@@ -1156,6 +1156,64 @@ fn parseStmtByType(self: *Parser, statementType: StatementType) std.mem.Allocato
                 return statement_idx;
             }
         },
+        .OpenCurly => {
+            const start = self.pos;
+
+            // Look for a similarly nested CloseCurly
+            var is_record_destructure = false;
+            var lookahead_pos = self.pos + 1;
+            var depth: u32 = 0;
+            while (lookahead_pos < self.tok_buf.tokens.len) {
+                const tok = self.tok_buf.tokens.items(.tag)[lookahead_pos];
+                switch (tok) {
+                    .OpenCurly => depth += 1,
+                    .CloseCurly => {
+                        if (depth == 0) {
+                            const token_after_close_curly = self.tok_buf.tokens.items(.tag)[lookahead_pos + 1];
+                            if (token_after_close_curly == .OpAssign) {
+                                is_record_destructure = true;
+                            }
+                            break;
+                        }
+                        depth -= 1;
+                    },
+                    .EndOfFile => break,
+                    else => {
+                        // Ignore other tokens
+                    },
+                }
+                lookahead_pos += 1;
+            }
+
+            // Restore parser position after lookahead
+            self.pos = start;
+
+            if (is_record_destructure) {
+                const patt_idx = try self.parsePatternNoAlts();
+
+                self.expect(.OpAssign) catch {
+                    return try self.pushMalformed(AST.Statement.Idx, .statement_unexpected_token, self.pos);
+                };
+
+                const idx = try self.parseExpr();
+                const statement_idx = try self.store.addStatement(.{ .decl = .{
+                    .pattern = patt_idx,
+                    .body = idx,
+                    .region = .{ .start = start, .end = self.pos },
+                } });
+                return statement_idx;
+            }
+
+            self.advance();
+
+            const record_expr = try self.parseRecord(start);
+            const expr = try self.parseExprWithBpSuffix(0, start, record_expr);
+            const statement_idx = try self.store.addStatement(.{ .expr = .{
+                .expr = expr,
+                .region = .{ .start = start, .end = self.pos },
+            } });
+            return statement_idx;
+        },
         else => {},
     }
 
@@ -1982,85 +2040,90 @@ pub fn parseExprWithBp(self: *Parser, min_bp: u8) std.mem.Allocator.Error!AST.Ex
         },
     }
     if (expr) |e| {
-        var expression = try self.parseExprSuffix(start, e);
-        while (self.peek() == .NoSpaceDotInt or self.peek() == .NoSpaceDotLowerIdent or self.peek() == .DotLowerIdent or self.peek() == .OpArrow) {
-            const tok = self.peek();
-            if (tok == .NoSpaceDotInt) {
-                return try self.pushMalformed(AST.Expr.Idx, .expr_no_space_dot_int, self.pos);
-            } else if (self.peek() == .OpArrow) {
-                const s = self.pos;
-                self.advance();
-                if (self.peek() == .LowerIdent) {
-                    const empty_qualifiers = try self.store.tokenSpanFrom(self.store.scratchTokenTop());
-                    const ident = try self.store.addExpr(.{ .ident = .{
-                        .region = .{ .start = self.pos, .end = self.pos },
-                        .token = self.pos,
-                        .qualifiers = empty_qualifiers,
-                    } });
-                    self.advance();
-                    const ident_suffixed = try self.parseExprSuffix(s, ident);
-                    expression = try self.store.addExpr(.{ .local_dispatch = .{
-                        .region = .{ .start = start, .end = self.pos },
-                        .operator = s,
-                        .left = expression,
-                        .right = ident_suffixed,
-                    } });
-                } else if (self.peek() == .UpperIdent) { // UpperIdent - should be a tag
-                    const empty_qualifiers = try self.store.tokenSpanFrom(self.store.scratchTokenTop());
-                    const tag = try self.store.addExpr(.{ .tag = .{
-                        .region = .{ .start = self.pos, .end = self.pos },
-                        .token = self.pos,
-                        .qualifiers = empty_qualifiers,
-                    } });
-                    self.advance();
-                    const ident_suffixed = try self.parseExprSuffix(s, tag);
-                    expression = try self.store.addExpr(.{ .local_dispatch = .{
-                        .region = .{ .start = start, .end = self.pos },
-                        .operator = s,
-                        .left = expression,
-                        .right = ident_suffixed,
-                    } });
-                } else {
-                    return try self.pushMalformed(AST.Expr.Idx, .expr_arrow_expects_ident, self.pos);
-                }
-            } else { // NoSpaceDotLowerIdent
-                const s = self.pos;
-                self.advance();
+        return try self.parseExprWithBpSuffix(min_bp, start, e);
+    }
+    return try self.store.addMalformed(AST.Expr.Idx, .expr_unexpected_token, .{ .start = start, .end = self.pos });
+}
+
+/// todo
+fn parseExprWithBpSuffix(self: *Parser, min_bp: u32, start: u32, e: AST.Expr.Idx) std.mem.Allocator.Error!AST.Expr.Idx {
+    var expression = try self.parseExprSuffix(start, e);
+    while (self.peek() == .NoSpaceDotInt or self.peek() == .NoSpaceDotLowerIdent or self.peek() == .DotLowerIdent or self.peek() == .OpArrow) {
+        const tok = self.peek();
+        if (tok == .NoSpaceDotInt) {
+            return try self.pushMalformed(AST.Expr.Idx, .expr_no_space_dot_int, self.pos);
+        } else if (self.peek() == .OpArrow) {
+            const s = self.pos;
+            self.advance();
+            if (self.peek() == .LowerIdent) {
                 const empty_qualifiers = try self.store.tokenSpanFrom(self.store.scratchTokenTop());
                 const ident = try self.store.addExpr(.{ .ident = .{
-                    .region = .{ .start = s, .end = self.pos },
-                    .token = s,
+                    .region = .{ .start = self.pos, .end = self.pos },
+                    .token = self.pos,
                     .qualifiers = empty_qualifiers,
                 } });
+                self.advance();
                 const ident_suffixed = try self.parseExprSuffix(s, ident);
-                expression = try self.store.addExpr(.{ .field_access = .{
+                expression = try self.store.addExpr(.{ .local_dispatch = .{
                     .region = .{ .start = start, .end = self.pos },
-                    .operator = start,
+                    .operator = s,
                     .left = expression,
                     .right = ident_suffixed,
                 } });
+            } else if (self.peek() == .UpperIdent) { // UpperIdent - should be a tag
+                const empty_qualifiers = try self.store.tokenSpanFrom(self.store.scratchTokenTop());
+                const tag = try self.store.addExpr(.{ .tag = .{
+                    .region = .{ .start = self.pos, .end = self.pos },
+                    .token = self.pos,
+                    .qualifiers = empty_qualifiers,
+                } });
+                self.advance();
+                const ident_suffixed = try self.parseExprSuffix(s, tag);
+                expression = try self.store.addExpr(.{ .local_dispatch = .{
+                    .region = .{ .start = start, .end = self.pos },
+                    .operator = s,
+                    .left = expression,
+                    .right = ident_suffixed,
+                } });
+            } else {
+                return try self.pushMalformed(AST.Expr.Idx, .expr_arrow_expects_ident, self.pos);
             }
-        }
-        while (getTokenBP(self.peek())) |bp| {
-            if (bp.left < min_bp) {
-                break;
-            }
-            const opPos = self.pos;
-
+        } else { // NoSpaceDotLowerIdent
+            const s = self.pos;
             self.advance();
-
-            const nextExpr = try self.parseExprWithBp(bp.right);
-
-            expression = try self.store.addExpr(.{ .bin_op = .{
-                .left = expression,
-                .right = nextExpr,
-                .operator = opPos,
+            const empty_qualifiers = try self.store.tokenSpanFrom(self.store.scratchTokenTop());
+            const ident = try self.store.addExpr(.{ .ident = .{
+                .region = .{ .start = s, .end = self.pos },
+                .token = s,
+                .qualifiers = empty_qualifiers,
+            } });
+            const ident_suffixed = try self.parseExprSuffix(s, ident);
+            expression = try self.store.addExpr(.{ .field_access = .{
                 .region = .{ .start = start, .end = self.pos },
+                .operator = start,
+                .left = expression,
+                .right = ident_suffixed,
             } });
         }
-        return expression;
     }
-    return try self.store.addMalformed(AST.Expr.Idx, .expr_unexpected_token, .{ .start = start, .end = self.pos });
+    while (getTokenBP(self.peek())) |bp| {
+        if (bp.left < min_bp) {
+            break;
+        }
+        const opPos = self.pos;
+
+        self.advance();
+
+        const nextExpr = try self.parseExprWithBp(bp.right);
+
+        expression = try self.store.addExpr(.{ .bin_op = .{
+            .left = expression,
+            .right = nextExpr,
+            .operator = opPos,
+            .region = .{ .start = start, .end = self.pos },
+        } });
+    }
+    return expression;
 }
 
 /// todo
@@ -2700,7 +2763,7 @@ pub fn parseBlock(self: *Parser, start: u32) std.mem.Allocator.Error!AST.Expr.Id
     }
 
     self.expect(.CloseCurly) catch {
-        try self.pushDiagnostic(.expected_expr_close_curly_or_comma, .{
+        try self.pushDiagnostic(.expected_expr_close_curly, .{
             .start = self.pos,
             .end = self.pos,
         });

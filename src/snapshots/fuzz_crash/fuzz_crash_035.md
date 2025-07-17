@@ -46,13 +46,12 @@ EndOfFile(2:2-2:2),
 	(module @1.1-1.9
 		(exposes @1.7-1.9))
 	(statements
-		(e-block @1.9-1.10
-			(statements))))
+		(e-malformed @1.1-1.1 (reason "expected_expr_close_curly_or_comma"))))
 ~~~
 # FORMATTED
 ~~~roc
 module []
-{}
+
 
 ~~~
 # CANONICALIZE
