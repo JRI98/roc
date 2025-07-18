@@ -666,6 +666,7 @@ pub const Diagnostic = struct {
         for_expected_in,
         match_branch_wrong_arrow,
         expected_expr_close_curly,
+        match_branch_missing_arrow,
     };
 };
 
