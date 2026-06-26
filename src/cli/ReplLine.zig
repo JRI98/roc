@@ -209,6 +209,10 @@ const History = struct {
     }
 
     pub fn append(self: *History, input: []const u8) Allocator.Error!void {
+        if (self.entries.items.len > 0) {
+            const last = self.entries.items[self.entries.items.len - 1];
+            if (std.mem.eql(u8, last, input)) return;
+        }
         const input_copy = try self.allocator.alloc(u8, input.len);
         @memcpy(input_copy, input);
         try self.entries.append(self.allocator, input_copy);
@@ -1271,4 +1275,17 @@ test "InputParser: 2-byte ESC sequence" {
         .{ .esc2 = .{ 0x1b, 'f' } },
         .{ .esc2 = .{ 0x1b, 'd' } },
     }, events.items);
+}
+
+test "History: basic appending and deduplication" {
+    var history = History.init(testing.allocator);
+    defer history.deinit();
+
+    try history.append("x = 1");
+    try history.append("y = 2");
+    try history.append("y = 2"); // should be ignored as consecutive duplicate
+
+    try testing.expectEqual(@as(usize, 2), history.entries.items.len);
+    try testing.expectEqualStrings("x = 1", history.entries.items[0]);
+    try testing.expectEqualStrings("y = 2", history.entries.items[1]);
 }
