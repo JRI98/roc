@@ -1429,6 +1429,14 @@ straight public-value path; it must not construct optimized-demand data,
 attempt the optimized path speculatively, or depend on optimized state to
 preserve observable Roc behavior.
 
+This is not a heuristic and not a fallback boundary. The build mode selects the
+lowering architecture before optimized state exists. `--opt=size` and
+`--opt=speed` construct optimized callable-state lowering; every other mode
+constructs ordinary public-value lowering. If optimized lowering discovers that
+it needs explicit compiler data that was not produced, that is a compiler bug in
+the relevant producer, not permission to materialize a public wrapper, scan
+finished LIR, or retry through ordinary lowering.
+
 The optimization is enabled only for optimized code generation:
 
 - on for `--opt=size`
