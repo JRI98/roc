@@ -1340,6 +1340,9 @@ This is the accepted long-term design for optimized callable-state lowering.
 The compiler must move directly to this architecture; there is no separate
 short-term iterator implementation, no cleanup pass to preserve, and no
 source-specific rule that should remain once this design is implemented.
+The target design is the long-term design. Implementation checkpoints may land
+incrementally, but they must be partial implementations of this architecture,
+not alternate mechanisms that later need to be removed.
 
 `Iter` and `Stream` are public Roc builtins whose methods remain ordinary Roc
 functions. Their public representation is the same family:
@@ -2074,6 +2077,12 @@ completed LIR, backend output, wasm bytes, object bytes, or disassembly. If an
 ordinary public value must be observed, optimized lowering materializes it at
 that point. If it does not need to be observed, optimized lowering avoids
 constructing it in the first place.
+
+Focused tests must cover structurally equivalent source forms that previously
+optimized differently. In particular, primitive private state and a
+single-field record wrapper around that primitive must reach the same optimized
+shape under the same result demand. This proves the optimizer is using checked
+facts and demand, not aggregate source shape, as its source of private state.
 
 The success condition is backend-neutral. A Rocci Bird `--opt=size` wasm build is
 an important integration proof, but the invariant is stronger: focused compiler
