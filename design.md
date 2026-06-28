@@ -1640,6 +1640,15 @@ emitted. Ordinary lowering emits public values directly; optimized lowering
 emits ordinary LIR after deciding, under demand, which public values never need
 to be materialized.
 
+The optimizer may have temporary lowering data for demanded values, private
+state, loop graph nodes, and worker requests, but that data is not a stored IR
+and does not require a later elimination or materialization pass. Each producer
+is cloned while the relevant demand is active. The clone either emits ordinary
+LIR for a materialized public value, emits ordinary LIR for a demanded private
+state transition, or queues an optimized worker owned by the same lowering
+context. There is no phase that first builds plan values and then converts them
+into LIR after the fact.
+
 The entrypoint gate is also the compile-time-cost gate. Result demand,
 demanded-value arenas, private-state graphs, worker queues, and loop fixed-point
 work are constructed only after the post-check driver has selected the optimized
