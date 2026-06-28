@@ -1339,10 +1339,18 @@ concrete monomorphic dispatcher type has already determined the owner.
 This is the accepted long-term design for optimized callable-state lowering.
 The compiler must move directly to this architecture; there is no separate
 short-term iterator implementation, no cleanup pass to preserve, and no
-source-specific rule that should remain once this design is implemented.
-The target design is the long-term design. Implementation checkpoints may land
+source-specific rule that should remain once this design is implemented. The
+target design is the long-term design. Implementation checkpoints may land
 incrementally, but they must be partial implementations of this architecture,
 not alternate mechanisms that later need to be removed.
+
+This optimizer runs only in optimized code-generation modes: `--opt=size` and
+`--opt=speed`. It does not run during `roc check`, compile-time evaluation,
+dev builds, interpreter preparation, or any other non-optimized lowering path.
+Those paths must lower public Roc values directly and must not allocate dormant
+demand graphs, sparse private-state tables, loop fixed-point structures, or
+optimized worker queues. The mode gate is a construction boundary, not a
+late boolean buried in helper code.
 
 `Iter` and `Stream` are public Roc builtins whose methods remain ordinary Roc
 functions. Their public representation is the same family:
@@ -1439,10 +1447,10 @@ or a late cleanup pass. A consumer creates exact result demand, optimized
 lowering clones the producer while that demand is active, and the same cloning
 context creates any private state machine, finite callable dispatch, or
 demand-keyed worker required by the facts exposed during cloning. The optimizer
-may emit direct recursive workers or LIR joins for compiler-created private
-state, but those workers are internal code-generation artifacts; they do not
-change source loop semantics, source mutable-variable semantics, or public Roc
-value identity.
+may emit direct workers or LIR joins for compiler-created private state, but
+those workers are internal code-generation artifacts; they do not change source
+loop semantics, source mutable-variable semantics, or public Roc value
+identity.
 
 The optimized callable-state path is an optimized-code-generation facility, not
 a correctness mechanism. It is allowed to spend extra time specializing calls,
@@ -1472,6 +1480,14 @@ defunctionalization behavior, or public materialization boundaries. Focused
 optimizer-shape tests must therefore exercise both optimized modes with the
 same expected optimizer-owned facts unless the test is explicitly about a later
 backend size-vs-speed preference.
+
+This mode boundary is allowed because the transformation is a generated-code
+optimization, not a source-language semantic requirement. All modes must report
+the same checking diagnostics, run the same eligible compile-time expressions,
+preserve the same public iterator/callable immutability, and produce the same
+observable Roc behavior. Optimized modes may spend extra compiler time to avoid
+constructing public wrappers in hot paths; non-optimized modes may construct
+those public wrappers normally.
 
 The opt-mode gate is also the compile-time-performance contract. Demand
 propagation, sparse private-state construction, finite callable splitting, loop
