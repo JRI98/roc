@@ -1385,8 +1385,8 @@ as that same Roc type.
 Roc reaches the optimized shape through ordinary lambdas, lambda sets, captures,
 known constructor values, and result demand. A step field is a normal callable.
 Lambda-set solving already records finite callable targets and captures behind
-the single public callable type. Optimized post-check lowering consumes those
-ordinary facts and defunctionalizes reachable callable/capture graphs into
+the single public callable type. Optimized post-check lowering consumes that
+ordinary compiler data and defunctionalizes reachable callable/capture graphs into
 private state machines when the surrounding code only demands private state.
 This is not an iterator source-meaning rule; `Iter` and `Stream` are important
 clients of a general callable-state and control-boundary optimization.
@@ -1402,11 +1402,11 @@ the captures those targets actually read, and each returned `One`, `Skip`, or
 `Iter(item)` record exists only when source code observes it as a public value.
 
 This is the Roc analogue of Rust's optimized iterator lowering, but the private
-state comes from Roc lambda-set facts instead of from public type erasure. Rust
+state comes from Roc lambda-set data instead of from public type erasure. Rust
 puts adapter identity in the static type. Roc keeps adapter identity out of the
-public type and keeps it in ordinary checked callable facts until optimized
-lowering consumes those facts. The optimized state machine is therefore an
-implementation artifact of `--opt=size` and `--opt=speed` lowering, not a new
+public type and keeps it in ordinary checked callable data until optimized
+lowering consumes that data. The optimized state machine is therefore
+lowering-local data for `--opt=size` and `--opt=speed`, not a new
 source-level iterator representation.
 
 The optimizer must use actual Roc lambdas and the existing lambda-set model. It
@@ -1419,7 +1419,7 @@ program's public value behavior, not a deoptimization fallback.
 The selected design has these hard implementation commitments:
 
 - preserve the public `Iter` and `Stream` three-step records
-- use ordinary Roc lambdas and existing lambda-set facts as the private adapter
+- use ordinary Roc lambdas and existing lambda-set data as the private adapter
   shape source
 - enter optimized callable-state lowering only for `--opt=size` and
   `--opt=speed`
@@ -1439,17 +1439,17 @@ The selected design has these hard implementation commitments:
 None of those commitments is iterator-specific. They are the general optimized
 post-check lowering contract that happens to make `Iter` and `Stream` optimize
 to the Rust-like cursor shape when the checked program exposes finite callable
-facts under demand.
+data under demand.
 
 The concrete algorithm is selective demand-specialized lowering. It is not a
 source-loop rewrite, a source-conditional rewrite, a builtin iterator rewrite,
 or a late cleanup pass. A consumer creates exact result demand, optimized
 lowering clones the producer while that demand is active, and the same cloning
 context creates any private state machine, finite callable dispatch, or
-demand-keyed worker required by the facts exposed during cloning. The optimizer
+demand-keyed worker required by the data exposed during cloning. The optimizer
 may emit direct workers or LIR joins for compiler-created private state, but
-those workers are internal code-generation artifacts; they do not change source
-loop semantics, source mutable-variable semantics, or public Roc value
+those workers are internal generated code; they do not change source loop
+behavior, source mutable-variable behavior, or public Roc value
 identity.
 
 The optimized callable-state path is an optimized-code-generation facility, not
@@ -1472,17 +1472,17 @@ context explicitly. Calling such a helper from ordinary lowering should be an
 API/type error, or at minimum a debug invariant violation at the optimized
 context boundary.
 
-Both optimized modes use the same callable-state specialization semantics.
+Both optimized modes use the same callable-state specialization behavior.
 `--opt=size` and `--opt=speed` may differ later through backend optimization
 preferences, but they do not select different producer-under-demand rules,
 private-state representations, loop-demand fixed-point behavior, callable
 defunctionalization behavior, or public materialization boundaries. Focused
 optimizer-shape tests must therefore exercise both optimized modes with the
-same expected optimizer-owned facts unless the test is explicitly about a later
+same expected optimizer-owned data unless the test is explicitly about a later
 backend size-vs-speed preference.
 
 This mode boundary is allowed because the transformation is a generated-code
-optimization, not a source-language semantic requirement. All modes must report
+optimization, not a source-language requirement. All modes must report
 the same checking diagnostics, run the same eligible compile-time expressions,
 preserve the same public iterator/callable immutability, and produce the same
 observable Roc behavior. Optimized modes may spend extra compiler time to avoid
@@ -1496,7 +1496,7 @@ stronger than ordinary public-value lowering, and they are paid for only when
 the user requests optimized generated code. Correctness, diagnostics, checking,
 compile-time evaluation, static storage, and interpreter behavior must not
 depend on this optimizer. If an optimized-mode regression reveals missing
-checked facts, the producer of those facts must be fixed; non-optimized modes
+checked data, the producer of that data must be fixed; non-optimized modes
 must not grow dormant optimizer state just to share the fix.
 
 This means the optimizer may use more expensive exact machinery than a dev
@@ -1591,9 +1591,9 @@ This gate is part of the optimizer's data-ownership model. Optimized demand
 state is not a dormant field on ordinary lowering, and ordinary lowering must
 not be able to manufacture an optimized context. `--opt=size` and `--opt=speed`
 enter the same callable-state specialization entrypoint and use the same
-producer-under-demand semantics; any later size-vs-speed differences belong to
+producer-under-demand behavior; any later size-vs-speed differences belong to
 backend optimization preferences, not to the callable-state optimizer.
-Focused regressions for optimizer-owned facts must therefore run in both
+Focused regressions for optimizer-owned data must therefore run in both
 optimized modes with the same expected private-state shape.
 
 The implementation boundary should be visible at construction time. The
@@ -1611,20 +1611,20 @@ Focused tests should prove this boundary directly. A negative test should be
 able to lower the same small program through dev/check/interpreter-style paths
 without constructing the optimized context. Positive tests for `--opt=size` and
 `--opt=speed` should observe the same optimized entrypoint and the same
-optimizer-owned facts before backend-specific size or speed preferences run.
+optimizer-owned data before backend-specific size or speed preferences run.
 The proof must come from compiler-owned lowering/test data, not from final wasm
 size, generated symbol names, disassembly, or backend output.
 
 The optimized path is a different post-check lowering entrypoint, not a cleanup
 pass after ordinary lowering. It may create extra private workers, private
 state loops, and demand-specific direct calls while cloning optimized code. The
-ordinary public-value path never constructs those optimized-only artifacts.
+ordinary public-value path never constructs that optimized-only state.
 Conversely, optimized lowering must not first build public iterator/callable
 wrappers and then try to remove them later; avoided materialization is the
 design, not a post-pass improvement.
 
 There is also no "try optimized, then fall back to public lowering" path inside
-the optimized entrypoint. If optimized lowering needs a fact, that fact must be
+the optimized entrypoint. If optimized lowering needs compiler data, that data must be
 explicit optimized input produced by checking, lambda-set solving, known-value
 construction, result-demand propagation, or loop fixed-point solving. Missing
 required optimized data is a compiler bug to fix at the producer; it is not a
@@ -1647,7 +1647,7 @@ is cloned while the relevant demand is active. The clone either emits ordinary
 LIR for a materialized public value, emits ordinary LIR for a demanded private
 state transition, or queues an optimized worker owned by the same lowering
 context. There is no phase that first builds plan values and then converts them
-into LIR after the fact.
+into LIR afterward.
 
 The entrypoint gate is also the compile-time-cost gate. Result demand,
 demanded-value arenas, private-state graphs, worker queues, and loop fixed-point
@@ -1661,7 +1661,7 @@ Every correctness and generated-code invariant of this optimizer applies to
 both optimized modes. A specialized shape proved only for `--opt=size` is not
 landed; the same focused property must also be proved for `--opt=speed` unless
 the test is explicitly about a later size-vs-speed backend preference. The
-callable-state optimizer itself has no size-only or speed-only semantics.
+callable-state optimizer itself has no size-only or speed-only behavior.
 
 The gate must be represented in the implementation as data ownership, not as a
 boolean checked deep inside lowering. Ordinary public-value lowering owns no
@@ -1716,7 +1716,7 @@ lowered. The output is ordinary LIR control flow and ordinary LIR values.
 This is not a source-level loop-to-recursive-function transform. Optimized
 lowering may emit demand-specific private workers and state-machine joins, but
 those are implementation details created while lowering already checked control
-flow. A source loop remains source loop semantics: outer mutable variables,
+flow. A source loop remains source loop behavior: outer mutable variables,
 branch conditions, guards, scrutinees, appended item expressions, stream
 effects, `dbg`, `expect`, `crash`, `break`, and `return` keep their checked
 evaluation order and control behavior. The optimizer may update only
@@ -1729,7 +1729,7 @@ clones each branch result under the continuation's result demand. A match
 clones the scrutinee under explicit tag and payload demand, then clones branch
 results under the outer demand. A loop solves loop-parameter demand as a fixed
 point over body observations and reachable `continue` edges. A direct call may
-create an optimized worker keyed by callee identity, argument facts, and result
+create an optimized worker keyed by callee identity, argument data, and result
 demand. These are all the same optimization family: defunctionalization and
 specialization under exact demand. They are not separate rules for `for`, `if`,
 `match`, or iterator builtins.
@@ -1768,7 +1768,7 @@ accidentally materialized and should have been avoided.
 
 The implementation may organize optimized lowering into helper phases, but those
 phases are internal to the optimized entrypoint and operate on explicit demand
-and known-value data as the body is cloned. They are not a second semantic IR, a
+and known-value data as the body is cloned. They are not a second source-language IR, a
 whole-program cleanup pass, or an analysis that ordinary lowering has to run and
 then ignore.
 
@@ -1783,7 +1783,7 @@ This mode gate is also a test boundary. Focused optimizer regressions must
 prove both sides of it: dev, check, interpreter, and compile-time-finalization
 paths do not construct optimized contexts, and `--opt=size` plus `--opt=speed`
 enter the same callable-state specialization path. Assertions about
-optimizer-owned facts, such as sparse demand shape, finite callable alternatives,
+optimizer-owned data, such as sparse demand shape, finite callable alternatives,
 loop-demand fixed points, and public materialization boundaries, must be checked
 in both optimized modes unless the assertion is explicitly about a later
 backend size-vs-speed preference.
@@ -1800,13 +1800,13 @@ are ordered by data dependency, not by source syntax:
 
 1. establish the consumer's result demand
 2. clone the producer under that demand
-3. refine finite callable/tag/direct-call facts exposed by that clone
+3. refine finite callable/tag/direct-call data exposed by that clone
 4. solve any loop-carried demand fixed point created by reachable transitions
 5. emit ordinary LIR from the resulting private state or materialized value
 
 No phase may recover missing demand from names, lowered symbols, backend
-output, wasm bytes, disassembly, or completed LIR. If a later helper needs a
-fact, the earlier clone-under-demand step must produce it explicitly.
+output, wasm bytes, disassembly, or completed LIR. If a later helper needs
+compiler data, the earlier clone-under-demand step must produce it explicitly.
 
 Current implementation work must therefore converge by replacing dense
 public-wrapper paths with this producer-under-demand lowering. A partial
@@ -1836,7 +1836,7 @@ evaluation must report the same checking results without constructing private
 runtime state. Interpreters and backend-independent consumers must see the
 ordinary public lowering path unless they explicitly request optimized code.
 
-Optimized callable-state specialization uses one set of generic compiler facts:
+Optimized callable-state specialization uses one set of generic compiler data:
 
 - direct-call targets
 - finite lambda-set callable targets
@@ -1846,11 +1846,11 @@ Optimized callable-state specialization uses one set of generic compiler facts:
 - explicit result demand
 
 The same mechanism applies to any ordinary Roc value whose producer and
-consumer expose enough checked facts under demand. `Stream` does not get a
+consumer expose enough checked data under demand. `Stream` does not get a
 separate compiler rule, `Iter` does not get a separate compiler rule, and a
 record wrapping a primitive does not get a more powerful rule than the primitive
 itself. The optimizer specializes callable state because the checked program
-contains finite callable facts, not because a value has a particular builtin
+contains finite callable data, not because a value has a particular builtin
 name.
 
 The intended implementation therefore has two explicit post-check lowering
@@ -1858,7 +1858,7 @@ contexts. Ordinary lowering owns public-value construction and has no demand
 arena, demanded-known-value table, sparse private-state table, worker queue, or
 loop-state fixed-point storage. Optimized lowering owns those structures and is
 constructible only from the `--opt=size`/`--opt=speed` entrypoint. Helpers that
-create or consume optimized-only facts must take the optimized context
+create or consume optimized-only data must take the optimized context
 directly; ordinary lowering should be unable to call them by accident.
 
 The pass must not recognize source `for`, source `if`, source `match`,
@@ -1866,14 +1866,14 @@ The pass must not recognize source `for`, source `if`, source `match`,
 or generated symbol names as optimization triggers. Source `for` lowers through
 the ordinary public `.iter` and `.next` meaning. Source `if` and `match` lower
 as ordinary control flow. The optimizer observes the generic demand and
-callable-state facts created by that lowered code; it never asks which source
+callable-state data created by that lowered code; it never asks which source
 construct produced them.
 
 Control-flow precision comes from the checked/Lambda representation that is
 already being lowered, not from source-shape rules. Branches merge demanded
 results because the continuation demands a value from the branch expression.
 Matches demand tag choices and payloads because the continuation observes those
-facts. Loops demand parameters because body observations and reachable
+data. Loops demand parameters because body observations and reachable
 `continue` edges consume those parameters. These are ordinary producer-consumer
 relationships in the lowered program, so adding support for one control-flow
 form must not add a separate rule for a builtin or syntax form.
@@ -1904,10 +1904,10 @@ Demand propagation is the only source of private state shape. Optimized
 lowering must not derive private state by starting with a dense public value and
 dropping fields opportunistically. It must also not rediscover demand by
 scanning completed LIR, symbol names, generated code, wasm disassembly, or
-backend artifacts. If a producer needs a private shape, that requirement must be
+backend output. If a producer needs a private shape, that requirement must be
 visible as explicit demand at the point where the producer is cloned.
 
-Known values are optimizer facts, not runtime values. They are not limited to
+Known values are optimizer data, not runtime values. They are not limited to
 aggregate source syntax. Primitive leaves are first-class known values, so a
 `U64` loop cursor must optimize the same way whether it appears directly or
 inside a single-field record. Records and tuples are only one way to expose
@@ -1920,7 +1920,7 @@ payloads, or callable captures. The private-state representation therefore
 stores demanded children sparsely by checked child identity: record field name,
 tuple item index, tag payload index, nominal backing value, and callable capture
 index. A missing child means private state does not carry it. A present child
-whose fact is unknown means private state carries the runtime value but has no
+whose data is unknown means private state carries the runtime value but has no
 more precise structure.
 
 Sparse demanded private state must not be forced through the ordinary dense
@@ -2048,7 +2048,7 @@ ordinary potentially nonterminating Roc computations.
 
 The optimization creates extra direct-call workers only from explicit call
 patterns discovered while cloning optimized code. Worker identity includes the
-callee identity, split argument facts, result demand, and relevant type/layout
+callee identity, split argument data, result demand, and relevant type/layout
 decisions. The original public-ABI body remains available. Extra workers are
 implementation details for optimized direct calls and callable-state
 specialization, not replacements for public callable boundaries.
@@ -2085,7 +2085,7 @@ demand graph nodes, finite callable-state alternatives, and demand-keyed
 workers as data owned by that context. Later stages must see only ordinary LIR.
 If a private-state shape is discovered only by scanning completed LIR, generated
 symbols, wasm bytes, object bytes, or disassembly, the implementation has missed
-the producer-consumer boundary where that fact should have been produced.
+the producer-consumer boundary where that data should have been produced.
 
 The implementation must move directly to this design. There is no intermediate
 iterator-specific design to preserve, and no short-term fallback path to keep
@@ -2097,7 +2097,7 @@ responsible for these pieces as one coherent system:
 - sparse demanded private state for records, tuples, tags, nominals, callables,
   and primitive leaves
 - demand-aware cloning through calls, branches, matches, and loops
-- finite callable-state defunctionalization from ordinary lambda-set facts
+- finite callable-state defunctionalization from ordinary lambda-set data
 - loop-parameter demand fixed points over observations and reachable
   `continue` edges
 - demand-keyed optimized direct-call workers
@@ -2105,7 +2105,7 @@ responsible for these pieces as one coherent system:
 
 If an optimized path needs information that is not available, the fix is to make
 an earlier stage produce that information explicitly. It is not acceptable to
-recover the fact from source syntax, builtin names, generated symbol names,
+recover the data from source syntax, builtin names, generated symbol names,
 completed LIR, backend output, wasm bytes, object bytes, or disassembly. If an
 ordinary public value must be observed, optimized lowering materializes it at
 that point. If it does not need to be observed, optimized lowering avoids
@@ -2115,7 +2115,7 @@ Focused tests must cover structurally equivalent source forms that previously
 optimized differently. In particular, primitive private state and a
 single-field record wrapper around that primitive must reach the same optimized
 shape under the same result demand. This proves the optimizer is using checked
-facts and demand, not aggregate source shape, as its source of private state.
+data and demand, not aggregate source shape, as its source of private state.
 
 The success condition is backend-neutral. A Rocci Bird `--opt=size` wasm build is
 an important integration proof, but the invariant is stronger: focused compiler

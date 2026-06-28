@@ -472,15 +472,15 @@ const MatchValueBranchSource = struct {
     scrutinee_known_value: ?KnownValue,
     scrutinee_value: ?*const Value,
     bindings: []const SavedBinding,
-    projection: MatchValueBranchSourceProjection = .none,
+    read: MatchValueBranchSourceRead = .none,
 };
 
-const MatchValueBranchSourceProjection = union(enum) {
+const MatchValueBranchSourceRead = union(enum) {
     none,
-    callable_capture: MatchValueCallableCaptureProjection,
+    callable_capture: MatchValueCallableCaptureRead,
 };
 
-const MatchValueCallableCaptureProjection = struct {
+const MatchValueCallableCaptureRead = struct {
     callable: DemandedKnownCallable,
     capture_index: u32,
 };
@@ -2920,10 +2920,10 @@ const Cloner = struct {
         if (try self.bindPatToMatchValue(source.pat, demanded_scrutinee, source.body, source_body_demand, unsafe_count, &pending_lets) == null) {
             const known_value = (try self.pass.knownValueFromValue(demanded_scrutinee)) orelse source.scrutinee_known_value orelse
                 return try self.applyValueDemand(branch.body, demand);
-            _ = try self.bindPatToExprWithKnownValueAndFact(source.pat, known_value, demanded_scrutinee);
+            _ = try self.bindPatToExprWithKnownValueAndValue(source.pat, known_value, demanded_scrutinee);
         }
 
-        const result = try self.cloneProjectedMatchSourceBodyWithDemand(source, demand);
+        const result = try self.cloneMatchSourceBodyReadWithDemand(source, demand);
         return try self.wrapPendingLets(result, pending_lets.items, demand != .none);
     }
 
@@ -2932,25 +2932,25 @@ const Cloner = struct {
         source: MatchValueBranchSource,
         demand: ValueDemand,
     ) Allocator.Error!ValueDemand {
-        return switch (source.projection) {
+        return switch (source.read) {
             .none => demand,
-            .callable_capture => |projection| try self.callableCaptureDemand(projection.capture_index, demand),
+            .callable_capture => |capture_read| try self.callableCaptureDemand(capture_read.capture_index, demand),
         };
     }
 
-    fn cloneProjectedMatchSourceBodyWithDemand(
+    fn cloneMatchSourceBodyReadWithDemand(
         self: *Cloner,
         source: MatchValueBranchSource,
         demand: ValueDemand,
     ) Common.LowerError!Value {
-        return switch (source.projection) {
+        return switch (source.read) {
             .none => try self.cloneExprValueWithDemand(source.body, demand),
-            .callable_capture => |projection| blk: {
+            .callable_capture => |capture_read| blk: {
                 const capture_demand: ValueDemand = if (demand == .none) .materialize else demand;
-                const callable_demand = try self.callableCaptureDemand(projection.capture_index, capture_demand);
+                const callable_demand = try self.callableCaptureDemand(capture_read.capture_index, capture_demand);
                 const body_value = try self.cloneExprValueWithDemand(source.body, callable_demand);
-                break :blk (try self.callableCaptureFromValue(body_value, projection.callable, projection.capture_index)) orelse
-                    Common.invariant("projected callable capture source did not produce requested capture");
+                break :blk (try self.callableCaptureFromValue(body_value, capture_read.callable, capture_read.capture_index)) orelse
+                    Common.invariant("callable capture source read did not produce requested capture");
             },
         };
     }
@@ -8110,7 +8110,7 @@ const Cloner = struct {
                     .scrutinee_known_value = source.scrutinee_known_value,
                     .scrutinee_value = source.scrutinee_value,
                     .bindings = source.bindings,
-                    .projection = .{ .callable_capture = .{
+                    .read = .{ .callable_capture = .{
                         .callable = callable,
                         .capture_index = capture_index,
                     } },
@@ -8523,7 +8523,7 @@ const Cloner = struct {
             }
             const change_start = self.changes.items.len;
             if (scrutinee_known_value) |known_value| {
-                _ = try self.bindPatToExprWithKnownValueAndFact(branch.pat, known_value, scrutinee_value);
+                _ = try self.bindPatToExprWithKnownValueAndValue(branch.pat, known_value, scrutinee_value);
             }
             const cloned_branch = Ast.Branch{
                 .pat = try self.clonePat(branch.pat),
@@ -8577,7 +8577,7 @@ const Cloner = struct {
             }
             const change_start = self.changes.items.len;
             if (scrutinee_known_value) |known_value| {
-                _ = try self.bindPatToExprWithKnownValueAndFact(branch.pat, known_value, scrutinee_value);
+                _ = try self.bindPatToExprWithKnownValueAndValue(branch.pat, known_value, scrutinee_value);
             }
             const cloned_branch = Ast.Branch{
                 .pat = try self.clonePat(branch.pat),
@@ -8756,7 +8756,7 @@ const Cloner = struct {
         comptime_site: ?Ast.ComptimeSiteId,
     ) Common.LowerError!?MatchValueBranchSource {
         const source = maybe_source orelse return null;
-        if (source.projection != .none) return null;
+        if (source.read != .none) return null;
         return MatchValueBranchSource{
             .scrutinee = source.scrutinee,
             .pat = source.pat,
@@ -12463,14 +12463,14 @@ const Cloner = struct {
 
     fn bindPatToMaterializedKnownValue(self: *Cloner, pat_id: Ast.PatId, value: Value) Common.LowerError!bool {
         const known_value = (try self.pass.knownValueFromValue(value)) orelse return false;
-        return try self.bindPatToExprWithKnownValueAndFact(pat_id, known_value, value);
+        return try self.bindPatToExprWithKnownValueAndValue(pat_id, known_value, value);
     }
 
     fn bindPatToExprWithKnownValue(self: *Cloner, pat_id: Ast.PatId, known_value: KnownValue) Common.LowerError!bool {
-        return try self.bindPatToExprWithKnownValueAndFact(pat_id, known_value, null);
+        return try self.bindPatToExprWithKnownValueAndValue(pat_id, known_value, null);
     }
 
-    fn bindPatToExprWithKnownValueAndFact(
+    fn bindPatToExprWithKnownValueAndValue(
         self: *Cloner,
         pat_id: Ast.PatId,
         known_value: KnownValue,
@@ -12493,7 +12493,7 @@ const Cloner = struct {
             },
             .wildcard => return true,
             .as => |as| {
-                if (!try self.bindPatToExprWithKnownValueAndFact(as.pattern, known_value, maybe_value)) return false;
+                if (!try self.bindPatToExprWithKnownValueAndValue(as.pattern, known_value, maybe_value)) return false;
                 const local_ty = self.pass.program.locals.items[@intFromEnum(as.local)].ty;
                 const local_expr = try self.addExpr(.{
                     .ty = local_ty,
@@ -12512,7 +12512,7 @@ const Cloner = struct {
                     const field_known_value = fieldKnownValueFromKnownValue(known_value, field.name) orelse
                         KnownValue{ .any = self.pass.program.pats.items[@intFromEnum(field.pattern)].ty };
                     const field_value = if (maybe_value) |value| fieldFromValue(value, field.name) else null;
-                    if (!try self.bindPatToExprWithKnownValueAndFact(field.pattern, field_known_value, field_value)) return false;
+                    if (!try self.bindPatToExprWithKnownValueAndValue(field.pattern, field_known_value, field_value)) return false;
                 }
                 return true;
             },
@@ -12522,7 +12522,7 @@ const Cloner = struct {
                     const item_known_value = itemKnownValueFromKnownValue(known_value, @as(u32, @intCast(index))) orelse
                         KnownValue{ .any = self.pass.program.pats.items[@intFromEnum(child_pat)].ty };
                     const item_value = if (maybe_value) |value| itemFromValue(value, @intCast(index)) else null;
-                    if (!try self.bindPatToExprWithKnownValueAndFact(child_pat, item_known_value, item_value)) return false;
+                    if (!try self.bindPatToExprWithKnownValueAndValue(child_pat, item_known_value, item_value)) return false;
                 }
                 return true;
             },
@@ -12532,13 +12532,13 @@ const Cloner = struct {
                     if (pats.len != tag_known_value.payloads.len) return false;
                     for (pats, tag_known_value.payloads, 0..) |child_pat, payload_known_value, index| {
                         const payload_value = if (maybe_value) |value| tagPayloadFromValue(value, @intCast(index)) else null;
-                        if (!try self.bindPatToExprWithKnownValueAndFact(child_pat, payload_known_value, payload_value)) return false;
+                        if (!try self.bindPatToExprWithKnownValueAndValue(child_pat, payload_known_value, payload_value)) return false;
                     }
                 } else {
                     for (pats, 0..) |child_pat, index| {
                         const payload_known_value = KnownValue{ .any = self.pass.program.pats.items[@intFromEnum(child_pat)].ty };
                         const payload_value = if (maybe_value) |value| tagPayloadFromValue(value, @intCast(index)) else null;
-                        if (!try self.bindPatToExprWithKnownValueAndFact(child_pat, payload_known_value, payload_value)) return false;
+                        if (!try self.bindPatToExprWithKnownValueAndValue(child_pat, payload_known_value, payload_value)) return false;
                     }
                 }
                 return true;
@@ -12552,7 +12552,7 @@ const Cloner = struct {
                     .nominal => |nominal| nominal.backing.*,
                     else => value,
                 } else null;
-                return try self.bindPatToExprWithKnownValueAndFact(backing_pat, backing_known_value, backing_value);
+                return try self.bindPatToExprWithKnownValueAndValue(backing_pat, backing_known_value, backing_value);
             },
             .list,
             .int_lit,
@@ -17507,7 +17507,7 @@ fn tupleFromValue(value: Value) ?TupleValue {
     };
 }
 
-test "value demand equality ignores projection order" {
+test "value demand equality ignores capture read order" {
     const materialize: ValueDemand = .materialize;
     const none: ValueDemand = .none;
     const field_a: names.RecordFieldNameId = @enumFromInt(1);
