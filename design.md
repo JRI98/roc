@@ -1400,6 +1400,27 @@ an erased or public boundary, ordinary public callable materialization is
 selected by explicit materialization demand. That boundary is part of the source
 program's public value behavior, not a deoptimization fallback.
 
+The selected design has these hard implementation commitments:
+
+- preserve the public `Iter` and `Stream` three-step records
+- use ordinary Roc lambdas and existing lambda-set facts as the private adapter
+  shape source
+- enter optimized callable-state lowering only for `--opt=size` and
+  `--opt=speed`
+- clone producers under exact consumer demand before public wrappers are
+  materialized
+- represent private state sparsely by demanded checked child identity, not by
+  dense public value shape
+- solve recursive loop-carried demand with explicit loop-demand graph nodes
+- materialize public Roc records, callables, iterators, streams, tags, tuples,
+  lists, and nominals only at explicit public observation boundaries
+- emit ordinary scope-closed LIR before ARC and backend code generation
+
+None of those commitments is iterator-specific. They are the general optimized
+post-check lowering contract that happens to make `Iter` and `Stream` optimize
+to the Rust-like cursor shape when the checked program exposes finite callable
+facts under demand.
+
 The optimized callable-state path is an optimized-code-generation facility, not
 a correctness mechanism. It is allowed to spend extra time specializing calls,
 control-flow boundaries, and loop-carried private state only when the user has
