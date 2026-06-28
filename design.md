@@ -1352,6 +1352,17 @@ demand graphs, sparse private-state tables, loop fixed-point structures, or
 optimized worker queues. The mode gate is a construction boundary, not a
 late boolean buried in helper code.
 
+This opt-mode restriction is part of the target design. The optimizer is a
+generated-code specialization facility, so it is selected only when the user
+asks for optimized generated code. It is not a target policy, a wasm policy, an
+iterator policy, or a compile-time recovery mechanism. Checking,
+compile-time evaluation, const storage, diagnostics, interpreter preparation,
+and ordinary public-value lowering all remain correct without constructing
+optimized callable-state data. Optimized lowering may consume checked facts and
+stored constants produced by those stages, but those stages must not create
+private cursor state, demand graphs, or demand-keyed workers just in case a
+later optimized build could use them.
+
 `Iter` and `Stream` are public Roc builtins whose methods remain ordinary Roc
 functions. Their public representation is the same family:
 
