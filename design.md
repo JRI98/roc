@@ -1336,6 +1336,11 @@ concrete monomorphic dispatcher type has already determined the owner.
 
 ### Optimized Callable-State And Control-Boundary Specialization
 
+This is the accepted long-term design for optimized callable-state lowering.
+The compiler must move directly to this architecture; there is no separate
+short-term iterator implementation, no cleanup pass to preserve, and no
+source-specific rule that should remain once this design is implemented.
+
 `Iter` and `Stream` are public Roc builtins whose methods remain ordinary Roc
 functions. Their public representation is the same family:
 
@@ -1453,6 +1458,16 @@ defunctionalization behavior, or public materialization boundaries. Focused
 optimizer-shape tests must therefore exercise both optimized modes with the
 same expected optimizer-owned facts unless the test is explicitly about a later
 backend size-vs-speed preference.
+
+The opt-mode gate is also the compile-time-performance contract. Demand
+propagation, sparse private-state construction, finite callable splitting, loop
+fixed-point solving, and demand-keyed worker generation are intentionally
+stronger than ordinary public-value lowering, and they are paid for only when
+the user requests optimized generated code. Correctness, diagnostics, checking,
+compile-time evaluation, static storage, and interpreter behavior must not
+depend on this optimizer. If an optimized-mode regression reveals missing
+checked facts, the producer of those facts must be fixed; non-optimized modes
+must not grow dormant optimizer state just to share the fix.
 
 This is not a heuristic and not a fallback boundary. The build mode selects the
 lowering architecture before optimized state exists. `--opt=size` and
