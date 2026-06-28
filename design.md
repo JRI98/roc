@@ -1460,6 +1460,14 @@ straight public-value path; it must not construct optimized-demand data,
 attempt the optimized path speculatively, or depend on optimized state to
 preserve observable Roc behavior.
 
+The mode restriction does not make this a lesser or temporary design. It is the
+complete target design for generated-code optimization. Dev, check,
+interpreter, and compile-time-finalization paths have their own correct
+ordinary-public-value lowering architecture; they are not partial failed
+attempts at optimized lowering. Conversely, `--opt=size` and `--opt=speed` must
+not be ordinary lowering plus a later cleanup. They enter the optimized
+architecture from the beginning, before public wrappers are created.
+
 The implementation consequence is strict: the post-check driver first classifies
 the requested build into exactly one of two lowering families, then constructs
 only the matching context. Ordinary public-value lowering has no result-demand
@@ -1816,6 +1824,15 @@ later is not this design. A partial implementation that recognizes `Iter`,
 this design. The transition is complete only when the same demand machinery
 explains optimized direct calls, branch results, match results, loop-carried
 state, finite callable alternatives, and public materialization boundaries.
+
+The implementation must prove that transition through compiler-owned facts.
+The first proof is the mode boundary: non-optimized lowering constructs no
+optimized context, and both optimized modes construct the same optimized
+context. Later proofs are shape facts produced by optimized lowering itself:
+result demand, sparse private state, finite callable alternatives, loop-demand
+fixed points, demand-keyed workers, and explicit materialization boundaries.
+Final wasm size and disassembly may confirm the result, but they are not the
+optimizer's source of truth.
 
 This boundary is about compiler cost and generated code quality, not
 correctness. Checking, static-dispatch finalization, compile-time root
