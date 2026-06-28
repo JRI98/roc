@@ -1407,6 +1407,10 @@ The selected design has these hard implementation commitments:
   shape source
 - enter optimized callable-state lowering only for `--opt=size` and
   `--opt=speed`
+- make the optimized-mode decision before any lowering-owned optimizer state is
+  constructed
+- keep ordinary public-value lowering and optimized callable-state lowering as
+  separate construction paths, not one context with optional optimizer fields
 - clone producers under exact consumer demand before public wrappers are
   materialized
 - represent private state sparsely by demanded checked child identity, not by
@@ -1428,6 +1432,27 @@ asked for optimized generated code. Non-optimized lowering must remain the
 straight public-value path; it must not construct optimized-demand data,
 attempt the optimized path speculatively, or depend on optimized state to
 preserve observable Roc behavior.
+
+The implementation consequence is strict: the post-check driver first classifies
+the requested build into exactly one of two lowering families, then constructs
+only the matching context. Ordinary public-value lowering has no result-demand
+arena, demanded-known-value arena, sparse private-state table, loop fixed-point
+graph, or demand-keyed worker queue. Optimized callable-state lowering owns all
+of those structures and is constructible only from the `--opt=size` or
+`--opt=speed` entrypoint. A helper that creates or consumes optimized demand,
+private state, loop graph nodes, or optimized workers must require the optimized
+context explicitly. Calling such a helper from ordinary lowering should be an
+API/type error, or at minimum a debug invariant violation at the optimized
+context boundary.
+
+Both optimized modes use the same callable-state specialization semantics.
+`--opt=size` and `--opt=speed` may differ later through backend optimization
+preferences, but they do not select different producer-under-demand rules,
+private-state representations, loop-demand fixed-point behavior, callable
+defunctionalization behavior, or public materialization boundaries. Focused
+optimizer-shape tests must therefore exercise both optimized modes with the
+same expected optimizer-owned facts unless the test is explicitly about a later
+backend size-vs-speed preference.
 
 This is not a heuristic and not a fallback boundary. The build mode selects the
 lowering architecture before optimized state exists. `--opt=size` and
