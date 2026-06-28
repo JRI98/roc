@@ -1520,6 +1520,17 @@ entrypoint and must be consumed before LIR emission. The ordinary lowering
 context must not have nullable copies of these fields, debug-disabled versions
 of these fields, or lazy constructors for these fields.
 
+This ownership split is also the implementation split. The post-check driver
+owns the build-mode decision. Ordinary lowering owns public Roc value
+construction. Optimized lowering owns producer-under-demand cloning, sparse
+private-state construction, finite callable-state splitting, loop-demand fixed
+points, and demand-keyed workers. Direct LIR construction receives the ordinary
+control flow and value operations produced by whichever lowering context was
+selected; it must not receive an optimizer side table that later stages need to
+interpret. If LIR, ARC, a backend, or LirImage would need to know that a value
+was an iterator, stream, private cursor, or optimized callable state, the
+optimized lowering boundary has leaked and must be fixed before LIR emission.
+
 This gate is an ownership boundary in the implementation, not just a conditional
 inside the optimizer. Ordinary public-value lowering must not import, allocate,
 initialize, or retain dormant optimized-demand state. The post-check driver
