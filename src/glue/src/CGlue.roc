@@ -4,6 +4,9 @@ app [make_glue] { pf: platform "../platform/main.roc" }
 import pf.Types exposing [Types]
 import pf.File exposing [File]
 import pf.TypeRepr exposing [TypeRepr]
+import pf.ArgShape exposing [ArgShape]
+import pf.GlueInput exposing [GlueInput]
+import pf.HostedFunctionInfo exposing [HostedFunctionInfo]
 import pf.RecordField exposing [RecordField]
 import pf.TagUnionRepr exposing [TagUnionRepr]
 import pf.ProvidesEntry exposing [ProvidesEntry]
@@ -12,46 +15,10 @@ import pf.RocName exposing [RocName]
 
 make_glue : List(Types) -> Try(List(File), Str)
 make_glue = |types_list| {
-	var $hosted_functions = []
-	var $type_table = []
-	var $provides_entries = []
-
-	for types in types_list {
-		$type_table = types.type_table
-		$provides_entries = types.provides_entries
-
-		for mod in types.modules {
-			for func in mod.hosted_functions {
-				full_qualified_name = "${mod.name}.${func.name}"
-
-				hosted_func = {
-					arg_type_ids: func.arg_type_ids,
-					ffi_symbol: func.ffi_symbol,
-					index: func.index,
-					name: full_qualified_name,
-					ret_type_id: func.ret_type_id,
-					type_str: func.type_str,
-				}
-
-				$hosted_functions = $hosted_functions.append(hosted_func)
-			}
-		}
-	}
-
-	sorted = List.sort_with($hosted_functions, compare_by_index)
-	header_content = generate_c_header(sorted, $type_table, $provides_entries)
+	input = GlueInput.from_types(types_list)
+	header_content = generate_c_header(input.hosted_functions, input.type_table, input.provides_entries)
 
 	Ok([{ name: "roc_platform_abi.h", content: header_content }])
-}
-
-compare_by_index = |a, b| {
-	if a.index < b.index {
-		return LT
-	}
-	if a.index > b.index {
-		return GT
-	}
-	EQ
 }
 
 # =============================================================================
@@ -209,56 +176,20 @@ capitalize_first : Str -> Str
 capitalize_first = |s| RocName.capitalize_first(s)
 
 name_to_struct_name : Str -> Str
-name_to_struct_name = |name| {
-	parts = Str.split_on(name, ".")
-
-	var $result = ""
-	for part in parts {
-		for subpart in Str.split_on(part, "_") {
-			cleaned = subpart
-				->str_replace_all("!", "")
-				->str_replace_all("-", "")
-				->str_replace_all(" ", "")
-
-			if cleaned != "" {
-				$result = Str.concat($result, capitalize_first(cleaned))
-			}
-		}
-	}
-
-	if $result == "" {
-		"Anon"
-	} else {
-		$result
-	}
-}
+name_to_struct_name = |name| RocName.from_str(name).to_pascal_clean()
 
 expect name_to_struct_name("Stdout.line!") == "StdoutLine"
 expect name_to_struct_name("Foo.bar.baz!") == "FooBarBaz"
 expect name_to_struct_name("__AnonStruct10") == "AnonStruct10"
 
 name_to_upper_ident : Str -> Str
-name_to_upper_ident = |name| {
-	name
-		->str_replace_all(".", "_")
-		->str_replace_all("!", "")
-		->str_replace_all("-", "_")
-		->str_replace_all(" ", "_")
-		->to_screaming_snake_case()
-}
+name_to_upper_ident = |name| RocName.from_str(name).to_screaming_snake_identifier()
 
 expect name_to_upper_ident("Stdout.line!") == "STDOUT_LINE"
 expect name_to_upper_ident("Foo.barBaz!") == "FOO_BAR_BAZ"
 
 name_to_c_func_name : Str -> Str
-name_to_c_func_name = |name| {
-	name
-		->str_replace_all(".", "_")
-		->str_replace_all("!", "")
-		->str_replace_all("-", "_")
-		->str_replace_all(" ", "_")
-		->to_lower_snake_case()
-}
+name_to_c_func_name = |name| RocName.from_str(name).to_lower_snake_identifier()
 
 expect name_to_c_func_name("Stdout.line!") == "stdout_line"
 expect name_to_c_func_name("Foo.barBaz!") == "foo_bar_baz"
@@ -266,12 +197,7 @@ expect name_to_c_func_name("Foo.barBaz!") == "foo_bar_baz"
 name_to_c_field_ident : Str -> Str
 name_to_c_field_ident = |name| {
 	sanitized =
-		name
-			->str_replace_all("!", "_bang")
-			->str_replace_all("-", "_")
-			->str_replace_all(".", "_")
-			->str_replace_all(" ", "_")
-			->to_lower_snake_case()
+		RocName.from_str(name).to_bang_snake_identifier()
 
 	match sanitized {
 		"" => "field"
@@ -322,7 +248,7 @@ expect name_to_c_field_ident("struct") == "struct_field"
 # Header Generation
 # =============================================================================
 
-generate_c_header : List({ arg_type_ids : List(U64), ffi_symbol : Str, index : U64, name : Str, ret_type_id : U64, type_str : Str }), List(TypeRepr), List(ProvidesEntry) -> Str
+generate_c_header : List(HostedFunctionInfo), List(TypeRepr), List(ProvidesEntry) -> Str
 generate_c_header = |hosted_functions, type_table, provides_list| {
 	duplicate_records = duplicate_record_names(type_table)
 	duplicate_tags = duplicate_tag_union_names(type_table)
@@ -354,6 +280,7 @@ generate_c_header = |hosted_functions, type_table, provides_list| {
 		.concat(header_guard_bottom)
 }
 
+generate_defines : List(HostedFunctionInfo) -> Str
 generate_defines = |hosted_functions| {
 	var $defines = ""
 	var $first = Bool.True
@@ -389,19 +316,19 @@ generate_opaque_type_decls = |type_table, duplicate_records, duplicate_tags| {
 			RocRecord(rec) =>
 				if rec.name != "" {
 					type_name = record_struct_name(duplicate_records, $type_id, rec)
-						if !(List.contains($seen_names, type_name)) {
-							$seen_names = $seen_names.append(type_name)
-							$decls = Str.concat($decls, generate_opaque_type_decl(type_name, rec.size_32, rec.alignment_32, rec.size_64, rec.alignment_64))
-						}
+					if !(List.contains($seen_names, type_name)) {
+						$seen_names = $seen_names.append(type_name)
+						$decls = Str.concat($decls, generate_opaque_type_decl(type_name, rec.size_32, rec.alignment_32, rec.size_64, rec.alignment_64))
 					}
-				RocTagUnion(tu) =>
-					if List.len(tu.tags) >= 2 and tu.name != "" {
-						type_name = tag_union_struct_name(duplicate_tags, $type_id, tu)
-						if !(List.contains($seen_names, type_name)) {
-							$seen_names = $seen_names.append(type_name)
-							$decls = Str.concat($decls, generate_opaque_type_decl(type_name, tu.size_32, tu.alignment_32, tu.size_64, tu.alignment_64))
-						}
+				}
+			RocTagUnion(tu) =>
+				if List.len(tu.tags) >= 2 and tu.name != "" {
+					type_name = tag_union_struct_name(duplicate_tags, $type_id, tu)
+					if !(List.contains($seen_names, type_name)) {
+						$seen_names = $seen_names.append(type_name)
+						$decls = Str.concat($decls, generate_opaque_type_decl(type_name, tu.size_32, tu.alignment_32, tu.size_64, tu.alignment_64))
 					}
+				}
 			_ => {}
 		}
 		$type_id = $type_id + 1
@@ -447,6 +374,7 @@ pointer_width_record_typedef = |type_name, doc, fields_32, fields_64| {
 	"${doc}#if UINTPTR_MAX == UINT32_MAX\ntypedef struct {\n${fields_32}} ${type_name};\n#elif UINTPTR_MAX == UINT64_MAX\ntypedef struct {\n${fields_64}} ${type_name};\n#else\n#error \"unsupported pointer width\"\n#endif\n"
 }
 
+generate_all_args_structs : List(HostedFunctionInfo), List(TypeRepr), List(Str), List(Str) -> Str
 generate_all_args_structs = |hosted_functions, type_table, duplicate_records, duplicate_tags| {
 	var $args_structs = ""
 	for func in hosted_functions {
@@ -455,73 +383,43 @@ generate_all_args_structs = |hosted_functions, type_table, duplicate_records, du
 	$args_structs
 }
 
+generate_args_struct : HostedFunctionInfo, List(TypeRepr), List(Str), List(Str) -> Str
 generate_args_struct = |func, type_table, duplicate_records, duplicate_tags| {
-	if !(has_meaningful_args(func, type_table)) {
-		return ""
-	}
-
 	struct_name = name_to_struct_name(func.name)
 
-		type_table_result = if List.len(func.arg_type_ids) == 1 {
-			match List.first(func.arg_type_ids) {
-				Ok(arg_id) => lookup_record_in_type_table(type_table, arg_id)
-				Err(_) => { found: Bool.False, fields: [], size: 0, alignment: 0, size_32: 0, alignment_32: 0, size_64: 0, alignment_64: 0 }
-			}
-		} else {
-			{ found: Bool.False, fields: [], size: 0, alignment: 0, size_32: 0, alignment_32: 0, size_64: 0, alignment_64: 0 }
-		}
-
-		if type_table_result.found {
-			fields_32 = c_record_fields_decl(type_table, duplicate_records, duplicate_tags, type_table_result.fields, Bool.True)
-			fields_64 = c_record_fields_decl(type_table, duplicate_records, duplicate_tags, type_table_result.fields, Bool.False)
+	match ArgShape.hosted_args(type_table, func) {
+		NoMeaningfulArgs => ""
+		SingleRecordArg(record) => {
+			fields_32 = c_record_fields_decl(type_table, duplicate_records, duplicate_tags, record.fields, Bool.True)
+			fields_64 = c_record_fields_decl(type_table, duplicate_records, duplicate_tags, record.fields, Bool.False)
 
 			doc = doc_comment([
 				"Arguments for ${func.name}",
-			"Roc signature: ${func.type_str}",
-			"Refcounted fields are owned by the hosted function.",
-		])
+				"Roc signature: ${func.type_str}",
+				"Refcounted fields are owned by the hosted function.",
+			])
 
 			args_name = "${struct_name}Args"
-			args_assertions = pointer_width_static_asserts(args_name, type_table_result.size_32, type_table_result.alignment_32, type_table_result.size_64, type_table_result.alignment_64)
-			return "${pointer_width_record_typedef(args_name, doc, fields_32, fields_64)}${args_assertions}"
+			args_assertions = pointer_width_static_asserts(args_name, record.size_32, record.alignment_32, record.size_64, record.alignment_64)
+			"${pointer_width_record_typedef(args_name, doc, fields_32, fields_64)}${args_assertions}"
 		}
+		PositionalArgs(arg_type_ids) => {
+			var $positional_fields = ""
+			var $idx = 0
+			for arg_type_id in arg_type_ids {
+				c_type = type_id_to_c(type_table, duplicate_records, duplicate_tags, arg_type_id)
+				$positional_fields = Str.concat($positional_fields, "    ${c_type} arg${U64.to_str($idx)};\n")
+				$idx = $idx + 1
+			}
 
-	var $positional_fields = ""
-	var $idx = 0
-	for arg_type_id in func.arg_type_ids {
-		if !TypeTable.is_unit(TypeTable.from_list(type_table), arg_type_id) {
-			c_type = type_id_to_c(type_table, duplicate_records, duplicate_tags, arg_type_id)
-			$positional_fields = Str.concat($positional_fields, "    ${c_type} arg${U64.to_str($idx)};\n")
-			$idx = $idx + 1
+			doc = doc_comment([
+				"Arguments for ${func.name}",
+				"Roc signature: ${func.type_str}",
+				"Refcounted fields are owned by the hosted function.",
+			])
+
+			"${doc}typedef struct {\n${$positional_fields}} ${struct_name}Args;\n\n"
 		}
-	}
-
-	doc = doc_comment([
-		"Arguments for ${func.name}",
-		"Roc signature: ${func.type_str}",
-		"Refcounted fields are owned by the hosted function.",
-	])
-
-	"${doc}typedef struct {\n${$positional_fields}} ${struct_name}Args;\n\n"
-}
-
-lookup_record_in_type_table = |type_table, type_id| {
-	match TypeTable.record_layout(TypeTable.from_list(type_table), type_id) {
-		RecordFound(layout) => { found: Bool.True, fields: layout.fields, size: layout.size, alignment: layout.alignment, size_32: layout.size_32, alignment_32: layout.alignment_32, size_64: layout.size_64, alignment_64: layout.alignment_64 }
-		NotRecord => { found: Bool.False, fields: [], size: 0, alignment: 0, size_32: 0, alignment_32: 0, size_64: 0, alignment_64: 0 }
-	}
-}
-
-has_meaningful_args = |func, type_table| {
-	if List.is_empty(func.arg_type_ids) {
-		Bool.False
-	} else if List.len(func.arg_type_ids) == 1 {
-		match List.first(func.arg_type_ids) {
-			Ok(id) => !(TypeTable.is_unit(TypeTable.from_list(type_table), id))
-			_ => Bool.False
-		}
-	} else {
-		Bool.True
 	}
 }
 
@@ -529,17 +427,15 @@ direct_param_list = |type_table, duplicate_records, duplicate_tags, arg_type_ids
 	var $params = ""
 	var $idx = 0
 
-	for arg_type_id in arg_type_ids {
-		if !TypeTable.is_unit(TypeTable.from_list(type_table), arg_type_id) {
-			arg_c = type_id_to_c(type_table, duplicate_records, duplicate_tags, arg_type_id)
-			sep = if $params == "" {
-				""
-			} else {
-				", "
-			}
-			$params = "${$params}${sep}${arg_c} arg${U64.to_str($idx)}"
-			$idx = $idx + 1
+	for arg_type_id in ArgShape.positional_non_unit_type_ids(type_table, arg_type_ids) {
+		arg_c = type_id_to_c(type_table, duplicate_records, duplicate_tags, arg_type_id)
+		sep = if $params == "" {
+			""
+		} else {
+			", "
 		}
+		$params = "${$params}${sep}${arg_c} arg${U64.to_str($idx)}"
+		$idx = $idx + 1
 	}
 
 	if $params == "" {
@@ -549,35 +445,26 @@ direct_param_list = |type_table, duplicate_records, duplicate_tags, arg_type_ids
 	}
 }
 
+direct_hosted_param_list : List(TypeRepr), List(Str), List(Str), HostedFunctionInfo -> Str
 direct_hosted_param_list = |type_table, duplicate_records, duplicate_tags, func| {
-	use_args_wrapper =
-		if List.len(func.arg_type_ids) == 1 {
-			match List.first(func.arg_type_ids) {
-				Ok(arg_id) => TypeTable.is_anonymous_record(TypeTable.from_list(type_table), arg_id)
-				Err(_) => Bool.False
-			}
-		} else {
-			Bool.False
-		}
+	use_args_wrapper = ArgShape.single_arg_is_anonymous_record(type_table, func.arg_type_ids)
 
 	var $params = ""
 	var $idx = 0
 
-	for arg_type_id in func.arg_type_ids {
-		if !TypeTable.is_unit(TypeTable.from_list(type_table), arg_type_id) {
-			arg_c = if use_args_wrapper {
-				"${name_to_struct_name(func.name)}Args"
-			} else {
-				type_id_to_c(type_table, duplicate_records, duplicate_tags, arg_type_id)
-			}
-			sep = if $params == "" {
-				""
-			} else {
-				", "
-			}
-			$params = "${$params}${sep}${arg_c} arg${U64.to_str($idx)}"
-			$idx = $idx + 1
+	for arg_type_id in ArgShape.positional_non_unit_type_ids(type_table, func.arg_type_ids) {
+		arg_c = if use_args_wrapper {
+			"${name_to_struct_name(func.name)}Args"
+		} else {
+			type_id_to_c(type_table, duplicate_records, duplicate_tags, arg_type_id)
 		}
+		sep = if $params == "" {
+			""
+		} else {
+			", "
+		}
+		$params = "${$params}${sep}${arg_c} arg${U64.to_str($idx)}"
+		$idx = $idx + 1
 	}
 
 	if $params == "" {
@@ -587,6 +474,7 @@ direct_hosted_param_list = |type_table, duplicate_records, duplicate_tags, func|
 	}
 }
 
+generate_hosted_symbol_decls : List(HostedFunctionInfo), List(TypeRepr), List(Str), List(Str) -> Str
 generate_hosted_symbol_decls = |hosted_functions, type_table, duplicate_records, duplicate_tags| {
 	if List.is_empty(hosted_functions) {
 		return ""
@@ -626,6 +514,7 @@ generate_provided_symbol_decls = |provides_list, type_table, duplicate_records, 
 	section("Provided Symbols", $decls)
 }
 
+generate_hosted_fn_fields : List(HostedFunctionInfo) -> Str
 generate_hosted_fn_fields = |hosted_functions| {
 	var $fields = ""
 	var $first = Bool.True
