@@ -5,6 +5,9 @@ import pf.Types exposing [Types]
 import pf.File exposing [File]
 import pf.RecordFieldInfo exposing [RecordFieldInfo]
 import pf.TypeRepr exposing [TypeRepr]
+import pf.AbiLayout exposing [AbiLayout]
+import pf.AbiFieldLayout exposing [AbiFieldLayout]
+import pf.AbiTagLayout exposing [AbiTagLayout]
 import pf.ArgShape exposing [ArgShape]
 import pf.GlueInput exposing [GlueInput]
 import pf.TypeNamePlan exposing [TypeNamePlan]
@@ -14,13 +17,15 @@ import pf.TagUnionRepr exposing [TagUnionRepr]
 import pf.RecordField exposing [RecordField]
 import pf.TagVariant exposing [TagVariant]
 import pf.ProvidesEntry exposing [ProvidesEntry]
+import pf.TypeInfo exposing [TypeInfo]
 import pf.TypeTable exposing [TypeTable]
 import pf.RocName exposing [RocName]
 
 make_glue : List(Types) -> Try(List(File), Str)
 make_glue = |types_list| {
 	input = GlueInput.from_types(types_list)
-	rust_content = generate_rust_file(input.hosted_functions, input.type_table, input.provides_entries)
+	type_table = TypeTable.from_list(input.types)
+	rust_content = generate_rust_file(input.hosted_functions, type_table, input.provides_entries)
 
 	Ok([{ name: "roc_platform_abi.rs", content: rust_content }])
 }
@@ -31,7 +36,7 @@ make_glue = |types_list| {
 
 ## Map a type table entry to its Rust type string using structured TypeRepr
 type_id_to_rust = |type_table, duplicate_names, preferred_names, type_id| {
-	type_repr = TypeTable.get(TypeTable.from_list(type_table), type_id)
+	type_repr = type_table.get(type_id)
 	match type_repr {
 		RocRecord(rec) =>
 			if rec.name == "" {
@@ -47,10 +52,10 @@ type_id_to_rust = |type_table, duplicate_names, preferred_names, type_id| {
 ## Render one struct field declaration for a record field. Unnamed
 ## nominal-record padding fields become fixed-size byte arrays (`[u8; size]`);
 ## named fields use their resolved Rust type.
-rust_record_field_decl = |type_table, duplicate_names, preferred_names, field, use_32| {
+rust_record_field_decl = |type_table, duplicate_names, preferred_names, field, is_wasm32| {
 	field_name = name_to_rust_field_ident(field.name)
 	rust_type = if field.is_padding {
-		size = if use_32 { field.size_32 } else { field.size_64 }
+		size = if is_wasm32 { field.size32 } else { field.size64 }
 		"[u8; ${U64.to_str(size)}]"
 	} else {
 		type_id_to_rust(type_table, duplicate_names, preferred_names, field.type_id)
@@ -58,10 +63,10 @@ rust_record_field_decl = |type_table, duplicate_names, preferred_names, field, u
 	"    pub ${field_name}: ${rust_type},\n"
 }
 
-rust_record_fields_decl = |type_table, duplicate_names, preferred_names, fields, use_32| {
+rust_record_fields_decl = |type_table, duplicate_names, preferred_names, fields, is_wasm32| {
 	var $field_strs = ""
-	for field in fields {
-		$field_strs = Str.concat($field_strs, rust_record_field_decl(type_table, duplicate_names, preferred_names, field, use_32))
+	for field in AbiFieldLayout.sort_by_target_offset(fields, is_wasm32) {
+		$field_strs = Str.concat($field_strs, rust_record_field_decl(type_table, duplicate_names, preferred_names, field, is_wasm32))
 	}
 	$field_strs
 }
@@ -79,7 +84,7 @@ type_repr_to_rust = |type_table, duplicate_names, preferred_names, type_id, type
 	match type_repr {
 		RocBool => "bool"
 		RocBox(inner_id) =>
-			match TypeTable.get(TypeTable.from_list(type_table), inner_id) {
+			match type_table.get(inner_id) {
 				RocFunction(_) => "RocErasedCallable"
 				RocUnknown(_) => "RocBox"
 				_ => {
@@ -141,11 +146,29 @@ resolve_tag_union_type_rust = |type_table, duplicate_names, preferred_names, typ
 
 ## Determine whether a type is refcounted (heap-allocated).
 ## Refcounted types need 2*ptr_width header space in list allocations.
-is_type_refcounted : List(TypeRepr), U64 -> Bool
-is_type_refcounted = |type_table, type_id| TypeTable.is_refcounted(TypeTable.from_list(type_table), type_id)
+is_type_refcounted : TypeTable, U64 -> Bool
+is_type_refcounted = |type_table, type_id| type_table.is_refcounted(type_id)
 
-is_repr_refcounted : List(TypeRepr), TypeRepr -> Bool
-is_repr_refcounted = |type_table, type_repr| TypeTable.repr_is_refcounted(TypeTable.from_list(type_table), type_repr)
+is_repr_refcounted : TypeTable, TypeRepr -> Bool
+is_repr_refcounted = |type_table, type_repr| type_table.repr_is_refcounted(type_repr)
+
+type_table_entries : TypeTable -> List(TypeInfo)
+type_table_entries = |type_table| type_table.entries()
+
+abi_record_fields : AbiLayout -> List(AbiFieldLayout)
+abi_record_fields = |abi_layout| abi_layout.record_fields()
+
+abi_tag_layouts : AbiLayout -> List(AbiTagLayout)
+abi_tag_layouts = |abi_layout| abi_layout.tag_layouts()
+
+abi_discriminant_offset64 : AbiLayout -> U64
+abi_discriminant_offset64 = |abi_layout| abi_layout.discriminant_offset64()
+
+abi_discriminant_offset32 : AbiLayout -> U64
+abi_discriminant_offset32 = |abi_layout| abi_layout.discriminant_offset32()
+
+abi_discriminant_size : AbiLayout -> U64
+abi_discriminant_size = |abi_layout| abi_layout.discriminant_size()
 
 # =============================================================================
 # String Utilities
@@ -211,10 +234,10 @@ expect name_to_struct_name("__AnonStruct10") == "AnonStruct10"
 ## Find named multi-variant tag unions whose Roc name appears more than once in
 ## the type table. The result is computed once per glue run and reused while
 ## rendering type names.
-duplicate_tag_union_names : List(TypeRepr) -> List(Str)
-duplicate_tag_union_names = |type_table| TypeTable.duplicate_tag_union_names(TypeTable.from_list(type_table))
+duplicate_tag_union_names : TypeTable -> List(Str)
+duplicate_tag_union_names = |type_table| type_table.duplicate_tag_union_names()
 
-## Return the fallback Rust struct name for a multi-variant tag union.
+## Return the default Rust struct name for a multi-variant tag union.
 ##
 ## Generic tag unions used heavily by hosted functions can appear many times in
 ## the type table with different payload layouts. Rust needs a distinct concrete
@@ -232,7 +255,7 @@ default_tag_union_struct_name = |duplicate_names, type_id, tu| {
 
 ## Return the emitted Rust struct name for a multi-variant tag union.
 tag_union_struct_name = |preferred_names, duplicate_names, type_id, tu| {
-	preferred = TypeNamePlan.lookup_preferred(preferred_names, type_id)
+	preferred = preferred_names.lookup(type_id)
 	if preferred.found {
 		preferred.name
 	} else {
@@ -251,8 +274,8 @@ generated_type_names_rust = |type_table, duplicate_names| {
 	var $names = []
 	var $type_id = 0
 
-	for type_repr in type_table {
-		match type_repr {
+	for type_info in type_table_entries(type_table) {
+		match type_info.repr {
 			RocRecord(rec) =>
 				if rec.name != "" {
 					$names = $names.append(name_to_struct_name(rec.name))
@@ -285,7 +308,7 @@ type_name_roots_rust = |hosted_functions, provides_list, type_table| {
 		$roots = $roots.append({
 			alias_base: name_to_struct_name(entry.name),
 			module_base: hosted_module_name_to_struct_name(entry.name),
-			type_id: TypeNamePlan.provided_entry_root_type_id(type_table, entry),
+			type_id: TypeNamePlan.from_table(type_table).provided_entry_root_type_id(entry),
 		})
 	}
 
@@ -293,8 +316,7 @@ type_name_roots_rust = |hosted_functions, provides_list, type_table| {
 }
 
 preferred_type_names_rust = |hosted_functions, provides_list, type_table, duplicate_names| {
-	TypeNamePlan.preferred_names(
-		type_table,
+	TypeNamePlan.from_table(type_table).preferred_names(
 		generated_type_names_rust(type_table, duplicate_names),
 		type_name_roots_rust(hosted_functions, provides_list, type_table),
 	)
@@ -330,13 +352,14 @@ add_tag_union_aliases_rust = |state, alias, target, tu| {
 
 generate_platform_type_aliases_rust = |hosted_functions, provides_list, type_table, duplicate_names, preferred_names| {
 	var $state = { content: "", seen: [] }
+	name_plan = TypeNamePlan.from_table(type_table)
 
-	for plan in TypeNamePlan.alias_plan(type_table, type_name_roots_rust(hosted_functions, provides_list, type_table)) {
+	for plan in name_plan.alias_plan(type_name_roots_rust(hosted_functions, provides_list, type_table)) {
 		target = type_id_to_rust(type_table, duplicate_names, preferred_names, plan.type_id)
 		$state = match plan.kind {
 			PlainAlias => add_type_alias_rust($state, plan.alias, target)
 			TagUnionAlias =>
-				match TypeTable.get(TypeTable.from_list(type_table), plan.type_id) {
+				match type_table.get(plan.type_id) {
 					RocTagUnion(tu) => add_tag_union_aliases_rust($state, plan.alias, target, tu)
 					_ => add_type_alias_rust($state, plan.alias, target)
 				}
@@ -468,20 +491,57 @@ disc_type_for_size = |size| {
 # Type Table Helpers
 # =============================================================================
 
-rust_tag_union_layout_assertions = |type_name, size_32, alignment_32, discriminant_offset_32, size_64, alignment_64, discriminant_offset_64| {
-	if size_32 > 0 or size_64 > 0 {
-		"#[cfg(target_pointer_width = \"64\")]\nconst _: () = assert!(core::mem::size_of::<${type_name}>() == ${U64.to_str(size_64)}, \"${type_name} size mismatch\");\n#[cfg(target_pointer_width = \"64\")]\nconst _: () = assert!(core::mem::align_of::<${type_name}>() == ${U64.to_str(alignment_64)}, \"${type_name} alignment mismatch\");\n#[cfg(target_pointer_width = \"64\")]\nconst _: () = assert!(core::mem::offset_of!(${type_name}, tag) == ${U64.to_str(discriminant_offset_64)}, \"${type_name} tag offset mismatch\");\n#[cfg(target_pointer_width = \"32\")]\nconst _: () = assert!(core::mem::size_of::<${type_name}>() == ${U64.to_str(size_32)}, \"${type_name} size mismatch\");\n#[cfg(target_pointer_width = \"32\")]\nconst _: () = assert!(core::mem::align_of::<${type_name}>() == ${U64.to_str(alignment_32)}, \"${type_name} alignment mismatch\");\n#[cfg(target_pointer_width = \"32\")]\nconst _: () = assert!(core::mem::offset_of!(${type_name}, tag) == ${U64.to_str(discriminant_offset_32)}, \"${type_name} tag offset mismatch\");\n\n"
+abi_tag_at = |abi_tags, index| {
+	match List.get(abi_tags, index) {
+		Ok(tag) => tag
+		Err(_) => {
+			crash "glue invariant violated: missing ABI tag layout at index ${U64.to_str(index)}"
+		}
+	}
+}
+
+abi_tag_has_payload = |tag| tag.payload_size32 > 0 or tag.payload_size64 > 0
+
+rust_layout_assertions = |type_name, abi_layout| {
+	if abi_layout.size64 > 0 or abi_layout.size32 > 0 {
+		"#[cfg(target_pointer_width = \"64\")]\nconst _: () = assert!(core::mem::size_of::<${type_name}>() == ${U64.to_str(abi_layout.size64)}, \"${type_name} size mismatch\");\n#[cfg(target_pointer_width = \"64\")]\nconst _: () = assert!(core::mem::align_of::<${type_name}>() == ${U64.to_str(abi_layout.alignment64)}, \"${type_name} alignment mismatch\");\n#[cfg(target_pointer_width = \"32\")]\nconst _: () = assert!(core::mem::size_of::<${type_name}>() == ${U64.to_str(abi_layout.size32)}, \"${type_name} size mismatch\");\n#[cfg(target_pointer_width = \"32\")]\nconst _: () = assert!(core::mem::align_of::<${type_name}>() == ${U64.to_str(abi_layout.alignment32)}, \"${type_name} alignment mismatch\");\n\n"
 	} else {
 		""
 	}
 }
 
-generate_record_struct_decl_rust = |doc, struct_name, type_table, duplicate_names, preferred_names, fields, size_32, alignment_32, size_64, alignment_64| {
-	fields_32 = rust_record_fields_decl(type_table, duplicate_names, preferred_names, fields, Bool.True)
-	fields_64 = rust_record_fields_decl(type_table, duplicate_names, preferred_names, fields, Bool.False)
-	assertions = rust_size_align_assertions(struct_name, size_32, alignment_32, size_64, alignment_64)
+rust_tag_union_layout_assertions = |type_name, abi_layout| {
+	if abi_layout.size64 > 0 or abi_layout.size32 > 0 {
+		"#[cfg(target_pointer_width = \"64\")]\nconst _: () = assert!(core::mem::size_of::<${type_name}>() == ${U64.to_str(abi_layout.size64)}, \"${type_name} size mismatch\");\n#[cfg(target_pointer_width = \"64\")]\nconst _: () = assert!(core::mem::align_of::<${type_name}>() == ${U64.to_str(abi_layout.alignment64)}, \"${type_name} alignment mismatch\");\n#[cfg(target_pointer_width = \"64\")]\nconst _: () = assert!(core::mem::offset_of!(${type_name}, tag) == ${U64.to_str(abi_discriminant_offset64(abi_layout))}, \"${type_name} tag offset mismatch\");\n#[cfg(target_pointer_width = \"32\")]\nconst _: () = assert!(core::mem::size_of::<${type_name}>() == ${U64.to_str(abi_layout.size32)}, \"${type_name} size mismatch\");\n#[cfg(target_pointer_width = \"32\")]\nconst _: () = assert!(core::mem::align_of::<${type_name}>() == ${U64.to_str(abi_layout.alignment32)}, \"${type_name} alignment mismatch\");\n#[cfg(target_pointer_width = \"32\")]\nconst _: () = assert!(core::mem::offset_of!(${type_name}, tag) == ${U64.to_str(abi_discriminant_offset32(abi_layout))}, \"${type_name} tag offset mismatch\");\n\n"
+	} else {
+		""
+	}
+}
 
-	"${doc}#[cfg(target_pointer_width = \"32\")]\n#[repr(C)]\n#[derive(Clone, Copy)]\npub struct ${struct_name} {\n${fields_32}}\n\n${doc}#[cfg(target_pointer_width = \"64\")]\n#[repr(C)]\n#[derive(Clone, Copy)]\npub struct ${struct_name} {\n${fields_64}}\n\n${assertions}"
+rust_payload_layout_assertions = |type_name, tag_layout| {
+	if tag_layout.payload_size64 > 0 or tag_layout.payload_size32 > 0 {
+		"#[cfg(target_pointer_width = \"64\")]\nconst _: () = assert!(core::mem::size_of::<${type_name}>() == ${U64.to_str(tag_layout.payload_size64)}, \"${type_name} size mismatch\");\n#[cfg(target_pointer_width = \"64\")]\nconst _: () = assert!(core::mem::align_of::<${type_name}>() == ${U64.to_str(tag_layout.payload_alignment64)}, \"${type_name} alignment mismatch\");\n#[cfg(target_pointer_width = \"32\")]\nconst _: () = assert!(core::mem::size_of::<${type_name}>() == ${U64.to_str(tag_layout.payload_size32)}, \"${type_name} size mismatch\");\n#[cfg(target_pointer_width = \"32\")]\nconst _: () = assert!(core::mem::align_of::<${type_name}>() == ${U64.to_str(tag_layout.payload_alignment32)}, \"${type_name} alignment mismatch\");\n\n"
+	} else {
+		""
+	}
+}
+
+generate_record_struct_decl_rust = |doc, struct_name, type_table, duplicate_names, preferred_names, fields, _anonymous, abi_layout| {
+	native_field_strs = rust_record_fields_decl(type_table, duplicate_names, preferred_names, fields, Bool.False)
+	wasm32_field_strs = rust_record_fields_decl(type_table, duplicate_names, preferred_names, fields, Bool.True)
+	assertions = rust_layout_assertions(struct_name, abi_layout)
+
+	struct_decl = "${doc}#[cfg(target_pointer_width = \"32\")]\n#[repr(C)]\n#[derive(Clone, Copy)]\npub struct ${struct_name} {\n${wasm32_field_strs}}\n\n${doc}#[cfg(not(target_pointer_width = \"32\"))]\n#[repr(C)]\n#[derive(Clone, Copy)]\npub struct ${struct_name} {\n${native_field_strs}}\n\n"
+
+	"${struct_decl}${assertions}"
+}
+
+generate_payload_struct_decl_rust = |doc, struct_name, type_table, duplicate_names, preferred_names, fields, tag_layout| {
+	native_field_strs = rust_record_fields_decl(type_table, duplicate_names, preferred_names, fields, Bool.False)
+	wasm32_field_strs = rust_record_fields_decl(type_table, duplicate_names, preferred_names, fields, Bool.True)
+	assertions = rust_payload_layout_assertions(struct_name, tag_layout)
+
+	"${doc}#[cfg(target_pointer_width = \"32\")]\n#[repr(C)]\n#[derive(Clone, Copy)]\npub struct ${struct_name} {\n${wasm32_field_strs}}\n\n${doc}#[cfg(not(target_pointer_width = \"32\"))]\n#[repr(C)]\n#[derive(Clone, Copy)]\npub struct ${struct_name} {\n${native_field_strs}}\n\n${assertions}"
 }
 
 # =============================================================================
@@ -1365,8 +1425,8 @@ generate_element_type_structs_rust = |type_table, duplicate_names, preferred_nam
 	var $structs = ""
 	var $seen_names = []
 
-	for type_repr in type_table {
-		match type_repr {
+	for type_info in type_table_entries(type_table) {
+		match type_info.repr {
 			RocRecord(rec) =>
 				if rec.name != "" {
 					struct_name = name_to_struct_name(rec.name)
@@ -1375,7 +1435,7 @@ generate_element_type_structs_rust = |type_table, duplicate_names, preferred_nam
 						doc = "/// Element type for ${rec.name}\n"
 						$structs = Str.concat(
 							$structs,
-							generate_record_struct_decl_rust(doc, struct_name, type_table, duplicate_names, preferred_names, rec.fields, rec.size_32, rec.alignment_32, rec.size_64, rec.alignment_64),
+							generate_record_struct_decl_rust(doc, struct_name, type_table, duplicate_names, preferred_names, abi_record_fields(type_info.layout), rec.anonymous, type_info.layout),
 						)
 					}
 				}
@@ -1392,14 +1452,14 @@ generate_tag_union_structs_rust = |type_table, duplicate_names, preferred_names|
 	var $seen_names = []
 	var $type_id = 0
 
-	for type_repr in type_table {
-		match type_repr {
+	for type_info in type_table_entries(type_table) {
+		match type_info.repr {
 			RocTagUnion(tu) =>
 				if List.len(tu.tags) >= 2 and tu.name != "" {
 					struct_name = tag_union_struct_name(preferred_names, duplicate_names, $type_id, tu)
 					if !(List.contains($seen_names, struct_name)) {
 						$seen_names = $seen_names.append(struct_name)
-						$structs = Str.concat($structs, generate_single_tag_union_rust(type_table, duplicate_names, preferred_names, $type_id, tu))
+						$structs = Str.concat($structs, generate_single_tag_union_rust(type_table, duplicate_names, preferred_names, $type_id, tu, type_info.layout))
 					}
 				}
 			_ => {}
@@ -1412,12 +1472,13 @@ generate_tag_union_structs_rust = |type_table, duplicate_names, preferred_names|
 }
 
 ## Generate Rust code for a single multi-variant tag union.
-generate_single_tag_union_rust = |type_table, duplicate_names, preferred_names, type_id, tu| {
+generate_single_tag_union_rust = |type_table, duplicate_names, preferred_names, type_id, tu, abi_layout| {
 	struct_name = tag_union_struct_name(preferred_names, duplicate_names, type_id, tu)
-	disc_type = disc_type_for_size(tu.discriminant_size)
+	disc_type = disc_type_for_size(abi_discriminant_size(abi_layout))
+	abi_tags = abi_tag_layouts(abi_layout)
 
 	# Check if this is a pure enum (all variants have no payload)
-	is_pure_enum = List.all(tu.tags, |tag| List.is_empty(tag.payload))
+	is_pure_enum = List.all(abi_tags, |tag| !(abi_tag_has_payload(tag)))
 
 	if is_pure_enum {
 		# Pure enum: just emit the enum type
@@ -1428,24 +1489,20 @@ generate_single_tag_union_rust = |type_table, duplicate_names, preferred_names, 
 			$idx = $idx + 1
 		}
 
-		assertions = rust_size_align_assertions(struct_name, tu.size_32, tu.alignment_32, tu.size_64, tu.alignment_64)
+		assertions = rust_layout_assertions(struct_name, abi_layout)
 		"/// Tag union: ${tu.name}\n#[repr(${disc_type})]\n#[derive(Debug, Clone, Copy, PartialEq, Eq)]\npub enum ${struct_name} {\n${$variants}}\n\n${assertions}"
 	} else {
 		# Generate tuple structs for any variant with >1 payload
 		var $tuple_structs = ""
+		var $tag_idx = 0
 		for tag in tu.tags {
-			if List.len(tag.payload) > 1 {
+			tag_layout = abi_tag_at(abi_tags, $tag_idx)
+			if abi_tag_has_payload(tag_layout) and List.len(tag.payload) > 1 {
 				tuple_name = "${struct_name}${capitalize_first(tag.name)}Payload"
-				var $tuple_fields = ""
-				var $ti = 0
-				for pid in tag.payload {
-					rust_type = type_id_to_rust(type_table, duplicate_names, preferred_names, pid)
-					$tuple_fields = Str.concat($tuple_fields, "    pub _${U64.to_str($ti)}: ${rust_type},\n")
-					$ti = $ti + 1
-				}
-				tuple_assertions = rust_size_align_assertions(tuple_name, tag.payload_size_32, tag.payload_alignment_32, tag.payload_size_64, tag.payload_alignment_64)
-				$tuple_structs = Str.concat($tuple_structs, "/// Payload struct for ${tag.name} variant.\n#[repr(C)]\n#[derive(Clone, Copy)]\npub struct ${tuple_name} {\n${$tuple_fields}}\n\n${tuple_assertions}")
+				tuple_doc = "/// Payload struct for ${tag.name} variant.\n"
+				$tuple_structs = Str.concat($tuple_structs, generate_payload_struct_decl_rust(tuple_doc, tuple_name, type_table, duplicate_names, preferred_names, tag_layout.payload_fields, tag_layout))
 			}
+			$tag_idx = $tag_idx + 1
 		}
 
 		# Tag enum
@@ -1459,9 +1516,11 @@ generate_single_tag_union_rust = |type_table, duplicate_names, preferred_names, 
 		# Payload union - Rust requires ManuallyDrop for non-Copy fields in unions
 		var $union_fields = ""
 		var $payload_accessors = ""
+		var $union_tag_idx = 0
 		for union_tag in tu.tags {
+			tag_layout = abi_tag_at(abi_tags, $union_tag_idx)
 			snake = to_lower_snake_case(union_tag.name)
-			if List.is_empty(union_tag.payload) {
+			if !(abi_tag_has_payload(tag_layout)) {
 				# No-payload variant: use [u8; 0]
 				$union_fields = Str.concat($union_fields, "    pub ${snake}: [u8; 0],\n")
 			} else if List.len(union_tag.payload) == 1 {
@@ -1483,26 +1542,29 @@ generate_single_tag_union_rust = |type_table, duplicate_names, preferred_names, 
 					"    #[cfg(target_pointer_width = \"32\")]\n    pub fn payload_${snake}(&self) -> ${tuple_name} {\n        unsafe { core::ptr::read(self.payload.as_ptr() as *const ${tuple_name}) }\n    }\n\n    #[cfg(not(target_pointer_width = \"32\"))]\n    pub fn payload_${snake}(&self) -> ${tuple_name} {\n        unsafe { core::mem::ManuallyDrop::into_inner(self.payload.${snake}) }\n    }\n\n",
 				)
 			}
+			$union_tag_idx = $union_tag_idx + 1
 		}
 
-		assertions = rust_tag_union_layout_assertions(struct_name, tu.size_32, tu.alignment_32, tu.discriminant_offset_32, tu.size_64, tu.alignment_64, tu.discriminant_offset_64)
+		# Size/alignment assertions
+		assertions = rust_tag_union_layout_assertions(struct_name, abi_layout)
 		alignment_marker = "${struct_name}PayloadAlignment"
 
-		"${$tuple_structs}/// Tag discriminant for ${tu.name}.\n#[repr(${disc_type})]\n#[derive(Debug, Clone, Copy, PartialEq, Eq)]\npub enum ${struct_name}Tag {\n${$enum_variants}}\n\n#[repr(C)]\n#[derive(Clone, Copy)]\npub union ${struct_name}Payload {\n${$union_fields}}\n\n#[cfg(target_pointer_width = \"32\")]\n#[repr(align(${U64.to_str(tu.alignment_32)}))]\n#[derive(Clone, Copy)]\npub struct ${alignment_marker};\n\n/// Tag union: ${tu.name}\n#[cfg(target_pointer_width = \"32\")]\n#[repr(C)]\n#[derive(Clone, Copy)]\npub struct ${struct_name} {\n    pub _payload_alignment: [${alignment_marker}; 0],\n    pub payload: [u8; ${U64.to_str(tu.discriminant_offset_32)}],\n    pub tag: ${struct_name}Tag,\n}\n\n/// Tag union: ${tu.name}\n#[cfg(not(target_pointer_width = \"32\"))]\n#[repr(C)]\n#[derive(Clone, Copy)]\npub struct ${struct_name} {\n    pub payload: ${struct_name}Payload,\n    pub tag: ${struct_name}Tag,\n}\n\nimpl ${struct_name} {\n${$payload_accessors}}\n\n${assertions}"
+		"${$tuple_structs}/// Tag discriminant for ${tu.name}.\n#[repr(${disc_type})]\n#[derive(Debug, Clone, Copy, PartialEq, Eq)]\npub enum ${struct_name}Tag {\n${$enum_variants}}\n\n#[repr(C)]\n#[derive(Clone, Copy)]\npub union ${struct_name}Payload {\n${$union_fields}}\n\n#[cfg(target_pointer_width = \"32\")]\n#[repr(align(${U64.to_str(abi_layout.alignment32)}))]\n#[derive(Clone, Copy)]\npub struct ${alignment_marker};\n\n/// Tag union: ${tu.name}\n#[cfg(target_pointer_width = \"32\")]\n#[repr(C)]\n#[derive(Clone, Copy)]\npub struct ${struct_name} {\n    pub _payload_alignment: [${alignment_marker}; 0],\n    pub payload: [u8; ${U64.to_str(abi_discriminant_offset32(abi_layout))}],\n    pub tag: ${struct_name}Tag,\n}\n\n/// Tag union: ${tu.name}\n#[cfg(not(target_pointer_width = \"32\"))]\n#[repr(C)]\n#[derive(Clone, Copy)]\npub struct ${struct_name} {\n    pub payload: ${struct_name}Payload,\n    pub tag: ${struct_name}Tag,\n}\n\nimpl ${struct_name} {\n${$payload_accessors}}\n\n${assertions}"
 	}
 }
 
 ## Generate #[repr(C)] structs for record return types using type table.
 generate_all_record_structs_rust = |hosted_functions, type_table, duplicate_names, preferred_names| {
 	var $structs = ""
+	arg_shape = ArgShape.from_table(type_table)
 	for func in hosted_functions {
-		match ArgShape.record_lookup(type_table, func.ret_type_id) {
+		match arg_shape.record_lookup(func.ret_type_id) {
 			ArgRecordFound(record) => {
 				struct_name = name_to_struct_name(func.name)
-				doc = "/// Return type record for ${func.name}\n/// Fields use committed Roc ABI order.\n"
+				doc = "/// Return type record for ${func.name}\n/// Fields ordered by compiler-emitted ABI offsets.\n"
 				$structs = Str.concat(
 					$structs,
-					generate_record_struct_decl_rust(doc, "${struct_name}RetRecord", type_table, duplicate_names, preferred_names, record.fields, record.size_32, record.alignment_32, record.size_64, record.alignment_64),
+					generate_record_struct_decl_rust(doc, "${struct_name}RetRecord", type_table, duplicate_names, preferred_names, record.fields, record.anonymous, record.layout),
 				)
 			}
 			ArgNotRecord => {}
@@ -1523,12 +1585,13 @@ generate_all_args_structs_rust = |hosted_functions, type_table, duplicate_names,
 ## Generate a single argument struct (empty string if no args).
 generate_args_struct_rust = |func, type_table, duplicate_names, preferred_names| {
 	struct_name = name_to_struct_name(func.name)
+	arg_shape = ArgShape.from_table(type_table)
 
-	match ArgShape.hosted_args(type_table, func) {
+	match arg_shape.hosted_args(func) {
 		NoMeaningfulArgs => ""
 		SingleRecordArg(record) => {
 			doc = "/// Arguments for ${func.name}\n/// Roc signature: ${func.type_str}\n/// Refcounted fields are owned by the hosted function.\n"
-			generate_record_struct_decl_rust(doc, "${struct_name}Args", type_table, duplicate_names, preferred_names, record.fields, record.size_32, record.alignment_32, record.size_64, record.alignment_64)
+			generate_record_struct_decl_rust(doc, "${struct_name}Args", type_table, duplicate_names, preferred_names, record.fields, record.anonymous, record.layout)
 		}
 		PositionalArgs(arg_type_ids) => {
 			var $positional_fields = ""
@@ -1572,7 +1635,7 @@ indent_lines = |text, prefix| {
 box_payload_decref_name_rust = |inner_id| "decref_box_payload_type${U64.to_str(inner_id)}"
 
 decref_stmt_for_type_id_rust = |type_table, duplicate_names, preferred_names, type_id, expr| {
-	type_repr = TypeTable.get(TypeTable.from_list(type_table), type_id)
+	type_repr = type_table.get(type_id)
 	decref_stmt_for_repr_rust(type_table, duplicate_names, preferred_names, type_id, type_repr, expr)
 }
 
@@ -1592,7 +1655,7 @@ decref_stmt_for_repr_rust = |type_table, duplicate_names, preferred_names, _type
 			}
 		}
 		RocBox(inner_id) =>
-			match TypeTable.get(TypeTable.from_list(type_table), inner_id) {
+			match type_table.get(inner_id) {
 				RocFunction(_) => "    unsafe { decref_erased_callable(${expr}, roc_host); }\n"
 				_ => {
 					inner_rust = type_id_to_rust(type_table, duplicate_names, preferred_names, inner_id)
@@ -1633,7 +1696,7 @@ decref_stmt_for_repr_rust = |type_table, duplicate_names, preferred_names, _type
 }
 
 incref_stmt_for_type_id_rust = |type_table, duplicate_names, preferred_names, type_id, expr| {
-	type_repr = TypeTable.get(TypeTable.from_list(type_table), type_id)
+	type_repr = type_table.get(type_id)
 	incref_stmt_for_repr_rust(type_table, duplicate_names, preferred_names, type_id, type_repr, expr)
 }
 
@@ -1642,7 +1705,7 @@ incref_stmt_for_repr_rust = |type_table, duplicate_names, preferred_names, _type
 		RocStr => "    unsafe { ${expr}.incref(amount); }\n"
 		RocList(_) => "    unsafe { ${expr}.incref(amount); }\n"
 		RocBox(inner_id) =>
-			match TypeTable.get(TypeTable.from_list(type_table), inner_id) {
+			match type_table.get(inner_id) {
 				RocFunction(_) => "    unsafe { incref_erased_callable(${expr}, amount); }\n"
 				_ => "    unsafe { incref_box(${expr} as RocBox, amount); }\n"
 			}
@@ -1766,12 +1829,12 @@ generate_box_payload_decref_helpers_rust = |type_table, duplicate_names, preferr
 	var $helpers = ""
 	var $seen_inner_ids = []
 
-	for type_repr in type_table {
-		match type_repr {
+	for type_info in type_table_entries(type_table) {
+		match type_info.repr {
 			RocBox(inner_id) => {
 				if !(List.contains($seen_inner_ids, inner_id)) {
 					$seen_inner_ids = $seen_inner_ids.append(inner_id)
-					match TypeTable.get(TypeTable.from_list(type_table), inner_id) {
+					match type_table.get(inner_id) {
 						RocFunction(_) => {}
 						_ => {
 							inner_rust = type_id_to_rust(type_table, duplicate_names, preferred_names, inner_id)
@@ -1798,8 +1861,8 @@ generate_refcount_helpers_rust = |type_table, duplicate_names, preferred_names| 
 	var $seen_names = []
 	var $type_id = 0
 
-	for type_repr in type_table {
-		match type_repr {
+	for type_info in type_table_entries(type_table) {
+		match type_info.repr {
 			RocRecord(rec) =>
 				if rec.name != "" {
 					struct_name = name_to_struct_name(rec.name)
@@ -1829,8 +1892,9 @@ generate_refcount_helpers_rust = |type_table, duplicate_names, preferred_names| 
 direct_param_list_rust = |type_table, duplicate_names, preferred_names, arg_type_ids| {
 	var $params = ""
 	var $idx = 0
+	arg_shape = ArgShape.from_table(type_table)
 
-	for arg_type_id in ArgShape.positional_non_unit_type_ids(type_table, arg_type_ids) {
+	for arg_type_id in arg_shape.positional_non_unit_type_ids(arg_type_ids) {
 		arg_rust = type_id_to_rust(type_table, duplicate_names, preferred_names, arg_type_id)
 		sep = if $params == "" {
 			""
@@ -1847,12 +1911,13 @@ direct_param_list_rust = |type_table, duplicate_names, preferred_names, arg_type
 ## Build a hosted symbol parameter list, using the generated Args wrapper for
 ## anonymous single-record arguments so direct-symbol glue stays readable.
 direct_hosted_param_list_rust = |type_table, duplicate_names, preferred_names, func| {
-	use_args_wrapper = ArgShape.single_arg_is_anonymous_record(type_table, func.arg_type_ids)
+	arg_shape = ArgShape.from_table(type_table)
+	use_args_wrapper = arg_shape.single_arg_is_anonymous_record(func.arg_type_ids)
 
 	var $params = ""
 	var $idx = 0
 
-	for arg_type_id in ArgShape.positional_non_unit_type_ids(type_table, func.arg_type_ids) {
+	for arg_type_id in arg_shape.positional_non_unit_type_ids(func.arg_type_ids) {
 		arg_rust = if use_args_wrapper {
 			"${name_to_struct_name(func.name)}Args"
 		} else {
@@ -1946,7 +2011,7 @@ generate_entrypoint_externs_rust = |provides_list, type_table, duplicate_names, 
 	var $result = "// Provided Symbols\n//\n// Roc exports these symbols from the app with their natural C ABI signatures.\n\n#[allow(improper_ctypes)]\nunsafe extern \"C\" {\n"
 
 	for entry in provides_list {
-		type_repr = TypeTable.get(TypeTable.from_list(type_table), entry.type_id)
+		type_repr = type_table.get(entry.type_id)
 		$result = Str.concat($result, generate_provided_decl_rust(entry, type_table, duplicate_names, preferred_names, type_repr))
 	}
 
