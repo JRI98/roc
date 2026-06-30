@@ -90,6 +90,45 @@ graphs. Iteration limits are debug assertions for compiler bugs, not an
 optimization policy, and public materialization must never be used merely to
 make a recursive demand terminate.
 
+The next failed implementation slice exposed two additional process hazards.
+First, demanded private loop values can introduce generated locals while
+cloning a loop body. Those locals are valid only inside the control region that
+owns the demanded state. If they are not registered in the active
+`DemandFrame`/state-param scope before the body is cloned, later scope checks
+will find apparently mysterious unavailable locals. That is not an ARC,
+backend, or LIR problem. It means optimized lowering introduced a binding
+without also producing the explicit scope fact that makes the binding legal.
+
+Second, finite callable alternatives can have different capture counts and
+different demanded capture indexes. A merged callable demand is not a demand
+that can be blindly replayed against every alternative. The consumer must keep
+capture demand keyed by the original capture identity for the particular
+alternative being lowered. If an alternative has fewer captures than a merged
+demand vector, the producer-consumer contract is wrong; do not repair this by
+padding captures, materializing the callable, dropping the demand, or adding an
+arity check at the call site.
+
+The next aborted attempt exposed a third contract gap: public materialization
+boundaries are not the same thing as decomposable structural demand. A
+non-inlined direct call, hosted call, or backend-visible runtime boundary needs
+an ordinary public value for each argument. A sparse private record that carries
+only the demanded fields is not a valid substitute, even if its demand graph
+contains a `record` demand that came from asking to "materialize" it. Before
+optimized lowering splits a loop value into private state, it must know whether
+that value will cross a public-value boundary. If it will, the producer must
+either keep an explicit public leaf available for that boundary or produce an
+explicit public-boundary demand fact. Do not fix this by manufacturing
+uninitialized placeholder args, forcing a late direct-call inline, treating
+`materialize` as both structural decomposition and public value, or adding a
+boundary-local escape hatch.
+
+The diagnostic loop that found those issues also showed why temporary
+inspection must stay out of commits. Shape dumps, proc counters, disassembly
+notes, hardcoded local ids, and "print then infer" debugging are acceptable
+while classifying a failure, but they are not compiler facts. Before a change
+is committed, the same conclusion must be represented by a focused regression
+and an explicit producer-owned fact.
+
 Every change starts from the contract, not from Rocci Bird or final wasm size.
 Rocci Bird is the motivating integration case, but it is not the design source
 of truth. If a Rocci Bird failure cannot be explained through `Demand`,
@@ -148,6 +187,21 @@ When a test fails, classify the failure before changing code:
 - Fixed-point non-convergence: reduce to a demand-graph regression, then fix
   demand normalization, reference closure, ordering, or equality. Do not add
   caps, cutoffs, source-specific exits, or public materialization.
+- Generated-scope leak: reduce to the smallest private-state body that
+  references a generated local outside its owning control region. The fix is to
+  make the owner frame expose that local explicitly while cloning the region, or
+  to pass the value as an explicit runtime leaf. Do not move the local outward
+  based on source shape.
+- Cross-alternative callable demand: reduce to finite callable alternatives
+  whose captures differ in count or index. The fix is per-alternative demanded
+  capture identity. Do not merge capture vectors into a single positional shape
+  and apply it to every alternative.
+- Public-boundary demand: reduce to a loop-carried private value that is later
+  passed to a non-inlined direct call, hosted call, or other public runtime
+  boundary. The fix is an explicit producer fact that the boundary needs a
+  public value, or an explicit public leaf in the state. Do not model this as
+  ordinary structural `record`/`tuple`/`callable` demand, and do not make the
+  boundary recover by inspecting sparse private state.
 
 The classification must produce one of these outputs before code changes
 continue:
@@ -227,14 +281,38 @@ Each remaining implementation slice is executed in this order:
    consumed both before demand propagation and later as LIR cleanup, one of the
    consumers is wrong. Delete the wrong one before moving on.
 
-6. Prove the narrow invariant, then update the checklist.
+6. Prove scope closure before proving shape quality.
+
+   When optimized lowering introduces generated locals, first prove those
+   locals are owned by the cloned region or passed explicitly as runtime leaves.
+   A LIR shape expectation is not meaningful while scope closure is broken.
+   Once the scope regression passes, then check join counts, call counts, and
+   private-state shape.
+
+7. Prove per-alternative callable capture demand before broad loop demand.
+
+   A callable-state change that handles only one capture layout is not ready to
+   support iterator or stream pipelines. Add or run the focused test where
+   finite alternatives have different capture counts or demanded capture
+   indexes before using the result to explain Rocci Bird.
+
+8. Prove public-boundary demand before sparse private-state transport.
+
+   If a loop value may be passed to a non-inlined direct call, hosted call, or
+   backend-visible boundary, first prove that optimized lowering has an
+   explicit public-value fact for that path. Only then split the same value into
+   sparse private state for internal iterator, stream, or callable operations.
+   A passing private-state shape test is not enough if a later boundary still
+   tries to materialize sparse state.
+
+9. Prove the narrow invariant, then update the checklist.
 
    Run the smallest focused Zig target that exercises the invariant. Check off
    a plan item only when that focused test proves it. Rocci Bird size and
    browser testing are final integration checks, not checklist proof for
    compiler invariants.
 
-7. Scan for reset violations before committing.
+10. Scan for reset violations before committing.
 
    Before each commit, verify that no temporary diagnostics, trace scaffolding,
    hardcoded ids, source-form optimization rules, late cleanup rewrites, or
