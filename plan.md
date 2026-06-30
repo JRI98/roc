@@ -235,6 +235,12 @@ When a test fails, classify the failure before changing code:
   that producer. Do not refresh missing fields or captures from the sparse
   product, insert placeholders, or move the repair to the call/materialization
   site.
+- Loop-supplied callable capture: reduce to a loop-carried callable whose
+  result demand reaches a capture supplied by the same active loop state. The
+  fix is an explicit supplier reference from callable capture demand to the
+  owning loop-demand node or state slot. Do not structurally expand the capture
+  into the callable state, omit it because a substitution currently exists, or
+  close the recursive loop demand into an ever-larger tree.
 - Generated-scope leak: reduce to the smallest private-state body that
   references a generated local outside its owning control region. The fix is to
   make the owner frame expose that local explicitly while cloning the region, or
@@ -575,6 +581,28 @@ If either side is missing, stop and add that explicit data first. Do not make
 the consumer infer ownership from stack position, state-array index, source
 shape, or the current sparse product.
 
+The next diagnostic showed a different missing fact, not an invitation to omit
+captures locally. `Iter.append` builds a step lambda whose captures include
+the current loop-carried iterator state. Result demand for that step can demand
+the captured current iterator again through the returned `rest`. If the
+compiler stores that capture by structurally expanding the demanded iterator
+state, demand solving alternates between larger recursive trees and never
+reaches the Rust-like cursor shape. The correct producer fact is:
+
+```text
+this callable capture is supplied by loop state slot N under demand D
+```
+
+That fact is distinct from an omitted capture and distinct from a carried
+unknown capture. The private callable state must be able to say that a demanded
+capture is supplied by the active loop-demand node or state slot, and callable
+inlining must consume that supplier reference when binding the source capture
+local. Do not fix this by checking whether `subst` happens to contain the
+capture local and then dropping the capture, because that is a consumer-local
+guess. Do not fix it by fully closing loop-demand references into structural
+trees, because that recreates the unbounded expansion. Do not materialize the
+public callable or public iterator to terminate the recursion.
+
 ## Target Contract
 
 The optimized entrypoint owns builder-local optimizer data. That data is not a
@@ -592,13 +620,17 @@ Required internal data:
   choices.
 - `PrivateState`: optimized-only state with sparse demanded children. Missing
   children mean not carried. Present unknown children mean carried runtime
-  leaves.
+  leaves. A demanded callable capture may also be supplied by an explicit
+  loop-state supplier reference instead of being stored structurally in the
+  callable.
 - `FiniteCallableState`: ordinary lambda-set target data plus demanded captures
   by original capture index. Alternatives may have different capture shapes.
 - `LoopDemandNode`: graph identity for recursive loop-carried demand. A nested
   demand may refer back to a loop parameter while the owning fixed point is
   active; references must be resolved or closed before crossing worker,
-  public-materialization, or LIR boundaries.
+  public-materialization, or LIR boundaries. Loop-demand nodes also identify
+  loop state suppliers for callable captures that are already carried by the
+  active loop state.
 - `DemandFrame`: the transient producer-consumer boundary while cloning under
   demand, including the checked control scope that owns any locals introduced
   while satisfying that demand.
@@ -690,6 +722,9 @@ Forbidden shapes:
 
 - Use existing lambda-set data as the only source of finite callable targets.
 - Carry demanded captures by original capture index.
+- Represent captures supplied by active loop state as explicit supplier
+  references keyed by original capture index. A supplier reference is neither an
+  omitted capture nor a dense carried capture.
 - Inline a single known target directly when demand and scope allow it.
 - Dispatch over multiple known targets without widening to a public erased
   callable merely because capture shapes differ.
@@ -700,8 +735,8 @@ Forbidden shapes:
   when the wrapper call has no known-value argument.
 - Add tests for one target, multiple targets, differing capture counts,
   differing capture indexes, omitted captures, callable reuse after optimized
-  call, public callable crossing, and a user wrapper that exposes a builtin
-  iterator producer before demand propagation.
+  call, loop-supplied captures, public callable crossing, and a user wrapper
+  that exposes a builtin iterator producer before demand propagation.
 - Do not normalize differing capture shapes by building public erased callables
   unless materialization demand explicitly requires a public callable value.
 - Do not depend on late LIR wrapper inlining to create the optimized shape. The
@@ -712,6 +747,9 @@ Forbidden shapes:
 
 - Represent loop-parameter demand with explicit graph nodes owned by the loop
   fixed point.
+- Let callable capture demand refer to a loop-demand node when the capture is
+  supplied by that loop state. This is how recursive iterator `rest` state
+  remains a finite graph instead of becoming an infinite capture tree.
 - Merge body observations and reachable `continue` edges monotonically.
 - Reclone provisional edge values when demand grows.
 - Carry runtime leaves as loop parameters, not finite-state dimensions.

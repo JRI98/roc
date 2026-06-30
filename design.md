@@ -1457,7 +1457,10 @@ builder-owned data inside optimized lowering, not a stored public IR stage:
   finite tag choices, and sparse demanded children by checked identity.
 - `PrivateState` describes optimized-only state that is not the public Roc
   value. It stores only demanded children. A missing child means not carried; a
-  present unknown child means carried as a runtime leaf.
+  present unknown child means carried as a runtime leaf. For callable captures,
+  a demanded child may also be represented by an explicit supplier reference to
+  an active loop state slot; that is distinct from both omission and structural
+  storage.
 - `FiniteCallableState` is ordinary lambda-set data plus demanded captures by
   original capture index. Different alternatives may have different capture
   indexes and counts without widening to a public erased callable.
@@ -1465,7 +1468,8 @@ builder-owned data inside optimized lowering, not a stored public IR stage:
   A demand may refer back to a loop parameter instead of expanding an infinite
   structural tree. These references are legal only while the owning loop fixed
   point is active and must be closed or resolved before crossing a worker,
-  public materialization, or LIR boundary.
+  public materialization, or LIR boundary. The same graph identity is used when
+  callable capture demand is supplied by an active loop state slot.
 - `DemandFrame` is the transient producer-consumer boundary while cloning a
   value under demand. It owns the checked control scope for locals introduced
   while satisfying that demand.
@@ -1958,6 +1962,14 @@ tuple item index, tag payload index, nominal backing value, and callable capture
 index. A missing child means private state does not carry it. A present child
 whose data is unknown means private state carries the runtime value but has no
 more precise structure.
+
+Callable captures have one additional private-state source: a capture may be
+supplied by an active loop state slot through a loop-demand node. This is how a
+recursive iterator step closure can refer to the current cursor without storing
+the cursor inside itself and expanding forever. Supplier references are
+explicit optimizer data. They must not be inferred from source names, from a
+temporary substitution table, or from the fact that a capture happened to be
+available while cloning one particular body.
 
 Sparse demanded private state must not be forced through the ordinary dense
 public `Value` representation. Ordinary public values require all children
