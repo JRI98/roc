@@ -122,6 +122,26 @@ uninitialized placeholder args, forcing a late direct-call inline, treating
 `materialize` as both structural decomposition and public value, or adding a
 boundary-local escape hatch.
 
+The same aborted attempt also exposed a process gap in how failures were
+classified. The first invariant failure was about loop-state key selection: the
+state side had been keyed as an unknown leaf while the entry side had already
+been split into private record state. A local change moved that failure forward
+to a different invariant: a sparse private value then reached a non-inlined
+direct-call boundary and crashed during materialization. Those are two separate
+contracts. When a change moves a focused regression to the next invariant, stop
+and update the current slice before continuing. Do not keep editing under the
+old failure label, and do not treat "made it fail later" as a completed
+implementation checkpoint until the newly exposed invariant has its own named
+producer fact and passing focused test.
+
+The lesson from that sequence is that sparse private state and public boundary
+state must be represented at the same time when a value has both internal
+optimized uses and public observation uses. A public boundary must not ask
+`materialize` to reverse-engineer a value from whatever sparse private fields
+happen to be present. The producer must decide, before the split, whether a
+public leaf/public value is needed alongside private fields, and the consumer
+must read that explicit fact.
+
 The diagnostic loop that found those issues also showed why temporary
 inspection must stay out of commits. Shape dumps, proc counters, disassembly
 notes, hardcoded local ids, and "print then infer" debugging are acceptable
@@ -354,7 +374,16 @@ Each remaining implementation slice is executed in this order:
    `design.md`; otherwise delete it before continuing. This prevents the next
    slice from being built on accidental scaffolding.
 
-11. Scan for reset violations before committing.
+11. Reclassify when a fix exposes the next invariant.
+
+   If the focused regression stops failing in the recorded way but fails in a
+   new way, do not keep editing under the old slice. Update this plan with the
+   new failure text, expected failure class, producer-owned fact, and consumer
+   boundary before writing the next production change. A change that only moves
+   the failure forward is useful diagnosis, not a commit-ready implementation
+   checkpoint.
+
+12. Scan for reset violations before committing.
 
    Before each commit, verify that no temporary diagnostics, trace scaffolding,
    hardcoded ids, source-form optimization rules, late cleanup rewrites, or
@@ -458,6 +487,49 @@ projection.
 
 Do not use this verified slice as evidence for the remaining loop-demand,
 public-boundary, or broad scope-closure checklist items.
+
+## Current Implementation Slice
+
+The active regression for the loop-entry private-state key change and the
+public-boundary follow-up is:
+
+```sh
+zig build run-test-zig-lir-inline -- --test-filter "imported iterator producer keeps finite step callables"
+```
+
+Before the change, this crashes with:
+
+```text
+postcheck invariant violated: optimized loop entry values could neither select a state nor be emitted as ordinary loop initials
+```
+
+Expected failure class: loop-state key mismatch. The diagnostic shape was:
+
+```text
+state 0: any leaf
+entry: private_state(record) expr
+```
+
+The invariant is that state-loop keys and entry keys must be derived from the
+same demanded representation. If optimized lowering decides that a loop entry
+is carried as demanded private state, the state key producer must key the loop
+state from that demanded private shape too. It must not key the state from the
+original public value and then ask a private entry value to match it.
+
+After the local loop-key change, the same focused regression moves to:
+
+```text
+postcheck invariant violated: sparse private state reached materialization
+```
+
+Expected failure class: public-boundary demand. The crash occurs while cloning
+a non-inlined direct-call boundary argument. A sparse private value is valid for
+internal demanded-state transport, but it is not an ordinary public argument.
+The next producer fact must say when a loop-carried value also needs an
+ordinary public value for a direct-call, hosted-call, or backend-visible
+boundary. The fix must not be in `materialize`, must not force a late direct
+call inline, and must not treat structural `record` demand as equivalent to a
+public runtime value.
 
 ## Target Contract
 
