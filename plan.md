@@ -48,12 +48,23 @@ producing diagnostics, temporary refinement paths, source-shape repairs, and
 special-case fallbacks before the core contract was fully represented. The rest
 of this plan must be implemented with these guardrails.
 
+The main lesson is that a passing Rocci Bird build or a smaller wasm file is
+not evidence that the compiler design is correct. Those are integration
+checks. The design is correct only when the optimized lowering consumes
+explicit compiler facts and emits ordinary scope-closed LIR with no hidden
+iterator, stream, wasm, builtin-name, or source-form knowledge.
+
 Every change starts from the contract, not from Rocci Bird or final wasm size.
 Rocci Bird is the motivating integration case, but it is not the design source
 of truth. If a Rocci Bird failure cannot be explained through `Demand`,
 `KnownValue`, `PrivateState`, `FiniteCallableState`, `LoopDemandNode`,
 `DemandFrame`, or `WorkerKey`, stop and add the missing compiler fact or revise
 the contract before changing lowering.
+
+Do not debug this by repeatedly changing Rocci Bird and refreshing a browser.
+Use minimal compiler regressions first, then LIR inspection, then wasm
+disassembly. Browser testing is only a final human validation that the
+optimized build still runs.
 
 Every behavior change gets a minimal compiler regression first. The regression
 should use the smallest source or Zig unit shape that proves the invariant:
@@ -74,6 +85,7 @@ particular, do not add:
 - recursive direct-call expansion as a replacement for loop-demand graph nodes
 - nullable optimized fields on ordinary lowering state
 - dense private-state placeholders for omitted children
+- public/private step-shape changes such as adding `Append` to `Iter`
 - temporary result-refinement or call-rewrite paths whose inputs are not exact
   compiler data from the target contract
 
@@ -91,10 +103,22 @@ When a test fails, classify the failure before changing code:
 - Backend/ARC issue: first prove optimized lowering emitted ordinary
   scope-closed LIR; only then change ARC or backend code.
 
+The classification must produce one of these outputs before code changes
+continue:
+
+- a new focused failing regression
+- a documented contract correction in this file and `design.md`
+- deletion of obsolete code that contradicts the contract
+
 If the local fix would need a phrase like "for now", "fallback", "special case",
 "detect", "recognize", "cleanup", or "just inline", stop. Either the target
 contract is missing an explicit fact, or the implementation is in the wrong
 stage.
+
+The same stop rule applies to "public compatibility" arguments. `Iter` and
+`Stream` keep their current public shape, and the optimizer must make that shape
+lower well. Do not change the public step union, add a private public-looking
+variant, or normalize at a new API boundary to make the optimizer easier.
 
 Each commit should leave the branch in one of two states:
 
@@ -106,6 +130,20 @@ Do not keep obsolete code beside replacement code unless both are permanent
 public paths described by this plan. Ordinary public-value lowering and
 optimized callable-state lowering are the two permanent paths; everything else
 is suspect until justified by the target contract.
+
+Before moving to the next numbered implementation section, verify all of the
+following for the section just changed:
+
+- every new behavior has a focused regression that fails without the change
+- no forbidden words or concepts were introduced into optimized lowering
+- replaced code was deleted in the same commit
+- the relevant focused Zig target passes
+- the completion checklist was updated only for facts proven by tests or
+  architecture checks
+
+Do not check off a Rocci Bird item until the focused compiler tests for the
+underlying invariant have passed. Do not check off a compiler invariant because
+Rocci Bird got smaller.
 
 ## Target Contract
 
@@ -352,9 +390,9 @@ zig build minici
       plans.
 - [x] Architecture checks reject committed trace/debug scaffolding and
       hardcoded local/proc/symbol recognition in optimized lowering.
-- [ ] Optimized callable-state lowering is constructed only for `--opt=size`
+- [x] Optimized callable-state lowering is constructed only for `--opt=size`
       and `--opt=speed`.
-- [ ] Non-optimized paths construct zero optimized demand/private-state/worker
+- [x] Non-optimized paths construct zero optimized demand/private-state/worker
       data.
 - [ ] Result demand is explicit compiler data everywhere optimized lowering
       needs it.
