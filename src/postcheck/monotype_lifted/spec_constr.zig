@@ -18285,6 +18285,11 @@ const Cloner = struct {
             if (capture_index != capture_exprs.len) {
                 Common.invariant("compact finite callable branch did not consume every capture slot");
             }
+            const scoped_start = self.scopedLocalsLen();
+            defer self.restoreScopedLocals(scoped_start);
+            for (capture_pats) |capture_pat| {
+                try self.appendPatternScopedLocals(capture_pat);
+            }
             const tag_name = try self.pass.compactCallableAlternativeTagName(alternative_index);
             branch.* = .{
                 .pat = try self.pass.program.addPat(.{
@@ -20915,7 +20920,7 @@ const Cloner = struct {
             }
 
             if (try self.demandedKnownValueFromAvailableValueDemand(capture, demand)) |pattern| {
-                out.* = pattern;
+                out.* = try self.compactDemandedKnownValue(pattern);
                 continue;
             }
 
@@ -20925,7 +20930,7 @@ const Cloner = struct {
 
             const known_value = (try self.pass.knownValueFromValue(capture)) orelse
                 KnownValue{ .any = valueType(self.pass.program, capture) };
-            out.* = try materializedDemandedKnownValue(self.pass.arena.allocator(), known_value);
+            out.* = try self.compactDemandedKnownValue(try materializedDemandedKnownValue(self.pass.arena.allocator(), known_value));
         }
         return captures;
     }
@@ -24285,40 +24290,17 @@ fn demandedKnownValueFromDemand(
                 } };
             }
 
-            var effective_callable_demand = callable_demand;
-            if (cloner) |active_cloner| {
-                if (callable_demand.result) |result_demand| {
-                    const concrete_demand = switch (known_value) {
-                        .callable => |callable| try active_cloner.callableDemandForFnWithResultDemand(
-                            callable.fn_id,
-                            callable.captures.len,
-                            result_demand.*,
-                        ),
-                        .finite_callables => |finite_callables| concrete: {
-                            var alternative_demand: ValueDemand = .{ .callable = .{ .captures = &.{} } };
-                            for (finite_callables.alternatives) |alternative| {
-                                alternative_demand = try active_cloner.pass.mergeValueDemand(
-                                    alternative_demand,
-                                    try active_cloner.callableDemandForFnWithResultDemand(
-                                        alternative.fn_id,
-                                        alternative.captures.len,
-                                        result_demand.*,
-                                    ),
-                                );
-                            }
-                            break :concrete alternative_demand;
-                        },
-                        else => null,
-                    };
-                    if (concrete_demand) |concrete| {
-                        const merged = try active_cloner.pass.mergeValueDemand(.{ .callable = callable_demand }, concrete);
-                        if (merged == .callable) effective_callable_demand = merged.callable;
-                    }
-                }
-            }
-
             switch (known_value) {
                 .callable => |callable| {
+                    const effective_callable_demand = try effectiveCallableDemandForTarget(
+                        cloner,
+                        program,
+                        arena,
+                        callable_demand,
+                        callable.fn_id,
+                        callable.captures.len,
+                        .exact_target,
+                    );
                     const captures = try demandedKnownCapturesFromDemand(cloner, program, arena, callable.fn_id, callable.captures, effective_callable_demand);
                     break :blk DemandedKnownValue{ .callable = .{
                         .ty = callable.ty,
@@ -24329,6 +24311,15 @@ fn demandedKnownValueFromDemand(
                 .finite_callables => |finite_callables| {
                     const alternatives = try arena.alloc(DemandedKnownCallable, finite_callables.alternatives.len);
                     for (finite_callables.alternatives, alternatives) |alternative, *out| {
+                        const effective_callable_demand = try effectiveCallableDemandForTarget(
+                            cloner,
+                            program,
+                            arena,
+                            callable_demand,
+                            alternative.fn_id,
+                            alternative.captures.len,
+                            .finite_alternative,
+                        );
                         const captures = try demandedKnownCapturesFromDemand(cloner, program, arena, alternative.fn_id, alternative.captures, effective_callable_demand);
                         out.* = .{
                             .ty = alternative.ty,
@@ -24344,6 +24335,67 @@ fn demandedKnownValueFromDemand(
                 else => break :blk null,
             }
         },
+    };
+}
+
+const CallableDemandProjection = enum {
+    exact_target,
+    finite_alternative,
+};
+
+fn effectiveCallableDemandForTarget(
+    cloner: ?*Cloner,
+    program: ?*const Ast.Program,
+    arena: Allocator,
+    base_demand: CallableDemand,
+    fn_id: Ast.FnId,
+    known_capture_count: usize,
+    projection: CallableDemandProjection,
+) Allocator.Error!CallableDemand {
+    const capture_count = sourceCaptureCountForTarget(program, fn_id, known_capture_count);
+    var effective = try projectCallableDemandForTarget(arena, base_demand, capture_count, projection);
+    if (cloner) |active_cloner| {
+        if (base_demand.result) |result_demand| {
+            const derived = try active_cloner.callableDemandForFnWithResultDemand(fn_id, capture_count, result_demand.*);
+            const merged = try active_cloner.pass.mergeValueDemand(.{ .callable = effective }, derived);
+            if (merged == .callable) {
+                effective = try projectCallableDemandForTarget(arena, merged.callable, capture_count, projection);
+            }
+        }
+    }
+    return effective;
+}
+
+fn sourceCaptureCountForTarget(program: ?*const Ast.Program, fn_id: Ast.FnId, known_capture_count: usize) usize {
+    const program_ref = program orelse return known_capture_count;
+    const source_fn = program_ref.fns.items[@intFromEnum(fn_id)];
+    return program_ref.typedLocalSpan(source_fn.captures).len;
+}
+
+fn projectCallableDemandForTarget(
+    arena: Allocator,
+    demand: CallableDemand,
+    capture_count: usize,
+    projection: CallableDemandProjection,
+) Allocator.Error!CallableDemand {
+    if (demand.captures.len <= capture_count) return demand;
+
+    switch (projection) {
+        .exact_target => {
+            for (demand.captures[capture_count..]) |capture_demand| {
+                if (capture_demand != .none) Common.invariant("callable demand capture index exceeded target source capture count");
+            }
+        },
+        .finite_alternative => {},
+    }
+
+    const captures = try arena.alloc(ValueDemand, capture_count);
+    for (captures, demand.captures[0..capture_count]) |*out, capture_demand| {
+        out.* = capture_demand;
+    }
+    return .{
+        .captures = captures,
+        .result = demand.result,
     };
 }
 

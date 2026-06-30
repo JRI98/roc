@@ -394,6 +394,71 @@ Do not check off a Rocci Bird item until the focused compiler tests for the
 underlying invariant have passed. Do not check off a compiler invariant because
 Rocci Bird got smaller.
 
+## Recent Verified Implementation Slice
+
+The active regression for the finite-callable projection change was:
+
+```sh
+zig build run-test-zig-lir-inline -- --test-filter "direct range map collect uses direct list loop"
+```
+
+Before the change, this crashed with:
+
+```text
+postcheck invariant violated: callable demand capture index exceeded lifted function capture count
+```
+
+Expected failure class: cross-alternative callable demand. The invariant being
+proved is that a callable result demand applied to finite callable alternatives
+must derive demanded captures for each alternative's own source function and
+capture layout. A merged callable capture vector is not valid input for every
+alternative when the alternatives differ in capture count or capture index.
+
+After the per-alternative projection change, the same filter exposed the next
+expected failure class:
+
+```text
+postcheck invariant violated: finite demanded state reached private-state argument construction before expansion
+```
+
+The invariant being proved is that callable specialization capture patterns
+must use the private-state contract before they reach private-state argument
+construction. If a demanded capture contains finite tag or finite callable
+state, the capture-pattern producer must compact that demanded-known value
+recursively; the argument constructor must not expand it into public values or
+recover the shape later.
+
+After compacting capture patterns, the same filter exposed a scope-closure
+failure:
+
+```text
+postcheck invariant violated: materialized expression still referenced unavailable bindings
+```
+
+Expected failure class: generated-scope leak. A compact finite callable branch
+creates payload locals while building the branch pattern and then immediately
+clones the branch body. Those locals are valid inside that branch body, so the
+branch-body producer must register them in the active checked scope while it is
+cloning the branch. The fix is not to move the locals outward, inline a
+surrounding call, or materialize public callable state; it is to make the
+owning branch scope explicit during body construction.
+
+Verification after the change:
+
+```sh
+zig build run-test-zig-lir-inline -- --test-filter "direct range map collect uses direct list loop"
+zig build run-test-zig-lir-inline -- --test-filter "plant iter pipeline collect uses direct range map list loop"
+zig build run-test-zig-lir-inline -- --test-filter "known-length List.iter collect specializes without unbound locals"
+```
+
+The full `zig build run-test-zig-lir-inline --summary all --color off` target
+still fails after this slice. The next remaining failure class starts in
+optimized loop entry/state construction, not in finite callable capture
+projection.
+
+Do not use this verified slice as evidence for the remaining loop-demand,
+public-boundary, or broad scope-closure checklist items.
+
 ## Target Contract
 
 The optimized entrypoint owns builder-local optimizer data. That data is not a
@@ -681,7 +746,7 @@ zig build minici
 - [ ] Primitive and single-field-record loop state optimize equivalently.
 - [ ] Sparse private state distinguishes omitted children from
       unknown-but-carried children.
-- [ ] Finite callable alternatives remain finite across differing capture
+- [x] Finite callable alternatives remain finite across differing capture
       shapes.
 - [x] Explicit solved-inline wrapper bodies are available to optimized lowering
       before demand propagation.
