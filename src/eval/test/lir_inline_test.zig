@@ -1812,6 +1812,54 @@ test "direct range map collect uses direct list loop" {
     , 2);
 }
 
+test "non-inlined call list argument keeps let-bound leaves available" {
+    // A boundary call cannot be inlined, so its arguments must materialize as
+    // ordinary public values. A list argument whose elements are let-bound
+    // locals must keep those bindings available (or substituted) when the
+    // boundary materializes inside nested inlining.
+    const allocator = std.testing.allocator;
+    var optimized = try lowerModule(allocator,
+        \\module [main]
+        \\
+        \\len_rec : List(U64), U64 -> U64
+        \\len_rec = |bytes, acc| {
+        \\    match bytes {
+        \\        [] => acc
+        \\        [_, .. as rest] => len_rec(rest, acc + 1)
+        \\    }
+        \\}
+        \\
+        \\countdown : U64 -> U64
+        \\countdown = |x| if x == 0 1 else countdown(x - 1)
+        \\
+        \\save : U64 -> U64
+        \\save = |frame| {
+        \\    data = U64.bitwise_and(frame, 255)
+        \\    other = countdown(3)
+        \\    len_rec([data, other], 0)
+        \\}
+        \\
+        \\init : { frame : U64 } -> U64
+        \\init = |state| {
+        \\    frame_count = state.frame
+        \\    save(frame_count)
+        \\}
+        \\
+        \\step : { frame : U64 }, U64 -> U64
+        \\step = |state, mode| {
+        \\    if mode == 1 {
+        \\        init(state)
+        \\    } else {
+        \\        0
+        \\    }
+        \\}
+        \\
+        \\main : U64
+        \\main = step({ frame: 9 }, 1)
+    , .optimized);
+    defer optimized.deinit(allocator);
+}
+
 test "local iterator append loop demands step captures across states" {
     // The append step callable's appended-item capture is demanded only
     // through the step-result `item` demand observed inside the loop body.

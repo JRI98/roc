@@ -8328,16 +8328,10 @@ const Cloner = struct {
             state_loop_iterations += 1;
             if (state_loop_iterations > 1000) Common.invariant("state loop demand feedback did not converge");
 
-            const state_keys = try demandedKnownValueProducts(self.pass.allocator, self.pass.arena.allocator(), known_values);
             const state_start_len = self.pass.program.state_loop_states.items.len;
             const state_start: u32 = @intCast(state_start_len);
             var states = std.ArrayList(SparseStateLoopState).empty;
             defer states.deinit(self.pass.allocator);
-
-            for (state_keys) |state_values| {
-                if (state_values.len != params.len) Common.invariant("state_loop key arity differed from loop params");
-                _ = try self.appendSparseState(&states, state_values);
-            }
 
             var state_demands_changed = false;
             var provenance = std.ArrayList(LoopLocalProvenance).empty;
@@ -8359,6 +8353,23 @@ const Cloner = struct {
             defer self.pass.allocator.free(demanded_entry_values);
             for (values, demands, demanded_entry_values) |value, demand, *out| {
                 out.* = try self.applyValueDemand(value, demand);
+            }
+
+            // State identity and entry split are a paired output of applying
+            // the normalized demand to the original entry value: when the
+            // demanded entry is sparse private state, the state key set is
+            // derived from that exact private shape, in this loop's own
+            // demand-reference resolution context.
+            for (demanded_entry_values, known_values) |demanded_entry, *known_value| {
+                if (demanded_entry == .private_state) {
+                    known_value.* = try self.demandedKnownValueFromPrivateStateLoopStateShape(demanded_entry.private_state);
+                }
+            }
+
+            const state_keys = try demandedKnownValueProducts(self.pass.allocator, self.pass.arena.allocator(), known_values);
+            for (state_keys) |state_values| {
+                if (state_values.len != params.len) Common.invariant("state_loop key arity differed from loop params");
+                _ = try self.appendSparseState(&states, state_values);
             }
 
             var entry_state_index: ?usize = null;
@@ -20474,7 +20485,10 @@ const Cloner = struct {
 
         const stmt = self.pass.program.stmts.items[@intFromEnum(stmt_id)];
         const cloned: Ast.Stmt = switch (stmt) {
-            .uninitialized => |pat| .{ .uninitialized = try self.clonePat(pat) },
+            .uninitialized => |pat| blk: {
+                try self.appendPatternScopedLocals(pat);
+                break :blk .{ .uninitialized = try self.clonePat(pat) };
+            },
             .let_ => |let_| blk: {
                 var pattern_demand: ValueDemand = if (let_.recursive)
                     .materialize
@@ -20520,6 +20534,9 @@ const Cloner = struct {
                     return;
                 }
                 _ = try self.bindPatToMaterializedKnownValue(let_.pat, value);
+                // The emitted statement binds these locals for the rest of the
+                // block being cloned; the enclosing block clone restores them.
+                try self.appendPatternScopedLocals(let_.pat);
                 break :blk .{ .let_ = .{
                     .pat = try self.clonePat(let_.pat),
                     .value = value_expr,
