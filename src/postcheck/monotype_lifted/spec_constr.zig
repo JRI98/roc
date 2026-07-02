@@ -13412,9 +13412,9 @@ const Cloner = struct {
 
         if (receiver == .private_state) {
             // A carried private child is the same checked data as the public
-            // field, so projection through the checked identity is exact. A
-            // carried leaf is one whole public value, so its field projects
-            // as an ordinary field access on the carried expression. A
+            // field, so the field read resolves through the checked identity
+            // exactly. A carried leaf is one whole public value, so its field
+            // read is an ordinary field access on the carried expression. A
             // missing child keeps the public-boundary invariant intact.
             var private_receiver = receiver.private_state;
             while (private_receiver == .nominal) {
