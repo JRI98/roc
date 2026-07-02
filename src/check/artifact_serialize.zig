@@ -560,6 +560,8 @@ pub fn SliceStoreSerde(comptime Store: type, comptime Serialized: type) type {
             inline for (@typeInfo(Serialized).@"struct".fields) |field| {
                 const value = if (comptime @hasDecl(field.type, "deserializeInto"))
                     @field(self, field.name).deserializeInto(base_addr)
+                else if (comptime @hasDecl(field.type, "deserializeWithAllocator"))
+                    @field(self, field.name).deserializeWithAllocator(base_addr, allocator)
                 else
                     @field(self, field.name).deserialize(base_addr);
                 if (comptime isArrayListType(@TypeOf(@field(store, field.name)))) {
@@ -632,11 +634,14 @@ fn isArrayListType(comptime T: type) bool {
     return @typeInfo(T) == .@"struct" and @hasField(T, "items") and @hasField(T, "capacity");
 }
 
+/// Errors that can occur in serialization round-trip tests.
+pub const TestError = Allocator.Error || error{ BufferTooSmall, TestExpectedEqual };
+
 /// Test helper: serialize `store` through a `CompactWriter` into a fresh
 /// 16-byte-aligned buffer, then deserialize it back. Works for any store whose
 /// `Serialized` form exposes `serialize(self, *const Store, gpa, *CompactWriter)`
 /// and `deserialize(self, base) Store`. Caller frees `.buffer`.
-pub fn roundTripForTest(gpa: Allocator, comptime Store: type, store: *const Store) anyerror!struct {
+pub fn roundTripForTest(gpa: Allocator, comptime Store: type, store: *const Store) TestError!struct {
     buffer: []align(CompactWriter.SERIALIZATION_ALIGNMENT.toByteUnits()) u8,
     loaded: Store,
 } {
@@ -673,7 +678,7 @@ pub fn zeroSlicePadding(comptime T: type, buf: []T) void {
 
 /// Test helper: assert two POD slices are byte-identical (including padding),
 /// element by element via `asBytes` (avoiding the banned `sliceAsBytes`).
-pub fn expectSlicesByteEqual(comptime T: type, expected: []const T, actual: []const T) anyerror!void {
+pub fn expectSlicesByteEqual(comptime T: type, expected: []const T, actual: []const T) TestError!void {
     try std.testing.expectEqual(expected.len, actual.len);
     for (expected, actual) |*e, *a| {
         try std.testing.expectEqualSlices(u8, std.mem.asBytes(e), std.mem.asBytes(a));
@@ -906,7 +911,7 @@ fn serializeHolderToBuffer(
     gpa: Allocator,
     comptime Holder: type,
     items: anytype,
-) anyerror![]align(CompactWriter.SERIALIZATION_ALIGNMENT.toByteUnits()) u8 {
+) TestError![]align(CompactWriter.SERIALIZATION_ALIGNMENT.toByteUnits()) u8 {
     var arena = std.heap.ArenaAllocator.init(gpa);
     defer arena.deinit();
     const aa = arena.allocator();

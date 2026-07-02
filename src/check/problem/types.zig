@@ -45,16 +45,17 @@ pub const Problem = union(enum) {
     effectful_expect: EffectfulExpect,
     annotation_only_value: AnnotationOnlyValue,
     hosted_unboxed_function: HostedUnboxedFunction,
+    host_boundary_open_row: HostBoundaryOpenRow,
     platform_def_not_found: PlatformDefNotFound,
     platform_hosted_section: PlatformHostedSection,
     platform_alias_not_found: PlatformAliasNotFound,
     comptime_crash: ComptimeCrash,
-    comptime_dbg: ComptimeDbg,
     comptime_invalid_numeral: ComptimeInvalidNumeral,
     comptime_invalid_quote: ComptimeInvalidQuote,
     comptime_expect_failed: ComptimeExpectFailed,
     comptime_eval_error: ComptimeEvalError,
     invalid_numeric_literal: InvalidNumericLiteral,
+    tuple_access_needs_annotation: TupleAccessNeedsAnnotation,
     literal_defaulted: LiteralDefaulted,
     non_exhaustive_match: NonExhaustiveMatch,
     non_exhaustive_destructure: NonExhaustiveDestructure,
@@ -62,6 +63,7 @@ pub const Problem = union(enum) {
     unmatchable_pattern: UnmatchablePattern,
     unreachable_code: UnreachableCode,
     comptime_unused_branch: ComptimeUnusedBranch,
+    comptime_condition: ComptimeCondition,
 
     pub const Idx = enum(u32) { _ };
     pub const Tag = std.meta.Tag(@This());
@@ -89,6 +91,8 @@ pub const PlatformHostedSection = struct {
         duplicate_function,
         /// Two hosted/provides entries use the same linker symbol
         duplicate_symbol,
+        /// The symbol is not a valid external C identifier
+        invalid_symbol,
         /// The symbol is one of the fixed runtime symbols (the roc_alloc family)
         reserved_symbol,
         /// The symbol starts with the internal roc__ namespace prefix
@@ -104,6 +108,11 @@ pub const PlatformDefNotFound = struct {
 
 /// Hosted functions cannot accept or return unboxed functions.
 pub const HostedUnboxedFunction = struct {
+    region: base.Region,
+};
+
+/// Host-bound types must not contain open record or tag-union rows.
+pub const HostBoundaryOpenRow = struct {
     region: base.Region,
 };
 
@@ -133,12 +142,6 @@ pub const EffectfulExpect = struct {
 
 /// A crash that occurred during compile-time evaluation
 pub const ComptimeCrash = struct {
-    message: ExtraStringIdx,
-    region: base.Region,
-};
-
-/// A dbg that ran during compile-time evaluation
-pub const ComptimeDbg = struct {
     message: ExtraStringIdx,
     region: base.Region,
 };
@@ -201,6 +204,12 @@ pub const InvalidNumericLiteral = struct {
     expected_type: SnapshotContentIdx,
     is_fractional: bool,
     region: base.Region,
+};
+
+/// Tuple access on an unconstrained value cannot infer the tuple's full arity.
+pub const TupleAccessNeedsAnnotation = struct {
+    region: base.Region,
+    elem_index: u32,
 };
 
 /// Warning (the Haskell §4.3.4 / `-Wtype-defaults` analogue): an open literal
@@ -290,6 +299,16 @@ pub const ComptimeUnusedBranch = struct {
     branch_region: base.Region,
 };
 
+/// A conditional expression was known while checking, so it will always make the same choice.
+pub const ComptimeCondition = struct {
+    kind: enum {
+        if_condition,
+        if_guard,
+        match_scrutinee,
+    },
+    region: base.Region,
+};
+
 /// Problem data for a redundant pattern in a match
 pub const RedundantPattern = struct {
     match_expr: CIR.Expr.Idx,
@@ -348,6 +367,9 @@ pub const UnresolvedDispatcher = struct {
     is_binop: bool,
     /// For desugared equality (`==`/`!=`), whether the source operator was `!=`.
     binop_negated: bool,
+    /// True when checking inserted an explicit runtime-error node for this
+    /// diagnostic, so post-check lowering can safely continue through it.
+    runtime_error_inserted: bool,
 };
 
 /// Error when you try to static dispatch on something that's not a nominal type
@@ -366,9 +388,9 @@ pub const DispatcherDoesNotImplMethod = struct {
     fn_var: Var,
     method_name: Ident.Idx,
     origin: types_mod.StaticDispatchConstraint.Origin,
-    /// Optional numeric literal info for from_numeral constraints
+    /// Optional numeric literal info for `from_literal` constraints of kind `numeral`
     num_literal: ?types_mod.NumeralInfo = null,
-    /// Source region of the string literal for from_quote constraints
+    /// Source region of the string literal for `from_literal` constraints of kind `quote`
     quote_region: ?base.Region = null,
     /// True when the dispatcher was a numeric literal that was defaulted to Dec
     /// because no type annotation was given. Used to add explanatory text in errors.

@@ -10,26 +10,20 @@ platform ""
         HostedFunctionInfo,
         ModuleTypeInfo,
         ProvidesEntry,
+        RocName,
         RecordField,
         RecordFieldInfo,
         RecordRepr,
         TagUnionRepr,
         TagVariant,
         TypeId,
+        TypeTable,
         TypeRepr,
         Types,
     ]
     packages {}
     provides { "roc_make_glue": make_glue_for_host }
-    targets: {
-        inputs_dir: "targets/",
-        x64mac: { inputs: ["libhost.a", app] },
-        arm64mac: { inputs: ["libhost.a", app] },
-        x64musl: { inputs: ["crt1.o", "libhost.a", app, "libc.a"] },
-        arm64musl: { inputs: ["crt1.o", "libhost.a", app, "libc.a"] },
-        x64win: { inputs: ["host.lib", app] },
-        arm64win: { inputs: ["host.lib", app] },
-    }
+    targets: {}
 
 import Types exposing [Types]
 import File exposing [File]
@@ -46,6 +40,8 @@ import TagUnionRepr exposing [TagUnionRepr]
 import TagVariant exposing [TagVariant]
 import TypeRepr exposing [TypeRepr]
 import ProvidesEntry exposing [ProvidesEntry]
+import TypeTable exposing [TypeTable]
+import RocName exposing [RocName]
 
 make_glue_for_host : List(Types) -> Try(List(File), Str)
 make_glue_for_host = |types_list| make_glue(types_list)

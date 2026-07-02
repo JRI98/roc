@@ -733,6 +733,7 @@ pub fn addPattern(store: *NodeStore, pattern: AST.Pattern) std.mem.Allocator.Err
             try store.extra_data.append(store.gpa, t.args.span.len);
             try store.extra_data.append(store.gpa, t.qualifiers.span.start);
             try store.extra_data.append(store.gpa, t.qualifiers.span.len);
+            try store.extra_data.append(store.gpa, @intFromBool(t.backing_value));
 
             node.tag = .tag_patt;
             node.region = t.region;
@@ -1070,6 +1071,15 @@ pub fn addExpr(store: *NodeStore, expr: AST.Expr) std.mem.Allocator.Error!AST.Ex
             node.region = nr.region;
             node.data.lhs = @intFromEnum(nr.mapper);
             node.data.rhs = @intFromEnum(nr.backing);
+        },
+        .nominal_apply => |na| {
+            node.tag = .nominal_apply;
+            node.region = na.region;
+            node.data.lhs = @intFromEnum(na.mapper);
+            const args_data_idx = store.extra_data.items.len;
+            try store.extra_data.append(store.gpa, na.args.span.start);
+            try store.extra_data.append(store.gpa, na.args.span.len);
+            node.data.rhs = @as(u32, @intCast(args_data_idx));
         },
         .block => |body| {
             node.tag = .block;
@@ -1742,6 +1752,7 @@ pub fn getPattern(store: *const NodeStore, pattern_idx: AST.Pattern.Idx) AST.Pat
             const args_len = store.extra_data.items[ed_start];
             const qualifiers_start = store.extra_data.items[ed_start + 1];
             const qualifiers_len = store.extra_data.items[ed_start + 2];
+            const backing_value = store.extra_data.items[ed_start + 3] != 0;
 
             return .{ .tag = .{
                 .tag_tok = node.main_token,
@@ -1753,6 +1764,7 @@ pub fn getPattern(store: *const NodeStore, pattern_idx: AST.Pattern.Idx) AST.Pat
                     .start = qualifiers_start,
                     .len = qualifiers_len,
                 } },
+                .backing_value = backing_value,
                 .region = node.region,
             } };
         },
@@ -2187,6 +2199,17 @@ pub fn getExpr(store: *const NodeStore, expr_idx: AST.Expr.Idx) AST.Expr {
             return .{ .nominal_record = .{
                 .mapper = @enumFromInt(node.data.lhs),
                 .backing = @enumFromInt(node.data.rhs),
+                .region = node.region,
+            } };
+        },
+        .nominal_apply => {
+            const args_data_idx = @as(usize, @intCast(node.data.rhs));
+            return .{ .nominal_apply = .{
+                .mapper = @enumFromInt(node.data.lhs),
+                .args = .{ .span = .{
+                    .start = store.extra_data.items[args_data_idx],
+                    .len = store.extra_data.items[args_data_idx + 1],
+                } },
                 .region = node.region,
             } };
         },

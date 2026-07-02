@@ -22,6 +22,8 @@ pub fn run(
     owned.names = @import("check").CheckedNames.NameStore.init(allocator);
     var types = owned.types;
     owned.types = @import("../monotype/type.zig").Store.init(allocator);
+    var imported_fns = owned.imported_fns;
+    owned.imported_fns = .empty;
     var exprs = owned.exprs;
     owned.exprs = .empty;
     var pats = owned.pats;
@@ -40,6 +42,8 @@ pub fn run(
     owned.stmt_ids = .empty;
     var field_exprs = owned.field_exprs;
     owned.field_exprs = .empty;
+    var fn_def_captures = owned.fn_def_captures;
+    owned.fn_def_captures = .empty;
     var record_destructs = owned.record_destructs;
     owned.record_destructs = .empty;
     const str_pattern_steps = owned.str_pattern_steps;
@@ -48,18 +52,12 @@ pub fn run(
     owned.branches = .empty;
     var if_branches = owned.if_branches;
     owned.if_branches = .empty;
-    var state_loop_states = owned.state_loop_states;
-    owned.state_loop_states = .empty;
     var string_literals = owned.string_literals;
     owned.string_literals = .empty;
-    var local_proc_contexts = owned.local_proc_contexts;
-    owned.local_proc_contexts = .empty;
     var proc_debug_names = owned.proc_debug_names;
     owned.proc_debug_names = Mono.ProcDebugNameMap.init(allocator);
     var runtime_schema_requests = owned.runtime_schema_requests;
     owned.runtime_schema_requests = .empty;
-    var static_data_values = owned.static_data_values;
-    owned.static_data_values = .empty;
     var comptime_sites = owned.comptime_sites;
     owned.comptime_sites = .empty;
     var source_files = owned.source_files;
@@ -79,6 +77,7 @@ pub fn run(
         allocator,
         name_store,
         types,
+        imported_fns,
         exprs,
         pats,
         stmts,
@@ -88,13 +87,12 @@ pub fn run(
         typed_locals,
         stmt_ids,
         field_exprs,
+        fn_def_captures,
         record_destructs,
         str_pattern_steps,
         branches,
         if_branches,
-        state_loop_states,
         string_literals,
-        local_proc_contexts,
         proc_debug_names,
         source_files,
         expr_locs,
@@ -102,12 +100,12 @@ pub fn run(
         stmt_locs,
         stmt_regions,
         local_names,
-        static_data_values,
         comptime_sites,
         owned.next_symbol,
     );
     name_store = undefined;
     types = undefined;
+    imported_fns = undefined;
     exprs = undefined;
     pats = undefined;
     stmts = undefined;
@@ -117,12 +115,11 @@ pub fn run(
     typed_locals = undefined;
     stmt_ids = undefined;
     field_exprs = undefined;
+    fn_def_captures = undefined;
     record_destructs = undefined;
     branches = undefined;
     if_branches = undefined;
-    state_loop_states = undefined;
     string_literals = undefined;
-    local_proc_contexts = undefined;
     proc_debug_names = undefined;
     source_files = undefined;
     expr_locs = undefined;
@@ -130,13 +127,13 @@ pub fn run(
     stmt_locs = undefined;
     stmt_regions = undefined;
     local_names = undefined;
-    static_data_values = undefined;
     comptime_sites = undefined;
     program.runtime_schema_requests = runtime_schema_requests;
     runtime_schema_requests = undefined;
     errdefer program.deinit();
 
-    var lifter = try Lifter.init(allocator, &owned, &program);
+    const source_view = movedMonoView(&owned, &program);
+    var lifter = try Lifter.init(allocator, source_view, &program);
     defer lifter.deinit();
 
     try lifter.lowerDefsAndRoots();
@@ -144,6 +141,66 @@ pub fn run(
 
     owned.deinit();
     return program;
+}
+
+/// Build the read-only Monotype input view after side arrays have been moved
+/// into the lifted output program. The source still owns definitions, roots,
+/// and specialization metadata until `run` finishes.
+fn movedMonoView(source: *const Mono.Program, moved: *const Ast.Program) Mono.ProgramView {
+    return .{
+        .names = &moved.names,
+        .types = moved.types.view(),
+        .specs = source.specs.items,
+        .imported_fns = source.imported_fns.items,
+        .fns = source.fns.items,
+        .defs = source.defs.items,
+        .nested_defs = source.nested_defs.items,
+        .exprs = moved.exprs.items,
+        .pats = moved.pats.items,
+        .stmts = moved.stmts.items,
+        .locals = moved.locals.items,
+        .expr_ids = moved.expr_ids.items,
+        .pat_ids = moved.pat_ids.items,
+        .typed_locals = moved.typed_locals.items,
+        .stmt_ids = moved.stmt_ids.items,
+        .field_exprs = moved.field_exprs.items,
+        .fn_def_captures = moved.fn_def_captures.items,
+        .record_destructs = moved.record_destructs.items,
+        .str_pattern_steps = moved.str_pattern_steps.items,
+        .branches = moved.branches.items,
+        .if_branches = moved.if_branches.items,
+        .string_literals = moved.string_literals.items,
+        .proc_debug_names = moved.proc_debug_names.items.items,
+        .roots = source.roots.items,
+        .layout_requests = source.layout_requests.items,
+        .runtime_schema_requests = moved.runtime_schema_requests.items,
+        .comptime_sites = moved.comptime_sites.items,
+        .source_files = moved.source_files.items,
+        .expr_locs = moved.expr_locs.items,
+        .expr_regions = moved.expr_regions.items,
+        .stmt_locs = moved.stmt_locs.items,
+        .stmt_regions = moved.stmt_regions.items,
+        .local_names = moved.local_names.items,
+        .next_symbol = source.next_symbol,
+    };
+}
+
+/// Recompute every lifted function's capture span from the current function
+/// bodies, then rebase every function reference/direct-call capture operand
+/// span to the recomputed capture slot order. Transformations that clone or
+/// rewrite lifted bodies must call this after they finish mutating the program,
+/// because substitutions can change the capture shape of the rewritten
+/// functions.
+pub fn recomputeCaptures(allocator: Allocator, program: *Ast.Program) Allocator.Error!void {
+    const fn_captures = try allocateCaptureTable(allocator, program.fns.items.len);
+    defer deinitCaptureTable(allocator, fn_captures);
+
+    try solveCaptureFixpoint(allocator, program, fn_captures);
+    try finalizeProgramFunctionReferenceCaptures(allocator, program, fn_captures);
+
+    for (program.fns.items, 0..) |*fn_, index| {
+        fn_.captures = try program.addTypedLocalSpan(fn_captures[index].items);
+    }
 }
 
 const DefMap = []?Ast.FnId;
@@ -155,9 +212,27 @@ const MonoFnBody = struct {
     body: Mono.FnBody,
 };
 
+const CaptureIdentity = struct {
+    const Origin = union(enum) {
+        binder: checked.PatternBinderId,
+        generated: u32,
+        local: Ast.LocalId,
+    };
+
+    origin: Origin,
+    ty: MonoType.TypeId,
+};
+
+const CaptureOperand = struct {
+    identity: CaptureIdentity,
+    value: Ast.ExprId,
+};
+
+const CaptureOperandSpan = Ast.Span(CaptureOperand);
+
 const Lifter = struct {
     allocator: Allocator,
-    source: *const Mono.Program,
+    source: Mono.ProgramView,
     output: *Ast.Program,
     expr_done: []bool,
     stmt_done: []bool,
@@ -167,6 +242,8 @@ const Lifter = struct {
     fn_bodies: std.ArrayList(?MonoFnBody),
     nested_fn_ids: std.AutoHashMap(Ast.FnId, void),
     initialized_fns: std.AutoHashMap(Ast.FnId, void),
+    capture_operands: std.ArrayList(CaptureOperand),
+    capture_operands_by_expr: std.AutoHashMap(Ast.ExprId, CaptureOperandSpan),
     symbols: Common.SymbolGen,
     /// Solved capture set per lifted function, indexed by `Ast.FnId`. Computed
     /// as a least fixed point over the function-reference graph before any body
@@ -175,7 +252,7 @@ const Lifter = struct {
     /// walking (possibly already-rewritten) bodies.
     fn_captures: []std.ArrayList(Ast.TypedLocal),
 
-    fn init(allocator: Allocator, source: *const Mono.Program, output: *Ast.Program) Allocator.Error!Lifter {
+    fn init(allocator: Allocator, source: Mono.ProgramView, output: *Ast.Program) Allocator.Error!Lifter {
         const expr_done = try allocator.alloc(bool, output.exprCount());
         errdefer allocator.free(expr_done);
         @memset(expr_done, false);
@@ -196,6 +273,8 @@ const Lifter = struct {
             .fn_bodies = .empty,
             .nested_fn_ids = std.AutoHashMap(Ast.FnId, void).init(allocator),
             .initialized_fns = std.AutoHashMap(Ast.FnId, void).init(allocator),
+            .capture_operands = .empty,
+            .capture_operands_by_expr = std.AutoHashMap(Ast.ExprId, CaptureOperandSpan).init(allocator),
             .symbols = .{ .next = source.next_symbol },
             .fn_captures = &.{},
         };
@@ -204,6 +283,8 @@ const Lifter = struct {
     fn deinit(self: *Lifter) void {
         for (self.fn_captures) |*captures| captures.deinit(self.allocator);
         if (self.fn_captures.len > 0) self.allocator.free(self.fn_captures);
+        self.capture_operands_by_expr.deinit();
+        self.capture_operands.deinit(self.allocator);
         self.initialized_fns.deinit();
         self.nested_fn_ids.deinit();
         self.fn_bodies.deinit(self.allocator);
@@ -215,13 +296,13 @@ const Lifter = struct {
     }
 
     fn lowerDefsAndRoots(self: *Lifter) Allocator.Error!void {
-        self.fn_map = try self.allocator.alloc(?Ast.FnId, self.source.fns.items.len);
+        self.fn_map = try self.allocator.alloc(?Ast.FnId, self.source.fns.len);
         @memset(self.fn_map, null);
 
-        self.def_map = try self.allocator.alloc(?Ast.FnId, self.source.defs.items.len);
+        self.def_map = try self.allocator.alloc(?Ast.FnId, self.source.defs.len);
         @memset(self.def_map, null);
 
-        for (self.source.defs.items, 0..) |def, index| {
+        for (self.source.defs, 0..) |def, index| {
             const fn_id: Ast.FnId = @enumFromInt(@as(u32, @intCast(self.output.fns.items.len)));
             try self.output.fns.append(self.allocator, undefined);
             try self.fn_bodies.append(self.allocator, .{ .args = def.args, .body = def.body });
@@ -229,9 +310,9 @@ const Lifter = struct {
             if (def.fn_id) |source_fn_id| self.registerFn(source_fn_id, fn_id);
         }
 
-        self.nested_def_map = try self.allocator.alloc(?Ast.FnId, self.source.nested_defs.items.len);
+        self.nested_def_map = try self.allocator.alloc(?Ast.FnId, self.source.nested_defs.len);
         @memset(self.nested_def_map, null);
-        for (self.source.nested_defs.items, 0..) |def, index| {
+        for (self.source.nested_defs, 0..) |def, index| {
             const fn_id: Ast.FnId = @enumFromInt(@as(u32, @intCast(self.output.fns.items.len)));
             try self.output.fns.append(self.allocator, undefined);
             try self.fn_bodies.append(self.allocator, .{ .args = def.args, .body = .{ .roc = def.body } });
@@ -242,12 +323,12 @@ const Lifter = struct {
 
         try self.computeCaptureFixpoint();
 
-        for (self.source.defs.items, 0..) |def, index| {
+        for (self.source.defs, 0..) |def, index| {
             try self.lowerTopLevelDef(self.def_map[index] orelse
                 Common.invariant("Monotype definition was not reserved before lifting"), def);
         }
 
-        for (self.source.nested_defs.items, 0..) |def, index| {
+        for (self.source.nested_defs, 0..) |def, index| {
             try self.lowerNestedDef(self.nested_def_map[index] orelse
                 Common.invariant("Monotype nested definition was not reserved before lifting"), def);
         }
@@ -258,7 +339,9 @@ const Lifter = struct {
             Common.invariant("Monotype Lifted function was reserved but not initialized");
         }
 
-        for (self.source.roots.items) |root| {
+        try self.completeFunctionReferenceCaptures();
+
+        for (self.source.roots) |root| {
             const raw = @intFromEnum(root.def);
             if (raw >= self.def_map.len) Common.invariant("Monotype root references a missing definition");
             const fn_id = self.def_map[raw] orelse
@@ -269,7 +352,7 @@ const Lifter = struct {
             });
         }
 
-        for (self.source.layout_requests.items) |request| {
+        for (self.source.layout_requests) |request| {
             const fn_id = if (request.def) |def| blk: {
                 const raw = @intFromEnum(def);
                 if (raw >= self.def_map.len) Common.invariant("Monotype static data layout request references a missing definition");
@@ -280,8 +363,40 @@ const Lifter = struct {
                 .checked_type = request.checked_type,
                 .ty = request.ty,
                 .fn_id = fn_id,
-                .static_data = request.static_data,
             });
+        }
+    }
+
+    fn completeFunctionReferenceCaptures(self: *Lifter) Allocator.Error!void {
+        const expr_count = self.expr_done.len;
+        for (0..expr_count) |index| {
+            if (!self.expr_done[index]) continue;
+
+            const expr_id: Ast.ExprId = @enumFromInt(@as(u32, @intCast(index)));
+            switch (self.output.exprs.items[index].data) {
+                .fn_ref => |fn_ref| {
+                    const captures = self.output.typedLocalSpan(self.output.fns.items[@intFromEnum(fn_ref.fn_id)].captures);
+                    if (captures.len == 0 and fn_ref.captures.len == 0) continue;
+                    const operands = self.captureOperandsForExpr(expr_id, fn_ref.captures);
+                    self.output.exprs.items[index].data = .{ .fn_ref = .{
+                        .fn_id = fn_ref.fn_id,
+                        .captures = try finalizeCaptureExprSpanFromOperands(self.allocator, self.output, operands, captures),
+                    } };
+                },
+                .call_proc => |call| {
+                    const fn_id = Ast.localDirectCallee(call) orelse continue;
+                    const captures = self.output.typedLocalSpan(self.output.fns.items[@intFromEnum(fn_id)].captures);
+                    if (captures.len == 0 and call.captures.len == 0) continue;
+                    const operands = self.captureOperandsForExpr(expr_id, call.captures);
+                    self.output.exprs.items[index].data = .{ .call_proc = .{
+                        .callee = call.callee,
+                        .args = call.args,
+                        .captures = try finalizeCaptureExprSpanFromOperands(self.allocator, self.output, operands, captures),
+                        .is_cold = call.is_cold,
+                    } };
+                },
+                else => {},
+            }
         }
     }
 
@@ -333,8 +448,8 @@ const Lifter = struct {
             .expr,
             .expect,
             .dbg,
-            .return_,
             => |expr| try self.rewriteExpr(expr),
+            .return_ => |ret| try self.rewriteExpr(ret.value),
             .crash => {},
         }
     }
@@ -353,25 +468,22 @@ const Lifter = struct {
             .frac_f64_lit,
             .dec_lit,
             .str_lit,
-            .static_data,
             .uninitialized,
             .uninitialized_payload,
             .crash,
             .comptime_exhaustiveness_failed,
-            .fn_ref,
             => {},
-            .fn_ref_captures => |fn_ref| for (self.output.exprSpan(fn_ref.captures)) |capture| try self.rewriteExpr(capture),
-            .static_data_candidate => |candidate| try self.rewriteExpr(candidate.restored_expr),
+            .fn_ref => |fn_ref| for (self.output.exprSpan(fn_ref.captures)) |capture| try self.rewriteExpr(capture),
             .list,
             .tuple,
             => |items| for (self.output.exprSpan(items)) |child| try self.rewriteExpr(child),
             .record => |fields| for (self.output.fieldExprSpan(fields)) |field| try self.rewriteExpr(field.value),
             .tag => |tag| for (self.output.exprSpan(tag.payloads)) |child| try self.rewriteExpr(child),
             .nominal,
-            .return_,
             .dbg,
             .expect,
             => |child| try self.rewriteExpr(child),
+            .return_ => |ret| try self.rewriteExpr(ret.value),
             .expect_err => |expect_err| try self.rewriteExpr(expect_err.msg),
             .comptime_branch_taken => |taken| try self.rewriteExpr(taken.body),
             .let_ => |let_| {
@@ -382,23 +494,63 @@ const Lifter = struct {
             .def_ref => |def_id| {
                 const raw = @intFromEnum(def_id);
                 if (raw >= self.def_map.len) Common.invariant("Monotype definition reference was outside the definition table");
-                expr.data = .{ .fn_ref = self.def_map[raw] orelse
-                    Common.invariant("Monotype definition reference reached lifting before its function was registered") };
+                const fn_id = self.def_map[raw] orelse
+                    Common.invariant("Monotype definition reference reached lifting before its function was registered");
+                const captures = try self.captureExprSpanForFn(fn_id, expr_id);
+                self.output.exprs.items[index].data = .{ .fn_ref = .{
+                    .fn_id = fn_id,
+                    .captures = captures,
+                } };
             },
-            .fn_def => |fn_id| expr.data = .{ .fn_ref = self.liftedFn(fn_id) },
+            .fn_def => |fn_def| {
+                for (self.output.fnDefCaptureSpan(fn_def.captures)) |capture| try self.rewriteExpr(capture.value);
+                const lifted = self.liftedFn(fn_def.fn_id);
+                const captures = try self.fnRefCaptureExprSpanForFnDef(lifted, fn_def.captures, expr_id);
+                self.output.exprs.items[index].data = .{ .fn_ref = .{
+                    .fn_id = lifted,
+                    .captures = captures,
+                } };
+            },
             .call_value => |call| {
                 try self.rewriteExpr(call.callee);
                 for (self.output.exprSpan(call.args)) |arg| try self.rewriteExpr(arg);
             },
             .call_proc => |call| {
-                const fn_id = switch (call.callee) {
-                    .func => |mono_fn_id| self.liftedFn(mono_fn_id),
-                    .lifted => |fn_id| fn_id,
-                };
                 for (self.output.exprSpan(call.args)) |arg| try self.rewriteExpr(arg);
-                expr.data = .{ .call_proc = .{
-                    .callee = .{ .lifted = fn_id },
+                for (self.output.exprSpan(call.captures)) |capture| try self.rewriteExpr(capture);
+                const RewrittenProcCall = struct {
+                    callee: Mono.ProcCallee,
+                    captures: Ast.Span(Ast.ExprId),
+                };
+                const rewritten: RewrittenProcCall = switch (call.callee) {
+                    .func => |slot| switch (slot) {
+                        .local => |mono_fn_id| blk: {
+                            const fn_id = self.liftedFn(mono_fn_id);
+                            break :blk .{
+                                .callee = .{ .lifted = fn_id },
+                                .captures = if (call.captures.len == 0)
+                                    try self.captureExprSpanForFn(fn_id, expr_id)
+                                else
+                                    call.captures,
+                            };
+                        },
+                        .imported => |imported| .{
+                            .callee = .{ .func = .{ .imported = imported } },
+                            .captures = call.captures,
+                        },
+                    },
+                    .lifted => |fn_id| .{
+                        .callee = .{ .lifted = fn_id },
+                        .captures = if (call.captures.len == 0)
+                            try self.captureExprSpanForFn(fn_id, expr_id)
+                        else
+                            call.captures,
+                    },
+                };
+                self.output.exprs.items[index].data = .{ .call_proc = .{
+                    .callee = rewritten.callee,
                     .args = call.args,
+                    .captures = rewritten.captures,
                     .is_cold = call.is_cold,
                 } };
             },
@@ -448,21 +600,21 @@ const Lifter = struct {
                 for (self.output.exprSpan(loop.initial_values)) |initial| try self.rewriteExpr(initial);
                 try self.rewriteExpr(loop.body);
             },
-            .state_loop => |state_loop| {
-                for (self.output.exprSpan(state_loop.entry_values)) |initial| try self.rewriteExpr(initial);
-                for (self.output.stateLoopStateSpan(state_loop.states)) |state| try self.rewriteExpr(state.body);
-            },
             .break_ => |maybe| if (maybe) |value| try self.rewriteExpr(value),
             .continue_ => |continue_| for (self.output.exprSpan(continue_.values)) |value| try self.rewriteExpr(value),
-            .state_continue => |continue_| for (self.output.exprSpan(continue_.values)) |value| try self.rewriteExpr(value),
         }
     }
 
     fn liftLambda(self: *Lifter, expr_id: Mono.ExprId, ty: @import("../monotype/type.zig").TypeId, lambda: Mono.LambdaExpr) Allocator.Error!void {
         const fn_id = try self.reserveFn(lambda.fn_id);
-        self.output.exprs.items[@intFromEnum(expr_id)].data = .{ .fn_ref = fn_id };
-        if (self.nested_fn_ids.contains(fn_id)) return;
-        if (self.initialized_fns.contains(fn_id)) return;
+        if (self.nested_fn_ids.contains(fn_id) or self.initialized_fns.contains(fn_id)) {
+            const captures = try self.captureExprSpanForFn(fn_id, expr_id);
+            self.output.exprs.items[@intFromEnum(expr_id)].data = .{ .fn_ref = .{
+                .fn_id = fn_id,
+                .captures = captures,
+            } };
+            return;
+        }
 
         try self.setFnBody(fn_id, .{ .args = lambda.args, .body = .{ .roc = lambda.body } });
 
@@ -477,6 +629,12 @@ const Lifter = struct {
         defer bound.deinit();
         try bindTypedLocals(self.output, &bound, self.output.typedLocalSpan(lambda.args));
         try captures.collectExpr(lambda.body, &bound);
+
+        const capture_exprs = try self.captureExprSpanFromTypedLocals(captures.items.items, expr_id);
+        self.output.exprs.items[@intFromEnum(expr_id)].data = .{ .fn_ref = .{
+            .fn_id = fn_id,
+            .captures = capture_exprs,
+        } };
 
         try self.rewriteExpr(lambda.body);
         const capture_span = try self.output.addTypedLocalSpan(captures.items.items);
@@ -509,19 +667,12 @@ const Lifter = struct {
         self.fn_bodies.items[raw] = body;
     }
 
-    /// Solve every function's capture set as a least fixed point over the
+    /// Solve every function's capture set as a fixed point over the
     /// function-reference graph. Each function's captures are the free locals
     /// of its body, where a reference to another function contributes that
-    /// callee's solved captures (filtered by the locals bound at the reference
-    /// site). The all-empty assignment is the bottom; `addIfFree` only ever
-    /// grows a set, so iteration is monotone and terminates.
-    ///
-    /// Propagation is edge-driven: re-solving a function only when one of its
-    /// callees grew, via the reverse-edge map, instead of re-walking every
-    /// function each round. A function's stored order is its body's discovery
-    /// order under the final callee sets — deterministic and self-consistent
-    /// (every consumer of a function reads that one span), which is all the
-    /// downstream positional capture handling requires.
+    /// callee's current captures filtered by the locals bound at the reference
+    /// site. The stored order is the body's discovery order under the final
+    /// callee sets.
     fn computeCaptureFixpoint(self: *Lifter) Allocator.Error!void {
         // `count` covers top-level defs and nested defs only; inline lambdas are
         // reserved later, during `rewriteExpr`/`liftLambda`. Sizing here is what
@@ -529,79 +680,33 @@ const Lifter = struct {
         // are never the target of a reference that reaches `collectFnCaptures`
         // (only defs and nested defs are) — an invariant that function enforces.
         const count = self.output.fns.items.len;
-        self.fn_captures = try self.allocator.alloc(std.ArrayList(Ast.TypedLocal), count);
-        for (self.fn_captures) |*captures| captures.* = .empty;
-
-        // Callers indexed by callee. Edges are structural — independent of the
-        // captures being solved — so the reverse map is built once, from each
-        // function's first solve, rather than re-derived on every re-solve.
-        const callers = try self.allocator.alloc(std.ArrayList(Ast.FnId), count);
-        defer {
-            for (callers) |*list| list.deinit(self.allocator);
-            self.allocator.free(callers);
-        }
-        for (callers) |*list| list.* = .empty;
-
-        var queued = try self.allocator.alloc(bool, count);
-        defer self.allocator.free(queued);
-        @memset(queued, true);
-
-        var recorded = try self.allocator.alloc(bool, count);
-        defer self.allocator.free(recorded);
-        @memset(recorded, false);
-
-        var worklist = std.ArrayList(Ast.FnId).empty;
-        defer worklist.deinit(self.allocator);
-        try worklist.ensureTotalCapacity(self.allocator, count);
-        for (0..count) |raw| worklist.appendAssumeCapacity(@enumFromInt(@as(u32, @intCast(raw))));
+        self.fn_captures = try allocateCaptureTable(self.allocator, count);
 
         var scratch = CaptureSet.init(self);
         defer scratch.deinit();
         var bound = BoundSet.init(self.allocator);
         defer bound.deinit();
-        var edge_buf = std.ArrayList(Ast.FnId).empty;
-        defer edge_buf.deinit(self.allocator);
 
-        while (worklist.pop()) |fn_id| {
-            const raw = @intFromEnum(fn_id);
-            queued[raw] = false;
-
-            // Collect edges only on the first solve of each function; the
-            // reverse map they build is complete because every function is
-            // solved at least once (all start queued).
-            if (recorded[raw]) {
-                try self.solveInto(fn_id, &scratch, &bound, null);
-            } else {
-                edge_buf.clearRetainingCapacity();
-                try self.solveInto(fn_id, &scratch, &bound, &edge_buf);
-                for (edge_buf.items) |callee| {
-                    try callers[@intFromEnum(callee)].append(self.allocator, fn_id);
-                }
-                recorded[raw] = true;
-            }
-
-            if (scratch.items.items.len > self.fn_captures[raw].items.len) {
-                self.fn_captures[raw].clearRetainingCapacity();
-                try self.fn_captures[raw].appendSlice(self.allocator, scratch.items.items);
-                for (callers[raw].items) |caller| {
-                    const craw = @intFromEnum(caller);
-                    if (!queued[craw]) {
-                        queued[craw] = true;
-                        try worklist.append(self.allocator, caller);
-                    }
+        var changed = true;
+        while (changed) {
+            changed = false;
+            for (0..count) |raw| {
+                const fn_id: Ast.FnId = @enumFromInt(@as(u32, @intCast(raw)));
+                try self.solveInto(fn_id, &scratch, &bound);
+                if (!captureListEql(scratch.items.items, self.fn_captures[raw].items)) {
+                    self.fn_captures[raw].clearRetainingCapacity();
+                    try self.fn_captures[raw].appendSlice(self.allocator, scratch.items.items);
+                    changed = true;
                 }
             }
         }
     }
 
     /// Solve one function's captures into the reusable `scratch`/`bound`,
-    /// reading the current solved sets of referenced functions. When
-    /// `edges_out` is non-null, the referenced functions are recorded there
-    /// (used to build the reverse-edge map on a function's first solve). Both
-    /// scratch buffers are cleared first.
-    fn solveInto(self: *Lifter, fn_id: Ast.FnId, scratch: *CaptureSet, bound: *BoundSet, edges_out: ?*std.ArrayList(Ast.FnId)) Allocator.Error!void {
+    /// reading the current solved sets of referenced functions. Both scratch
+    /// buffers are cleared first.
+    fn solveInto(self: *Lifter, fn_id: Ast.FnId, scratch: *CaptureSet, bound: *BoundSet) Allocator.Error!void {
         scratch.clear();
-        scratch.edges = edges_out;
         bound.clear();
         const body = self.fn_bodies.items[@intFromEnum(fn_id)] orelse return;
         try bindTypedLocals(self.output, bound, self.output.typedLocalSpan(body.args));
@@ -628,6 +733,122 @@ const Lifter = struct {
             Common.invariant("Monotype expression referenced a function specialization before lifting registered it");
     }
 
+    fn captureExprSpanForFn(self: *Lifter, fn_id: Ast.FnId, call_expr: Mono.ExprId) Allocator.Error!Ast.Span(Ast.ExprId) {
+        return try self.captureExprSpanFromTypedLocals(self.fn_captures[@intFromEnum(fn_id)].items, call_expr);
+    }
+
+    fn captureExprSpanFromTypedLocals(self: *Lifter, captures: []const Ast.TypedLocal, call_expr: Mono.ExprId) Allocator.Error!Ast.Span(Ast.ExprId) {
+        if (captures.len == 0) return .empty();
+
+        const saved_loc = self.output.current_loc;
+        defer self.output.current_loc = saved_loc;
+        const saved_region = self.output.current_region;
+        defer self.output.current_region = saved_region;
+        const call_loc = self.output.exprLoc(call_expr);
+        if (call_loc.hasLocation()) self.output.current_loc = call_loc;
+        const call_region = self.output.exprRegion(call_expr);
+        if (!call_region.isEmpty()) self.output.current_region = call_region;
+
+        const exprs = try self.allocator.alloc(Ast.ExprId, captures.len);
+        defer self.allocator.free(exprs);
+        const operands = try self.allocator.alloc(CaptureOperand, captures.len);
+        defer self.allocator.free(operands);
+        for (captures, 0..) |capture, index| {
+            exprs[index] = try self.output.addExpr(.{
+                .ty = capture.ty,
+                .data = .{ .local = capture.local },
+            });
+            operands[index] = .{ .identity = try captureIdentityForTypedLocal(self.output, capture), .value = exprs[index] };
+        }
+        const expr_span = try self.output.addExprSpan(exprs);
+        try self.recordCaptureOperands(call_expr, operands);
+        return expr_span;
+    }
+
+    fn fnRefCaptureExprSpanForFnDef(
+        self: *Lifter,
+        fn_id: Ast.FnId,
+        explicit_span: Ast.Span(Ast.FnDefCapture),
+        call_expr: Mono.ExprId,
+    ) Allocator.Error!Ast.Span(Ast.ExprId) {
+        if (explicit_span.len == 0) return try self.captureExprSpanForFn(fn_id, call_expr);
+
+        const captures = self.fn_captures[@intFromEnum(fn_id)].items;
+        if (captures.len == 0) return .empty();
+
+        const saved_loc = self.output.current_loc;
+        defer self.output.current_loc = saved_loc;
+        const saved_region = self.output.current_region;
+        defer self.output.current_region = saved_region;
+        const call_loc = self.output.exprLoc(call_expr);
+        if (call_loc.hasLocation()) self.output.current_loc = call_loc;
+        const call_region = self.output.exprRegion(call_expr);
+        if (!call_region.isEmpty()) self.output.current_region = call_region;
+
+        const explicit = self.output.fnDefCaptureSpan(explicit_span);
+        const exprs = try self.allocator.alloc(Ast.ExprId, captures.len);
+        defer self.allocator.free(exprs);
+        const operands = try self.allocator.alloc(CaptureOperand, captures.len);
+        defer self.allocator.free(operands);
+        for (captures, 0..) |capture, index| {
+            if (try explicitFnDefCaptureValue(self.output, explicit, capture)) |value| {
+                exprs[index] = value;
+            } else {
+                exprs[index] = try self.output.addExpr(.{
+                    .ty = capture.ty,
+                    .data = .{ .local = capture.local },
+                });
+            }
+            operands[index] = .{ .identity = try captureIdentityForTypedLocal(self.output, capture), .value = exprs[index] };
+        }
+        const expr_span = try self.output.addExprSpan(exprs);
+        try self.recordCaptureOperands(call_expr, operands);
+        return expr_span;
+    }
+
+    fn recordCaptureOperands(
+        self: *Lifter,
+        expr_id: Ast.ExprId,
+        operands: []const CaptureOperand,
+    ) Allocator.Error!void {
+        if (operands.len == 0) return;
+        if (self.capture_operands_by_expr.contains(expr_id)) {
+            Common.invariant("lifted function reference capture operands were recorded twice");
+        }
+        const start: u32 = @intCast(self.capture_operands.items.len);
+        try self.capture_operands.appendSlice(self.allocator, operands);
+        try self.capture_operands_by_expr.put(expr_id, .{
+            .start = start,
+            .len = @intCast(operands.len),
+        });
+    }
+
+    fn captureOperandSpan(self: *const Lifter, span: CaptureOperandSpan) []const CaptureOperand {
+        return self.capture_operands.items[span.start..][0..span.len];
+    }
+
+    fn captureOperandsForExpr(
+        self: *const Lifter,
+        expr_id: Ast.ExprId,
+        expr_span: Ast.Span(Ast.ExprId),
+    ) []const CaptureOperand {
+        const span = self.capture_operands_by_expr.get(expr_id) orelse
+            Common.invariant("lifted function reference had captures without keyed operands");
+        const operands = self.captureOperandSpan(span);
+        const exprs = self.output.exprSpan(expr_span);
+        if (exprs.len != 0) {
+            if (span.len != exprs.len) {
+                Common.invariant("lifted function reference capture identity operands disagreed with expression operands");
+            }
+            for (operands, exprs) |operand, expr| {
+                if (operand.value != expr) {
+                    Common.invariant("lifted function reference capture identity operands diverged from expression operands");
+                }
+            }
+        }
+        return operands;
+    }
+
     fn defSource(self: *Lifter, mono_fn_id: Mono.FnId, expected: ?Mono.FnTemplate) ?Mono.FnTemplate {
         const source = self.source.fnSource(mono_fn_id);
         if (expected) |template| {
@@ -647,6 +868,219 @@ const Lifter = struct {
     }
 };
 
+fn allocateCaptureTable(allocator: Allocator, count: usize) Allocator.Error![]std.ArrayList(Ast.TypedLocal) {
+    const captures = try allocator.alloc(std.ArrayList(Ast.TypedLocal), count);
+    for (captures) |*capture| capture.* = .empty;
+    return captures;
+}
+
+fn deinitCaptureTable(allocator: Allocator, captures: []std.ArrayList(Ast.TypedLocal)) void {
+    for (captures) |*capture| capture.deinit(allocator);
+    if (captures.len > 0) allocator.free(captures);
+}
+
+fn finalizeProgramFunctionReferenceCaptures(
+    allocator: Allocator,
+    program: *Ast.Program,
+    fn_captures: []std.ArrayList(Ast.TypedLocal),
+) Allocator.Error!void {
+    const expr_count = program.exprs.items.len;
+    for (0..expr_count) |index| {
+        switch (program.exprs.items[index].data) {
+            .fn_ref => |fn_ref| {
+                const fn_index = @intFromEnum(fn_ref.fn_id);
+                if (fn_index >= fn_captures.len) Common.invariant("function reference target missing recomputed captures");
+
+                const old_captures = program.typedLocalSpan(program.fns.items[fn_index].captures);
+                const new_captures = fn_captures[fn_index].items;
+                const capture_exprs = program.exprSpan(fn_ref.captures);
+                if (captureListEql(old_captures, new_captures) and capture_exprs.len == new_captures.len) continue;
+
+                const operands = try captureOperandsFromPositionals(allocator, program, old_captures, capture_exprs);
+                defer allocator.free(operands);
+                program.exprs.items[index].data = .{ .fn_ref = .{
+                    .fn_id = fn_ref.fn_id,
+                    .captures = try finalizeCaptureExprSpanFromOperands(allocator, program, operands, new_captures),
+                } };
+            },
+            .call_proc => |call| {
+                const fn_id = switch (call.callee) {
+                    .lifted => |fn_id| fn_id,
+                    .func => continue,
+                };
+                const fn_index = @intFromEnum(fn_id);
+                if (fn_index >= fn_captures.len) Common.invariant("direct call target missing recomputed captures");
+
+                const old_captures = program.typedLocalSpan(program.fns.items[fn_index].captures);
+                const new_captures = fn_captures[fn_index].items;
+                const capture_exprs = program.exprSpan(call.captures);
+                if (captureListEql(old_captures, new_captures) and capture_exprs.len == new_captures.len) continue;
+
+                const operands = try captureOperandsFromPositionals(allocator, program, old_captures, capture_exprs);
+                defer allocator.free(operands);
+                program.exprs.items[index].data = .{ .call_proc = .{
+                    .callee = call.callee,
+                    .args = call.args,
+                    .captures = try finalizeCaptureExprSpanFromOperands(allocator, program, operands, new_captures),
+                    .is_cold = call.is_cold,
+                } };
+            },
+            else => {},
+        }
+    }
+}
+
+fn captureOperandsFromPositionals(
+    allocator: Allocator,
+    program: *const Ast.Program,
+    captures: []const Ast.TypedLocal,
+    exprs: []const Ast.ExprId,
+) Allocator.Error![]CaptureOperand {
+    if (captures.len != exprs.len) {
+        Common.invariant("function reference capture operand count disagreed with its previous capture slots");
+    }
+
+    const operands = try allocator.alloc(CaptureOperand, captures.len);
+    errdefer allocator.free(operands);
+    for (captures, exprs, 0..) |capture, expr, index| {
+        operands[index] = .{ .identity = try captureIdentityForTypedLocal(program, capture), .value = expr };
+    }
+    return operands;
+}
+
+fn finalizeCaptureExprSpanFromOperands(
+    allocator: Allocator,
+    program: *Ast.Program,
+    operands: []const CaptureOperand,
+    captures: []const Ast.TypedLocal,
+) Allocator.Error!Ast.Span(Ast.ExprId) {
+    if (captures.len == 0) return .empty();
+
+    try assertUniqueOperandIdentities(program, operands);
+    try assertUniqueCaptureIdentities(program, captures);
+
+    const exprs = try allocator.alloc(Ast.ExprId, captures.len);
+    defer allocator.free(exprs);
+
+    for (captures, 0..) |capture, capture_index| {
+        const identity = try captureIdentityForTypedLocal(program, capture);
+        const operand = (try findCaptureOperand(program, operands, identity)) orelse
+            Common.invariant("function reference missing operand for finalized capture slot");
+        const operand_ty = program.exprs.items[@intFromEnum(operand.value)].ty;
+        if (!try monotypeTypeEql(program, operand_ty, capture.ty)) {
+            Common.invariant("function reference capture operand type differed from finalized capture slot");
+        }
+        exprs[capture_index] = operand.value;
+    }
+
+    return try program.addExprSpan(exprs);
+}
+
+fn assertUniqueOperandIdentities(program: *const Ast.Program, operands: []const CaptureOperand) Allocator.Error!void {
+    for (operands, 0..) |operand, index| {
+        for (operands[index + 1 ..]) |other| {
+            if (try captureIdentityEql(program, operand.identity, other.identity)) {
+                Common.invariant("function reference carried duplicate keyed capture operands");
+            }
+        }
+    }
+}
+
+fn assertUniqueCaptureIdentities(program: *const Ast.Program, captures: []const Ast.TypedLocal) Allocator.Error!void {
+    for (captures, 0..) |capture, index| {
+        const identity = try captureIdentityForTypedLocal(program, capture);
+        for (captures[index + 1 ..]) |other| {
+            if (try captureIdentityEql(program, identity, try captureIdentityForTypedLocal(program, other))) {
+                Common.invariant("lifted function declared duplicate capture identities");
+            }
+        }
+    }
+}
+
+fn findCaptureOperand(program: *const Ast.Program, operands: []const CaptureOperand, identity: CaptureIdentity) Allocator.Error!?CaptureOperand {
+    for (operands) |operand| {
+        if (try captureIdentityEql(program, operand.identity, identity)) return operand;
+    }
+    return null;
+}
+
+fn captureIdentityForTypedLocal(program: *const Ast.Program, capture: Ast.TypedLocal) Allocator.Error!CaptureIdentity {
+    const local_data = program.locals.items[@intFromEnum(capture.local)];
+    if (!try monotypeTypeEql(program, local_data.ty, capture.ty)) {
+        Common.invariant("typed capture local disagreed with its local type");
+    }
+    const origin: CaptureIdentity.Origin = if (local_data.binder) |binder|
+        .{ .binder = binder }
+    else if (local_data.capture_id) |capture_id|
+        .{ .generated = capture_id }
+    else
+        .{ .local = capture.local };
+    return .{ .origin = origin, .ty = capture.ty };
+}
+
+fn monotypeTypeEql(program: *const Ast.Program, lhs: MonoType.TypeId, rhs: MonoType.TypeId) Allocator.Error!bool {
+    if (lhs == rhs) return true;
+    return try program.types.typeEql(&program.names, lhs, rhs);
+}
+
+fn captureIdentityEql(program: *const Ast.Program, left: CaptureIdentity, right: CaptureIdentity) Allocator.Error!bool {
+    if (!try monotypeTypeEql(program, left.ty, right.ty)) return false;
+    return switch (left.origin) {
+        .binder => |left_binder| switch (right.origin) {
+            .binder => |right_binder| left_binder == right_binder,
+            else => false,
+        },
+        .generated => |left_capture| switch (right.origin) {
+            .generated => |right_capture| left_capture == right_capture,
+            else => false,
+        },
+        .local => |left_local| switch (right.origin) {
+            .local => |right_local| left_local == right_local,
+            else => false,
+        },
+    };
+}
+
+fn solveCaptureFixpoint(
+    allocator: Allocator,
+    program: *Ast.Program,
+    fn_captures: []std.ArrayList(Ast.TypedLocal),
+) Allocator.Error!void {
+    var scratch = CaptureSet.initForProgram(allocator, program, fn_captures);
+    defer scratch.deinit();
+    var bound = BoundSet.init(allocator);
+    defer bound.deinit();
+
+    var changed = true;
+    while (changed) {
+        changed = false;
+        for (program.fns.items, 0..) |fn_, raw| {
+            scratch.clear();
+            bound.clear();
+
+            try bindTypedLocals(program, &bound, program.typedLocalSpan(fn_.args));
+            switch (fn_.body) {
+                .roc => |expr| try scratch.collectExpr(expr, &bound),
+                .hosted => {},
+            }
+
+            if (!captureListEql(scratch.items.items, fn_captures[raw].items)) {
+                fn_captures[raw].clearRetainingCapacity();
+                try fn_captures[raw].appendSlice(allocator, scratch.items.items);
+                changed = true;
+            }
+        }
+    }
+}
+
+fn captureListEql(lhs: []const Ast.TypedLocal, rhs: []const Ast.TypedLocal) bool {
+    if (lhs.len != rhs.len) return false;
+    for (lhs, rhs) |a, b| {
+        if (a.local != b.local or a.ty != b.ty) return false;
+    }
+    return true;
+}
+
 const BoundSet = struct {
     locals: std.AutoHashMap(Mono.LocalId, void),
     binders: std.AutoHashMap(checked.PatternBinderId, u32),
@@ -663,10 +1097,8 @@ const BoundSet = struct {
         self.locals.deinit();
     }
 
-    fn contains(self: *const BoundSet, input: *const Ast.Program, local: Mono.LocalId) bool {
-        if (self.locals.contains(local)) return true;
-        const binder = input.locals.items[@intFromEnum(local)].binder orelse return false;
-        return self.binders.contains(binder);
+    fn contains(self: *const BoundSet, local: Mono.LocalId) bool {
+        return self.locals.contains(local);
     }
 
     fn put(self: *BoundSet, input: *const Ast.Program, local: Mono.LocalId) Allocator.Error!void {
@@ -705,23 +1137,62 @@ const BoundSet = struct {
     }
 };
 
+fn explicitFnDefCaptureValue(program: *const Ast.Program, captures: []const Ast.FnDefCapture, required: Ast.TypedLocal) Allocator.Error!?Ast.ExprId {
+    for (captures) |capture| {
+        if (try fnDefCaptureLocalMatches(program, required, capture.local)) {
+            return capture.value;
+        }
+    }
+    return null;
+}
+
+fn fnDefCaptureLocalMatches(program: *const Ast.Program, required: Ast.TypedLocal, explicit: Ast.LocalId) Allocator.Error!bool {
+    const required_local = program.locals.items[@intFromEnum(required.local)];
+    const explicit_local = program.locals.items[@intFromEnum(explicit)];
+
+    if (!try monotypeTypeEql(program, required.ty, required_local.ty)) {
+        Common.invariant("typed explicit capture local disagreed with its local type");
+    }
+    if (!try monotypeTypeEql(program, required.ty, explicit_local.ty)) return false;
+    if (required.local == explicit) return true;
+    if (required_local.symbol == explicit_local.symbol) return true;
+    if (required_local.binder != null and explicit_local.binder != null and required_local.binder.? == explicit_local.binder.?) return true;
+    if (required_local.capture_id != null and explicit_local.capture_id != null and required_local.capture_id.? == explicit_local.capture_id.?) return true;
+
+    return false;
+}
+
 const CaptureSet = struct {
     allocator: Allocator,
-    lifter: *Lifter,
+    lifter: ?*Lifter,
+    program: *Ast.Program,
+    fn_captures: []std.ArrayList(Ast.TypedLocal),
     items: std.ArrayList(Ast.TypedLocal),
     seen: std.AutoHashMap(Mono.LocalId, void),
-    /// Optional, caller-owned sink for the functions this body references (via
-    /// `fn_def`/`call_proc`). The capture fixpoint points it at a buffer on a
-    /// function's first solve to build its edge set; every other use leaves it
-    /// null and pays nothing.
-    edges: ?*std.ArrayList(Ast.FnId) = null,
 
     fn init(lifter: *Lifter) CaptureSet {
         return .{
             .allocator = lifter.allocator,
             .lifter = lifter,
+            .program = lifter.output,
+            .fn_captures = lifter.fn_captures,
             .items = .empty,
             .seen = std.AutoHashMap(Mono.LocalId, void).init(lifter.allocator),
+        };
+    }
+
+    fn initForProgram(
+        allocator: Allocator,
+        program: *Ast.Program,
+        fn_captures: []std.ArrayList(Ast.TypedLocal),
+    ) CaptureSet {
+        return .{
+            .allocator = allocator,
+            .lifter = null,
+            .program = program,
+            .fn_captures = fn_captures,
+            .items = .empty,
+            .seen = std.AutoHashMap(Mono.LocalId, void).init(allocator),
         };
     }
 
@@ -730,16 +1201,15 @@ const CaptureSet = struct {
         self.items.deinit(self.allocator);
     }
 
-    /// Reset for reuse across fixpoint solves without freeing capacity. The
-    /// edge sink is caller-owned and reassigned per solve, so it is not touched.
+    /// Reset for reuse across fixpoint solves without freeing capacity.
     fn clear(self: *CaptureSet) void {
         self.items.clearRetainingCapacity();
         self.seen.clearRetainingCapacity();
     }
 
     fn addIfFree(self: *CaptureSet, local: Mono.LocalId, bound: *const BoundSet) Allocator.Error!void {
-        if (bound.contains(self.lifter.output, local) or self.seen.contains(local)) return;
-        const local_data = self.lifter.output.locals.items[@intFromEnum(local)];
+        if (bound.contains(local) or self.seen.contains(local)) return;
+        const local_data = self.program.locals.items[@intFromEnum(local)];
         try self.seen.put(local, {});
         try self.items.append(self.allocator, .{
             .local = local,
@@ -748,7 +1218,7 @@ const CaptureSet = struct {
     }
 
     fn collectExpr(self: *CaptureSet, expr_id: Mono.ExprId, bound: *BoundSet) Allocator.Error!void {
-        const input = self.lifter.output;
+        const input = self.program;
         const expr = input.exprs.items[@intFromEnum(expr_id)];
         switch (expr.data) {
             .local => |local| try self.addIfFree(local, bound),
@@ -758,29 +1228,33 @@ const CaptureSet = struct {
             .frac_f64_lit,
             .dec_lit,
             .str_lit,
-            .static_data,
             .uninitialized,
             .uninitialized_payload,
             .def_ref,
             .crash,
             .comptime_exhaustiveness_failed,
             => {},
-            .static_data_candidate => |candidate| try self.collectExpr(candidate.restored_expr, bound),
-            .fn_ref => |fn_id| try self.collectFnCaptures(fn_id, bound),
-            .fn_ref_captures => |fn_ref| {
-                for (input.exprSpan(fn_ref.captures)) |capture| try self.collectExpr(capture, bound);
+            .fn_ref => |fn_ref| for (input.exprSpan(fn_ref.captures)) |capture| try self.collectExpr(capture, bound),
+            .fn_def => |fn_def| {
+                const lifter = self.lifter orelse Common.invariant("post-lift capture recomputation saw a pre-lift function definition");
+                const explicit = input.fnDefCaptureSpan(fn_def.captures);
+                if (explicit.len == 0) {
+                    try self.collectFnCaptures(lifter.liftedFn(fn_def.fn_id), bound);
+                } else {
+                    try self.collectFnCapturesExceptExplicit(lifter.liftedFn(fn_def.fn_id), explicit, bound);
+                    for (explicit) |capture| try self.collectExpr(capture.value, bound);
+                }
             },
-            .fn_def => |fn_id| try self.collectFnCaptures(self.lifter.liftedFn(fn_id), bound),
             .list,
             .tuple,
             => |items| for (input.exprSpan(items)) |child| try self.collectExpr(child, bound),
             .record => |fields| for (input.fieldExprSpan(fields)) |field| try self.collectExpr(field.value, bound),
             .tag => |tag| for (input.exprSpan(tag.payloads)) |child| try self.collectExpr(child, bound),
             .nominal,
-            .return_,
             .dbg,
             .expect,
             => |child| try self.collectExpr(child, bound),
+            .return_ => |ret| try self.collectExpr(ret.value, bound),
             .expect_err => |expect_err| try self.collectExpr(expect_err.msg, bound),
             .comptime_branch_taken => |taken| try self.collectExpr(taken.body, bound),
             .let_ => |let_| {
@@ -804,10 +1278,17 @@ const CaptureSet = struct {
             },
             .call_proc => |call| {
                 switch (call.callee) {
-                    .func => |mono_fn_id| try self.collectFnCaptures(self.lifter.liftedFn(mono_fn_id), bound),
+                    .func => |slot| switch (slot) {
+                        .local => |mono_fn_id| {
+                            const lifter = self.lifter orelse Common.invariant("post-lift capture recomputation saw a pre-lift function call");
+                            try self.collectFnCaptures(lifter.liftedFn(mono_fn_id), bound);
+                        },
+                        .imported => {},
+                    },
                     .lifted => |fn_id| try self.collectFnCaptures(fn_id, bound),
                 }
                 for (input.exprSpan(call.args)) |arg| try self.collectExpr(arg, bound);
+                for (input.exprSpan(call.captures)) |capture| try self.collectExpr(capture, bound);
             },
             .low_level => |call| for (input.exprSpan(call.args)) |arg| try self.collectExpr(arg, bound),
             .field_access => |field| try self.collectExpr(field.receiver, bound),
@@ -873,19 +1354,8 @@ const CaptureSet = struct {
                 try self.collectExpr(loop.body, bound);
                 removeBound(input, bound, added.items);
             },
-            .state_loop => |state_loop| {
-                for (input.exprSpan(state_loop.entry_values)) |initial| try self.collectExpr(initial, bound);
-                for (input.stateLoopStateSpan(state_loop.states)) |state| {
-                    var added = std.ArrayList(Mono.LocalId).empty;
-                    defer added.deinit(self.allocator);
-                    try bindTypedLocalsTracked(self.allocator, input, bound, input.typedLocalSpan(state.params), &added);
-                    try self.collectExpr(state.body, bound);
-                    removeBound(input, bound, added.items);
-                }
-            },
             .break_ => |maybe| if (maybe) |value| try self.collectExpr(value, bound),
             .continue_ => |continue_| for (input.exprSpan(continue_.values)) |value| try self.collectExpr(value, bound),
-            .state_continue => |continue_| for (input.exprSpan(continue_.values)) |value| try self.collectExpr(value, bound),
         }
     }
 
@@ -901,9 +1371,22 @@ const CaptureSet = struct {
         // devirtualized calls and `fn_def` references never target an inline
         // lambda), and every one has a fixpoint entry. An out-of-range id
         // means an earlier stage produced a call target the fixpoint never saw.
-        if (raw >= self.lifter.fn_captures.len) Common.invariant("capture collection referenced a function without a solved capture set");
-        if (self.edges) |sink| try sink.append(self.allocator, fn_id);
-        for (self.lifter.fn_captures[raw].items) |capture| {
+        if (raw >= self.fn_captures.len) Common.invariant("capture collection referenced a function without a solved capture set");
+        for (self.fn_captures[raw].items) |capture| {
+            try self.addIfFree(capture.local, caller_bound);
+        }
+    }
+
+    fn collectFnCapturesExceptExplicit(
+        self: *CaptureSet,
+        fn_id: Ast.FnId,
+        explicit: []const Ast.FnDefCapture,
+        caller_bound: *BoundSet,
+    ) Allocator.Error!void {
+        const raw = @intFromEnum(fn_id);
+        if (raw >= self.fn_captures.len) Common.invariant("capture collection referenced a function without a solved capture set");
+        for (self.fn_captures[raw].items) |capture| {
+            if (try explicitFnDefCaptureValue(self.program, explicit, capture) != null) continue;
             try self.addIfFree(capture.local, caller_bound);
         }
     }
@@ -923,8 +1406,8 @@ const CaptureSet = struct {
             .expr,
             .expect,
             .dbg,
-            .return_,
             => |expr| try self.collectExpr(expr, bound),
+            .return_ => |ret| try self.collectExpr(ret.value, bound),
             .crash => {},
         }
     }
@@ -1004,6 +1487,44 @@ fn shapeContent(types: *const MonoType.Store, ty: MonoType.TypeId) MonoType.Cont
             },
             else => |content| return content,
         }
+    }
+}
+
+test "monotype lifting preserves imported direct call slots" {
+    const allocator = std.testing.allocator;
+    var mono = Mono.Program.init(allocator);
+    errdefer mono.deinit();
+
+    const unit_ty = try mono.types.add(.zst);
+    const imported = try mono.addImportedFn(.{
+        .shard = @enumFromInt(1),
+        .fn_id = @enumFromInt(1),
+    });
+    const body = try mono.addExpr(.{ .ty = unit_ty, .data = .{ .call_proc = .{
+        .callee = Mono.importedProcCallee(imported),
+        .args = Mono.Span(Mono.ExprId).empty(),
+    } } });
+    try mono.defs.append(allocator, .{
+        .symbol = @enumFromInt(1),
+        .args = Mono.Span(Mono.TypedLocal).empty(),
+        .body = .{ .roc = body },
+        .ret = unit_ty,
+    });
+
+    var lifted = try run(allocator, mono);
+    defer lifted.deinit();
+
+    try std.testing.expectEqual(@as(usize, 1), lifted.imported_fns.items.len);
+    const call = switch (lifted.exprs.items[@intFromEnum(body)].data) {
+        .call_proc => |call| call,
+        else => return error.TestUnexpectedResult,
+    };
+    switch (call.callee) {
+        .func => |slot| switch (slot) {
+            .imported => |actual| try std.testing.expectEqual(imported, actual),
+            .local => return error.TestUnexpectedResult,
+        },
+        .lifted => return error.TestUnexpectedResult,
     }
 }
 

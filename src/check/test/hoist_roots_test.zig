@@ -22,22 +22,6 @@ test "hoist roots selected for referenced closed local binding chain" {
     try std.testing.expect(roots[1].pattern != null);
 }
 
-test "hoist roots selected for local alias of compile-time-known local" {
-    var test_env = try TestEnv.init("Test",
-        \\main = |arg| {
-        \\    x = 41.I64
-        \\    y = x
-        \\    y + arg
-        \\}
-    );
-    defer test_env.deinit();
-
-    try test_env.assertNoErrors();
-    const roots = test_env.checker.selectedHoistedRoots();
-    try std.testing.expect(roots.len >= 1);
-    try std.testing.expect(roots[0].pattern != null);
-}
-
 test "hoist roots selected for closed ordinary call binding RHS" {
     var test_env = try TestEnv.init("Test",
         \\add_one = |n| n + 1.I64
@@ -51,8 +35,9 @@ test "hoist roots selected for closed ordinary call binding RHS" {
 
     try test_env.assertNoErrors();
     const roots = test_env.checker.selectedHoistedRoots();
-    try std.testing.expect(roots.len >= 1);
-    try std.testing.expectEqual(@as(usize, 1), countExprRootsByTag(&test_env, .e_call));
+    try std.testing.expectEqual(@as(usize, 1), roots.len);
+    try std.testing.expect(roots[0].pattern != null);
+    try expectExprTag(&test_env, roots[0].expr, .e_call);
 }
 
 test "hoist roots selected for closed local block with internal locals" {
@@ -75,50 +60,6 @@ test "hoist roots selected for closed local block with internal locals" {
     try expectExprTag(&test_env, roots[0].expr, .e_block);
 }
 
-test "hoist roots do not select local function dependency call" {
-    var test_env = try TestEnv.init("Test",
-        \\main = |_| {
-        \\    make = || Ok(1.I64)
-        \\    parsed = make()?
-        \\    Ok(parsed)
-        \\}
-    );
-    defer test_env.deinit();
-
-    try test_env.assertNoErrors();
-    try std.testing.expectEqual(@as(usize, 0), countExprRootsByTag(&test_env, .e_call));
-}
-
-test "hoist roots do not select parent over unavailable contextual local" {
-    var test_env = try TestEnv.init("Test",
-        \\main = |arg| {
-        \\    make = || 41.I64
-        \\    x = make()
-        \\    y = x + 1.I64
-        \\    y + arg
-        \\}
-    );
-    defer test_env.deinit();
-
-    try test_env.assertNoErrors();
-    try std.testing.expectEqual(@as(usize, 0), countExprRootsByTag(&test_env, .e_call));
-    try std.testing.expectEqual(@as(usize, 0), countExprRootsByTag(&test_env, .e_dispatch_call));
-}
-
-test "hoist roots keep deferred local dependencies from interpolation children" {
-    var test_env = try TestEnv.init("Test",
-        \\main = |arg| {
-        \\    config = { host: "localhost", port: "8080" }
-        \\    msg = "host=${config.host}, port=${config.port}"
-        \\    Str.count_utf8_bytes(msg).to_i64_wrap() + arg
-        \\}
-    );
-    defer test_env.deinit();
-
-    try test_env.assertNoErrors();
-    try std.testing.expectEqual(@as(usize, 1), countBindingRootsWithDependencies(&test_env));
-}
-
 test "hoist roots selected for direct closed ordinary call function body" {
     var test_env = try TestEnv.init("Test",
         \\add_one = |n| n + 1.I64
@@ -129,11 +70,12 @@ test "hoist roots selected for direct closed ordinary call function body" {
 
     try test_env.assertNoErrors();
     const roots = test_env.checker.selectedHoistedRoots();
-    try std.testing.expect(roots.len >= 1);
-    try std.testing.expectEqual(@as(usize, 1), countExprRootsByTag(&test_env, .e_call));
+    try std.testing.expectEqual(@as(usize, 1), roots.len);
+    try std.testing.expectEqual(@as(?CIR.Pattern.Idx, null), roots[0].pattern);
+    try expectExprTag(&test_env, roots[0].expr, .e_call);
 }
 
-test "hoist roots selected for ordinary call with dbg in reachable body" {
+test "hoist roots are not selected for ordinary call with dbg in reachable body" {
     var test_env = try TestEnv.init("Test",
         \\dbg_value = || {
         \\    x = 42.I64
@@ -149,10 +91,10 @@ test "hoist roots selected for ordinary call with dbg in reachable body" {
     defer test_env.deinit();
 
     try test_env.assertNoErrors();
-    try std.testing.expectEqual(@as(usize, 1), countExprRootsByTag(&test_env, .e_call));
+    try std.testing.expectEqual(@as(usize, 0), countExprRootsByTag(&test_env, .e_call));
 }
 
-test "hoist roots selected for ordinary call with expect in reachable body" {
+test "hoist roots are not selected for ordinary call with expect in reachable body" {
     var test_env = try TestEnv.init("Test",
         \\expect_value = || {
         \\    expect 1.I64 == 1.I64
@@ -167,7 +109,7 @@ test "hoist roots selected for ordinary call with expect in reachable body" {
     defer test_env.deinit();
 
     try test_env.assertNoErrors();
-    try std.testing.expectEqual(@as(usize, 1), countExprRootsByTag(&test_env, .e_call));
+    try std.testing.expectEqual(@as(usize, 0), countExprRootsByTag(&test_env, .e_call));
 }
 
 test "hoist roots selected for direct closed arithmetic function body" {
@@ -181,285 +123,6 @@ test "hoist roots selected for direct closed arithmetic function body" {
     try std.testing.expectEqual(@as(usize, 1), roots.len);
     try std.testing.expectEqual(@as(?CIR.Pattern.Idx, null), roots[0].pattern);
     try expectExprTag(&test_env, roots[0].expr, .e_dispatch_call);
-}
-
-test "hoist roots selected for closed number literal" {
-    var test_env = try TestEnv.init("Test",
-        \\main = |_| 42.I64
-    );
-    defer test_env.deinit();
-
-    try test_env.assertNoErrors();
-    const roots = test_env.checker.selectedHoistedRoots();
-    try std.testing.expectEqual(@as(usize, 1), roots.len);
-    try expectExprTag(&test_env, roots[0].expr, .e_typed_int);
-}
-
-test "hoist roots selected for closed string literal" {
-    var test_env = try TestEnv.init("Test",
-        \\main : {} -> Str
-        \\main = |_| "Roc"
-    );
-    defer test_env.deinit();
-
-    try test_env.assertNoErrors();
-    const roots = test_env.checker.selectedHoistedRoots();
-    try std.testing.expectEqual(@as(usize, 1), roots.len);
-    try expectExprTag(&test_env, roots[0].expr, .e_str);
-}
-
-test "hoist roots selected for concrete closed empty list" {
-    var test_env = try TestEnv.init("Test",
-        \\main : {} -> List(U64)
-        \\main = |_| []
-    );
-    defer test_env.deinit();
-
-    try test_env.assertNoErrors();
-    const roots = test_env.checker.selectedHoistedRoots();
-    try std.testing.expectEqual(@as(usize, 1), roots.len);
-    try expectExprTag(&test_env, roots[0].expr, .e_empty_list);
-}
-
-test "hoist roots selected for closed empty record" {
-    var test_env = try TestEnv.init("Test",
-        \\main = |_| {}
-    );
-    defer test_env.deinit();
-
-    try test_env.assertNoErrors();
-    const roots = test_env.checker.selectedHoistedRoots();
-    try std.testing.expectEqual(@as(usize, 1), roots.len);
-    try expectExprTag(&test_env, roots[0].expr, .e_empty_record);
-}
-
-test "hoist roots select record parent over closed list child" {
-    var test_env = try TestEnv.init("Test",
-        \\main = |_| { nums: [1.U64, 2.U64] }
-    );
-    defer test_env.deinit();
-
-    try test_env.assertNoErrors();
-    try std.testing.expectEqual(@as(usize, 1), countExprRootsByTag(&test_env, .e_record));
-    try std.testing.expectEqual(@as(usize, 0), countExprRootsByTag(&test_env, .e_list));
-}
-
-test "hoist roots keep record parent with function field over closed list child" {
-    var test_env = try TestEnv.init("Test",
-        \\main = |arg| {
-        \\    value = { f: |n| n + 1.I64, bytes: [1.U8, 2.U8] }
-        \\    List.len(value.bytes).to_i64_wrap() + arg
-        \\}
-    );
-    defer test_env.deinit();
-
-    try test_env.assertNoErrors();
-    try std.testing.expectEqual(@as(usize, 1), countExprRootsByTag(&test_env, .e_record));
-    try std.testing.expectEqual(@as(usize, 0), countExprRootsByTag(&test_env, .e_list));
-    try std.testing.expectEqual(@as(usize, 0), countExprRootsByTag(&test_env, .e_closure));
-}
-
-test "hoist roots select closed local List.iter binding over list child" {
-    var test_env = try TestEnv.init("Test",
-        \\main = |arg| {
-        \\    base = [{ x: 1.I64, y: 2.I64 }].iter()
-        \\    _ = List.len(arg)
-        \\    base
-        \\}
-    );
-    defer test_env.deinit();
-
-    try test_env.assertNoErrors();
-    const roots = test_env.checker.selectedHoistedRoots();
-    try std.testing.expectEqual(@as(usize, 1), roots.len);
-    try std.testing.expect(roots[0].pattern != null);
-    try std.testing.expectEqual(@as(usize, 1), countExprRootsByTag(&test_env, .e_dispatch_call));
-    try std.testing.expectEqual(@as(usize, 0), countListRootsByLength(&test_env, 1));
-    try std.testing.expectEqual(@as(usize, 0), countExprRootsByTag(&test_env, .e_closure));
-}
-
-test "hoist roots preserve closed List.iter child inside runtime-dependent record" {
-    var test_env = try TestEnv.init("Test",
-        \\main = |arg| {
-        \\    value = {
-        \\        base: [{ x: 1.I64, y: 2.I64 }].iter(),
-        \\        runtime: List.len(arg),
-        \\    }
-        \\    value.runtime
-        \\}
-    );
-    defer test_env.deinit();
-
-    try test_env.assertNoErrors();
-    try std.testing.expectEqual(@as(usize, 0), countExprRootsByTag(&test_env, .e_record));
-    try std.testing.expectEqual(@as(usize, 1), countExprRootsByTag(&test_env, .e_dispatch_call));
-    try std.testing.expectEqual(@as(usize, 0), countListRootsByLength(&test_env, 1));
-    try std.testing.expectEqual(@as(usize, 0), countExprRootsByTag(&test_env, .e_closure));
-}
-
-test "hoist roots preserve closed List.iter child inside runtime-dependent fold" {
-    var test_env = try TestEnv.init("Test",
-        \\main = |arg| {
-        \\    base = [{ x: 1.I64, y: 2.I64 }, { x: 3.I64, y: 4.I64 }].iter()
-        \\    Iter.fold(base, 0.I64, |acc, point| acc + point.x + point.y + List.len(arg).to_i64_wrap())
-        \\}
-    );
-    defer test_env.deinit();
-
-    try test_env.assertNoErrors();
-    try std.testing.expectEqual(@as(usize, 1), countDispatchRootsContaining(&test_env, ".iter()"));
-    try std.testing.expectEqual(@as(usize, 0), countDispatchRootsContaining(&test_env, "Iter.fold"));
-    try std.testing.expectEqual(@as(usize, 0), countListRootsByLength(&test_env, 2));
-    try std.testing.expectEqual(@as(usize, 0), countExprRootsByTag(&test_env, .e_closure));
-}
-
-test "hoist roots preserve closed List.iter child inside effectful runtime-dependent fold" {
-    var test_env = try TestEnv.init("Test",
-        \\main! : List(Str) => I64
-        \\main! = |arg| {
-        \\    base = [{ x: 1.I64, y: 2.I64 }, { x: 3.I64, y: 4.I64 }].iter()
-        \\    Iter.fold(base, 0.I64, |acc, point| acc + point.x + point.y + List.len(arg).to_i64_wrap())
-        \\}
-    );
-    defer test_env.deinit();
-
-    try test_env.assertNoErrors();
-    try std.testing.expectEqual(@as(usize, 1), countDispatchRootsContaining(&test_env, ".iter()"));
-    try std.testing.expectEqual(@as(usize, 0), countDispatchRootsContaining(&test_env, "Iter.fold"));
-    try std.testing.expectEqual(@as(usize, 0), countListRootsByLength(&test_env, 2));
-    try std.testing.expectEqual(@as(usize, 0), countExprRootsByTag(&test_env, .e_closure));
-}
-
-test "hoist roots preserve List.iter child when fold result controls branch" {
-    var test_env = try TestEnv.init("Test",
-        \\main! : List(Str) => Try({}, [Exit(I8)])
-        \\main! = |arg| {
-        \\    base = [{ x: 1.I64, y: 2.I64 }, { x: 3.I64, y: 4.I64 }].iter()
-        \\    total = Iter.fold(base, 0.I64, |acc, point| acc + point.x + point.y + List.len(arg).to_i64_wrap())
-        \\    if total == -1 {
-        \\        Ok({})
-        \\    } else {
-        \\        Ok({})
-        \\    }
-        \\}
-    );
-    defer test_env.deinit();
-
-    try test_env.assertNoErrors();
-    try std.testing.expectEqual(@as(usize, 1), countDispatchRootsContaining(&test_env, ".iter()"));
-    try std.testing.expectEqual(@as(usize, 0), countDispatchRootsContaining(&test_env, "Iter.fold"));
-    try std.testing.expectEqual(@as(usize, 0), countListRootsByLength(&test_env, 2));
-    try std.testing.expectEqual(@as(usize, 0), countExprRootsByTag(&test_env, .e_closure));
-}
-
-test "hoist roots preserve List.iter child when unannotated fold result controls branch" {
-    var test_env = try TestEnv.init("Test",
-        \\main! = |arg| {
-        \\    base = [{ x: 1.I64, y: 2.I64 }, { x: 3.I64, y: 4.I64 }].iter()
-        \\    total = Iter.fold(base, 0.I64, |acc, point| acc + point.x + point.y + List.len(arg).to_i64_wrap())
-        \\    if total == -1 {
-        \\        Ok({})
-        \\    } else {
-        \\        Ok({})
-        \\    }
-        \\}
-    );
-    defer test_env.deinit();
-
-    try test_env.assertNoErrors();
-    try std.testing.expectEqual(@as(usize, 1), countDispatchRootsContaining(&test_env, ".iter()"));
-    try std.testing.expectEqual(@as(usize, 0), countDispatchRootsContaining(&test_env, "Iter.fold"));
-    try std.testing.expectEqual(@as(usize, 0), countListRootsByLength(&test_env, 2));
-    try std.testing.expectEqual(@as(usize, 0), countExprRootsByTag(&test_env, .e_closure));
-}
-
-test "hoist roots select callable record parent when whole value is used" {
-    var test_env = try TestEnv.init("Test",
-        \\main = |arg| {
-        \\    value = { f: |n| n + 1.I64, bytes: [1.U8, 2.U8] }
-        \\    _ = List.len(arg)
-        \\    value
-        \\}
-    );
-    defer test_env.deinit();
-
-    try test_env.assertNoErrors();
-    try std.testing.expectEqual(@as(usize, 1), countExprRootsByTag(&test_env, .e_record));
-    try std.testing.expectEqual(@as(usize, 0), countExprRootsByTag(&test_env, .e_list));
-    try std.testing.expectEqual(@as(usize, 0), countExprRootsByTag(&test_env, .e_closure));
-}
-
-test "hoist roots preserve list child inside runtime-dependent record" {
-    var test_env = try TestEnv.init("Test",
-        \\main = |arg| {
-        \\    record = { nums: [1.U64, 2.U64], runtime: arg }
-        \\    record.runtime
-        \\}
-    );
-    defer test_env.deinit();
-
-    try test_env.assertNoErrors();
-    try std.testing.expectEqual(@as(usize, 0), countExprRootsByTag(&test_env, .e_record));
-    try std.testing.expectEqual(@as(usize, 1), countListRootsByLength(&test_env, 2));
-}
-
-test "hoist roots are equivalent for named top-level data and inline data" {
-    {
-        var test_env = try TestEnv.init("Test",
-            \\nums : List(U64)
-            \\nums = [1, 2]
-            \\
-            \\main = |_| { nums: nums }
-        );
-        defer test_env.deinit();
-
-        try test_env.assertNoErrors();
-        try std.testing.expectEqual(@as(usize, 1), countExprRootsByTag(&test_env, .e_record));
-        try std.testing.expectEqual(@as(usize, 0), countListRootsByLength(&test_env, 2));
-    }
-
-    {
-        var test_env = try TestEnv.init("Test",
-            \\main = |_| { nums: [1.U64, 2.U64] }
-        );
-        defer test_env.deinit();
-
-        try test_env.assertNoErrors();
-        try std.testing.expectEqual(@as(usize, 1), countExprRootsByTag(&test_env, .e_record));
-        try std.testing.expectEqual(@as(usize, 0), countListRootsByLength(&test_env, 2));
-    }
-}
-
-test "hoist roots are equivalent for closed local data and inline data" {
-    {
-        var test_env = try TestEnv.init("Test",
-            \\main = |arg| {
-            \\    nums : List(U64)
-            \\    nums = [1, 2]
-            \\    record = { nums, runtime: arg }
-            \\    record.runtime
-            \\}
-        );
-        defer test_env.deinit();
-
-        try test_env.assertNoErrors();
-        try std.testing.expectEqual(@as(usize, 0), countExprRootsByTag(&test_env, .e_record));
-        try std.testing.expectEqual(@as(usize, 1), countListRootsByLength(&test_env, 2));
-    }
-
-    {
-        var test_env = try TestEnv.init("Test",
-            \\main = |arg| {
-            \\    record = { nums: [1.U64, 2.U64], runtime: arg }
-            \\    record.runtime
-            \\}
-        );
-        defer test_env.deinit();
-
-        try test_env.assertNoErrors();
-        try std.testing.expectEqual(@as(usize, 0), countExprRootsByTag(&test_env, .e_record));
-        try std.testing.expectEqual(@as(usize, 1), countListRootsByLength(&test_env, 2));
-    }
 }
 
 test "hoist roots select closed ordinary call dependencies first" {
@@ -476,9 +139,10 @@ test "hoist roots select closed ordinary call dependencies first" {
 
     try test_env.assertNoErrors();
     const roots = test_env.checker.selectedHoistedRoots();
-    try std.testing.expect(roots.len >= 2);
-    try std.testing.expect(countRootsWithPattern(roots) >= 2);
-    try std.testing.expectEqual(@as(usize, 1), countExprRootsByTag(&test_env, .e_call));
+    try std.testing.expectEqual(@as(usize, 2), roots.len);
+    try std.testing.expect(roots[0].pattern != null);
+    try std.testing.expect(roots[1].pattern != null);
+    try expectExprTag(&test_env, roots[1].expr, .e_call);
 }
 
 test "hoist roots select closed ordinary call child expressions" {
@@ -494,122 +158,9 @@ test "hoist roots select closed ordinary call child expressions" {
 
     try test_env.assertNoErrors();
     const roots = test_env.checker.selectedHoistedRoots();
-    try std.testing.expect(roots.len >= 1);
-    try std.testing.expectEqual(@as(usize, 1), countExprRootsByTag(&test_env, .e_call));
-}
-
-test "hoist roots select closed call inside record with runtime field" {
-    var test_env = try TestEnv.init("Test",
-        \\add_one = |n| n + 1.I64
-        \\
-        \\main = |arg| {
-        \\    record = { static: add_one(41.I64), runtime: arg }
-        \\    record.runtime
-        \\}
-    );
-    defer test_env.deinit();
-
-    try test_env.assertNoErrors();
-    const roots = test_env.checker.selectedHoistedRoots();
-    try std.testing.expect(roots.len >= 1);
-    try std.testing.expectEqual(@as(usize, 1), countExprRootsByTag(&test_env, .e_call));
-}
-
-test "hoist roots select rocci-shaped cell child inside runtime record" {
-    var test_env = try TestEnv.init("Test",
-        \\mk_sprite = |n| { data: [1.U8, 2.U8, 3.U8], region: { x: n, y: 0.I64 } }
-        \\
-        \\main = |frame_count| {
-        \\    anim = {
-        \\        last_updated: frame_count,
-        \\        cells: [
-        \\            { frames: 5.I64, sprite: mk_sprite(41.I64) },
-        \\        ],
-        \\    }
-        \\    anim.last_updated
-        \\}
-    );
-    defer test_env.deinit();
-
-    try test_env.assertNoErrors();
-    try std.testing.expect(countExprRootsByTag(&test_env, .e_list) >= 2);
-}
-
-test "hoist roots select rocci-shaped sub_or_crash cells inside runtime record" {
-    var test_env = try TestEnv.init("Test",
-        \\Region : { src_x : U64, src_y : U64, width : U64, height : U64 }
-        \\Sprite : { data : List(U8), region : Region }
-        \\Cell : { frames : U64, sprite : Sprite }
-        \\
-        \\sprite_sheet : Sprite
-        \\sprite_sheet = {
-        \\    data: [1.U8, 2.U8, 3.U8, 4.U8],
-        \\    region: { src_x: 0, src_y: 0, width: 16, height: 16 },
-        \\}
-        \\
-        \\sub : Sprite, Region -> Try(Sprite, {})
-        \\sub = |sprite, region| Ok({ ..sprite, region })
-        \\
-        \\sub_or_crash : Sprite, Region -> Sprite
-        \\sub_or_crash = |sprite, region|
-        \\    match sub(sprite, region) {
-        \\        Ok(sub_sprite) => sub_sprite
-        \\        Err(_) => {
-        \\            crash "bad sprite"
-        \\        }
-        \\    }
-        \\
-        \\main = |frame_count| {
-        \\    anim = {
-        \\        last_updated: frame_count,
-        \\        cells: [
-        \\            {
-        \\                frames: 5.U64,
-        \\                sprite: sub_or_crash(sprite_sheet, { src_x: 0, src_y: 0, width: 16, height: 16 }),
-        \\            },
-        \\            {
-        \\                frames: 6.U64,
-        \\                sprite: sub_or_crash(sprite_sheet, { src_x: 16, src_y: 0, width: 16, height: 16 }),
-        \\            },
-        \\        ],
-        \\    }
-        \\    anim.last_updated
-        \\}
-    );
-    defer test_env.deinit();
-
-    try test_env.assertNoErrors();
-    try std.testing.expectEqual(@as(usize, 1), countListRootsByLength(&test_env, 2));
-}
-
-test "hoist roots selected inside effectful function body" {
-    var test_env = try TestEnv.init("Test",
-        \\main! : () => U64
-        \\main! = || {
-        \\    x = [1.U64, 2.U64]
-        \\    List.len(x)
-        \\}
-    );
-    defer test_env.deinit();
-
-    try test_env.assertNoErrors();
-    try std.testing.expectEqual(@as(usize, 1), countListRootsByLength(&test_env, 2));
-}
-
-test "hoist suppression does not leak from top-level constant into referenced top-level function" {
-    var test_env = try TestEnv.init("Test",
-        \\main = { run: run! }
-        \\
-        \\run! : () => U64
-        \\run! = || {
-        \\    x = [1.U64, 2.U64]
-        \\    List.len(x)
-        \\}
-    );
-    defer test_env.deinit();
-
-    try test_env.assertNoErrors();
-    try std.testing.expectEqual(@as(usize, 1), countExprRootsByTag(&test_env, .e_block));
+    try std.testing.expectEqual(@as(usize, 1), roots.len);
+    try std.testing.expectEqual(@as(?CIR.Pattern.Idx, null), roots[0].pattern);
+    try expectExprTag(&test_env, roots[0].expr, .e_call);
 }
 
 test "hoist roots selected for closed pure static dispatch call binding RHS" {
@@ -627,8 +178,9 @@ test "hoist roots selected for closed pure static dispatch call binding RHS" {
 
     try test_env.assertNoErrors();
     const roots = test_env.checker.selectedHoistedRoots();
-    try std.testing.expect(roots.len >= 1);
-    try std.testing.expectEqual(@as(usize, 1), countExprRootsByTag(&test_env, .e_dispatch_call));
+    try std.testing.expectEqual(@as(usize, 1), roots.len);
+    try std.testing.expect(roots[0].pattern != null);
+    try expectExprTag(&test_env, roots[0].expr, .e_dispatch_call);
 }
 
 test "hoist roots selected for direct closed static dispatch function body" {
@@ -643,11 +195,12 @@ test "hoist roots selected for direct closed static dispatch function body" {
 
     try test_env.assertNoErrors();
     const roots = test_env.checker.selectedHoistedRoots();
-    try std.testing.expect(roots.len >= 1);
-    try std.testing.expectEqual(@as(usize, 1), countExprRootsByTag(&test_env, .e_dispatch_call));
+    try std.testing.expectEqual(@as(usize, 1), roots.len);
+    try std.testing.expectEqual(@as(?CIR.Pattern.Idx, null), roots[0].pattern);
+    try expectExprTag(&test_env, roots[0].expr, .e_dispatch_call);
 }
 
-test "hoist roots preserve children for ordinary call with runtime argument" {
+test "hoist roots are not selected for ordinary call with runtime argument" {
     var test_env = try TestEnv.init("Test",
         \\add_one = |n| n + 1.I64
         \\
@@ -659,11 +212,10 @@ test "hoist roots preserve children for ordinary call with runtime argument" {
     defer test_env.deinit();
 
     try test_env.assertNoErrors();
-    try std.testing.expectEqual(@as(usize, 0), countExprRootsByTag(&test_env, .e_call));
-    try std.testing.expect(test_env.checker.selectedHoistedRoots().len > 0);
+    try std.testing.expectEqual(@as(usize, 0), test_env.checker.selectedHoistedRoots().len);
 }
 
-test "hoist roots preserve children for ordinary call with runtime callee" {
+test "hoist roots are not selected for ordinary call with runtime callee" {
     var test_env = try TestEnv.init("Test",
         \\main = |arg, f| {
         \\    x = f(41.I64)
@@ -673,11 +225,10 @@ test "hoist roots preserve children for ordinary call with runtime callee" {
     defer test_env.deinit();
 
     try test_env.assertNoErrors();
-    try std.testing.expectEqual(@as(usize, 0), countExprRootsByTag(&test_env, .e_call));
-    try std.testing.expect(test_env.checker.selectedHoistedRoots().len > 0);
+    try std.testing.expectEqual(@as(usize, 0), test_env.checker.selectedHoistedRoots().len);
 }
 
-test "hoist roots preserve children for direct runtime-dependent function body" {
+test "hoist roots are not selected for direct runtime-dependent function body" {
     var test_env = try TestEnv.init("Test",
         \\add_one = |n| n + 1.I64
         \\
@@ -686,8 +237,7 @@ test "hoist roots preserve children for direct runtime-dependent function body" 
     defer test_env.deinit();
 
     try test_env.assertNoErrors();
-    try std.testing.expectEqual(@as(usize, 0), countExprRootsByTag(&test_env, .e_call));
-    try std.testing.expect(test_env.checker.selectedHoistedRoots().len > 0);
+    try std.testing.expectEqual(@as(usize, 0), test_env.checker.selectedHoistedRoots().len);
 }
 
 test "hoist roots selected for closed nested lambda body child" {
@@ -706,7 +256,7 @@ test "hoist roots selected for closed nested lambda body child" {
     try expectExprTag(&test_env, roots[0].expr, .e_dispatch_call);
 }
 
-test "hoist roots preserve children for nested lambda body depending on its argument" {
+test "hoist roots are not selected for nested lambda body depending on its argument" {
     var test_env = try TestEnv.init("Test",
         \\main = |arg| {
         \\    f = |n| n + 2.I64
@@ -716,8 +266,7 @@ test "hoist roots preserve children for nested lambda body depending on its argu
     defer test_env.deinit();
 
     try test_env.assertNoErrors();
-    try std.testing.expectEqual(@as(usize, 0), countExprRootsByTag(&test_env, .e_dispatch_call));
-    try std.testing.expect(test_env.checker.selectedHoistedRoots().len > 0);
+    try std.testing.expectEqual(@as(usize, 0), test_env.checker.selectedHoistedRoots().len);
 }
 
 test "hoist roots selected for record destructure extraction binders" {
@@ -837,7 +386,7 @@ test "hoist roots selected for single-branch match tuple binders" {
     );
     defer test_env.deinit();
 
-    try test_env.assertNoErrors();
+    try expectOnlyComptimeConditionWarnings(&test_env, 1);
     try std.testing.expectEqual(@as(usize, 2), countPatternExtractionRoots(test_env.checker.selectedHoistedRoots()));
 }
 
@@ -851,7 +400,7 @@ test "hoist roots selected for single-branch match alias binders" {
     );
     defer test_env.deinit();
 
-    try test_env.assertNoErrors();
+    try expectOnlyComptimeConditionWarnings(&test_env, 1);
     try std.testing.expectEqual(@as(usize, 1), countPatternExtractionRoots(test_env.checker.selectedHoistedRoots()));
 }
 
@@ -865,7 +414,7 @@ test "hoist roots selected for single-branch match list rest binders" {
     );
     defer test_env.deinit();
 
-    try test_env.assertNoErrors();
+    try expectOnlyComptimeConditionWarnings(&test_env, 1);
     try std.testing.expectEqual(@as(usize, 1), countPatternExtractionRoots(test_env.checker.selectedHoistedRoots()));
 }
 
@@ -883,9 +432,9 @@ test "hoist roots selected for closed multi-branch match with branch binders" {
     );
     defer test_env.deinit();
 
-    try test_env.assertNoErrors();
+    try expectOnlyComptimeConditionWarnings(&test_env, 1);
     const roots = test_env.checker.selectedHoistedRoots();
-    try std.testing.expect(roots.len >= 2);
+    try std.testing.expectEqual(@as(usize, 2), roots.len);
     try std.testing.expectEqual(@as(usize, 1), countMatchExprRoots(&test_env));
     try std.testing.expectEqual(@as(usize, 0), countPatternExtractionRoots(roots));
 }
@@ -912,7 +461,7 @@ test "hoist roots are not selected for runtime-dependent multi-branch match" {
     try std.testing.expectEqual(@as(usize, 0), countMatchExprRoots(&test_env));
 }
 
-test "hoist roots are not selected for closed child inside runtime-controlled match branch" {
+test "hoist roots are not selected for runtime-controlled match branch bodies" {
     var test_env = try TestEnv.init("Test",
         \\main = |arg| {
         \\    input : Try(I64, I64)
@@ -930,10 +479,10 @@ test "hoist roots are not selected for closed child inside runtime-controlled ma
     defer test_env.deinit();
 
     try test_env.assertNoErrors();
-    try std.testing.expectEqual(@as(usize, 0), countExprRootsByTag(&test_env, .e_dispatch_call));
+    try std.testing.expectEqual(@as(usize, 0), test_env.checker.selectedHoistedRoots().len);
 }
 
-test "hoist roots preserve children for local values depending on function arguments" {
+test "hoist roots are not selected for local values depending on function arguments" {
     var test_env = try TestEnv.init("Test",
         \\main = |arg| {
         \\    x = arg + 1.I64
@@ -943,8 +492,7 @@ test "hoist roots preserve children for local values depending on function argum
     defer test_env.deinit();
 
     try test_env.assertNoErrors();
-    try std.testing.expectEqual(@as(usize, 0), countExprRootsByTag(&test_env, .e_dispatch_call));
-    try std.testing.expect(test_env.checker.selectedHoistedRoots().len > 0);
+    try std.testing.expectEqual(@as(usize, 0), test_env.checker.selectedHoistedRoots().len);
 }
 
 test "hoist roots are not selected for many unused closed locals" {
@@ -979,7 +527,7 @@ test "hoist roots are not selected for many unused closed locals" {
     try std.testing.expectEqual(@as(usize, 0), test_env.checker.selectedHoistedRoots().len);
 }
 
-fn expectPatternExtractionRoot(root: hoist_roots.SelectedHoistedRoot) anyerror!void {
+fn expectPatternExtractionRoot(root: hoist_roots.SelectedHoistedRoot) error{ TestUnexpectedResult, TestExpectedEqual, ExpectedPatternExtractionRoot }!void {
     try std.testing.expect(root.pattern != null);
     const extraction = switch (root.body) {
         .pattern_extraction => |extraction| extraction,
@@ -990,8 +538,24 @@ fn expectPatternExtractionRoot(root: hoist_roots.SelectedHoistedRoot) anyerror!v
     try std.testing.expect(extraction.scrutinee_pattern != extraction.result_pattern);
 }
 
-fn expectExprTag(test_env: *const TestEnv, expr: CIR.Expr.Idx, expected: std.meta.Tag(CIR.Expr)) anyerror!void {
+fn expectExprTag(test_env: *const TestEnv, expr: CIR.Expr.Idx, expected: std.meta.Tag(CIR.Expr)) error{TestExpectedEqual}!void {
     try std.testing.expectEqual(expected, std.meta.activeTag(test_env.checker.cir.store.getExpr(expr)));
+}
+
+fn expectOnlyComptimeConditionWarnings(test_env: *TestEnv, expected_count: usize) error{ OutOfMemory, TestExpectedEqual, TestUnexpectedResult }!void {
+    try std.testing.expect(!test_env.parse_ast.hasErrors());
+
+    const diagnostics = try test_env.module_env.getDiagnostics();
+    defer test_env.gpa.free(diagnostics);
+    try std.testing.expectEqual(@as(usize, 0), diagnostics.len);
+
+    try std.testing.expectEqual(expected_count, test_env.checker.problems.problems.items.len);
+    for (test_env.checker.problems.problems.items) |problem| {
+        switch (problem) {
+            .comptime_condition => {},
+            else => return error.TestUnexpectedResult,
+        }
+    }
 }
 
 fn countPatternExtractionRoots(roots: []const hoist_roots.SelectedHoistedRoot) usize {
@@ -1001,14 +565,6 @@ fn countPatternExtractionRoots(roots: []const hoist_roots.SelectedHoistedRoot) u
             .pattern_extraction => count += 1,
             .expr => {},
         }
-    }
-    return count;
-}
-
-fn countRootsWithPattern(roots: []const hoist_roots.SelectedHoistedRoot) usize {
-    var count: usize = 0;
-    for (roots) |root| {
-        if (root.pattern != null) count += 1;
     }
     return count;
 }
@@ -1086,108 +642,7 @@ fn countExprRootsByTag(test_env: *const TestEnv, tag: std.meta.Tag(CIR.Expr)) us
     return count;
 }
 
-fn countBindingRootsWithDependencies(test_env: *const TestEnv) usize {
-    var count: usize = 0;
-    for (test_env.checker.selectedHoistedRoots()) |root| {
-        if (root.pattern != null and root.dependencies.len != 0) {
-            count += 1;
-        }
-    }
-    return count;
-}
-
-fn countListRootsByLength(test_env: *const TestEnv, len: u32) usize {
-    var count: usize = 0;
-    for (test_env.checker.selectedHoistedRoots()) |root| {
-        switch (test_env.checker.cir.store.getExpr(root.expr)) {
-            .e_list => |list| {
-                if (list.elems.span.len == len) count += 1;
-            },
-            else => {},
-        }
-    }
-    return count;
-}
-
-fn countDispatchRootsContaining(test_env: *const TestEnv, needle: []const u8) usize {
-    var count: usize = 0;
-    for (test_env.checker.selectedHoistedRoots()) |root| {
-        switch (test_env.checker.cir.store.getExpr(root.expr)) {
-            .e_dispatch_call => {
-                const region = test_env.checker.cir.store.getExprRegion(root.expr);
-                const source = test_env.checker.cir.common.source;
-                const start = region.start.offset;
-                const end = region.end.offset;
-                if (start < end and end <= source.len and std.mem.find(u8, source[start..end], needle) != null) {
-                    count += 1;
-                }
-            },
-            else => {},
-        }
-    }
-    return count;
-}
-
-fn countBlockRootsEndingInCrash(test_env: *const TestEnv) usize {
-    var count: usize = 0;
-    for (test_env.checker.selectedHoistedRoots()) |root| {
-        switch (test_env.checker.cir.store.getExpr(root.expr)) {
-            .e_block => |block| {
-                if (std.meta.activeTag(test_env.checker.cir.store.getExpr(block.final_expr)) == .e_crash) count += 1;
-            },
-            else => {},
-        }
-    }
-    return count;
-}
-
-fn hoistRootPolicySource() []const u8 {
-    const source = @embedFile("../Check.zig");
-    const start = std.mem.find(u8, source, "fn exprCanBeStoredConstRoot") orelse
-        @panic("missing hoist root policy function");
-    const end = std.mem.findPos(u8, source, start, "/// In debug builds") orelse
-        @panic("missing hoist root policy function end marker");
-    return source[start..end];
-}
-
-fn expectPolicyDoesNotMention(needle: []const u8) anyerror!void {
-    try std.testing.expect(!std.mem.containsAtLeast(u8, hoistRootPolicySource(), 1, needle));
-}
-
-test "static search finds no root blocker for dbg expect or crash" {
-    try expectPolicyDoesNotMention(".e_dbg");
-    try expectPolicyDoesNotMention(".e_crash");
-    try expectPolicyDoesNotMention(".e_expect,");
-    try expectPolicyDoesNotMention(".e_expect\n");
-}
-
-test "static search finds no root blocker for leaves" {
-    try expectPolicyDoesNotMention(".e_str_segment");
-    try expectPolicyDoesNotMention(".e_bytes_literal");
-    try expectPolicyDoesNotMention(".e_num,");
-    try expectPolicyDoesNotMention(".e_num_from_numeral");
-    try expectPolicyDoesNotMention(".e_empty_list");
-    try expectPolicyDoesNotMention(".e_empty_record");
-    try expectPolicyDoesNotMention(".e_zero_argument_tag");
-}
-
-test "static search finds no data-shape root blockers" {
-    try expectPolicyDoesNotMention(".e_for");
-    try expectPolicyDoesNotMention(".e_list");
-    try expectPolicyDoesNotMention(".e_tuple");
-    try expectPolicyDoesNotMention(".e_record");
-    try expectPolicyDoesNotMention(".e_tag");
-    try expectPolicyDoesNotMention(".e_nominal");
-}
-
-test "static search shows return and break use explicit control-transfer policy" {
-    const policy = hoistRootPolicySource();
-    try std.testing.expect(std.mem.containsAtLeast(u8, policy, 1, "Non-local control transfer"));
-    try std.testing.expect(std.mem.containsAtLeast(u8, policy, 1, ".e_return"));
-    try std.testing.expect(std.mem.containsAtLeast(u8, policy, 1, ".e_break"));
-}
-
-test "hoist roots preserve children for local values indirectly depending on function arguments" {
+test "hoist roots are not selected for local values indirectly depending on function arguments" {
     var test_env = try TestEnv.init("Test",
         \\main = |arg| {
         \\    x = arg + 1.I64
@@ -1198,25 +653,7 @@ test "hoist roots preserve children for local values indirectly depending on fun
     defer test_env.deinit();
 
     try test_env.assertNoErrors();
-    try std.testing.expectEqual(@as(usize, 0), countExprRootsByTag(&test_env, .e_dispatch_call));
-    try std.testing.expect(test_env.checker.selectedHoistedRoots().len > 0);
-}
-
-test "hoist roots do not select early return control-flow fragments" {
-    var test_env = try TestEnv.init("Test",
-        \\main = |flag| {
-        \\    if flag {
-        \\        return True
-        \\    }
-        \\
-        \\    False
-        \\}
-    );
-    defer test_env.deinit();
-
-    try test_env.assertNoErrors();
-    try std.testing.expectEqual(@as(usize, 0), countExprRootsByTag(&test_env, .e_return));
-    try std.testing.expectEqual(@as(usize, 0), countExprRootsByTag(&test_env, .e_block));
+    try std.testing.expectEqual(@as(usize, 0), test_env.checker.selectedHoistedRoots().len);
 }
 
 test "hoist roots are not selected for branch-local binding dependencies" {
@@ -1246,7 +683,7 @@ test "hoist roots are not selected for branch-local binding dependencies" {
     }
 }
 
-test "hoist roots preserve children for mutable local dependencies" {
+test "hoist roots are not selected for mutable local dependencies" {
     var test_env = try TestEnv.init("Test",
         \\main = |_| {
         \\    var x = 41.I64
@@ -1257,57 +694,10 @@ test "hoist roots preserve children for mutable local dependencies" {
     defer test_env.deinit();
 
     try test_env.assertNoErrors();
-    try std.testing.expectEqual(@as(usize, 0), countExprRootsByTag(&test_env, .e_dispatch_call));
-    try std.testing.expect(test_env.checker.selectedHoistedRoots().len > 0);
+    try std.testing.expectEqual(@as(usize, 0), test_env.checker.selectedHoistedRoots().len);
 }
 
-test "hoist roots preserve children for reassigned local dependencies" {
-    var test_env = try TestEnv.init("Test",
-        \\main = |_| {
-        \\    var x = 41.I64
-        \\    x = 42.I64
-        \\    y = x + 1.I64
-        \\    y
-        \\}
-    );
-    defer test_env.deinit();
-
-    try test_env.assertNoErrors();
-    try std.testing.expectEqual(@as(usize, 0), countExprRootsByTag(&test_env, .e_dispatch_call));
-    try std.testing.expect(test_env.checker.selectedHoistedRoots().len > 0);
-}
-
-test "hoist roots poison parent with erroneous child without duplicate diagnostics" {
-    var test_env = try TestEnv.init("Test",
-        \\main = |_| {
-        \\    record = { bad: 1.I64 + "nope", bytes: [1.U8, 2.U8] }
-        \\    record
-        \\}
-    );
-    defer test_env.deinit();
-
-    try test_env.assertOneTypeError("TYPE MISMATCH");
-    try std.testing.expectEqual(@as(usize, 0), countExprRootsByTag(&test_env, .e_record));
-}
-
-test "hoist roots preserve children for loop-bound value dependencies" {
-    var test_env = try TestEnv.init("Test",
-        \\main = |_| {
-        \\    for item in [1.I64, 2.I64] {
-        \\        y = item + 1.I64
-        \\        y
-        \\    }
-        \\    {}
-        \\}
-    );
-    defer test_env.deinit();
-
-    try test_env.assertNoErrors();
-    try std.testing.expectEqual(@as(usize, 0), countExprRootsByTag(&test_env, .e_dispatch_call));
-    try std.testing.expect(test_env.checker.selectedHoistedRoots().len > 0);
-}
-
-test "hoist roots selected for observable debug expressions" {
+test "hoist roots are not selected for observable debug expressions" {
     var test_env = try TestEnv.init("Test",
         \\main = |_| {
         \\    dbg 1.I64
@@ -1317,10 +707,10 @@ test "hoist roots selected for observable debug expressions" {
     defer test_env.deinit();
 
     try test_env.assertNoErrors();
-    try std.testing.expectEqual(@as(usize, 1), countExprRootsByTag(&test_env, .e_block));
+    try std.testing.expectEqual(@as(usize, 0), test_env.checker.selectedHoistedRoots().len);
 }
 
-test "hoist roots selected across observable debug statements in blocks" {
+test "hoist roots are not selected after observable effects in blocks" {
     var test_env = try TestEnv.init("Test",
         \\main = |_| {
         \\    before = 1.I64 + 2.I64
@@ -1332,106 +722,10 @@ test "hoist roots selected across observable debug statements in blocks" {
     defer test_env.deinit();
 
     try test_env.assertNoErrors();
-    try std.testing.expectEqual(@as(usize, 2), countExprRootsByTag(&test_env, .e_dispatch_call));
-}
-
-test "hoist roots selected for dbg expression wrappers" {
-    var test_env = try TestEnv.init("Test",
-        \\main = |_| dbg (1.I64 + 2.I64)
-    );
-    defer test_env.deinit();
-
-    try test_env.assertNoErrors();
-    try std.testing.expectEqual(@as(usize, 1), countExprRootsByTag(&test_env, .e_dbg));
-}
-
-test "hoist roots selected for expect statements" {
-    var test_env = try TestEnv.init("Test",
-        \\main = |_| {
-        \\    expect 1.I64 == 1.I64
-        \\    {}
-        \\}
-    );
-    defer test_env.deinit();
-
-    try test_env.assertNoErrors();
-    try std.testing.expectEqual(@as(usize, 1), countExprRootsByTag(&test_env, .e_block));
-}
-
-test "hoist roots selected for conditional crash expressions" {
-    var test_env = try TestEnv.init("Test",
-        \\main = |_| if 1.I64 == 0.I64 { crash "bad" } else { 42.I64 }
-    );
-    defer test_env.deinit();
-
-    try test_env.assertNoErrors();
-    try std.testing.expectEqual(@as(usize, 1), countExprRootsByTag(&test_env, .e_if));
-}
-
-test "hoist roots do not select unreachable crashing match branch body" {
-    var test_env = try TestEnv.init("Test",
-        \\main = |_| {
-        \\    input : Try(I64, I64)
-        \\    input = Ok(1.I64)
-        \\    match input {
-        \\        Ok(_) => 1.I64
-        \\        Err(_) => { crash "bad" }
-        \\    }
-        \\}
-    );
-    defer test_env.deinit();
-
-    try test_env.assertNoErrors();
-    try std.testing.expectEqual(@as(usize, 0), countBlockRootsEndingInCrash(&test_env));
-    try std.testing.expectEqual(@as(usize, 0), countExprRootsByTag(&test_env, .e_crash));
-}
-
-test "hoist roots selected across return statements" {
-    var test_env = try TestEnv.init("Test",
-        \\main = |_| {
-        \\    before = 1.I64 + 2.I64
-        \\    return before
-        \\}
-    );
-    defer test_env.deinit();
-
-    try test_env.assertNoErrors();
     try std.testing.expectEqual(@as(usize, 1), countExprRootsByTag(&test_env, .e_dispatch_call));
 }
 
-test "hoist roots selected across break statements" {
-    var test_env = try TestEnv.init("Test",
-        \\main = |arg| {
-        \\    before = 1.I64 + 2.I64
-        \\    while True {
-        \\        break
-        \\    }
-        \\    before + arg
-        \\}
-    );
-    defer test_env.deinit();
-
-    try test_env.assertNoErrors();
-    try std.testing.expectEqual(@as(usize, 1), countExprRootsByTag(&test_env, .e_dispatch_call));
-    try std.testing.expectEqual(@as(usize, 0), countExprRootsByTag(&test_env, .e_break));
-}
-
-test "hoist roots selected for closed for expressions" {
-    var test_env = try TestEnv.init("Test",
-        \\main = |_| {
-        \\    for _ in [1.I64, 2.I64] {
-        \\        1.I64 + 2.I64
-        \\    }
-        \\    {}
-        \\}
-    );
-    defer test_env.deinit();
-
-    try test_env.assertNoErrors();
-    try std.testing.expectEqual(@as(usize, 1), countExprRootsByTag(&test_env, .e_block));
-}
-
-test "hoist roots ignore unused closed empty list binding" {
+test "hoist roots with non-concrete compile-time types are pruned" {
     var test_env = try TestEnv.init("Test",
         \\main = |arg| {
         \\    x = []
@@ -1445,7 +739,7 @@ test "hoist roots ignore unused closed empty list binding" {
     try std.testing.expectEqual(@as(usize, 0), test_env.checker.selectedHoistedRoots().len);
 }
 
-test "hoist roots preserve closed block inside discarded runtime-dependent list" {
+test "hoist arbitrary block roots with non-concrete internal locals are pruned" {
     var test_env = try TestEnv.init("Test",
         \\main = |arg| {
         \\    _ = [
@@ -1461,10 +755,10 @@ test "hoist roots preserve closed block inside discarded runtime-dependent list"
     defer test_env.deinit();
 
     try test_env.assertNoErrors();
-    try std.testing.expectEqual(@as(usize, 1), countExprRootsByTag(&test_env, .e_block));
+    try std.testing.expectEqual(@as(usize, 0), test_env.checker.selectedHoistedRoots().len);
 }
 
-test "hoist roots preserve closed block inside discarded runtime-dependent list repro" {
+test "hoist exact non-concrete internal local repro roots are pruned" {
     var test_env = try TestEnv.init("Test",
         \\main = |arg| {
         \\    _ = [
@@ -1480,10 +774,10 @@ test "hoist roots preserve closed block inside discarded runtime-dependent list 
     defer test_env.deinit();
 
     try test_env.assertNoErrors();
-    try std.testing.expectEqual(@as(usize, 1), countExprRootsByTag(&test_env, .e_block));
+    try std.testing.expectEqual(@as(usize, 0), test_env.checker.selectedHoistedRoots().len);
 }
 
-test "hoist roots preserve closed destructuring block inside discarded runtime-dependent list" {
+test "hoist nested block roots with non-concrete destructured internal binders are pruned" {
     var test_env = try TestEnv.init("Test",
         \\main = |arg| {
         \\    _ = [
@@ -1499,10 +793,10 @@ test "hoist roots preserve closed destructuring block inside discarded runtime-d
     defer test_env.deinit();
 
     try test_env.assertNoErrors();
-    try std.testing.expectEqual(@as(usize, 1), countExprRootsByTag(&test_env, .e_block));
+    try std.testing.expectEqual(@as(usize, 0), test_env.checker.selectedHoistedRoots().len);
 }
 
-test "hoist roots preserve closed match inside discarded runtime-dependent list" {
+test "hoist match roots with non-concrete contextual binders are pruned" {
     var test_env = try TestEnv.init("Test",
         \\main = |arg| {
         \\    _ = [
@@ -1516,11 +810,11 @@ test "hoist roots preserve closed match inside discarded runtime-dependent list"
     );
     defer test_env.deinit();
 
-    try test_env.assertNoErrors();
-    try std.testing.expectEqual(@as(usize, 1), countExprRootsByTag(&test_env, .e_match));
+    try expectOnlyComptimeConditionWarnings(&test_env, 1);
+    try std.testing.expectEqual(@as(usize, 0), test_env.checker.selectedHoistedRoots().len);
 }
 
-test "hoist roots preserve unconstrained empty-list dependency chain after checking" {
+test "hoist roots depending on pruned non-concrete roots are pruned" {
     var test_env = try TestEnv.init("Test",
         \\main = |_| {
         \\    x = []
@@ -1531,12 +825,10 @@ test "hoist roots preserve unconstrained empty-list dependency chain after check
     defer test_env.deinit();
 
     try test_env.assertNoErrors();
-    try std.testing.expectEqual(@as(usize, 3), test_env.checker.selectedHoistedRoots().len);
-    try std.testing.expectEqual(@as(usize, 1), countExprRootsByTag(&test_env, .e_empty_list));
-    try std.testing.expectEqual(@as(usize, 1), countExprRootsByTag(&test_env, .e_dispatch_call));
+    try std.testing.expectEqual(@as(usize, 0), test_env.checker.selectedHoistedRoots().len);
 }
 
-test "hoist roots are selected for custom literal dependencies" {
+test "hoist roots depending on pruned custom literal roots are pruned" {
     var test_env = try TestEnv.init("Test",
         \\Picky := [Picky(Numeral)].{
         \\    from_numeral : Numeral -> Try(Picky, [InvalidNumeral(Str)])
@@ -1555,7 +847,7 @@ test "hoist roots are selected for custom literal dependencies" {
     defer test_env.deinit();
 
     try test_env.assertNoErrors();
-    try std.testing.expect(test_env.checker.selectedHoistedRoots().len > 0);
+    try std.testing.expectEqual(@as(usize, 0), test_env.checker.selectedHoistedRoots().len);
 }
 
 test "hoist roots are not selected inside ordinary top-level constants" {
@@ -1572,7 +864,23 @@ test "hoist roots are not selected inside ordinary top-level constants" {
     try std.testing.expectEqual(@as(usize, 0), test_env.checker.selectedHoistedRoots().len);
 }
 
-test "hoist roots are not selected for closed child inside runtime-controlled branch body" {
+test "hoist roots are not selected inside top-level expects" {
+    var test_env = try TestEnv.init("Test",
+        \\expensive = |n| n + 1.I64
+        \\
+        \\expect {
+        \\    result = expensive(41.I64)
+        \\    result == 42.I64
+        \\}
+    );
+    defer test_env.deinit();
+
+    try test_env.assertNoErrors();
+    // repro for https://github.com/roc-lang/roc/issues/9747
+    try std.testing.expectEqual(@as(usize, 0), test_env.checker.selectedHoistedRoots().len);
+}
+
+test "hoist roots are not selected for runtime-controlled branch bodies" {
     var test_env = try TestEnv.init("Test",
         \\main = |arg| {
         \\    if arg == 0.I64 {
@@ -1585,47 +893,7 @@ test "hoist roots are not selected for closed child inside runtime-controlled br
     defer test_env.deinit();
 
     try test_env.assertNoErrors();
-    try std.testing.expectEqual(@as(usize, 0), countExprRootsByTag(&test_env, .e_block));
-}
-
-test "hoist roots preserve children for branch body call with runtime argument" {
-    var test_env = try TestEnv.init("Test",
-        \\add_one = |n| n + 1.I64
-        \\
-        \\main = |arg| {
-        \\    if arg == 0.I64 {
-        \\        add_one(arg)
-        \\    } else {
-        \\        arg
-        \\    }
-        \\}
-    );
-    defer test_env.deinit();
-
-    try test_env.assertNoErrors();
-    try std.testing.expectEqual(@as(usize, 0), countExprRootsByTag(&test_env, .e_call));
-    try std.testing.expect(test_env.checker.selectedHoistedRoots().len > 0);
-}
-
-test "hoist roots selected for branch body call with observable reachable body" {
-    var test_env = try TestEnv.init("Test",
-        \\dbg_value = || {
-        \\    dbg 1.I64
-        \\    42.I64
-        \\}
-        \\
-        \\main = |arg| {
-        \\    if arg == 0.I64 {
-        \\        dbg_value()
-        \\    } else {
-        \\        0.I64
-        \\    }
-        \\}
-    );
-    defer test_env.deinit();
-
-    try test_env.assertNoErrors();
-    try std.testing.expect(countExprRootsByTag(&test_env, .e_block) > 0);
+    try std.testing.expectEqual(@as(usize, 0), test_env.checker.selectedHoistedRoots().len);
 }
 
 test "hoist roots selected for whole closed conditional expressions" {
@@ -1638,14 +906,14 @@ test "hoist roots selected for whole closed conditional expressions" {
     );
     defer test_env.deinit();
 
-    try test_env.assertNoErrors();
+    try expectOnlyComptimeConditionWarnings(&test_env, 1);
     const roots = test_env.checker.selectedHoistedRoots();
     try std.testing.expectEqual(@as(usize, 1), roots.len);
     try std.testing.expectEqual(@as(?CIR.Pattern.Idx, null), roots[0].pattern);
     try expectExprTag(&test_env, roots[0].expr, .e_if);
 }
 
-test "hoist roots are selected for custom from_numeral conversion roots" {
+test "hoist roots are not selected for custom from_numeral conversion roots" {
     var test_env = try TestEnv.init("Test",
         \\Picky := [Picky(Numeral)].{
         \\    from_numeral : Numeral -> Try(Picky, [InvalidNumeral(Str)])
@@ -1662,10 +930,10 @@ test "hoist roots are selected for custom from_numeral conversion roots" {
     defer test_env.deinit();
 
     try test_env.assertNoErrors();
-    try std.testing.expect(test_env.checker.selectedHoistedRoots().len > 0);
+    try std.testing.expectEqual(@as(usize, 0), test_env.checker.selectedHoistedRoots().len);
 }
 
-test "hoist roots are selected for custom from_quote conversion roots" {
+test "hoist roots are not selected for custom from_quote conversion roots" {
     var test_env = try TestEnv.init("Test",
         \\Tag := [Tag(Str)].{
         \\    from_quote : Str -> Try(Tag, [BadQuotedBytes(Str)])
@@ -1682,10 +950,10 @@ test "hoist roots are selected for custom from_quote conversion roots" {
     defer test_env.deinit();
 
     try test_env.assertNoErrors();
-    try std.testing.expect(test_env.checker.selectedHoistedRoots().len > 0);
+    try std.testing.expectEqual(@as(usize, 0), test_env.checker.selectedHoistedRoots().len);
 }
 
-test "hoist roots preserve independent children around effectful static dispatch calls" {
+test "hoist roots are not selected for effectful static dispatch calls" {
     var test_env = try TestEnv.init("Test",
         \\Foo := { x: I64 }.{
         \\    show! : Foo => I64
@@ -1703,51 +971,10 @@ test "hoist roots preserve independent children around effectful static dispatch
     defer test_env.deinit();
 
     try test_env.assertNoErrors();
-    try std.testing.expectEqual(@as(usize, 1), countExprRootsByTag(&test_env, .e_record));
+    try std.testing.expectEqual(@as(usize, 0), test_env.checker.selectedHoistedRoots().len);
 }
 
-test "hoist roots preserve independent children around direct effectful calls" {
-    var test_env = try TestEnv.init("Test",
-        \\consume! : List(U8) => U64
-        \\consume! = |_bytes| 1
-        \\
-        \\main! = |_| {
-        \\    result = consume!([1.U8, 2.U8])
-        \\    _ = result
-        \\    {}
-        \\}
-    );
-    defer test_env.deinit();
-
-    try test_env.assertNoErrors();
-    try std.testing.expectEqual(@as(usize, 0), countExprRootsByTag(&test_env, .e_call));
-    try std.testing.expectEqual(@as(usize, 1), countListRootsByLength(&test_env, 2));
-}
-
-test "hoist roots preserve children when delayed where-clause dispatch resolves effectful" {
-    var test_env = try TestEnv.init("Test",
-        \\uses_tick! : a => { value: U64, bytes: List(U8) } where [a.tick! : a => U64]
-        \\uses_tick! = |x| { value: x.tick!(), bytes: [1.U8, 2.U8] }
-        \\
-        \\Eff := [Eff].{
-        \\    tick! : Eff => U64
-        \\    tick! = |_| 1
-        \\}
-        \\
-        \\main! = |arg| {
-        \\    x = uses_tick!(Eff.Eff)
-        \\    _ = x.value + arg
-        \\    {}
-        \\}
-    );
-    defer test_env.deinit();
-
-    try test_env.assertNoErrors();
-    try std.testing.expectEqual(@as(usize, 0), countExprRootsByTag(&test_env, .e_call));
-    try std.testing.expectEqual(@as(usize, 1), countExprRootsByTag(&test_env, .e_list));
-}
-
-test "hoist roots reject dict pseudo-seed dependent parents" {
+test "hoist roots are not selected for dict pseudo-seed dependent values" {
     var test_env = try TestEnv.init("Test",
         \\main! = || {
         \\    dict = Dict.single("a", "b")
@@ -1758,16 +985,5 @@ test "hoist roots reject dict pseudo-seed dependent parents" {
     defer test_env.deinit();
 
     try test_env.assertNoErrors();
-    for (test_env.checker.selectedHoistedRoots()) |root| {
-        try std.testing.expect(!root.has_runtime_source);
-        switch (test_env.checker.cir.store.getExpr(root.expr)) {
-            .e_block,
-            .e_call,
-            .e_run_low_level,
-            => return error.DictRuntimeSourceRootSurvived,
-            else => {},
-        }
-    }
-    try std.testing.expectEqual(@as(usize, 3), countExprRootsByTag(&test_env, .e_str));
-    try std.testing.expectEqual(@as(usize, 1), countExprRootsByTag(&test_env, .e_empty_record));
+    try std.testing.expectEqual(@as(usize, 0), test_env.checker.selectedHoistedRoots().len);
 }

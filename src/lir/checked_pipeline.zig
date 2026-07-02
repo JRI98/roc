@@ -12,9 +12,6 @@ const core = @import("lir_core");
 
 const Arc = @import("arc.zig");
 const Trmc = @import("trmc.zig");
-const BoxReuse = @import("box_reuse.zig");
-const ReturnSlot = @import("return_slot.zig");
-const StrAppend = @import("str_append.zig");
 const ScalarizeJoins = @import("scalarize_joins.zig");
 const TagReachability = @import("tag_reachability.zig");
 const ReachableProcs = @import("reachable_procs.zig");
@@ -46,8 +43,8 @@ pub const RootRequestSet = struct {
 pub const TargetConfig = struct {
     target_usize: base.target.TargetUsize = base.target.TargetUsize.native,
     checked_module_state: CheckedModuleState = .complete,
-    post_check_lowering: PostCheckLoweringMode = .ordinary,
-    debug_effects: DebugEffectMode = .run,
+    inline_mode: InlineMode = .none,
+    inline_expects: InlineExpectMode = .run,
     /// Allow `List.map` to reuse a unique input list's allocation when the
     /// input and output element layouts are interchangeable. Optimized builds
     /// enable this; dev builds and compile-time evaluation leave it off so
@@ -55,6 +52,8 @@ pub const TargetConfig = struct {
     list_in_place_map: bool = false,
     /// Preserve source-level procedure names in LIR for runtime diagnostics.
     proc_debug_names: bool = false,
+    /// Control Monotype specialization cache reads and writes.
+    monotype_cache: MonotypeCacheControl = .{},
     /// Delete LIR switch edges whose tag discriminants are unreachable. This
     /// is enabled for optimized builds and kept off for dev and compile-time
     /// evaluation.
@@ -67,31 +66,13 @@ pub const CheckedModuleState = enum {
     checking_finalization,
 };
 
-/// Field metadata for runtime record value inspection.
 pub const RuntimeRecordFieldSchema = postcheck.SolvedLirLower.RuntimeRecordFieldSchema;
-/// Record metadata for runtime value inspection.
 pub const RuntimeRecordSchema = postcheck.SolvedLirLower.RuntimeRecordSchema;
-/// Tag metadata for runtime tag-union value inspection.
 pub const RuntimeTagSchema = postcheck.SolvedLirLower.RuntimeTagSchema;
-/// Tag-union metadata for runtime value inspection.
 pub const RuntimeTagUnionSchema = postcheck.SolvedLirLower.RuntimeTagUnionSchema;
-/// Debug effect handling selected for post-check lowering.
-pub const DebugEffectMode = postcheck.SolvedLirLower.DebugEffectMode;
-
-/// Checked-to-LIR lowering family selected at the driver boundary.
-pub const PostCheckLoweringMode = enum {
-    ordinary,
-    optimized,
-
-    pub fn isOptimized(self: PostCheckLoweringMode) bool {
-        return self == .optimized;
-    }
-};
-
-/// Construction counts for post-check lowering families.
-pub const PostCheckLoweringStats = struct {
-    optimized_contexts: u32 = 0,
-};
+pub const InlineMode = postcheck.SolvedInline.Mode;
+pub const InlineExpectMode = postcheck.SolvedLirLower.InlineExpectMode;
+pub const MonotypeCacheControl = postcheck.Monotype.Lower.SpecializationCacheControl;
 
 /// Runtime record and tag-union schemas needed by dev tooling.
 pub const RuntimeValueSchemaStore = struct {
@@ -150,7 +131,6 @@ pub const LoweredProgram = struct {
     main_proc: ?LIR.LirProcSpecId,
     target_usize: base.target.TargetUsize,
     runtime_value_schemas: RuntimeValueSchemaStore,
-    post_check_stats: PostCheckLoweringStats,
 
     pub fn deinit(self: *LoweredProgram) void {
         self.runtime_value_schemas.deinit();
@@ -233,8 +213,11 @@ pub fn lowerCheckedModulesToLir(
         rootRequests(roots, layout_requests, static_data_requests),
         .{
             .proc_debug_names = target.proc_debug_names,
-            .static_data_literals = target.checked_module_state == .complete and roots.include_static_data_exports,
-            .target_usize = target.target_usize,
+            .specialization_cache = target.monotype_cache,
+            .inline_expects = switch (target.inline_expects) {
+                .run => .run,
+                .omit => .omit,
+            },
         },
     );
     var mono_owned = true;
@@ -246,23 +229,10 @@ pub fn lowerCheckedModulesToLir(
     var lifted_owned = true;
     errdefer if (lifted_owned) lifted.deinit();
 
-    var post_check_stats = PostCheckLoweringStats{};
-
-    if (target.post_check_lowering.isOptimized()) {
-        post_check_stats.optimized_contexts += 1;
-
-        var pre_solved = try postcheck.LambdaSolved.Solve.run(allocator, lifted);
-        lifted_owned = false;
-        var pre_solved_owned = true;
-        errdefer if (pre_solved_owned) pre_solved.deinit();
-
-        try postcheck.MonotypeLifted.SpecConstr.runWithSolved(allocator, &pre_solved);
-
-        lifted = pre_solved.lifted;
-        pre_solved.deinitExceptLifted();
-        pre_solved_owned = false;
-        lifted_owned = true;
+    if (target.inline_mode != .none) {
+        try postcheck.MonotypeLifted.SpecConstr.run(allocator, &lifted);
     }
+    try postcheck.MonotypeLifted.Lift.recomputeCaptures(allocator, &lifted);
 
     var solved = try postcheck.LambdaSolved.Solve.run(allocator, lifted);
     lifted_owned = false;
@@ -270,12 +240,12 @@ pub fn lowerCheckedModulesToLir(
     var solved_owned = true;
     errdefer if (solved_owned) solved.deinit();
 
-    var inline_plan = try postcheck.SolvedInline.analyze(allocator, .none, &solved);
+    var inline_plan = try postcheck.SolvedInline.analyze(allocator, target.inline_mode, &solved);
     defer inline_plan.deinit();
 
     var lowered = try postcheck.SolvedLirLower.run(allocator, target.target_usize, solved, .{
         .inline_plan = inline_plan.view(),
-        .debug_effects = target.debug_effects,
+        .inline_expects = target.inline_expects,
         .list_in_place_map = target.list_in_place_map,
         .proc_debug_names = target.proc_debug_names,
     });
@@ -288,9 +258,6 @@ pub fn lowerCheckedModulesToLir(
     // statements (see src/lir/trmc.zig).
     try Trmc.run(&lowered.lir_result.store, &lowered.lir_result.layouts);
     try ScalarizeJoins.run(&lowered.lir_result.store, &lowered.lir_result.layouts);
-    try BoxReuse.run(&lowered.lir_result.store, &lowered.lir_result.layouts);
-    try ReturnSlot.run(&lowered.lir_result.store, &lowered.lir_result.layouts);
-    try StrAppend.run(&lowered.lir_result.store);
     if (target.tag_reachability) {
         try TagReachability.run(&lowered.lir_result);
     }
@@ -298,7 +265,7 @@ pub fn lowerCheckedModulesToLir(
 
     try Arc.insert(&lowered.lir_result.store, &lowered.lir_result.layouts, .{
         .roots = lowered.lir_result.root_procs.items,
-        .specialize = target.post_check_lowering.isOptimized(),
+        .specialize = target.inline_mode != .none,
     });
 
     if (roots.requests.len != 0 and lowered.lir_result.root_procs.items.len == 0) {
@@ -321,7 +288,6 @@ pub fn lowerCheckedModulesToLir(
         .main_proc = main_proc,
         .target_usize = target.target_usize,
         .runtime_value_schemas = runtime_value_schemas,
-        .post_check_stats = post_check_stats,
     };
 }
 
@@ -330,11 +296,6 @@ fn verifyCheckedBoundary(modules: CheckedModuleSet, target: TargetConfig) Alloca
     switch (target.checked_module_state) {
         .complete => try modules.root.module.verifyComplete(),
         .checking_finalization => modules.root.module.verifyReadyForCompileTimeLowering(),
-    }
-    if (target.post_check_lowering.isOptimized()) {
-        if (target.checked_module_state != .complete) {
-            checkedPipelineInvariant("optimized post-check lowering cannot run during checking finalization");
-        }
     }
 }
 
@@ -430,10 +391,7 @@ fn collectStaticDataRequests(
         switch (provided) {
             .data => |data| {
                 if (try checkedTypeContainsFunction(allocator, root.checked_types.view(), data.checked_type)) {
-                    try requests.append(allocator, .{
-                        .const_ref = data.const_ref,
-                        .checked_type = data.checked_type,
-                    });
+                    try requests.append(allocator, .{ .data = data });
                 }
             },
             .procedure => {},

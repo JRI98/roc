@@ -23,16 +23,21 @@ const RuntimeValueAddress = struct {
     layout: u32,
 };
 
-const ResolvedTagValue = struct {
-    selected: LirProgram.ConstTagVariant,
-    payload_layout: layout.Idx,
-    payload_value: Value,
+/// Runtime erased-callable identity decoded into the LIR proc and capture data.
+pub const ErasedCallableResolution = struct {
+    proc: lir.LIR.LirProcSpecId,
+    capture_ptr: [*]u8,
 };
 
-const ResolvedFnValue = struct {
-    selected: LirProgram.FnVariant,
-    payload_layout: layout.Idx,
-    payload_value: Value,
+/// Resolves erased-callable runtime data for the active evaluator.
+pub const ErasedCallableResolver = struct {
+    context: ?*anyopaque = null,
+    resolve: *const fn (?*anyopaque, [*]u8) ErasedCallableResolution = interpreterErasedCallable,
+};
+
+const TagBase = struct {
+    value: Value,
+    layout_idx: layout.Idx,
 };
 
 const StrBacking = struct {
@@ -47,6 +52,7 @@ pub const Writer = struct {
     program: *const LirProgram.Result,
     stored_values: std.AutoHashMap(RuntimeValueAddress, checked.ConstNodeId),
     str_backings: std.AutoHashMap(usize, StrBacking),
+    erased_callable_resolver: ErasedCallableResolver,
 
     pub fn init(
         allocator: Allocator,
@@ -59,7 +65,12 @@ pub const Writer = struct {
             .program = program,
             .stored_values = std.AutoHashMap(RuntimeValueAddress, checked.ConstNodeId).init(allocator),
             .str_backings = std.AutoHashMap(usize, StrBacking).init(allocator),
+            .erased_callable_resolver = .{},
         };
+    }
+
+    pub fn setErasedCallableResolver(self: *Writer, resolver: ErasedCallableResolver) void {
+        self.erased_callable_resolver = resolver;
     }
 
     pub fn deinit(self: *Writer) void {
@@ -87,7 +98,6 @@ pub const Writer = struct {
                 .erased_fn => |set| .{ .fn_value = try self.storeErasedFn(set, value) },
                 else => writerInvariant("compile-time callable root did not have a function const plan"),
             },
-            .test_expect => .expect,
             else => writerInvariant("non compile-time root reached ConstStore writer"),
         };
     }
@@ -113,12 +123,7 @@ pub const Writer = struct {
         layout_idx: layout.Idx,
         value: Value,
     ) Allocator.Error!checked.ConstNodeId {
-        const plan = self.constPlan(plan_id);
-        if (self.layoutWrapsLogicalValue(layout_idx, plan)) {
-            return try self.storeLayoutBoxedValue(plan_id, layout_idx, value);
-        }
-
-        return switch (plan) {
+        return switch (self.constPlan(plan_id)) {
             .pending => writerInvariant("pending const plan reached ConstStore writer"),
             .zst => try self.module.const_store.append(.zst),
             .scalar => try self.module.const_store.append(.{ .scalar = self.storeScalar(layout_idx, value) }),
@@ -129,7 +134,7 @@ pub const Writer = struct {
             .record => |fields| try self.storeRecord(fields, layout_idx, value),
             .tag_union => |variants| try self.storeTag(variants, layout_idx, value),
             .named => |named| blk: {
-                const backing = try self.storeValue(named.backing, named.backing_layout_idx, value);
+                const backing = try self.storeValue(named.backing, layout_idx, value);
                 break :blk try self.module.const_store.append(.{ .nominal = .{
                     .named_type = named.named_type,
                     .backing = backing,
@@ -143,36 +148,6 @@ pub const Writer = struct {
                 const fn_id = try self.storeErasedFn(set, value);
                 break :blk try self.module.const_store.append(.{ .fn_value = fn_id });
             },
-        };
-    }
-
-    fn layoutWrapsLogicalValue(
-        self: *Writer,
-        layout_idx: layout.Idx,
-        plan: LirProgram.ConstPlan,
-    ) bool {
-        switch (plan) {
-            .box => return false,
-            else => {},
-        }
-        const layout_value = self.program.layouts.getLayout(layout_idx);
-        return layout_value.tag == .box or layout_value.tag == .box_of_zst;
-    }
-
-    fn storeLayoutBoxedValue(
-        self: *Writer,
-        plan_id: LirProgram.ConstPlanId,
-        box_layout_idx: layout.Idx,
-        value: Value,
-    ) Allocator.Error!checked.ConstNodeId {
-        const box_layout = self.program.layouts.getLayout(box_layout_idx);
-        return switch (box_layout.tag) {
-            .box_of_zst => try self.storeValue(plan_id, .zst, Value.zst),
-            .box => blk: {
-                const ptr = self.readBoxDataPointer(value) orelse writerInvariant("layout-boxed value had null payload pointer");
-                break :blk try self.storeValue(plan_id, box_layout.getIdx(), .{ .ptr = ptr });
-            },
-            else => writerInvariant("layout-boxed const value had non-box layout"),
         };
     }
 
@@ -300,7 +275,7 @@ pub const Writer = struct {
 
     fn storeTuple(
         self: *Writer,
-        items: []const LirProgram.ConstFieldPlan,
+        items: []const LirProgram.ConstPlanId,
         layout_idx: layout.Idx,
         value: Value,
     ) Allocator.Error!checked.ConstNodeId {
@@ -311,7 +286,7 @@ pub const Writer = struct {
 
     fn storeRecord(
         self: *Writer,
-        fields: []const LirProgram.ConstFieldPlan,
+        fields: []const LirProgram.ConstPlanId,
         layout_idx: layout.Idx,
         value: Value,
     ) Allocator.Error!checked.ConstNodeId {
@@ -322,45 +297,38 @@ pub const Writer = struct {
 
     fn storeStructChildren(
         self: *Writer,
-        plans: []const LirProgram.ConstFieldPlan,
+        plans: []const LirProgram.ConstPlanId,
         layout_idx: layout.Idx,
         value: Value,
     ) Allocator.Error![]const checked.ConstNodeId {
-        const nodes = try self.module.const_store.allocator.alloc(checked.ConstNodeId, plans.len);
-        errdefer self.module.const_store.allocator.free(nodes);
-        if (plans.len == 0) return nodes;
+        if (plans.len == 0) return try self.module.const_store.allocator.alloc(checked.ConstNodeId, 0);
 
         const layout_value = self.program.layouts.getLayout(layout_idx);
+        if (layout_value.tag == .box) {
+            const ptr = self.readBoxDataPointer(value) orelse writerInvariant("boxed struct value had null payload pointer");
+            return try self.storeStructChildren(plans, layout_value.getIdx(), .{ .ptr = ptr });
+        }
+
+        const nodes = try self.module.const_store.allocator.alloc(checked.ConstNodeId, plans.len);
+        errdefer self.module.const_store.allocator.free(nodes);
         if (layout_value.tag == .zst) {
             for (nodes, 0..) |*node, index| {
-                if (!self.isZeroSizedLayout(plans[index].layout_idx)) {
-                    writerInvariant("zero-sized aggregate had a runtime child const-plan layout");
-                }
-                node.* = try self.storeValue(plans[index].plan, plans[index].layout_idx, Value.zst);
+                node.* = try self.storeValue(plans[index], .zst, Value.zst);
             }
             return nodes;
         }
-        if (layout_value.tag != .struct_) {
-            const runtime_child_index = self.representedFieldIndex(plans) orelse
-                writerInvariant("compact aggregate const plan did not have a represented runtime child");
+        if (layout_value.tag == .box_of_zst) {
             for (nodes, 0..) |*node, index| {
-                const child = plans[index];
-                if (index == runtime_child_index) {
-                    node.* = try self.storeValue(child.plan, layout_idx, value);
-                } else if (self.isZeroSizedLayout(child.layout_idx)) {
-                    node.* = try self.storeValue(child.plan, child.layout_idx, Value.zst);
-                } else {
-                    writerInvariant("compact aggregate const plan had multiple represented runtime children");
-                }
+                node.* = try self.storeValue(plans[index], .zst, Value.zst);
             }
             return nodes;
         }
+        if (layout_value.tag != .struct_) writerInvariant("struct const plan had non-struct layout");
 
         for (nodes, 0..) |*node, index| {
             const field_layout = self.program.layouts.getStructFieldLayoutByOriginalIndex(layout_value.getStruct().idx, @intCast(index));
             const offset = self.program.layouts.getStructFieldOffsetByOriginalIndex(layout_value.getStruct().idx, @intCast(index));
-            const field_value = if (self.isZeroSizedLayout(field_layout)) Value.zst else value.offset(offset);
-            node.* = try self.storeValue(plans[index].plan, field_layout, field_value);
+            node.* = try self.storeValue(plans[index], field_layout, value.offset(offset));
         }
         return nodes;
     }
@@ -371,10 +339,12 @@ pub const Writer = struct {
         layout_idx: layout.Idx,
         value: Value,
     ) Allocator.Error!checked.ConstNodeId {
-        const resolved = self.resolveTagValue(variants, layout_idx, value);
-        const payload_nodes = try self.storeTagPayloads(resolved.selected.payloads, resolved.payload_layout, resolved.payload_value);
+        const tag_base = self.resolveTagBase(layout_idx, value);
+        const selected = self.selectTagVariant(variants, tag_base.layout_idx, tag_base.value);
+        const payload_layout = self.tagPayloadLayout(tag_base.layout_idx, selected.discriminant);
+        const payload_nodes = try self.storeTagPayloads(selected.payloads, payload_layout, tag_base.value);
         defer self.module.const_store.allocator.free(payload_nodes);
-        const tag_name = try self.module.const_store.allocator.dupe(u8, resolved.selected.name);
+        const tag_name = try self.module.const_store.allocator.dupe(u8, selected.name);
         defer self.module.const_store.allocator.free(tag_name);
         return try self.module.const_store.append(.{ .tag = .{
             .tag_name = tag_name,
@@ -384,7 +354,7 @@ pub const Writer = struct {
 
     fn storeTagPayloads(
         self: *Writer,
-        plans: []const LirProgram.ConstFieldPlan,
+        plans: []const LirProgram.ConstPlanId,
         payload_layout: layout.Idx,
         value: Value,
     ) Allocator.Error![]const checked.ConstNodeId {
@@ -392,42 +362,22 @@ pub const Writer = struct {
         errdefer self.module.const_store.allocator.free(nodes);
         if (plans.len == 0) return nodes;
         if (plans.len == 1) {
-            nodes[0] = try self.storeValue(
-                plans[0].plan,
-                payload_layout,
-                if (self.isZeroSizedLayout(payload_layout)) Value.zst else value,
-            );
+            nodes[0] = try self.storeValue(plans[0], payload_layout, value);
             return nodes;
         }
-
         const layout_value = self.program.layouts.getLayout(payload_layout);
         if (layout_value.tag == .zst) {
             for (nodes, 0..) |*node, index| {
-                if (!self.isZeroSizedLayout(plans[index].layout_idx)) {
-                    writerInvariant("zero-sized tag payload had a runtime child const-plan layout");
-                }
-                node.* = try self.storeValue(plans[index].plan, plans[index].layout_idx, Value.zst);
+                node.* = try self.storeValue(plans[index], .zst, Value.zst);
             }
         } else if (layout_value.tag == .struct_) {
             for (nodes, 0..) |*node, index| {
                 const field_layout = self.program.layouts.getStructFieldLayoutByOriginalIndex(layout_value.getStruct().idx, @intCast(index));
                 const offset = self.program.layouts.getStructFieldOffsetByOriginalIndex(layout_value.getStruct().idx, @intCast(index));
-                const field_value = if (self.isZeroSizedLayout(field_layout)) Value.zst else value.offset(offset);
-                node.* = try self.storeValue(plans[index].plan, field_layout, field_value);
+                node.* = try self.storeValue(plans[index], field_layout, value.offset(offset));
             }
         } else {
-            const runtime_child_index = self.representedFieldIndex(plans) orelse
-                writerInvariant("compact tag payload const plan did not have a represented runtime child");
-            for (nodes, 0..) |*node, index| {
-                const child = plans[index];
-                if (index == runtime_child_index) {
-                    node.* = try self.storeValue(child.plan, payload_layout, value);
-                } else if (self.isZeroSizedLayout(child.layout_idx)) {
-                    node.* = try self.storeValue(child.plan, child.layout_idx, Value.zst);
-                } else {
-                    writerInvariant("compact tag payload const plan had multiple represented runtime children");
-                }
-            }
+            writerInvariant("multi-payload tag did not use a struct payload layout");
         }
         return nodes;
     }
@@ -439,15 +389,15 @@ pub const Writer = struct {
         value: Value,
     ) Allocator.Error!checked.ConstFnId {
         const set = self.program.fn_sets.items[@intFromEnum(set_id)];
-        const resolved = self.resolveFnValue(set, layout_idx, value);
-        const captures = try self.storeCaptures(resolved.selected.captures, resolved.payload_layout, resolved.payload_value);
+        const tag_base = self.resolveTagBase(layout_idx, value);
+        const variant = self.selectFnVariant(set, tag_base.layout_idx, tag_base.value);
+        const captures = try self.storeCaptures(variant.captures, variant.payload_layout, tag_base.value);
         defer self.module.const_store.allocator.free(captures);
         return try self.module.const_store.appendFn(.{
-            .fn_def = resolved.selected.template.fn_def,
-            .source_fn_ty = resolved.selected.template.source_fn_ty,
-            .source_fn_key = resolved.selected.template.source_fn_key,
+            .fn_def = variant.template.fn_def,
+            .source_fn_ty = variant.template.source_fn_ty,
+            .source_fn_key = variant.template.source_fn_key,
             .captures = captures,
-            .local_proc_contexts = resolved.selected.template.local_proc_contexts,
         });
     }
 
@@ -458,18 +408,16 @@ pub const Writer = struct {
     ) Allocator.Error!checked.ConstFnId {
         const set = self.program.erased_fns.items[@intFromEnum(set_id)];
         const data_ptr = self.readErasedCallablePointer(value);
-        const proc = Interpreter.erasedCallableInterpreterProcId(data_ptr);
+        const resolved = self.erased_callable_resolver.resolve(self.erased_callable_resolver.context, data_ptr);
         for (set.entries) |entry| {
-            if (entry.entry != proc) continue;
-            const capture_ptr = Interpreter.erasedCallableInterpreterCaptureValuePtr(data_ptr);
-            const captures = try self.storeCaptures(entry.captures, entry.capture_layout, .{ .ptr = capture_ptr });
+            if (entry.entry != resolved.proc) continue;
+            const captures = try self.storeCaptures(entry.captures, entry.capture_layout, .{ .ptr = resolved.capture_ptr });
             defer self.module.const_store.allocator.free(captures);
             return try self.module.const_store.appendFn(.{
                 .fn_def = entry.template.fn_def,
                 .source_fn_ty = entry.template.source_fn_ty,
                 .source_fn_key = entry.template.source_fn_key,
                 .captures = captures,
-                .local_proc_contexts = entry.template.local_proc_contexts,
             });
         }
         writerInvariant("erased callable result did not match an explicit erased function entry");
@@ -488,12 +436,10 @@ pub const Writer = struct {
         const layout_value = self.program.layouts.getLayout(payload_layout);
         if (layout_value.tag == .zst) {
             for (slots, 0..) |slot, index| {
-                if (!self.isZeroSizedLayout(slot.layout_idx)) {
-                    writerInvariant("zero-sized capture payload had a runtime child const-plan layout");
-                }
                 captures[index] = .{
                     .id = slot.id,
-                    .value = try self.storeValue(slot.plan, slot.layout_idx, Value.zst),
+                    .ty = try self.cloneCaptureType(slot.ty),
+                    .value = try self.storeValue(slot.plan, .zst, Value.zst),
                 };
             }
         } else if (layout_value.tag == .struct_) {
@@ -502,38 +448,29 @@ pub const Writer = struct {
                 const offset = self.program.layouts.getStructFieldOffsetByOriginalIndex(layout_value.getStruct().idx, slot.slot);
                 captures[index] = .{
                     .id = slot.id,
-                    .value = try self.storeValue(
-                        slot.plan,
-                        field_layout,
-                        if (self.isZeroSizedLayout(field_layout)) Value.zst else payload_value.offset(offset),
-                    ),
+                    .ty = try self.cloneCaptureType(slot.ty),
+                    .value = try self.storeValue(slot.plan, field_layout, payload_value.offset(offset)),
                 };
             }
         } else if (slots.len == 1) {
             captures[0] = .{
                 .id = slots[0].id,
+                .ty = try self.cloneCaptureType(slots[0].ty),
                 .value = try self.storeValue(slots[0].plan, payload_layout, payload_value),
             };
         } else {
-            const runtime_capture_index = self.representedCaptureIndex(slots) orelse
-                writerInvariant("compact capture const plan did not have a represented runtime child");
-            for (slots, 0..) |slot, index| {
-                if (index == runtime_capture_index) {
-                    captures[index] = .{
-                        .id = slot.id,
-                        .value = try self.storeValue(slot.plan, payload_layout, payload_value),
-                    };
-                } else if (self.isZeroSizedLayout(slot.layout_idx)) {
-                    captures[index] = .{
-                        .id = slot.id,
-                        .value = try self.storeValue(slot.plan, slot.layout_idx, Value.zst),
-                    };
-                } else {
-                    writerInvariant("compact capture const plan had multiple represented runtime children");
-                }
-            }
+            writerInvariant("multi-capture function did not use a struct capture layout");
         }
         return captures;
+    }
+
+    fn cloneCaptureType(self: *Writer, ty: const_store.ConstTypeId) Allocator.Error!const_store.ConstTypeId {
+        return self.module.const_store.type_store.cloneTypeFromTranslated(
+            &self.program.const_types,
+            &self.program.const_type_names,
+            &self.module.canonical_names,
+            ty,
+        );
     }
 
     fn collectStrBackings(
@@ -542,12 +479,7 @@ pub const Writer = struct {
         layout_idx: layout.Idx,
         value: Value,
     ) Allocator.Error!void {
-        const plan = self.constPlan(plan_id);
-        if (self.layoutWrapsLogicalValue(layout_idx, plan)) {
-            try self.collectLayoutBoxedValueStrBackings(plan_id, layout_idx, value);
-            return;
-        }
-        switch (plan) {
+        switch (self.constPlan(plan_id)) {
             .pending => writerInvariant("pending const plan reached string backing collection"),
             .zst,
             .scalar,
@@ -558,26 +490,9 @@ pub const Writer = struct {
             .tuple => |items| try self.collectStructStrBackings(items, layout_idx, value),
             .record => |fields| try self.collectStructStrBackings(fields, layout_idx, value),
             .tag_union => |variants| try self.collectTagStrBackings(variants, layout_idx, value),
-            .named => |named| try self.collectStrBackings(named.backing, named.backing_layout_idx, value),
+            .named => |named| try self.collectStrBackings(named.backing, layout_idx, value),
             .fn_value => |set| try self.collectFnValueStrBackings(set, layout_idx, value),
             .erased_fn => |set| try self.collectErasedFnStrBackings(set, value),
-        }
-    }
-
-    fn collectLayoutBoxedValueStrBackings(
-        self: *Writer,
-        plan_id: LirProgram.ConstPlanId,
-        box_layout_idx: layout.Idx,
-        value: Value,
-    ) Allocator.Error!void {
-        const box_layout = self.program.layouts.getLayout(box_layout_idx);
-        switch (box_layout.tag) {
-            .box_of_zst => try self.collectStrBackings(plan_id, .zst, Value.zst),
-            .box => {
-                const ptr = self.readBoxDataPointer(value) orelse writerInvariant("layout-boxed value had null payload pointer");
-                try self.collectStrBackings(plan_id, box_layout.getIdx(), .{ .ptr = ptr });
-            },
-            else => writerInvariant("layout-boxed const value had non-box layout"),
         }
     }
 
@@ -649,41 +564,31 @@ pub const Writer = struct {
 
     fn collectStructStrBackings(
         self: *Writer,
-        plans: []const LirProgram.ConstFieldPlan,
+        plans: []const LirProgram.ConstPlanId,
         layout_idx: layout.Idx,
         value: Value,
     ) Allocator.Error!void {
         if (plans.len == 0) return;
         const layout_value = self.program.layouts.getLayout(layout_idx);
         if (layout_value.tag == .zst) {
-            for (plans) |child| {
-                if (!self.isZeroSizedLayout(child.layout_idx)) {
-                    writerInvariant("zero-sized aggregate had a runtime child const-plan layout");
-                }
-                try self.collectStrBackings(child.plan, child.layout_idx, Value.zst);
-            }
+            for (plans) |plan| try self.collectStrBackings(plan, .zst, Value.zst);
             return;
         }
-        if (layout_value.tag != .struct_) {
-            const runtime_child_index = self.representedFieldIndex(plans) orelse
-                writerInvariant("compact aggregate const plan did not have a represented runtime child");
-            for (plans, 0..) |child, index| {
-                if (index == runtime_child_index) {
-                    try self.collectStrBackings(child.plan, layout_idx, value);
-                } else if (self.isZeroSizedLayout(child.layout_idx)) {
-                    try self.collectStrBackings(child.plan, child.layout_idx, Value.zst);
-                } else {
-                    writerInvariant("compact aggregate const plan had multiple represented runtime children");
-                }
-            }
+        if (layout_value.tag == .box_of_zst) {
+            for (plans) |plan| try self.collectStrBackings(plan, .zst, Value.zst);
             return;
         }
+        if (layout_value.tag == .box) {
+            const ptr = self.readBoxDataPointer(value) orelse writerInvariant("boxed struct value had null payload pointer");
+            try self.collectStructStrBackings(plans, layout_value.getIdx(), .{ .ptr = ptr });
+            return;
+        }
+        if (layout_value.tag != .struct_) writerInvariant("struct const plan had non-struct layout");
 
-        for (plans, 0..) |child, index| {
+        for (plans, 0..) |plan, index| {
             const field_layout = self.program.layouts.getStructFieldLayoutByOriginalIndex(layout_value.getStruct().idx, @intCast(index));
             const offset = self.program.layouts.getStructFieldOffsetByOriginalIndex(layout_value.getStruct().idx, @intCast(index));
-            const field_value = if (self.isZeroSizedLayout(field_layout)) Value.zst else value.offset(offset);
-            try self.collectStrBackings(child.plan, field_layout, field_value);
+            try self.collectStrBackings(plan, field_layout, value.offset(offset));
         }
     }
 
@@ -693,53 +598,34 @@ pub const Writer = struct {
         layout_idx: layout.Idx,
         value: Value,
     ) Allocator.Error!void {
-        const resolved = self.resolveTagValue(variants, layout_idx, value);
-        try self.collectTagPayloadStrBackings(resolved.selected.payloads, resolved.payload_layout, resolved.payload_value);
+        const tag_base = self.resolveTagBase(layout_idx, value);
+        const selected = self.selectTagVariant(variants, tag_base.layout_idx, tag_base.value);
+        const payload_layout = self.tagPayloadLayout(tag_base.layout_idx, selected.discriminant);
+        try self.collectTagPayloadStrBackings(selected.payloads, payload_layout, tag_base.value);
     }
 
     fn collectTagPayloadStrBackings(
         self: *Writer,
-        plans: []const LirProgram.ConstFieldPlan,
+        plans: []const LirProgram.ConstPlanId,
         payload_layout: layout.Idx,
         value: Value,
     ) Allocator.Error!void {
         if (plans.len == 0) return;
         if (plans.len == 1) {
-            try self.collectStrBackings(
-                plans[0].plan,
-                payload_layout,
-                if (self.isZeroSizedLayout(payload_layout)) Value.zst else value,
-            );
+            try self.collectStrBackings(plans[0], payload_layout, value);
             return;
         }
-
         const layout_value = self.program.layouts.getLayout(payload_layout);
         if (layout_value.tag == .zst) {
-            for (plans) |child| {
-                if (!self.isZeroSizedLayout(child.layout_idx)) {
-                    writerInvariant("zero-sized tag payload had a runtime child const-plan layout");
-                }
-                try self.collectStrBackings(child.plan, child.layout_idx, Value.zst);
-            }
+            for (plans) |plan| try self.collectStrBackings(plan, .zst, Value.zst);
         } else if (layout_value.tag == .struct_) {
-            for (plans, 0..) |child, index| {
+            for (plans, 0..) |plan, index| {
                 const field_layout = self.program.layouts.getStructFieldLayoutByOriginalIndex(layout_value.getStruct().idx, @intCast(index));
                 const offset = self.program.layouts.getStructFieldOffsetByOriginalIndex(layout_value.getStruct().idx, @intCast(index));
-                const field_value = if (self.isZeroSizedLayout(field_layout)) Value.zst else value.offset(offset);
-                try self.collectStrBackings(child.plan, field_layout, field_value);
+                try self.collectStrBackings(plan, field_layout, value.offset(offset));
             }
         } else {
-            const runtime_child_index = self.representedFieldIndex(plans) orelse
-                writerInvariant("compact tag payload const plan did not have a represented runtime child");
-            for (plans, 0..) |child, index| {
-                if (index == runtime_child_index) {
-                    try self.collectStrBackings(child.plan, payload_layout, value);
-                } else if (self.isZeroSizedLayout(child.layout_idx)) {
-                    try self.collectStrBackings(child.plan, child.layout_idx, Value.zst);
-                } else {
-                    writerInvariant("compact tag payload const plan had multiple represented runtime children");
-                }
-            }
+            writerInvariant("multi-payload tag did not use a struct payload layout");
         }
     }
 
@@ -750,8 +636,9 @@ pub const Writer = struct {
         value: Value,
     ) Allocator.Error!void {
         const set = self.program.fn_sets.items[@intFromEnum(set_id)];
-        const resolved = self.resolveFnValue(set, layout_idx, value);
-        try self.collectCaptureStrBackings(resolved.selected.captures, resolved.payload_layout, resolved.payload_value);
+        const tag_base = self.resolveTagBase(layout_idx, value);
+        const variant = self.selectFnVariant(set, tag_base.layout_idx, tag_base.value);
+        try self.collectCaptureStrBackings(variant.captures, variant.payload_layout, tag_base.value);
     }
 
     fn collectErasedFnStrBackings(
@@ -761,11 +648,10 @@ pub const Writer = struct {
     ) Allocator.Error!void {
         const set = self.program.erased_fns.items[@intFromEnum(set_id)];
         const data_ptr = self.readErasedCallablePointer(value);
-        const proc = Interpreter.erasedCallableInterpreterProcId(data_ptr);
+        const resolved = self.erased_callable_resolver.resolve(self.erased_callable_resolver.context, data_ptr);
         for (set.entries) |entry| {
-            if (entry.entry != proc) continue;
-            const capture_ptr = Interpreter.erasedCallableInterpreterCaptureValuePtr(data_ptr);
-            try self.collectCaptureStrBackings(entry.captures, entry.capture_layout, .{ .ptr = capture_ptr });
+            if (entry.entry != resolved.proc) continue;
+            try self.collectCaptureStrBackings(entry.captures, entry.capture_layout, .{ .ptr = resolved.capture_ptr });
             return;
         }
         writerInvariant("erased callable result did not match an explicit erased function entry");
@@ -778,273 +664,90 @@ pub const Writer = struct {
         payload_value: Value,
     ) Allocator.Error!void {
         if (slots.len == 0) return;
-
         const layout_value = self.program.layouts.getLayout(payload_layout);
         if (layout_value.tag == .zst) {
-            for (slots) |slot| {
-                if (!self.isZeroSizedLayout(slot.layout_idx)) {
-                    writerInvariant("zero-sized capture payload had a runtime child const-plan layout");
-                }
-                try self.collectStrBackings(slot.plan, slot.layout_idx, Value.zst);
-            }
+            for (slots) |slot| try self.collectStrBackings(slot.plan, .zst, Value.zst);
         } else if (layout_value.tag == .struct_) {
             for (slots) |slot| {
                 const field_layout = self.program.layouts.getStructFieldLayoutByOriginalIndex(layout_value.getStruct().idx, slot.slot);
                 const offset = self.program.layouts.getStructFieldOffsetByOriginalIndex(layout_value.getStruct().idx, slot.slot);
-                const field_value = if (self.isZeroSizedLayout(field_layout)) Value.zst else payload_value.offset(offset);
-                try self.collectStrBackings(slot.plan, field_layout, field_value);
+                try self.collectStrBackings(slot.plan, field_layout, payload_value.offset(offset));
             }
         } else if (slots.len == 1) {
             try self.collectStrBackings(slots[0].plan, payload_layout, payload_value);
         } else {
-            const runtime_capture_index = self.representedCaptureIndex(slots) orelse
-                writerInvariant("compact capture const plan did not have a represented runtime child");
-            for (slots, 0..) |slot, index| {
-                if (index == runtime_capture_index) {
-                    try self.collectStrBackings(slot.plan, payload_layout, payload_value);
-                } else if (self.isZeroSizedLayout(slot.layout_idx)) {
-                    try self.collectStrBackings(slot.plan, slot.layout_idx, Value.zst);
-                } else {
-                    writerInvariant("compact capture const plan had multiple represented runtime children");
-                }
-            }
+            writerInvariant("multi-capture function did not use a struct capture layout");
         }
     }
 
-    fn resolveFnValue(
+    fn selectFnVariant(
         self: *Writer,
         set: LirProgram.FnSet,
         layout_idx: layout.Idx,
         value: Value,
-    ) ResolvedFnValue {
-        const layout_value = self.program.layouts.getLayout(layout_idx);
-        switch (layout_value.tag) {
-            .zst => {
-                const selected = self.selectFnVariantByDiscriminant(set, 0);
-                return .{ .selected = selected, .payload_layout = .zst, .payload_value = Value.zst };
-            },
-            .tag_union => {
-                const selected = self.selectFnVariantByDiscriminant(
-                    set,
-                    self.program.layouts.getTagUnionData(layout_value.getTagUnion().idx).readDiscriminant(value.ptr),
-                );
-                return .{
-                    .selected = selected,
-                    .payload_layout = selected.payload_layout,
-                    .payload_value = value,
-                };
-            },
-            .box => {
-                const payload_ptr = self.readBoxDataPointer(value);
-                const inner_layout = layout_value.getIdx();
-                const inner_layout_value = self.program.layouts.getLayout(inner_layout);
-                if (inner_layout_value.tag == .tag_union) {
-                    const ptr = payload_ptr orelse writerInvariant("boxed finite callable had null payload pointer");
-                    const payload_value = Value{ .ptr = ptr };
-                    const selected = self.selectFnVariantByDiscriminant(
-                        set,
-                        self.program.layouts.getTagUnionData(inner_layout_value.getTagUnion().idx).readDiscriminant(payload_value.ptr),
-                    );
-                    return .{
-                        .selected = selected,
-                        .payload_layout = selected.payload_layout,
-                        .payload_value = payload_value,
-                    };
-                }
-
-                if (payload_ptr) |ptr| {
-                    const selected = self.selectNullableBoxedFnPayloadVariant(set);
-                    return .{
-                        .selected = selected,
-                        .payload_layout = inner_layout,
-                        .payload_value = .{ .ptr = ptr },
-                    };
-                }
-
-                const selected = self.selectNullableBoxedFnEmptyVariant(set);
-                return .{ .selected = selected, .payload_layout = .zst, .payload_value = Value.zst };
-            },
-            else => {
-                if (set.variants.len != 1) writerInvariant("layout-unwrapped finite callable had multiple variants");
-                return .{ .selected = set.variants[0], .payload_layout = layout_idx, .payload_value = value };
-            },
-        }
-    }
-
-    fn selectFnVariantByDiscriminant(_: *Writer, set: LirProgram.FnSet, discriminant: u32) LirProgram.FnVariant {
+    ) LirProgram.FnVariant {
+        if (set.variants.len == 1) return set.variants[0];
+        const discriminant = self.readTagDiscriminant(layout_idx, value);
         for (set.variants) |variant| {
             if (variant.discriminant == discriminant) return variant;
         }
         writerInvariant("finite callable result discriminant did not match an explicit variant");
     }
 
-    fn resolveTagValue(
+    fn selectTagVariant(
         self: *Writer,
         variants: []const LirProgram.ConstTagVariant,
         layout_idx: layout.Idx,
         value: Value,
-    ) ResolvedTagValue {
-        const layout_value = self.program.layouts.getLayout(layout_idx);
-        switch (layout_value.tag) {
-            .zst => {
-                const selected = self.selectTagVariantByDiscriminant(variants, 0);
-                return .{ .selected = selected, .payload_layout = .zst, .payload_value = Value.zst };
-            },
-            .tag_union => {
-                const selected = self.selectTagVariantByDiscriminant(
-                    variants,
-                    self.program.layouts.getTagUnionData(layout_value.getTagUnion().idx).readDiscriminant(value.ptr),
-                );
-                return .{
-                    .selected = selected,
-                    .payload_layout = self.tagUnionPayloadLayout(layout_idx, selected),
-                    .payload_value = value,
-                };
-            },
-            .box => {
-                const payload_ptr = self.readBoxDataPointer(value);
-                const inner_layout = layout_value.getIdx();
-                const inner_layout_value = self.program.layouts.getLayout(inner_layout);
-                if (inner_layout_value.tag == .tag_union) {
-                    const ptr = payload_ptr orelse writerInvariant("boxed tag union had null payload pointer");
-                    const payload_value = Value{ .ptr = ptr };
-                    const selected = self.selectTagVariantByDiscriminant(
-                        variants,
-                        self.program.layouts.getTagUnionData(inner_layout_value.getTagUnion().idx).readDiscriminant(payload_value.ptr),
-                    );
-                    return .{
-                        .selected = selected,
-                        .payload_layout = self.tagUnionPayloadLayout(inner_layout, selected),
-                        .payload_value = payload_value,
-                    };
-                }
-
-                if (payload_ptr) |ptr| {
-                    const selected = self.selectNullableBoxedPayloadVariant(variants);
-                    return .{
-                        .selected = selected,
-                        .payload_layout = inner_layout,
-                        .payload_value = .{ .ptr = ptr },
-                    };
-                }
-
-                const selected = self.selectNullableBoxedEmptyVariant(variants);
-                return .{ .selected = selected, .payload_layout = .zst, .payload_value = Value.zst };
-            },
-            else => {
-                if (variants.len != 1) writerInvariant("layout-unwrapped tag const plan had multiple variants");
-                return .{ .selected = variants[0], .payload_layout = layout_idx, .payload_value = value };
-            },
-        }
-    }
-
-    fn selectTagVariantByDiscriminant(
-        _: *Writer,
-        variants: []const LirProgram.ConstTagVariant,
-        discriminant: u32,
     ) LirProgram.ConstTagVariant {
+        const discriminant = self.readTagDiscriminant(layout_idx, value);
         for (variants) |variant| {
             if (variant.discriminant == discriminant) return variant;
         }
         writerInvariant("tag result discriminant did not match an explicit const variant");
     }
 
-    fn tagUnionPayloadLayout(self: *Writer, layout_idx: layout.Idx, selected: LirProgram.ConstTagVariant) layout.Idx {
+    fn readTagDiscriminant(self: *Writer, layout_idx: layout.Idx, value: Value) u32 {
+        const layout_value = self.program.layouts.getLayout(layout_idx);
+        return switch (layout_value.tag) {
+            .zst => 0,
+            .tag_union => self.program.layouts.getTagUnionData(layout_value.getTagUnion().idx).readDiscriminant(value.ptr, self.program.layouts.targetUsize()),
+            else => writerInvariant("tag discriminant read had non-tag-union layout"),
+        };
+    }
+
+    fn tagPayloadLayout(self: *Writer, layout_idx: layout.Idx, discriminant: u16) layout.Idx {
         const layout_value = self.program.layouts.getLayout(layout_idx);
         if (layout_value.tag == .zst) return .zst;
-        if (layout_value.tag != .tag_union) writerInvariant("tag-union payload layout lookup had non-tag-union layout");
+        if (layout_value.tag != .tag_union) writerInvariant("tag payload read had non-tag-union layout");
         const data = self.program.layouts.getTagUnionData(layout_value.getTagUnion().idx);
         const variants = self.program.layouts.getTagUnionVariants(data);
-        const index: usize = selected.discriminant;
+        const index: usize = discriminant;
         if (index >= variants.len) writerInvariant("tag discriminant was outside variant layouts");
         return variants.get(@intCast(index)).payload_layout;
-    }
-
-    fn selectNullableBoxedPayloadVariant(self: *Writer, variants: []const LirProgram.ConstTagVariant) LirProgram.ConstTagVariant {
-        var found: ?LirProgram.ConstTagVariant = null;
-        for (variants) |variant| {
-            if (self.variantRuntimePayloadCount(variant) == 0) continue;
-            if (found != null) writerInvariant("nullable boxed tag const plan had multiple payload variants");
-            found = variant;
-        }
-        return found orelse writerInvariant("nullable boxed tag const plan had no payload variant");
-    }
-
-    fn selectNullableBoxedEmptyVariant(self: *Writer, variants: []const LirProgram.ConstTagVariant) LirProgram.ConstTagVariant {
-        var found: ?LirProgram.ConstTagVariant = null;
-        for (variants) |variant| {
-            if (self.variantRuntimePayloadCount(variant) != 0) continue;
-            if (found != null) writerInvariant("nullable boxed tag const plan had multiple empty variants");
-            found = variant;
-        }
-        return found orelse writerInvariant("nullable boxed tag const plan had no empty variant");
-    }
-
-    fn variantRuntimePayloadCount(self: *Writer, variant: LirProgram.ConstTagVariant) usize {
-        var count: usize = 0;
-        for (variant.payloads) |payload| {
-            if (!self.isZeroSizedLayout(payload.layout_idx)) count += 1;
-        }
-        return count;
-    }
-
-    fn selectNullableBoxedFnPayloadVariant(self: *Writer, set: LirProgram.FnSet) LirProgram.FnVariant {
-        var found: ?LirProgram.FnVariant = null;
-        for (set.variants) |variant| {
-            if (self.fnVariantRuntimeCaptureCount(variant) == 0) continue;
-            if (found != null) writerInvariant("nullable boxed finite callable had multiple payload variants");
-            found = variant;
-        }
-        return found orelse writerInvariant("nullable boxed finite callable had no payload variant");
-    }
-
-    fn selectNullableBoxedFnEmptyVariant(self: *Writer, set: LirProgram.FnSet) LirProgram.FnVariant {
-        var found: ?LirProgram.FnVariant = null;
-        for (set.variants) |variant| {
-            if (self.fnVariantRuntimeCaptureCount(variant) != 0) continue;
-            if (found != null) writerInvariant("nullable boxed finite callable had multiple empty variants");
-            found = variant;
-        }
-        return found orelse writerInvariant("nullable boxed finite callable had no empty variant");
-    }
-
-    fn representedFieldIndex(self: *Writer, children: []const LirProgram.ConstFieldPlan) ?usize {
-        var found: ?usize = null;
-        for (children, 0..) |child, index| {
-            if (self.isZeroSizedLayout(child.layout_idx)) continue;
-            if (found != null) writerInvariant("compact const field plan had multiple represented runtime children");
-            found = index;
-        }
-        return found;
-    }
-
-    fn representedCaptureIndex(self: *Writer, slots: []const LirProgram.CaptureSlot) ?usize {
-        var found: ?usize = null;
-        for (slots, 0..) |slot, index| {
-            if (self.isZeroSizedLayout(slot.layout_idx)) continue;
-            if (found != null) writerInvariant("compact capture plan had multiple represented runtime children");
-            found = index;
-        }
-        return found;
-    }
-
-    fn fnVariantRuntimeCaptureCount(self: *Writer, variant: LirProgram.FnVariant) usize {
-        var count: usize = 0;
-        for (variant.captures) |capture| {
-            if (!self.isZeroSizedLayout(capture.layout_idx)) count += 1;
-        }
-        return count;
-    }
-
-    fn isZeroSizedLayout(self: *Writer, layout_idx: layout.Idx) bool {
-        const layout_value = self.program.layouts.getLayout(layout_idx);
-        return self.program.layouts.layoutSize(layout_value) == 0;
     }
 
     fn readBoxDataPointer(self: *Writer, value: Value) ?[*]u8 {
         const raw = self.readPointerSizedInt(value);
         if (raw == 0) return null;
         return @ptrFromInt(raw);
+    }
+
+    fn resolveTagBase(self: *Writer, layout_idx: layout.Idx, value: Value) TagBase {
+        const layout_value = self.program.layouts.getLayout(layout_idx);
+        return switch (layout_value.tag) {
+            .zst, .tag_union => .{
+                .value = value,
+                .layout_idx = layout_idx,
+            },
+            .box => .{
+                .value = .{
+                    .ptr = self.readBoxDataPointer(value) orelse writerInvariant("boxed tag value had null payload pointer"),
+                },
+                .layout_idx = layout_value.getIdx(),
+            },
+            else => writerInvariant("tag value read had non-tag layout"),
+        };
     }
 
     fn readErasedCallablePointer(self: *Writer, value: Value) [*]u8 {
@@ -1098,6 +801,13 @@ pub const Writer = struct {
         return self.program.const_plans.items[raw];
     }
 };
+
+fn interpreterErasedCallable(_: ?*anyopaque, data_ptr: [*]u8) ErasedCallableResolution {
+    return .{
+        .proc = Interpreter.erasedCallableInterpreterProcId(data_ptr),
+        .capture_ptr = Interpreter.erasedCallableInterpreterCaptureValuePtr(data_ptr),
+    };
+}
 
 fn checkedU32(value: usize, comptime message: []const u8) u32 {
     if (value > std.math.maxInt(u32)) writerInvariant(message);

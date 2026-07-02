@@ -27,13 +27,8 @@ pub const RootRequests = struct {
 
 /// Checked const data that must produce a runtime layout and callable entries.
 pub const StaticDataRequest = struct {
-    const_ref: checked.ConstId,
-    node: ?checked.ConstNodeId = null,
-    checked_type: checked.CheckedTypeId,
+    data: checked.ProvidedDataExport,
 };
-
-/// Stage-local readonly static-data value id.
-pub const StaticDataId = enum(u32) { _ };
 
 /// Target settings carried through post-check lowering.
 pub const Target = struct {

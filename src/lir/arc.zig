@@ -178,6 +178,10 @@ pub fn insert(store: *LirStore, layouts: *const layout_mod.Store, options: Inser
         }
         inserter.rewritten_joins = &rewritten_joins;
         defer inserter.rewritten_joins = null;
+        var join_body_memo = JoinBodyMemo.init(store.allocator);
+        defer inserter.deinitJoinBodyMemo(&join_body_memo);
+        inserter.join_body_memo = &join_body_memo;
+        defer inserter.join_body_memo = null;
         var owned = try OwnedSet.init(store.allocator, store.locals.items.len);
         defer owned.deinit();
         for (store.getLocalSpan(emit_args), 0..) |param, position| {
@@ -260,6 +264,60 @@ const ReadBeforeRebindKey = struct {
     loop_keep_id: u32,
 };
 
+const AnalysisScopedJoin = struct {
+    body: LIR.CFStmtId,
+    remainder: LIR.CFStmtId,
+    params: LIR.LocalSpan,
+    maybe_uninitialized_params: LIR.LocalSpan,
+    entry_owned: OwnedSet,
+    keep: ?OwnedSet = null,
+};
+
+const AnalysisScopedJoinMap = std.AutoHashMap(LIR.JoinPointId, AnalysisScopedJoin);
+
+const AnalysisSeenEntry = struct {
+    owned: OwnedSet,
+};
+
+const AnalysisSeenId = struct {
+    stmt: LIR.CFStmtId,
+    owned_digest: u64,
+};
+
+const AnalysisSeenBucket = struct {
+    entries: std.ArrayList(AnalysisSeenEntry),
+};
+
+const AnalysisSeen = std.AutoHashMap(AnalysisSeenId, AnalysisSeenBucket);
+
+const JoinBodyMemoId = struct {
+    join: LIR.JoinPointId,
+    owned_digest: u64,
+};
+
+const JoinBodyMemoEntry = struct {
+    entry_owned: OwnedSet,
+    params: LIR.LocalSpan,
+    maybe_uninitialized_params: LIR.LocalSpan,
+    remainder: LIR.CFStmtId,
+    body: LIR.CFStmtId,
+    keep: OwnedSet,
+    body_reachable: bool,
+};
+
+const JoinBodyMemoBucket = struct {
+    entries: std.ArrayList(JoinBodyMemoEntry),
+};
+
+const JoinBodyMemo = std.AutoHashMap(JoinBodyMemoId, JoinBodyMemoBucket);
+
+const AnalysisStop = union(enum) {
+    /// Stop at an explicit shared continuation statement.
+    stmt: LIR.CFStmtId,
+    /// Stop at jumps targeting one join, recording the jump-entry ownership.
+    jump_to: LIR.JoinPointId,
+};
+
 fn rewriteBoundaryForStop(boundaries: []const RewriteBoundary, cursor: LIR.CFStmtId) ?RewriteBoundary {
     var i = boundaries.len;
     while (i > 0) {
@@ -286,6 +344,17 @@ fn appendRewriteBoundary(
     const nested = try allocator.alloc(RewriteBoundary, boundaries.len + 1);
     @memcpy(nested[0..boundaries.len], boundaries);
     nested[boundaries.len] = boundary;
+    return nested;
+}
+
+fn appendJoinKeep(
+    allocator: std.mem.Allocator,
+    join_keeps: []const JoinKeep,
+    join_keep: JoinKeep,
+) ResourceError![]JoinKeep {
+    const nested = try allocator.alloc(JoinKeep, join_keeps.len + 1);
+    @memcpy(nested[0..join_keeps.len], join_keeps);
+    nested[join_keeps.len] = join_keep;
     return nested;
 }
 
@@ -364,6 +433,7 @@ const Inserter = struct {
     current_proc_body: LIR.CFStmtId = undefined,
     join_bodies: ?*const JoinBodyMap = null,
     rewritten_joins: ?*RewrittenJoinMap = null,
+    join_body_memo: ?*JoinBodyMemo = null,
 
     const CallArgOwnership = struct {
         retain_args: std.ArrayList(LIR.LocalId) = .empty,
@@ -409,9 +479,9 @@ const Inserter = struct {
         incoming_owned: OwnedSet,
         entry_keep: OwnedSet,
         body_keep: OwnedSet,
+        body_reachable: bool,
         loop_keep_id: u32,
         join_keeps: []JoinKeep = &.{},
-        forward_join_keeps: std.ArrayList(*OwnedSet) = .empty,
         frames: std.ArrayList(LinearRewriteFrame),
         result: *LIR.CFStmtId,
     };
@@ -485,18 +555,22 @@ const Inserter = struct {
 
     const AnalysisPathTask = struct {
         cursor: LIR.CFStmtId,
-        stop: LIR.CFStmtId,
+        stop: AnalysisStop,
         owned: OwnedSet,
         exits: *std.ArrayList(OwnedSet),
         loop_keep: ?*const OwnedSet,
+        scoped_joins: ?*AnalysisScopedJoinMap,
+        seen: ?*AnalysisSeen,
     };
 
     const AnalysisSwitchContinuationTask = struct {
         continuation: LIR.CFStmtId,
-        stop: LIR.CFStmtId,
+        stop: AnalysisStop,
         switch_exits: std.ArrayList(OwnedSet),
         parent_exits: *std.ArrayList(OwnedSet),
         loop_keep: ?*const OwnedSet,
+        scoped_joins: ?*AnalysisScopedJoinMap,
+        seen: ?*AnalysisSeen,
     };
 
     fn rewritePath(self: *Inserter, start: LIR.CFStmtId, owned: *OwnedSet, options: RewriteOptions) ResourceError!LIR.CFStmtId {
@@ -687,19 +761,7 @@ const Inserter = struct {
                     if (assign.capture) |capture| {
                         transfer_single = try self.singleTransfer(capture, assign.next, assign.target, &path.owned, path.options.loop_keep);
                     }
-                    var reuse_unique = false;
-                    if (assign.reuse) |reuse| {
-                        const preserve_reuse = reuse != assign.target and try self.groupUsedInPath(assign.next, reuse, path.options.loop_keep);
-                        if (preserve_reuse or !self.ownsUnit(&path.owned, reuse)) {
-                            current_start = try self.retainLocalIfRc(reuse, current_start);
-                        } else {
-                            reuse_unique = self.localContainsRefcounted(reuse) and self.isLocalUniqueHere(reuse);
-                            self.unsetOwnedUnit(&path.owned, reuse);
-                        }
-                    }
-                    if (assign.reuse == null or assign.reuse.? != assign.target) {
-                        current_start = try self.releaseOldTargetIfNeeded(assign.target, &path.owned, current_start);
-                    }
+                    current_start = try self.releaseOldTargetIfNeeded(assign.target, &path.owned, current_start);
                     self.addOwnedIfRc(&path.owned, assign.target);
                     var deaths: std.ArrayList(LIR.LocalId) = .empty;
                     errdefer deaths.deinit(self.store.allocator);
@@ -709,7 +771,6 @@ const Inserter = struct {
                         .stmt = path.cursor,
                         .head = current_start,
                         .transfer_single = transfer_single,
-                        .unique_args = if (reuse_unique) 1 else 0,
                         .post_release = try self.takePostReleases(&deaths),
                     });
                     path.cursor = assign.next;
@@ -1116,8 +1177,6 @@ const Inserter = struct {
                     .capture = assign.capture,
                     .capture_layout = assign.capture_layout,
                     .on_drop = assign.on_drop,
-                    .reuse = assign.reuse,
-                    .reuse_unique = (frame.unique_args & 1) != 0,
                     .next = next,
                 } });
             },
@@ -1134,6 +1193,7 @@ const Inserter = struct {
                     .rc_effect = assign.rc_effect,
                     .unique_args = frame.unique_args,
                     .args = assign.args,
+                    .interchangeable = assign.interchangeable,
                     .next = next,
                 } });
             },
@@ -1339,6 +1399,7 @@ const Inserter = struct {
         const state = try self.store.allocator.create(RewriteJoinTask);
         var queued = false;
         errdefer if (!queued) self.store.allocator.destroy(state);
+        var body_reachable = false;
         state.* = .{
             .start = start,
             .id = join_stmt.id,
@@ -1348,12 +1409,20 @@ const Inserter = struct {
             .maybe_uninitialized_condition_masks = join_stmt.maybe_uninitialized_condition_masks,
             .incoming_owned = try path.owned.clone(),
             .entry_keep = try self.joinEntryOwnedSet(&path.owned, join_stmt.remainder),
-            .body_keep = try self.joinBodyOwnedSet(&path.owned, join_stmt.params, join_stmt.maybe_uninitialized_params, join_stmt.body),
+            .body_keep = try self.joinBodyOwnedSet(
+                &path.owned,
+                join_stmt.id,
+                join_stmt.params,
+                join_stmt.maybe_uninitialized_params,
+                join_stmt.remainder,
+                join_stmt.body,
+                &body_reachable,
+            ),
+            .body_reachable = body_reachable,
             .loop_keep_id = self.next_loop_keep_id,
             .frames = takeRewriteFrames(path),
             .result = path.result,
         };
-        errdefer if (!queued) self.destroyForwardJoinKeeps(&state.forward_join_keeps);
         self.next_loop_keep_id += 1;
         var carried_body_keep = try state.body_keep.clone();
         defer carried_body_keep.deinit();
@@ -1369,15 +1438,10 @@ const Inserter = struct {
         };
         try self.active_loop_keep_ids.put(@intFromPtr(&state.body_keep), state.loop_keep_id);
         loop_keep_registered = true;
-        var join_keeps = std.ArrayList(JoinKeep).empty;
-        defer join_keeps.deinit(self.store.allocator);
-        try join_keeps.appendSlice(self.store.allocator, path.options.join_keeps);
-        try join_keeps.append(self.store.allocator, .{
+        state.join_keeps = try appendJoinKeep(self.store.allocator, path.options.join_keeps, .{
             .target = join_stmt.id,
             .keep = &state.body_keep,
         });
-        try self.appendForwardJoinKeeps(&join_keeps, &state.forward_join_keeps, &state.entry_keep, join_stmt.remainder);
-        state.join_keeps = try join_keeps.toOwnedSlice(self.store.allocator);
         errdefer if (!queued) self.store.allocator.free(state.join_keeps);
 
         try tasks.append(self.store.allocator, .{ .join = state });
@@ -1394,40 +1458,19 @@ const Inserter = struct {
             .loop_keep_id = join_options.loop_keep_id,
             .join_keeps = join_options.join_keeps,
         }, &state.remainder);
-        try self.pushRewritePath(tasks, join_stmt.body, &state.body_keep, join_options, &state.body);
-    }
-
-    fn appendForwardJoinKeeps(
-        self: *Inserter,
-        join_keeps: *std.ArrayList(JoinKeep),
-        owned_sets: *std.ArrayList(*OwnedSet),
-        entry_keep: *const OwnedSet,
-        start: LIR.CFStmtId,
-    ) ResourceError!void {
-        var cursor = start;
-        while (true) {
-            const join_stmt = switch (self.store.getCFStmt(cursor)) {
-                .join => |join_stmt| join_stmt,
-                else => return,
-            };
-            const keep = try self.store.allocator.create(OwnedSet);
-            var keep_stored = false;
-            errdefer if (!keep_stored) self.store.allocator.destroy(keep);
-            keep.* = try self.joinBodyOwnedSet(entry_keep, join_stmt.params, join_stmt.maybe_uninitialized_params, join_stmt.body);
-            errdefer if (!keep_stored) keep.deinit();
-
-            try join_keeps.append(self.store.allocator, .{
-                .target = join_stmt.id,
-                .keep = keep,
-            });
-            try owned_sets.append(self.store.allocator, keep);
-            keep_stored = true;
-            cursor = join_stmt.remainder;
+        if (state.body_reachable) {
+            try self.pushRewritePath(tasks, join_stmt.body, &state.body_keep, join_options, &state.body);
         }
     }
 
     fn finishRewriteJoin(self: *Inserter, state: *RewriteJoinTask) ResourceError!void {
         errdefer self.destroyRewriteJoin(state);
+        if (!state.body_reachable) {
+            const tail = try self.releaseDifference(&state.incoming_owned, &state.entry_keep, state.remainder);
+            state.result.* = try self.finishLinearRewrite(&state.frames, tail);
+            self.destroyRewriteJoin(state);
+            return;
+        }
         const join = try self.store.addCFStmt(.{ .join = .{
             .id = state.id,
             .params = state.params,
@@ -1815,7 +1858,35 @@ const Inserter = struct {
             tasks.deinit(self.store.allocator);
         }
 
-        try self.pushAnalysisPath(&tasks, start, stop, owned, exits, loop_keep);
+        try self.pushAnalysisPath(&tasks, start, .{ .stmt = stop }, owned, exits, loop_keep, null, null);
+        while (tasks.pop()) |task| {
+            switch (task) {
+                .path => |path| try self.processAnalysisPath(&tasks, path),
+                .resume_switch_continuation => |resume_task| try self.processAnalysisSwitchContinuation(&tasks, resume_task),
+            }
+        }
+    }
+
+    fn analyzeJumpsToJoin(
+        self: *Inserter,
+        start: LIR.CFStmtId,
+        owned: *const OwnedSet,
+        target: LIR.JoinPointId,
+        exits: *std.ArrayList(OwnedSet),
+        loop_keep: ?*const OwnedSet,
+    ) ResourceError!void {
+        var tasks = std.ArrayList(AnalysisTask).empty;
+        defer {
+            while (tasks.pop()) |task| self.destroyAnalysisTask(task);
+            tasks.deinit(self.store.allocator);
+        }
+
+        var seen = AnalysisSeen.init(self.store.allocator);
+        defer self.deinitAnalysisSeen(&seen);
+        var scoped_joins = AnalysisScopedJoinMap.init(self.store.allocator);
+        defer self.deinitAnalysisScopedJoins(&scoped_joins);
+
+        try self.pushAnalysisPath(&tasks, start, .{ .jump_to = target }, owned, exits, loop_keep, &scoped_joins, &seen);
         while (tasks.pop()) |task| {
             switch (task) {
                 .path => |path| try self.processAnalysisPath(&tasks, path),
@@ -1828,10 +1899,12 @@ const Inserter = struct {
         self: *Inserter,
         tasks: *std.ArrayList(AnalysisTask),
         start: LIR.CFStmtId,
-        stop: LIR.CFStmtId,
+        stop: AnalysisStop,
         owned: *const OwnedSet,
         exits: *std.ArrayList(OwnedSet),
         loop_keep: ?*const OwnedSet,
+        scoped_joins: ?*AnalysisScopedJoinMap,
+        seen: ?*AnalysisSeen,
     ) ResourceError!void {
         const task = try self.store.allocator.create(AnalysisPathTask);
         errdefer self.store.allocator.destroy(task);
@@ -1841,6 +1914,8 @@ const Inserter = struct {
             .owned = try owned.clone(),
             .exits = exits,
             .loop_keep = loop_keep,
+            .scoped_joins = scoped_joins,
+            .seen = seen,
         };
         errdefer task.owned.deinit();
         try tasks.append(self.store.allocator, .{ .path = task });
@@ -1850,10 +1925,16 @@ const Inserter = struct {
         errdefer self.destroyAnalysisPath(path);
 
         while (true) {
-            if (path.cursor == path.stop) {
+            if (path.stop == .stmt and path.cursor == path.stop.stmt) {
                 try path.exits.append(self.store.allocator, try path.owned.clone());
                 self.destroyAnalysisPath(path);
                 return;
+            }
+            if (path.seen) |seen| {
+                if (try self.analysisSeenContainsOrAppend(seen, path.cursor, &path.owned)) {
+                    self.destroyAnalysisPath(path);
+                    return;
+                }
             }
 
             const stmt = self.store.getCFStmt(path.cursor);
@@ -1909,13 +1990,6 @@ const Inserter = struct {
                 .assign_packed_erased_fn => |assign| {
                     if (assign.capture) |capture| {
                         _ = try self.singleTransfer(capture, assign.next, assign.target, &path.owned, path.loop_keep);
-                    }
-                    if (assign.reuse) |reuse| {
-                        if (reuse != assign.target and try self.groupUsedInPath(assign.next, reuse, path.loop_keep)) {
-                            // Mirrors the rewrite path's pre-statement retain.
-                        } else if (self.ownsUnit(&path.owned, reuse)) {
-                            self.unsetOwnedUnit(&path.owned, reuse);
-                        }
                     }
                     self.addOwnedIfRc(&path.owned, assign.target);
                     const singles = [_]LIR.LocalId{ assign.capture orelse assign.target, assign.target };
@@ -2030,22 +2104,24 @@ const Inserter = struct {
                             .switch_exits = .empty,
                             .parent_exits = path.exits,
                             .loop_keep = path.loop_keep,
+                            .scoped_joins = path.scoped_joins,
+                            .seen = path.seen,
                         };
                         try tasks.append(self.store.allocator, .{ .resume_switch_continuation = resume_task });
                         queued = true;
 
                         for (self.store.getCFSwitchBranches(switch_stmt.branches)) |branch| {
-                            try self.pushAnalysisPath(tasks, branch.body, continuation, &path.owned, &resume_task.switch_exits, path.loop_keep);
+                            try self.pushAnalysisPath(tasks, branch.body, .{ .stmt = continuation }, &path.owned, &resume_task.switch_exits, path.loop_keep, path.scoped_joins, path.seen);
                         }
-                        try self.pushAnalysisPath(tasks, switch_stmt.default_branch, continuation, &path.owned, &resume_task.switch_exits, path.loop_keep);
+                        try self.pushAnalysisPath(tasks, switch_stmt.default_branch, .{ .stmt = continuation }, &path.owned, &resume_task.switch_exits, path.loop_keep, path.scoped_joins, path.seen);
                         self.destroyAnalysisPath(path);
                         return;
                     }
 
                     for (self.store.getCFSwitchBranches(switch_stmt.branches)) |branch| {
-                        try self.pushAnalysisPath(tasks, branch.body, path.stop, &path.owned, path.exits, path.loop_keep);
+                        try self.pushAnalysisPath(tasks, branch.body, path.stop, &path.owned, path.exits, path.loop_keep, path.scoped_joins, path.seen);
                     }
-                    try self.pushAnalysisPath(tasks, switch_stmt.default_branch, path.stop, &path.owned, path.exits, path.loop_keep);
+                    try self.pushAnalysisPath(tasks, switch_stmt.default_branch, path.stop, &path.owned, path.exits, path.loop_keep, path.scoped_joins, path.seen);
                     self.destroyAnalysisPath(path);
                     return;
                 },
@@ -2058,8 +2134,8 @@ const Inserter = struct {
                     defer uninitialized_owned.deinit();
                     uninitialized_owned.unset(switch_stmt.payload);
 
-                    try self.pushAnalysisPath(tasks, switch_stmt.initialized_branch, path.stop, &initialized_owned, path.exits, path.loop_keep);
-                    try self.pushAnalysisPath(tasks, switch_stmt.uninitialized_branch, path.stop, &uninitialized_owned, path.exits, path.loop_keep);
+                    try self.pushAnalysisPath(tasks, switch_stmt.initialized_branch, path.stop, &initialized_owned, path.exits, path.loop_keep, path.scoped_joins, path.seen);
+                    try self.pushAnalysisPath(tasks, switch_stmt.uninitialized_branch, path.stop, &uninitialized_owned, path.exits, path.loop_keep, path.scoped_joins, path.seen);
                     self.destroyAnalysisPath(path);
                     return;
                 },
@@ -2072,8 +2148,8 @@ const Inserter = struct {
                             .view => |local| self.addOwnedIfRc(&match_owned, local),
                         }
                     }
-                    try self.pushAnalysisPath(tasks, str_match.on_match, path.stop, &match_owned, path.exits, path.loop_keep);
-                    try self.pushAnalysisPath(tasks, str_match.on_miss, path.stop, &path.owned, path.exits, path.loop_keep);
+                    try self.pushAnalysisPath(tasks, str_match.on_match, path.stop, &match_owned, path.exits, path.loop_keep, path.scoped_joins, path.seen);
+                    try self.pushAnalysisPath(tasks, str_match.on_miss, path.stop, &path.owned, path.exits, path.loop_keep, path.scoped_joins, path.seen);
                     self.destroyAnalysisPath(path);
                     return;
                 },
@@ -2087,20 +2163,93 @@ const Inserter = struct {
                                 .view => |local| self.addOwnedIfRc(&match_owned, local),
                             }
                         }
-                        try self.pushAnalysisPath(tasks, arm.on_match, path.stop, &match_owned, path.exits, path.loop_keep);
+                        try self.pushAnalysisPath(tasks, arm.on_match, path.stop, &match_owned, path.exits, path.loop_keep, path.scoped_joins, path.seen);
                     }
-                    try self.pushAnalysisPath(tasks, str_match_set.on_miss, path.stop, &path.owned, path.exits, path.loop_keep);
+                    try self.pushAnalysisPath(tasks, str_match_set.on_miss, path.stop, &path.owned, path.exits, path.loop_keep, path.scoped_joins, path.seen);
                     self.destroyAnalysisPath(path);
                     return;
                 },
-                .join => {
-                    // A join starts a separate loop/recursive ownership frame.
-                    // Switch continuation analysis must not fold that frame into
-                    // the parent switch's shared continuation.
+                .join => |join_stmt| {
+                    switch (path.stop) {
+                        .stmt => {
+                            // A join starts a separate loop/recursive ownership frame.
+                            // Switch continuation analysis must not fold that frame into
+                            // the parent switch's shared continuation.
+                            self.destroyAnalysisPath(path);
+                            return;
+                        },
+                        .jump_to => {
+                            if (path.scoped_joins) |scoped_joins| {
+                                const scoped_entry = try scoped_joins.getOrPut(join_stmt.id);
+                                if (scoped_entry.found_existing) {
+                                    if (scoped_entry.value_ptr.body != join_stmt.body) {
+                                        arcInvariant("ARC jump analysis saw one join id with multiple bodies");
+                                    }
+                                    if (scoped_entry.value_ptr.remainder != join_stmt.remainder) {
+                                        arcInvariant("ARC jump analysis saw one join id with multiple remainders");
+                                    }
+                                    if (!localSpanEql(scoped_entry.value_ptr.params, join_stmt.params)) {
+                                        arcInvariant("ARC jump analysis saw one join id with multiple param spans");
+                                    }
+                                    if (!localSpanEql(scoped_entry.value_ptr.maybe_uninitialized_params, join_stmt.maybe_uninitialized_params)) {
+                                        arcInvariant("ARC jump analysis saw one join id with multiple maybe-uninitialized param spans");
+                                    }
+                                    if (!scoped_entry.value_ptr.entry_owned.eql(&path.owned)) {
+                                        scoped_entry.value_ptr.entry_owned.intersect(&path.owned);
+                                        if (scoped_entry.value_ptr.keep) |*keep| {
+                                            keep.deinit();
+                                            scoped_entry.value_ptr.keep = null;
+                                        }
+                                    }
+                                } else {
+                                    errdefer _ = scoped_joins.remove(join_stmt.id);
+                                    scoped_entry.value_ptr.* = .{
+                                        .body = join_stmt.body,
+                                        .remainder = join_stmt.remainder,
+                                        .params = join_stmt.params,
+                                        .maybe_uninitialized_params = join_stmt.maybe_uninitialized_params,
+                                        .entry_owned = try path.owned.clone(),
+                                        .keep = null,
+                                    };
+                                }
+                            }
+                            path.cursor = join_stmt.remainder;
+                        },
+                    }
+                },
+                .runtime_error, .comptime_exhaustiveness_failed, .loop_continue, .loop_break => {
                     self.destroyAnalysisPath(path);
                     return;
                 },
-                .runtime_error, .comptime_exhaustiveness_failed, .loop_continue, .loop_break, .jump, .ret, .crash, .expect_err => {
+                .jump => |jump_stmt| {
+                    if (path.stop == .jump_to and jump_stmt.target == path.stop.jump_to) {
+                        try path.exits.append(self.store.allocator, try path.owned.clone());
+                    } else if (path.stop == .jump_to) {
+                        if (path.scoped_joins) |scoped_joins| {
+                            if (scoped_joins.getPtr(jump_stmt.target)) |target_join| {
+                                if (target_join.keep == null) {
+                                    target_join.keep = try self.joinBodyOwnedSet(
+                                        &target_join.entry_owned,
+                                        jump_stmt.target,
+                                        target_join.params,
+                                        target_join.maybe_uninitialized_params,
+                                        target_join.remainder,
+                                        target_join.body,
+                                        null,
+                                    );
+                                }
+                                const next_owned = try target_join.keep.?.clone();
+                                path.owned.deinit();
+                                path.owned = next_owned;
+                                path.cursor = target_join.body;
+                                continue;
+                            }
+                        }
+                    }
+                    self.destroyAnalysisPath(path);
+                    return;
+                },
+                .ret, .crash, .expect_err => {
                     self.destroyAnalysisPath(path);
                     return;
                 },
@@ -2126,7 +2275,7 @@ const Inserter = struct {
         var common = try resume_task.switch_exits.items[0].clone();
         defer common.deinit();
         for (resume_task.switch_exits.items[1..]) |*state| common.intersect(state);
-        try self.pushAnalysisPath(tasks, resume_task.continuation, resume_task.stop, &common, resume_task.parent_exits, resume_task.loop_keep);
+        try self.pushAnalysisPath(tasks, resume_task.continuation, resume_task.stop, &common, resume_task.parent_exits, resume_task.loop_keep, resume_task.scoped_joins, resume_task.seen);
         self.destroyAnalysisSwitchContinuation(resume_task);
     }
 
@@ -2162,19 +2311,10 @@ const Inserter = struct {
         _ = self.active_loop_keep_ids.remove(@intFromPtr(&state.body_keep));
         self.destroyFrames(&state.frames);
         if (state.join_keeps.len != 0) self.store.allocator.free(state.join_keeps);
-        self.destroyForwardJoinKeeps(&state.forward_join_keeps);
         state.incoming_owned.deinit();
         state.entry_keep.deinit();
         state.body_keep.deinit();
         self.store.allocator.destroy(state);
-    }
-
-    fn destroyForwardJoinKeeps(self: *Inserter, forward_join_keeps: *std.ArrayList(*OwnedSet)) void {
-        for (forward_join_keeps.items) |keep| {
-            keep.deinit();
-            self.store.allocator.destroy(keep);
-        }
-        forward_join_keeps.deinit(self.store.allocator);
     }
 
     fn destroyRewriteSwitchNoContinuation(self: *Inserter, state: *RewriteSwitchNoContinuationTask) void {
@@ -2226,6 +2366,70 @@ const Inserter = struct {
         self.store.allocator.destroy(resume_task);
     }
 
+    fn analysisSeenContainsOrAppend(
+        self: *Inserter,
+        seen: *AnalysisSeen,
+        stmt: LIR.CFStmtId,
+        owned: *const OwnedSet,
+    ) ResourceError!bool {
+        const seen_id = AnalysisSeenId{
+            .stmt = stmt,
+            .owned_digest = ownedSetDigest(owned),
+        };
+        const seen_entry = try seen.getOrPut(seen_id);
+        if (!seen_entry.found_existing) {
+            seen_entry.value_ptr.* = .{ .entries = .empty };
+        }
+        errdefer if (!seen_entry.found_existing) {
+            _ = seen.remove(seen_id);
+        };
+
+        for (seen_entry.value_ptr.entries.items) |*entry| {
+            if (entry.owned.eql(owned)) return true;
+        }
+
+        var owned_clone = try owned.clone();
+        errdefer owned_clone.deinit();
+        try seen_entry.value_ptr.entries.append(self.store.allocator, .{
+            .owned = owned_clone,
+        });
+        return false;
+    }
+
+    fn deinitAnalysisSeen(self: *Inserter, seen: *AnalysisSeen) void {
+        var iter = seen.valueIterator();
+        while (iter.next()) |bucket| {
+            for (bucket.entries.items) |*entry| {
+                entry.owned.deinit();
+            }
+            bucket.entries.deinit(self.store.allocator);
+        }
+        seen.deinit();
+    }
+
+    fn deinitAnalysisScopedJoins(_: *Inserter, scoped_joins: *AnalysisScopedJoinMap) void {
+        var iter = scoped_joins.valueIterator();
+        while (iter.next()) |entry| {
+            entry.entry_owned.deinit();
+            if (entry.keep) |*keep| {
+                keep.deinit();
+            }
+        }
+        scoped_joins.deinit();
+    }
+
+    fn deinitJoinBodyMemo(self: *Inserter, memo: *JoinBodyMemo) void {
+        var iter = memo.valueIterator();
+        while (iter.next()) |bucket| {
+            for (bucket.entries.items) |*entry| {
+                entry.entry_owned.deinit();
+                entry.keep.deinit();
+            }
+            bucket.entries.deinit(self.store.allocator);
+        }
+        memo.deinit();
+    }
+
     fn isBindingBorrowed(self: *const Inserter, local: LIR.LocalId) bool {
         if (!self.solution.isBorrowed(local)) return false;
         return !self.owned_param_override.contains(local);
@@ -2264,22 +2468,143 @@ const Inserter = struct {
         owned.unset(self.solution.unitLocalOf(local));
     }
 
+    fn cachedJoinBodyOwnedSet(
+        self: *Inserter,
+        entry_owned: *const OwnedSet,
+        join_id: LIR.JoinPointId,
+        params: LIR.LocalSpan,
+        maybe_uninitialized_params: LIR.LocalSpan,
+        remainder: LIR.CFStmtId,
+        body: LIR.CFStmtId,
+        body_reachable: ?*bool,
+    ) ResourceError!?OwnedSet {
+        const memo = self.join_body_memo orelse return null;
+        const memo_id = JoinBodyMemoId{
+            .join = join_id,
+            .owned_digest = ownedSetDigest(entry_owned),
+        };
+        const bucket = memo.getPtr(memo_id) orelse return null;
+        for (bucket.entries.items) |*entry| {
+            if (!entry.entry_owned.eql(entry_owned)) continue;
+            checkJoinBodyMemoMetadata(entry, params, maybe_uninitialized_params, remainder, body);
+            if (body_reachable) |reachable| reachable.* = entry.body_reachable;
+            return try entry.keep.clone();
+        }
+        return null;
+    }
+
+    fn cacheJoinBodyOwnedSet(
+        self: *Inserter,
+        entry_owned: *const OwnedSet,
+        join_id: LIR.JoinPointId,
+        params: LIR.LocalSpan,
+        maybe_uninitialized_params: LIR.LocalSpan,
+        remainder: LIR.CFStmtId,
+        body: LIR.CFStmtId,
+        keep: *const OwnedSet,
+        body_reachable: bool,
+    ) ResourceError!void {
+        const memo = self.join_body_memo orelse return;
+        const memo_id = JoinBodyMemoId{
+            .join = join_id,
+            .owned_digest = ownedSetDigest(entry_owned),
+        };
+        const bucket = try memo.getOrPut(memo_id);
+        if (!bucket.found_existing) {
+            bucket.value_ptr.* = .{ .entries = .empty };
+        }
+        errdefer if (!bucket.found_existing) {
+            _ = memo.remove(memo_id);
+        };
+
+        for (bucket.value_ptr.entries.items) |*entry| {
+            if (!entry.entry_owned.eql(entry_owned)) continue;
+            checkJoinBodyMemoMetadata(entry, params, maybe_uninitialized_params, remainder, body);
+            return;
+        }
+
+        var entry_owned_clone = try entry_owned.clone();
+        errdefer entry_owned_clone.deinit();
+        var keep_clone = try keep.clone();
+        errdefer keep_clone.deinit();
+        try bucket.value_ptr.entries.append(self.store.allocator, .{
+            .entry_owned = entry_owned_clone,
+            .params = params,
+            .maybe_uninitialized_params = maybe_uninitialized_params,
+            .remainder = remainder,
+            .body = body,
+            .keep = keep_clone,
+            .body_reachable = body_reachable,
+        });
+    }
+
+    fn checkJoinBodyMemoMetadata(
+        entry: *const JoinBodyMemoEntry,
+        params: LIR.LocalSpan,
+        maybe_uninitialized_params: LIR.LocalSpan,
+        remainder: LIR.CFStmtId,
+        body: LIR.CFStmtId,
+    ) void {
+        if (!localSpanEql(entry.params, params)) {
+            arcInvariant("ARC join body memo saw one join id with multiple param spans");
+        }
+        if (!localSpanEql(entry.maybe_uninitialized_params, maybe_uninitialized_params)) {
+            arcInvariant("ARC join body memo saw one join id with multiple maybe-uninitialized param spans");
+        }
+        if (entry.remainder != remainder) {
+            arcInvariant("ARC join body memo saw one join id with multiple remainders");
+        }
+        if (entry.body != body) {
+            arcInvariant("ARC join body memo saw one join id with multiple bodies");
+        }
+    }
+
     fn joinBodyOwnedSet(
         self: *Inserter,
         entry_owned: *const OwnedSet,
+        join_id: LIR.JoinPointId,
         params: LIR.LocalSpan,
         maybe_uninitialized_params: LIR.LocalSpan,
+        remainder: LIR.CFStmtId,
         body: LIR.CFStmtId,
+        body_reachable: ?*bool,
     ) ResourceError!OwnedSet {
+        if (try self.cachedJoinBodyOwnedSet(entry_owned, join_id, params, maybe_uninitialized_params, remainder, body, body_reachable)) |cached| {
+            return cached;
+        }
+
+        // The emitted body is shared by every jump into the join. A non-param
+        // local can enter that body as owned only when every jump reaches it
+        // with that local owned, whether the local was already owned before
+        // the join or born inside the run-once remainder.
+        var jump_states = std.ArrayList(OwnedSet).empty;
+        defer {
+            for (jump_states.items) |*state| state.deinit();
+            jump_states.deinit(self.store.allocator);
+        }
+        try self.analyzeJumpsToJoin(remainder, entry_owned, join_id, &jump_states, null);
+        const reachable = jump_states.items.len != 0;
+        if (body_reachable) |reachable_out| reachable_out.* = reachable;
+
         var owned = try OwnedSet.init(self.store.allocator, entry_owned.len());
         errdefer owned.deinit();
-        var iter = entry_owned.bits.iterator(.{});
-        while (iter.next()) |i| {
-            const local: LIR.LocalId = @enumFromInt(@as(u32, @intCast(i)));
-            if (try self.groupUsedInPath(body, local, null)) {
-                owned.set(local);
+
+        if (jump_states.items.len != 0) {
+            owned.deinit();
+            owned = try jump_states.items[0].clone();
+            for (jump_states.items[1..]) |*jump_owned| {
+                owned.intersect(jump_owned);
+            }
+
+            var iter = owned.bits.iterator(.{});
+            while (iter.next()) |i| {
+                const local: LIR.LocalId = @enumFromInt(@as(u32, @intCast(i)));
+                if (!try self.groupUsedInPath(body, local, null)) {
+                    owned.unset(local);
+                }
             }
         }
+
         for (self.store.getLocalSpan(params)) |param| {
             self.addOwnedIfRc(&owned, param);
         }
@@ -2291,6 +2616,7 @@ const Inserter = struct {
             // the param as borrowed.
             self.addConditionallyOwnedIfRc(&owned, param);
         }
+        try self.cacheJoinBodyOwnedSet(entry_owned, join_id, params, maybe_uninitialized_params, remainder, body, &owned, reachable);
         return owned;
     }
 
@@ -2304,7 +2630,8 @@ const Inserter = struct {
         var iter = entry_owned.bits.iterator(.{});
         while (iter.next()) |i| {
             const local: LIR.LocalId = @enumFromInt(@as(u32, @intCast(i)));
-            if (try self.groupUsedInPath(remainder, local, null)) {
+            const used = try self.groupUsedInPath(remainder, local, null);
+            if (used) {
                 owned.set(local);
             }
         }
@@ -2826,6 +3153,8 @@ const Inserter = struct {
             .ret_layout = source_spec.ret_layout,
             .abi = source_spec.abi,
             .hosted = source_spec.hosted,
+            .tail_transform = source_spec.tail_transform,
+            .stack_probe = source_spec.stack_probe,
         });
         try self.store.copyProcDebugInfo(variant, callee);
         entry.value_ptr.* = variant;
@@ -3212,7 +3541,6 @@ const Inserter = struct {
                 },
                 .assign_packed_erased_fn => |assign| {
                     if (assign.capture) |capture| noteReadBeforeRebindLocal(&graph.nodes.items[node_index].reads, capture);
-                    if (assign.reuse) |reuse| noteReadBeforeRebindLocal(&graph.nodes.items[node_index].reads, reuse);
                     setReadBeforeRebindDef(&graph, node_index, assign.target);
                     try self.appendReadBeforeRebindSuccessor(&graph, &work, node_index, assign.next);
                 },
@@ -3466,7 +3794,6 @@ const Inserter = struct {
                 },
                 .assign_packed_erased_fn => |assign| {
                     if (assign.capture != null and assign.capture.? == needle) return true;
-                    if (assign.reuse != null and assign.reuse.? == needle) return true;
                     if (assign.target == needle) continue;
                     try stack.append(self.store.allocator, assign.next);
                 },
@@ -3676,7 +4003,6 @@ const Inserter = struct {
                 },
                 .assign_packed_erased_fn => |assign| {
                     if (assign.capture != null and needles.contains(assign.capture.?)) return true;
-                    if (assign.reuse != null and needles.contains(assign.reuse.?)) return true;
                     try stack.append(self.store.allocator, assign.next);
                 },
                 .assign_low_level => |assign| {
@@ -3973,6 +4299,11 @@ const OwnedSet = struct {
         return self.bits.isSet(@intFromEnum(local));
     }
 
+    fn eql(self: *const OwnedSet, other: *const OwnedSet) bool {
+        if (self.len() != other.len()) return false;
+        return self.bits.eql(other.bits);
+    }
+
     fn intersect(self: *OwnedSet, other: *const OwnedSet) void {
         if (self.len() != other.len()) arcInvariant("ARC owned-set intersection length mismatch");
         self.bits.setIntersection(other.bits);
@@ -3983,6 +4314,16 @@ const OwnedSet = struct {
         self.bits.setUnion(other.bits);
     }
 };
+
+fn ownedSetDigest(owned: *const OwnedSet) u64 {
+    var hasher = std.hash.Wyhash.init(0x6172635f616e616c);
+    var iter = owned.bits.iterator(.{});
+    while (iter.next()) |index| {
+        const local_index: u32 = @intCast(index);
+        hasher.update(std.mem.asBytes(&local_index));
+    }
+    return hasher.final();
+}
 
 fn refOpSource(op: LIR.RefOp) LIR.LocalId {
     return switch (op) {
@@ -4155,16 +4496,6 @@ const ArcTest = struct {
         } });
     }
 
-    fn assignStaticData(self: *ArcTest, target: LIR.LocalId, next: LIR.CFStmtId) Allocator.Error!LIR.CFStmtId {
-        return try self.store.addCFStmt(.{
-            .assign_literal = .{
-                .target = target,
-                .value = .{ .static_data = undefined }, // ARC tests inspect ownership shape; the static-data id is never dereferenced.
-                .next = next,
-            },
-        });
-    }
-
     fn assignList(self: *ArcTest, target: LIR.LocalId, elems: []const LIR.LocalId, next: LIR.CFStmtId) Allocator.Error!LIR.CFStmtId {
         return try self.store.addCFStmt(.{ .assign_list = .{
             .target = target,
@@ -4247,25 +4578,6 @@ const ArcTest = struct {
             .op = .list_append_unsafe,
             .rc_effect = rc_effect,
             .args = try self.span(args),
-            .next = next,
-        } });
-    }
-
-    fn assignPackedErased(
-        self: *ArcTest,
-        target: LIR.LocalId,
-        capture: LIR.LocalId,
-        capture_layout: layout_mod.Idx,
-        reuse: ?LIR.LocalId,
-        next: LIR.CFStmtId,
-    ) Allocator.Error!LIR.CFStmtId {
-        return try self.store.addCFStmt(.{ .assign_packed_erased_fn = .{
-            .target = target,
-            .proc = try self.addBodylessProc(.i64),
-            .capture = capture,
-            .capture_layout = capture_layout,
-            .on_drop = .{ .rc_helper = .{ .op = .decref, .layout_idx = capture_layout } },
-            .reuse = reuse,
             .next = next,
         } });
     }
@@ -4386,7 +4698,9 @@ const ArcTest = struct {
         return count;
     }
 
-    fn expectRcAtomicity(self: *const ArcTest, local_id: LIR.LocalId, expected: LIR.RcAtomicity) anyerror!void {
+    const ExpectError = error{ TestExpectedEqual, TestUnexpectedResult };
+
+    fn expectRcAtomicity(self: *const ArcTest, local_id: LIR.LocalId, expected: LIR.RcAtomicity) ExpectError!void {
         var seen: usize = 0;
         for (self.store.cf_stmts.items) |stmt| {
             const found: LIR.RcAtomicity = switch (stmt) {
@@ -4481,7 +4795,7 @@ const ArcTest = struct {
         return count;
     }
 
-    fn expectRc(self: *const ArcTest, local_id: LIR.LocalId, increfs: usize, decrefs: usize, frees: usize) anyerror!void {
+    fn expectRc(self: *const ArcTest, local_id: LIR.LocalId, increfs: usize, decrefs: usize, frees: usize) ExpectError!void {
         try testing.expectEqual(increfs, self.countRc(local_id, .incref));
         try testing.expectEqual(decrefs, self.countRc(local_id, .decref));
         try testing.expectEqual(frees, self.countRc(local_id, .free));
@@ -5279,6 +5593,86 @@ test "RC join remainder starts from join entry ownership" {
     try f.expectRc(pair, 0, 1, 0);
 }
 
+test "RC join body keeps local born in remainder" {
+    var f = try ArcTest.init(testing.allocator);
+    defer f.deinit();
+    const carried = try f.local(.str);
+    const join_id = f.freshJoinPointId();
+
+    const ret = try f.ret(carried);
+    const jump = try f.store.addCFStmt(.{ .jump = .{ .target = join_id } });
+    const remainder = try f.assignStr(carried, "carried", jump);
+    const join = try f.store.addCFStmt(.{ .join = .{
+        .id = join_id,
+        .params = LIR.LocalSpan.empty(),
+        .body = ret,
+        .remainder = remainder,
+    } });
+
+    _ = try f.addProc(&.{}, join, .str);
+    try f.run();
+    try f.expectRc(carried, 0, 0, 0);
+}
+
+test "RC join body keeps remainder local through nested join jump" {
+    var f = try ArcTest.init(testing.allocator);
+    defer f.deinit();
+    const carried = try f.local(.str);
+    const outer_join_id = f.freshJoinPointId();
+    const inner_join_id = f.freshJoinPointId();
+
+    const ret = try f.ret(carried);
+    const outer_jump = try f.store.addCFStmt(.{ .jump = .{ .target = outer_join_id } });
+    const inner_jump = try f.store.addCFStmt(.{ .jump = .{ .target = inner_join_id } });
+    const inner_join = try f.store.addCFStmt(.{ .join = .{
+        .id = inner_join_id,
+        .params = LIR.LocalSpan.empty(),
+        .body = outer_jump,
+        .remainder = inner_jump,
+    } });
+    const outer_remainder = try f.assignStr(carried, "nested-carried", inner_join);
+    const outer_join = try f.store.addCFStmt(.{ .join = .{
+        .id = outer_join_id,
+        .params = LIR.LocalSpan.empty(),
+        .body = ret,
+        .remainder = outer_remainder,
+    } });
+
+    _ = try f.addProc(&.{}, outer_join, .str);
+    try f.run();
+    try f.expectRc(carried, 0, 0, 0);
+}
+
+test "RC unreachable join body does not cache nested join ownership" {
+    var f = try ArcTest.init(testing.allocator);
+    defer f.deinit();
+    const carried = try f.local(.str);
+    const result = try f.local(.str);
+    const dead_join_id = f.freshJoinPointId();
+    const nested_join_id = f.freshJoinPointId();
+
+    const ret = try f.ret(result);
+    const nested_jump = try f.store.addCFStmt(.{ .jump = .{ .target = nested_join_id } });
+    const set_result = try f.setLocal(result, carried, .initialize_join_param, nested_jump);
+    const nested_join = try f.store.addCFStmt(.{ .join = .{
+        .id = nested_join_id,
+        .params = try f.span(&.{result}),
+        .body = ret,
+        .remainder = set_result,
+    } });
+    const dead_join = try f.store.addCFStmt(.{ .join = .{
+        .id = dead_join_id,
+        .params = LIR.LocalSpan.empty(),
+        .body = nested_join,
+        .remainder = nested_join,
+    } });
+    const body = try f.assignStr(carried, "cached-carried", dead_join);
+
+    _ = try f.addProc(&.{}, body, .str);
+    try f.run();
+    try f.expectRc(carried, 0, 0, 0);
+}
+
 test "RC join loop jump releases body-only list but keeps carried state" {
     var f = try ArcTest.init(testing.allocator);
     defer f.deinit();
@@ -5342,40 +5736,6 @@ test "RC join loop exit releases body-only list and preserves returned state" {
     try f.expectRc(scratch, 0, 1, 0);
     // The carried state moves out on return.
     try f.expectRc(state, 0, 0, 0);
-}
-
-test "RC join body can jump to forward sibling join" {
-    var f = try ArcTest.init(testing.allocator);
-    defer f.deinit();
-    const source = try f.local(f.list_i64);
-    const state = try f.local(f.list_i64);
-    const forwarded = try f.local(f.list_i64);
-    const loop_id = f.freshJoinPointId();
-    const exit_id = f.freshJoinPointId();
-
-    const exit_body = try f.ret(forwarded);
-    const exit_jump = try f.store.addCFStmt(.{ .jump = .{ .target = exit_id } });
-    const initialize_forwarded = try f.setLocal(forwarded, state, .initialize_join_param, exit_jump);
-
-    const initial_jump = try f.store.addCFStmt(.{ .jump = .{ .target = loop_id } });
-    const initialize_state = try f.setLocal(state, source, .initialize_join_param, initial_jump);
-    const entry = try f.assignList(source, &.{}, initialize_state);
-    const exit_join = try f.store.addCFStmt(.{ .join = .{
-        .id = exit_id,
-        .params = try f.span(&.{forwarded}),
-        .body = exit_body,
-        .remainder = entry,
-    } });
-    const loop_join = try f.store.addCFStmt(.{ .join = .{
-        .id = loop_id,
-        .params = try f.span(&.{state}),
-        .body = initialize_forwarded,
-        .remainder = exit_join,
-    } });
-
-    _ = try f.addProc(&.{}, loop_join, f.list_i64);
-    try f.run();
-    try testing.expectEqual(@as(usize, 0), f.countAllRc());
 }
 
 test "RC maybe-initialized join payload releases conditionally on loop exit" {
@@ -5642,94 +6002,26 @@ test "uniqueness: freshly built list consumed by a checked op elides the check" 
     try testing.expectEqual(@as(u64, 1), f.uniqueArgsFor(appended));
 }
 
-test "uniqueness: static data list consumed by a checked op keeps the runtime check" {
+test "uniqueness: slice-producing checked op result keeps later check" {
     var f = try ArcTest.init(testing.allocator);
     defer f.deinit();
     const list = try f.local(f.list_i64);
-    const elem = try f.local(.i64);
-    const appended = try f.local(f.list_i64);
+    const sliced = try f.local(f.list_i64);
+    const trimmed = try f.local(f.list_i64);
     const result = try f.local(.i64);
 
+    // elem = []; sliced = sublist_like(elem); trimmed = checked_op(sliced)
     const ret = try f.ret(result);
     const result_assign = try f.assignI64(result, 1, ret);
-    const append = try f.assignLowLevel(appended, &.{ list, elem }, LIR.LowLevel.RcEffect.runtimeUniqueness(1), result_assign);
-    const list_assign = try f.assignStaticData(list, append);
-    const body = try f.assignI64(elem, 5, list_assign);
+    const trim = try f.assignLowLevel(trimmed, &.{sliced}, LIR.LowLevel.RcEffect.runtimeUniqueness(1), result_assign);
+    const slice = try f.assignLowLevel(sliced, &.{list}, LIR.LowLevel.RcEffect.runtimeUniquenessMaybeSharedResult(1), trim);
+    const body = try f.assignList(list, &.{}, slice);
     _ = try f.addProc(&.{}, body, .i64);
 
     try f.run();
-    try testing.expectEqual(@as(u64, 0), f.uniqueArgsFor(appended));
-}
-
-test "uniqueness: freshly packed erased callable repack elides the check" {
-    var f = try ArcTest.init(testing.allocator);
-    defer f.deinit();
-    const erased_callable = try f.layouts.insertErasedCallable();
-    const old_capture = try f.local(f.list_i64);
-    const new_capture = try f.local(f.list_i64);
-    const old_callable = try f.local(erased_callable);
-    const new_callable = try f.local(erased_callable);
-
-    const ret = try f.ret(new_callable);
-    const new_pack = try f.assignPackedErased(new_callable, new_capture, f.list_i64, old_callable, ret);
-    const new_capture_assign = try f.assignList(new_capture, &.{}, new_pack);
-    const old_pack = try f.assignPackedErased(old_callable, old_capture, f.list_i64, null, new_capture_assign);
-    const old_capture_assign = try f.assignList(old_capture, &.{}, old_pack);
-    _ = try f.addProc(&.{}, old_capture_assign, erased_callable);
-
-    try f.run();
-
-    var saw_repack = false;
-    var saw_unique = false;
-    for (f.store.cf_stmts.items) |stmt| {
-        switch (stmt) {
-            .assign_packed_erased_fn => |assign| {
-                if (assign.target == new_callable and assign.reuse == old_callable) {
-                    saw_repack = true;
-                    saw_unique = saw_unique or assign.reuse_unique;
-                }
-            },
-            else => {},
-        }
-    }
-    try testing.expect(saw_repack);
-    try testing.expect(saw_unique);
-}
-
-test "uniqueness: erased callable repack keeps the check when old value is used later" {
-    var f = try ArcTest.init(testing.allocator);
-    defer f.deinit();
-    const erased_callable = try f.layouts.insertErasedCallable();
-    const old_capture = try f.local(f.list_i64);
-    const new_capture = try f.local(f.list_i64);
-    const old_callable = try f.local(erased_callable);
-    const new_callable = try f.local(erased_callable);
-
-    const ret = try f.ret(new_callable);
-    const use_old = try f.expectStmt(old_callable, ret);
-    const new_pack = try f.assignPackedErased(new_callable, new_capture, f.list_i64, old_callable, use_old);
-    const new_capture_assign = try f.assignList(new_capture, &.{}, new_pack);
-    const old_pack = try f.assignPackedErased(old_callable, old_capture, f.list_i64, null, new_capture_assign);
-    const old_capture_assign = try f.assignList(old_capture, &.{}, old_pack);
-    _ = try f.addProc(&.{}, old_capture_assign, erased_callable);
-
-    try f.run();
-
-    var saw_repack = false;
-    var saw_unique = false;
-    for (f.store.cf_stmts.items) |stmt| {
-        switch (stmt) {
-            .assign_packed_erased_fn => |assign| {
-                if (assign.target == new_callable and assign.reuse == old_callable) {
-                    saw_repack = true;
-                    saw_unique = saw_unique or assign.reuse_unique;
-                }
-            },
-            else => {},
-        }
-    }
-    try testing.expect(saw_repack);
-    try testing.expect(!saw_unique);
+    // Slice-producing list builtins can return a seamless slice of a shared
+    // allocation, so their result must not seed born-unique analysis.
+    try testing.expectEqual(@as(u64, 0), f.uniqueArgsFor(trimmed));
 }
 
 test "uniqueness: list held by a struct keeps its runtime check" {

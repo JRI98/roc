@@ -14,7 +14,7 @@ const compiled_builtins = @import("compiled_builtins");
 const lir = @import("lir");
 const reporting = @import("reporting");
 
-const builtin_loading = @import("builtin_loading.zig");
+const builtin_static = can.BuiltinStatic;
 const eval_loader = @import("vendor_eval_loader");
 const native_runtime_libcalls = builtins.native_runtime_libcalls;
 const CompileTimeFinalization = @import("compile_time_finalization.zig");
@@ -34,6 +34,54 @@ const LayoutIdx = @import("layout").Idx;
 const LirProcSpecId = lir.LirProcSpecId;
 const LirImage = lir.LirImage;
 
+/// Errors surfaced by shared eval test helpers.
+pub const TestHelperError = Allocator.Error || std.DynLib.Error || std.Io.File.OpenError || std.Io.File.Reader.Error || std.Io.File.Writer.Error || std.Io.File.StatError || std.Io.File.ReadPositionalError || std.Io.Writer.Error || check.CheckedArtifact.CompileTimeFinalizer.Error || error{
+    InvalidUtf8,
+    LlvmBackendUnavailable,
+    DevBackendUnavailable,
+    WasmExecFailed,
+    TypeCheckError,
+    ParseError,
+    CorruptEmbeddedBuiltins,
+    Crash,
+    RuntimeError,
+    DivisionByZero,
+    ComptimeExhaustiveness,
+    ExpectErr,
+    EvaluationFailed,
+    EntrypointNotFound,
+    InvalidLirImage,
+    UnsupportedLirImageVersion,
+    Internal,
+    UnsupportedTarget,
+    UnsupportedPlatform,
+    SysctlFailed,
+    CreateFileMappingFailed,
+    OpenFileMappingFailed,
+    MapViewOfFileFailed,
+    TempFileOpenFailed,
+    TempFileUnlinkFailed,
+    ShmOpenFailed,
+    ShmUnlinkFailed,
+    MemfdCreateFailed,
+    FtruncateFailed,
+    MmapFailed,
+    EmptyCode,
+    VirtualAllocFailed,
+    MprotectFailed,
+    VirtualProtectFailed,
+    InvalidHandle,
+    WindowsSDKNotFound,
+    CompilationFailed,
+    BitcodeParseError,
+    ModuleLinkFailed,
+    TempFileError,
+    LinkFailed,
+    UnsupportedLowLevel,
+    TestExpectedEqual,
+    TestUnexpectedResult,
+};
+
 const EvalDynLib = switch (builtin.target.os.tag) {
     .windows => struct {
         handle: std.os.windows.HMODULE,
@@ -44,7 +92,7 @@ const EvalDynLib = switch (builtin.target.os.tag) {
             extern "kernel32" fn FreeLibrary(hLibModule: std.os.windows.HMODULE) callconv(.winapi) c_int;
         };
 
-        fn open(allocator: Allocator, path: [:0]const u8) anyerror!@This() {
+        fn open(allocator: Allocator, path: [:0]const u8) TestHelperError!@This() {
             const wide_path = try std.unicode.utf8ToUtf16LeAllocZ(allocator, path);
             defer allocator.free(wide_path);
             const handle = kernel32.LoadLibraryW(wide_path.ptr) orelse return error.LlvmBackendUnavailable;
@@ -70,7 +118,7 @@ const EvalDynLib = switch (builtin.target.os.tag) {
 
         inner: Inner,
 
-        fn open(_: Allocator, path: [:0]const u8) anyerror!@This() {
+        fn open(_: Allocator, path: [:0]const u8) TestHelperError!@This() {
             // The vendored loader has no dynamic linker behind it, so it needs a
             // resolver to bind the compiler-rt libcalls native codegen emits.
             // `std.DynLib` defers to the OS loader, which resolves them itself.
@@ -102,11 +150,11 @@ const SharedMemoryAllocator = if (builtin.target.os.tag == .freestanding) struct
     fixed_buffer: std.heap.FixedBufferAllocator,
     page_size: usize,
 
-    fn getSystemPageSize() anyerror!usize {
+    fn getSystemPageSize() TestHelperError!usize {
         return 64 * 1024;
     }
 
-    fn create(_: anytype, size: usize, page_size: usize) anyerror!@This() {
+    fn create(_: anytype, size: usize, page_size: usize) TestHelperError!@This() {
         const aligned_size = std.mem.alignForward(usize, size, page_size);
         const buffer = try std.heap.wasm_allocator.alignedAlloc(
             u8,
@@ -123,7 +171,7 @@ const SharedMemoryAllocator = if (builtin.target.os.tag == .freestanding) struct
         };
     }
 
-    fn createWithMinSize(_: std.Io, preferred_size: usize, _: usize, page_size: usize) anyerror!@This() {
+    fn createWithMinSize(_: std.Io, preferred_size: usize, _: usize, page_size: usize) TestHelperError!@This() {
         return create({}, preferred_size, page_size);
     }
 
@@ -144,7 +192,7 @@ const SharedMemoryAllocator = if (builtin.target.os.tag == .freestanding) struct
 
 /// Monotonic stage timer (std.time.Timer was removed in Zig 0.16).
 const StageTimer = if (builtin.target.os.tag == .freestanding) struct {
-    fn start() anyerror!@This() {
+    fn start() TestHelperError!@This() {
         return .{};
     }
 
@@ -248,7 +296,7 @@ pub const ProblemResources = struct {
     /// Locally-loaded Builtin; null when the caller supplied a pre-published
     /// Builtin via `parseAndCheckProgramForProblemsWithBuiltin` and retains
     /// ownership of the borrowed env.
-    builtin_module: ?builtin_loading.LoadedModule,
+    builtin_module: ?builtin_static.BuiltinModuleView,
     extra_modules: []CheckedModule,
 
     pub fn deinit(self: *ProblemResources, allocator: Allocator) void {
@@ -279,7 +327,7 @@ pub const ParsedResources = struct {
     import_artifacts: []check.CheckedArtifact.CheckedModuleArtifact,
     /// Locally-loaded Builtin; null when a pre-published Builtin was supplied
     /// and ownership stays with the caller.
-    builtin_module: ?builtin_loading.LoadedModule,
+    builtin_module: ?builtin_static.BuiltinModuleView,
     /// Borrowed Builtin artifact when the caller pre-published it. Used during
     /// lowering to build import views; never deinit'd here.
     borrowed_builtin_artifact: ?*check.CheckedArtifact.CheckedModuleArtifact = null,
@@ -450,7 +498,7 @@ pub fn parseAndCanonicalizeProgram(
     source_kind: SourceKind,
     source: []const u8,
     imports: []const ModuleSource,
-) anyerror!ParsedResources {
+) TestHelperError!ParsedResources {
     return parseAndCanonicalizeProgramWrapped(allocator, source_kind, source, imports, false);
 }
 
@@ -462,7 +510,7 @@ pub fn parseAndCanonicalizeProgramWithBuiltin(
     source: []const u8,
     imports: []const ModuleSource,
     pre_published_builtin: PrePublishedBuiltin,
-) anyerror!ParsedResources {
+) TestHelperError!ParsedResources {
     return parseAndCanonicalizeProgramWithRootMode(
         allocator,
         source_kind,
@@ -482,7 +530,7 @@ pub fn parseAndCanonicalizeProgramPublishedRootsWithBuiltin(
     source: []const u8,
     imports: []const ModuleSource,
     pre_published_builtin: PrePublishedBuiltin,
-) anyerror!ParsedResources {
+) TestHelperError!ParsedResources {
     return parseAndCanonicalizeProgramWithRootMode(
         allocator,
         source_kind,
@@ -495,7 +543,7 @@ pub fn parseAndCanonicalizeProgramPublishedRootsWithBuiltin(
 }
 
 /// Parse and canonicalize a single expression (no imports).
-pub fn parseAndCanonicalizeExpr(allocator: Allocator, source: []const u8) anyerror!ParsedResources {
+pub fn parseAndCanonicalizeExpr(allocator: Allocator, source: []const u8) TestHelperError!ParsedResources {
     return parseAndCanonicalizeProgram(allocator, .expr, source, &.{});
 }
 
@@ -505,7 +553,7 @@ pub fn parseAndCheckProgramForProblems(
     source_kind: SourceKind,
     source: []const u8,
     imports: []const ModuleSource,
-) anyerror!ProblemResources {
+) TestHelperError!ProblemResources {
     return parseAndCheckProgramForProblemsImpl(allocator, source_kind, source, imports, null);
 }
 
@@ -518,7 +566,7 @@ pub fn parseAndCheckProgramForProblemsWithBuiltin(
     source: []const u8,
     imports: []const ModuleSource,
     pre_published_builtin: PrePublishedBuiltin,
-) anyerror!ProblemResources {
+) TestHelperError!ProblemResources {
     return parseAndCheckProgramForProblemsImpl(allocator, source_kind, source, imports, pre_published_builtin);
 }
 
@@ -528,16 +576,16 @@ fn parseAndCheckProgramForProblemsImpl(
     source: []const u8,
     imports: []const ModuleSource,
     pre_published_builtin: ?PrePublishedBuiltin,
-) anyerror!ProblemResources {
+) TestHelperError!ProblemResources {
     const builtin_indices: CIR.BuiltinIndices = if (pre_published_builtin) |ppb|
         ppb.indices
     else
-        try builtin_loading.deserializeBuiltinIndices(allocator, compiled_builtins.builtin_indices_bin);
+        compiled_builtins.builtinIndices(CIR);
 
-    var loaded_builtin: ?builtin_loading.LoadedModule = if (pre_published_builtin == null)
-        try builtin_loading.loadCompiledModule(
+    var loaded_builtin: ?builtin_static.BuiltinModuleView = if (pre_published_builtin == null)
+        try builtin_static.moduleView(
             allocator,
-            compiled_builtins.builtin_bin,
+            compiled_builtins.builtin_bin[0..],
             "Builtin",
             compiled_builtins.builtin_source,
         )
@@ -593,6 +641,16 @@ fn parseAndCheckProgramForProblemsImpl(
         };
     }
 
+    var explicit_problem_root_names_storage: [1][]const u8 = undefined;
+    var explicit_problem_root_names: []const []const u8 = &.{};
+    switch (source_kind) {
+        .expr => {
+            explicit_problem_root_names_storage[0] = evalRootName(source_kind, false);
+            explicit_problem_root_names = explicit_problem_root_names_storage[0..];
+        },
+        .module => {},
+    }
+
     const main_checked = try parseCheckModule(
         allocator,
         "Test",
@@ -601,7 +659,7 @@ fn parseAndCheckProgramForProblemsImpl(
         false,
         false,
         .checked_artifact,
-        &.{},
+        explicit_problem_root_names,
         builtin_env,
         builtin_indices,
         main_imports,
@@ -631,7 +689,7 @@ pub fn compileProgram(
     source_kind: SourceKind,
     source: []const u8,
     imports: []const ModuleSource,
-) anyerror!CompiledProgram {
+) TestHelperError!CompiledProgram {
     var resources = try parseAndCanonicalizeProgramWrapped(allocator, source_kind, source, imports, false);
     errdefer cleanupParseAndCanonical(allocator, resources);
 
@@ -662,7 +720,7 @@ pub fn compileProgramForTarget(
     source: []const u8,
     imports: []const ModuleSource,
     target_usize: base.target.TargetUsize,
-) anyerror!CompiledTargetProgram {
+) TestHelperError!CompiledTargetProgram {
     var resources = try parseAndCanonicalizeProgramWrapped(allocator, source_kind, source, imports, false);
     errdefer cleanupParseAndCanonical(allocator, resources);
 
@@ -689,7 +747,7 @@ pub fn compileProgramForTargetWithBuiltin(
     imports: []const ModuleSource,
     target_usize: base.target.TargetUsize,
     pre_published_builtin: PrePublishedBuiltin,
-) anyerror!CompiledTargetProgram {
+) TestHelperError!CompiledTargetProgram {
     var resources = try parseAndCanonicalizeProgramWithRootMode(
         allocator,
         source_kind,
@@ -720,7 +778,7 @@ pub fn compileInspectedProgram(
     source_kind: SourceKind,
     source: []const u8,
     imports: []const ModuleSource,
-) anyerror!CompiledProgram {
+) TestHelperError!CompiledProgram {
     return compileInspectedProgramImpl(allocator, io, source_kind, source, imports, null);
 }
 
@@ -733,7 +791,7 @@ pub fn compileInspectedProgramWithBuiltin(
     source: []const u8,
     imports: []const ModuleSource,
     pre_published_builtin: PrePublishedBuiltin,
-) anyerror!CompiledProgram {
+) TestHelperError!CompiledProgram {
     return compileInspectedProgramImpl(allocator, io, source_kind, source, imports, pre_published_builtin);
 }
 
@@ -744,7 +802,7 @@ fn compileInspectedProgramImpl(
     source: []const u8,
     imports: []const ModuleSource,
     pre_published_builtin: ?PrePublishedBuiltin,
-) anyerror!CompiledProgram {
+) TestHelperError!CompiledProgram {
     var resources = try parseAndCanonicalizeProgramWithRootMode(
         allocator,
         source_kind,
@@ -783,7 +841,7 @@ pub fn compileInspectedProgramForTarget(
     source: []const u8,
     imports: []const ModuleSource,
     target_usize: base.target.TargetUsize,
-) anyerror!CompiledTargetProgram {
+) TestHelperError!CompiledTargetProgram {
     return compileInspectedProgramForTargetImpl(allocator, io, source_kind, source, imports, target_usize, null);
 }
 
@@ -797,7 +855,7 @@ pub fn compileInspectedProgramForTargetWithBuiltin(
     imports: []const ModuleSource,
     target_usize: base.target.TargetUsize,
     pre_published_builtin: PrePublishedBuiltin,
-) anyerror!CompiledTargetProgram {
+) TestHelperError!CompiledTargetProgram {
     return compileInspectedProgramForTargetImpl(allocator, io, source_kind, source, imports, target_usize, pre_published_builtin);
 }
 
@@ -809,7 +867,7 @@ fn compileInspectedProgramForTargetImpl(
     imports: []const ModuleSource,
     target_usize: base.target.TargetUsize,
     pre_published_builtin: ?PrePublishedBuiltin,
-) anyerror!CompiledTargetProgram {
+) TestHelperError!CompiledTargetProgram {
     var resources = try parseAndCanonicalizeProgramWithRootMode(
         allocator,
         source_kind,
@@ -834,7 +892,7 @@ fn compileInspectedProgramForTargetImpl(
 }
 
 /// Compile a single expression with inspect wrapping, returning a Str result.
-pub fn compileInspectedExpr(allocator: Allocator, io: std.Io, source: []const u8) anyerror!CompiledInspectedExpr {
+pub fn compileInspectedExpr(allocator: Allocator, io: std.Io, source: []const u8) TestHelperError!CompiledInspectedExpr {
     return compileInspectedProgram(allocator, io, .expr, source, &.{});
 }
 
@@ -851,7 +909,7 @@ pub fn parseAndCanonicalizeProgramWrapped(
     source: []const u8,
     imports: []const ModuleSource,
     inspect_wrap: bool,
-) anyerror!ParsedResources {
+) TestHelperError!ParsedResources {
     return parseAndCanonicalizeProgramWithRootMode(allocator, source_kind, source, imports, inspect_wrap, .{ .eval_root = inspect_wrap }, null);
 }
 
@@ -861,7 +919,7 @@ pub fn parseAndCanonicalizeProgramPublishedRoots(
     source_kind: SourceKind,
     source: []const u8,
     imports: []const ModuleSource,
-) anyerror!ParsedResources {
+) TestHelperError!ParsedResources {
     return parseAndCanonicalizeProgramWithRootMode(allocator, source_kind, source, imports, false, .published_roots_only, null);
 }
 
@@ -879,7 +937,29 @@ pub fn publishProgramForComptimeProblems(
     source_kind: SourceKind,
     source: []const u8,
     imports: []const ModuleSource,
-) anyerror!ComptimePublishOutcome {
+) TestHelperError!ComptimePublishOutcome {
+    return publishProgramForComptimeProblemsImpl(allocator, source_kind, source, imports, null);
+}
+
+/// Same as `publishProgramForComptimeProblems` but reuses a Builtin artifact
+/// the caller has already published.
+pub fn publishProgramForComptimeProblemsWithBuiltin(
+    allocator: Allocator,
+    source_kind: SourceKind,
+    source: []const u8,
+    imports: []const ModuleSource,
+    pre_published_builtin: PrePublishedBuiltin,
+) TestHelperError!ComptimePublishOutcome {
+    return publishProgramForComptimeProblemsImpl(allocator, source_kind, source, imports, pre_published_builtin);
+}
+
+fn publishProgramForComptimeProblemsImpl(
+    allocator: Allocator,
+    source_kind: SourceKind,
+    source: []const u8,
+    imports: []const ModuleSource,
+    pre_published_builtin: ?PrePublishedBuiltin,
+) TestHelperError!ComptimePublishOutcome {
     const resources = parseAndCanonicalizeProgramWithRootModeReporting(
         allocator,
         source_kind,
@@ -887,7 +967,7 @@ pub fn publishProgramForComptimeProblems(
         imports,
         false,
         .published_roots_only,
-        null,
+        pre_published_builtin,
         .report_comptime_problems,
     ) catch |err| switch (err) {
         error.CompileTimeProblem => return .comptime_problems,
@@ -937,7 +1017,7 @@ const ComptimeProblemReporting = enum {
 
 fn problemBlocksCheckedArtifact(problem: check.problem.Problem) bool {
     return switch (problem) {
-        .redundant_pattern, .unmatchable_pattern, .comptime_unused_branch, .literal_defaulted => false,
+        .redundant_pattern, .unmatchable_pattern, .comptime_unused_branch, .comptime_condition, .literal_defaulted => false,
         else => true,
     };
 }
@@ -957,7 +1037,7 @@ fn parseAndCanonicalizeProgramWithRootMode(
     inspect_wrap: bool,
     root_mode: PublishedRootMode,
     pre_published_builtin: ?PrePublishedBuiltin,
-) anyerror!ParsedResources {
+) TestHelperError!ParsedResources {
     return parseAndCanonicalizeProgramWithRootModeReporting(
         allocator,
         source_kind,
@@ -979,24 +1059,24 @@ fn parseAndCanonicalizeProgramWithRootModeReporting(
     root_mode: PublishedRootMode,
     pre_published_builtin: ?PrePublishedBuiltin,
     problem_reporting: ComptimeProblemReporting,
-) anyerror!ParsedResources {
+) TestHelperError!ParsedResources {
     const builtin_indices: CIR.BuiltinIndices = if (pre_published_builtin) |ppb|
         ppb.indices
     else
-        try builtin_loading.deserializeBuiltinIndices(allocator, compiled_builtins.builtin_indices_bin);
+        compiled_builtins.builtinIndices(CIR);
 
-    var loaded_builtin: ?builtin_loading.LoadedModule = if (pre_published_builtin == null)
-        try builtin_loading.loadCompiledModule(
+    var loaded_builtin: ?builtin_static.BuiltinModuleView = if (pre_published_builtin == null)
+        try builtin_static.moduleView(
             allocator,
-            compiled_builtins.builtin_bin,
+            compiled_builtins.builtin_bin[0..],
             "Builtin",
             compiled_builtins.builtin_source,
         )
     else
         null;
-    // Tracks whether `loaded_builtin`'s env/buffer ownership has transferred to
+    // Tracks whether `loaded_builtin`'s env-wrapper ownership has transferred to
     // an import artifact (`publishImportArtifacts`). Once transferred, the
-    // errdefer must not deinit the LoadedModule.
+    // errdefer must not deinit the view.
     var builtin_module_owned_by_artifact = false;
     errdefer if (loaded_builtin) |*lm| {
         if (!builtin_module_owned_by_artifact) lm.deinit();
@@ -1191,7 +1271,7 @@ pub fn parseCheckModule(
     builtin_module_env: *const ModuleEnv,
     builtin_indices: CIR.BuiltinIndices,
     available_imports: []const AvailableImport,
-) anyerror!CheckedModule {
+) TestHelperError!CheckedModule {
     const owned_source = try makeModuleSource(allocator, source_kind, source, inspect_wrap);
     errdefer allocator.free(owned_source);
 
@@ -1293,6 +1373,15 @@ pub fn parseCheckModule(
         builtin_ctx,
     );
     checker.fixupTypeWriter();
+    for (explicit_root_names) |root_name| {
+        const root_def_idx = czer.explicitRootDefByName(root_name) orelse {
+            if (@import("builtin").mode == .Debug) {
+                std.debug.panic("eval helper invariant violated: explicit executable root `{s}` was not found", .{root_name});
+            }
+            unreachable;
+        };
+        try checker.addExecutableRootDef(root_def_idx);
+    }
     errdefer checker.deinit();
     var check_timer = try StageTimer.start();
     try checker.checkFile();
@@ -1317,7 +1406,7 @@ fn lowerParsedProgramToLir(
     io: std.Io,
     resources: *ParsedResources,
     target_usize: base.target.TargetUsize,
-) anyerror!LoweredProgram {
+) TestHelperError!LoweredProgram {
     if (resources.borrowed_builtin_artifact == null) {
         return lowerCheckedModuleSetToLir(allocator, io, &resources.checked_artifact, resources.import_artifacts, target_usize);
     }
@@ -1340,7 +1429,7 @@ pub fn lowerCheckedModuleSetToLir(
     root_module: *check.CheckedArtifact.CheckedModuleArtifact,
     import_modules: []check.CheckedArtifact.CheckedModuleArtifact,
     target_usize: base.target.TargetUsize,
-) anyerror!LoweredProgram {
+) TestHelperError!LoweredProgram {
     const import_views = try allocator.alloc(check.CheckedArtifact.ImportedModuleView, import_modules.len);
     defer allocator.free(import_views);
     for (import_modules, 0..) |*module, i| {
@@ -1355,7 +1444,7 @@ fn lowerCheckedRootWithViews(
     root_module: *check.CheckedArtifact.CheckedModuleArtifact,
     import_views: []const check.CheckedArtifact.ImportedModuleView,
     target_usize: base.target.TargetUsize,
-) anyerror!LoweredProgram {
+) TestHelperError!LoweredProgram {
     const page_size = try SharedMemoryAllocator.getSystemPageSize();
     var shm = try SharedMemoryAllocator.createWithMinSize(io, EVAL_SHARED_MEMORY_SIZE, EVAL_SHARED_MEMORY_MIN_SIZE, page_size);
     errdefer shm.deinit(allocator);
@@ -1384,12 +1473,11 @@ fn lowerCheckedRootWithViews(
         shm.base_ptr,
         shm.getUsedSize(),
         &lowered.lir_result,
-        lowered.target_usize,
         &.{},
     );
     shm.updateHeader();
 
-    const view = try LirImage.viewMappedImage(image_header, shm.base_ptr, shm.getUsedSize());
+    const view = try LirImage.viewMappedImage(image_header, shm.base_ptr, shm.getUsedSize(), lowered.target_usize);
     return .{
         .shm = shm,
         .image_header = image_header,
@@ -1407,12 +1495,12 @@ fn evalRootName(source_kind: SourceKind, inspect_wrap: bool) []const u8 {
 fn publishImportArtifacts(
     allocator: Allocator,
     typed_cir_modules: *const check.TypedCIR.Modules,
-    builtin_module: ?*builtin_loading.LoadedModule,
+    builtin_module: ?*builtin_static.BuiltinModuleView,
     extra_modules: []CheckedModule,
     builtin_module_owned_by_artifact: *bool,
     pre_published_builtin: ?PrePublishedBuiltin,
     problem_reporting: ComptimeProblemReporting,
-) anyerror![]check.CheckedArtifact.CheckedModuleArtifact {
+) TestHelperError![]check.CheckedArtifact.CheckedModuleArtifact {
     const extra_module_count = extra_modules.len;
     var artifacts = std.ArrayList(check.CheckedArtifact.CheckedModuleArtifact).empty;
     errdefer {
@@ -1435,10 +1523,7 @@ fn publishImportArtifacts(
             typed_cir_modules,
             1,
             .{
-                .module_env_storage = .{ .compiled_buffer = .{
-                    .env = builtin_module.?.env,
-                    .buffer = builtin_module.?.buffer,
-                } },
+                .module_env_storage = .{ .static_builtin = builtin_module.?.env },
                 .compile_time_finalizer = CompileTimeFinalization.finalizer(),
             },
         );
@@ -1545,7 +1630,7 @@ fn publishImportKeysWithBuiltin(
     allocator: Allocator,
     artifacts: []const check.CheckedArtifact.CheckedModuleArtifact,
     pre_published_builtin: ?PrePublishedBuiltin,
-) anyerror![]check.CheckedArtifact.PublishImportArtifact {
+) TestHelperError![]check.CheckedArtifact.PublishImportArtifact {
     const borrowed_builtin_count: usize = if (pre_published_builtin == null) 0 else 1;
     const imports = try allocator.alloc(check.CheckedArtifact.PublishImportArtifact, artifacts.len + borrowed_builtin_count);
     if (pre_published_builtin) |ppb| {
@@ -1572,7 +1657,7 @@ pub fn renderProblems(
     allocator: Allocator,
     source_kind: SourceKind,
     source: []const u8,
-) anyerror![]u8 {
+) TestHelperError![]u8 {
     return try renderProblemsWithConfig(allocator, source_kind, source, reporting.ReportingConfig.initColorTerminal());
 }
 
@@ -1582,7 +1667,7 @@ pub fn renderProblemsWithConfig(
     source_kind: SourceKind,
     source: []const u8,
     config: reporting.ReportingConfig,
-) anyerror![]u8 {
+) TestHelperError![]u8 {
     var resources = try parseAndCheckProgramForProblems(allocator, source_kind, source, &.{});
     defer resources.deinit(allocator);
 
@@ -1594,7 +1679,7 @@ fn renderCheckedModuleProblemsWithConfig(
     main: *const CheckedModule,
     filename: []const u8,
     config: reporting.ReportingConfig,
-) anyerror![]u8 {
+) TestHelperError![]u8 {
     var reports = std.array_list.Managed(reporting.Report).init(allocator);
     defer {
         for (reports.items) |*r| r.deinit();
@@ -1670,7 +1755,7 @@ fn makeModuleSource(
     source_kind: SourceKind,
     source: []const u8,
     inspect_wrap: bool,
-) anyerror![]u8 {
+) TestHelperError![]u8 {
     return switch (source_kind) {
         .expr => if (inspect_wrap)
             std.fmt.allocPrint(allocator, "main = || Str.inspect(({s}))", .{source})
@@ -1734,7 +1819,7 @@ fn resolveImportsConst(module_env: *ModuleEnv, imported_envs: []const *const Mod
 }
 
 /// Return the layout indices for the main proc's arguments.
-pub fn mainProcArgLayouts(allocator: Allocator, lowered: *const LoweredProgram) anyerror![]LayoutIdx {
+pub fn mainProcArgLayouts(allocator: Allocator, lowered: *const LoweredProgram) TestHelperError![]LayoutIdx {
     const proc = lowered.view.store.getProcSpec(lowered.mainProc());
     const arg_locals = lowered.view.store.getLocalSpan(proc.args);
     const arg_layouts = try allocator.alloc(LayoutIdx, arg_locals.len);
@@ -1774,7 +1859,7 @@ pub fn zeroedEntrypointArgBufferForLayouts(
     allocator: Allocator,
     layouts: *const LayoutStore,
     arg_layouts: []const LayoutIdx,
-) anyerror!?[]align(collections.max_roc_alignment.toByteUnits()) u8 {
+) TestHelperError!?[]align(collections.max_roc_alignment.toByteUnits()) u8 {
     const EntrypointArgOrder = struct {
         index: usize,
         alignment: u32,
@@ -1831,7 +1916,7 @@ pub fn zeroedEntrypointArgBuffer(
     allocator: Allocator,
     lowered: *const LoweredProgram,
     arg_layouts: []const LayoutIdx,
-) anyerror!?[]align(collections.max_roc_alignment.toByteUnits()) u8 {
+) TestHelperError!?[]align(collections.max_roc_alignment.toByteUnits()) u8 {
     return zeroedEntrypointArgBufferForLayouts(allocator, &lowered.view.layouts, arg_layouts);
 }
 
@@ -1839,14 +1924,14 @@ fn boolRootRetBuffer(
     allocator: Allocator,
     layouts: *const LayoutStore,
     ret_layout: LayoutIdx,
-) anyerror![]align(collections.max_roc_alignment.toByteUnits()) u8 {
+) TestHelperError![]align(collections.max_roc_alignment.toByteUnits()) u8 {
     const size_align = layouts.layoutSizeAlign(layouts.getLayout(ret_layout));
     const ret_buf = try allocator.alignedAlloc(u8, collections.max_roc_alignment, @max(size_align.size, 1));
     @memset(ret_buf, 0);
     return ret_buf;
 }
 
-fn copyRuntimeCrashMessage(allocator: Allocator, runtime_env: *const RuntimeHostEnv) anyerror![]const u8 {
+fn copyRuntimeCrashMessage(allocator: Allocator, runtime_env: *const RuntimeHostEnv) TestHelperError![]const u8 {
     return switch (runtime_env.crashState()) {
         .did_not_crash => try allocator.dupe(u8, "Roc crashed"),
         .crashed => |msg| try allocator.dupe(u8, msg),
@@ -1870,7 +1955,7 @@ fn runExecutableBoolRoot(
     executable: *const ExecutableMemory,
     root: BoolRoot,
     runtime_env: *RuntimeHostEnv,
-) anyerror!BoolRootEvalResult {
+) TestHelperError!BoolRootEvalResult {
     runtime_env.resetObservation();
     runtime_env.resetAllocationTracker();
     // Dev-JIT code calls the host's own expect_err wrapper, which records the
@@ -1912,7 +1997,7 @@ pub fn devEvalBoolRoots(
     store: *const lir.LirStore,
     layouts: *const LayoutStore,
     roots: []const BoolRoot,
-) anyerror![]BoolRootEvalResult {
+) TestHelperError![]BoolRootEvalResult {
     if (comptime !backend.host_lir_codegen_available) {
         return error.DevBackendUnavailable;
     } else {
@@ -1977,7 +2062,7 @@ fn callLlvmBoolRoot(
     root: BoolRoot,
     runtime_env: *RuntimeHostEnv,
     expect_err_region: ?*[3]u32,
-) anyerror!BoolRootEvalResult {
+) TestHelperError!BoolRootEvalResult {
     runtime_env.resetObservation();
     runtime_env.resetAllocationTracker();
     if (expect_err_region) |region| region[0] = 0;
@@ -2023,7 +2108,7 @@ pub fn llvmEvalBoolRoots(
     layouts: *const LayoutStore,
     roots: []const BoolRoot,
     opt: LlvmTestOpt,
-) anyerror![]BoolRootEvalResult {
+) TestHelperError![]BoolRootEvalResult {
     if (@import("builtin").target.os.tag == .freestanding) return error.LlvmBackendUnavailable;
 
     const llvm_compile = @import("llvm_compile");
@@ -2088,13 +2173,13 @@ pub fn llvmEvalBoolRoots(
 }
 
 /// Evaluate a lowered program via the LIR interpreter and return the output string.
-pub fn lirInterpreterInspectedStr(allocator: Allocator, lowered: *const LoweredProgram) anyerror![]u8 {
+pub fn lirInterpreterInspectedStr(allocator: Allocator, lowered: *const LoweredProgram) TestHelperError![]u8 {
     const result = try lirInterpreterStrWithStats(allocator, lowered);
     return result.output;
 }
 
 /// Evaluate via the LIR interpreter, returning output string and allocation count.
-pub fn lirInterpreterStrWithStats(allocator: Allocator, lowered: *const LoweredProgram) anyerror!EvalRunResult {
+pub fn lirInterpreterStrWithStats(allocator: Allocator, lowered: *const LoweredProgram) TestHelperError!EvalRunResult {
     var runtime_env = RuntimeHostEnv.init(allocator);
     defer runtime_env.deinit();
 
@@ -2132,13 +2217,13 @@ pub fn lirInterpreterStrWithStats(allocator: Allocator, lowered: *const LoweredP
 }
 
 /// Evaluate a lowered program via the dev JIT backend and return the output string.
-pub fn devEvaluatorInspectedStr(allocator: Allocator, lowered: *const LoweredProgram) anyerror![]u8 {
+pub fn devEvaluatorInspectedStr(allocator: Allocator, lowered: *const LoweredProgram) TestHelperError![]u8 {
     const result = try devEvaluatorStrWithStats(allocator, lowered);
     return result.output;
 }
 
 /// Evaluate via the dev JIT backend, returning output string and allocation count.
-pub fn devEvaluatorStrWithStats(allocator: Allocator, lowered: *const LoweredProgram) anyerror!EvalRunResult {
+pub fn devEvaluatorStrWithStats(allocator: Allocator, lowered: *const LoweredProgram) TestHelperError!EvalRunResult {
     if (comptime !backend.host_lir_codegen_available) {
         return error.DevBackendUnavailable;
     } else {
@@ -2209,7 +2294,7 @@ pub fn devEvaluatorStrWithStats(allocator: Allocator, lowered: *const LoweredPro
 }
 
 /// Evaluate a lowered program via the LLVM backend and return the output string.
-pub fn llvmEvaluatorInspectedStr(allocator: Allocator, lowered: *const LoweredProgram) anyerror![]u8 {
+pub fn llvmEvaluatorInspectedStr(allocator: Allocator, lowered: *const LoweredProgram) TestHelperError![]u8 {
     if (@import("builtin").target.os.tag == .freestanding) return error.LlvmBackendUnavailable;
 
     const llvm_compile = @import("llvm_compile");
@@ -2289,13 +2374,13 @@ pub fn llvmEvaluatorInspectedStr(allocator: Allocator, lowered: *const LoweredPr
 }
 
 /// Evaluate a lowered program via the wasm backend and return the output string.
-pub fn wasmEvaluatorInspectedStr(allocator: Allocator, lowered: *const LoweredProgram) anyerror![]u8 {
+pub fn wasmEvaluatorInspectedStr(allocator: Allocator, lowered: *const LoweredProgram) TestHelperError![]u8 {
     const result = try wasmEvaluatorStrWithStats(allocator, lowered);
     return result.output;
 }
 
 /// Evaluate via the wasm backend, returning output string and allocation count.
-pub fn wasmEvaluatorStrWithStats(allocator: Allocator, lowered: *const LoweredProgram) anyerror!EvalRunResult {
+pub fn wasmEvaluatorStrWithStats(allocator: Allocator, lowered: *const LoweredProgram) TestHelperError!EvalRunResult {
     if (@import("builtin").target.os.tag == .freestanding) return error.WasmExecFailed;
     var codegen = backend.wasm.WasmCodeGen.init(
         allocator,
@@ -2321,7 +2406,7 @@ fn copyReturnedRocStr(
     ret_layout: LayoutIdx,
     value_ptr: [*]u8,
     roc_ops: ?*builtins.host_abi.RocOps,
-) anyerror![]u8 {
+) TestHelperError![]u8 {
     const layout_val = layout_store.getLayout(ret_layout);
     const is_str =
         ret_layout == .str or

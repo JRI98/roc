@@ -442,6 +442,15 @@ hasher_write_f32_bits_import: ?u32 = null,
 hasher_write_f64_bits_import: ?u32 = null,
 hasher_write_bytes_import: ?u32 = null,
 hasher_write_str_import: ?u32 = null,
+/// Wasm function indices for imported crypto host functions.
+crypto_sha256_hash_bytes_import: ?u32 = null,
+crypto_sha256_hasher_empty_import: ?u32 = null,
+crypto_sha256_hasher_write_import: ?u32 = null,
+crypto_sha256_hasher_finish_import: ?u32 = null,
+crypto_blake3_hash_bytes_import: ?u32 = null,
+crypto_blake3_hasher_empty_import: ?u32 = null,
+crypto_blake3_hasher_write_import: ?u32 = null,
+crypto_blake3_hasher_finish_import: ?u32 = null,
 /// Configurable wasm stack size in bytes (default 1MB).
 wasm_stack_bytes: u32 = 1024 * 1024,
 /// Configurable wasm memory pages (0 = auto-compute from stack size).
@@ -454,6 +463,9 @@ stack_pointer_symbol: ?SymbolIndex = null,
 indirect_table_symbol: ?SymbolIndex = null,
 /// Whether generated static-data addresses must remain relocatable for object output.
 relocatable_object: bool = false,
+/// Whether final in-memory codegen should still emit relocation edges for
+/// static-data addresses so final DCE can trace data liveness explicitly.
+track_static_data_addresses: bool = false,
 pub fn init(allocator: Allocator, store: *const LirStore, layout_store: *const LayoutStore) Self {
     return .{
         .allocator = allocator,
@@ -514,6 +526,13 @@ pub fn configureTableReloc(self: *Self, symbol: SymbolIndex) void {
 /// Configure generated data-address operands for relocatable object output.
 pub fn configureRelocatableObject(self: *Self) void {
     self.relocatable_object = true;
+}
+
+/// Configure final in-memory codegen to keep explicit relocation edges from
+/// instructions to static data. `resolveRelocations()` still patches the known
+/// final address before encode; the relocation entry exists for DCE liveness.
+pub fn configureStaticDataAddressTracking(self: *Self) void {
+    self.track_static_data_addresses = true;
 }
 
 pub fn deinit(self: *Self) void {
@@ -911,6 +930,63 @@ fn emitHasherLowLevel(self: *Self, op: lir.LowLevel, args: []const ProcLocalId) 
     }
 }
 
+fn emitCryptoLowLevel(self: *Self, op: lir.LowLevel, args: []const ProcLocalId) Allocator.Error!void {
+    const Arity = enum { zero, one, two };
+    const CryptoCall = struct {
+        arity: Arity,
+        kind: BuiltinKind,
+        host_import: ?u32,
+    };
+
+    const call: CryptoCall = switch (op) {
+        .crypto_sha256_hash_bytes => .{ .arity = .one, .kind = .crypto_sha256_hash_bytes, .host_import = self.crypto_sha256_hash_bytes_import },
+        .crypto_sha256_hasher_empty => .{ .arity = .zero, .kind = .crypto_sha256_hasher_empty, .host_import = self.crypto_sha256_hasher_empty_import },
+        .crypto_sha256_hasher_write => .{ .arity = .two, .kind = .crypto_sha256_hasher_write, .host_import = self.crypto_sha256_hasher_write_import },
+        .crypto_sha256_hasher_finish => .{ .arity = .one, .kind = .crypto_sha256_hasher_finish, .host_import = self.crypto_sha256_hasher_finish_import },
+        .crypto_blake3_hash_bytes => .{ .arity = .one, .kind = .crypto_blake3_hash_bytes, .host_import = self.crypto_blake3_hash_bytes_import },
+        .crypto_blake3_hasher_empty => .{ .arity = .zero, .kind = .crypto_blake3_hasher_empty, .host_import = self.crypto_blake3_hasher_empty_import },
+        .crypto_blake3_hasher_write => .{ .arity = .two, .kind = .crypto_blake3_hasher_write, .host_import = self.crypto_blake3_hasher_write_import },
+        .crypto_blake3_hasher_finish => .{ .arity = .one, .kind = .crypto_blake3_hasher_finish, .host_import = self.crypto_blake3_hasher_finish_import },
+        else => unreachable,
+    };
+
+    const result_offset = try self.allocStackMemory(12, 4);
+    switch (call.arity) {
+        .zero => {
+            try self.emitFpOffset(result_offset);
+            try self.emitLocalGet(self.roc_ops_local);
+        },
+        .one => {
+            try self.emitProcLocal(args[0]);
+            const list_ptr = self.storage.allocAnonymousLocal(.i32) catch return error.OutOfMemory;
+            try self.emitLocalSet(list_ptr);
+            const fields = try self.loadRocListFields(list_ptr);
+
+            try self.emitFpOffset(result_offset);
+            try self.emitRocListFields(fields);
+            try self.emitLocalGet(self.roc_ops_local);
+        },
+        .two => {
+            try self.emitProcLocal(args[0]);
+            const first_ptr = self.storage.allocAnonymousLocal(.i32) catch return error.OutOfMemory;
+            try self.emitLocalSet(first_ptr);
+            try self.emitProcLocal(args[1]);
+            const second_ptr = self.storage.allocAnonymousLocal(.i32) catch return error.OutOfMemory;
+            try self.emitLocalSet(second_ptr);
+            const first = try self.loadRocListFields(first_ptr);
+            const second = try self.loadRocListFields(second_ptr);
+
+            try self.emitFpOffset(result_offset);
+            try self.emitRocListFields(first);
+            try self.emitRocListFields(second);
+            try self.emitLocalGet(self.roc_ops_local);
+        },
+    }
+
+    try self.emitBuiltinCall(call.kind, call.host_import);
+    try self.emitFpOffset(result_offset);
+}
+
 fn compileBuiltinInternalIncrefCallback(self: *Self, helper_key: RcHelperKey) Allocator.Error!u32 {
     if (helper_key.op != .incref) {
         wasmInvariantFmt(
@@ -1062,7 +1138,7 @@ fn externalCallsUseRelocs(self: *const Self) bool {
 
 fn emitDataAddressConst(self: *Self, address: DataAddress, addend: i32) Allocator.Error!void {
     self.currentCode().append(self.allocator, Op.i32_const) catch return error.OutOfMemory;
-    if (self.relocatable_object) {
+    if (self.relocatable_object or self.track_static_data_addresses) {
         const code_pos: u32 = @intCast(self.currentCode().items.len);
         try self.currentBody().addOffsetRelocation(
             self.allocator,
@@ -1071,7 +1147,11 @@ fn emitDataAddressConst(self: *Self, address: DataAddress, addend: i32) Allocato
             address.symbol,
             addend,
         );
-        WasmModule.appendPaddedI32(self.allocator, self.currentCode(), 0) catch return error.OutOfMemory;
+        const placeholder: i32 = if (self.relocatable_object)
+            0
+        else
+            @intCast(@as(i64, @intCast(address.offset)) + @as(i64, addend));
+        WasmModule.appendPaddedI32(self.allocator, self.currentCode(), placeholder) catch return error.OutOfMemory;
     } else {
         WasmModule.leb128WriteI32(
             self.allocator,
@@ -1342,6 +1422,24 @@ fn registerHostImports(self: *Self) Allocator.Error!void {
     // (seed i64, ptr i32, len i32, cap i32) -> i64
     const hasher_write_str_type = try self.module.addFuncType(&.{ .i64, .i32, .i32, .i32 }, &.{.i64});
     self.hasher_write_str_import = try self.module.addImport("env", "roc_hasher_write_str", hasher_write_str_type);
+
+    // Crypto host functions mirror the builtin wrapper ABI so eval host
+    // imports and relocatable builtin calls use the same lowering.
+    const crypto_hash_bytes_type = try self.module.addFuncType(&.{ .i32, .i32, .i32, .i32, .i32 }, &.{});
+    self.crypto_sha256_hash_bytes_import = try self.module.addImport("env", "roc_crypto_sha256_hash_bytes", crypto_hash_bytes_type);
+    self.crypto_blake3_hash_bytes_import = try self.module.addImport("env", "roc_crypto_blake3_hash_bytes", crypto_hash_bytes_type);
+
+    const crypto_hasher_empty_type = try self.module.addFuncType(&.{ .i32, .i32 }, &.{});
+    self.crypto_sha256_hasher_empty_import = try self.module.addImport("env", "roc_crypto_sha256_hasher_empty", crypto_hasher_empty_type);
+    self.crypto_blake3_hasher_empty_import = try self.module.addImport("env", "roc_crypto_blake3_hasher_empty", crypto_hasher_empty_type);
+
+    const crypto_hasher_write_type = try self.module.addFuncType(&.{ .i32, .i32, .i32, .i32, .i32, .i32, .i32, .i32 }, &.{});
+    self.crypto_sha256_hasher_write_import = try self.module.addImport("env", "roc_crypto_sha256_hasher_write", crypto_hasher_write_type);
+    self.crypto_blake3_hasher_write_import = try self.module.addImport("env", "roc_crypto_blake3_hasher_write", crypto_hasher_write_type);
+
+    const crypto_hasher_finish_type = try self.module.addFuncType(&.{ .i32, .i32, .i32, .i32, .i32 }, &.{});
+    self.crypto_sha256_hasher_finish_import = try self.module.addImport("env", "roc_crypto_sha256_hasher_finish", crypto_hasher_finish_type);
+    self.crypto_blake3_hasher_finish_import = try self.module.addImport("env", "roc_crypto_blake3_hasher_finish", crypto_hasher_finish_type);
 
     // RocOps function imports follow the platform C ABI: each takes a leading `*RocOps`
     // (the i32 pointer to the RocOps struct in linear memory) followed by its natural
@@ -7431,6 +7529,7 @@ fn generateCFStmtNode(self: *Self, work: *std.ArrayList(StmtWork), wa: Allocator
                 .args = assign.args,
                 .ret_layout = self.procLocalLayoutIdx(assign.target),
                 .unique_args = assign.unique_args,
+                .interchangeable = assign.interchangeable,
             });
             try self.bindAssignedLocal(assign.target);
             try work.append(wa, .{ .node = .{ .stmt_id = assign.next, .stop = stop } });
@@ -9035,12 +9134,23 @@ fn generateStructAccess(self: *Self, sa: anytype) Allocator.Error!void {
     try self.emitLocalSet(struct_ptr);
 
     // Get the field offset
-    const struct_layout = ls.getLayout(sa.struct_layout);
-    std.debug.assert(struct_layout.tag == .struct_);
+    const source_layout = ls.getLayout(sa.struct_layout);
+    const struct_layout_idx = switch (source_layout.tag) {
+        .box => source_layout.getIdx(),
+        else => sa.struct_layout,
+    };
+    const struct_layout = ls.getLayout(struct_layout_idx);
+    if (struct_layout.tag != .struct_) {
+        wasmInvariantFmt(
+            "WasmCodeGen invariant violated: field access expected struct layout, got {s}",
+            .{@tagName(struct_layout.tag)},
+        );
+    }
 
     const field_offset = try self.structFieldOffsetByOriginalIndexWasm(struct_layout.getStruct().idx, sa.field_idx);
     const field_byte_size = try self.structFieldSizeByOriginalIndexWasm(struct_layout.getStruct().idx, sa.field_idx);
-    const field_layout = ls.getLayout(ls.getStructFieldLayoutByOriginalIndex(struct_layout.getStruct().idx, sa.field_idx));
+    const source_field_layout_idx = ls.getStructFieldLayoutByOriginalIndex(struct_layout.getStruct().idx, sa.field_idx);
+    const field_layout = ls.getLayout(source_field_layout_idx);
 
     // Check if the field is a composite type
     if (try self.isCompositeLayout(sa.field_layout) and field_byte_size > 0) {
@@ -9373,6 +9483,18 @@ fn generateLowLevel(self: *Self, ll: anytype) Allocator.Error!void {
         .hasher_write_str,
         => {
             return self.emitHasherLowLevel(ll.op, args);
+        },
+
+        .crypto_sha256_hash_bytes,
+        .crypto_sha256_hasher_empty,
+        .crypto_sha256_hasher_write,
+        .crypto_sha256_hasher_finish,
+        .crypto_blake3_hash_bytes,
+        .crypto_blake3_hasher_empty,
+        .crypto_blake3_hasher_write,
+        .crypto_blake3_hasher_finish,
+        => {
+            return self.emitCryptoLowLevel(ll.op, args);
         },
 
         // Safe integer widenings (no-op or single instruction)
@@ -9854,6 +9976,13 @@ fn generateLowLevel(self: *Self, ll: anytype) Allocator.Error!void {
         },
 
         .list_map_can_reuse => {
+            // On a width where the element layouts are not interchangeable, the
+            // in-place branch is statically dead, so the result is a constant 0
+            // and the uniqueness check must not run.
+            if (!ll.interchangeable.get(self.getLayoutStore().targetUsize())) {
+                try self.emitI32Const(0);
+                return;
+            }
             // list_map_can_reuse(list, transform) -> U8: the list uniquely owns
             // its allocation and is not a seamless slice. Wasm is
             // single-threaded, so a plain refcount load suffices.
@@ -10948,7 +11077,7 @@ fn generateLowLevel(self: *Self, ll: anytype) Allocator.Error!void {
                             const inner_tu = ls.getTagUnionData(err_layout.getTagUnion().idx);
                             if (try self.findBadUtf8Variant(inner_tu)) |info| {
                                 err_record_idx = info.struct_idx;
-                                inner_disc_offset = inner_tu.discriminant_offset;
+                                inner_disc_offset = inner_tu.discriminant_offset.get(ls.targetUsize());
                                 inner_disc_size = inner_tu.discriminant_size;
                                 inner_bad_utf8_disc = info.disc;
                             }
@@ -14195,6 +14324,11 @@ fn emitStrToUtf8(self: *Self, str_arg: ProcLocalId) Allocator.Error!void {
         try self.emitLoadOp(.i32, 4);
         try self.emitLocalSet(str_cap);
 
+        // Non-SSO Str.to_utf8 returns a List(U8) that aliases the string bytes.
+        // Retain the shared backing so dropping the list does not invalidate the
+        // input Str that ARC still owns.
+        try self.emitDataPtrIncref(str_data, 1);
+
         try self.emitLocalGet(result_ptr);
         try self.emitLocalGet(str_data);
         try self.emitStoreOp(.i32, 0);
@@ -16071,6 +16205,7 @@ fn generateLLListReserve(self: *Self, args: anytype, ret_layout: layout.Idx, uni
             try self.emitI32Const(@intCast(elem_size));
             try self.emitI32Const(@intCast(callbacks.elements_refcounted));
             try self.emitI32Const(@intCast(callbacks.incref_table_idx));
+            try self.emitI32Const(@intCast(callbacks.decref_table_idx));
             try self.emitI32Const(updateModeImmForArg(unique_args, 0));
             try self.emitLocalGet(self.roc_ops_local);
             try self.emitBuiltinCall(.list_reserve, null);
@@ -16149,7 +16284,7 @@ fn resolveListElementPairLayout(self: *Self, ret_layout: layout.Idx) ListElement
     const field0_is_list = field0_val.tag == .list or field0_val.tag == .list_of_zst;
 
     return .{
-        .result_size = record_data.size,
+        .result_size = record_data.size.get(ls.targetUsize()),
         .result_align = @intCast(ret_layout_val.alignment(ls.targetUsize()).toByteUnits()),
         .elem_offset = if (field0_is_list)
             ls.getStructFieldOffset(record_idx, 1)
@@ -16364,4 +16499,40 @@ test "rcAllocationLayout matches wasm32 builtin refcount allocation layout" {
     const refcounted_aligned = rcAllocationLayout(16, true);
     try expectEqual(@as(u32, 16), refcounted_aligned.data_offset);
     try expectEqual(@as(u32, 16), refcounted_aligned.allocation_alignment);
+}
+
+test "final static data address tracking keeps referenced data through DCE" {
+    const allocator = std.testing.allocator;
+    const fake_store: *const LirStore = undefined;
+    const fake_layouts: *const LayoutStore = undefined;
+
+    var codegen = Self.init(allocator, fake_store, fake_layouts);
+    defer codegen.deinit();
+    codegen.configureStaticDataAddressTracking();
+
+    const type_idx = try codegen.module.addFuncType(&.{}, &.{});
+    const defined = try codegen.module.addDefinedFunction(type_idx);
+    try codegen.module.addExport("main", .func, defined.function.raw());
+
+    const live_address = try codegen.addStaticDataSymbol(&.{ 0, 0, 0, 0, 'l', 'i', 'v', 'e' }, 4, ".rodata.live", "live.data", 4, 4);
+    _ = try codegen.addStaticDataSymbol(&.{ 0, 0, 0, 0, 'd', 'e', 'a', 'd' }, 4, ".rodata.dead", "dead.data", 4, 4);
+
+    try codegen.beginFunction(defined.local);
+    try codegen.emitDataAddressConst(live_address, 0);
+    try codegen.currentCode().append(allocator, Op.drop);
+    try codegen.currentCode().append(allocator, Op.end);
+    codegen.endFunction();
+    try codegen.flushPendingBodies();
+
+    try std.testing.expectEqual(@as(usize, 1), codegen.module.reloc_code.entries.items.len);
+    try codegen.module.resolveRelocations();
+
+    const called_fns = try allocator.alloc(bool, codegen.module.liveFunctionCount());
+    defer allocator.free(called_fns);
+    @memset(called_fns, false);
+    try codegen.module.eliminateDeadCode(called_fns);
+
+    try std.testing.expectEqual(@as(usize, 1), codegen.module.data_segments.items.len);
+    try std.testing.expect(std.mem.find(u8, codegen.module.data_segments.items[0].data, "live") != null);
+    try std.testing.expect(std.mem.find(u8, codegen.module.data_segments.items[0].data, "dead") == null);
 }

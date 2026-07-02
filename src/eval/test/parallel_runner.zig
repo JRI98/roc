@@ -80,6 +80,14 @@ const trace = struct {
 const helpers = eval.test_helpers;
 const LoweredProgram = helpers.LoweredProgram;
 
+const RunnerError = helpers.TestHelperError || std.mem.Allocator.Error || std.process.SpawnError || std.process.Child.WaitError || std.Io.File.OpenError || std.Io.File.Reader.Error || std.Io.File.Writer.Error || std.Io.File.LockError || std.Io.Dir.RealPathFileAllocError || std.Io.Dir.WriteFileError || error{
+    NotLink,
+    ProcessNotFound,
+    LinkQuotaExceeded,
+    TestExpectedEqual,
+    TestUnexpectedResult,
+};
+
 const posix = std.posix;
 const DEFAULT_EVAL_TIMEOUT_MS: u64 = 240_000;
 
@@ -102,9 +110,6 @@ pub const TestCase = struct {
     imports: []const helpers.ModuleSource = &.{},
     expected: Expected,
     skip: Skip = .{},
-    /// Known compiler-bug repros are opt-in so ordinary `zig build run-test-eval`
-    /// stays green while still letting bug hunts use the eval pipeline directly.
-    known_bug: bool = false,
 
     pub const Expected = union(enum) {
         inspect_str: []const u8,
@@ -243,8 +248,8 @@ const WireHeader = extern struct {
 
 const has_fork = builtin.os.tag != .windows;
 
-const BackendEvalFn = *const fn (std.mem.Allocator, *const LoweredProgram) anyerror![]u8;
-const BackendEvalWithStatsFn = *const fn (std.mem.Allocator, *const LoweredProgram) anyerror!helpers.EvalRunResult;
+const BackendEvalFn = *const fn (std.mem.Allocator, *const LoweredProgram) RunnerError![]u8;
+const BackendEvalWithStatsFn = *const fn (std.mem.Allocator, *const LoweredProgram) RunnerError!helpers.EvalRunResult;
 
 /// Result of a forked backend evaluation.
 const ForkResult = union(enum) {
@@ -467,7 +472,7 @@ fn forkAndEval(
 const LlvmEvalPermit = struct {
     file: std.Io.File,
 
-    fn acquire(io: std.Io) anyerror!LlvmEvalPermit {
+    fn acquire(io: std.Io) RunnerError!LlvmEvalPermit {
         var queue_path_buf: [std.fs.max_path_bytes]u8 = undefined;
         const queue_path = try llvmEvalQueueLockPath(&queue_path_buf);
         var queue_file = try openLlvmEvalLockFile(io, queue_path);
@@ -490,7 +495,7 @@ const LlvmEvalPermit = struct {
     }
 };
 
-fn acquireLlvmEvalSlot(io: std.Io) anyerror!?LlvmEvalPermit {
+fn acquireLlvmEvalSlot(io: std.Io) RunnerError!?LlvmEvalPermit {
     for (0..llvm_eval_slot_count) |slot| {
         var path_buf: [std.fs.max_path_bytes]u8 = undefined;
         const path = try llvmEvalSlotLockPath(&path_buf, slot);
@@ -507,7 +512,7 @@ fn acquireLlvmEvalSlot(io: std.Io) anyerror!?LlvmEvalPermit {
     return null;
 }
 
-fn openLlvmEvalLockFile(io: std.Io, path: []const u8) anyerror!std.Io.File {
+fn openLlvmEvalLockFile(io: std.Io, path: []const u8) RunnerError!std.Io.File {
     return std.Io.Dir.createFileAbsolute(io, path, .{
         .read = true,
         .truncate = false,
@@ -521,11 +526,11 @@ fn llvmEvalLockPrefix() []const u8 {
         "/tmp/roc_eval_llvm_";
 }
 
-fn llvmEvalSlotLockPath(buf: *[std.fs.max_path_bytes]u8, slot: usize) anyerror![]const u8 {
+fn llvmEvalSlotLockPath(buf: *[std.fs.max_path_bytes]u8, slot: usize) RunnerError![]const u8 {
     return std.fmt.bufPrint(buf, "{s}slot_{d}.lock", .{ llvmEvalLockPrefix(), slot });
 }
 
-fn llvmEvalQueueLockPath(buf: *[std.fs.max_path_bytes]u8) anyerror![]const u8 {
+fn llvmEvalQueueLockPath(buf: *[std.fs.max_path_bytes]u8) RunnerError![]const u8 {
     return std.fmt.bufPrint(buf, "{s}queue.lock", .{llvmEvalLockPrefix()});
 }
 
@@ -540,7 +545,7 @@ fn runBackendEval(
     eval_fn: BackendEvalFn,
     lowered: *const LoweredProgram,
     timeout_ms: u64,
-) anyerror!ForkResult {
+) RunnerError!ForkResult {
     if (index == LLVM_BACKEND_INDEX) {
         var permit = try LlvmEvalPermit.acquire(io);
         defer permit.release(io);
@@ -805,7 +810,7 @@ fn backendTimeoutBudgetMs(io: std.Io, index: usize, standard_deadline_ms: ?i64) 
     return remainingBackendBudgetMs(io, standard_deadline_ms);
 }
 
-fn runSingleTestInner(io: std.Io, allocator: std.mem.Allocator, tc: TestCase, timeout_ms: u64) anyerror!TestOutcome {
+fn runSingleTestInner(io: std.Io, allocator: std.mem.Allocator, tc: TestCase, timeout_ms: u64) RunnerError!TestOutcome {
     return switch (tc.expected) {
         .inspect_str => runInspectTest(io, allocator, tc.source_kind, tc.source, tc.imports, tc.expected, tc.skip, timeout_ms),
         .allocations_at_most => |expected| runAllocationTest(io, allocator, tc.source_kind, tc.source, tc.imports, expected, tc.skip),
@@ -823,7 +828,7 @@ fn runAllocationTest(
     imports: []const helpers.ModuleSource,
     expected: TestCase.AllocationExpectation,
     skip: TestCase.Skip,
-) anyerror!TestOutcome {
+) RunnerError!TestOutcome {
     var compiled = try helpers.compileProgram(allocator, io, source_kind, src, imports);
     defer compiled.deinit(allocator);
 
@@ -958,7 +963,7 @@ fn runInspectTest(
     expected: TestCase.Expected,
     skip: TestCase.Skip,
     timeout_ms: u64,
-) anyerror!TestOutcome {
+) RunnerError!TestOutcome {
     var compiled = try helpers.compileInspectedProgram(allocator, io, source_kind, src, imports);
     defer compiled.deinit(allocator);
 
@@ -1091,7 +1096,7 @@ fn runTestProblem(
     source_kind: helpers.SourceKind,
     src: []const u8,
     imports: []const helpers.ModuleSource,
-) anyerror!TestOutcome {
+) RunnerError!TestOutcome {
     var timer = Timer.start() catch unreachable;
     var resources = helpers.parseAndCheckProgramForProblems(allocator, source_kind, src, imports) catch {
         // Parse or canonicalize error means a problem was found — that's a pass.
@@ -1154,7 +1159,7 @@ fn runCrashTest(
     skip: TestCase.Skip,
     require_problems: bool,
     timeout_ms: u64,
-) anyerror!TestOutcome {
+) RunnerError!TestOutcome {
     var compiled = try helpers.compileInspectedProgram(allocator, io, source_kind, src, imports);
     defer compiled.deinit(allocator);
 
@@ -1338,7 +1343,7 @@ fn serializeOutcomeToBuffer(
     gpa: std.mem.Allocator,
     outcome: TestOutcome,
     duration_ns: u64,
-) anyerror!void {
+) RunnerError!void {
     var header: WireHeader = .{
         .status = @intFromEnum(outcome.status),
         .backend_statuses = undefined,
@@ -1480,7 +1485,7 @@ fn applyBackendIsolation(skip: *TestCase.Skip, name: []const u8) void {
 /// this runner. Starts with `selfExePath`, then preserves every original arg
 /// *except* `--worker N` / `--worker-backend NAME` (the harness appends those
 /// per-worker; we strip any pre-existing instance so we don't double-add).
-fn buildWorkerArgvTemplate(io: std.Io, arena: std.mem.Allocator, process_args: std.process.Args) anyerror![]const []const u8 {
+fn buildWorkerArgvTemplate(io: std.Io, arena: std.mem.Allocator, process_args: std.process.Args) RunnerError![]const []const u8 {
     // std.fs.selfExePath was removed in Zig 0.16; use std.process.executablePathAlloc instead.
     const self_path = try std.process.executablePathAlloc(io, arena);
 
@@ -1692,8 +1697,7 @@ fn collectTests() []const TestCase {
 
 // CLI parsing uses harness.parseStandardArgs for consistent flag handling.
 // The eval runner accepts the standard flags: --filter, --threads, --timeout, --verbose, --help,
-// plus `--llvm` and the positional marker `known-bugs` to include opt-in
-// compiler-bug repros.
+// plus `--llvm`.
 
 fn printHelp() void {
     const help =
@@ -1721,7 +1725,6 @@ fn printHelp() void {
         \\                        LLVM uses a separate 420000ms backend budget.
         \\                        LLVM eval lock slots match the worker count.
         \\  --llvm                Include the LLVM backend. Default: skip LLVM.
-        \\  known-bugs            Include opt-in known compiler-bug repro tests.
         \\
         \\COVERAGE:
         \\  Use `zig build run-coverage-eval` to build with coverage instrumentation.
@@ -1731,7 +1734,7 @@ fn printHelp() void {
         \\
         \\TIMING:
         \\  Every test is instrumented with per-phase monotonic timing (std.time.Timer):
-        \\    parse    - builtin loading + source parsing
+        \\    parse    - builtin view setup + source parsing
         \\    can      - canonicalization (CIR generation)
         \\    check    - type checking / constraint solving
         \\    interp   - interpreter evaluation
@@ -1981,7 +1984,7 @@ fn appendPhaseEvent(
     phase: []const u8,
     start_ns: *u64,
     duration_ns: u64,
-) anyerror!void {
+) RunnerError!void {
     if (duration_ns == 0) return;
     const id = try std.fmt.allocPrint(gpa, "case-{d}-{s}", .{ case_index, phase });
     appendStatsEvent(gpa, events, id, case_id, phase, phase, "pass", start_ns.*, start_ns.* + duration_ns, &.{});
@@ -1995,7 +1998,7 @@ fn writeStatsJson(
     tests: []const TestCase,
     results: []const TestResult,
     spans: []const ?harness.PoolSpan,
-) anyerror!void {
+) RunnerError!void {
     var stats_arena = std.heap.ArenaAllocator.init(gpa);
     defer stats_arena.deinit();
     const stats_allocator = stats_arena.allocator();
@@ -2045,7 +2048,7 @@ fn writeStatsJson(
 const nsToMs = harness.nsToMs;
 const computeTimingStats = harness.computeTimingStats;
 
-fn printPerformanceSummary(gpa: std.mem.Allocator, tests: []const TestCase, results: []const TestResult) anyerror!void {
+fn printPerformanceSummary(gpa: std.mem.Allocator, tests: []const TestCase, results: []const TestResult) RunnerError!void {
     // Collect per-phase timing arrays (only include tests that ran that phase, i.e. ns > 0)
     var parse_times: std.ArrayListUnmanaged(u64) = .empty;
     defer parse_times.deinit(gpa);
@@ -2151,15 +2154,8 @@ fn effectiveMaxChildren(cli: harness.StandardArgs, cpu_count: usize, test_count:
     return @max(1, requested);
 }
 
-fn hasPositionalArg(args: []const []const u8, target: []const u8) bool {
-    for (args) |arg| {
-        if (std.mem.eql(u8, arg, target)) return true;
-    }
-    return false;
-}
-
 /// Entry point for the parallel eval test runner.
-pub fn main(init: std.process.Init) anyerror!void {
+pub fn main(init: std.process.Init) RunnerError!void {
     const io = init.io;
     var trace_worker = WorkerTrace.init(io);
     trace_worker.stamp("main entry");
@@ -2184,7 +2180,6 @@ pub fn main(init: std.process.Init) anyerror!void {
 
     const all_tests = collectTests();
     trace_worker.stamp("collectTests");
-    const include_known_bugs = hasPositionalArg(cli.positional, "known-bugs");
 
     // Apply filters (support multiple --filter values)
     var filtered_buf: std.ArrayListUnmanaged(TestCase) = .empty;
@@ -2192,7 +2187,6 @@ pub fn main(init: std.process.Init) anyerror!void {
 
     if (cli.filters.len > 0) {
         for (all_tests) |tc| {
-            if (tc.known_bug and !include_known_bugs) continue;
             for (cli.filters) |pattern| {
                 if (std.mem.find(u8, tc.name, pattern) != null or
                     std.mem.find(u8, tc.source, pattern) != null)
@@ -2204,7 +2198,6 @@ pub fn main(init: std.process.Init) anyerror!void {
         }
     } else {
         for (all_tests) |tc| {
-            if (tc.known_bug and !include_known_bugs) continue;
             try filtered_buf.append(gpa, tc);
         }
     }

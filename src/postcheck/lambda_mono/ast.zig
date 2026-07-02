@@ -33,9 +33,6 @@ pub const StringLiteralId = Lifted.StringLiteralId;
 /// Identifier for a compile-time-observed control-flow site.
 pub const ComptimeSiteId = enum(u32) { _ };
 
-/// Local procedure context shared with Monotype IR.
-pub const LocalProcContext = Mono.LocalProcContext;
-
 /// Slice descriptor over one of the program side arrays.
 pub fn Span(comptime _: type) type {
     return extern struct {
@@ -130,9 +127,15 @@ pub const TryRecordSequence = struct {
     ok_body: ExprId,
 };
 
-/// Direct call to a known Lambda Mono function.
+/// Direct call target after Lambda Mono lowering.
+pub const DirectCallTarget = union(enum(u8)) {
+    local: FnId,
+    imported: Lifted.ImportedFnId,
+};
+
+/// Direct call to a known Lambda Mono function or loaded specialization shard.
 pub const DirectCall = struct {
-    target: FnId,
+    target: DirectCallTarget,
     args: Span(ExprId),
     /// Explicit cold-call provenance from generated code. This prevents later
     /// stages from inlining or laying out this call as if it were on a hot path.
@@ -156,28 +159,6 @@ pub const CallableValue = struct {
     ty: Type.TypeId,
     variant: Type.FnVariantId,
     payload: ?ExprId,
-};
-
-/// Identifier for one private optimized loop state.
-pub const StateLoopStateId = enum(u32) { _ };
-
-/// One private optimized loop state.
-pub const StateLoopState = struct {
-    params: Span(TypedLocal),
-    body: ExprId,
-};
-
-/// Private optimized loop state graph.
-pub const StateLoopExpr = struct {
-    entry_state: StateLoopStateId,
-    entry_values: Span(ExprId),
-    states: Span(StateLoopState),
-};
-
-/// Edge to another private optimized loop state.
-pub const StateContinueExpr = struct {
-    target_state: StateLoopStateId,
-    values: Span(ExprId),
 };
 
 /// Source control-flow construct observed during compile-time finalization.
@@ -204,13 +185,6 @@ pub const Expr = struct {
     data: ExprData,
 };
 
-/// A restored compile-time value that may lower to static data once the final
-/// LIR const plan and target layout are known.
-pub const StaticDataCandidate = struct {
-    static_data: Common.StaticDataId,
-    restored_expr: ExprId,
-};
-
 /// Lambda Mono expression forms.
 pub const ExprData = union(enum) {
     local: LocalId,
@@ -220,8 +194,6 @@ pub const ExprData = union(enum) {
     frac_f64_lit: f64,
     dec_lit: builtins.dec.RocDec,
     str_lit: StringLiteralId,
-    static_data: Common.StaticDataId,
-    static_data_candidate: StaticDataCandidate,
     list: Span(ExprId),
     tuple: Span(ExprId),
     record: Span(FieldExpr),
@@ -291,12 +263,10 @@ pub const ExprData = union(enum) {
         initial_values: Span(ExprId),
         body: ExprId,
     },
-    state_loop: StateLoopExpr,
     break_: ?ExprId,
     continue_: struct {
         values: Span(ExprId),
     },
-    state_continue: StateContinueExpr,
     return_: ExprId,
     crash: StringLiteralId,
     comptime_branch_taken: ComptimeBranchTaken,
@@ -424,7 +394,6 @@ pub const Root = struct {
 pub const LayoutRequest = struct {
     checked_type: checked.CheckedTypeId,
     ty: Type.TypeId,
-    static_data: ?Common.StaticDataRequest = null,
 };
 
 /// Runtime schema requested for a named runtime value shape.
@@ -432,9 +401,6 @@ pub const RuntimeSchemaRequest = struct {
     def: MonoType.TypeDef,
     ty: Type.TypeId,
 };
-
-/// Request to make a Lambda Mono value available as static data.
-pub const StaticDataValue = Common.StaticDataRequest;
 
 /// Complete Lambda Mono program plus side arrays.
 pub const Program = struct {
@@ -456,14 +422,11 @@ pub const Program = struct {
     str_pattern_steps: std.ArrayList(StrPatternStep),
     branches: std.ArrayList(Branch),
     if_branches: std.ArrayList(IfBranch),
-    state_loop_states: std.ArrayList(StateLoopState),
     string_literals: std.ArrayList(Mono.StringLiteral),
-    local_proc_contexts: std.ArrayList(LocalProcContext),
     proc_debug_names: ProcDebugNameMap,
     roots: std.ArrayList(Root),
     layout_requests: std.ArrayList(LayoutRequest),
     runtime_schema_requests: std.ArrayList(RuntimeSchemaRequest),
-    static_data_values: std.ArrayList(StaticDataValue),
     comptime_sites: std.ArrayList(ComptimeSite),
     /// Source file table for `SourceLoc.file` indices (copied from the lifted
     /// program; owned by this program).
@@ -509,14 +472,11 @@ pub const Program = struct {
             .str_pattern_steps = .empty,
             .branches = .empty,
             .if_branches = .empty,
-            .state_loop_states = .empty,
             .string_literals = string_literals,
-            .local_proc_contexts = .empty,
             .proc_debug_names = ProcDebugNameMap.init(allocator),
             .roots = .empty,
             .layout_requests = .empty,
             .runtime_schema_requests = .empty,
-            .static_data_values = .empty,
             .comptime_sites = .empty,
             .source_files = .empty,
             .expr_locs = .empty,
@@ -544,16 +504,13 @@ pub const Program = struct {
             self.allocator.free(site.branch_regions);
         }
         self.comptime_sites.deinit(self.allocator);
-        self.static_data_values.deinit(self.allocator);
         self.runtime_schema_requests.deinit(self.allocator);
         self.layout_requests.deinit(self.allocator);
         self.roots.deinit(self.allocator);
         self.proc_debug_names.deinit();
-        self.local_proc_contexts.deinit(self.allocator);
         for (self.string_literals.items) |literal| self.allocator.free(literal.backing);
         self.string_literals.deinit(self.allocator);
         self.if_branches.deinit(self.allocator);
-        self.state_loop_states.deinit(self.allocator);
         self.branches.deinit(self.allocator);
         self.str_pattern_steps.deinit(self.allocator);
         self.record_destructs.deinit(self.allocator);
@@ -733,12 +690,6 @@ pub const Program = struct {
         return .{ .start = start, .len = @intCast(values.len) };
     }
 
-    pub fn addStateLoopStateSpan(self: *Program, values: []const StateLoopState) std.mem.Allocator.Error!Span(StateLoopState) {
-        const start: u32 = @intCast(self.state_loop_states.items.len);
-        try self.state_loop_states.appendSlice(self.allocator, values);
-        return .{ .start = start, .len = @intCast(values.len) };
-    }
-
     pub fn exprSpan(self: *const Program, span_: Span(ExprId)) []const ExprId {
         return self.expr_ids.items[span_.start..][0..span_.len];
     }
@@ -775,20 +726,12 @@ pub const Program = struct {
         return self.if_branches.items[span_.start..][0..span_.len];
     }
 
-    pub fn stateLoopStateSpan(self: *const Program, span_: Span(StateLoopState)) []const StateLoopState {
-        return self.state_loop_states.items[span_.start..][0..span_.len];
-    }
-
     pub fn stringLiteralText(self: *const Program, id: StringLiteralId) []const u8 {
         return self.stringLiteral(id).text();
     }
 
     pub fn stringLiteral(self: *const Program, id: StringLiteralId) Mono.StringLiteral {
         return self.string_literals.items[@intFromEnum(id)];
-    }
-
-    pub fn localProcContextSpan(self: *const Program, span: Mono.Span(LocalProcContext)) []const LocalProcContext {
-        return self.local_proc_contexts.items[span.start .. span.start + span.len];
     }
 };
 

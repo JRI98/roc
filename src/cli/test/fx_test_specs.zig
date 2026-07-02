@@ -15,6 +15,8 @@ pub const TestSpec = struct {
     roc_file: []const u8,
     /// IO spec for --test mode
     io_spec: []const u8,
+    /// Stderr substrings expected during build-only cross-compilation.
+    expected_build_stderr_contains: []const []const u8 = &.{},
     /// Optional description of what the test verifies
     description: []const u8 = "",
     /// Skip this test on Windows (usually due to dev backend limitations)
@@ -42,7 +44,7 @@ pub const io_spec_tests = [_]TestSpec{
     // Basic effectful function tests
     .{
         .roc_file = "test/fx/app.roc",
-        .io_spec = "1>Hello from stdout!|1>Line 1 to stdout|2>Line 2 to stderr|1>Line 3 to stdout|2>Error from stderr!",
+        .io_spec = "0<abc|1>Hello from stdout!|1>Line 1 to stdout|2>Line 2 to stderr|1>Line 3 to stdout|2>Error from stderr!|1>Crypto hashes ok",
         .description = "Basic effectful functions: Stdout.line!, Stderr.line!",
     },
     .{
@@ -368,6 +370,7 @@ pub const io_spec_tests = [_]TestSpec{
     .{
         .roc_file = "test/fx/dbg_corrupts_recursive_tag_union.roc",
         .io_spec = "1>Child is Text: hello",
+        .expected_build_stderr_contains = &.{"`DBG` IN OPTIMIZED BUILD"},
         .description = "Regression test: dbg on recursive tag union preserves variant discriminant (issue #8804)",
     },
     .{
@@ -537,6 +540,11 @@ pub const io_spec_tests = [_]TestSpec{
         .roc_file = "test/fx/keep_oks.roc",
         .io_spec = "1>done",
         .description = "Regression test: Monomorphize panic when callback always returns Ok but match expects Err tag",
+    },
+    .{
+        .roc_file = "test/fx/arc_certifier_large_tree.roc",
+        .io_spec = "1><!DOCTYPE html><html class=\"en\"><head><meta class=\"ct\"><title>T</title><link class=\"ss\"></head><body><div class=\"main\"><div class=\"navbar\"><ul><li class=\"nav-link\"><a class=\"x\">X</a></li><li class=\"nav-link\"><a class=\"y\">Y</a></li></ul></div><div class=\"article\">body</div></div></body></html>",
+        .description = "Regression test: large refcounted recursive tree passes ARC borrow certification",
     },
 
     // Leak regression tests for the address-taken element-decref callbacks in

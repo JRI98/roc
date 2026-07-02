@@ -45,7 +45,7 @@ test "cross-module - check type - monomorphic function fails" {
     ;
     var test_env_b = try TestEnv.initWithImport("B", source_b, "A", &test_env_a);
     defer test_env_b.deinit();
-    try test_env_b.assertOneTypeError("TYPE MISMATCH");
+    try test_env_b.assertOneTypeError("Type Mismatch");
 }
 
 test "cross-module - check type - polymorphic function passes" {
@@ -146,6 +146,30 @@ test "cross-module - check type - static dispatch - no annotation & indirection"
     try test_env_b.assertDefType("main", "(Str, Str, Str)");
 }
 
+test "cross-module - check type - method call on imported associated constant" {
+    const source_html =
+        \\Html := { foo : U8 }.{
+        \\  href : Html, Str -> Html
+        \\  href = |html, _val| html
+        \\
+        \\  a : Html
+        \\  a = { foo: 4 }
+        \\}
+    ;
+    var test_env_html = try TestEnv.init("Html", source_html);
+    defer test_env_html.deinit();
+
+    const source_main =
+        \\import Html
+        \\
+        \\main : Html
+        \\main = Html.a.href("./other-page.html")
+    ;
+    var test_env_main = try TestEnv.initWithImport("Main", source_main, "Html", &test_env_html);
+    defer test_env_main.deinit();
+    try test_env_main.assertDefType("main", "Html");
+}
+
 test "cross-module - check type - opaque types 1" {
     const source_a =
         \\A :: [A(Str)].{}
@@ -161,7 +185,7 @@ test "cross-module - check type - opaque types 1" {
     ;
     var test_env_b = try TestEnv.initWithImport("B", source_b, "A", &test_env_a);
     defer test_env_b.deinit();
-    try test_env_b.assertFirstTypeError("TYPE MISMATCH");
+    try test_env_b.assertFirstTypeError("Type Mismatch");
 }
 
 test "cross-module - check type - opaque types 2" {
@@ -178,7 +202,7 @@ test "cross-module - check type - opaque types 2" {
     ;
     var test_env_b = try TestEnv.initWithImport("B", source_b, "A", &test_env_a);
     defer test_env_b.deinit();
-    try test_env_b.assertFirstTypeError("CANNOT USE OPAQUE NOMINAL TYPE");
+    try test_env_b.assertFirstTypeError("Cannot Use Opaque Nominal Type");
 }
 
 test "displayNameIsBetter - shorter names are preferred" {

@@ -5,6 +5,8 @@
 //! - Dev: Fast development backends that generate native code directly (x86_64, aarch64)
 //! - Wasm: WebAssembly backend that generates wasm bytecode
 
+const StructuralTest = @import("structural_test.zig");
+
 pub const dev = @import("dev/mod.zig");
 pub const wasm = @import("wasm/mod.zig");
 
@@ -37,11 +39,13 @@ pub const RunImage = dev.RunImage;
 pub const procSymbolName = dev.procSymbolName;
 pub const ObjectFileCompiler = dev.ObjectFileCompiler;
 pub const CompilationResult = dev.CompilationResult;
+pub const CompilationError = dev.CompilationError;
 pub const writeFileWindowsAvSafe = dev.writeFileWindowsAvSafe;
 pub const resolveBuiltinFunction = dev.resolveBuiltinFunction;
 
 test "backend tests" {
     const std = @import("std");
+    std.testing.refAllDecls(StructuralTest);
     std.testing.refAllDecls(dev);
     std.testing.refAllDecls(wasm);
 }

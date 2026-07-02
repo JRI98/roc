@@ -30,9 +30,12 @@ pub const Constants = struct {
     ///    node, diagnostic, and type-annotation payloads.
     /// 6: merge with typed node/static-dispatch payload layout changes.
     /// 7: field-order layout metadata moved from nominal-only to general field-order.
-    /// 8: checked hoisted-root selection now includes leaf/custom literal roots.
-    /// 9: ModuleEnv stores checked runtime-dependency summaries for imports.
-    pub const CACHE_VERSION = 9;
+    /// 8: ModuleEnv stores source-relative file-import dependency metadata.
+    /// 9: ModuleEnv records runtime-prepared static builtin serialization state.
+    /// 10: ModuleEnv common identifiers include Crypto digest and hasher builtin names.
+    /// 11: Builtin indices and common identifiers changed for Encoding.Json and Encoding.HttpHeader.
+    /// 12: Builtin.Encoding.Json structural encode/parse support changed common identifiers.
+    pub const CACHE_VERSION = 13;
 };
 
 /// Configuration for the Roc cache system.

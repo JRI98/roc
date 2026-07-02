@@ -5,15 +5,6 @@ type=package
 ~~~
 # SOURCE
 ~~~roc
-module [
-    Color,
-    to_str,
-    rgb,
-    rgba,
-    hex,
-    named,
-]
-
 Color := [
     RGB(U8, U8, U8),
     RGBA(U8, U8, U8, Dec),
@@ -78,202 +69,185 @@ is_named_color = |str|{
 }
 ~~~
 # EXPECTED
-MODULE HEADER DEPRECATED - Color.md:1:1:8:2
-UNUSED VARIABLE - Color.md:30:5:30:25
-DOES NOT EXIST - Color.md:50:34:50:44
-DOES NOT EXIST - Color.md:50:52:50:62
-DOES NOT EXIST - Color.md:50:70:50:80
-DOES NOT EXIST - Color.md:51:39:51:49
-DOES NOT EXIST - Color.md:51:57:51:67
-DOES NOT EXIST - Color.md:51:75:51:85
-DOES NOT EXIST - Color.md:51:93:51:103
-MISSING METHOD - Color.md:22:17:22:24
-MISSING METHOD - Color.md:35:19:35:39
-MISSING METHOD - Color.md:62:12:62:26
-MISSING METHOD - Color.md:56:26:56:32
-MISSING METHOD - Color.md:57:32:57:38
+UNUSED VARIABLE - Color.md:21:5:21:25
+DOES NOT EXIST - Color.md:41:34:41:44
+DOES NOT EXIST - Color.md:41:52:41:62
+DOES NOT EXIST - Color.md:41:70:41:80
+DOES NOT EXIST - Color.md:42:39:42:49
+DOES NOT EXIST - Color.md:42:57:42:67
+DOES NOT EXIST - Color.md:42:75:42:85
+DOES NOT EXIST - Color.md:42:93:42:103
+MISSING METHOD - Color.md:13:17:13:24
+MISSING METHOD - Color.md:26:19:26:39
+MISSING METHOD - Color.md:53:12:53:26
+MISSING METHOD - Color.md:47:26:47:32
+MISSING METHOD - Color.md:48:32:48:38
 # PROBLEMS
-**MODULE HEADER DEPRECATED**
-The `module` header is deprecated.
 
-Type modules (headerless files with a top-level type matching the filename) are now the preferred way to define modules.
+┌─────────────────┐
+│ UNUSED VARIABLE ├─ Variable `is_char_in_hex_range` is defined here and ─────┐
+└┬────────────────┘  then never used.                                         │
+ │                                                                            │
+ │  is_char_in_hex_range = |b| (b >= '0' and b <= '9') or (b >= 'a' and b <=… │
+ │  ‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾                                                      │
+ └───────────────────────────────────────────────────────────── Color.md:21:5 ┘
 
-Remove the `module` header and ensure your file defines a type that matches the filename.
-**Color.md:1:1:8:2:**
-```roc
-module [
-    Color,
-    to_str,
-    rgb,
-    rgba,
-    hex,
-    named,
-]
-```
+    If you don't need this variable, prefix it with an underscore like
+    `_is_char_in_hex_range` to suppress this warning.
 
 
-**UNUSED VARIABLE**
-Variable `is_char_in_hex_range` is not used anywhere in your code.
-
-If you don't need this variable, prefix it with an underscore like `_is_char_in_hex_range` to suppress this warning.
-The unused variable is declared here:
-**Color.md:30:5:30:25:**
-```roc
-    is_char_in_hex_range = |b| (b >= '0' and b <= '9') or (b >= 'a' and b <= 'f') or (b >= 'A' and b <= 'F')
-```
-    ^^^^^^^^^^^^^^^^^^^^
+┌────────────────┐
+│ DOES NOT EXIST ├─ `Num.to_str` does not exist. ─────────────────────────────┐
+└┬───────────────┘                                                            │
+ │                                                                            │
+ │  … "rgb(${Num.to_str(r)}, ${Num.to_str(g)}, ${Num.to_str(b)})"             │
+ │           ‾‾‾‾‾‾‾‾‾‾                                                       │
+ └──────────────────────────────────────────────────────────── Color.md:41:34 ┘
 
 
-**DOES NOT EXIST**
-`Num.to_str` does not exist.
 
-**Color.md:50:34:50:44:**
-```roc
-    Color.RGB(r, g, b) => "rgb(${Num.to_str(r)}, ${Num.to_str(g)}, ${Num.to_str(b)})"
-```
-                                 ^^^^^^^^^^
-
-
-**DOES NOT EXIST**
-`Num.to_str` does not exist.
-
-**Color.md:50:52:50:62:**
-```roc
-    Color.RGB(r, g, b) => "rgb(${Num.to_str(r)}, ${Num.to_str(g)}, ${Num.to_str(b)})"
-```
-                                                   ^^^^^^^^^^
+┌────────────────┐
+│ DOES NOT EXIST ├─ `Num.to_str` does not exist. ─────────────────────────────┐
+└┬───────────────┘                                                            │
+ │                                                                            │
+ │  …(r)}, ${Num.to_str(g)}, ${Num.to_str(b)})"                               │
+ │           ‾‾‾‾‾‾‾‾‾‾                                                       │
+ └──────────────────────────────────────────────────────────── Color.md:41:52 ┘
 
 
-**DOES NOT EXIST**
-`Num.to_str` does not exist.
 
-**Color.md:50:70:50:80:**
-```roc
-    Color.RGB(r, g, b) => "rgb(${Num.to_str(r)}, ${Num.to_str(g)}, ${Num.to_str(b)})"
-```
-                                                                     ^^^^^^^^^^
-
-
-**DOES NOT EXIST**
-`Num.to_str` does not exist.
-
-**Color.md:51:39:51:49:**
-```roc
-    Color.RGBA(r, g, b, a) => "rgba(${Num.to_str(r)}, ${Num.to_str(g)}, ${Num.to_str(b)}, ${Num.to_str(a)})"
-```
-                                      ^^^^^^^^^^
+┌────────────────┐
+│ DOES NOT EXIST ├─ `Num.to_str` does not exist. ─────────────────────────────┐
+└┬───────────────┘                                                            │
+ │                                                                            │
+ │  …(g)}, ${Num.to_str(b)})"                                                 │
+ │           ‾‾‾‾‾‾‾‾‾‾                                                       │
+ └──────────────────────────────────────────────────────────── Color.md:41:70 ┘
 
 
-**DOES NOT EXIST**
-`Num.to_str` does not exist.
 
-**Color.md:51:57:51:67:**
-```roc
-    Color.RGBA(r, g, b, a) => "rgba(${Num.to_str(r)}, ${Num.to_str(g)}, ${Num.to_str(b)}, ${Num.to_str(a)})"
-```
-                                                        ^^^^^^^^^^
-
-
-**DOES NOT EXIST**
-`Num.to_str` does not exist.
-
-**Color.md:51:75:51:85:**
-```roc
-    Color.RGBA(r, g, b, a) => "rgba(${Num.to_str(r)}, ${Num.to_str(g)}, ${Num.to_str(b)}, ${Num.to_str(a)})"
-```
-                                                                          ^^^^^^^^^^
+┌────────────────┐
+│ DOES NOT EXIST ├─ `Num.to_str` does not exist. ─────────────────────────────┐
+└┬───────────────┘                                                            │
+ │                                                                            │
+ │  …"rgba(${Num.to_str(r)}, ${Num.to_str(g)}, ${Num.to_str(b)}, ${Num.to_str…│
+ │           ‾‾‾‾‾‾‾‾‾‾                                                       │
+ └──────────────────────────────────────────────────────────── Color.md:42:39 ┘
 
 
-**DOES NOT EXIST**
-`Num.to_str` does not exist.
 
-**Color.md:51:93:51:103:**
-```roc
-    Color.RGBA(r, g, b, a) => "rgba(${Num.to_str(r)}, ${Num.to_str(g)}, ${Num.to_str(b)}, ${Num.to_str(a)})"
-```
-                                                                                            ^^^^^^^^^^
+┌────────────────┐
+│ DOES NOT EXIST ├─ `Num.to_str` does not exist. ─────────────────────────────┐
+└┬───────────────┘                                                            │
+ │                                                                            │
+ │  …(r)}, ${Num.to_str(g)}, ${Num.to_str(b)}, ${Num.to_str(a)})"             │
+ │           ‾‾‾‾‾‾‾‾‾‾                                                       │
+ └──────────────────────────────────────────────────────────── Color.md:42:57 ┘
 
 
-**MISSING METHOD**
-This **to_frac** method is being called on a value whose type doesn't have that method:
-**Color.md:22:17:22:24:**
-```roc
-    rounded = a.to_frac() / 255.0
-```
-                ^^^^^^^
 
-The value's type, which does not have a method named **to_frac**, is:
+┌────────────────┐
+│ DOES NOT EXIST ├─ `Num.to_str` does not exist. ─────────────────────────────┐
+└┬───────────────┘                                                            │
+ │                                                                            │
+ │  …(g)}, ${Num.to_str(b)}, ${Num.to_str(a)})"                               │
+ │           ‾‾‾‾‾‾‾‾‾‾                                                       │
+ └──────────────────────────────────────────────────────────── Color.md:42:75 ┘
 
-    U8
 
-**Hint:** For this to work, the type would need to have a method named **to_frac** associated with it in the type's declaration.
 
-**MISSING METHOD**
-This **is_char_in_hex_range** method is being called on a value whose type doesn't have that method:
-**Color.md:35:19:35:39:**
-```roc
-                a.is_char_in_hex_range()
-```
-                  ^^^^^^^^^^^^^^^^^^^^
+┌────────────────┐
+│ DOES NOT EXIST ├─ `Num.to_str` does not exist. ─────────────────────────────┐
+└┬───────────────┘                                                            │
+ │                                                                            │
+ │  …(b)}, ${Num.to_str(a)})"                                                 │
+ │           ‾‾‾‾‾‾‾‾‾‾                                                       │
+ └──────────────────────────────────────────────────────────── Color.md:42:93 ┘
 
-The value's type, which does not have a method named **is_char_in_hex_range**, is:
 
-    U8
 
-**Hint:** For this to work, the type would need to have a method named **is_char_in_hex_range** associated with it in the type's declaration.
+┌────────────────┐
+│ MISSING METHOD ├─ This `to_frac` method is being called on a value whose ───┐
+└┬───────────────┘  type doesn't have that method.                            │
+ │                                                                            │
+ │  rounded = a.to_frac() / 255.0                                             │
+ │              ‾‾‾‾‾‾‾                                                       │
+ └──────────────────────────────────────────────────────────── Color.md:13:17 ┘
 
-**MISSING METHOD**
-This **is_named_color** method is being called on a value whose type doesn't have that method:
-**Color.md:62:12:62:26:**
-```roc
-    if str.is_named_color()
-```
-           ^^^^^^^^^^^^^^
+    The value's type, which does not have a method named `to_frac`, is:
 
-The value's type, which does not have a method named **is_named_color**, is:
+        U8
 
-    Str
+    Hint: For this to work, the type would need to have a method named
+    `to_frac` associated with it in the type's declaration.
 
-**Hint:** For this to work, the type would need to have a method named **is_named_color** associated with it in the type's declaration.
 
-**MISSING METHOD**
-This **to_str** method is being called on a value whose type doesn't have that method:
-**Color.md:56:26:56:32:**
-```roc
-expect rgb(124, 56, 245).to_str() == "rgb(124, 56, 245)"
-```
-                         ^^^^^^
+┌────────────────┐
+│ MISSING METHOD ├─ This `is_char_in_hex_range` method is being called on a ──┐
+└┬───────────────┘  value whose type doesn't have that method.                │
+ │                                                                            │
+ │  a.is_char_in_hex_range()                                                  │
+ │    ‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾                                                    │
+ └──────────────────────────────────────────────────────────── Color.md:26:19 ┘
 
-The value's type, which does not have a method named **to_str**, is:
+    The value's type, which does not have a method named
+    `is_char_in_hex_range`, is:
 
-    Color
+        U8
 
-**Hint:** For this to work, the type would need to have a method named **to_str** associated with it in the type's declaration.
+    Hint: For this to work, the type would need to have a method named
+    `is_char_in_hex_range` associated with it in the type's declaration.
 
-**MISSING METHOD**
-This **to_str** method is being called on a value whose type doesn't have that method:
-**Color.md:57:32:57:38:**
-```roc
-expect rgba(124, 56, 245, 255).to_str() == "rgba(124, 56, 245, 1.0)"
-```
-                               ^^^^^^
 
-The value's type, which does not have a method named **to_str**, is:
+┌────────────────┐
+│ MISSING METHOD ├─ This `is_named_color` method is being called on a value ──┐
+└┬───────────────┘  whose type doesn't have that method.                      │
+ │                                                                            │
+ │  if str.is_named_color()                                                   │
+ │         ‾‾‾‾‾‾‾‾‾‾‾‾‾‾                                                     │
+ └──────────────────────────────────────────────────────────── Color.md:53:12 ┘
 
-    Color
+    The value's type, which does not have a method named `is_named_color`, is:
 
-**Hint:** For this to work, the type would need to have a method named **to_str** associated with it in the type's declaration.
+        Str
+
+    Hint: For this to work, the type would need to have a method named
+    `is_named_color` associated with it in the type's declaration.
+
+
+┌────────────────┐
+│ MISSING METHOD ├─ This `to_str` method is being called on a value whose ────┐
+└┬───────────────┘  type doesn't have that method.                            │
+ │                                                                            │
+ │  expect rgb(124, 56, 245).to_str() == "rgb(124, 56, 245)"                  │
+ │                           ‾‾‾‾‾‾                                           │
+ └──────────────────────────────────────────────────────────── Color.md:47:26 ┘
+
+    The value's type, which does not have a method named `to_str`, is:
+
+        Color
+
+    Hint: For this to work, the type would need to have a method named `to_str`
+    associated with it in the type's declaration.
+
+
+┌────────────────┐
+│ MISSING METHOD ├─ This `to_str` method is being called on a value whose ────┐
+└┬───────────────┘  type doesn't have that method.                            │
+ │                                                                            │
+ │  expect rgba(124, 56, 245, 255).to_str() == "rgba(124, 56, 245, 1.0)"      │
+ │                                 ‾‾‾‾‾‾                                     │
+ └──────────────────────────────────────────────────────────── Color.md:48:32 ┘
+
+    The value's type, which does not have a method named `to_str`, is:
+
+        Color
+
+    Hint: For this to work, the type would need to have a method named `to_str`
+    associated with it in the type's declaration.
 
 # TOKENS
 ~~~zig
-KwModule,OpenSquare,
-UpperIdent,Comma,
-LowerIdent,Comma,
-LowerIdent,Comma,
-LowerIdent,Comma,
-LowerIdent,Comma,
-LowerIdent,Comma,
-CloseSquare,
 UpperIdent,OpColonEqual,OpenSquare,
 UpperIdent,NoSpaceOpenRound,UpperIdent,Comma,UpperIdent,Comma,UpperIdent,CloseRound,Comma,
 UpperIdent,NoSpaceOpenRound,UpperIdent,Comma,UpperIdent,Comma,UpperIdent,Comma,UpperIdent,CloseRound,Comma,
@@ -330,19 +304,7 @@ EndOfFile,
 # PARSE
 ~~~clojure
 (file
-	(module
-		(exposes
-			(exposed-upper-ident (text "Color"))
-			(exposed-lower-ident
-				(text "to_str"))
-			(exposed-lower-ident
-				(text "rgb"))
-			(exposed-lower-ident
-				(text "rgba"))
-			(exposed-lower-ident
-				(text "hex"))
-			(exposed-lower-ident
-				(text "named"))))
+	(type-module)
 	(statements
 		(s-type-decl
 			(header (name "Color")
@@ -702,15 +664,6 @@ EndOfFile,
 ~~~
 # FORMATTED
 ~~~roc
-module [
-	Color,
-	to_str,
-	rgb,
-	rgba,
-	hex,
-	named,
-]
-
 Color := [
 	RGB(U8, U8, U8),
 	RGBA(U8, U8, U8, Dec),
@@ -810,9 +763,9 @@ is_named_color = |str| {
 			(e-block
 				(s-let
 					(p-assign (ident "rounded"))
-					(e-dispatch-call (method "div_by") (constraint-fn-var 637)
+					(e-dispatch-call (method "div_by") (constraint-fn-var 649)
 						(receiver
-							(e-dispatch-call (method "to_frac") (constraint-fn-var 601)
+							(e-dispatch-call (method "to_frac") (constraint-fn-var 613)
 								(receiver
 									(e-lookup-local
 										(p-assign (ident "a"))))
@@ -845,7 +798,7 @@ is_named_color = |str| {
 			(e-block
 				(s-let
 					(p-assign (ident "bytes"))
-					(e-dispatch-call (method "to_utf8") (constraint-fn-var 832)
+					(e-dispatch-call (method "to_utf8") (constraint-fn-var 844)
 						(receiver
 							(e-lookup-local
 								(p-assign (ident "str"))))
@@ -861,13 +814,13 @@ is_named_color = |str| {
 									(e-if
 										(if-branches
 											(if-branch
-												(e-dispatch-call (method "is_gte") (constraint-fn-var 890)
+												(e-dispatch-call (method "is_gte") (constraint-fn-var 902)
 													(receiver
 														(e-lookup-local
 															(p-assign (ident "b"))))
 													(args
 														(e-num (value "48"))))
-												(e-dispatch-call (method "is_lte") (constraint-fn-var 931)
+												(e-dispatch-call (method "is_lte") (constraint-fn-var 943)
 													(receiver
 														(e-lookup-local
 															(p-assign (ident "b"))))
@@ -887,13 +840,13 @@ is_named_color = |str| {
 											(e-if
 												(if-branches
 													(if-branch
-														(e-dispatch-call (method "is_gte") (constraint-fn-var 985)
+														(e-dispatch-call (method "is_gte") (constraint-fn-var 997)
 															(receiver
 																(e-lookup-local
 																	(p-assign (ident "b"))))
 															(args
 																(e-num (value "97"))))
-														(e-dispatch-call (method "is_lte") (constraint-fn-var 1026)
+														(e-dispatch-call (method "is_lte") (constraint-fn-var 1038)
 															(receiver
 																(e-lookup-local
 																	(p-assign (ident "b"))))
@@ -910,13 +863,13 @@ is_named_color = |str| {
 										(e-if
 											(if-branches
 												(if-branch
-													(e-dispatch-call (method "is_gte") (constraint-fn-var 1077)
+													(e-dispatch-call (method "is_gte") (constraint-fn-var 1089)
 														(receiver
 															(e-lookup-local
 																(p-assign (ident "b"))))
 														(args
 															(e-num (value "65"))))
-													(e-dispatch-call (method "is_lte") (constraint-fn-var 1118)
+													(e-dispatch-call (method "is_lte") (constraint-fn-var 1130)
 														(receiver
 															(e-lookup-local
 																(p-assign (ident "b"))))
@@ -951,7 +904,7 @@ is_named_color = |str| {
 											(e-if
 												(if-branches
 													(if-branch
-														(e-dispatch-call (method "is_char_in_hex_range") (constraint-fn-var 1250)
+														(e-dispatch-call (method "is_char_in_hex_range") (constraint-fn-var 1262)
 															(receiver
 																(e-lookup-local
 																	(p-assign (ident "a"))))
@@ -959,7 +912,7 @@ is_named_color = |str| {
 														(e-if
 															(if-branches
 																(if-branch
-																	(e-dispatch-call (method "is_char_in_hex_range") (constraint-fn-var 1256)
+																	(e-dispatch-call (method "is_char_in_hex_range") (constraint-fn-var 1268)
 																		(receiver
 																			(e-lookup-local
 																				(p-assign (ident "b"))))
@@ -967,7 +920,7 @@ is_named_color = |str| {
 																	(e-if
 																		(if-branches
 																			(if-branch
-																				(e-dispatch-call (method "is_char_in_hex_range") (constraint-fn-var 1262)
+																				(e-dispatch-call (method "is_char_in_hex_range") (constraint-fn-var 1274)
 																					(receiver
 																						(e-lookup-local
 																							(p-assign (ident "c"))))
@@ -975,7 +928,7 @@ is_named_color = |str| {
 																				(e-if
 																					(if-branches
 																						(if-branch
-																							(e-dispatch-call (method "is_char_in_hex_range") (constraint-fn-var 1268)
+																							(e-dispatch-call (method "is_char_in_hex_range") (constraint-fn-var 1280)
 																								(receiver
 																									(e-lookup-local
 																										(p-assign (ident "d"))))
@@ -983,12 +936,12 @@ is_named_color = |str| {
 																							(e-if
 																								(if-branches
 																									(if-branch
-																										(e-dispatch-call (method "is_char_in_hex_range") (constraint-fn-var 1274)
+																										(e-dispatch-call (method "is_char_in_hex_range") (constraint-fn-var 1286)
 																											(receiver
 																												(e-lookup-local
 																													(p-assign (ident "e"))))
 																											(args))
-																										(e-dispatch-call (method "is_char_in_hex_range") (constraint-fn-var 1280)
+																										(e-dispatch-call (method "is_char_in_hex_range") (constraint-fn-var 1292)
 																											(receiver
 																												(e-lookup-local
 																													(p-assign (ident "f"))))
@@ -1035,7 +988,7 @@ is_named_color = |str| {
 																		(p-assign (ident "#interp_0"))
 																		(e-lookup-local
 																			(p-assign (ident "str"))))
-																	(e-interpolation (constraint-fn-var 1399)
+																	(e-interpolation (constraint-fn-var 1411)
 																		(first
 																			(e-literal (string "Expected Hex to be in the range 0-9, a-f, A-F, got ")))
 																		(parts
@@ -1056,7 +1009,7 @@ is_named_color = |str| {
 															(p-assign (ident "#interp_1"))
 															(e-lookup-local
 																(p-assign (ident "str"))))
-														(e-interpolation (constraint-fn-var 1463)
+														(e-interpolation (constraint-fn-var 1475)
 															(first
 																(e-literal (string "Expected Hex must start with # and be 7 characters long, got ")))
 															(parts
@@ -1195,7 +1148,7 @@ is_named_color = |str| {
 			(e-if
 				(if-branches
 					(if-branch
-						(e-dispatch-call (method "is_named_color") (constraint-fn-var 1875)
+						(e-dispatch-call (method "is_named_color") (constraint-fn-var 1887)
 							(receiver
 								(e-lookup-local
 									(p-assign (ident "str"))))
@@ -1217,7 +1170,7 @@ is_named_color = |str| {
 											(p-assign (ident "#interp_9"))
 											(e-lookup-local
 												(p-assign (ident "str"))))
-										(e-interpolation (constraint-fn-var 1968)
+										(e-interpolation (constraint-fn-var 1980)
 											(first
 												(e-literal (string "Unknown color ")))
 											(parts
@@ -1240,7 +1193,7 @@ is_named_color = |str| {
 			(e-block
 				(s-let
 					(p-assign (ident "colors"))
-					(e-call (constraint-fn-var 2058)
+					(e-call (constraint-fn-var 2070)
 						(e-lookup-external
 							(builtin))
 						(e-list
@@ -1251,7 +1204,7 @@ is_named_color = |str| {
 									(e-literal (string "AntiqueWhite")))
 								(e-string
 									(e-literal (string "Aqua")))))))
-				(e-dispatch-call (method "contains") (constraint-fn-var 2059)
+				(e-dispatch-call (method "contains") (constraint-fn-var 2071)
 					(receiver
 						(e-lookup-local
 							(p-assign (ident "colors"))))
@@ -1277,9 +1230,9 @@ is_named_color = |str| {
 	(s-expect
 		(e-method-eq (negated "false")
 			(lhs
-				(e-dispatch-call (method "to_str") (constraint-fn-var 2401)
+				(e-dispatch-call (method "to_str") (constraint-fn-var 2413)
 					(receiver
-						(e-call (constraint-fn-var 2190)
+						(e-call (constraint-fn-var 2202)
 							(e-lookup-local
 								(p-assign (ident "rgb")))
 							(e-num (value "124"))
@@ -1292,9 +1245,9 @@ is_named_color = |str| {
 	(s-expect
 		(e-method-eq (negated "false")
 			(lhs
-				(e-dispatch-call (method "to_str") (constraint-fn-var 2841)
+				(e-dispatch-call (method "to_str") (constraint-fn-var 2853)
 					(receiver
-						(e-call (constraint-fn-var 2560)
+						(e-call (constraint-fn-var 2572)
 							(e-lookup-local
 								(p-assign (ident "rgba")))
 							(e-num (value "124"))
@@ -1308,9 +1261,9 @@ is_named_color = |str| {
 	(s-expect
 		(e-method-eq (negated "false")
 			(lhs
-				(e-dispatch-call (method "map_ok") (constraint-fn-var 2909)
+				(e-dispatch-call (method "map_ok") (constraint-fn-var 2921)
 					(receiver
-						(e-call (constraint-fn-var 2884)
+						(e-call (constraint-fn-var 2896)
 							(e-lookup-local
 								(p-assign (ident "hex")))
 							(e-string

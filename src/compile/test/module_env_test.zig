@@ -32,9 +32,9 @@ test "ModuleEnv.Serialized roundtrip" {
 
     try original.common.calcLineStarts(gpa);
 
-    const import_json = try original.imports.getOrPut(gpa, &original.common.strings, "json.Json");
-    try std.testing.expectEqual(@as(u32, 1), @intFromEnum(try original.imports.getOrPut(gpa, &original.common.strings, "core.List")));
-    const import_json_duplicate = try original.imports.getOrPut(gpa, &original.common.strings, "json.Json");
+    const import_json = try original.imports.getOrPut(gpa, &original.common, "json.Json");
+    try std.testing.expectEqual(@as(u32, 1), @intFromEnum(try original.imports.getOrPut(gpa, &original.common, "core.List")));
+    const import_json_duplicate = try original.imports.getOrPut(gpa, &original.common, "json.Json");
     try std.testing.expectEqual(import_json, import_json_duplicate);
     try std.testing.expectEqual(@as(usize, 2), original.imports.imports.len());
 
@@ -108,13 +108,10 @@ test "ModuleEnv.Serialized roundtrip" {
     // Plus 2 fully qualified builtin type names: Builtin.List, Builtin.Box
     // Plus 2 fully qualified Box intrinsic method names: Builtin.Box.box, Builtin.Box.unbox
     // Plus 1 fully qualified Bool type name: Builtin.Bool
-    // Count reflects the merged builtin set: origin/main's identifiers
-    // (Str.find_first, parser_for, encode_to, structural parser field metadata)
-    // plus this branch's `to_hash` method name used for structural hash
-    // derivation. Ranges desugar to the generic Iter.exclusive_range /
-    // inclusive_range constructors, so no per-type range method identifiers are
-    // interned.
-    try testing.expectEqual(@as(u32, 98), original.common.idents.interner.entry_count);
+    // Plus 4 fully qualified Crypto builtin type names: SHA256/BLAKE3 Digest and Hasher
+    // Count reflects the merged builtin set, including structural parser/encoder
+    // method identifiers, Builtin.Json.Encoding's parse/encode helpers, and Crypto.
+    try testing.expectEqual(@as(u32, 106), original.common.idents.interner.entry_count);
     try testing.expectEqualStrings("hello", original.getIdent(hello_idx));
     try testing.expectEqualStrings("world", original.getIdent(world_idx));
 
@@ -125,7 +122,7 @@ test "ModuleEnv.Serialized roundtrip" {
     // First verify that the CommonEnv data was preserved after deserialization
     // Should have same identifiers as original, including the builtin structural method identifiers.
     // (Note: "Try" is now shared with well-known identifiers, reducing total by 1)
-    try testing.expectEqual(@as(u32, 98), env.common.idents.interner.entry_count);
+    try testing.expectEqual(@as(u32, 106), env.common.idents.interner.entry_count);
 
     try testing.expectEqual(@as(usize, 1), env.common.exposed_items.count());
     try testing.expectEqual(@as(?u32, 42), env.common.exposed_items.getValueNodeIndexById(gpa, @as(u32, @bitCast(hello_idx))));
@@ -159,7 +156,7 @@ test "ModuleEnv.Serialized roundtrip" {
     defer test_arena.deinit();
     const test_alloc = test_arena.allocator();
 
-    const import4 = try env.imports.getOrPut(test_alloc, &env.common.strings, "json.Json");
+    const import4 = try env.imports.getOrPut(test_alloc, &env.common, "json.Json");
 
     // Should find existing json.Json (deduplication)
     try testing.expectEqual(@as(u32, 0), @intFromEnum(import4));
@@ -168,7 +165,7 @@ test "ModuleEnv.Serialized roundtrip" {
 
 test "ModuleEnv.Serialized finalizes method metadata tables before writing" {
     const gpa = std.testing.allocator;
-    const source = "module []\n";
+    const source = "";
 
     var original = try ModuleEnv.init(gpa, source);
     defer original.deinit();
@@ -211,6 +208,60 @@ test "ModuleEnv.Serialized finalizes method metadata tables before writing" {
     try std.testing.expect(serialized.method_defs.sorted);
     try std.testing.expect(serialized.method_defs.deduplicated);
     try std.testing.expectEqual(@as(u64, 2), serialized.method_defs.entries_len);
+}
+
+test "ModuleEnv.Serialized roundtrip preserves file dependency states" {
+    const gpa = std.testing.allocator;
+    const source = "";
+
+    var original = try ModuleEnv.init(gpa, source);
+    defer original.deinit();
+
+    try original.initCIRFields("Test");
+
+    const present_idx = try original.recordFileDependency("data.txt");
+    const present_hash = [_]u8{0x11} ** 32;
+    original.setFileDependencyContentHash(present_idx, present_hash);
+
+    const missing_idx = try original.recordFileDependency("missing.txt");
+    original.setFileDependencyMissing(missing_idx);
+
+    const unreadable_idx = try original.recordFileDependency("denied.txt");
+    original.setFileDependencyUnreadable(unreadable_idx);
+
+    var arena = collections.SingleThreadArena.init(gpa);
+    defer arena.deinit();
+    const arena_alloc = arena.allocator();
+
+    var writer = CompactWriter.init();
+    defer writer.deinit(arena_alloc);
+
+    const serialized = try writer.appendAlloc(arena_alloc, ModuleEnv.Serialized);
+    try serialized.serialize(&original, arena_alloc, &writer);
+
+    const buffer = try gpa.alignedAlloc(u8, CompactWriter.SERIALIZATION_ALIGNMENT, writer.total_bytes);
+    defer gpa.free(buffer);
+    _ = try writer.writeToBuffer(buffer);
+
+    const deserialized_ptr: *ModuleEnv.Serialized = @ptrCast(@alignCast(buffer.ptr));
+    const env = try deserialized_ptr.deserializeWithMutableTypes(@intFromPtr(buffer.ptr), gpa, source, "Test");
+    defer {
+        env.deinitCachedModule();
+        gpa.destroy(env);
+    }
+
+    const deps = env.file_dependencies.items.items;
+    try testing.expectEqual(@as(usize, 3), deps.len);
+
+    try testing.expectEqual(ModuleEnv.FileDependencyState.present, deps[0].state);
+    try testing.expectEqualStrings("data.txt", env.fileDependencyRelativePath(deps[0]));
+    try testing.expectEqualSlices(u8, &present_hash, &deps[0].content_hash);
+
+    try testing.expectEqual(ModuleEnv.FileDependencyState.missing, deps[1].state);
+    try testing.expectEqualStrings("missing.txt", env.fileDependencyRelativePath(deps[1]));
+
+    try testing.expectEqual(ModuleEnv.FileDependencyState.unreadable, deps[2].state);
+    try testing.expectEqualStrings("denied.txt", env.fileDependencyRelativePath(deps[2]));
 }
 
 test "ModuleEnv pushExprTypesToSExprTree extracts and formats types" {

@@ -114,56 +114,6 @@ sub iter_zig_files {
 
 my @violations;
 
-sub read_file {
-    my ($rel) = @_;
-    my $path = File::Spec->catfile($ROOT, $rel);
-    open my $fh, '<', $path or die "failed to read $rel: $!\n";
-    local $/;
-    my $source = <$fh>;
-    close $fh or die "failed to close $rel: $!\n";
-    return $source;
-}
-
-sub source_slice {
-    my ($source, $start, $end, $label) = @_;
-    my $start_index = index($source, $start);
-    if ($start_index < 0) {
-        push @violations, "$label: missing start marker: $start";
-        return '';
-    }
-    my $after_start = substr($source, $start_index);
-    my $end_index = index($after_start, $end);
-    if ($end_index < 0) {
-        push @violations, "$label: missing end marker: $end";
-        return '';
-    }
-    return substr($after_start, 0, $end_index);
-}
-
-sub check_builtin_iterator_step_shape {
-    my $rel = 'src/build/roc/Builtin.roc';
-    my $source = read_file($rel);
-    my $iter_step = source_slice($source, 'Iter(item) :: {', '# The general unfold.', "$rel:Iter");
-    my $stream_step = source_slice($source, 'Stream(item) :: {', 'from_iter : Iter(item) -> Stream(item)', "$rel:Stream");
-
-    my $iter_expected = 'step : () -> [One({ item : item, rest : Iter(item) }), Skip({ rest : Iter(item) }), Done]';
-    my $stream_expected = 'step! : () => [One({ item : item, rest : Stream(item) }), Skip({ rest : Stream(item) }), Done]';
-
-    if (index($iter_step, $iter_expected) < 0) {
-        push @violations, "$rel:Iter: public Iter step result shape changed or no longer has exactly One/Skip/Done";
-    }
-    if ($iter_step =~ /\bAppend\b/) {
-        push @violations, "$rel:Iter: public Iter step result must not contain Append";
-    }
-
-    if (index($stream_step, $stream_expected) < 0) {
-        push @violations, "$rel:Stream: public Stream step result shape changed or no longer has exactly One/Skip/Done";
-    }
-    if ($stream_step =~ /\bAppend\b/) {
-        push @violations, "$rel:Stream: public Stream step result must not contain Append";
-    }
-}
-
 for my $rel (iter_zig_files()) {
     my $path = File::Spec->catfile($ROOT, $rel);
     open my $fh, '<', $path or die "failed to read $rel: $!\n";
@@ -184,7 +134,180 @@ for my $rel (iter_zig_files()) {
     close $fh or die "failed to close $rel: $!\n";
 }
 
-check_builtin_iterator_step_shape();
+sub brace_delta {
+    my ($line) = @_;
+    my $opens = ($line =~ tr/{/{/);
+    my $closes = ($line =~ tr/}/}/);
+    return $opens - $closes;
+}
+
+sub check_body_context_output_access {
+    my $rel = 'src/postcheck/monotype/lower.zig';
+    my $path = File::Spec->catfile($ROOT, $rel);
+    open my $fh, '<', $path or die "failed to read $rel: $!\n";
+
+    my %allowed_fn = map { $_ => 1 } qw(
+        addExpr
+        addPat
+        addLocal
+        addLocalWithBinder
+        addFn
+        reserveDef
+        setDef
+        addExprSpan
+        addPatSpan
+        addTypedLocalSpan
+        addStmt
+        addStmtSpan
+        addFieldExprSpan
+        addRecordDestructSpan
+        addBranchSpan
+        addIfBranchSpan
+        addStrPatternStepSpan
+        addStringLiteral
+        addStringView
+        addComptimeSite
+        exprLoc
+        exprRegion
+        exprType
+        patData
+        localType
+    );
+
+    my $direct_output = qr/self\.builder\.program\.(?:addExpr|addPat|addLocal|addLocalWithBinder|addFn|addExprSpan|addPatSpan|addTypedLocalSpan|addStmt|addStmtSpan|addFieldExprSpan|addRecordDestructSpan|addBranchSpan|addIfBranchSpan|addStrPatternStepSpan|addStringLiteral|addStringView|addComptimeSite|defs\.append|defs\.items|exprs\.items|pats\.items|locals\.items)\b/;
+
+    my $in_body_context = 0;
+    my $body_depth = 0;
+    my $current_fn;
+    my $fn_started = 0;
+    my $fn_depth = 0;
+    my $line_no = 0;
+
+    while (my $line = <$fh>) {
+        ++$line_no;
+        chomp $line;
+
+        if (!$in_body_context) {
+            if ($line =~ /^\s*const\s+BodyContext\s*=\s*struct\s*\{/) {
+                $in_body_context = 1;
+                $body_depth = brace_delta($line);
+            }
+            next;
+        }
+
+        if (!defined $current_fn && $line =~ /^\s+fn\s+([A-Za-z0-9_]+)\b/) {
+            $current_fn = $1;
+            $fn_started = 0;
+            $fn_depth = 0;
+        }
+
+        if ($line =~ $direct_output && !$allowed_fn{$current_fn // ''}) {
+            push @violations, "$rel:$line_no: body-context-final-output: $line";
+        }
+
+        my $delta = brace_delta($line);
+        $body_depth += $delta;
+
+        if (defined $current_fn) {
+            if (!$fn_started && $line =~ /\{/) {
+                $fn_started = 1;
+            }
+            $fn_depth += $delta if $fn_started;
+            if ($fn_started && $fn_depth <= 0) {
+                undef $current_fn;
+                $fn_started = 0;
+                $fn_depth = 0;
+            }
+        }
+
+        last if $body_depth <= 0;
+    }
+
+    close $fh or die "failed to close $rel: $!\n";
+}
+
+check_body_context_output_access();
+
+sub check_active_body_draft_seal_access {
+    my $rel = 'src/postcheck/monotype/lower.zig';
+    my $path = File::Spec->catfile($ROOT, $rel);
+    open my $fh, '<', $path or die "failed to read $rel: $!\n";
+
+    my $current_fn;
+    my $fn_started = 0;
+    my $fn_depth = 0;
+    my $in_test = 0;
+    my $test_started = 0;
+    my $test_depth = 0;
+    my $line_no = 0;
+
+    while (my $line = <$fh>) {
+        ++$line_no;
+        chomp $line;
+
+        if (!$in_test && $line =~ /^\s*test\s+"/) {
+            $in_test = 1;
+            $test_started = 0;
+            $test_depth = 0;
+        }
+
+        if (!$in_test && !defined $current_fn && $line =~ /^\s+fn\s+([A-Za-z0-9_]+)\b/) {
+            $current_fn = $1;
+            $fn_started = 0;
+            $fn_depth = 0;
+        }
+
+        if (!$in_test && ($current_fn // '') ne 'sealActiveBodyDraft') {
+            if ($line =~ /\b[A-Za-z_][A-Za-z0-9_]*\.sealCoreIntoProgram\(/) {
+                push @violations, "$rel:$line_no: active-body-draft-seal-bypass: $line";
+            }
+            if ($line =~ /\b[A-Za-z_][A-Za-z0-9_]*\.markNestedReady\(/) {
+                push @violations, "$rel:$line_no: active-body-draft-seal-bypass: $line";
+            }
+            if ($line =~ /\b[A-Za-z_][A-Za-z0-9_]*\.seal\(self,\s*graph,\s*&sealer/) {
+                push @violations, "$rel:$line_no: active-body-draft-seal-bypass: $line";
+            }
+            if ($line =~ /\bBodyDraftStore\.finalIdOffsets\(self\.program\)/) {
+                push @violations, "$rel:$line_no: active-body-draft-seal-bypass: $line";
+            }
+        }
+        if (!$in_test && ($current_fn // '') ne 'activeTypeFromNode') {
+            if ($line =~ /\bactiveTypeViewForNode\(/) {
+                push @violations, "$rel:$line_no: active-graph-view-bypass: $line";
+            }
+        }
+
+        my $delta = brace_delta($line);
+
+        if ($in_test) {
+            if (!$test_started && $line =~ /\{/) {
+                $test_started = 1;
+            }
+            $test_depth += $delta if $test_started;
+            if ($test_started && $test_depth <= 0) {
+                $in_test = 0;
+                $test_started = 0;
+                $test_depth = 0;
+            }
+        }
+
+        if (defined $current_fn) {
+            if (!$fn_started && $line =~ /\{/) {
+                $fn_started = 1;
+            }
+            $fn_depth += $delta if $fn_started;
+            if ($fn_started && $fn_depth <= 0) {
+                undef $current_fn;
+                $fn_started = 0;
+                $fn_depth = 0;
+            }
+        }
+    }
+
+    close $fh or die "failed to close $rel: $!\n";
+}
+
+check_active_body_draft_seal_access();
 
 if (@violations) {
     print "Post-check architecture violations found:\n";

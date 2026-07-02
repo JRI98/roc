@@ -764,7 +764,7 @@ fn parseExposedItemTokens(self: *Parser) std.mem.Allocator.Error!AST.ExposedItem
         },
         .UpperIdent => {
             var as: ?TokenIdx = null;
-            const qual_result = try self.readQualificationChain();
+            const qual_result = try self.readQualificationChain(.all_segments);
             self.pos = qual_result.final_token + 1;
             const ident = qual_result.final_token;
             if (self.peek() == .KwAs) {
@@ -1943,6 +1943,11 @@ const QualificationResult = struct {
     is_upper: bool,
 };
 
+const QualificationMode = enum {
+    all_segments,
+    expression_value_boundary,
+};
+
 fn CurrentStack(comptime State: type) type {
     return struct {
         current: ?State = null,
@@ -2004,6 +2009,9 @@ const PatternTagArgsState = struct {
     final_token: Token.Idx,
     qualifiers: Token.Span,
     scratch_top: u32,
+    /// True when parsing `Type.(pattern)` nominal-value destructuring args,
+    /// false for ordinary `Tag(args)` application args.
+    backing_value: bool = false,
 };
 
 const PatternListState = struct {
@@ -2154,6 +2162,7 @@ const ExprCollectionResult = union(enum) {
     tuple,
     apply: ExprAfterApplyArgsState,
     method_apply: ExprAfterMethodArgsState,
+    nominal_apply: ExprAfterNominalApplyArgsState,
     arrow_apply: ExprArrowAppAfterArgsState,
 };
 
@@ -2177,6 +2186,12 @@ const ExprAfterMethodArgsState = struct {
     min_bp: u8,
     receiver: AST.Expr.Idx,
     method_token: Token.Idx,
+};
+
+const ExprAfterNominalApplyArgsState = struct {
+    start: Token.Idx,
+    min_bp: u8,
+    mapper: AST.Expr.Idx,
 };
 
 const ExprAfterBinaryRhsState = struct {
@@ -2661,7 +2676,7 @@ const TypeFnAfterRetState = struct {
 
 /// Parses a qualification chain (e.g., "json.Core.Utf8" -> ["json", "Core"])
 /// Returns the qualifiers and the final token
-fn readQualificationChain(self: *Parser) std.mem.Allocator.Error!QualificationResult {
+fn readQualificationChain(self: *Parser, mode: QualificationMode) std.mem.Allocator.Error!QualificationResult {
     std.debug.assert(self.peek() == .UpperIdent or self.peek() == .LowerIdent);
 
     const scratch_top = self.store.scratchTokenTop();
@@ -2672,6 +2687,7 @@ fn readQualificationChain(self: *Parser) std.mem.Allocator.Error!QualificationRe
     self.advance();
 
     var saw_qualifier = false;
+    var saw_lower_segment = false;
     while (true) {
         switch (self.peek()) {
             .NoSpaceDotUpperIdent => {
@@ -2682,10 +2698,14 @@ fn readQualificationChain(self: *Parser) std.mem.Allocator.Error!QualificationRe
                 self.advance();
             },
             .NoSpaceDotLowerIdent => {
+                if (mode == .expression_value_boundary and saw_lower_segment) {
+                    break;
+                }
                 saw_qualifier = true;
                 try self.store.addScratchToken(final_token);
                 final_token = self.pos;
                 is_upper = false;
+                saw_lower_segment = true;
                 self.advance();
             },
             else => break,
@@ -3027,7 +3047,7 @@ fn runExprStatementKernel(
                 }
                 if (tok == .UpperIdent) {
                     const start = self.pos;
-                    const qual_result = try self.readQualificationChain();
+                    const qual_result = try self.readQualificationChain(.expression_value_boundary);
                     self.pos = qual_result.final_token + 1;
                     const expr = if (qual_result.is_upper)
                         try self.store.addExpr(.{ .tag = .{
@@ -3343,6 +3363,29 @@ fn runExprStatementKernel(
                 continue :expr_kernel .record_fields_next;
             }
 
+            // `Type.(args)` nominal value/tuple construction. Only treat `.(` as
+            // construction when the mapper is a tag/type path (`Distance`,
+            // `Module.Type`); for any other mapper (e.g. `0.(`) leave the tokens
+            // unconsumed so it surfaces as a parse error instead of a construction
+            // node canonicalization would only reject.
+            if (tok == .Dot and self.peekN(1) == .NoSpaceOpenRound and self.store.getExpr(expr_finish_state.expr) == .tag) {
+                self.advance();
+                self.advance();
+                try expr_collections.enter(open_allocator, .{
+                    .start = expr_finish_state.start,
+                    .min_bp = null,
+                    .scratch_top = self.store.scratchExprTop(),
+                    .end_token = .CloseRound,
+                    .result = .{ .nominal_apply = .{
+                        .start = expr_finish_state.start,
+                        .min_bp = expr_finish_state.min_bp,
+                        .mapper = expr_finish_state.expr,
+                    } },
+                    .close_error = .expected_expr_apply_close_round,
+                });
+                continue :expr_kernel .collection_next;
+            }
+
             if (tok_int < @intFromEnum(Token.Tag.OpenRound)) {
                 if (tok == .NoSpaceDotInt or tok == .DotInt) {
                     const elem_token = self.pos;
@@ -3457,7 +3500,7 @@ fn runExprStatementKernel(
                 const first_token_tag = self.peek();
                 if (first_token_tag == .LowerIdent or first_token_tag == .UpperIdent) {
                     const ident_start = self.pos;
-                    const qual_result = try self.readQualificationChain();
+                    const qual_result = try self.readQualificationChain(.expression_value_boundary);
                     self.pos = qual_result.final_token + 1;
                     const is_tag = if (qual_result.qualifiers.span.len == 0)
                         first_token_tag == .UpperIdent
@@ -3963,6 +4006,15 @@ fn runExprStatementKernel(
                             expr_finish_state = .{ .start = method_state.start, .min_bp = method_state.min_bp, .expr = expr };
                             continue :expr_kernel .suffix;
                         },
+                        .nominal_apply => |nominal_state| {
+                            const expr = try self.store.addExpr(.{ .nominal_apply = .{
+                                .mapper = nominal_state.mapper,
+                                .args = span,
+                                .region = .{ .start = nominal_state.start, .end = self.pos },
+                            } });
+                            expr_finish_state = .{ .start = nominal_state.start, .min_bp = nominal_state.min_bp, .expr = expr };
+                            continue :expr_kernel .suffix;
+                        },
                         .arrow_apply => |arrow_state| {
                             const rhs = try self.store.addExpr(.{ .apply = .{
                                 .args = span,
@@ -4254,7 +4306,7 @@ fn runExprStatementKernel(
                 if (tok == .UpperIdent or tok == .LowerIdent) {
                     const start = self.pos;
                     const first_token_tag = self.peek();
-                    const qual_result = try self.readQualificationChain();
+                    const qual_result = try self.readQualificationChain(.all_segments);
                     self.pos = qual_result.final_token + 1;
 
                     const base_anno = if (first_token_tag == .LowerIdent and qual_result.qualifiers.span.len == 0)
@@ -5594,7 +5646,7 @@ fn runExprStatementKernel(
             } else if (tok_int < @intFromEnum(Token.Tag.OpPlus)) {
                 if (tok == .UpperIdent) {
                     const start = self.pos;
-                    const qual_result = try self.readQualificationChain();
+                    const qual_result = try self.readQualificationChain(.all_segments);
                     self.pos = qual_result.final_token + 1;
                     if (!qual_result.is_upper) {
                         last_pattern = try self.pushMalformed(AST.Pattern.Idx, .pattern_unexpected_token, start);
@@ -5607,6 +5659,21 @@ fn runExprStatementKernel(
                             .final_token = qual_result.final_token,
                             .qualifiers = qual_result.qualifiers,
                             .scratch_top = self.store.scratchPatternTop(),
+                        };
+                        continue :expr_kernel .pattern_tag_args_next;
+                    }
+                    if (self.peek() == .Dot and self.peekN(1) == .NoSpaceOpenRound) {
+                        // `Type.(pattern)` — nominal-value destructure, the inverse
+                        // of `Type.(value)` construction. Parse the backing
+                        // pattern(s) just like tag args, flagged as backing_value.
+                        self.advance(); // `.`
+                        self.advance(); // `(`
+                        pattern_tag_args_state = .{
+                            .start = start,
+                            .final_token = qual_result.final_token,
+                            .qualifiers = qual_result.qualifiers,
+                            .scratch_top = self.store.scratchPatternTop(),
+                            .backing_value = true,
                         };
                         continue :expr_kernel .pattern_tag_args_next;
                     }
@@ -5927,6 +5994,7 @@ fn runExprStatementKernel(
                     .args = args,
                     .tag_tok = pattern_tag_args_state.final_token,
                     .qualifiers = pattern_tag_args_state.qualifiers,
+                    .backing_value = pattern_tag_args_state.backing_value,
                 } });
                 continue :expr_kernel .pattern_complete;
             },
@@ -6324,7 +6392,7 @@ fn finishRecordExpr(
 }
 
 /// Binding power of the lhs and rhs of a particular operator.
-const BinOpBp = struct { left: u8, right: u8 };
+pub const BinOpBp = struct { left: u8, right: u8 };
 
 inline fn isInBinOpTokenRange(tok: Token.Tag) bool {
     const tok_int = @intFromEnum(tok);
@@ -6347,6 +6415,8 @@ const bin_op_bp_table = blk: {
     table[@intFromEnum(Token.Tag.OpPlus) - start] = .{ .left = 22, .right = 23 };
     table[@intFromEnum(Token.Tag.OpBinaryMinus) - start] = .{ .left = 22, .right = 23 };
     table[@intFromEnum(Token.Tag.OpDoubleQuestion) - start] = .{ .left = 20, .right = 21 };
+    // `lhs ? handler` (spaced `?`) binds looser than `??` and tighter than `=`/`==`.
+    table[@intFromEnum(Token.Tag.OpQuestion) - start] = .{ .left = 18, .right = 19 };
     table[@intFromEnum(Token.Tag.OpEquals) - start] = .{ .left = 17, .right = 17 };
     table[@intFromEnum(Token.Tag.OpNotEquals) - start] = .{ .left = 15, .right = 15 };
     table[@intFromEnum(Token.Tag.OpLessThan) - start] = .{ .left = 13, .right = 13 };
@@ -6372,7 +6442,7 @@ inline fn getTokenBPInRange(tok: Token.Tag) BinOpBp {
 }
 
 /// Get the binding power for a Token if it's a operator token, else return null.
-fn getTokenBP(tok: Token.Tag) ?BinOpBp {
+pub fn getTokenBP(tok: Token.Tag) ?BinOpBp {
     if (!isInBinOpTokenRange(tok)) return null;
     const bp = getTokenBPInRange(tok);
     return if (bp.left == 0) null else bp;

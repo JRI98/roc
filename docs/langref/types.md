@@ -130,8 +130,38 @@ p : Point
 p = { x: 1, y: 2 }    # a bare record literal becomes a Point here
 
 uid : UserId
-uid = 0               # a bare U64 becomes a UserId here
+uid = UserId.(0)      # a number literal needs explicit construction (see below)
 ```
+
+You can also construct a nominal value **explicitly** by naming the type. This is
+required when no expected type drives the conversion — for example, returning a
+nominal from a function whose argument is the plain backing value:
+
+```roc
+Distance := U64
+Pair := (U64, Str)
+
+d = Distance.(26)         # value backing
+pair = Pair.(1, "two")    # tuple backing
+p = Point.{ x: 1, y: 2 }  # record backing
+c = Color.Red             # tag backing (with a payload: `Color.Tag(payload)`)
+
+to_distance : U64 -> Distance
+to_distance = |n| Distance.(n)   # `|n| n` is a type error: a plain U64 is not a Distance
+```
+
+**Structural** literals — records and tags — coerce into a nominal type
+implicitly when the expected type supplies the identity (`p` and `c` above): the
+literal *is* the backing shape, so it lifts by unification.
+
+**Number and string** literals do not implicitly become a nominal. They coerce
+only into a builtin number/string type, or into a nominal that declares its own
+`from_numeral` / `from_quote`. For any other nominal — including a transparent
+newtype like `UserId := U64` — use explicit construction (`UserId.(0)`).
+
+A value that already has a concrete type — like the `U64` parameter `n` above —
+must also be constructed explicitly; it does not silently become a different
+nominal.
 
 ### Destructuring Nominal Types
 

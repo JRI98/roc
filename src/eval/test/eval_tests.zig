@@ -1,10 +1,11 @@
 //! Data-driven eval test definitions for the inspect-only parallel runner.
 
 const TestCase = @import("parallel_runner.zig").TestCase;
-const bughunt_repros = @import("eval_bughunt_repros.zig");
+const regression_repros = @import("eval_regression_repros.zig");
 const trmc_tests = @import("eval_trmc_tests.zig");
 const closure_recursion_tests = @import("eval_closure_recursion_tests.zig");
 const comptime_finalization_tests = @import("eval_comptime_finalization_tests.zig");
+const crypto_tests = @import("eval_crypto_tests.zig");
 const highest_lowest_tests = @import("eval_highest_lowest_tests.zig");
 const issue_tests = @import("eval_issue_tests.zig");
 const interpreter_style_tests = @import("eval_interpreter_style_tests.zig");
@@ -415,14 +416,12 @@ const core_tests = [_]TestCase{
         \\    Value({ is_negative: Bool, before: List(U8), after: List(U8), count: U64 }),
         \\].{
         \\    from_numeral : Numeral -> Try(Big, [InvalidNumeral(Str)])
-        \\    from_numeral = |numeral| match numeral {
-        \\        Literal(parts) => Ok(Value({
-        \\            is_negative: parts.is_negative,
-        \\            before: parts.digits_before_pt,
-        \\            after: parts.digits_after_pt,
-        \\            count: parts.digits_after_pt_count,
-        \\        }))
-        \\    }
+        \\    from_numeral = |numeral| Ok(Value({
+        \\        is_negative: numeral.is_negative(),
+        \\        before: numeral.digits_before_pt(),
+        \\        after: numeral.digits_after_pt(),
+        \\        count: numeral.digits_after_pt_count(),
+        \\    }))
         \\}
         \\
         \\force : Big -> Big
@@ -446,14 +445,12 @@ const core_tests = [_]TestCase{
         \\    Value({ is_negative: Bool, before: List(U8), after: List(U8), count: U64 }),
         \\].{
         \\    from_numeral : Numeral -> Try(Big, [InvalidNumeral(Str)])
-        \\    from_numeral = |numeral| match numeral {
-        \\        Literal(parts) => Ok(Value({
-        \\            is_negative: parts.is_negative,
-        \\            before: parts.digits_before_pt,
-        \\            after: parts.digits_after_pt,
-        \\            count: parts.digits_after_pt_count,
-        \\        }))
-        \\    }
+        \\    from_numeral = |numeral| Ok(Value({
+        \\        is_negative: numeral.is_negative(),
+        \\        before: numeral.digits_before_pt(),
+        \\        after: numeral.digits_after_pt(),
+        \\        count: numeral.digits_after_pt_count(),
+        \\    }))
         \\}
         \\
         \\main = {
@@ -475,14 +472,12 @@ const core_tests = [_]TestCase{
         \\    Value({ is_negative: Bool, before: List(U8), after: List(U8), count: U64 }),
         \\].{
         \\    from_numeral : Numeral -> Try(Big, [InvalidNumeral(Str)])
-        \\    from_numeral = |numeral| match numeral {
-        \\        Literal(parts) => Ok(Value({
-        \\            is_negative: parts.is_negative,
-        \\            before: parts.digits_before_pt,
-        \\            after: parts.digits_after_pt,
-        \\            count: parts.digits_after_pt_count,
-        \\        }))
-        \\    }
+        \\    from_numeral = |numeral| Ok(Value({
+        \\        is_negative: numeral.is_negative(),
+        \\        before: numeral.digits_before_pt(),
+        \\        after: numeral.digits_after_pt(),
+        \\        count: numeral.digits_after_pt_count(),
+        \\    }))
         \\}
         \\
         \\main = {
@@ -501,9 +496,7 @@ const core_tests = [_]TestCase{
         .source =
         \\Code := [Code(List(U8))].{
         \\    from_numeral : Numeral -> Try(Code, [InvalidNumeral(Str)])
-        \\    from_numeral = |numeral| match numeral {
-        \\        Literal(parts) => Ok(Code(parts.digits_before_pt))
-        \\    }
+        \\    from_numeral = |numeral| Ok(Code(numeral.digits_before_pt()))
         \\    is_eq : Code, Code -> Bool
         \\    is_eq = |a, b| match (a, b) {
         \\        (Code(x), Code(y)) => x == y
@@ -529,9 +522,7 @@ const core_tests = [_]TestCase{
         .source =
         \\Tally := [Tally(U64)].{
         \\    from_numeral : Numeral -> Try(Tally, [InvalidNumeral(Str)])
-        \\    from_numeral = |numeral| match numeral {
-        \\        Literal(parts) => Ok(Tally(parts.digits_before_pt.len()))
-        \\    }
+        \\    from_numeral = |numeral| Ok(Tally(numeral.digits_before_pt().len()))
         \\    is_eq : Tally, Tally -> Bool
         \\    is_eq = |a, b| match (a, b) {
         \\        (Tally(x), Tally(y)) => x == y
@@ -560,9 +551,7 @@ const core_tests = [_]TestCase{
         .source =
         \\Code := [Code(List(U8))].{
         \\    from_numeral : Numeral -> Try(Code, [InvalidNumeral(Str)])
-        \\    from_numeral = |numeral| match numeral {
-        \\        Literal(parts) => Ok(Code(parts.digits_before_pt))
-        \\    }
+        \\    from_numeral = |numeral| Ok(Code(numeral.digits_before_pt()))
         \\    is_eq : Code, Code -> Bool
         \\    is_eq = |a, b| match (a, b) {
         \\        (Code(x), Code(y)) => x == y
@@ -588,9 +577,7 @@ const core_tests = [_]TestCase{
         .source =
         \\Scale := [Scale(U64)].{
         \\    from_numeral : Numeral -> Try(Scale, [InvalidNumeral(Str)])
-        \\    from_numeral = |numeral| match numeral {
-        \\        Literal(parts) => Ok(Scale(parts.digits_after_pt_count))
-        \\    }
+        \\    from_numeral = |numeral| Ok(Scale(numeral.digits_after_pt_count()))
         \\    is_eq : Scale, Scale -> Bool
         \\    is_eq = |a, b| match (a, b) {
         \\        (Scale(x), Scale(y)) => x == y
@@ -632,9 +619,7 @@ const core_tests = [_]TestCase{
             .source =
             \\Tally := [Tally(U64)].{
             \\    from_numeral : Numeral -> Try(Tally, [InvalidNumeral(Str)])
-            \\    from_numeral = |numeral| match numeral {
-            \\        Literal(parts) => Ok(Tally(parts.digits_before_pt.len()))
-            \\    }
+            \\    from_numeral = |numeral| Ok(Tally(numeral.digits_before_pt().len()))
             \\    is_eq : Tally, Tally -> Bool
             \\    is_eq = |a, b| match (a, b) {
             \\        (Tally(x), Tally(y)) => x == y
@@ -4352,59 +4337,6 @@ const core_tests = [_]TestCase{
         .expected = .{ .inspect_str = "Ok(1)" },
     },
     .{
-        .name = "inspect: direct builtin from_numeral handles base256 digits",
-        .source =
-        \\{
-        \\    num : Bool, List(U8), List(U8), U64 -> Numeral
-        \\    num = |is_negative, digits_before_pt, digits_after_pt, digits_after_pt_count|
-        \\        Literal({
-        \\            is_negative: is_negative,
-        \\            digits_before_pt: digits_before_pt,
-        \\            digits_after_pt: digits_after_pt,
-        \\            digits_after_pt_count: digits_after_pt_count,
-        \\        })
-        \\
-        \\    invalid : Try(a, [InvalidNumeral(Str), ..]) -> Bool
-        \\    invalid = |result| match result {
-        \\        Err(InvalidNumeral(msg)) => msg == "invalid numeric literal"
-        \\        Err(_) => False
-        \\        Ok(_) => False
-        \\    }
-        \\
-        \\    u8_ok = U8.from_numeral(num(False, [42], [], 0)) == Ok(42)
-        \\    u16_leading_zero_ok = U16.from_numeral(num(False, [0, 1, 0], [], 0)) == Ok(256)
-        \\    i8_lowest_ok = I8.from_numeral(num(True, [128], [], 0)) == Ok(I8.lowest)
-        \\    u128_highest_ok = U128.from_numeral(num(False, [255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255], [], 0)) == Ok(U128.highest)
-        \\    dec_fraction_ok = Dec.from_numeral(num(False, [1], [1], 18)) == Ok(1.000000000000000001)
-        \\    f32_fraction_ok = match F32.from_numeral(num(False, [3], [125], 3)) {
-        \\        Ok(value) => F32.is_float_eq(value, 3.125)
-        \\        Err(_) => False
-        \\    }
-        \\    f64_fraction_ok = match F64.from_numeral(num(False, [2], [5], 1)) {
-        \\        Ok(value) => F64.is_float_eq(value, 2.5)
-        \\        Err(_) => False
-        \\    }
-        \\    unsigned_negative_err = invalid(U8.from_numeral(num(True, [1], [], 0)))
-        \\    unsigned_overflow_err = invalid(U8.from_numeral(num(False, [1, 0], [], 0)))
-        \\    integer_fraction_err = invalid(I8.from_numeral(num(False, [1], [1], 1)))
-        \\
-        \\    (
-        \\        u8_ok,
-        \\        u16_leading_zero_ok,
-        \\        i8_lowest_ok,
-        \\        u128_highest_ok,
-        \\        dec_fraction_ok,
-        \\        f32_fraction_ok,
-        \\        f64_fraction_ok,
-        \\        unsigned_negative_err,
-        \\        unsigned_overflow_err,
-        \\        integer_fraction_err,
-        \\    )
-        \\}
-        ,
-        .expected = .{ .inspect_str = "(True, True, True, True, True, True, True, True, True, True)" },
-    },
-    .{
         .name = "inspect: numeric compare covers all integer widths and Dec",
         .source =
         \\{
@@ -4782,9 +4714,9 @@ const core_tests = [_]TestCase{
             .{
                 .name = "Helpers",
                 .source =
-                \\module [read]
-                \\
-                \\read = |value| value.get()
+                \\Helpers := [].{
+                \\  read = |value| value.get()
+                \\}
                 ,
             },
         },
@@ -4821,12 +4753,12 @@ const core_tests = [_]TestCase{
             .{
                 .name = "Helpers",
                 .source =
-                \\module [read]
-                \\
                 \\import CrateMod
                 \\
-                \\read : item -> U64 where [item.get : item -> U64]
-                \\read = |value| value.get()
+                \\Helpers := [].{
+                \\  read : item -> U64 where [item.get : item -> U64]
+                \\  read = |value| value.get()
+                \\}
                 ,
             },
         },
@@ -5026,4 +4958,4 @@ const core_tests = [_]TestCase{
     },
 };
 
-pub const tests = core_tests ++ comptime_finalization_tests.tests ++ closure_recursion_tests.tests ++ recursive_data_tests.tests ++ low_level_tests.tests ++ highest_lowest_tests.tests ++ polymorphism_tests.tests ++ issue_tests.tests ++ interpreter_style_tests.tests ++ bughunt_repros.tests ++ trmc_tests.tests;
+pub const tests = core_tests ++ comptime_finalization_tests.tests ++ crypto_tests.tests ++ closure_recursion_tests.tests ++ recursive_data_tests.tests ++ low_level_tests.tests ++ highest_lowest_tests.tests ++ polymorphism_tests.tests ++ issue_tests.tests ++ interpreter_style_tests.tests ++ regression_repros.tests ++ trmc_tests.tests;

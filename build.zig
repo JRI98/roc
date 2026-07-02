@@ -69,6 +69,22 @@ fn configureBackend(step: *Step.Compile, target: ResolvedTarget) void {
     }
 }
 
+/// The watch module uses real macOS FSEvents (CoreFoundation/CoreServices) when building
+/// natively for macOS, and kernel32 for directory-change notifications on Windows. Any step
+/// that compiles the watch module (the roc exe and the tests that import it) must link these.
+fn linkWatchPlatformLibs(step: *Step.Compile, target: ResolvedTarget) void {
+    if (target.result.os.tag == .macos and
+        builtin.target.os.tag == .macos and
+        target.result.cpu.arch == builtin.target.cpu.arch and
+        target.result.abi == builtin.target.abi)
+    {
+        step.root_module.linkFramework("CoreFoundation", .{});
+        step.root_module.linkFramework("CoreServices", .{});
+    } else if (target.result.os.tag == .windows) {
+        step.root_module.linkSystemLibrary("kernel32", .{});
+    }
+}
+
 const TestHostOptions = struct {
     uses_stack_handler: bool = false,
 };
@@ -1598,7 +1614,7 @@ const CheckFxStep = struct {
 const BuiltinCompilerRun = struct {
     run: *Step.Run,
     builtin_bin: std.Build.LazyPath,
-    builtin_indices_bin: std.Build.LazyPath,
+    builtin_indices_zig: std.Build.LazyPath,
     builtin_artifact_bin: std.Build.LazyPath,
 };
 
@@ -1639,21 +1655,6 @@ fn createAndRunBuiltinCompiler(
     builtin_compiler_exe.root_module.addImport("reporting", roc_modules.reporting);
     builtin_compiler_exe.root_module.addImport("builtins", roc_modules.builtins);
 
-    // The builtin compiler reloads the just-written Builtin.bin via the same
-    // loader the runtime uses, so the baked artifact pairs identically with the
-    // env that BuiltinModules.init will load. `builtin_loading` lives in the eval
-    // module, which imports `compiled_builtins` (this compiler's own output), so
-    // it is added here as a standalone module to avoid that import cycle.
-    builtin_compiler_exe.root_module.addImport("builtin_loading", b.createModule(.{
-        .root_source_file = b.path("src/eval/builtin_loading.zig"),
-        .target = b.graph.host,
-        .optimize = .Debug,
-        .imports = &.{
-            .{ .name = "can", .module = roc_modules.can },
-            .{ .name = "collections", .module = roc_modules.collections },
-        },
-    }));
-
     // The builtin compiler publishes the Builtin module to a CheckedModuleArtifact
     // and must run the same compile-time finalizer the runtime uses (Builtin has
     // compile-time roots that must be evaluated into its ConstStore). The finalizer
@@ -1669,9 +1670,11 @@ fn createAndRunBuiltinCompiler(
         .imports = &.{
             .{ .name = "base", .module = roc_modules.base },
             .{ .name = "build_options", .module = roc_modules.build_options },
+            .{ .name = "backend", .module = roc_modules.backend },
             .{ .name = "builtins", .module = roc_modules.builtins },
             .{ .name = "can", .module = roc_modules.can },
             .{ .name = "check", .module = roc_modules.check },
+            .{ .name = "collections", .module = roc_modules.collections },
             .{ .name = "layout", .module = roc_modules.layout },
             .{ .name = "lir", .module = roc_modules.lir },
             .{ .name = "sljmp", .module = roc_modules.sljmp },
@@ -1694,13 +1697,13 @@ fn createAndRunBuiltinCompiler(
     }
 
     const builtin_bin = run_builtin_compiler.addOutputFileArg("Builtin.bin");
-    const builtin_indices_bin = run_builtin_compiler.addOutputFileArg("builtin_indices.bin");
+    const builtin_indices_zig = run_builtin_compiler.addOutputFileArg("builtin_indices.zig");
     const builtin_artifact_bin = run_builtin_compiler.addOutputFileArg("Builtin.artifact.bin");
 
     return .{
         .run = run_builtin_compiler,
         .builtin_bin = builtin_bin,
-        .builtin_indices_bin = builtin_indices_bin,
+        .builtin_indices_zig = builtin_indices_zig,
         .builtin_artifact_bin = builtin_artifact_bin,
     };
 }
@@ -2284,6 +2287,7 @@ pub fn build(b: *std.Build) void {
     const run_fmt_zig_step = b.step("run-fmt-zig", "Format all zig code");
     const run_snapshot_tool_step = b.step("run-snapshot-tool", "Run the snapshot tool to update snapshot files");
     const echo_wasm_step = b.step("build-echo-wasm", "Build the echo platform to zig-out/lib/echo.wasm");
+    const echo_wasm_archive_step = b.step("build-echo-wasm-archive", "Build echo.wasm and zstd-compress it to zig-out/lib/echo.wasm.zst");
 
     const build_test_hosts_step = b.step("build-test-hosts", "Build test platform host libraries");
     const build_release_step = b.step("build-release", "Build optimized release binary for distribution");
@@ -2472,24 +2476,29 @@ pub fn build(b: *std.Build) void {
         "Builtin.roc",
     );
 
-    // Copy builtin_indices.bin
-    _ = write_compiled_builtins.addCopyFile(
-        builtin_compiler.builtin_indices_bin,
-        "builtin_indices.bin",
-    );
-
     // Copy the baked CheckedModuleArtifact
     _ = write_compiled_builtins.addCopyFile(
         builtin_compiler.builtin_artifact_bin,
         "Builtin.artifact.bin",
     );
 
-    // Generate compiled_builtins.zig with hardcoded Builtin module
+    // Generate compiled_builtins.zig with hardcoded Builtin module.
+    // The embedded blobs are copied by Zig at compile time into 16-byte-aligned
+    // static storage, so runtime code can build views over them directly.
     const builtins_source_str =
-        \\pub const builtin_bin = @embedFile("Builtin.bin");
+        \\const generated_indices = @import("builtin_indices");
+        \\
+        \\const builtin_bin_raw = @embedFile("Builtin.bin");
+        \\pub var builtin_bin: [builtin_bin_raw.len]u8 align(16) = builtin_bin_raw.*;
         \\pub const builtin_source = @embedFile("Builtin.roc");
-        \\pub const builtin_indices_bin = @embedFile("builtin_indices.bin");
-        \\pub const builtin_artifact_bin = @embedFile("Builtin.artifact.bin");
+        \\const builtin_artifact_bin_raw = @embedFile("Builtin.artifact.bin");
+        \\pub var builtin_artifact_bin: [builtin_artifact_bin_raw.len]u8 align(16) = builtin_artifact_bin_raw.*;
+        \\pub const builtin_indices_raw = generated_indices.builtin_indices_raw;
+        \\pub fn builtinIndices(comptime CIR: type) CIR.BuiltinIndices {
+        \\    return generated_indices.builtinIndices(CIR);
+        \\}
+        \\pub const builtin_type_registry_hash = generated_indices.builtin_type_registry_hash;
+        \\pub const builtin_indices_layout_hash = generated_indices.builtin_indices_layout_hash;
         \\
     ;
 
@@ -2501,6 +2510,9 @@ pub fn build(b: *std.Build) void {
     const compiled_builtins_module = b.createModule(.{
         .root_source_file = compiled_builtins_source,
     });
+    compiled_builtins_module.addImport("builtin_indices", b.createModule(.{
+        .root_source_file = builtin_compiler.builtin_indices_zig,
+    }));
 
     const bytebox = b.dependency("bytebox", .{
         .target = target,
@@ -2673,7 +2685,7 @@ pub fn build(b: *std.Build) void {
     llvm_codegen_module.addImport("roc_target", roc_modules.roc_target);
     llvm_codegen_module.addImport("vendor_llvm_ir", roc_modules.vendor_llvm_ir);
 
-    const roc_exe = addMainExe(b, roc_modules, target, optimize, strip, omit_frame_pointer, use_system_llvm, user_llvm_path, flag_enable_tracy, zstd, compiled_builtins_module, write_compiled_builtins, llvm_codegen_module, flag_enable_tracy) orelse return;
+    const roc_exe = addMainExe(b, roc_modules, target, optimize, strip, omit_frame_pointer, use_system_llvm, user_llvm_path, flag_enable_tracy, zstd, compiled_builtins_module, write_compiled_builtins, llvm_codegen_module, flag_enable_tracy, true) orelse return;
     roc_modules.addAll(roc_exe);
     _ = install_and_run(b, no_bin, roc_exe, build_roc_step, run_roc_step, run_args);
 
@@ -2712,6 +2724,7 @@ pub fn build(b: *std.Build) void {
             write_compiled_builtins,
             llvm_codegen_module,
             null, // No tracy
+            false,
         );
         if (release_exe) |exe| {
             roc_modules.addAll(exe);
@@ -3335,6 +3348,26 @@ pub fn build(b: *std.Build) void {
         });
         build_playground_step.dependOn(&echo_wasm_install.step);
         echo_wasm_step.dependOn(&echo_wasm_install.step);
+
+        // build-echo-wasm-archive: compress echo.wasm into echo.wasm.zst using
+        // the same zstd streaming compressor as `roc bundle` (src/bundle/).
+        const echo_wasm_archive_exe = b.addExecutable(.{
+            .name = "echo_wasm_archive",
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("src/echo_platform/echo_wasm_archive.zig"),
+                .target = target,
+                .optimize = optimize,
+            }),
+        });
+        configureBackend(echo_wasm_archive_exe, target);
+        echo_wasm_archive_exe.root_module.addImport("bundle", roc_modules.bundle);
+        echo_wasm_archive_exe.root_module.linkLibrary(zstd.artifact("zstd"));
+
+        const echo_wasm_archive_cmd = b.addRunArtifact(echo_wasm_archive_exe);
+        echo_wasm_archive_cmd.addFileArg(echo_wasm.getEmittedBin());
+        const echo_wasm_archive_out = echo_wasm_archive_cmd.addOutputFileArg("echo.wasm.zst");
+        const echo_wasm_archive_install = b.addInstallFileWithDir(echo_wasm_archive_out, .lib, "echo.wasm.zst");
+        echo_wasm_archive_step.dependOn(&echo_wasm_archive_install.step);
 
         // Copy the echo platform www files alongside echo.wasm
         inline for (.{ "index.html", "app.js" }) |filename| {
@@ -4002,7 +4035,7 @@ pub fn build(b: *std.Build) void {
     build_test_lsp_integration_runner_step.dependOn(&lsp_integration_runner_exe.step);
 
     const run_lsp_integration = b.addRunArtifact(lsp_integration_runner_exe);
-    run_lsp_integration.expectExitCode(0);
+    run_lsp_integration.stdio = .inherit;
     for (test_filters) |filter| {
         run_lsp_integration.addArg("--filter");
         run_lsp_integration.addArg(filter);
@@ -4229,6 +4262,7 @@ pub fn build(b: *std.Build) void {
             .filters = test_filters,
         });
         roc_modules.addAll(cli_test);
+        linkWatchPlatformLibs(cli_test, target);
         cli_test.root_module.linkLibrary(zstd.artifact("zstd"));
         try addLlvmSupportToStep(
             b,
@@ -4281,12 +4315,7 @@ pub fn build(b: *std.Build) void {
         add_tracy(b, roc_modules.build_options, watch_test, target, false, flag_enable_tracy);
 
         // Link platform-specific libraries for file watching
-        if (target.result.os.tag == .macos and target_is_native) {
-            watch_test.root_module.linkFramework("CoreFoundation", .{});
-            watch_test.root_module.linkFramework("CoreServices", .{});
-        } else if (target.result.os.tag == .windows) {
-            watch_test.root_module.linkSystemLibrary("kernel32", .{});
-        }
+        linkWatchPlatformLibs(watch_test, target);
 
         build_test_zig_step.dependOn(&watch_test.step);
 
@@ -4760,7 +4789,6 @@ pub fn build(b: *std.Build) void {
             const http_app_output = build_http_app.addPrefixedOutputFileArg("--output=", http_app_exe_name);
             build_http_app.addFileArg(b.path("test/http-headers/app.roc"));
             build_http_app.addFileInput(b.path("test/http-headers/platform/main.roc"));
-            build_http_app.addFileInput(b.path("test/http-headers/platform/Headers.roc"));
             build_http_app.step.dependOn(final_http_host_step);
             build_http_app.step.dependOn(build_roc_step);
             const install_http_app = b.addInstallBinFile(http_app_output, http_app_exe_name);
@@ -4844,7 +4872,6 @@ pub fn build(b: *std.Build) void {
             const json_app_output = build_json_app.addPrefixedOutputFileArg("--output=", json_app_exe_name);
             build_json_app.addFileArg(b.path("test/json-decoder/app.roc"));
             build_json_app.addFileInput(b.path("test/json-decoder/platform/main.roc"));
-            build_json_app.addFileInput(b.path("test/json-decoder/platform/Json.roc"));
             build_json_app.step.dependOn(final_json_host_step);
             build_json_app.step.dependOn(build_roc_step);
             const install_json_app = b.addInstallBinFile(json_app_output, json_app_exe_name);
@@ -4862,7 +4889,6 @@ pub fn build(b: *std.Build) void {
             const json_camel_app_output = build_json_camel_app.addPrefixedOutputFileArg("--output=", json_camel_app_exe_name);
             build_json_camel_app.addFileArg(b.path("test/json-decoder/camel_app.roc"));
             build_json_camel_app.addFileInput(b.path("test/json-decoder/platform/main.roc"));
-            build_json_camel_app.addFileInput(b.path("test/json-decoder/platform/Json.roc"));
             build_json_camel_app.step.dependOn(final_json_host_step);
             build_json_camel_app.step.dependOn(build_roc_step);
             const install_json_camel_app = b.addInstallBinFile(json_camel_app_output, json_camel_app_exe_name);
@@ -4880,7 +4906,6 @@ pub fn build(b: *std.Build) void {
             const json_camel_direct_app_output = build_json_camel_direct_app.addPrefixedOutputFileArg("--output=", json_camel_direct_app_exe_name);
             build_json_camel_direct_app.addFileArg(b.path("test/json-decoder/camel_direct_app.roc"));
             build_json_camel_direct_app.addFileInput(b.path("test/json-decoder/platform/main.roc"));
-            build_json_camel_direct_app.addFileInput(b.path("test/json-decoder/platform/Json.roc"));
             build_json_camel_direct_app.step.dependOn(final_json_host_step);
             build_json_camel_direct_app.step.dependOn(build_roc_step);
             const install_json_camel_direct_app = b.addInstallBinFile(json_camel_direct_app_output, json_camel_direct_app_exe_name);
@@ -4930,76 +4955,6 @@ pub fn build(b: *std.Build) void {
                 "Run JSON Decoder platform Zig test",
             );
             run_json_decoder_platform_zig_test_step.dependOn(&run_json_decoder_platform_test.step);
-        }
-    }
-
-    // Build glue platform host at runtime for the native platform.
-    if (run_cli_test_step != null) {
-        if (isNativeishOrMusl(target)) {
-            // Determine the appropriate target for the glue platform host library.
-            // On Linux, we need to use musl explicitly because the platform's
-            // findHostLibrary looks for targets/x64musl/libhost.a.
-            const glue_host_target, const glue_host_target_dir: ?[]const u8 = switch (target.result.os.tag) {
-                .linux => switch (target.result.cpu.arch) {
-                    .x86_64 => .{ b.resolveTargetQuery(.{ .cpu_arch = .x86_64, .os_tag = .linux, .abi = .musl }), "x64musl" },
-                    .aarch64 => .{ b.resolveTargetQuery(.{ .cpu_arch = .aarch64, .os_tag = .linux, .abi = .musl }), "arm64musl" },
-                    else => .{ target, null },
-                },
-                .windows => switch (target.result.cpu.arch) {
-                    .x86_64 => .{ target, "x64win" },
-                    .aarch64 => .{ target, "arm64win" },
-                    else => .{ target, null },
-                },
-                .macos => switch (target.result.cpu.arch) {
-                    .x86_64 => .{ target, "x64mac" },
-                    .aarch64 => .{ target, "arm64mac" },
-                    else => .{ target, null },
-                },
-                else => .{ target, null },
-            };
-
-            if (glue_host_target_dir) |target_dir| {
-                const glue_platform_host_lib = createTestPlatformHostLib(
-                    b,
-                    "glue_platform_host_runtime",
-                    "src/glue/platform/host.zig",
-                    glue_host_target,
-                    optimize,
-                    roc_modules,
-                    strip,
-                    omit_frame_pointer,
-                    .{ .uses_stack_handler = true },
-                );
-
-                // Add compiler modules to glue platform host for type extraction
-                glue_platform_host_lib.root_module.addImport("can", roc_modules.can);
-                glue_platform_host_lib.root_module.addImport("types", roc_modules.types);
-                glue_platform_host_lib.root_module.addImport("layout", roc_modules.layout);
-                glue_platform_host_lib.root_module.addImport("eval", roc_modules.eval);
-                glue_platform_host_lib.root_module.addImport("collections", roc_modules.collections);
-
-                // Copy to the target-specific directory
-                const copy_glue_host = b.addUpdateSourceFiles();
-                const glue_host_filename = if (target.result.os.tag == .windows) "host.lib" else "libhost.a";
-                const target_path = b.pathJoin(&.{ "src/glue/platform/targets", target_dir, glue_host_filename });
-
-                // Ensure the target directory exists
-                const dir_path = b.pathJoin(&.{ "src/glue/platform/targets", target_dir });
-                std.Io.Dir.cwd().createDirPath(b.graph.io, dir_path) catch {};
-
-                copy_glue_host.addCopyFileToSource(glue_platform_host_lib.getEmittedBin(), target_path);
-
-                // Apply archive padding fix for non-Windows targets
-                const final_step: *Step = if (target.result.os.tag != .windows) blk: {
-                    const fix_target = FixArchivePaddingStep.create(b, target_path);
-                    fix_target.step.dependOn(&copy_glue_host.step);
-                    break :blk &fix_target.step;
-                } else &copy_glue_host.step;
-
-                if (run_cli_test_step) |cli_test_step| {
-                    cli_test_step.dependOn(final_step);
-                }
-            }
         }
     }
 
@@ -5133,14 +5088,65 @@ fn add_fuzz_target(
 
         const fuzz_exe = if (target.result.os.tag == .macos)
             addMacosAflFuzzExe(b, target, .ReleaseSafe, use_system_afl, fuzz_obj) orelse return
-        else blk: {
-            const afl = b.lazyImport(@This(), "afl_kit") orelse return;
-            break :blk afl.addInstrumentedExe(b, target, .ReleaseSafe, &.{}, use_system_afl, fuzz_obj, &.{"-lm"}) orelse return;
-        };
+        else
+            addAflFuzzExe(b, target, .ReleaseSafe, use_system_afl, fuzz_obj) orelse return;
         const install_fuzz = b.addInstallBinFile(fuzz_exe, name_exe);
         fuzz_step.dependOn(&install_fuzz.step);
         b.getInstallStep().dependOn(&install_fuzz.step);
     }
+}
+
+fn addAflFuzzExe(
+    b: *std.Build,
+    target: ResolvedTarget,
+    optimize: OptimizeMode,
+    use_system_afl: bool,
+    fuzz_obj: *Step.Compile,
+) ?std.Build.LazyPath {
+    const afl_kit = b.lazyDependency("afl_kit", .{}) orelse return null;
+
+    var run_afl_cc: *Step.Run = undefined;
+    if (use_system_afl) {
+        run_afl_cc = b.addSystemCommand(&.{
+            b.findProgram(&.{"afl-cc"}, &.{}) catch @panic("Could not find 'afl-cc', which is required to build"),
+            "-O3",
+        });
+    } else {
+        const afl = afl_kit.builder.lazyDependency("AFLplusplus", .{
+            .target = target,
+            .optimize = optimize,
+            .@"llvm-config-path" = &[_][]const u8{},
+        }) orelse return null;
+
+        const install_tools = b.addInstallDirectory(.{
+            .source_dir = std.Build.LazyPath{
+                .cwd_relative = afl.builder.install_path,
+            },
+            .install_dir = .prefix,
+            .install_subdir = "AFLplusplus",
+        });
+
+        install_tools.step.dependOn(afl.builder.getInstallStep());
+        run_afl_cc = b.addSystemCommand(&.{
+            b.pathJoin(&.{ afl.builder.exe_dir, "afl-cc" }),
+            "-O3",
+        });
+        run_afl_cc.step.dependOn(&afl.builder.top_level_steps.get("llvm_exes").?.step);
+        run_afl_cc.step.dependOn(&install_tools.step);
+    }
+
+    // Keep the object output requested so Zig materializes the LLVM bitcode output.
+    _ = fuzz_obj.getEmittedBin();
+
+    run_afl_cc.addArg("-o");
+    const fuzz_exe = run_afl_cc.addOutputFileArg(fuzz_obj.name);
+    run_afl_cc.addFileArg(afl_kit.path("afl.c"));
+    run_afl_cc.addFileArg(fuzz_obj.getEmittedLlvmBc());
+    // ELF linkers resolve libraries left-to-right, so math libraries must follow the bitcode.
+    run_afl_cc.addArg("-lm");
+    run_afl_cc.addArg("-lquadmath");
+
+    return fuzz_exe;
 }
 
 fn addMacosAflFuzzExe(
@@ -5198,6 +5204,7 @@ fn addMainExe(
     write_compiled_builtins: *Step.WriteFile,
     llvm_codegen_module: *std.Build.Module,
     flag_enable_tracy: ?[]const u8,
+    add_machine_code_shim_test: bool,
 ) ?*Step.Compile {
     const exe = b.addExecutable(.{
         .name = "roc",
@@ -5218,6 +5225,7 @@ fn addMainExe(
     exe.stack_size = 64 * 1024 * 1024;
     configureBackend(exe, target);
     exe.root_module.addImport("llvm_codegen", llvm_codegen_module);
+    linkWatchPlatformLibs(exe, target);
 
     // Build str and int test platform host libraries for native target
     // (fx and fx-open are only built by build-test-hosts for CLI platform tests)
@@ -5399,6 +5407,49 @@ fn addMainExe(
     machine_code_shim_lib.step.dependOn(&write_compiled_builtins.step);
     machine_code_shim_lib.root_module.addObjectFile(builtins_obj.getEmittedBin());
     machine_code_shim_lib.bundle_compiler_rt = true;
+
+    if (add_machine_code_shim_test) {
+        const machine_code_shim_test = b.addTest(.{
+            .name = "machine_code_shim",
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("src/machine_code_shim/main.zig"),
+                .target = target,
+                .optimize = optimize,
+                .link_libc = true,
+            }),
+        });
+        configureBackend(machine_code_shim_test, target);
+        roc_modules.addAll(machine_code_shim_test);
+        machine_code_shim_test.root_module.addImport("vendor_parse_float", roc_modules.vendor_parse_float);
+        machine_code_shim_test.root_module.addImport("vendor_ryu", roc_modules.vendor_ryu);
+        machine_code_shim_test.root_module.addImport("shim_io", b.addModule("shim_io_machine_code_test", .{
+            .root_source_file = b.path("src/shim_io.zig"),
+        }));
+        machine_code_shim_test.root_module.addImport("shim_host_abi", shim_host_abi_module);
+        machine_code_shim_test.root_module.addImport("compiled_builtins", compiled_builtins_module);
+        machine_code_shim_test.step.dependOn(&write_compiled_builtins.step);
+        machine_code_shim_test.root_module.addObjectFile(builtins_obj.getEmittedBin());
+        const machine_code_shim_test_host = b.addObject(.{
+            .name = "machine_code_shim_test_host",
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("src/machine_code_shim/test_host.zig"),
+                .target = target,
+                .optimize = optimize,
+            }),
+        });
+        configureBackend(machine_code_shim_test_host, target);
+        machine_code_shim_test_host.root_module.addImport("builtins", roc_modules.builtins);
+        machine_code_shim_test.root_module.addObject(machine_code_shim_test_host);
+        machine_code_shim_test.bundle_compiler_rt = true;
+        add_tracy(b, roc_modules.build_options, machine_code_shim_test, b.graph.host, false, flag_enable_tracy);
+
+        const run_machine_code_shim_test = b.addRunArtifact(machine_code_shim_test);
+        const run_machine_code_shim_test_step = b.step(
+            "run-test-zig-machine-code-shim",
+            "Run machine-code shim Zig tests",
+        );
+        run_machine_code_shim_test_step.dependOn(&run_machine_code_shim_test.step);
+    }
 
     const install_machine_code_shim = b.addInstallArtifact(machine_code_shim_lib, .{});
     b.getInstallStep().dependOn(&install_machine_code_shim.step);

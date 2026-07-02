@@ -341,11 +341,13 @@ fn writeFailureContext(
 ) void {
     const proc = store.getProcSpec(proc_id);
     context.append("\nfailure context: proc={d}", .{@intFromEnum(proc_id)});
+    if (store.procDebugName(proc_id)) |name| context.append(" name={s}", .{name});
     if (local) |l| {
         context.append(" local={d} layout={d}", .{
             @intFromEnum(l),
             @intFromEnum(store.getLocal(l).layout_idx),
         });
+        if (store.localName(l)) |name| context.append(" local_name={s}", .{name});
     }
     context.append("\n  args:", .{});
     for (store.getLocalSpan(proc.args)) |arg| context.append(" {d}", .{@intFromEnum(arg)});
@@ -499,6 +501,27 @@ fn appendLocalSpan(context: *FailureContext, store: *const LirStore, span: LIR.L
     context.append("]", .{});
 }
 
+fn appendRefOp(context: *FailureContext, op: LIR.RefOp) void {
+    switch (op) {
+        .local => |source| context.append("local({d})", .{@intFromEnum(source)}),
+        .discriminant => |ref| context.append("discriminant({d})", .{@intFromEnum(ref.source)}),
+        .field => |ref| context.append("field({d}, {d})", .{ @intFromEnum(ref.source), ref.field_idx }),
+        .tag_payload => |ref| context.append("tag_payload({d}, variant={d}, payload={d}, disc={d})", .{
+            @intFromEnum(ref.source),
+            ref.variant_index,
+            ref.payload_idx,
+            ref.tag_discriminant,
+        }),
+        .tag_payload_struct => |ref| context.append("tag_payload_struct({d}, variant={d}, disc={d})", .{
+            @intFromEnum(ref.source),
+            ref.variant_index,
+            ref.tag_discriminant,
+        }),
+        .list_reinterpret => |ref| context.append("list_reinterpret({d})", .{@intFromEnum(ref.backing_ref)}),
+        .nominal => |ref| context.append("nominal({d})", .{@intFromEnum(ref.backing_ref)}),
+    }
+}
+
 fn stmtMentionsLocal(store: *const LirStore, stmt: LIR.CFStmt, needle: LIR.LocalId) bool {
     return switch (stmt) {
         .assign_ref => |a| a.target == needle or refOpReadsLocal(a.op, needle),
@@ -555,25 +578,6 @@ fn spanHasLocal(store: *const LirStore, span: LIR.LocalSpan, needle: LIR.LocalId
         if (local == needle) return true;
     }
     return false;
-}
-
-fn appendRefOp(context: *FailureContext, op: LIR.RefOp) void {
-    switch (op) {
-        .local => |src| context.append("local {d}", .{@intFromEnum(src)}),
-        .discriminant => |d| context.append("discriminant {d}", .{@intFromEnum(d.source)}),
-        .field => |f| context.append("field {d}[{d}]", .{ @intFromEnum(f.source), f.field_idx }),
-        .tag_payload => |t| context.append("tag_payload {d} variant={d} payload={d}", .{
-            @intFromEnum(t.source),
-            t.variant_index,
-            t.payload_idx,
-        }),
-        .tag_payload_struct => |t| context.append("tag_payload_struct {d} variant={d}", .{
-            @intFromEnum(t.source),
-            t.variant_index,
-        }),
-        .list_reinterpret => |l| context.append("list_reinterpret {d}", .{@intFromEnum(l.backing_ref)}),
-        .nominal => |n| context.append("nominal {d}", .{@intFromEnum(n.backing_ref)}),
-    }
 }
 
 const ValueId = u32;

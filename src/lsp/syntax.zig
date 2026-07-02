@@ -37,6 +37,15 @@ const Region = base.Region;
 
 pub const DebugFlags = @import("debug.zig").DebugFlags;
 
+/// Errors that can occur while preparing the syntax check build environment.
+pub const SyntaxBuildEnvError = Allocator.Error || std.Io.Dir.RealPathFileAllocError || eval.BuiltinModules.InitError;
+/// Errors that can occur while preparing a document for syntax checking.
+pub const SyntaxPrepareDocumentError = SyntaxBuildEnvError;
+/// Errors that can occur while checking syntax for a document.
+pub const SyntaxCheckError = SyntaxPrepareDocumentError || error{WriteFailed};
+/// Errors that can occur while answering syntax-backed LSP queries.
+pub const SyntaxQueryError = SyntaxPrepareDocumentError || error{WriteFailed};
+
 const MethodOwnerLookup = struct {
     owner: CIR.Statement.Idx,
     type_ident: base.Ident.Idx,
@@ -67,6 +76,8 @@ pub const SyntaxChecker = struct {
     const owner_build = "build_env";
     const owner_previous = "previous_build_env";
     const owner_snapshot = "snapshot";
+    pub const CheckError = SyntaxCheckError;
+    pub const QueryError = SyntaxQueryError;
 
     const DocumentIdentity = struct {
         absolute_path: [:0]u8,
@@ -191,7 +202,7 @@ pub const SyntaxChecker = struct {
         return false;
     }
 
-    fn prepareDocumentBuild(self: *SyntaxChecker, uri: []const u8, override_text: ?[]const u8) anyerror!DocumentBuild {
+    fn prepareDocumentBuild(self: *SyntaxChecker, uri: []const u8, override_text: ?[]const u8) SyntaxPrepareDocumentError!DocumentBuild {
         var identity: ?DocumentIdentity = if (override_text) |text|
             try self.documentIdentityFromText(uri, text)
         else
@@ -241,7 +252,7 @@ pub const SyntaxChecker = struct {
     }
 
     /// Check the file referenced by the URI and return diagnostics grouped by URI.
-    pub fn check(self: *SyntaxChecker, uri: []const u8, override_text: ?[]const u8, workspace_root: ?[]const u8) anyerror![]Diagnostics.PublishDiagnostics {
+    pub fn check(self: *SyntaxChecker, uri: []const u8, override_text: ?[]const u8, workspace_root: ?[]const u8) CheckError![]Diagnostics.PublishDiagnostics {
         _ = workspace_root; // Reserved for future use
 
         self.mutex.lockUncancelable(self.std_io);
@@ -375,7 +386,7 @@ pub const SyntaxChecker = struct {
 
     /// Creates a fresh BuildEnv for a new build.
     /// The previous build_env is moved to previous_build_env for module lookups.
-    fn createFreshBuildEnv(self: *SyntaxChecker) anyerror!*BuildEnvHandle {
+    fn createFreshBuildEnv(self: *SyntaxChecker) SyntaxBuildEnvError!*BuildEnvHandle {
         self.logDebug(.build, "createFreshBuildEnv: prev_build_env={any} build_env={any}", .{ self.previous_build_env != null, self.build_env != null });
 
         // Release the previous_build_env owner first.
@@ -420,7 +431,7 @@ pub const SyntaxChecker = struct {
         return handle;
     }
 
-    fn sharedBuiltinModules(self: *SyntaxChecker) anyerror!*eval.BuiltinModules {
+    fn sharedBuiltinModules(self: *SyntaxChecker) (Allocator.Error || eval.BuiltinModules.InitError)!*eval.BuiltinModules {
         if (self.builtin_modules) |builtin_modules| return builtin_modules;
 
         const builtin_modules = try self.allocator.create(eval.BuiltinModules);
@@ -748,7 +759,7 @@ pub const SyntaxChecker = struct {
 
     /// Temporary suppression to avoid noisy undefined-variable diagnostics from BuildEnv.
     fn shouldSuppressReport(_: *SyntaxChecker, rep: reporting.Report) bool {
-        if (!std.mem.startsWith(u8, rep.title, "UNDEFINED VARIABLE")) return false;
+        if (!std.mem.startsWith(u8, rep.title, "Undefined Variable")) return false;
 
         const disallowed = [_][]const u8{ "Stderr", "Stdin", "Stdout" };
         return reportContainsAny(rep, &disallowed);
@@ -844,7 +855,7 @@ pub const SyntaxChecker = struct {
         override_text: ?[]const u8,
         line: u32,
         character: u32,
-    ) anyerror!?HoverResult {
+    ) QueryError!?HoverResult {
         self.mutex.lockUncancelable(self.std_io);
         defer self.mutex.unlock(self.std_io);
 
@@ -1384,7 +1395,7 @@ pub const SyntaxChecker = struct {
         override_text: ?[]const u8,
         line: u32,
         character: u32,
-    ) anyerror!?DefinitionResult {
+    ) QueryError!?DefinitionResult {
         self.mutex.lockUncancelable(self.std_io);
         defer self.mutex.unlock(self.std_io);
 
@@ -2007,7 +2018,7 @@ pub const SyntaxChecker = struct {
         override_text: ?[]const u8,
         line: u32,
         character: u32,
-    ) anyerror!?HighlightResult {
+    ) QueryError!?HighlightResult {
         self.mutex.lockUncancelable(self.std_io);
         defer self.mutex.unlock(self.std_io);
 
@@ -2058,7 +2069,7 @@ pub const SyntaxChecker = struct {
         allocator: std.mem.Allocator,
         uri: []const u8,
         source: []const u8,
-    ) anyerror![]document_symbol_handler.SymbolInformation {
+    ) QueryError![]document_symbol_handler.SymbolInformation {
         const SymbolInformation = document_symbol_handler.SymbolInformation;
 
         self.mutex.lockUncancelable(self.std_io);
@@ -2098,15 +2109,7 @@ pub const SyntaxChecker = struct {
             const def = module_env.store.getDef(def_idx);
             if (extractSymbolFromDecl(module_env, def.pattern, def.expr, source, uri, &line_offsets)) |symbol| {
                 self.logDebug(.build, "symbols: found def symbol '{s}'", .{symbol.name});
-                const owned_name = try allocator.dupe(u8, symbol.name);
-                try symbols.append(allocator, .{
-                    .name = owned_name,
-                    .kind = symbol.kind,
-                    .location = .{
-                        .uri = uri,
-                        .range = symbol.location.range,
-                    },
-                });
+                try appendOwnedSymbol(allocator, &symbols, symbol);
             }
         }
 
@@ -2114,22 +2117,35 @@ pub const SyntaxChecker = struct {
         const local_statements_slice = module_env.store.sliceStatements(module_env.all_statements);
         for (local_statements_slice) |stmt_idx| {
             const stmt = module_env.store.getStatement(stmt_idx);
+            switch (stmt) {
+                .s_alias_decl => |decl| {
+                    if (extractSymbolFromTypeDecl(module_env, decl.header, stmt_idx, uri, &line_offsets, .class)) |symbol| {
+                        self.logDebug(.build, "symbols: found alias symbol '{s}'", .{symbol.name});
+                        try appendOwnedSymbol(allocator, &symbols, symbol);
+                    }
+                    continue;
+                },
+                .s_nominal_decl => |decl| {
+                    if (extractSymbolFromTypeDecl(module_env, decl.header, stmt_idx, uri, &line_offsets, .@"struct")) |symbol| {
+                        self.logDebug(.build, "symbols: found nominal symbol '{s}'", .{symbol.name});
+                        try appendOwnedSymbol(allocator, &symbols, symbol);
+                    }
+                    continue;
+                },
+                else => {},
+            }
+
             const stmt_parts = module_lookup.getStatementParts(stmt);
 
             if (stmt_parts.pattern) |pattern_idx| {
                 if (stmt_parts.expr) |expr_idx| {
                     if (extractSymbolFromDecl(module_env, pattern_idx, expr_idx, source, uri, &line_offsets)) |symbol| {
                         self.logDebug(.build, "symbols: found stmt symbol '{s}'", .{symbol.name});
-                        const owned_name = try allocator.dupe(u8, symbol.name);
-                        try symbols.append(allocator, .{
-                            .name = owned_name,
-                            .kind = symbol.kind,
-                            .location = .{
-                                .uri = uri,
-                                .range = symbol.location.range,
-                            },
-                        });
+                        try appendOwnedSymbol(allocator, &symbols, symbol);
                     }
+                } else if (extractSymbolFromPattern(module_env, pattern_idx, uri, &line_offsets, .variable)) |symbol| {
+                    self.logDebug(.build, "symbols: found pattern symbol '{s}'", .{symbol.name});
+                    try appendOwnedSymbol(allocator, &symbols, symbol);
                 }
             }
         }
@@ -2395,7 +2411,7 @@ pub const SyntaxChecker = struct {
         override_text: ?[]const u8,
         line: u32,
         character: u32,
-    ) anyerror!?completion_handler.CompletionResult {
+    ) QueryError!?completion_handler.CompletionResult {
         self.mutex.lockUncancelable(self.std_io);
         defer self.mutex.unlock(self.std_io);
 
@@ -2653,6 +2669,83 @@ const pos = @import("position.zig");
 
 // Position utilities moved to position.zig
 
+fn appendOwnedSymbol(
+    allocator: Allocator,
+    symbols: *std.ArrayList(document_symbol_handler.SymbolInformation),
+    symbol: document_symbol_handler.SymbolInformation,
+) Allocator.Error!void {
+    const owned_name = try allocator.dupe(u8, symbol.name);
+    try symbols.append(allocator, .{
+        .name = owned_name,
+        .kind = symbol.kind,
+        .location = .{
+            .uri = symbol.location.uri,
+            .range = symbol.location.range,
+        },
+    });
+}
+
+fn symbolFromRegion(
+    name: []const u8,
+    kind: document_symbol_handler.SymbolKind,
+    uri: []const u8,
+    region: Region,
+    line_offsets: *const pos.LineOffsets,
+) document_symbol_handler.SymbolInformation {
+    return .{
+        .name = name,
+        .kind = kind,
+        .location = .{
+            .uri = uri,
+            .range = .{
+                .start = pos.offsetToPosition(region.start.offset, line_offsets),
+                .end = pos.offsetToPosition(region.end.offset, line_offsets),
+            },
+        },
+    };
+}
+
+fn extractSymbolFromPattern(
+    module_env: *ModuleEnv,
+    pattern_idx: CIR.Pattern.Idx,
+    uri: []const u8,
+    line_offsets: *const pos.LineOffsets,
+    kind: document_symbol_handler.SymbolKind,
+) ?document_symbol_handler.SymbolInformation {
+    const ident_idx = module_lookup.extractIdentFromPattern(&module_env.store, pattern_idx) orelse return null;
+    const name = module_env.getIdentText(ident_idx);
+    if (name.len == 0) return null;
+
+    return symbolFromRegion(
+        name,
+        kind,
+        uri,
+        module_env.store.getPatternRegion(pattern_idx),
+        line_offsets,
+    );
+}
+
+fn extractSymbolFromTypeDecl(
+    module_env: *ModuleEnv,
+    header_idx: CIR.TypeHeader.Idx,
+    stmt_idx: CIR.Statement.Idx,
+    uri: []const u8,
+    line_offsets: *const pos.LineOffsets,
+    kind: document_symbol_handler.SymbolKind,
+) ?document_symbol_handler.SymbolInformation {
+    const header = module_env.store.getTypeHeader(header_idx);
+    const name = module_env.getIdentText(header.relative_name);
+    if (name.len == 0) return null;
+
+    return symbolFromRegion(
+        name,
+        kind,
+        uri,
+        module_env.store.getStatementRegion(stmt_idx),
+        line_offsets,
+    );
+}
+
 fn extractSymbolFromDecl(
     module_env: *ModuleEnv,
     pattern_idx: CIR.Pattern.Idx,
@@ -2668,37 +2761,11 @@ fn extractSymbolFromDecl(
         else => false,
     };
 
-    // Get the pattern and extract the identifier name
-    const pattern = module_env.store.getPattern(pattern_idx);
-    const ident_idx = switch (pattern) {
-        .assign => |p| p.ident,
-        .as => |p| p.ident,
-        else => return null, // Only handle assign and as patterns
-    };
-
-    // Get the identifier text from the module's ident table
-    const name = module_env.getIdentText(ident_idx);
-
-    // Skip empty or placeholder names
-    if (name.len == 0) {
-        return null;
-    }
-
-    // Get the pattern region for position info
-    const pattern_region = module_env.store.getPatternRegion(pattern_idx);
-    const start_offset = pattern_region.start.offset;
-    const end_offset = pattern_region.end.offset;
-
-    // Convert offsets to positions
-    const start_pos = pos.offsetToPosition(start_offset, line_offsets);
-    const end_pos = pos.offsetToPosition(end_offset, line_offsets);
-
-    return .{
-        .name = name,
-        .kind = if (is_function) .function else .variable,
-        .location = .{
-            .uri = uri,
-            .range = .{ .start = start_pos, .end = end_pos },
-        },
-    };
+    return extractSymbolFromPattern(
+        module_env,
+        pattern_idx,
+        uri,
+        line_offsets,
+        if (is_function) .function else .variable,
+    );
 }

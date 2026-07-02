@@ -38,6 +38,7 @@ pub const RecursiveDispatch = types.RecursiveDispatch;
 pub const NumberDoesNotFit = types.NumberDoesNotFit;
 pub const NegativeUnsignedInt = types.NegativeUnsignedInt;
 pub const InvalidNumericLiteral = types.InvalidNumericLiteral;
+pub const TupleAccessNeedsAnnotation = types.TupleAccessNeedsAnnotation;
 pub const LiteralDefaulted = types.LiteralDefaulted;
 pub const UnusedValue = types.UnusedValue;
 
@@ -48,6 +49,7 @@ pub const RedundantPattern = types.RedundantPattern;
 pub const UnmatchablePattern = types.UnmatchablePattern;
 pub const UnreachableCode = types.UnreachableCode;
 pub const ComptimeUnusedBranch = types.ComptimeUnusedBranch;
+pub const ComptimeCondition = types.ComptimeCondition;
 
 // Type declaration errors
 pub const TypeApplyArityMismatch = types.TypeApplyArityMismatch;
@@ -63,6 +65,7 @@ pub const PlatformAliasNotFound = types.PlatformAliasNotFound;
 pub const PlatformDefNotFound = types.PlatformDefNotFound;
 pub const PlatformHostedSection = types.PlatformHostedSection;
 pub const HostedUnboxedFunction = types.HostedUnboxedFunction;
+pub const HostBoundaryOpenRow = types.HostBoundaryOpenRow;
 pub const AnnotationOnlyValue = types.AnnotationOnlyValue;
 pub const PolymorphicVarAnnotation = types.PolymorphicVarAnnotation;
 pub const EffectfulTopLevel = types.EffectfulTopLevel;
@@ -70,7 +73,6 @@ pub const EffectfulExpect = types.EffectfulExpect;
 
 // Comptime errors
 pub const ComptimeCrash = types.ComptimeCrash;
-pub const ComptimeDbg = types.ComptimeDbg;
 pub const ComptimeInvalidNumeral = types.ComptimeInvalidNumeral;
 pub const ComptimeInvalidQuote = types.ComptimeInvalidQuote;
 pub const ComptimeExpectFailed = types.ComptimeExpectFailed;

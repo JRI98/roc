@@ -3,6 +3,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const base = @import("base");
+const layout = @import("layout");
 
 const lir_defs = @import("LIR.zig");
 
@@ -47,6 +48,8 @@ local_ids: std.ArrayList(LocalId),
 u64s: std.ArrayList(u64),
 proc_specs: std.ArrayList(LirProcSpec),
 strings: base.StringLiteral.Store,
+string_builder: base.StringLiteral.BuilderState,
+strings_insertable: bool,
 allocator: Allocator,
 next_synthetic_symbol: u64,
 patterns: std.ArrayList(LirPattern),
@@ -88,6 +91,8 @@ pub fn init(allocator: Allocator) Self {
         .u64s = std.ArrayList(u64).empty,
         .proc_specs = std.ArrayList(LirProcSpec).empty,
         .strings = base.StringLiteral.Store{},
+        .string_builder = .{},
+        .strings_insertable = true,
         .allocator = allocator,
         .next_synthetic_symbol = 0xf000_0000_0000_0000,
         .patterns = std.ArrayList(LirPattern).empty,
@@ -115,6 +120,7 @@ pub fn deinit(self: *Self) void {
     self.local_ids.deinit(self.allocator);
     self.u64s.deinit(self.allocator);
     self.proc_specs.deinit(self.allocator);
+    self.string_builder.deinit(self.allocator);
     self.strings.deinit(self.allocator);
     self.patterns.deinit(self.allocator);
     self.pattern_ids.deinit(self.allocator);
@@ -253,7 +259,8 @@ pub fn freshSyntheticSymbol(self: *Self) Symbol {
 
 /// Interns a string literal in the store-level string table.
 pub fn insertString(self: *Self, text: []const u8) Allocator.Error!base.StringLiteral.Idx {
-    return self.strings.insert(self.allocator, text);
+    self.assertStringsInsertable();
+    return self.string_builder.insert(&self.strings, self.allocator, text);
 }
 
 /// Interns string backing bytes and returns a literal view into them.
@@ -301,6 +308,15 @@ pub fn getStringLiteral(self: *const Self, literal: lir_defs.StrLiteral) []const
 /// Returns the full backing bytes for one string literal view.
 pub fn getStringLiteralBacking(self: *const Self, literal: lir_defs.StrLiteral) []const u8 {
     return self.getString(literal.backing);
+}
+
+fn assertStringsInsertable(self: *const Self) void {
+    if (self.strings_insertable) return;
+
+    if (comptime builtin.mode == .Debug) {
+        std.debug.panic("LirStore invariant violated: attempted to insert into frozen string literal store", .{});
+    }
+    unreachable;
 }
 
 /// Registers one LIR local and returns its id.
@@ -604,4 +620,20 @@ pub fn getProcSpecPtr(self: *Self, idx: LirProcSpecId) *LirProcSpec {
 /// Returns all stored proc specifications.
 pub fn getProcSpecs(self: *const Self) []const LirProcSpec {
     return self.proc_specs.items;
+}
+
+/// Reports whether any local in a span has a layout that requires stack probing.
+pub fn localSpanNeedsStackProbe(self: *const Self, layouts: *const layout.Store, span: LocalSpan) bool {
+    for (self.getLocalSpan(span)) |local| {
+        if (lir_defs.layoutNeedsStackProbe(layouts, self.getLocal(local).layout_idx)) return true;
+    }
+    return false;
+}
+
+/// Reports whether a proc's args, frame locals, or return layout require stack probing.
+pub fn procNeedsStackProbe(self: *const Self, layouts: *const layout.Store, proc: LirProcSpec) bool {
+    if (self.localSpanNeedsStackProbe(layouts, proc.args)) return true;
+    if (self.localSpanNeedsStackProbe(layouts, proc.frame_locals)) return true;
+    if (lir_defs.layoutNeedsStackProbe(layouts, proc.ret_layout)) return true;
+    return false;
 }

@@ -42,6 +42,7 @@ const runner_core = @import("runner_core.zig");
 
 const PlatformConfig = platform_config.PlatformConfig;
 const TestStats = runner_core.TestStats;
+const TestRunnerError = runner_core.RunnerError || std.process.Args.Iterator.InitError;
 
 /// Test mode
 const TestMode = enum {
@@ -63,7 +64,7 @@ const Args = struct {
 };
 
 /// Entry point for the unified test platform runner.
-pub fn main(init: std.process.Init) anyerror!void {
+pub fn main(init: std.process.Init) TestRunnerError!void {
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -153,7 +154,7 @@ fn runCrossCompileTests(
     args: Args,
     platform: PlatformConfig,
     stats: *TestStats,
-) anyerror!void {
+) TestRunnerError!void {
     runner_core.printHeader("Cross-compilation tests", .{});
 
     // First verify platform files exist
@@ -214,7 +215,7 @@ fn runCrossCompileTests(
                 const output_name = try std.fmt.allocPrint(allocator, "{s}_{s}", .{ platform.name, target.name });
                 defer allocator.free(output_name);
 
-                const result = try runner_core.crossCompile(allocator, std_io, args.roc_binary, roc_file, target.name, output_name, args.opt);
+                const result = try runner_core.crossCompile(allocator, std_io, args.roc_binary, roc_file, target.name, output_name, args.opt, &.{});
                 stats.record(result);
             }
         },
@@ -250,7 +251,7 @@ fn runCrossCompileTests(
                     const output_name = try std.fmt.allocPrint(allocator, "{s}_{s}", .{ basename, target.name });
                     defer allocator.free(output_name);
 
-                    const result = try runner_core.crossCompile(allocator, std_io, args.roc_binary, spec.roc_file, target.name, output_name, args.opt);
+                    const result = try runner_core.crossCompile(allocator, std_io, args.roc_binary, spec.roc_file, target.name, output_name, args.opt, spec.expected_build_stderr_contains);
                     stats.record(result);
                 }
             }
@@ -287,7 +288,7 @@ fn runCrossCompileTests(
                     const output_name = try std.fmt.allocPrint(allocator, "{s}_{s}", .{ basename, target.name });
                     defer allocator.free(output_name);
 
-                    const result = try runner_core.crossCompile(allocator, std_io, args.roc_binary, spec.roc_file, target.name, output_name, args.opt);
+                    const result = try runner_core.crossCompile(allocator, std_io, args.roc_binary, spec.roc_file, target.name, output_name, args.opt, &.{});
                     stats.record(result);
                 }
             }
@@ -301,7 +302,7 @@ fn runNativeTests(
     args: Args,
     platform: PlatformConfig,
     stats: *TestStats,
-) anyerror!void {
+) TestRunnerError!void {
     // Check if native target is filtered out
     if (args.target_filter) |filter| {
         if (!std.mem.eql(u8, filter, "native")) {
@@ -435,7 +436,7 @@ fn runValgrindTests(
     args: Args,
     platform: PlatformConfig,
     stats: *TestStats,
-) anyerror!void {
+) TestRunnerError!void {
     // Valgrind only works on Linux x86_64
     if (builtin.os.tag != .linux or builtin.cpu.arch != .x86_64) {
         std.debug.print("Skipping valgrind tests (requires Linux x86_64)\n", .{});
@@ -510,7 +511,7 @@ fn runValgrindTests(
     }
 }
 
-fn parseArgs(process_args: std.process.Args, gpa: std.mem.Allocator) anyerror!Args {
+fn parseArgs(process_args: std.process.Args, gpa: std.mem.Allocator) TestRunnerError!Args {
     var iter = try process_args.iterateAllocator(gpa);
 
     // Skip argv[0] (program name)

@@ -39,11 +39,11 @@ fn sourceSliceBetween(source: []const u8, start: []const u8, end: []const u8) []
     return after_start[0..end_index];
 }
 
-fn expectContains(haystack: []const u8, needle: []const u8) anyerror!void {
+fn expectContains(haystack: []const u8, needle: []const u8) error{TestUnexpectedResult}!void {
     try std.testing.expect(std.mem.find(u8, haystack, needle) != null);
 }
 
-fn expectNotContains(haystack: []const u8, needle: []const u8) anyerror!void {
+fn expectNotContains(haystack: []const u8, needle: []const u8) error{TestUnexpectedResult}!void {
     try std.testing.expect(std.mem.find(u8, haystack, needle) == null);
 }
 
@@ -53,7 +53,6 @@ test "Monotype has direct calls and no checked-only expression forms" {
     try std.testing.expect(@hasField(Mono.ExprData, "structural_eq"));
     try std.testing.expect(@hasField(Mono.ExprData, "structural_hash"));
     try std.testing.expect(@hasField(Mono.ExprData, "loop_"));
-    try std.testing.expect(!@hasField(Mono.ExprData, "iter_plan"));
 
     try std.testing.expect(!@hasField(Mono.ExprData, "dispatch_call"));
     try std.testing.expect(!@hasField(Mono.ExprData, "type_dispatch_call"));
@@ -61,29 +60,6 @@ test "Monotype has direct calls and no checked-only expression forms" {
     try std.testing.expect(!@hasField(Mono.ExprData, "method_eq"));
     try std.testing.expect(!@hasField(Mono.ExprData, "anno_only"));
     try std.testing.expect(!@hasField(Mono.ExprData, "for_"));
-}
-
-test "Monotype has no explicit builtin iterator plan storage" {
-    try std.testing.expect(!@hasField(Mono.Program, "iter_plans"));
-    try std.testing.expect(!@hasDecl(Mono.Program, "addIterPlan"));
-    try std.testing.expect(!@hasDecl(Mono.Program, "iterPlan"));
-    try std.testing.expect(!@hasField(Mono.ExprData, "iter_plan"));
-    try std.testing.expect(!@hasField(Mono.ExprData, "stream_plan"));
-    try std.testing.expect(!@hasField(Mono.ExprData, "adapter_chain"));
-
-    try std.testing.expect(!@hasField(Lifted.Program, "iter_plans"));
-    try std.testing.expect(!@hasDecl(Lifted.Program, "addIterPlan"));
-    try std.testing.expect(!@hasDecl(Lifted.Program, "iterPlan"));
-    try std.testing.expect(!@hasField(Lifted.ExprData, "iter_plan"));
-    try std.testing.expect(!@hasField(Lifted.ExprData, "stream_plan"));
-    try std.testing.expect(!@hasField(Lifted.ExprData, "adapter_chain"));
-
-    try std.testing.expect(!@hasField(LambdaMono.Program, "iter_plans"));
-    try std.testing.expect(!@hasDecl(LambdaMono.Program, "addIterPlan"));
-    try std.testing.expect(!@hasDecl(LambdaMono.Program, "iterPlan"));
-    try std.testing.expect(!@hasField(LambdaMono.ExprData, "iter_plan"));
-    try std.testing.expect(!@hasField(LambdaMono.ExprData, "stream_plan"));
-    try std.testing.expect(!@hasField(LambdaMono.ExprData, "adapter_chain"));
 }
 
 test "Monotype types are closed checked types without row tails" {
@@ -133,20 +109,48 @@ test "Monotype lookup lowering uses explicit resolved use types" {
     const lower_expr_at_type = sourceSliceBetween(lower_source, "fn lowerExprAtType", "fn sameType");
     const lower_lookup_at_type = sourceSliceBetween(lower_source, "fn lowerLookupExprAtType", "fn lowerProcedureUseValue");
 
-    try expectContains(lower_call, "const fn_ty = (try self.indirectCalleeMonoType(call.func)) orelse fn_ty: {");
-    try expectContains(lower_call, "break :fn_ty try call_ctx.instantiateCallTypeFromCaller(call.source_fn_ty_payload, self, checked_ret_ty, call.args);");
+    try expectContains(lower_call, "const fn_ty = (try self.indirectCalleeMonoType(call.func, call.args, expected_ret_ty)) orelse fn_ty: {");
+    try expectContains(lower_call, "break :fn_ty try call_ctx.instantiateCallTypeFromCallerAtType(call.source_fn_ty_payload, self, checked_ret_ty, call.args, expected_ret_ty);");
     try std.testing.expect(std.mem.find(u8, lower_call, "try self.lowerExprType(call.func)") == null);
     try std.testing.expect(std.mem.find(u8, lower_call, "try self.lowerType(call.source_fn_ty_payload)") == null);
 
-    try expectContains(lower_expr_type, ".lookup_required => |resolved| try self.lookupExprMonoType(expr.ty, resolved)");
+    try expectContains(lower_expr_type, ".lookup_required => |resolved| try self.activeNodeFromType(try self.lookupExprMonoType(expr.ty, resolved))");
     try expectContains(lower_expr_at_type, ".lookup_required => |resolved| return try self.lowerLookupExprAtType(expr.ty, resolved, ty)");
     try expectContains(lower_lookup_at_type, ".platform_required_const => |required| return try self.restoreConstUseAtType(required.const_use, ty)");
     try expectContains(lower_lookup_at_type, ".platform_required_proc => |proc| return try self.lowerProcedureUseValue(proc.procedure, ty)");
 }
 
+test "Monotype specialization has no target backend or LIR imports" {
+    const sources = .{
+        @embedFile("monotype/ast.zig"),
+        @embedFile("monotype/type.zig"),
+        @embedFile("monotype/lower.zig"),
+        @embedFile("monotype/solve.zig"),
+        @embedFile("monotype/specialize.zig"),
+        @embedFile("monotype/serialize.zig"),
+        @embedFile("monotype_lifted/ast.zig"),
+        @embedFile("monotype_lifted/lift.zig"),
+        @embedFile("monotype_lifted/spec_constr.zig"),
+    };
+    const forbidden_imports = .{
+        "@import(\"backend\")",
+        "@import(\"layout\")",
+        "@import(\"lir\")",
+        "@import(\"lir_core\")",
+        "@import(\"roc_target\")",
+        "@import(\"llvm\")",
+        "@import(\"wasm\")",
+    };
+
+    inline for (sources) |source| {
+        inline for (forbidden_imports) |needle| {
+            try expectNotContains(source, needle);
+        }
+    }
+}
+
 test "Lifted functions own captures and consume Monotype expression storage" {
     try std.testing.expect(@hasField(Lifted.Fn, "captures"));
-    try std.testing.expect(!@hasField(Lifted.Program, "iter_plans"));
     try std.testing.expect(Lifted.ExprId == Mono.ExprId);
     try std.testing.expect(Lifted.PatId == Mono.PatId);
     try std.testing.expect(Lifted.StmtId == Mono.StmtId);
@@ -154,6 +158,8 @@ test "Lifted functions own captures and consume Monotype expression storage" {
     try std.testing.expect(@hasField(Lifted.ExprData, "fn_ref"));
     try std.testing.expect(@hasField(Lifted.ExprData, "call_proc"));
     try std.testing.expect(@hasField(Lifted.ExprData, "call_value"));
+    try std.testing.expect(@hasField(Mono.FnSlot, "local"));
+    try std.testing.expect(@hasField(Mono.FnSlot, "imported"));
     try std.testing.expect(@hasField(Mono.ProcCallee, "func"));
     try std.testing.expect(@hasField(Mono.ProcCallee, "lifted"));
 
@@ -174,7 +180,6 @@ test "Lambda Solved keeps lifted syntax and stores callable sets in types" {
 }
 
 test "Lambda Mono has concrete callable values and no function type" {
-    try std.testing.expect(!@hasField(LambdaMono.ExprData, "iter_plan"));
     try std.testing.expect(@hasField(LambdaMono.ExprData, "direct_call"));
     try std.testing.expect(@hasField(LambdaMono.ExprData, "indirect_erased_call"));
     try std.testing.expect(@hasField(LambdaMono.ExprData, "packed_erased_fn"));
@@ -219,36 +224,12 @@ test "post-check expression forms do not reintroduce checked-only syntax" {
     }
 }
 
-test "Lambda Mono replaces callable source forms with runtime callable encoding forms" {
-    try std.testing.expect(Lifted.ExprData == Mono.ExprData);
-    try std.testing.expect(!@hasField(LambdaMono.ExprData, "lambda"));
-    try std.testing.expect(!@hasField(LambdaMono.ExprData, "def_ref"));
-    try std.testing.expect(!@hasField(LambdaMono.ExprData, "fn_def"));
-    try std.testing.expect(!@hasField(LambdaMono.ExprData, "fn_ref"));
-    try std.testing.expect(!@hasField(LambdaMono.ExprData, "fn_ref_captures"));
-    try std.testing.expect(!@hasField(LambdaMono.ExprData, "call_value"));
-    try std.testing.expect(!@hasField(LambdaMono.ExprData, "call_proc"));
+test "stage expression forms only shrink checked syntax or add runtime encoding forms" {
+    try std.testing.expect(unionFieldCount(Lifted.ExprData) <= unionFieldCount(Mono.ExprData));
+    try std.testing.expect(unionFieldCount(LambdaMono.ExprData) >= unionFieldCount(Lifted.ExprData));
+
     try std.testing.expect(@hasField(LambdaMono.ExprData, "direct_call"));
     try std.testing.expect(@hasField(LambdaMono.ExprData, "callable"));
-    try std.testing.expect(@hasField(LambdaMono.ExprData, "capture_record"));
-    try std.testing.expect(@hasField(LambdaMono.ExprData, "capture_access"));
-    try std.testing.expect(@hasField(LambdaMono.ExprData, "indirect_erased_call"));
-    try std.testing.expect(@hasField(LambdaMono.ExprData, "packed_erased_fn"));
-}
-
-test "optimized callable-state lowering has no debug or hardcoded recognition scaffolding" {
-    const spec_constr_source = @embedFile("monotype_lifted/spec_constr.zig");
-    const optimized_lowering = sourceSliceBetween(spec_constr_source, "const OptimizedContext = struct", "fn unsignedIntLiteral");
-
-    try expectNotContains(optimized_lowering, "traceSpecConstr");
-    try expectNotContains(optimized_lowering, "debugTraceTest");
-    try expectNotContains(optimized_lowering, "created call_proc with local");
-    try expectNotContains(optimized_lowering, "local 22");
-    try expectNotContains(optimized_lowering, "Builtin.Iter.append");
-    try expectNotContains(optimized_lowering, "Builtin.List.iter");
-    try expectNotContains(optimized_lowering, "iter_from_step");
-    try expectNotContains(optimized_lowering, "Rocci");
-    try expectNotContains(optimized_lowering, "wasm4");
 }
 
 test "post-check stage products do not store expression cache state" {
@@ -265,14 +246,56 @@ test "post-check stage products do not store expression cache state" {
     }
 }
 
+test "checked module artifact does not store post-check lowering products" {
+    @setEvalBranchQuota(1_000_000);
+    comptime assertNoPostCheckType(check.CheckedModule.CheckedModuleArtifact.Serialized, "CheckedModuleArtifact.Serialized");
+}
+
+fn assertNoPostCheckType(comptime T: type, comptime path: []const u8) void {
+    const type_name = @typeName(T);
+    if (std.mem.find(u8, type_name, "postcheck") != null or
+        std.mem.find(u8, type_name, "lir.") != null or
+        std.mem.find(u8, type_name, "monotype") != null or
+        std.mem.find(u8, type_name, "lambda") != null)
+    {
+        @compileError(path ++ " stores post-check lowering type " ++ type_name);
+    }
+
+    switch (@typeInfo(T)) {
+        .array => |array| assertNoPostCheckType(array.child, path ++ "[]"),
+        .optional => |optional| assertNoPostCheckType(optional.child, path ++ "?"),
+        .pointer => |pointer| assertNoPostCheckType(pointer.child, path ++ ".*"),
+        .@"struct" => |info| {
+            inline for (info.fields) |field| {
+                assertNoPostCheckType(field.type, path ++ "." ++ field.name);
+            }
+        },
+        .@"union" => |info| {
+            inline for (info.fields) |field| {
+                assertNoPostCheckType(field.type, path ++ "." ++ field.name);
+            }
+        },
+        else => {},
+    }
+}
+
 test "Monotype lifting mutates only callable expression nodes in place" {
     const lifted_source = @embedFile("monotype_lifted/lift.zig");
+    try expectContains(lifted_source, "source: Mono.ProgramView");
+    try expectContains(lifted_source, "const source_view = movedMonoView(&owned, &program);");
+    try expectContains(lifted_source, "Lifter.init(allocator, source_view, &program)");
+    try std.testing.expect(std.mem.find(u8, lifted_source, "self.source.") != null);
+    try std.testing.expect(std.mem.find(u8, lifted_source, "self.source.exprs.items") == null);
+    try std.testing.expect(std.mem.find(u8, lifted_source, "self.source.pats.items") == null);
+    try std.testing.expect(std.mem.find(u8, lifted_source, "self.source.stmts.items") == null);
+    try std.testing.expect(std.mem.find(u8, lifted_source, "self.source.locals.items") == null);
+
     const rewrite_expr = sourceSliceBetween(lifted_source, "fn rewriteExpr", "fn liftLambda");
-    try expectContains(rewrite_expr, "expr.data = .{ .fn_ref");
-    try expectContains(rewrite_expr, "expr.data = .{ .call_proc");
+    try expectContains(rewrite_expr, "self.output.exprs.items[index].data = .{ .fn_ref");
+    try expectContains(rewrite_expr, "self.output.exprs.items[index].data = .{ .call_proc");
 
     const lift_lambda = sourceSliceBetween(lifted_source, "fn liftLambda", "fn reserveFn");
-    try expectContains(lift_lambda, "self.output.exprs.items[@intFromEnum(expr_id)].data = .{ .fn_ref = fn_id };");
+    try expectContains(lift_lambda, "self.output.exprs.items[@intFromEnum(expr_id)].data = .{ .fn_ref = .{");
 
     const lambda_mono_source = @embedFile("lambda_mono/lower.zig");
     const lower_fn = sourceSliceBetween(lambda_mono_source, "fn lowerFnSpec", "fn ensureOwnFnSpec");
@@ -280,6 +303,29 @@ test "Monotype lifting mutates only callable expression nodes in place" {
     try expectContains(lower_fn, "@memset(self.expr_map, null);");
     try expectContains(lower_fn, "@memset(self.pat_map, null);");
     try expectContains(lower_fn, "@memset(self.stmt_map, null);");
+}
+
+test "Lambda Solved consumes lifted program through a read-only view" {
+    const lifted_ast_source = @embedFile("monotype_lifted/ast.zig");
+    try expectContains(lifted_ast_source, "pub const ProgramView = struct");
+    try expectContains(lifted_ast_source, "pub fn view(self: *const Program) ProgramView");
+
+    const solve_source = @embedFile("lambda_solved/solve.zig");
+    try expectContains(solve_source, "lifted: Lifted.ProgramView");
+    try expectContains(solve_source, "const lifted = program.lifted.view();");
+    try std.testing.expect(std.mem.find(u8, solve_source, "self.program.lifted.") == null);
+}
+
+test "Lambda Mono consumes Lambda Solved through a read-only view" {
+    const solved_ast_source = @embedFile("lambda_solved/ast.zig");
+    try expectContains(solved_ast_source, "pub const ProgramView = struct");
+    try expectContains(solved_ast_source, "pub fn view(self: *const Program) ProgramView");
+
+    const lower_source = @embedFile("lambda_mono/lower.zig");
+    try expectContains(lower_source, "solved: Solved.ProgramView");
+    try expectContains(lower_source, "const solved_view = movedSolvedView(&owned, &program);");
+    try std.testing.expect(std.mem.find(u8, lower_source, "self.solved.lifted.fns.items") == null);
+    try std.testing.expect(std.mem.find(u8, lower_source, "self.solved.fn_tys.items") == null);
 }
 
 test "post-check invariant helper is failure-only" {

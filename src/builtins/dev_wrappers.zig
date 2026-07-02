@@ -14,6 +14,7 @@ const utils = @import("utils.zig");
 const erased_callable = @import("erased_callable.zig");
 const dec = @import("dec.zig");
 const hash = @import("hash.zig");
+const crypto = @import("crypto.zig");
 const i128h = @import("compiler_rt_128.zig");
 const float_tan = @import("float_math/tan.zig");
 const numeric_conversions = @import("numeric_conversions.zig");
@@ -91,6 +92,46 @@ pub fn roc_builtins_hasher_finish(seed: u64) callconv(.c) u64 {
 /// C ABI wrapper for the compiler-owned Dict hash seed.
 pub fn roc_builtins_dict_pseudo_seed() callconv(.c) u64 {
     return utils.dictPseudoSeed();
+}
+
+/// C ABI wrapper for one-shot SHA-256 hashing.
+pub fn roc_builtins_crypto_sha256_hash_bytes(out: *RocList, bytes: ?[*]const u8, len: usize, _: usize, roc_ops: *RocOps) callconv(.c) void {
+    out.* = crypto.sha256HashBytes(bytes, len, roc_ops);
+}
+
+/// C ABI wrapper for creating an empty serialized SHA-256 state.
+pub fn roc_builtins_crypto_sha256_hasher_empty(out: *RocList, roc_ops: *RocOps) callconv(.c) void {
+    out.* = crypto.sha256HasherEmpty(roc_ops);
+}
+
+/// C ABI wrapper for updating serialized SHA-256 state.
+pub fn roc_builtins_crypto_sha256_hasher_write(out: *RocList, state_bytes: ?[*]const u8, state_len: usize, _: usize, input_bytes: ?[*]const u8, input_len: usize, _: usize, roc_ops: *RocOps) callconv(.c) void {
+    out.* = crypto.sha256HasherWrite(state_bytes, state_len, input_bytes, input_len, roc_ops);
+}
+
+/// C ABI wrapper for finishing serialized SHA-256 state.
+pub fn roc_builtins_crypto_sha256_hasher_finish(out: *RocList, state_bytes: ?[*]const u8, state_len: usize, _: usize, roc_ops: *RocOps) callconv(.c) void {
+    out.* = crypto.sha256HasherFinish(state_bytes, state_len, roc_ops);
+}
+
+/// C ABI wrapper for one-shot BLAKE3 hashing.
+pub fn roc_builtins_crypto_blake3_hash_bytes(out: *RocList, bytes: ?[*]const u8, len: usize, _: usize, roc_ops: *RocOps) callconv(.c) void {
+    out.* = crypto.blake3HashBytes(bytes, len, roc_ops);
+}
+
+/// C ABI wrapper for creating an empty serialized BLAKE3 state.
+pub fn roc_builtins_crypto_blake3_hasher_empty(out: *RocList, roc_ops: *RocOps) callconv(.c) void {
+    out.* = crypto.blake3HasherEmpty(roc_ops);
+}
+
+/// C ABI wrapper for updating serialized BLAKE3 state.
+pub fn roc_builtins_crypto_blake3_hasher_write(out: *RocList, state_bytes: ?[*]const u8, state_len: usize, _: usize, input_bytes: ?[*]const u8, input_len: usize, _: usize, roc_ops: *RocOps) callconv(.c) void {
+    out.* = crypto.blake3HasherWrite(state_bytes, state_len, input_bytes, input_len, roc_ops);
+}
+
+/// C ABI wrapper for finishing serialized BLAKE3 state.
+pub fn roc_builtins_crypto_blake3_hasher_finish(out: *RocList, state_bytes: ?[*]const u8, state_len: usize, _: usize, roc_ops: *RocOps) callconv(.c) void {
+    out.* = crypto.blake3HasherFinish(state_bytes, state_len, roc_ops);
 }
 
 // Import builtin functions we wrap (using actual function names from str.zig and list.zig)
@@ -627,16 +668,20 @@ pub fn roc_builtins_list_concat(out: *RocList, a_bytes: ?[*]u8, a_len: usize, a_
 /// Wrapper: listPrepend(RocList, alignment, element, element_width, ..., *RocOps) -> RocList.
 /// The update mode is forwarded to the builtin's uniqueness check; `.InPlace`
 /// skips it.
-pub fn roc_builtins_list_prepend(out: *RocList, list_bytes: ?[*]u8, list_len: usize, list_cap: usize, alignment: u32, element: ?[*]u8, element_width: usize, elements_refcounted: bool, element_incref: ?RcIncFn, update_mode: utils.UpdateMode, roc_ops: *RocOps) callconv(.c) void {
+pub fn roc_builtins_list_prepend(out: *RocList, list_bytes: ?[*]u8, list_len: usize, list_cap: usize, alignment: u32, element: ?[*]u8, element_width: usize, elements_refcounted: bool, element_incref: ?RcIncFn, element_decref: ?RcDropFn, update_mode: utils.UpdateMode, roc_ops: *RocOps) callconv(.c) void {
     const l = RocList{ .bytes = list_bytes, .length = list_len, .capacity_or_alloc_ptr = list_cap };
     if (elements_refcounted) {
         var inc_ctx = CallbackElementIncrefContext{
             .callback = element_incref orelse unreachable,
             .roc_ops = roc_ops,
         };
-        out.* = listPrepend(l, alignment, element, element_width, true, @ptrCast(&inc_ctx), &callbackListElementIncref, update_mode, &copy_fallback, roc_ops);
+        var dec_ctx = CallbackElementDecrefContext{
+            .callback = element_decref orelse unreachable,
+            .roc_ops = roc_ops,
+        };
+        out.* = listPrepend(l, alignment, element, element_width, true, @ptrCast(&inc_ctx), &callbackListElementIncref, @ptrCast(&dec_ctx), &callbackListElementDecref, update_mode, &copy_fallback, roc_ops);
     } else {
-        out.* = listPrepend(l, alignment, element, element_width, false, null, @ptrCast(&rcNone), update_mode, &copy_fallback, roc_ops);
+        out.* = listPrepend(l, alignment, element, element_width, false, null, @ptrCast(&rcNone), null, @ptrCast(&rcNone), update_mode, &copy_fallback, roc_ops);
     }
 }
 
@@ -720,16 +765,20 @@ pub fn roc_builtins_list_swap(out: *RocList, list_bytes: ?[*]u8, list_len: usize
 
 /// Wrapper: listReserve. The update mode is forwarded to the builtin's
 /// uniqueness check; `.InPlace` skips it.
-pub fn roc_builtins_list_reserve(out: *RocList, list_bytes: ?[*]u8, list_len: usize, list_cap: usize, alignment: u32, spare: u64, element_width: usize, elements_refcounted: bool, element_incref: ?RcIncFn, update_mode: utils.UpdateMode, roc_ops: *RocOps) callconv(.c) void {
+pub fn roc_builtins_list_reserve(out: *RocList, list_bytes: ?[*]u8, list_len: usize, list_cap: usize, alignment: u32, spare: u64, element_width: usize, elements_refcounted: bool, element_incref: ?RcIncFn, element_decref: ?RcDropFn, update_mode: utils.UpdateMode, roc_ops: *RocOps) callconv(.c) void {
     const l = RocList{ .bytes = list_bytes, .length = list_len, .capacity_or_alloc_ptr = list_cap };
     if (elements_refcounted) {
         var inc_ctx = CallbackElementIncrefContext{
             .callback = element_incref orelse unreachable,
             .roc_ops = roc_ops,
         };
-        out.* = listReserve(l, alignment, spare, element_width, true, @ptrCast(&inc_ctx), &callbackListElementIncref, update_mode, roc_ops);
+        var dec_ctx = CallbackElementDecrefContext{
+            .callback = element_decref orelse unreachable,
+            .roc_ops = roc_ops,
+        };
+        out.* = listReserve(l, alignment, spare, element_width, true, @ptrCast(&inc_ctx), &callbackListElementIncref, @ptrCast(&dec_ctx), &callbackListElementDecref, update_mode, roc_ops);
     } else {
-        out.* = listReserve(l, alignment, spare, element_width, false, null, @ptrCast(&rcNone), update_mode, roc_ops);
+        out.* = listReserve(l, alignment, spare, element_width, false, null, @ptrCast(&rcNone), null, @ptrCast(&rcNone), update_mode, roc_ops);
     }
 }
 
@@ -1201,6 +1250,41 @@ pub fn roc_builtins_erased_callable_repack(
 /// `on_drop` callback unconditionally first.
 pub fn roc_builtins_erased_callable_free(payload_ptr: ?[*]u8, roc_ops: *RocOps) callconv(.c) void {
     erased_callable.free(payload_ptr, roc_ops);
+}
+
+/// Enter the loaded dev-shim code image that contains the generated callsite.
+pub fn roc_builtins_hot_reload_enter(_: *RocOps) callconv(.c) ?*anyopaque {
+    if (comptime @hasDecl(@import("root"), "roc_hot_reload_enter")) {
+        return @import("root").roc_hot_reload_enter(@returnAddress());
+    }
+    return null;
+}
+
+/// Leave a loaded dev-shim code image previously returned by hot_reload_enter.
+pub fn roc_builtins_hot_reload_leave(code_ref: ?*anyopaque) callconv(.c) void {
+    if (comptime @hasDecl(@import("root"), "roc_hot_reload_leave")) {
+        @import("root").roc_hot_reload_leave(code_ref);
+    }
+}
+
+/// Retain the loaded dev-shim code image that created an erased-callable
+/// payload. The retained reference is released by
+/// roc_builtins_hot_reload_erased_callable_drop.
+pub fn roc_builtins_hot_reload_retain_current(_: *RocOps) callconv(.c) ?*anyopaque {
+    if (comptime @hasDecl(@import("root"), "roc_hot_reload_retain_current")) {
+        return @import("root").roc_hot_reload_retain_current(@returnAddress());
+    }
+    return null;
+}
+
+/// Final-drop callback for shim-execution erased callables that carry a
+/// hot-reload capture prefix.
+pub fn roc_builtins_hot_reload_erased_callable_drop(capture_ptr: ?[*]u8, roc_ops: *RocOps) callconv(.c) void {
+    const header = erased_callable.hotReloadCaptureHeader(capture_ptr) orelse return;
+    if (header.original_on_drop) |original_on_drop| {
+        original_on_drop(erased_callable.hotReloadAdjustedCapturePtr(capture_ptr), roc_ops);
+    }
+    roc_builtins_hot_reload_leave(header.code_ref);
 }
 
 // ═══════════════════════════════════════════════════════════════════════════

@@ -44,6 +44,7 @@ combineTrys = |result1, result2|
     }
 ~~~
 # EXPECTED
+DUPLICATE DEFINITION - can_import_type_annotations.md:2:1:2:17
 UNDECLARED TYPE - can_import_type_annotations.md:5:18:5:25
 UNDECLARED TYPE - can_import_type_annotations.md:5:29:5:37
 UNDEFINED VARIABLE - can_import_type_annotations.md:6:24:6:44
@@ -62,193 +63,198 @@ MODULE NOT FOUND - can_import_type_annotations.md:24:53:24:59
 MODULE NOT FOUND - can_import_type_annotations.md:24:72:24:78
 UNDEFINED VARIABLE - can_import_type_annotations.md:25:40:25:61
 # PROBLEMS
-**UNDECLARED TYPE**
-The type _Request_ is not declared in this scope.
 
-This type is referenced here:
-**can_import_type_annotations.md:5:18:5:25:**
-```roc
-processRequest : Request -> Response
-```
-                 ^^^^^^^
+┌──────────────────────┐
+│ DUPLICATE DEFINITION ├─ The name `Json` is being redeclared here. ──────────┐
+└┬─────────────────────┘                                                      │
+ │                                                                            │
+ │  import json.Json                                                          │
+ │  ‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾                                                          │
+ └──────────────────────────────────────── can_import_type_annotations.md:2:1 ┘
 
-
-**UNDECLARED TYPE**
-The type _Response_ is not declared in this scope.
-
-This type is referenced here:
-**can_import_type_annotations.md:5:29:5:37:**
-```roc
-processRequest : Request -> Response
-```
-                            ^^^^^^^^
+    In this scope, `Json` was already defined here:
+      ┌───────────────────────────────────────────────────────────────────────┐
+    1 │  import http.Client as Http exposing [Request, Response]              │
+      │  ‾                                                                    │
+      └─────────────────────────────────── can_import_type_annotations.md:1:1 ┘
 
 
-**UNDEFINED VARIABLE**
-Nothing is named `defaultResponse` in this scope.
-Is there an `import` or `exposing` missing up-top?
-
-**can_import_type_annotations.md:6:24:6:44:**
-```roc
-processRequest = |req| Http.defaultResponse
-```
-                       ^^^^^^^^^^^^^^^^^^^^
+┌─────────────────┐
+│ UNDECLARED TYPE ├─ The type `Request` is not declared in this scope. ───────┐
+└┬────────────────┘                                                           │
+ │                                                                            │
+ │  processRequest : Request -> Response                                      │
+ │                   ‾‾‾‾‾‾‾                                                  │
+ └─────────────────────────────────────── can_import_type_annotations.md:5:18 ┘
 
 
-**UNUSED VARIABLE**
-Variable `req` is not used anywhere in your code.
 
-If you don't need this variable, prefix it with an underscore like `_req` to suppress this warning.
-The unused variable is declared here:
-**can_import_type_annotations.md:6:19:6:22:**
-```roc
-processRequest = |req| Http.defaultResponse
-```
-                  ^^^
+┌─────────────────┐
+│ UNDECLARED TYPE ├─ The type `Response` is not declared in this scope. ──────┐
+└┬────────────────┘                                                           │
+ │                                                                            │
+ │  processRequest : Request -> Response                                      │
+ │                              ‾‾‾‾‾‾‾‾                                      │
+ └─────────────────────────────────────── can_import_type_annotations.md:5:29 ┘
 
 
-**MODULE NOT FOUND**
-The type `Value` is qualified by the module `json.Json`, but that module was not found in this Roc project.
 
-You're attempting to use this type here:
-**can_import_type_annotations.md:8:24:8:30:**
-```roc
-parseJson : Str -> Json.Value
-```
-                       ^^^^^^
+┌────────────────────┐
+│ UNDEFINED VARIABLE ├─ Nothing is named `defaultResponse` in this scope. ────┐
+└┬───────────────────┘                                                        │
+ │                                                                            │
+ │  processRequest = |req| Http.defaultResponse                               │
+ │                         ‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾                               │
+ └─────────────────────────────────────── can_import_type_annotations.md:6:24 ┘
 
-
-**UNDEFINED VARIABLE**
-Nothing is named `parse` in this scope.
-Is there an `import` or `exposing` missing up-top?
-
-**can_import_type_annotations.md:9:21:9:31:**
-```roc
-parseJson = |input| Json.parse(input)
-```
-                    ^^^^^^^^^^
+    Is there an `import` or `exposing` missing up-top?
 
 
-**MODULE NOT FOUND**
-The type `Request` is qualified by the module `http.Client`, but that module was not found in this Roc project.
+┌─────────────────┐
+│ UNUSED VARIABLE ├─ Variable `req` is defined here and then never used. ─────┐
+└┬────────────────┘                                                           │
+ │                                                                            │
+ │  processRequest = |req| Http.defaultResponse                               │
+ │                    ‾‾‾                                                     │
+ └─────────────────────────────────────── can_import_type_annotations.md:6:19 ┘
 
-You're attempting to use this type here:
-**can_import_type_annotations.md:11:17:11:25:**
-```roc
-handleApi : Http.Request -> Try(Http.Response, Json.Error)
-```
-                ^^^^^^^^
-
-
-**MODULE NOT FOUND**
-The type `Response` is qualified by the module `http.Client`, but that module was not found in this Roc project.
-
-You're attempting to use this type here:
-**can_import_type_annotations.md:11:37:11:46:**
-```roc
-handleApi : Http.Request -> Try(Http.Response, Json.Error)
-```
-                                    ^^^^^^^^^
+    If you don't need this variable, prefix it with an underscore like `_req`
+    to suppress this warning.
 
 
-**MODULE NOT FOUND**
-The type `Error` is qualified by the module `json.Json`, but that module was not found in this Roc project.
-
-You're attempting to use this type here:
-**can_import_type_annotations.md:11:52:11:58:**
-```roc
-handleApi : Http.Request -> Try(Http.Response, Json.Error)
-```
-                                                   ^^^^^^
+┌──────────────────┐
+│ MODULE NOT FOUND ├─ This `Value` type is declared to be in `json.Json`, ────┐
+└┬─────────────────┘  which does not exist.                                   │
+ │                                                                            │
+ │  parseJson : Str -> Json.Value                                             │
+ │                         ‾‾‾‾‾‾                                             │
+ └─────────────────────────────────────── can_import_type_annotations.md:8:24 ┘
 
 
-**UNDEFINED VARIABLE**
-Nothing is named `decode` in this scope.
-Is there an `import` or `exposing` missing up-top?
 
-**can_import_type_annotations.md:13:14:13:25:**
-```roc
-    result = Json.decode(request.body)
-```
-             ^^^^^^^^^^^
+┌────────────────────┐
+│ UNDEFINED VARIABLE ├─ Nothing is named `parse` in this scope. ──────────────┐
+└┬───────────────────┘                                                        │
+ │                                                                            │
+ │  parseJson = |input| Json.parse(input)                                     │
+ │                      ‾‾‾‾‾‾‾‾‾‾                                            │
+ └─────────────────────────────────────── can_import_type_annotations.md:9:21 ┘
 
-
-**UNDEFINED VARIABLE**
-Nothing is named `success` in this scope.
-Is there an `import` or `exposing` missing up-top?
-
-**can_import_type_annotations.md:15:24:15:36:**
-```roc
-        Ok(data) => Ok(Http.success(data))
-```
-                       ^^^^^^^^^^^^
+    Is there an `import` or `exposing` missing up-top?
 
 
-**MODULE NOT FOUND**
-The type `Config` is qualified by the module `json.Json`, but that module was not found in this Roc project.
-
-You're attempting to use this type here:
-**can_import_type_annotations.md:20:14:20:21:**
-```roc
-config : Json.Config
-```
-             ^^^^^^^
+┌──────────────────┐
+│ MODULE NOT FOUND ├─ This `Request` type is declared to be in ───────────────┐
+└┬─────────────────┘  `http.Client`, which does not exist.                    │
+ │                                                                            │
+ │  handleApi : Http.Request -> Try(Http.Response, Json.Error)                │
+ │                  ‾‾‾‾‾‾‾‾                                                  │
+ └────────────────────────────────────── can_import_type_annotations.md:11:17 ┘
 
 
-**UNDEFINED VARIABLE**
-Nothing is named `defaultConfig` in this scope.
-Is there an `import` or `exposing` missing up-top?
 
-**can_import_type_annotations.md:21:10:21:28:**
-```roc
-config = Json.defaultConfig
-```
-         ^^^^^^^^^^^^^^^^^^
-
-
-**MODULE NOT FOUND**
-The type `Parser.Config` is qualified by the module `json.Json`, but that module was not found in this Roc project.
-
-You're attempting to use this type here:
-**can_import_type_annotations.md:24:29:24:36:**
-```roc
-advancedParser : Json.Parser.Config, Str -> Try(Json.Value, Json.Parser.Error)
-```
-                            ^^^^^^^
+┌──────────────────┐
+│ MODULE NOT FOUND ├─ This `Response` type is declared to be in ──────────────┐
+└┬─────────────────┘  `http.Client`, which does not exist.                    │
+ │                                                                            │
+ │  handleApi : Http.Request -> Try(Http.Response, Json.Error)                │
+ │                                      ‾‾‾‾‾‾‾‾‾                             │
+ └────────────────────────────────────── can_import_type_annotations.md:11:37 ┘
 
 
-**MODULE NOT FOUND**
-The type `Value` is qualified by the module `json.Json`, but that module was not found in this Roc project.
 
-You're attempting to use this type here:
-**can_import_type_annotations.md:24:53:24:59:**
-```roc
-advancedParser : Json.Parser.Config, Str -> Try(Json.Value, Json.Parser.Error)
-```
-                                                    ^^^^^^
-
-
-**MODULE NOT FOUND**
-The type `Parser.Error` is qualified by the module `json.Json`, but that module was not found in this Roc project.
-
-You're attempting to use this type here:
-**can_import_type_annotations.md:24:72:24:78:**
-```roc
-advancedParser : Json.Parser.Config, Str -> Try(Json.Value, Json.Parser.Error)
-```
-                                                                       ^^^^^^
+┌──────────────────┐
+│ MODULE NOT FOUND ├─ This `Error` type is declared to be in `json.Json`, ────┐
+└┬─────────────────┘  which does not exist.                                   │
+ │                                                                            │
+ │  handleApi : Http.Request -> Try(Http.Response, Json.Error)                │
+ │                                                     ‾‾‾‾‾‾                 │
+ └────────────────────────────────────── can_import_type_annotations.md:11:52 ┘
 
 
-**UNDEFINED VARIABLE**
-Nothing is named `parseWith` in this scope.
-Is there an `import` or `exposing` missing up-top?
 
-**can_import_type_annotations.md:25:40:25:61:**
-```roc
-advancedParser = |parserConfig, input| Json.Parser.parseWith(parserConfig, input)
-```
-                                       ^^^^^^^^^^^^^^^^^^^^^
+┌────────────────────┐
+│ UNDEFINED VARIABLE ├─ Nothing is named `decode` in this scope. ─────────────┐
+└┬───────────────────┘                                                        │
+ │                                                                            │
+ │  result = Json.decode(request.body)                                        │
+ │           ‾‾‾‾‾‾‾‾‾‾‾                                                      │
+ └────────────────────────────────────── can_import_type_annotations.md:13:14 ┘
 
+    Is there an `import` or `exposing` missing up-top?
+
+
+┌────────────────────┐
+│ UNDEFINED VARIABLE ├─ Nothing is named `success` in this scope. ────────────┐
+└┬───────────────────┘                                                        │
+ │                                                                            │
+ │  Ok(data) => Ok(Http.success(data))                                        │
+ │                 ‾‾‾‾‾‾‾‾‾‾‾‾                                               │
+ └────────────────────────────────────── can_import_type_annotations.md:15:24 ┘
+
+    Is there an `import` or `exposing` missing up-top?
+
+
+┌──────────────────┐
+│ MODULE NOT FOUND ├─ This `Config` type is declared to be in `json.Json`, ───┐
+└┬─────────────────┘  which does not exist.                                   │
+ │                                                                            │
+ │  config : Json.Config                                                      │
+ │               ‾‾‾‾‾‾‾                                                      │
+ └────────────────────────────────────── can_import_type_annotations.md:20:14 ┘
+
+
+
+┌────────────────────┐
+│ UNDEFINED VARIABLE ├─ Nothing is named `defaultConfig` in this scope. ──────┐
+└┬───────────────────┘                                                        │
+ │                                                                            │
+ │  config = Json.defaultConfig                                               │
+ │           ‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾                                               │
+ └────────────────────────────────────── can_import_type_annotations.md:21:10 ┘
+
+    Is there an `import` or `exposing` missing up-top?
+
+
+┌──────────────────┐
+│ MODULE NOT FOUND ├─ This `Parser.Config` type is declared to be in ─────────┐
+└┬─────────────────┘  `json.Json`, which does not exist.                      │
+ │                                                                            │
+ │  …n.Parser.Config, Str -> Try(Json.Value, Json.Parser.Error)               │
+ │           ‾‾‾‾‾‾‾                                                          │
+ └────────────────────────────────────── can_import_type_annotations.md:24:29 ┘
+
+
+
+┌──────────────────┐
+│ MODULE NOT FOUND ├─ This `Value` type is declared to be in `json.Json`, ────┐
+└┬─────────────────┘  which does not exist.                                   │
+ │                                                                            │
+ │  …Try(Json.Value, Json.Parser.Error)                                       │
+ │           ‾‾‾‾‾‾                                                           │
+ └────────────────────────────────────── can_import_type_annotations.md:24:53 ┘
+
+
+
+┌──────────────────┐
+│ MODULE NOT FOUND ├─ This `Parser.Error` type is declared to be in ──────────┐
+└┬─────────────────┘  `json.Json`, which does not exist.                      │
+ │                                                                            │
+ │  …n.Parser.Error)                                                          │
+ │           ‾‾‾‾‾‾                                                           │
+ └────────────────────────────────────── can_import_type_annotations.md:24:72 ┘
+
+
+
+┌────────────────────┐
+│ UNDEFINED VARIABLE ├─ Nothing is named `parseWith` in this scope. ──────────┐
+└┬───────────────────┘                                                        │
+ │                                                                            │
+ │  … input| Json.Parser.parseWith(parserConfig, input)                       │
+ │           ‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾                                            │
+ └────────────────────────────────────── can_import_type_annotations.md:25:40 ┘
+
+    Is there an `import` or `exposing` missing up-top?
 
 # TOKENS
 ~~~zig

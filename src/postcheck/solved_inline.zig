@@ -16,7 +16,6 @@ pub const Mode = enum {
 /// Immutable inline eligibility table consumed by later lowering stages.
 pub const Plan = struct {
     inline_bodies: []const ?Lifted.ExprId = &.{},
-    materialize_bodies: []const ?Lifted.ExprId = &.{},
 
     pub fn bodyForFn(self: Plan, fn_id: Lifted.FnId) ?Lifted.ExprId {
         if (self.inline_bodies.len == 0) return null;
@@ -27,36 +26,24 @@ pub const Plan = struct {
         }
         return self.inline_bodies[index];
     }
-
-    pub fn materializeBodyForFn(self: Plan, fn_id: Lifted.FnId) ?Lifted.ExprId {
-        if (self.materialize_bodies.len == 0) return null;
-
-        const index = @intFromEnum(fn_id);
-        if (index >= self.materialize_bodies.len) {
-            Common.invariant("inline plan did not contain a lifted function");
-        }
-        return self.materialize_bodies[index];
-    }
 };
 
 /// Allocator-owned storage for a post-check inline plan.
 pub const OwnedPlan = struct {
     allocator: std.mem.Allocator,
     inline_bodies: []?Lifted.ExprId,
-    materialize_bodies: []?Lifted.ExprId,
 
     pub fn empty(allocator: std.mem.Allocator) OwnedPlan {
-        return .{ .allocator = allocator, .inline_bodies = &.{}, .materialize_bodies = &.{} };
+        return .{ .allocator = allocator, .inline_bodies = &.{} };
     }
 
     pub fn deinit(self: *OwnedPlan) void {
         if (self.inline_bodies.len != 0) self.allocator.free(self.inline_bodies);
-        if (self.materialize_bodies.len != 0) self.allocator.free(self.materialize_bodies);
         self.* = empty(self.allocator);
     }
 
     pub fn view(self: *const OwnedPlan) Plan {
-        return .{ .inline_bodies = self.inline_bodies, .materialize_bodies = self.materialize_bodies };
+        return .{ .inline_bodies = self.inline_bodies };
     }
 };
 
@@ -108,18 +95,9 @@ const WrapperAnalyzer = struct {
 
         const inline_bodies = try allocator.alloc(?Lifted.ExprId, decisions.len);
         errdefer allocator.free(inline_bodies);
-        const materialize_bodies = try allocator.alloc(?Lifted.ExprId, decisions.len);
-        errdefer allocator.free(materialize_bodies);
         for (decisions, 0..) |decision, index| {
             inline_bodies[index] = switch (decision) {
                 .inline_body => |body| body,
-                .unknown,
-                .visiting,
-                .never,
-                => null,
-            };
-            materialize_bodies[index] = switch (decision) {
-                .inline_body => |body| if (analyzer.isMaterializeInlineBody(body)) body else null,
                 .unknown,
                 .visiting,
                 .never,
@@ -133,7 +111,6 @@ const WrapperAnalyzer = struct {
         return .{
             .allocator = allocator,
             .inline_bodies = inline_bodies,
-            .materialize_bodies = materialize_bodies,
         };
     }
 
@@ -182,16 +159,22 @@ const WrapperAnalyzer = struct {
 
     fn wrapperCandidate(self: *const WrapperAnalyzer, fn_id: Lifted.FnId) ?Lifted.ExprId {
         const source_fn = self.solved.lifted.fns.items[@intFromEnum(fn_id)];
+        if (self.solved.lifted.typedLocalSpan(source_fn.captures).len != 0) return null;
+        if (self.solvedCaptureCount(fn_id) != 0) return null;
 
         const body = switch (source_fn.body) {
             .roc => |body_expr| body_expr,
             .hosted => return null,
         };
 
-        if (exprContainsReturn(&self.solved.lifted, body)) return null;
-        if (!self.bodyReadsOnlyInlineInputs(fn_id, body)) return null;
+        if (!self.bodyReadsOnlyArgs(fn_id, body)) return null;
         if (!self.isInlineableWrapperBody(body)) return null;
         return body;
+    }
+
+    fn solvedCaptureCount(self: *const WrapperAnalyzer, fn_id: Lifted.FnId) usize {
+        const captures = self.solvedCapturesForFn(fn_id);
+        return self.solved.types.captureSpan(captures).len;
     }
 
     fn solvedCapturesForFn(self: *const WrapperAnalyzer, fn_id: Lifted.FnId) SolvedType.Span {
@@ -211,66 +194,51 @@ const WrapperAnalyzer = struct {
         return .empty();
     }
 
-    fn bodyReadsOnlyInlineInputs(self: *const WrapperAnalyzer, fn_id: Lifted.FnId, body: Lifted.ExprId) bool {
+    fn bodyReadsOnlyArgs(self: *const WrapperAnalyzer, fn_id: Lifted.FnId, body: Lifted.ExprId) bool {
         const source_fn = self.solved.lifted.fns.items[@intFromEnum(fn_id)];
-        return self.exprReadsOnlyInlineInputs(
-            body,
-            self.solved.lifted.typedLocalSpan(source_fn.args),
-            self.solved.lifted.typedLocalSpan(source_fn.captures),
-            self.solved.types.captureSpan(self.solvedCapturesForFn(fn_id)),
-        );
+        return self.exprReadsOnlyArgs(body, self.solved.lifted.typedLocalSpan(source_fn.args));
     }
 
-    fn exprReadsOnlyInlineInputs(
-        self: *const WrapperAnalyzer,
-        expr_id: Lifted.ExprId,
-        args: []const Lifted.TypedLocal,
-        source_captures: []const Lifted.TypedLocal,
-        solved_captures: []const SolvedType.Capture,
-    ) bool {
+    fn exprReadsOnlyArgs(self: *const WrapperAnalyzer, expr_id: Lifted.ExprId, args: []const Lifted.TypedLocal) bool {
         const expr = self.solved.lifted.exprs.items[@intFromEnum(expr_id)];
         return switch (expr.data) {
-            .local => |local| localIsInlineInput(local, args, source_captures, solved_captures),
+            .local => |local| localIsArg(local, args),
             .unit,
             .int_lit,
             .frac_f32_lit,
             .frac_f64_lit,
             .dec_lit,
             .str_lit,
-            .static_data,
             .def_ref,
             => true,
-            .fn_ref => |target| self.fnHasNoCaptures(target),
-            .static_data_candidate => |candidate| self.exprReadsOnlyInlineInputs(candidate.restored_expr, args, source_captures, solved_captures),
+            .fn_ref => |fn_ref| self.exprSpanReadsOnlyArgs(fn_ref.captures, args),
             .list,
             .tuple,
-            => |items| self.exprSpanReadsOnlyInlineInputs(items, args, source_captures, solved_captures),
+            => |items| self.exprSpanReadsOnlyArgs(items, args),
             .record => |fields| {
                 for (self.solved.lifted.fieldExprSpan(fields)) |field| {
-                    if (!self.exprReadsOnlyInlineInputs(field.value, args, source_captures, solved_captures)) return false;
+                    if (!self.exprReadsOnlyArgs(field.value, args)) return false;
                 }
                 return true;
             },
-            .tag => |tag| self.exprSpanReadsOnlyInlineInputs(tag.payloads, args, source_captures, solved_captures),
+            .tag => |tag| self.exprSpanReadsOnlyArgs(tag.payloads, args),
             .nominal,
             .dbg,
             .expect,
-            .return_,
-            => |child| self.exprReadsOnlyInlineInputs(child, args, source_captures, solved_captures),
-            .expect_err => |expect_err| self.exprReadsOnlyInlineInputs(expect_err.msg, args, source_captures, solved_captures),
-            .comptime_branch_taken => |taken| self.exprReadsOnlyInlineInputs(taken.body, args, source_captures, solved_captures),
-            .call_value => |call| self.exprReadsOnlyInlineInputs(call.callee, args, source_captures, solved_captures) and
-                self.exprSpanReadsOnlyInlineInputs(call.args, args, source_captures, solved_captures),
-            .call_proc => |call| !call.is_cold and self.exprSpanReadsOnlyInlineInputs(call.args, args, source_captures, solved_captures),
-            .low_level => |call| self.exprSpanReadsOnlyInlineInputs(call.args, args, source_captures, solved_captures),
-            .field_access => |field| self.exprReadsOnlyInlineInputs(field.receiver, args, source_captures, solved_captures),
-            .tuple_access => |access| self.exprReadsOnlyInlineInputs(access.tuple, args, source_captures, solved_captures),
-            .structural_eq => |eq| self.exprReadsOnlyInlineInputs(eq.lhs, args, source_captures, solved_captures) and
-                self.exprReadsOnlyInlineInputs(eq.rhs, args, source_captures, solved_captures),
-            .structural_hash => |h| self.exprReadsOnlyInlineInputs(h.value, args, source_captures, solved_captures) and
-                self.exprReadsOnlyInlineInputs(h.hasher, args, source_captures, solved_captures),
-            .block => |block| self.solved.lifted.stmtSpan(block.statements).len == 0 and
-                self.exprReadsOnlyInlineInputs(block.final_expr, args, source_captures, solved_captures),
+            => |child| self.exprReadsOnlyArgs(child, args),
+            .return_ => |ret| self.exprReadsOnlyArgs(ret.value, args),
+            .expect_err => |expect_err| self.exprReadsOnlyArgs(expect_err.msg, args),
+            .comptime_branch_taken => |taken| self.exprReadsOnlyArgs(taken.body, args),
+            .call_value => |call| self.exprReadsOnlyArgs(call.callee, args) and self.exprSpanReadsOnlyArgs(call.args, args),
+            .call_proc => |call| !call.is_cold and
+                self.exprSpanReadsOnlyArgs(call.args, args) and
+                self.exprSpanReadsOnlyArgs(call.captures, args),
+            .low_level => |call| self.exprSpanReadsOnlyArgs(call.args, args),
+            .field_access => |field| self.exprReadsOnlyArgs(field.receiver, args),
+            .tuple_access => |access| self.exprReadsOnlyArgs(access.tuple, args),
+            .structural_eq => |eq| self.exprReadsOnlyArgs(eq.lhs, args) and self.exprReadsOnlyArgs(eq.rhs, args),
+            .structural_hash => |h| self.exprReadsOnlyArgs(h.value, args) and self.exprReadsOnlyArgs(h.hasher, args),
+            .block => |block| self.solved.lifted.stmtSpan(block.statements).len == 0 and self.exprReadsOnlyArgs(block.final_expr, args),
             .lambda,
             .fn_def,
             .let_,
@@ -282,150 +250,36 @@ const WrapperAnalyzer = struct {
             .try_sequence,
             .try_record_sequence,
             .loop_,
-            .state_loop,
             .break_,
             .continue_,
-            .state_continue,
             .crash,
             .comptime_exhaustiveness_failed,
             => false,
-            .fn_ref_captures => |fn_ref| self.exprSpanReadsOnlyInlineInputs(fn_ref.captures, args, source_captures, solved_captures),
         };
     }
 
-    fn exprSpanReadsOnlyInlineInputs(
-        self: *const WrapperAnalyzer,
-        span: Lifted.Span(Lifted.ExprId),
-        args: []const Lifted.TypedLocal,
-        source_captures: []const Lifted.TypedLocal,
-        solved_captures: []const SolvedType.Capture,
-    ) bool {
+    fn exprSpanReadsOnlyArgs(self: *const WrapperAnalyzer, span: Lifted.Span(Lifted.ExprId), args: []const Lifted.TypedLocal) bool {
         for (self.solved.lifted.exprSpan(span)) |expr| {
-            if (!self.exprReadsOnlyInlineInputs(expr, args, source_captures, solved_captures)) return false;
+            if (!self.exprReadsOnlyArgs(expr, args)) return false;
         }
         return true;
     }
 
-    fn localIsInlineInput(
-        local: Lifted.LocalId,
-        args: []const Lifted.TypedLocal,
-        source_captures: []const Lifted.TypedLocal,
-        solved_captures: []const SolvedType.Capture,
-    ) bool {
+    fn localIsArg(local: Lifted.LocalId, args: []const Lifted.TypedLocal) bool {
         for (args) |arg| {
             if (arg.local == local) return true;
         }
-        for (source_captures) |capture| {
-            if (capture.local != local) continue;
-            for (solved_captures) |solved_capture| {
-                if (solved_capture.local == local) return true;
-            }
-            return false;
-        }
         return false;
-    }
-
-    fn fnHasNoCaptures(self: *const WrapperAnalyzer, fn_id: Lifted.FnId) bool {
-        const fn_ = self.solved.lifted.fns.items[@intFromEnum(fn_id)];
-        return self.solved.lifted.typedLocalSpan(fn_.captures).len == 0;
     }
 
     fn isInlineableWrapperBody(self: *const WrapperAnalyzer, expr_id: Lifted.ExprId) bool {
         const expr = self.solved.lifted.exprs.items[@intFromEnum(expr_id)];
         return switch (expr.data) {
-            .local,
-            .unit,
-            .int_lit,
-            .frac_f32_lit,
-            .frac_f64_lit,
-            .dec_lit,
-            .str_lit,
-            .static_data,
-            .fn_ref,
-            => true,
-            .fn_ref_captures => |fn_ref| self.exprSpanIsInlineableWrapperBody(fn_ref.captures),
             .call_proc, .low_level => true,
-            .field_access => |field| self.isInlineableWrapperBody(field.receiver),
-            .tuple_access => |access| self.isInlineableWrapperBody(access.tuple),
-            .tuple,
-            => |items| self.exprSpanIsInlineableWrapperBody(items),
-            .record => |fields| {
-                for (self.solved.lifted.fieldExprSpan(fields)) |field| {
-                    if (!self.isInlineableWrapperBody(field.value)) return false;
-                }
-                return true;
-            },
-            .tag => |tag| self.exprSpanIsInlineableWrapperBody(tag.payloads),
-            .nominal => |backing| self.isInlineableWrapperBody(backing),
-            .call_value => |call| self.isInlineableWrapperBody(call.callee) and
-                self.exprSpanIsInlineableWrapperBody(call.args),
             .block => |block| self.solved.lifted.stmtSpan(block.statements).len == 0 and
                 self.isInlineableWrapperBody(block.final_expr),
             else => false,
         };
-    }
-
-    fn isMaterializeInlineBody(self: *const WrapperAnalyzer, expr_id: Lifted.ExprId) bool {
-        const expr = self.solved.lifted.exprs.items[@intFromEnum(expr_id)];
-        return switch (expr.data) {
-            .local,
-            .unit,
-            .int_lit,
-            .frac_f32_lit,
-            .frac_f64_lit,
-            .dec_lit,
-            .str_lit,
-            .static_data,
-            .def_ref,
-            .fn_ref,
-            => true,
-            .fn_ref_captures => |fn_ref| self.exprSpanIsMaterializeInlineBody(fn_ref.captures),
-            .static_data_candidate => |candidate| self.isMaterializeInlineBody(candidate.restored_expr),
-            .call_proc => |call| !call.is_cold and
-                self.inlineDecisionIsMaterializeInlineBody(Lifted.callProcCallee(call)) and
-                self.exprSpanIsMaterializeInlineBody(call.args),
-            .low_level => |call| self.exprSpanIsMaterializeInlineBody(call.args),
-            .field_access => |field| self.isMaterializeInlineBody(field.receiver),
-            .tuple_access => |access| self.isMaterializeInlineBody(access.tuple),
-            .tuple,
-            .list,
-            => |items| self.exprSpanIsMaterializeInlineBody(items),
-            .record => |fields| {
-                for (self.solved.lifted.fieldExprSpan(fields)) |field| {
-                    if (!self.isMaterializeInlineBody(field.value)) return false;
-                }
-                return true;
-            },
-            .tag => |tag| self.exprSpanIsMaterializeInlineBody(tag.payloads),
-            .nominal => |backing| self.isMaterializeInlineBody(backing),
-            .block => |block| self.solved.lifted.stmtSpan(block.statements).len == 0 and
-                self.isMaterializeInlineBody(block.final_expr),
-            else => false,
-        };
-    }
-
-    fn exprSpanIsMaterializeInlineBody(self: *const WrapperAnalyzer, span: Lifted.Span(Lifted.ExprId)) bool {
-        for (self.solved.lifted.exprSpan(span)) |expr| {
-            if (!self.isMaterializeInlineBody(expr)) return false;
-        }
-        return true;
-    }
-
-    fn inlineDecisionIsMaterializeInlineBody(self: *const WrapperAnalyzer, fn_id: Lifted.FnId) bool {
-        return switch (self.decisions[@intFromEnum(fn_id)]) {
-            .inline_body => |body| self.isMaterializeInlineBody(body),
-            .unknown,
-            .visiting,
-            .never,
-            => false,
-        };
-    }
-
-    fn exprSpanIsInlineableWrapperBody(self: *const WrapperAnalyzer, span: Lifted.Span(Lifted.ExprId)) bool {
-        for (self.solved.lifted.exprSpan(span)) |expr| {
-            if (!self.isInlineableWrapperBody(expr)) return false;
-        }
-        return true;
     }
 
     /// Visit every proc called within a wrapper body so inline cycles are
@@ -442,12 +296,9 @@ const WrapperAnalyzer = struct {
             .frac_f64_lit,
             .dec_lit,
             .str_lit,
-            .static_data,
             .def_ref,
-            .fn_ref,
             => {},
-            .fn_ref_captures => |fn_ref| try self.visitSpanCallees(fn_ref.captures),
-            .static_data_candidate => |candidate| try self.visitBodyCallees(candidate.restored_expr),
+            .fn_ref => |fn_ref| try self.visitSpanCallees(fn_ref.captures),
             .list,
             .tuple,
             => |items| try self.visitSpanCallees(items),
@@ -461,6 +312,7 @@ const WrapperAnalyzer = struct {
             .dbg,
             .expect,
             => |child| try self.visitBodyCallees(child),
+            .return_ => |ret| try self.visitBodyCallees(ret.value),
             .expect_err => |expect_err| try self.visitBodyCallees(expect_err.msg),
             .comptime_branch_taken => |taken| try self.visitBodyCallees(taken.body),
             .call_value => |call| {
@@ -468,8 +320,11 @@ const WrapperAnalyzer = struct {
                 try self.visitSpanCallees(call.args);
             },
             .call_proc => |call| {
-                _ = try self.inlineBody(Lifted.callProcCallee(call));
+                if (Lifted.localDirectCallee(call)) |callee| {
+                    _ = try self.inlineBody(callee);
+                }
                 try self.visitSpanCallees(call.args);
+                try self.visitSpanCallees(call.captures);
             },
             .low_level => |call| try self.visitSpanCallees(call.args),
             .field_access => |field| try self.visitBodyCallees(field.receiver),
@@ -482,59 +337,20 @@ const WrapperAnalyzer = struct {
                 try self.visitBodyCallees(h.value);
                 try self.visitBodyCallees(h.hasher);
             },
-            .block => |block| {
-                try self.visitStmtSpanCallees(block.statements);
-                try self.visitBodyCallees(block.final_expr);
-            },
-            .let_ => |let_| {
-                try self.visitBodyCallees(let_.value);
-                try self.visitBodyCallees(let_.rest);
-            },
-            .match_ => |match| {
-                try self.visitBodyCallees(match.scrutinee);
-                for (self.solved.lifted.branchSpan(match.branches)) |branch| {
-                    if (branch.guard) |guard| try self.visitBodyCallees(guard);
-                    try self.visitBodyCallees(branch.body);
-                }
-            },
-            .if_ => |if_| {
-                for (self.solved.lifted.ifBranchSpan(if_.branches)) |branch| {
-                    try self.visitBodyCallees(branch.cond);
-                    try self.visitBodyCallees(branch.body);
-                }
-                try self.visitBodyCallees(if_.final_else);
-            },
-            .if_initialized_payload => |payload_switch| {
-                try self.visitBodyCallees(payload_switch.cond);
-                try self.visitBodyCallees(payload_switch.initialized);
-                try self.visitBodyCallees(payload_switch.uninitialized);
-            },
-            .try_sequence => |sequence| {
-                try self.visitBodyCallees(sequence.try_expr);
-                try self.visitBodyCallees(sequence.ok_body);
-            },
-            .try_record_sequence => |sequence| {
-                try self.visitBodyCallees(sequence.try_expr);
-                try self.visitBodyCallees(sequence.ok_body);
-            },
-            .loop_ => |loop| {
-                try self.visitSpanCallees(loop.initial_values);
-                try self.visitBodyCallees(loop.body);
-            },
-            .state_loop => |state_loop| {
-                try self.visitSpanCallees(state_loop.entry_values);
-                for (self.solved.lifted.stateLoopStateSpan(state_loop.states)) |state| {
-                    try self.visitBodyCallees(state.body);
-                }
-            },
-            .break_ => |maybe| if (maybe) |value| try self.visitBodyCallees(value),
-            .continue_ => |continue_| try self.visitSpanCallees(continue_.values),
-            .state_continue => |continue_| try self.visitSpanCallees(continue_.values),
-            .return_ => Common.invariant("return-containing inline candidate reached callee visitor"),
+            .block => |block| try self.visitBodyCallees(block.final_expr),
             .lambda,
             .fn_def,
+            .let_,
+            .match_,
+            .if_,
             .uninitialized,
             .uninitialized_payload,
+            .if_initialized_payload,
+            .try_sequence,
+            .try_record_sequence,
+            .loop_,
+            .break_,
+            .continue_,
             .crash,
             .comptime_exhaustiveness_failed,
             => {},
@@ -544,26 +360,6 @@ const WrapperAnalyzer = struct {
     fn visitSpanCallees(self: *WrapperAnalyzer, span: Lifted.Span(Lifted.ExprId)) std.mem.Allocator.Error!void {
         for (self.solved.lifted.exprSpan(span)) |child| {
             try self.visitBodyCallees(child);
-        }
-    }
-
-    fn visitStmtSpanCallees(self: *WrapperAnalyzer, span: Lifted.Span(Lifted.StmtId)) std.mem.Allocator.Error!void {
-        for (self.solved.lifted.stmtSpan(span)) |stmt_id| {
-            try self.visitStmtCallees(stmt_id);
-        }
-    }
-
-    fn visitStmtCallees(self: *WrapperAnalyzer, stmt_id: Lifted.StmtId) std.mem.Allocator.Error!void {
-        switch (self.solved.lifted.stmts.items[@intFromEnum(stmt_id)]) {
-            .let_ => |let_| try self.visitBodyCallees(let_.value),
-            .expr,
-            .expect,
-            .dbg,
-            .return_,
-            => |expr| try self.visitBodyCallees(expr),
-            .uninitialized,
-            .crash,
-            => {},
         }
     }
 
@@ -581,118 +377,3 @@ const WrapperAnalyzer = struct {
         }
     }
 };
-
-fn exprContainsReturn(program: *const Lifted.Program, expr_id: Lifted.ExprId) bool {
-    return switch (program.exprs.items[@intFromEnum(expr_id)].data) {
-        .return_ => true,
-        .local,
-        .unit,
-        .int_lit,
-        .frac_f32_lit,
-        .frac_f64_lit,
-        .dec_lit,
-        .str_lit,
-        .static_data,
-        .uninitialized,
-        .uninitialized_payload,
-        .fn_ref,
-        .crash,
-        .comptime_exhaustiveness_failed,
-        => false,
-        .fn_ref_captures => |fn_ref| exprSpanContainsReturn(program, fn_ref.captures),
-        .static_data_candidate => |candidate| exprContainsReturn(program, candidate.restored_expr),
-        .list,
-        .tuple,
-        => |items| exprSpanContainsReturn(program, items),
-        .record => |fields| blk: {
-            for (program.fieldExprSpan(fields)) |field| {
-                if (exprContainsReturn(program, field.value)) break :blk true;
-            }
-            break :blk false;
-        },
-        .tag => |tag| exprSpanContainsReturn(program, tag.payloads),
-        .nominal,
-        .dbg,
-        .expect,
-        => |child| exprContainsReturn(program, child),
-        .expect_err => |expect_err| exprContainsReturn(program, expect_err.msg),
-        .comptime_branch_taken => |taken| exprContainsReturn(program, taken.body),
-        .let_ => |let_| exprContainsReturn(program, let_.value) or exprContainsReturn(program, let_.rest),
-        .lambda,
-        .def_ref,
-        .fn_def,
-        => Common.invariant("pre-lift function expression reached inline return scan"),
-        .call_value => |call| exprContainsReturn(program, call.callee) or exprSpanContainsReturn(program, call.args),
-        .call_proc => |call| exprSpanContainsReturn(program, call.args),
-        .low_level => |call| exprSpanContainsReturn(program, call.args),
-        .field_access => |field| exprContainsReturn(program, field.receiver),
-        .tuple_access => |access| exprContainsReturn(program, access.tuple),
-        .structural_eq => |eq| exprContainsReturn(program, eq.lhs) or exprContainsReturn(program, eq.rhs),
-        .structural_hash => |h| exprContainsReturn(program, h.value) or exprContainsReturn(program, h.hasher),
-        .match_ => |match| blk: {
-            if (exprContainsReturn(program, match.scrutinee)) break :blk true;
-            for (program.branchSpan(match.branches)) |branch| {
-                if (branch.guard) |guard| {
-                    if (exprContainsReturn(program, guard)) break :blk true;
-                }
-                if (exprContainsReturn(program, branch.body)) break :blk true;
-            }
-            break :blk false;
-        },
-        .if_ => |if_| blk: {
-            for (program.ifBranchSpan(if_.branches)) |branch| {
-                if (exprContainsReturn(program, branch.cond) or exprContainsReturn(program, branch.body)) {
-                    break :blk true;
-                }
-            }
-            break :blk exprContainsReturn(program, if_.final_else);
-        },
-        .if_initialized_payload => |payload_switch| exprContainsReturn(program, payload_switch.cond) or
-            exprContainsReturn(program, payload_switch.initialized) or
-            exprContainsReturn(program, payload_switch.uninitialized),
-        .try_sequence => |sequence| exprContainsReturn(program, sequence.try_expr) or
-            exprContainsReturn(program, sequence.ok_body),
-        .try_record_sequence => |sequence| exprContainsReturn(program, sequence.try_expr) or
-            exprContainsReturn(program, sequence.ok_body),
-        .block => |block| stmtSpanContainsReturn(program, block.statements) or exprContainsReturn(program, block.final_expr),
-        .loop_ => |loop| exprSpanContainsReturn(program, loop.initial_values) or exprContainsReturn(program, loop.body),
-        .state_loop => |state_loop| blk: {
-            if (exprSpanContainsReturn(program, state_loop.entry_values)) break :blk true;
-            for (program.stateLoopStateSpan(state_loop.states)) |state| {
-                if (exprContainsReturn(program, state.body)) break :blk true;
-            }
-            break :blk false;
-        },
-        .break_ => |maybe| if (maybe) |value| exprContainsReturn(program, value) else false,
-        .continue_ => |continue_| exprSpanContainsReturn(program, continue_.values),
-        .state_continue => |continue_| exprSpanContainsReturn(program, continue_.values),
-    };
-}
-
-fn exprSpanContainsReturn(program: *const Lifted.Program, span: Lifted.Span(Lifted.ExprId)) bool {
-    for (program.exprSpan(span)) |expr_id| {
-        if (exprContainsReturn(program, expr_id)) return true;
-    }
-    return false;
-}
-
-fn stmtContainsReturn(program: *const Lifted.Program, stmt_id: Lifted.StmtId) bool {
-    return switch (program.stmts.items[@intFromEnum(stmt_id)]) {
-        .return_ => true,
-        .let_ => |let_| exprContainsReturn(program, let_.value),
-        .expr,
-        .expect,
-        .dbg,
-        => |expr_id| exprContainsReturn(program, expr_id),
-        .uninitialized,
-        .crash,
-        => false,
-    };
-}
-
-fn stmtSpanContainsReturn(program: *const Lifted.Program, span: Lifted.Span(Lifted.StmtId)) bool {
-    for (program.stmtSpan(span)) |stmt_id| {
-        if (stmtContainsReturn(program, stmt_id)) return true;
-    }
-    return false;
-}

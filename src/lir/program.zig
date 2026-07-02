@@ -19,8 +19,6 @@ const const_store = check.ConstStore;
 pub const RequestedLayout = struct {
     ty: names.TypeDigest,
     checked_type: checked.CheckedTypeId,
-    const_ref: ?checked.ConstId = null,
-    node: ?checked.ConstNodeId = null,
     layout_idx: layout.Idx,
     plan: ConstPlanId,
 };
@@ -43,15 +41,14 @@ pub const FnTemplate = struct {
     fn_def: const_store.FnDef,
     source_fn_ty: checked.CheckedTypeId,
     source_fn_key: names.TypeDigest,
-    local_proc_contexts: []const const_store.LocalProcContext = &.{},
 };
 
 /// Capture field copied from a checked binder into a callable payload.
 pub const CaptureSlot = struct {
     id: const_store.CaptureId,
     slot: u32,
+    ty: const_store.ConstTypeId,
     plan: ConstPlanId,
-    layout_idx: layout.Idx,
 };
 
 /// One runtime tag variant for a finite callable value.
@@ -87,19 +84,12 @@ pub const ErasedFns = struct {
 /// Identifier for a constant storage plan emitted with LIR.
 pub const ConstPlanId = enum(u32) { _ };
 
-/// One logical child in an aggregate constant plan, paired with its committed
-/// runtime layout.
-pub const ConstFieldPlan = struct {
-    plan: ConstPlanId,
-    layout_idx: layout.Idx,
-};
-
 /// Tag variant in a constant storage plan.
 pub const ConstTagVariant = struct {
     name: []const u8,
     checked_name: names.TagNameId,
     discriminant: u16,
-    payloads: []const ConstFieldPlan = &.{},
+    payloads: []const ConstPlanId = &.{},
 };
 
 /// Shape plan used to store an interpreted compile-time result in ConstStore.
@@ -110,13 +100,12 @@ pub const ConstPlan = union(enum) {
     str,
     list: ConstPlanId,
     box: ConstPlanId,
-    tuple: []const ConstFieldPlan,
-    record: []const ConstFieldPlan,
+    tuple: []const ConstPlanId,
+    record: []const ConstPlanId,
     tag_union: []const ConstTagVariant,
     named: struct {
         named_type: check.CheckedModule.ConstNamedType,
         backing: ConstPlanId,
-        backing_layout_idx: layout.Idx,
     },
     fn_value: FnSetId,
     erased_fn: ErasedFnsId,
@@ -128,15 +117,6 @@ pub const ConstRootPlan = struct {
     request: check.CheckedModule.RootRequest,
     proc: LIR.LirProcSpecId,
     ret_layout: layout.Idx,
-    plan: ConstPlanId,
-};
-
-/// One checked value that is materialized as readonly target data.
-pub const StaticDataValue = struct {
-    const_ref: checked.ConstId,
-    node: ?checked.ConstNodeId = null,
-    checked_type: checked.CheckedTypeId,
-    layout_idx: layout.Idx,
     plan: ConstPlanId,
 };
 
@@ -152,11 +132,12 @@ pub const Result = struct {
     root_procs: std.ArrayList(LIR.LirProcSpecId),
     root_metadata: std.ArrayList(root.RootMetadata),
     requested_layouts: std.ArrayList(RequestedLayout),
+    const_types: const_store.ConstTypeStore,
+    const_type_names: names.NameStore,
     fn_sets: std.ArrayList(FnSet),
     erased_fns: std.ArrayList(ErasedFns),
     const_plans: std.ArrayList(ConstPlan),
     const_roots: std.ArrayList(ConstRootPlan),
-    static_data_values: std.ArrayList(StaticDataValue),
     comptime_sites: std.ArrayList(LIR.ComptimeSite),
 
     pub fn init(allocator: Allocator, target_usize: @import("base").target.TargetUsize) Allocator.Error!Result {
@@ -166,11 +147,12 @@ pub const Result = struct {
             .root_procs = .empty,
             .root_metadata = .empty,
             .requested_layouts = .empty,
+            .const_types = const_store.ConstTypeStore.init(allocator),
+            .const_type_names = names.NameStore.init(allocator),
             .fn_sets = .empty,
             .erased_fns = .empty,
             .const_plans = .empty,
             .const_roots = .empty,
-            .static_data_values = .empty,
             .comptime_sites = .empty,
         };
     }
@@ -181,7 +163,6 @@ pub const Result = struct {
             allocator.free(site.branch_regions);
         }
         self.comptime_sites.deinit(allocator);
-        self.static_data_values.deinit(allocator);
         deinitConstPlans(allocator, self.const_plans.items);
         self.const_roots.deinit(allocator);
         self.const_plans.deinit(allocator);
@@ -189,6 +170,8 @@ pub const Result = struct {
         deinitErasedFns(allocator, self.erased_fns.items);
         self.erased_fns.deinit(allocator);
         self.fn_sets.deinit(allocator);
+        self.const_type_names.deinit();
+        self.const_types.deinit();
         self.requested_layouts.deinit(allocator);
         self.root_metadata.deinit(allocator);
         self.root_procs.deinit(allocator);
@@ -258,7 +241,6 @@ pub fn deinitFnSets(allocator: Allocator, fn_sets: []const FnSet) void {
     for (fn_sets) |fn_set| {
         for (fn_set.variants) |variant| {
             if (variant.captures.len > 0) allocator.free(variant.captures);
-            if (variant.template.local_proc_contexts.len > 0) allocator.free(variant.template.local_proc_contexts);
         }
         if (fn_set.variants.len > 0) allocator.free(fn_set.variants);
     }
@@ -269,7 +251,6 @@ pub fn deinitErasedFns(allocator: Allocator, erased_fns: []const ErasedFns) void
     for (erased_fns) |set| {
         for (set.entries) |entry| {
             if (entry.captures.len > 0) allocator.free(entry.captures);
-            if (entry.template.local_proc_contexts.len > 0) allocator.free(entry.template.local_proc_contexts);
         }
         if (set.entries.len > 0) allocator.free(set.entries);
     }

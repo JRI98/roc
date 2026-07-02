@@ -5,7 +5,7 @@
 //! no separate semantic/backend enum pair.
 
 /// Canonical primitive operations shared across canonicalization and LIR/codegen.
-pub const LowLevel = enum {
+pub const LowLevel = enum(u16) {
     // String operations
     str_is_eq,
     str_is_eq_static_small,
@@ -102,6 +102,16 @@ pub const LowLevel = enum {
     hasher_write_dec,
     hasher_write_bytes,
     hasher_write_str,
+
+    // Crypto operations
+    crypto_sha256_hash_bytes,
+    crypto_sha256_hasher_empty,
+    crypto_sha256_hasher_write,
+    crypto_sha256_hasher_finish,
+    crypto_blake3_hash_bytes,
+    crypto_blake3_hasher_empty,
+    crypto_blake3_hasher_write,
+    crypto_blake3_hasher_finish,
 
     // Numeric comparison operations
     num_is_eq,
@@ -568,6 +578,16 @@ pub const LowLevel = enum {
             };
         }
 
+        pub fn runtimeUniquenessMaybeSharedResult(mask: u64) RcEffect {
+            return .{
+                .may_allocate = true,
+                .may_retain_or_release = true,
+                .may_runtime_uniqueness_check_args = mask,
+                .consume_args = mask,
+                .result_aliases_consumed_args = mask,
+            };
+        }
+
         pub fn runtimeUniquenessRetainingArgs(runtime_mask: u64, retain_mask: u64) RcEffect {
             return .{
                 .may_allocate = true,
@@ -663,11 +683,13 @@ pub const LowLevel = enum {
             .list_drop_last,
             .list_take_first,
             .list_take_last,
+            .list_split_first,
+            .list_split_last,
+            => RcEffect.runtimeUniquenessMaybeSharedResult(argMask(&.{0})),
+
             .list_reverse,
             .list_reserve,
             .list_release_excess_capacity,
-            .list_split_first,
-            .list_split_last,
             => RcEffect.runtimeUniqueness(argMask(&.{0})),
 
             .list_prepend => RcEffect.runtimeUniquenessRetainingArgs(argMask(&.{0}), argMask(&.{1})),
@@ -725,6 +747,14 @@ pub const LowLevel = enum {
             .f64_to_str,
             .num_to_str,
             .list_with_capacity,
+            .crypto_sha256_hash_bytes,
+            .crypto_sha256_hasher_empty,
+            .crypto_sha256_hasher_write,
+            .crypto_sha256_hasher_finish,
+            .crypto_blake3_hash_bytes,
+            .crypto_blake3_hasher_empty,
+            .crypto_blake3_hasher_write,
+            .crypto_blake3_hasher_finish,
             => RcEffect.allocates(),
 
             .str_join_with => RcEffect.allocatesConsumingArgs(argMask(&.{0})),

@@ -1893,6 +1893,7 @@ pub const Interpreter = struct {
                         .ret_layout = self.store.getLocal(assign.target).layout_idx,
                         .callable_proc = null,
                         .unique_args = assign.unique_args,
+                        .interchangeable = assign.interchangeable,
                     }));
                     current = assign.next;
                 },
@@ -3390,23 +3391,35 @@ pub const Interpreter = struct {
 
         const hosted_fn = self.roc_ops.hosted_fns.fns[hosted.dispatch_index];
 
-        // Call the hosted function with the platform C ABI via the fixed register-image
-        // trampoline (no runtime code generation).
-        var arena_state = std.heap.ArenaAllocator.init(self.allocator);
-        defer arena_state.deinit();
-        host_trampoline.call(
-            self.layout_store,
-            arena_state.allocator(),
-            @ptrCast(hosted_fn),
-            arg_layouts,
-            ret_layout,
-            args_buf.ptr,
-            arg_offsets,
-            ret_buf.ptr,
-        ) catch |err| return self.invariantFailedError(
-            "hosted call C-ABI lowering failed for proc {d}: {s}",
-            .{ @intFromEnum(proc_id), @errorName(err) },
-        );
+        if (comptime host_trampoline.available) {
+            // Call the hosted function with the platform C ABI via the fixed register-image
+            // trampoline (no runtime code generation).
+            var arena_state = std.heap.ArenaAllocator.init(self.allocator);
+            defer arena_state.deinit();
+            host_trampoline.call(
+                self.layout_store,
+                arena_state.allocator(),
+                @ptrCast(hosted_fn),
+                arg_layouts,
+                ret_layout,
+                args_buf.ptr,
+                arg_offsets,
+                ret_buf.ptr,
+            ) catch |err| return self.invariantFailedError(
+                "hosted call C-ABI lowering failed for proc {d}: {s}",
+                .{ @intFromEnum(proc_id), @errorName(err) },
+            );
+        } else {
+            // Architectures without a register-image trampoline (e.g. wasm32, where
+            // a dynamic-signature call cannot be synthesized) call hosted functions
+            // through a uniform `(args_buf, ret_buf)` ABI instead. The arguments are
+            // already packed contiguously above in Roc layout order, so the host reads
+            // each one from `args_buf` at its layout offset and writes the return value
+            // into `ret_buf`. Platforms register their hosted functions in this shape
+            // when `host_trampoline.available` is false (see the echo platform).
+            const uniform: *const fn ([*]u8, [*]u8) callconv(.c) void = @ptrCast(hosted_fn);
+            uniform(args_buf.ptr, ret_buf.ptr);
+        }
 
         if (self.roc_env.crashed) return error.Crash;
         if (ret_sa.size == 0) return Value.zst;
@@ -4081,10 +4094,11 @@ pub const Interpreter = struct {
 
                 const disc: u32 = blk: {
                     const tu_data = self.layout_store.getTagUnionData(tag_plan.tag_union_idx);
+                    const disc_offset = tu_data.discriminant_offset.get(self.layout_store.targetUsize());
                     break :blk switch (tu_data.discriminant_size) {
                         0 => 0,
-                        1 => val.offset(tu_data.discriminant_offset).read(u8),
-                        2 => val.offset(tu_data.discriminant_offset).read(u16),
+                        1 => val.offset(disc_offset).read(u8),
+                        2 => val.offset(disc_offset).read(u16),
                         else => return,
                     };
                 };
@@ -4400,6 +4414,11 @@ pub const Interpreter = struct {
         /// means argument i's runtime uniqueness check is redundant and the
         /// in-place path may be taken unconditionally.
         unique_args: u64 = 0,
+        /// For `list_map_can_reuse`: per-width interchangeability of the input
+        /// and output element layouts. On a width whose bit is false the
+        /// in-place branch is statically dead, so the op yields 0 without the
+        /// runtime uniqueness check. Ignored by every other op.
+        interchangeable: layout_mod.WidthValues(bool) = layout_mod.WidthValues(bool).both(true, true),
     };
 
     fn lowLevelArgLayout(self: *const LirInterpreter, ll: LowLevelEvalInput, index: usize) Error!layout_mod.Idx {
@@ -4692,7 +4711,7 @@ pub const Interpreter = struct {
                 }
 
                 const val = try self.alloc(ll.ret_layout);
-                @memset(val.ptr[0..tu_data.size], 0);
+                @memset(val.ptr[0..tu_data.size.get(self.layout_store.targetUsize())], 0);
 
                 const resolved_ok = ok_disc orelse return self.runtimeError("str_from_utf8: no Ok variant in layout");
                 const resolved_err = err_disc orelse return self.runtimeError("str_from_utf8: no Err variant in layout");
@@ -4709,7 +4728,7 @@ pub const Interpreter = struct {
                     if (inner_tu_data_opt) |inner_tu| {
                         // The inner tag union sits at offset 0 of the Err payload, which is at
                         // offset 0 of the outer tag union. Write its discriminant in place.
-                        inner_tu.writeDiscriminant(val.ptr, inner_bad_utf8_disc);
+                        inner_tu.writeDiscriminant(val.ptr, inner_bad_utf8_disc, self.layout_store.targetUsize());
                     }
                     self.helper.writeTagDiscriminant(val, ll.ret_layout, resolved_err);
                 }
@@ -4940,6 +4959,8 @@ pub const Interpreter = struct {
                     elems_rc,
                     if (elems_rc) @ptrCast(&elem_rc_ctx) else null,
                     if (elems_rc) &listElementIncref else &builtins.utils.rcNone,
+                    if (elems_rc) @ptrCast(&elem_rc_ctx) else null,
+                    if (elems_rc) &listElementDecref else &builtins.utils.rcNone,
                     updateModeForArg0(ll.unique_args),
                     &builtins.list.copy_fallback,
                     &self.roc_ops,
@@ -4980,8 +5001,13 @@ pub const Interpreter = struct {
                 break :blk self.rocListToValue(result, ll.ret_layout);
             },
             .list_map_can_reuse => blk: {
-                const rl = self.valueToRocListForLayout(args[0], arg_layout);
                 const val = try self.alloc(ll.ret_layout);
+                if (!ll.interchangeable.get(self.layout_store.targetUsize())) {
+                    // The in-place branch is statically dead on this width.
+                    val.write(u8, 0);
+                    break :blk val;
+                }
+                const rl = self.valueToRocListForLayout(args[0], arg_layout);
                 val.write(u8, if (builtins.list.listMapCanReuse(rl, &self.roc_ops)) 1 else 0);
                 break :blk val;
             },
@@ -5254,6 +5280,8 @@ pub const Interpreter = struct {
                     elems_rc,
                     if (elems_rc) @ptrCast(&elem_rc_ctx) else null,
                     if (elems_rc) &listElementIncref else &builtins.utils.rcNone,
+                    if (elems_rc) @ptrCast(&elem_rc_ctx) else null,
+                    if (elems_rc) &listElementDecref else &builtins.utils.rcNone,
                     updateModeForArg0(ll.unique_args),
                     &self.roc_ops,
                 );
@@ -5420,6 +5448,68 @@ pub const Interpreter = struct {
                 break :blk self.writeHasherValue(ll.ret_layout, next);
             },
 
+            // ── Crypto ──
+            .crypto_sha256_hash_bytes,
+            .crypto_blake3_hash_bytes,
+            => blk: {
+                var crash_boundary = self.enterCrashBoundary();
+                defer crash_boundary.deinit();
+                const sj = crash_boundary.set();
+                if (sj != 0) return error.Crash;
+                const bytes = try self.byteListSlice(args[0], try self.lowLevelArgLayout(ll, 0));
+                const result = switch (ll.op) {
+                    .crypto_sha256_hash_bytes => builtins.crypto.sha256HashBytes(bytes.ptr, bytes.len, &self.roc_ops),
+                    .crypto_blake3_hash_bytes => builtins.crypto.blake3HashBytes(bytes.ptr, bytes.len, &self.roc_ops),
+                    else => unreachable,
+                };
+                break :blk self.rocListToValue(result, ll.ret_layout);
+            },
+            .crypto_sha256_hasher_empty,
+            .crypto_blake3_hasher_empty,
+            => blk: {
+                var crash_boundary = self.enterCrashBoundary();
+                defer crash_boundary.deinit();
+                const sj = crash_boundary.set();
+                if (sj != 0) return error.Crash;
+                const result = switch (ll.op) {
+                    .crypto_sha256_hasher_empty => builtins.crypto.sha256HasherEmpty(&self.roc_ops),
+                    .crypto_blake3_hasher_empty => builtins.crypto.blake3HasherEmpty(&self.roc_ops),
+                    else => unreachable,
+                };
+                break :blk self.rocListToValue(result, ll.ret_layout);
+            },
+            .crypto_sha256_hasher_write,
+            .crypto_blake3_hasher_write,
+            => blk: {
+                var crash_boundary = self.enterCrashBoundary();
+                defer crash_boundary.deinit();
+                const sj = crash_boundary.set();
+                if (sj != 0) return error.Crash;
+                const state = try self.byteListSlice(args[0], try self.lowLevelArgLayout(ll, 0));
+                const bytes = try self.byteListSlice(args[1], try self.lowLevelArgLayout(ll, 1));
+                const result = switch (ll.op) {
+                    .crypto_sha256_hasher_write => builtins.crypto.sha256HasherWrite(state.ptr, state.len, bytes.ptr, bytes.len, &self.roc_ops),
+                    .crypto_blake3_hasher_write => builtins.crypto.blake3HasherWrite(state.ptr, state.len, bytes.ptr, bytes.len, &self.roc_ops),
+                    else => unreachable,
+                };
+                break :blk self.rocListToValue(result, ll.ret_layout);
+            },
+            .crypto_sha256_hasher_finish,
+            .crypto_blake3_hasher_finish,
+            => blk: {
+                var crash_boundary = self.enterCrashBoundary();
+                defer crash_boundary.deinit();
+                const sj = crash_boundary.set();
+                if (sj != 0) return error.Crash;
+                const state = try self.byteListSlice(args[0], try self.lowLevelArgLayout(ll, 0));
+                const result = switch (ll.op) {
+                    .crypto_sha256_hasher_finish => builtins.crypto.sha256HasherFinish(state.ptr, state.len, &self.roc_ops),
+                    .crypto_blake3_hasher_finish => builtins.crypto.blake3HasherFinish(state.ptr, state.len, &self.roc_ops),
+                    else => unreachable,
+                };
+                break :blk self.rocListToValue(result, ll.ret_layout);
+            },
+
             // ── Numeric parsing ──
             .u8_from_str,
             .i8_from_str,
@@ -5452,7 +5542,7 @@ pub const Interpreter = struct {
                         roc_str.bytes,
                         roc_str.length,
                         roc_str.capacity_or_alloc_ptr,
-                        tu_data.discriminant_offset,
+                        tu_data.discriminant_offset.get(self.layout_store.targetUsize()),
                     ),
                     .float => |float| dev_wrappers.roc_builtins_float_from_str(
                         result.ptr,
@@ -5460,7 +5550,7 @@ pub const Interpreter = struct {
                         roc_str.length,
                         roc_str.capacity_or_alloc_ptr,
                         float.width_bytes,
-                        tu_data.discriminant_offset,
+                        tu_data.discriminant_offset.get(self.layout_store.targetUsize()),
                     ),
                     .int => |int| dev_wrappers.roc_builtins_int_from_str(
                         result.ptr,
@@ -5469,7 +5559,7 @@ pub const Interpreter = struct {
                         roc_str.capacity_or_alloc_ptr,
                         int.width_bytes,
                         int.signed,
-                        tu_data.discriminant_offset,
+                        tu_data.discriminant_offset.get(self.layout_store.targetUsize()),
                     ),
                 }
                 break :blk result;
@@ -5924,19 +6014,19 @@ pub const Interpreter = struct {
 
         switch (kind) {
             .unsigned_int => |bits| switch (bits) {
-                8 => val.write(u8, intBinOp(u8, a.read(u8), b.read(u8), op)),
-                16 => val.write(u16, intBinOp(u16, a.read(u16), b.read(u16), op)),
-                32 => val.write(u32, intBinOp(u32, a.read(u32), b.read(u32), op)),
-                64 => val.write(u64, intBinOp(u64, a.read(u64), b.read(u64), op)),
-                128 => val.write(u128, intBinOp(u128, a.read(u128), b.read(u128), op)),
+                8 => val.write(u8, try self.intBinOp(u8, a.read(u8), b.read(u8), op)),
+                16 => val.write(u16, try self.intBinOp(u16, a.read(u16), b.read(u16), op)),
+                32 => val.write(u32, try self.intBinOp(u32, a.read(u32), b.read(u32), op)),
+                64 => val.write(u64, try self.intBinOp(u64, a.read(u64), b.read(u64), op)),
+                128 => val.write(u128, try self.intBinOp(u128, a.read(u128), b.read(u128), op)),
                 else => return self.invariantFailedError("LIR/interpreter invariant violated: unsupported unsigned integer width {d}", .{bits}),
             },
             .signed_int => |bits| switch (bits) {
-                8 => val.write(i8, intBinOp(i8, a.read(i8), b.read(i8), op)),
-                16 => val.write(i16, intBinOp(i16, a.read(i16), b.read(i16), op)),
-                32 => val.write(i32, intBinOp(i32, a.read(i32), b.read(i32), op)),
-                64 => val.write(i64, intBinOp(i64, a.read(i64), b.read(i64), op)),
-                128 => val.write(i128, intBinOp(i128, a.read(i128), b.read(i128), op)),
+                8 => val.write(i8, try self.intBinOp(i8, a.read(i8), b.read(i8), op)),
+                16 => val.write(i16, try self.intBinOp(i16, a.read(i16), b.read(i16), op)),
+                32 => val.write(i32, try self.intBinOp(i32, a.read(i32), b.read(i32), op)),
+                64 => val.write(i64, try self.intBinOp(i64, a.read(i64), b.read(i64), op)),
+                128 => val.write(i128, try self.intBinOp(i128, a.read(i128), b.read(i128), op)),
                 else => return self.invariantFailedError("LIR/interpreter invariant violated: unsupported signed integer width {d}", .{bits}),
             },
             .float => |bits| switch (bits) {
@@ -7271,10 +7361,10 @@ pub const Interpreter = struct {
     }
 
     /// Generic integer binary operation.
-    fn intBinOp(comptime T: type, av: T, bv: T, op: NumOp) T {
+    fn intBinOp(self: *LirInterpreter, comptime T: type, av: T, bv: T, op: NumOp) Error!T {
         return switch (op) {
-            .add => av +% bv,
-            .sub => av -% bv,
+            .add => checkedIntAdd(T, av, bv) orelse return self.triggerCrash("Integer addition overflowed!"),
+            .sub => checkedIntSub(T, av, bv) orelse return self.triggerCrash("Integer subtraction overflowed!"),
             .mul => av *% bv,
             .negate => if (@typeInfo(T).int.signedness == .signed) -%av else -%av,
             .abs => if (@typeInfo(T).int.signedness == .signed)
@@ -7289,6 +7379,18 @@ pub const Interpreter = struct {
             .rem => if (bv != 0) (if (signedMinDivOverflow(T, av, bv)) 0 else @rem(av, bv)) else 0,
             .mod => if (bv != 0) (if (signedMinDivOverflow(T, av, bv)) 0 else @mod(av, bv)) else 0,
         };
+    }
+
+    fn checkedIntAdd(comptime T: type, av: T, bv: T) ?T {
+        const result = @addWithOverflow(av, bv);
+        if (result[1] != 0) return null;
+        return result[0];
+    }
+
+    fn checkedIntSub(comptime T: type, av: T, bv: T) ?T {
+        const result = @subWithOverflow(av, bv);
+        if (result[1] != 0) return null;
+        return result[0];
     }
 
     fn signedMinDivOverflow(comptime T: type, av: T, bv: T) bool {

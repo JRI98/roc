@@ -18,6 +18,20 @@ const testing = std.testing;
 const util = @import("util.zig");
 const fx_test_specs = @import("fx_test_specs.zig");
 
+const FxPlatformTestError = util.RocRunError || util.ChildTimeoutError || util.ResultCheckError || std.mem.Allocator.Error || std.Io.Dir.RealPathFileAllocError || std.Io.Dir.CreateDirPathError || std.Io.Dir.ReadFileAllocError || error{
+    DevBackendBuildFailed,
+    DivisionByZeroNotHandled,
+    StackOverflowNotHandled,
+    StaticDataHostBinaryContainsComptimeOnlyString,
+    StaticDataHostBinaryMissingString,
+    StaticDataHostTestFailed,
+    TestExpectedEqual,
+    TestExpectedStartsWith,
+    TestUnexpectedResult,
+    UnexpectedExitCode,
+    UnexpectedTermination,
+};
+
 // Wire up tests from fx_test_specs module
 comptime {
     std.testing.refAllDecls(fx_test_specs);
@@ -27,7 +41,7 @@ fn runDevBackendHostSelfTest(
     allocator: std.mem.Allocator,
     roc_file: []const u8,
     self_test_flag: []const u8,
-) anyerror!std.process.RunResult {
+) FxPlatformTestError!std.process.RunResult {
     var tmp_dir = testing.tmpDir(.{});
     defer tmp_dir.cleanup();
 
@@ -102,8 +116,8 @@ fn buildAndRunDevBackendApp(
     allocator: std.mem.Allocator,
     roc_file: []const u8,
     output_basename: []const u8,
-    inspect_output: ?*const fn (std.mem.Allocator, []const u8) anyerror!void,
-) anyerror!std.process.RunResult {
+    inspect_output: ?*const fn (std.mem.Allocator, []const u8) FxPlatformTestError!void,
+) FxPlatformTestError!std.process.RunResult {
     var tmp_dir = testing.tmpDir(.{});
     defer tmp_dir.cleanup();
 
@@ -175,7 +189,7 @@ fn buildAndRunDevBackendApp(
     });
 }
 
-fn expectInterpreterRuntimeStackOverflow() anyerror!void {
+fn expectInterpreterRuntimeStackOverflow() FxPlatformTestError!void {
     const allocator = testing.allocator;
 
     const run_result = try util.runRoc(std.testing.io, allocator, &.{"--opt=interpreter"}, "test/fx/stack_overflow_runtime.roc");
@@ -201,7 +215,7 @@ fn expectInterpreterRuntimeStackOverflow() anyerror!void {
     }
 }
 
-fn expectDevRuntimeStackOverflow() anyerror!void {
+fn expectDevRuntimeStackOverflow() FxPlatformTestError!void {
     const allocator = testing.allocator;
 
     const run_result = try runDevBackendHostSelfTest(
@@ -236,7 +250,7 @@ fn expectDevRuntimeStackOverflow() anyerror!void {
     }
 }
 
-fn expectInterpreterRuntimeDivisionByZero() anyerror!void {
+fn expectInterpreterRuntimeDivisionByZero() FxPlatformTestError!void {
     const allocator = testing.allocator;
 
     const run_result = try util.runRoc(std.testing.io, allocator, &.{"--opt=interpreter"}, "test/fx/division_by_zero.roc");
@@ -262,7 +276,7 @@ fn expectInterpreterRuntimeDivisionByZero() anyerror!void {
     }
 }
 
-fn expectDevRuntimeDivisionByZero() anyerror!void {
+fn expectDevRuntimeDivisionByZero() FxPlatformTestError!void {
     const allocator = testing.allocator;
 
     const run_result = try buildAndRunDevBackendApp(
@@ -301,7 +315,7 @@ fn expectDevRuntimeDivisionByZero() anyerror!void {
 
 // IO spec helper for narrow fx-only Zig tests. The broad shared IO-spec matrix
 // runs through the parallel CLI platform runner.
-fn runIoSpecTest(comptime opt_flag: []const u8, spec: fx_test_specs.TestSpec) anyerror!void {
+fn runIoSpecTest(comptime opt_flag: []const u8, spec: fx_test_specs.TestSpec) FxPlatformTestError!void {
     const allocator = testing.allocator;
 
     const result = util.runRocCommand(std.testing.io, allocator, &.{ opt_flag, spec.roc_file, "--", "--test", spec.io_spec }) catch |err| {
@@ -328,7 +342,24 @@ test "fx platform boxed erased callable host boundary (dev backend)" {
     try runIoSpecTest("--opt=dev", fx_test_specs.host_boxed_fn_boundary_test);
 }
 
-test "provided and hoisted static data are host-linkable readonly constants" {
+test "fx platform direct run preserves RocOps after F32.abs before list allocation" {
+    const allocator = testing.allocator;
+
+    // Repro for https://github.com/roc-lang/roc/issues/9846:
+    // direct-run should preserve RocOps across F32.abs and the later list allocation.
+    const result = try util.runRocCommand(std.testing.io, allocator, &.{
+        "test/fx/issue_9846_direct_abs_list.roc",
+        "--",
+        "--test",
+        "1>count 1",
+    });
+    defer allocator.free(result.stdout);
+    defer allocator.free(result.stderr);
+
+    try util.checkTestSuccess(result);
+}
+
+test "provided static data exports are host-linkable readonly constants" {
     const allocator = testing.allocator;
 
     const run_result = try buildAndRunDevBackendApp(
@@ -361,7 +392,7 @@ test "provided and hoisted static data are host-linkable readonly constants" {
     try testing.expectEqualStrings("static data host constants ok\n", run_result.stderr);
 }
 
-fn inspectStaticDataHostBinary(allocator: std.mem.Allocator, output_path: []const u8) anyerror!void {
+fn inspectStaticDataHostBinary(allocator: std.mem.Allocator, output_path: []const u8) FxPlatformTestError!void {
     const bytes = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, output_path, allocator, .limited(256 * 1024 * 1024));
     defer allocator.free(bytes);
 
@@ -396,7 +427,7 @@ fn inspectStaticDataHostBinary(allocator: std.mem.Allocator, output_path: []cons
 }
 
 /// Shared body for "roc test" tests that expect exactly 1 passing test.
-fn testRocTestSinglePass(opt: []const u8, roc_file: []const u8) anyerror!void {
+fn testRocTestSinglePass(opt: []const u8, roc_file: []const u8) FxPlatformTestError!void {
     const allocator = testing.allocator;
     const run_result = try util.runRoc(std.testing.io, allocator, &.{ "test", opt }, roc_file);
     defer allocator.free(run_result.stdout);
@@ -505,6 +536,9 @@ test "fx platform dbg missing return value (interpreter)" {
     defer allocator.free(run_result.stderr);
 
     try util.checkSuccess(run_result);
+
+    // Verify that the dbg output was printed
+    try testing.expect(std.mem.find(u8, run_result.stderr, "this should work now") != null);
 }
 
 test "fx platform dbg missing return value (dev backend)" {
@@ -515,6 +549,9 @@ test "fx platform dbg missing return value (dev backend)" {
     defer allocator.free(run_result.stderr);
 
     try util.checkSuccess(run_result);
+
+    // Verify that the dbg output was printed
+    try testing.expect(std.mem.find(u8, run_result.stderr, "this should work now") != null);
 }
 
 test "fx platform check unused state var reports correct errors" {
@@ -1240,8 +1277,9 @@ test "fx platform runtime division by zero" {
 }
 
 test "fx platform inline expect fails as expected (interpreter)" {
-    // Regression test: inline expect inside main! should fail during
-    // compile-time evaluation instead of overflowing the stack.
+    // Regression test: inline expect inside main! should fail via the
+    // normal crash handler (Roc crashed: ...) instead of overflowing
+    // the stack and triggering the stack overflow handler.
     const allocator = testing.allocator;
     const run_result = try util.runRoc(std.testing.io, allocator, &.{"--opt=interpreter"}, "test/fx/issue8517.roc");
     defer allocator.free(run_result.stdout);
@@ -1252,8 +1290,9 @@ test "fx platform inline expect fails as expected (interpreter)" {
 
     const stderr = run_result.stderr;
 
-    try testing.expect(std.mem.find(u8, stderr, "COMPTIME EXPECT FAILED") != null);
-    try testing.expect(std.mem.find(u8, stderr, "expect failed") != null);
+    // The platform receives failed expectations through the expect-failed host
+    // callback, not through the crash callback.
+    try testing.expect(std.mem.find(u8, stderr, "Expect failed: expect failed") != null);
 }
 
 test "fx platform inline expect fails as expected (dev backend)" {
@@ -1273,17 +1312,46 @@ test "fx platform inline expect succeeds as expected" {
 
 test "fx platform inline expect fails in dev backend binary" {
     // Regression test for #9261: the dev backend (object file compilation) must
-    // evaluate inline expect expressions before producing a binary.
+    // evaluate inline expect expressions. Previously, lowered `s_expect`
+    // statements did not wrap the condition in an .expect node, causing the dev
+    // backend to silently skip the assertion.
     const allocator = testing.allocator;
 
     // Build with dev backend to produce a native binary
     const build_result = try util.runRoc(std.testing.io, allocator, &.{ "build", "--opt=dev" }, "test/fx/issue8517.roc");
     defer allocator.free(build_result.stdout);
     defer allocator.free(build_result.stderr);
+    try util.checkSuccess(build_result);
 
-    try util.checkFailure(build_result);
-    try testing.expect(std.mem.find(u8, build_result.stderr, "COMPTIME EXPECT FAILED") != null);
-    try testing.expect(std.mem.find(u8, build_result.stderr, "expect failed") != null);
+    // Run the built binary
+    const run_result = try util.runChildWithTimeout(std.testing.io, allocator, &[_][]const u8{"./issue8517"}, .{
+        .max_output_bytes = 10 * 1024 * 1024,
+    });
+    defer allocator.free(run_result.stdout);
+    defer allocator.free(run_result.stderr);
+
+    // Should exit with non-zero code (expect failure)
+    switch (run_result.term) {
+        .exited => |code| {
+            if (code == 0) {
+                std.debug.print("ERROR: dev backend binary exited with 0 but expect 1 == 2 should fail\n", .{});
+                std.debug.print("STDERR: {s}\n", .{run_result.stderr});
+                return error.UnexpectedSuccess;
+            }
+        },
+        .signal => |sig| {
+            std.debug.print("ERROR: dev backend binary crashed with signal {} instead of clean expect failure\n", .{sig});
+            std.debug.print("STDERR: {s}\n", .{run_result.stderr});
+            return error.SegFault;
+        },
+        else => {
+            std.debug.print("ERROR: dev backend binary terminated abnormally: {}\n", .{run_result.term});
+            return error.RunFailed;
+        },
+    }
+
+    // Should report the failing inline expect via roc_expect_failed
+    try testing.expect(std.mem.find(u8, run_result.stderr, "Expect failed") != null);
 }
 
 test "fx platform index out of bounds in instantiate regression" {
@@ -1572,7 +1640,7 @@ test "fx platform issue8943 error message memory corruption" {
 
     // The invalid top-level `?` must not escape checking and become a
     // post-check compile-time crash.
-    const has_comptime_crash = std.mem.find(u8, run_result.stderr, "COMPTIME CRASH") != null;
+    const has_comptime_crash = std.mem.find(u8, run_result.stderr, "COMPILE TIME CRASH") != null;
     if (has_comptime_crash) {
         std.debug.print("Unexpected 'COMPTIME CRASH' after checking reported the invalid `?` expression:\n", .{});
         std.debug.print("STDERR: {s}\n", .{run_result.stderr});
@@ -1696,8 +1764,10 @@ test "default app resolves a sibling type module imported with exposing" {
         .data =
         \\import FooBar exposing [square]
         \\
-        \\main! = |_arg| {
-        \\    if square(12) == 144 {
+        \\main! = |args| {
+        \\    arg_count = List.len(args)
+        \\    n = 12 + arg_count - arg_count
+        \\    if square(n) == 144 {
         \\        Ok({})
         \\    } else {
         \\        Err(Exit(1))

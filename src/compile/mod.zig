@@ -15,6 +15,7 @@ pub const threading = @import("threading.zig");
 pub const static_data_exports = @import("static_data_exports.zig");
 pub const package_source = @import("package_source.zig");
 pub const package_resolution = @import("package_resolution.zig");
+pub const watch_inputs = @import("watch_inputs.zig");
 
 // Actor model components
 pub const messages = @import("messages.zig");
@@ -91,6 +92,7 @@ test "compile tests" {
     std.testing.refAllDecls(@import("static_data_exports.zig"));
     std.testing.refAllDecls(@import("package_source.zig"));
     std.testing.refAllDecls(@import("package_resolution.zig"));
+    std.testing.refAllDecls(@import("watch_inputs.zig"));
 
     // Actor model components
     std.testing.refAllDecls(@import("messages.zig"));
@@ -108,8 +110,12 @@ test "compile tests" {
     std.testing.refAllDecls(@import("test/comptime_diagnostics_test.zig"));
     std.testing.refAllDecls(@import("test/issue_9614_test.zig"));
     std.testing.refAllDecls(@import("test/issue_9634_test.zig"));
+    std.testing.refAllDecls(@import("test/issue_806_stack_aggregate_test.zig"));
     std.testing.refAllDecls(@import("test/issue_9703_test.zig"));
     std.testing.refAllDecls(@import("test/issue_9704_test.zig"));
+    std.testing.refAllDecls(@import("test/issue_9825_test.zig"));
+    std.testing.refAllDecls(@import("test/issue_9884_test.zig"));
     std.testing.refAllDecls(@import("test/tce_capture_test.zig"));
+    std.testing.refAllDecls(@import("test/list_map_target_independent_lir_test.zig"));
     std.testing.refAllDecls(@import("test/url_package_test.zig"));
 }

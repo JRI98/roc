@@ -9,7 +9,7 @@
 //! 3. Collect hosted functions and module type info from checked artifacts
 //! 4. Build the glue input type table from artifact-owned checked type data
 //! 5. Materialize the glue input as Roc C-ABI values
-//! 6. Compile the glue spec through checked artifacts, lower to LIR, and run the LIR interpreter
+//! 6. Compile the glue spec through checked artifacts, lower to LIR, and run it with the requested backend
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -19,7 +19,7 @@ const parse = @import("parse");
 const compile = @import("compile");
 const check = @import("check");
 const can = @import("can");
-const echo_platform = @import("echo_platform");
+const backend = @import("backend");
 const roc_target = @import("roc_target");
 const layout = @import("layout");
 const lir = @import("lir");
@@ -37,11 +37,18 @@ const RocList = builtins.list.RocList;
 
 const eval_mod = @import("eval");
 
+/// Backend used to execute the glue spec.
+pub const GlueOpt = enum {
+    dev,
+    interpreter,
+};
+
 /// Arguments for glue code generation.
 pub const GlueArgs = struct {
     glue_spec: []const u8,
     output_dir: []const u8,
     platform_path: []const u8,
+    opt: GlueOpt = .dev,
 };
 
 /// Error types for glue generation operations.
@@ -55,6 +62,7 @@ pub const GlueError = error{
     SyntheticAppWrite,
     BuildEnvInit,
     CompilationFailed,
+    DevBackendUnavailable,
     ModuleRetrieval,
     OutOfMemory,
     WriteFailed,
@@ -77,6 +85,7 @@ pub fn rocGlue(gpa: Allocator, stderr: *std.Io.Writer, stdout: *std.Io.Writer, a
             error.SyntheticAppWrite => stderr.print("Error: Could not write synthetic app\n", .{}),
             error.BuildEnvInit => stderr.print("Error: Failed to initialize build environment\n", .{}),
             error.CompilationFailed => stderr.print("Error: Compilation failed\n", .{}),
+            error.DevBackendUnavailable => stderr.print("Error: The dev backend is not available for this host. Use `roc glue --opt=interpreter ...`.\n", .{}),
             error.ModuleRetrieval => stderr.print("Error: Failed to get compiled modules\n", .{}),
             error.OutOfMemory => stderr.print("Error: Out of memory\n", .{}),
             error.WriteFailed => stderr.print("Error: Write failed\n", .{}),
@@ -209,21 +218,16 @@ fn rocGlueInner(gpa: Allocator, stderr: *std.Io.Writer, stdout: *std.Io.Writer, 
 
     const target_usize = base.target.TargetUsize.native;
 
-    // Index every platform artifact by its own module name so a nominal type
-    // declared in one platform module can have its declared field order read
-    // from that module's CIR, even when referenced from another module.
-    var module_artifacts = ModuleArtifactMap.init(gpa);
-    defer module_artifacts.deinit();
+    // Index every checked artifact by key so nominal representations can resolve
+    // their declaration owners without reconstructing ownership from names.
+    var artifacts_by_key = ArtifactKeyMap.init(gpa);
+    defer artifacts_by_key.deinit();
     for (modules) |mod| {
-        if (!(mod.is_platform_sibling or mod.is_platform_main)) continue;
         const artifact = mod.semantic.checked_artifact orelse continue;
-        // Key on the qualified module name: a nominal's `origin_module` text
-        // resolves to that qualified form, not the short module name.
-        const module_name = artifact.canonical_names.moduleNameText(artifact.module_identity.qualified_module_name);
-        try module_artifacts.put(module_name, artifact);
+        try artifacts_by_key.put(artifact.key, artifact);
     }
 
-    var type_table = TypeTable.init(gpa, target_usize, &module_artifacts);
+    var type_table = TypeTable.init(gpa, target_usize, &artifacts_by_key);
     defer type_table.deinit();
 
     for (modules) |mod| {
@@ -352,26 +356,15 @@ fn rocGlueInner(gpa: Allocator, stderr: *std.Io.Writer, stdout: *std.Io.Writer, 
         glueInvariant("make_glue expected one List(Types) argument, got {d}", .{arg_layouts.len});
     }
 
-    // 6. Construct List(Types) using the exact committed LIR layout and invoke the LIR interpreter.
-    const hosted_function_ptrs = [_]builtins.host_abi.HostedFn{};
-    var echo_env = echo_platform.EchoEnv{ .std_io = std_io };
-    var roc_ops = echo_platform.makeDefaultRocOps(&echo_env, @constCast(&hosted_function_ptrs));
+    // 6. Construct List(Types) using the exact committed LIR layout and invoke the requested backend.
+    var runtime_env = eval_mod.RuntimeHostEnv.init(gpa);
+    defer runtime_env.deinit();
     const glue_writer = GlueRocValueWriter{
         .layouts = &lowered.lir_result.layouts,
         .schemas = &lowered.runtime_value_schemas,
-        .roc_ops = &roc_ops,
+        .roc_ops = runtime_env.get_ops(),
     };
     var types_list = constructTypesRocList(&glue_writer, collected_modules.items, &platform_info, provides_entries.items, &type_table, &entrypoint_type_ids, &provides_type_ids, arg_layouts[0]);
-
-    var interpreter = eval_mod.LirInterpreter.init(
-        gpa,
-        &lowered.lir_result.store,
-        &lowered.lir_result.layouts,
-        &roc_ops,
-    ) catch {
-        return error.OutOfMemory;
-    };
-    defer interpreter.deinit();
 
     const proc = lowered.lir_result.store.getProcSpec(glue_proc);
     const ret_size_align = lowered.lir_result.layouts.layoutSizeAlign(lowered.lir_result.layouts.getLayout(proc.ret_layout));
@@ -383,16 +376,11 @@ fn rocGlueInner(gpa: Allocator, stderr: *std.Io.Writer, stdout: *std.Io.Writer, 
     defer gpa.rawFree(result_buf, ret_alignment, @returnAddress());
     if (result_buf.len > 0) @memset(result_buf, 0);
 
-    _ = interpreter.eval(.{
-        .proc_id = glue_proc,
-        .arg_layouts = arg_layouts,
-        .ret_layout = proc.ret_layout,
-        .arg_ptr = @ptrCast(&types_list),
-        .ret_ptr = @ptrCast(result_buf.ptr),
-    }) catch |err| {
-        stderr.print("Error running glue spec: {}\n", .{err}) catch {};
-        return error.CompilationFailed;
-    };
+    switch (args.opt) {
+        .dev => try runGlueSpecDev(gpa, stderr, &lowered, glue_proc, arg_layouts, &types_list, result_buf.ptr, &runtime_env),
+        .interpreter => try runGlueSpecInterpreter(gpa, stderr, &lowered, glue_proc, arg_layouts, &types_list, result_buf.ptr, runtime_env.get_ops()),
+    }
+    try writeHostEvents(stderr, &runtime_env);
 
     const glue_result = try extractGlueResult(gpa, &glue_writer, result_buf.ptr, proc.ret_layout);
     defer glue_result.deinit();
@@ -429,6 +417,110 @@ fn rocGlueInner(gpa: Allocator, stderr: *std.Io.Writer, stdout: *std.Io.Writer, 
         };
 
         stdout.print("  Wrote: {s}\n", .{file_path}) catch {};
+    }
+}
+
+fn runGlueSpecInterpreter(
+    gpa: Allocator,
+    stderr: *std.Io.Writer,
+    lowered: *lir.CheckedPipeline.LoweredProgram,
+    glue_proc: lir.LirProcSpecId,
+    arg_layouts: []const layout.Idx,
+    types_list: *RocList,
+    result_ptr: [*]u8,
+    roc_ops: *builtins.host_abi.RocOps,
+) GlueError!void {
+    var interpreter = eval_mod.LirInterpreter.init(
+        gpa,
+        &lowered.lir_result.store,
+        &lowered.lir_result.layouts,
+        roc_ops,
+    ) catch return error.OutOfMemory;
+    defer interpreter.deinit();
+
+    const proc = lowered.lir_result.store.getProcSpec(glue_proc);
+    _ = interpreter.eval(.{
+        .proc_id = glue_proc,
+        .arg_layouts = arg_layouts,
+        .ret_layout = proc.ret_layout,
+        .arg_ptr = @ptrCast(types_list),
+        .ret_ptr = @ptrCast(result_ptr),
+    }) catch |err| {
+        stderr.print("Error running glue spec: {}\n", .{err}) catch {};
+        return error.CompilationFailed;
+    };
+}
+
+fn runGlueSpecDev(
+    gpa: Allocator,
+    stderr: *std.Io.Writer,
+    lowered: *lir.CheckedPipeline.LoweredProgram,
+    glue_proc: lir.LirProcSpecId,
+    arg_layouts: []const layout.Idx,
+    types_list: *RocList,
+    result_ptr: [*]u8,
+    runtime_env: *eval_mod.RuntimeHostEnv,
+) GlueError!void {
+    if (comptime !backend.host_lir_codegen_available) {
+        return error.DevBackendUnavailable;
+    } else {
+        var codegen = backend.HostLirCodeGen.init(
+            gpa,
+            &lowered.lir_result.store,
+            &lowered.lir_result.layouts,
+            &.{},
+        ) catch return error.OutOfMemory;
+        defer codegen.deinit();
+
+        codegen.compileAllProcSpecs(lowered.lir_result.store.getProcSpecs()) catch return error.OutOfMemory;
+
+        const proc = lowered.lir_result.store.getProcSpec(glue_proc);
+        const entrypoint = codegen.generateEntrypointWrapper(
+            "roc_make_glue",
+            glue_proc,
+            arg_layouts,
+            proc.ret_layout,
+        ) catch return error.OutOfMemory;
+
+        var executable = backend.ExecutableMemory.initWithEntryOffset(
+            codegen.getGeneratedCode(),
+            entrypoint.offset,
+        ) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return error.CompilationFailed,
+        };
+        defer executable.deinit();
+
+        runtime_env.resetObservation();
+        var crash_boundary = runtime_env.enterCrashBoundary();
+        defer crash_boundary.deinit();
+
+        const sj = crash_boundary.set();
+        if (sj == 0) {
+            executable.callRocABI(
+                @ptrCast(runtime_env.get_ops()),
+                @ptrCast(result_ptr),
+                @ptrCast(types_list),
+            );
+        }
+
+        switch (runtime_env.crashState()) {
+            .did_not_crash => {},
+            .crashed => |message| {
+                stderr.print("Error running glue spec: crashed with message: {s}\n", .{message}) catch {};
+                return error.CompilationFailed;
+            },
+        }
+    }
+}
+
+fn writeHostEvents(stderr: *std.Io.Writer, runtime_env: *const eval_mod.RuntimeHostEnv) GlueError!void {
+    for (runtime_env.events.items) |event| {
+        switch (event) {
+            .dbg => |msg| try stderr.print("[dbg] {s}\n", .{msg}),
+            .expect_failed => |msg| try stderr.print("Expect failed: {s}\n", .{msg}),
+            .crashed => {},
+        }
     }
 }
 
@@ -913,8 +1005,9 @@ const CollectedRecordField = struct {
     alignment: u64,
     /// True for an unnamed nominal-record padding field (`_` / `_name`). The
     /// emitters render it as a fixed-size `size`-byte array (`[size]u8` in Zig,
-    /// `uint8_t name[size]` in C) and skip it for refcount helpers. `type_id` is
-    /// unused for padding fields.
+    /// `uint8_t name[size]` in C) and skip it for refcount helpers. Zero-sized
+    /// unnamed fields are layout markers only and are not collected. `type_id`
+    /// is unused for padding fields.
     is_padding: bool = false,
 };
 
@@ -925,33 +1018,37 @@ const CollectedTagInfo = struct {
     payload_alignment: u64,
 };
 
-/// Maps a platform module's name text to its checked artifact, so a nominal
-/// declared in one module can have its declared field order read from the CIR
-/// of the module that declares it (its `source_decl` indexes that module's
-/// statements). Populated once from the compiled module list before collection.
-const ModuleArtifactMap = std.StringHashMap(*const CheckedArtifact.CheckedModuleArtifact);
+/// Maps checked artifact keys to artifacts. Populated once from the compiled
+/// module list before collection so nominal representation refs can resolve
+/// their declaration owners directly.
+const ArtifactKeyMap = std.AutoHashMap(CheckedArtifact.CheckedModuleArtifactKey, *const CheckedArtifact.CheckedModuleArtifact);
+
+const TypeTableKey = struct {
+    artifact_key: CheckedArtifact.CheckedModuleArtifactKey,
+    checked_type: CheckedArtifact.CheckedTypeId,
+};
 
 /// Builds a type table from artifact-owned checked type payloads.
 const TypeTable = struct {
     entries: std.ArrayList(CollectedTypeRepr),
-    var_map: std.AutoHashMap(CheckedArtifact.CheckedTypeId, u64),
+    var_map: std.AutoHashMap(TypeTableKey, u64),
     target_usize: base.target.TargetUsize,
     gpa: std.mem.Allocator,
-    /// Lookup from module name text to declaring artifact, for cross-module
-    /// declared-field-order reads. Borrowed; not owned by the type table.
-    module_artifacts: *const ModuleArtifactMap,
+    /// Lookup from checked artifact key to artifact. Borrowed; not owned by the
+    /// type table.
+    artifacts_by_key: *const ArtifactKeyMap,
 
     fn init(
         gpa: std.mem.Allocator,
         target_usize: base.target.TargetUsize,
-        module_artifacts: *const ModuleArtifactMap,
+        artifacts_by_key: *const ArtifactKeyMap,
     ) TypeTable {
         return .{
             .entries = std.ArrayList(CollectedTypeRepr).empty,
-            .var_map = std.AutoHashMap(CheckedArtifact.CheckedTypeId, u64).init(gpa),
+            .var_map = std.AutoHashMap(TypeTableKey, u64).init(gpa),
             .target_usize = target_usize,
             .gpa = gpa,
-            .module_artifacts = module_artifacts,
+            .artifacts_by_key = artifacts_by_key,
         };
     }
 
@@ -1015,11 +1112,12 @@ const TypeTable = struct {
         self.gpa.free(slice);
     }
 
-    /// Free the first `populated` field names in `fields` (each duped) and the
-    /// `fields` array itself. Used to unwind a partially-built declared-order
-    /// nominal record on an error or `null` fallback.
+    fn freeCollectedRecordFieldNames(self: *TypeTable, fields: []const CollectedRecordField) void {
+        for (fields) |field| self.freeDuped(field.name);
+    }
+
     fn freeCollectedRecordFields(self: *TypeTable, fields: []const CollectedRecordField, populated: usize) void {
-        for (fields[0..populated]) |field| self.freeDuped(field.name);
+        self.freeCollectedRecordFieldNames(fields[0..populated]);
         self.gpa.free(fields);
     }
 
@@ -1036,13 +1134,14 @@ const TypeTable = struct {
         artifact: *const CheckedArtifact.CheckedModuleArtifact,
         checked_type: CheckedArtifact.CheckedTypeId,
     ) Allocator.Error!u64 {
-        if (self.var_map.get(checked_type)) |idx| {
+        const key = TypeTableKey{ .artifact_key = artifact.key, .checked_type = checked_type };
+        if (self.var_map.get(key)) |idx| {
             return idx;
         }
 
         const idx: u64 = @intCast(self.entries.items.len);
         try self.entries.append(self.gpa, .{ .unknown = "" });
-        try self.var_map.put(checked_type, idx);
+        try self.var_map.put(key, idx);
 
         const repr = try self.convertCheckedType(artifact, checked_type);
 
@@ -1103,6 +1202,44 @@ const TypeTable = struct {
         };
     }
 
+    /// Target-independent `SortKey` for a type table entry (see `layout.SortKey`).
+    /// Mirrors `layout.Store.layoutSortKey` over glue's own type representation so
+    /// `roc glue` orders structural records/tuples identically to the layout store
+    /// on both 32-bit and 64-bit targets.
+    fn getSortKey(self: *const TypeTable, type_id: u64) layout.SortKey {
+        if (type_id >= self.entries.items.len) return .align_1;
+        return self.getSortKeyForRepr(self.entries.items[@intCast(type_id)]);
+    }
+
+    fn getSortKeyForRepr(self: *const TypeTable, repr: CollectedTypeRepr) layout.SortKey {
+        return switch (repr) {
+            .bool_, .u8_, .i8_, .unit, .unknown => .align_1,
+            .u16_, .i16_ => .align_2,
+            .u32_, .i32_, .f32_ => .align_4,
+            .u64_, .i64_, .f64_, .dec => .align_8,
+            .u128_, .i128_ => .align_16,
+            .box, .str_, .list, .function => .pointer,
+            .record => |rec| blk: {
+                var key: layout.SortKey = .align_1;
+                for (rec.fields) |field| {
+                    if (field.is_padding) continue;
+                    key = key.max(self.getSortKey(field.type_id));
+                }
+                break :blk key;
+            },
+            .tag_union => |tu| blk: {
+                const disc_size = layout.TagUnionData.discriminantSize(tu.tags.len);
+                var key = layout.SortKey.fromAlignBytes(
+                    layout.TagUnionData.alignmentForDiscriminantSize(disc_size).toByteUnits(),
+                );
+                for (tu.tags) |tag| {
+                    for (tag.payload_ids) |pid| key = key.max(self.getSortKey(pid));
+                }
+                break :blk key;
+            },
+        };
+    }
+
     fn convertCheckedType(
         self: *TypeTable,
         artifact: *const CheckedArtifact.CheckedModuleArtifact,
@@ -1149,11 +1286,17 @@ const TypeTable = struct {
                     if (nominal.args.len >= 1) return .{ .box = try self.getOrInsert(artifact, nominal.args[0]) };
                     return .{ .unknown = try self.gpa.dupe(u8, "Box") };
                 },
-                .iter => return .{ .unknown = try self.gpa.dupe(u8, "Iter") },
                 .parse_tag_union_spec,
                 .fields,
                 .field,
                 => return .unit,
+                .dict,
+                .set,
+                .crypto_sha256_digest,
+                .crypto_sha256_hasher,
+                .crypto_blake3_digest,
+                .crypto_blake3_hasher,
+                => {},
                 .str => return .str_,
                 .bool => return .bool_,
                 .dec => return .dec,
@@ -1216,116 +1359,155 @@ const TypeTable = struct {
         alignment: u64,
     };
 
-    /// Reconstructs a nominal record in DECLARED source order, with unnamed `_` /
-    /// `_name` fields reinstated as padding spacers, then reordered into the
-    /// runtime field order by the shared `field_order.computeNominalFieldOrder`
-    /// (the exact function the layout store uses). Returns `null` when the
-    /// declaration is unavailable (no `source_decl`, declaring module not found,
-    /// or the annotation is not a record), so the caller falls back to the
-    /// structural backing order. `backing` provides each named field's already
-    /// converted `type_id`/size/alignment, matched by field-name text.
+    const NominalDeclarationLookup = struct {
+        artifact: *const CheckedArtifact.CheckedModuleArtifact,
+        declaration: CheckedArtifact.CheckedNominalDeclaration,
+        padding_field_types: []const CheckedArtifact.CheckedTypeId,
+    };
+
+    fn artifactByKey(
+        self: *TypeTable,
+        key: CheckedArtifact.CheckedModuleArtifactKey,
+    ) *const CheckedArtifact.CheckedModuleArtifact {
+        return self.artifacts_by_key.get(key) orelse
+            glueInvariant("nominal representation referenced an artifact that glue did not load", .{});
+    }
+
+    fn nominalDeclarationFor(
+        self: *TypeTable,
+        artifact: *const CheckedArtifact.CheckedModuleArtifact,
+        nominal: CheckedArtifact.CheckedNominalType,
+    ) ?NominalDeclarationLookup {
+        return switch (nominal.representation) {
+            .local_declaration => |declaration_id| .{
+                .artifact = artifact,
+                .declaration = artifact.checked_types.nominalDeclarationById(declaration_id),
+                .padding_field_types = artifact.checked_types.nominalDeclarationById(declaration_id).paddingFieldTypes(&artifact.checked_types),
+            },
+            .imported_declaration => |imported| blk: {
+                const owner = self.artifactByKey(CheckedArtifact.importedNominalDeclarationModuleId(imported));
+                const declaration = owner.checked_types.nominalDeclarationById(imported.declaration);
+                break :blk .{
+                    .artifact = owner,
+                    .declaration = declaration,
+                    .padding_field_types = declaration.paddingFieldTypes(&owner.checked_types),
+                };
+            },
+            .local_box_payload_capability => |capability_ref| blk: {
+                const capability = artifact.interface_capabilities.boxPayloadCapability(capability_ref.capability);
+                const declaration = artifact.checked_types.nominalDeclaration(capability.nominal) orelse
+                    glueInvariant("boxed payload capability referenced a nominal declaration that is not in the owner artifact", .{});
+                break :blk .{
+                    .artifact = artifact,
+                    .declaration = declaration,
+                    .padding_field_types = capability.paddingFieldTys(&artifact.interface_capabilities),
+                };
+            },
+            .imported_box_payload_capability => |capability_ref| blk: {
+                const owner = self.artifactByKey(CheckedArtifact.importedBoxPayloadCapabilityModuleId(capability_ref));
+                const capability = owner.interface_capabilities.boxPayloadCapability(capability_ref.capability);
+                const declaration = owner.checked_types.nominalDeclaration(capability.nominal) orelse
+                    glueInvariant("imported boxed payload capability referenced a nominal declaration that is not in the owner artifact", .{});
+                break :blk .{
+                    .artifact = owner,
+                    .declaration = declaration,
+                    .padding_field_types = capability.paddingFieldTys(&owner.interface_capabilities),
+                };
+            },
+            .builtin,
+            .opaque_without_backing,
+            => null,
+        };
+    }
+
+    /// Builds a nominal record in DECLARED source order from checked artifact
+    /// metadata, with nonzero unnamed `_` / `_name` fields reinstated as padding
+    /// spacers and C-style padding inserted between fields, matching the layout
+    /// store's `putNominalStructFields`.
+    /// Returns `null` only when the declaration has no `_` field; such records
+    /// intentionally use structural backing order. `backing` provides each named
+    /// field's already converted `type_id`/size/alignment, matched by name text.
     fn nominalRecordInDeclaredOrder(
         self: *TypeTable,
         artifact: *const CheckedArtifact.CheckedModuleArtifact,
         nominal: CheckedArtifact.CheckedNominalType,
         backing: anytype,
     ) Allocator.Error!?NominalRecordLayout {
-        const source_decl = nominal.source_decl orelse return null;
+        const lookup = self.nominalDeclarationFor(artifact, nominal) orelse return null;
+        const declared_fields = lookup.declaration.declaredRecordFields(&lookup.artifact.checked_types);
+        if (declared_fields.len == 0) return null;
+        const padding_types = lookup.padding_field_types;
 
-        // The nominal's declared field order lives in the CIR of the module that
-        // declares it. `source_decl` indexes that module's statements.
-        const origin_text = artifact.canonical_names.moduleNameText(nominal.origin_module);
-        const decl_artifact = self.module_artifacts.get(origin_text) orelse artifact;
-        const module_env = decl_artifact.moduleEnvConst();
-
-        const anno_idx = switch (module_env.store.getStatement(@enumFromInt(source_decl))) {
-            .s_nominal_decl => |decl| decl.anno,
-            else => return null,
-        };
-        // The backing record annotation may be wrapped in parentheses.
-        var record_anno = anno_idx;
-        const record = while (true) {
-            switch (module_env.store.getTypeAnno(record_anno)) {
-                .parens => |parens| record_anno = parens.anno,
-                .record => |record| break record,
-                else => return null,
-            }
-        };
-        const anno_fields = module_env.store.sliceAnnoRecordFields(record.fields);
-        if (anno_fields.len == 0) return null;
-
-        // The unnamed fields' resolved types live on the nominal declaration in
-        // the declaring artifact (the nominal *reference* in a signature carries
-        // an empty padding list), indexing that artifact's checked type store.
-        const padding_types = nominalDeclarationPaddingTypes(decl_artifact, source_decl) orelse return null;
-
-        // Each named declared field recovers its converted shape from the backing
-        // record (matched by name); each unnamed field becomes a padding spacer
-        // whose size is its declared type's size and whose alignment is 1.
-        const collected = try self.gpa.alloc(CollectedRecordField, anno_fields.len);
-        const shapes = try self.gpa.alloc(layout.field_order.FieldShape, anno_fields.len);
-        defer self.gpa.free(shapes);
+        // Each named declared field reads its converted shape from the backing
+        // record (matched by name); each nonzero unnamed field becomes a padding
+        // spacer whose size is its declared type's size and whose alignment is 1.
+        const collected = try self.gpa.alloc(CollectedRecordField, declared_fields.len);
+        var populated: usize = 0;
+        errdefer self.freeCollectedRecordFields(collected, populated);
 
         var padding_cursor: usize = 0;
         var pad_index: usize = 0;
-        var populated: usize = 0;
-        // Free the field names duped into `collected` so far plus the array on any
-        // failure or `null` fallback path. `populated` is read at unwind time.
-        errdefer self.freeCollectedRecordFields(collected, populated);
-        for (anno_fields, 0..) |field_idx, i| {
-            const field = module_env.store.getAnnoRecordField(field_idx);
-            if (field.is_unnamed) {
-                if (padding_cursor >= padding_types.len) {
-                    self.freeCollectedRecordFields(collected, populated);
-                    return null;
-                }
-                // Padding field types index the declaring artifact's type store.
-                const padding_ty = padding_types[padding_cursor];
-                padding_cursor += 1;
-                const padding_type_id = try self.getOrInsert(decl_artifact, padding_ty);
-                const sa = self.getSizeAlign(padding_type_id);
-                const name = try std.fmt.allocPrint(self.gpa, "_pad{d}", .{pad_index});
-                pad_index += 1;
-                collected[i] = .{
-                    .name = name,
-                    .type_id = 0,
-                    .size = sa.size,
-                    .alignment = 1,
-                    .is_padding = true,
-                };
-                shapes[i] = .{ .size = @intCast(sa.size), .alignment = 1 };
-            } else {
-                const field_name = module_env.getIdentText(field.name);
-                const match = backingFieldByName(backing, field_name) orelse {
-                    self.freeCollectedRecordFields(collected, populated);
-                    return null;
-                };
-                collected[i] = .{
-                    .name = try self.gpa.dupe(u8, field_name),
-                    .type_id = match.type_id,
-                    .size = match.size,
-                    .alignment = match.alignment,
-                    .is_padding = false,
-                };
-                shapes[i] = .{ .size = @intCast(match.size), .alignment = @intCast(match.alignment) };
+        var saw_unnamed_field = false;
+        for (declared_fields) |field| {
+            switch (field) {
+                .padding => {
+                    saw_unnamed_field = true;
+                    if (padding_cursor >= padding_types.len) {
+                        glueInvariant("nominal declaration had more padding fields than padding types", .{});
+                    }
+                    const padding_ty = padding_types[padding_cursor];
+                    padding_cursor += 1;
+                    const padding_type_id = try self.getOrInsert(lookup.artifact, padding_ty);
+                    const sa = self.getSizeAlign(padding_type_id);
+                    if (sa.size == 0) continue;
+
+                    const name = try std.fmt.allocPrint(self.gpa, "_pad{d}", .{pad_index});
+                    pad_index += 1;
+                    collected[populated] = .{
+                        .name = name,
+                        .type_id = 0,
+                        .size = sa.size,
+                        .alignment = 1,
+                        .is_padding = true,
+                    };
+                    populated += 1;
+                },
+                .named => |field_name_id| {
+                    const field_name = lookup.artifact.canonical_names.recordFieldLabelText(field_name_id);
+                    const match = backingFieldByName(backing, field_name) orelse
+                        glueInvariant("nominal declaration field '{s}' missing from backing record", .{field_name});
+                    const name = try self.gpa.dupe(u8, field_name);
+                    collected[populated] = .{
+                        .name = name,
+                        .type_id = match.type_id,
+                        .size = match.size,
+                        .alignment = match.alignment,
+                        .is_padding = false,
+                    };
+                    populated += 1;
+                },
             }
-            populated = i + 1;
         }
 
-        // Runtime order: the shared nominal field-order permutation. This keeps
-        // declared order when it is already padding-free (the common case).
-        const order = try self.gpa.alloc(u16, anno_fields.len);
-        defer self.gpa.free(order);
-        try layout.field_order.computeNominalFieldOrder(self.gpa, shapes, order);
+        // A nominal record keeps its declared order only when it opts in with an
+        // unnamed `_` field. Without one it lays out like a structural record.
+        if (!saw_unnamed_field) {
+            self.freeCollectedRecordFields(collected, populated);
+            return null;
+        }
+        if (padding_cursor != padding_types.len) {
+            glueInvariant("nominal declaration had more padding types than padding fields", .{});
+        }
+        const collected_fields = if (populated == collected.len)
+            collected
+        else
+            try self.gpa.realloc(collected, populated);
 
-        const ordered = try self.gpa.alloc(CollectedRecordField, anno_fields.len);
-        for (order, 0..) |src, dst| ordered[dst] = collected[src];
-        self.gpa.free(collected);
-
-        // Size/alignment from laying the ordered fields out with no padding.
+        // Declared order, verbatim, with C-style padding inserted between fields as
+        // alignment requires (the padding amount can differ on 32- vs 64-bit).
         var max_alignment: u64 = 1;
         var offset: u64 = 0;
-        for (ordered) |field| {
+        for (collected_fields) |field| {
             if (field.alignment > max_alignment) max_alignment = field.alignment;
             if (field.alignment > 0) {
                 const rem = offset % field.alignment;
@@ -1339,7 +1521,7 @@ const TypeTable = struct {
             if (rem != 0) record_size += max_alignment - rem;
         }
 
-        return .{ .fields = ordered, .size = record_size, .alignment = max_alignment };
+        return .{ .fields = collected_fields, .size = record_size, .alignment = max_alignment };
     }
 
     /// Finds a backing record field by its name text, returning its converted
@@ -1349,23 +1531,6 @@ const TypeTable = struct {
         for (backing.fields) |field| {
             if (std.mem.eql(u8, field.name, name)) {
                 return .{ .type_id = field.type_id, .size = field.size, .alignment = field.alignment };
-            }
-        }
-        return null;
-    }
-
-    /// Resolved types of a nominal's unnamed (`_`) padding fields, in declared
-    /// order, read from the declaration in `decl_artifact` identified by its
-    /// `source_decl` statement index. The returned ids index `decl_artifact`'s
-    /// checked type store. `null` when no matching declaration is found.
-    fn nominalDeclarationPaddingTypes(
-        decl_artifact: *const CheckedArtifact.CheckedModuleArtifact,
-        source_decl: u32,
-    ) ?[]const CheckedArtifact.CheckedTypeId {
-        for (decl_artifact.checked_types.nominal_declarations.items) |declaration| {
-            const decl_source = declaration.nominal.source_decl orelse continue;
-            if (decl_source == source_decl) {
-                return declaration.paddingFieldTypes(&decl_artifact.checked_types);
             }
         }
         return null;
@@ -1402,13 +1567,13 @@ const TypeTable = struct {
             field_sizes[i] = self.getSizeAlign(field_type_ids[i]);
         }
 
-        // Structural records order by descending alignment then ascending field
+        // Structural records order by descending sort key then ascending field
         // name, computed by the shared field-order module the layout store uses.
         const structural = try self.gpa.alloc(layout.field_order.StructuralField, fields.len);
         defer self.gpa.free(structural);
         for (fields, 0..) |field, i| {
             structural[i] = .{
-                .alignment = @intCast(field_sizes[i].alignment),
+                .sort_key = self.getSortKey(field_type_ids[i]),
                 .name = artifact.canonical_names.recordFieldLabelText(field.name),
             };
         }
@@ -1479,7 +1644,15 @@ const TypeTable = struct {
             field_names[i] = try std.fmt.allocPrint(self.gpa, "_{d}", .{i});
         }
 
-        // Sort by alignment descending, then name ascending (matching Roc ABI)
+        // Sort by sort key descending, then name ascending (matching Roc ABI). The
+        // sort key is target-independent (a pointer sorts between 4- and 8-byte
+        // alignment), so the element order matches the layout store on both targets.
+        const field_sort_keys = try self.gpa.alloc(layout.SortKey, elems.len);
+        defer self.gpa.free(field_sort_keys);
+        for (0..elems.len) |i| {
+            field_sort_keys[i] = self.getSortKey(field_type_ids[i]);
+        }
+
         var field_indices = try self.gpa.alloc(usize, elems.len);
         defer self.gpa.free(field_indices);
         for (0..elems.len) |i| {
@@ -1487,19 +1660,17 @@ const TypeTable = struct {
         }
 
         const SortCtx = struct {
-            sizes: []const SizeAlign,
+            sort_keys: []const layout.SortKey,
             names: []const []const u8,
 
             pub fn lessThan(ctx: @This(), a: usize, b: usize) bool {
-                const a_align = ctx.sizes[a].alignment;
-                const b_align = ctx.sizes[b].alignment;
-                if (a_align != b_align) {
-                    return a_align > b_align; // descending alignment
+                if (ctx.sort_keys[a] != ctx.sort_keys[b]) {
+                    return ctx.sort_keys[a].sortsBefore(ctx.sort_keys[b]);
                 }
                 return std.mem.order(u8, ctx.names[a], ctx.names[b]) == .lt;
             }
         };
-        std.mem.sort(usize, field_indices, SortCtx{ .sizes = field_sizes, .names = field_names }, SortCtx.lessThan);
+        std.mem.sort(usize, field_indices, SortCtx{ .sort_keys = field_sort_keys, .names = field_names }, SortCtx.lessThan);
 
         const collected_fields = try self.gpa.alloc(CollectedRecordField, elems.len);
         var max_alignment: u64 = 0;
@@ -1859,7 +2030,7 @@ const GlueRocValueWriter = struct {
         if (tag_union_layout.tag != .tag_union) {
             glueInvariant("glue expected tag-union layout, got {s}", .{@tagName(tag_union_layout.tag)});
         }
-        self.layouts.getTagUnionInfo(tag_union_layout).data.writeDiscriminant(tag_union_base, tag_index);
+        self.layouts.getTagUnionInfo(tag_union_layout).data.writeDiscriminant(tag_union_base, tag_index, self.layouts.targetUsize());
     }
 
     fn readTagDiscriminant(self: *const GlueRocValueWriter, tag_union_base: [*]const u8, tag_union_layout_idx: layout.Idx) u64 {
@@ -1867,7 +2038,7 @@ const GlueRocValueWriter = struct {
         if (tag_union_layout.tag != .tag_union) {
             glueInvariant("glue expected tag-union layout, got {s}", .{@tagName(tag_union_layout.tag)});
         }
-        return self.layouts.getTagUnionInfo(tag_union_layout).data.readDiscriminant(@constCast(tag_union_base));
+        return self.layouts.getTagUnionInfo(tag_union_layout).data.readDiscriminant(@constCast(tag_union_base), self.layouts.targetUsize());
     }
 };
 
