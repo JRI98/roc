@@ -29,8 +29,12 @@ pub const PackageIdentityError = Allocator.Error;
 pub const PackageProvenance = union(enum) {
     /// A resolved package URL.
     url: []const u8,
-    /// A local package root path, canonicalized before use (with a lexical
-    /// fallback when the path has no on-disk resolution).
+    /// A local package root path, canonicalized (symlinks resolved via
+    /// realpath) before use. When realpath cannot resolve the path — the
+    /// file does not exist on disk yet, as with a typo'd package path that
+    /// gets its file-not-found diagnostic later, or an editor buffer that
+    /// has never been saved — the identity is the lexically normalized path
+    /// (`.` and `..` segments folded, no filesystem access).
     local_path: []const u8,
     /// Compiler-synthesized default-app root.
     synthetic_app,

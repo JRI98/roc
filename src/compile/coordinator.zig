@@ -915,6 +915,9 @@ pub const Coordinator = struct {
     /// compiling an app. This is role metadata; package identity itself still
     /// comes from package_identity.zig.
     app_package_name: ?[]const u8,
+    /// True when the build's root is not an app, recorded explicitly so the
+    /// hosted transform never has to guess whether an app exists.
+    app_package_absent: bool,
 
     /// Shared read-only builtin modules
     builtin_modules: *const BuiltinModules,
@@ -1017,6 +1020,7 @@ pub const Coordinator = struct {
             .worker_oom = std.atomic.Value(bool).init(false),
             .total_remaining = 0,
             .app_package_name = null,
+            .app_package_absent = false,
             .builtin_modules = builtin_modules,
             .roc_ctx = roc_ctx,
             .compiler_version = compiler_version,
@@ -1115,6 +1119,14 @@ pub const Coordinator = struct {
 
     pub fn markAppPackage(self: *Coordinator, package_name: []const u8) void {
         self.app_package_name = package_name;
+    }
+
+    /// Record that this build has no app package (its root is a platform,
+    /// package, or plain module). The hosted transform consumes this as
+    /// explicit data: with no app to exclude, every module takes the
+    /// transform.
+    pub fn markNoAppPackage(self: *Coordinator) void {
+        self.app_package_absent = true;
     }
 
     /// Set the I/O / core context implementation. Callers must supply a fully
@@ -4265,14 +4277,17 @@ pub const Coordinator = struct {
                 // The app package must never have annotation-only defs
                 // rewritten into hosted lambdas (they are user errors the
                 // checker reports), so enabling the transform requires
-                // marking which package is the app via markAppPackage.
-                const app_package_name = self.app_package_name orelse {
-                    if (builtin.mode == .Debug) {
-                        std.debug.panic("enable_hosted_transform requires markAppPackage", .{});
-                    }
+                // either marking which package is the app (markAppPackage)
+                // or recording that the build has none (markNoAppPackage).
+                const apply = if (self.app_package_name) |app_package_name|
+                    !std.mem.eql(u8, result.package_name, app_package_name)
+                else if (self.app_package_absent)
+                    true
+                else if (builtin.mode == .Debug)
+                    std.debug.panic("enable_hosted_transform requires markAppPackage or markNoAppPackage", .{})
+                else
                     unreachable;
-                };
-                if (!std.mem.eql(u8, result.package_name, app_package_name)) {
+                if (apply) {
                     if (can.HostedCompiler.replaceAnnoOnlyWithHosted(env)) |modified_defs| {
                         var defs = modified_defs;
                         defs.deinit(env.gpa);

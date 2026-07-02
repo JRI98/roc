@@ -719,9 +719,15 @@ pub const BuildEnv = struct {
 
             // The coordinator gates the hosted transform (and app-root artifact
             // lookups) on knowing which package is the app; app modules must
-            // never have annotation-only defs rewritten into hosted lambdas.
-            if (is_main_pkg and (pkg.kind == .app or pkg.kind == .default_app)) {
-                coord.markAppPackage(coord_pkg.name);
+            // never have annotation-only defs rewritten into hosted lambdas,
+            // and app-less builds (platform/package/module roots) record that
+            // explicitly so every module takes the transform.
+            if (is_main_pkg) {
+                if (pkg.kind == .app or pkg.kind == .default_app) {
+                    coord.markAppPackage(coord_pkg.name);
+                } else {
+                    coord.markNoAppPackage();
+                }
             }
 
             // Copy shorthands to coordinator package
