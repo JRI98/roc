@@ -4864,3 +4864,100 @@ test "iterdiff: infinite custom iterator bounded prefix agrees across inline mod
 //         try std.testing.expectEqual(loop_total, iter_total);
 //     }
 // }
+
+test "spec constr keeps a same-binder scalar distinct from a substituted aggregate" {
+    // A source pattern binder is reused across every monomorphization of its
+    // binding. Here `pair` (a tuple parameter the caller passes a known tuple to,
+    // so call-pattern specialization substitutes it) and `scalar` (a runtime
+    // `let` local left un-inlined by a non-substitutable value) deliberately
+    // share one binder at two monomorphic types. Keying binder-scoped
+    // substitutions by the binder alone resolves the scalar reference to the
+    // substituted tuple, materializing a tuple directly inside the result tuple.
+    // The layout-carrying identity must keep them distinct.
+    const allocator = std.testing.allocator;
+    var mono = MonoAst.Program.init(allocator);
+    var mono_consumed = false;
+    errdefer if (!mono_consumed) mono.deinit();
+
+    const shared_binder: check.CheckedModule.PatternBinderId = @enumFromInt(7);
+
+    const u32_ty = try mono.types.add(.{ .primitive = .u32 });
+    const pair_span = try mono.types.addSpan(&.{ u32_ty, u32_ty });
+    const pair_ty = try mono.types.add(.{ .tuple = pair_span });
+    const worker_fn_ty = try mono.types.add(.{ .func = .{
+        .args = try mono.types.addSpan(&.{pair_ty}),
+        .ret = pair_ty,
+    } });
+    const worker_fn_id = try mono.addFn(.{
+        .fn_def = undefined,
+        .source_fn_ty = undefined,
+        .source_fn_key = .{},
+        .mono_fn_ty = worker_fn_ty,
+    });
+
+    const opaque_scalar = try mono.addImportedFn(.{ .shard = @enumFromInt(1), .fn_id = @enumFromInt(1) });
+
+    const pair_local = try mono.addLocalWithBinder(@enumFromInt(1), pair_ty, shared_binder);
+    const scalar_local = try mono.addLocalWithBinder(@enumFromInt(2), u32_ty, shared_binder);
+
+    const scalar_value = try mono.addExpr(.{ .ty = u32_ty, .data = .{ .call_proc = .{
+        .callee = MonoAst.importedProcCallee(opaque_scalar),
+        .args = MonoAst.Span(MonoAst.ExprId).empty(),
+    } } });
+    const scalar_pat = try mono.addPat(.{ .ty = u32_ty, .data = .{ .bind = scalar_local } });
+
+    const pair_ref = try mono.addExpr(.{ .ty = pair_ty, .data = .{ .local = pair_local } });
+    const pair_first = try mono.addExpr(.{ .ty = u32_ty, .data = .{ .tuple_access = .{ .tuple = pair_ref, .elem_index = 0 } } });
+    const scalar_ref = try mono.addExpr(.{ .ty = u32_ty, .data = .{ .local = scalar_local } });
+    const result_pair = try mono.addExpr(.{ .ty = pair_ty, .data = .{ .tuple = try mono.addExprSpan(&.{ pair_first, scalar_ref }) } });
+    const worker_body = try mono.addExpr(.{ .ty = pair_ty, .data = .{ .let_ = .{
+        .bind = scalar_pat,
+        .value = scalar_value,
+        .rest = result_pair,
+    } } });
+
+    try mono.defs.append(allocator, .{
+        .symbol = @enumFromInt(10),
+        .fn_id = worker_fn_id,
+        .args = try mono.addTypedLocalSpan(&.{.{ .local = pair_local, .ty = pair_ty }}),
+        .body = .{ .roc = worker_body },
+        .ret = pair_ty,
+    });
+
+    const lit_a = try mono.addExpr(.{ .ty = u32_ty, .data = .{ .int_lit = .{ .bytes = @bitCast(@as(u128, 3)), .kind = .u128 } } });
+    const lit_b = try mono.addExpr(.{ .ty = u32_ty, .data = .{ .int_lit = .{ .bytes = @bitCast(@as(u128, 4)), .kind = .u128 } } });
+    const call_arg = try mono.addExpr(.{ .ty = pair_ty, .data = .{ .tuple = try mono.addExprSpan(&.{ lit_a, lit_b }) } });
+    const caller_body = try mono.addExpr(.{ .ty = pair_ty, .data = .{ .call_proc = .{
+        .callee = MonoAst.localProcCallee(worker_fn_id),
+        .args = try mono.addExprSpan(&.{call_arg}),
+    } } });
+    try mono.defs.append(allocator, .{
+        .symbol = @enumFromInt(11),
+        .args = MonoAst.Span(MonoAst.TypedLocal).empty(),
+        .body = .{ .roc = caller_body },
+        .ret = pair_ty,
+    });
+
+    var lifted = try postcheck.MonotypeLifted.Lift.run(allocator, mono);
+    mono_consumed = true;
+    defer lifted.deinit();
+
+    try postcheck.MonotypeLifted.SpecConstr.run(allocator, &lifted);
+    try postcheck.MonotypeLifted.Lift.recomputeCaptures(allocator, &lifted);
+
+    // The input program has no tuple nested directly inside another tuple, so a
+    // nested tuple after specialization means the substituted aggregate leaked
+    // into the scalar slot.
+    for (lifted.exprs.items) |expr| {
+        const items = switch (expr.data) {
+            .tuple => |items| items,
+            else => continue,
+        };
+        for (lifted.exprSpan(items)) |item| {
+            switch (lifted.exprs.items[@intFromEnum(item)].data) {
+                .tuple => return error.SubstitutedAggregateLeakedIntoScalar,
+                else => {},
+            }
+        }
+    }
+}

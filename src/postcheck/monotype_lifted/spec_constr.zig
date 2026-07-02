@@ -326,9 +326,19 @@ const FnPlan = struct {
     }
 };
 
+/// A pattern binder paired with the monomorphic type it was bound at. A single
+/// source binder is reused across every monomorphization of its binding, so the
+/// binder alone does not identify a value; the type digest completes the
+/// identity, matching the `(binder, type)` identity Monotype lowering uses for
+/// locals. See `Builder.sameLocalIdentity` in monotype/lower.zig.
+const BinderIdentity = struct {
+    binder: check.CheckedModule.PatternBinderId,
+    digest: names.TypeDigest,
+};
+
 const BindingTarget = union(enum) {
     local: Ast.LocalId,
-    binder: check.CheckedModule.PatternBinderId,
+    binder: BinderIdentity,
 };
 
 const BindingChange = struct {
@@ -1292,7 +1302,7 @@ const Cloner = struct {
     source_fn: Ast.FnId,
     pattern: CallPattern,
     subst: std.AutoHashMap(Ast.LocalId, Value),
-    binder_subst: std.AutoHashMap(check.CheckedModule.PatternBinderId, Value),
+    binder_subst: std.AutoHashMap(BinderIdentity, Value),
     changes: std.ArrayList(BindingChange),
     inline_stack: std.ArrayList(Ast.FnId),
     callable_stack: std.ArrayList(ActiveCallable),
@@ -1308,7 +1318,7 @@ const Cloner = struct {
             .source_fn = source_fn,
             .pattern = pattern,
             .subst = std.AutoHashMap(Ast.LocalId, Value).init(pass.allocator),
-            .binder_subst = std.AutoHashMap(check.CheckedModule.PatternBinderId, Value).init(pass.allocator),
+            .binder_subst = std.AutoHashMap(BinderIdentity, Value).init(pass.allocator),
             .changes = .empty,
             .inline_stack = .empty,
             .callable_stack = .empty,
@@ -1326,7 +1336,7 @@ const Cloner = struct {
             .source_fn = undefined, // initForRewrite never calls buildArgs, which is the only reader.
             .pattern = .{ .args = &.{} },
             .subst = std.AutoHashMap(Ast.LocalId, Value).init(pass.allocator),
-            .binder_subst = std.AutoHashMap(check.CheckedModule.PatternBinderId, Value).init(pass.allocator),
+            .binder_subst = std.AutoHashMap(BinderIdentity, Value).init(pass.allocator),
             .changes = .empty,
             .inline_stack = .empty,
             .callable_stack = .empty,
@@ -1468,8 +1478,8 @@ const Cloner = struct {
         switch (expr.data) {
             .local => |local| {
                 if (self.subst.get(local)) |value| return value;
-                if (self.pass.program.locals.items[@intFromEnum(local)].binder) |binder| {
-                    if (self.binder_subst.get(binder)) |value| return value;
+                if (self.binderIdentityOf(local)) |identity| {
+                    if (self.binder_subst.get(identity)) |value| return value;
                 }
                 return .{ .expr = try self.addExpr(.{ .ty = expr.ty, .data = .{ .local = local } }) };
             },
@@ -2009,13 +2019,13 @@ const Cloner = struct {
     /// the change log so it is restored when the loop clone finishes.
     fn dropCarriedBinderValue(self: *Cloner, initial: Ast.ExprId) Allocator.Error!void {
         const local = localExpr(self.pass.program, initial) orelse return;
-        const binder = self.pass.program.locals.items[@intFromEnum(local)].binder orelse return;
-        const previous = self.binder_subst.get(binder) orelse return;
+        const identity = self.binderIdentityOf(local) orelse return;
+        const previous = self.binder_subst.get(identity) orelse return;
         try self.changes.append(self.pass.allocator, .{
-            .key = .{ .binder = binder },
+            .key = .{ .binder = identity },
             .previous = previous,
         });
-        _ = self.binder_subst.remove(binder);
+        _ = self.binder_subst.remove(identity);
     }
 
     /// Whether every `continue` for the loop being specialized can supply each
@@ -2095,8 +2105,8 @@ const Cloner = struct {
         switch (expr.data) {
             .local => |local| {
                 if (self.subst.get(local)) |value| return value;
-                if (self.pass.program.locals.items[@intFromEnum(local)].binder) |binder| {
-                    if (self.binder_subst.get(binder)) |value| return value;
+                if (self.binderIdentityOf(local)) |identity| {
+                    if (self.binder_subst.get(identity)) |value| return value;
                 }
                 return null;
             },
@@ -3406,13 +3416,26 @@ const Cloner = struct {
             .callable,
             => false,
         };
-        if (subst_binder) if (self.pass.program.locals.items[@intFromEnum(local)].binder) |binder| {
-            const previous_binder = self.binder_subst.get(binder);
+        if (subst_binder) if (self.binderIdentityOf(local)) |identity| {
+            const previous_binder = self.binder_subst.get(identity);
             try self.changes.append(self.pass.allocator, .{
-                .key = .{ .binder = binder },
+                .key = .{ .binder = identity },
                 .previous = previous_binder,
             });
-            try self.binder_subst.put(binder, value);
+            try self.binder_subst.put(identity, value);
+        };
+    }
+
+    /// Identity a local's binder-scoped substitution is keyed by: the pattern
+    /// binder together with the digest of the local's monomorphic type. Two
+    /// locals that share a binder but were monomorphized at different types are
+    /// distinct bindings and must not read one another's substitution.
+    fn binderIdentityOf(self: *Cloner, local: Ast.LocalId) ?BinderIdentity {
+        const local_data = self.pass.program.locals.items[@intFromEnum(local)];
+        const binder = local_data.binder orelse return null;
+        return .{
+            .binder = binder,
+            .digest = self.pass.program.types.typeDigest(&self.pass.program.names, local_data.ty),
         };
     }
 
@@ -3429,11 +3452,11 @@ const Cloner = struct {
                         _ = self.subst.remove(local);
                     }
                 },
-                .binder => |binder| {
+                .binder => |identity| {
                     if (change.previous) |previous| {
-                        self.binder_subst.putAssumeCapacity(binder, previous);
+                        self.binder_subst.putAssumeCapacity(identity, previous);
                     } else {
-                        _ = self.binder_subst.remove(binder);
+                        _ = self.binder_subst.remove(identity);
                     }
                 },
             }
