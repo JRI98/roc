@@ -4628,44 +4628,32 @@ test "iterdiff: bounded list map collect agrees across inline modes" {
     );
 }
 
-// Pre-existing divergence: a filter-like adapter (`keep_if`) drives a collect
-// loop whose loop-carried source iterator advances through a runtime step
-// result. The naive (`.none`) lowering evaluates correctly and returns the
-// filtered list; the optimized (`.wrappers`) lowering does not terminate. There
-// are two independent freezes of the loop-carried state, on different layers:
-//   1. spec_constr freezes the collect loop's carried iterator to its entry
-//      value (`set l87 := entry` on the back edge). Fixed: spec_constr now keeps
-//      the carried slot whole and the back edge carries the advanced iterator.
-//   2. lambda_solved lowers the inlined step callable so its successor iterator
-//      re-reads the ORIGINAL captured inner iterator (`ref.field l201[0]`)
-//      instead of the advanced inner produced by the step, so the inner index
-//      never advances. This is the same lowered-capture freeze as the custom
-//      iterator divergence below.
-// This test cannot be activated until (2) is fixed, because a hanging test
-// cannot run in the suite. Minimal repro: `[1.I64, 2, 3].iter().keep_if(|n| n >
-// 1).collect()` returns `[2, 3]` under `.none` but does not terminate under
-// `.wrappers`.
-//
-// test "iterdiff: bounded list map keep_if collect agrees across inline modes" {
-//     try expectSameObservationsAcrossInlineModes(
-//         \\module [main]
-//         \\
-//         \\main : I64
-//         \\main = {
-//         \\    doubled : List(I64)
-//         \\    doubled =
-//         \\        [1.I64, 2, 3, 4, 5, 6]
-//         \\            .iter()
-//         \\            .map(|n| n * 2)
-//         \\            .keep_if(|n| n > 5)
-//         \\            .collect()
-//         \\    total = List.sum(doubled)
-//         \\    dbg doubled
-//         \\    dbg total
-//         \\    total
-//         \\}
-//     );
-// }
+// A filter-like adapter (`keep_if`) drives a collect loop whose loop-carried
+// source iterator advances through a runtime step result. The step callable's
+// successor iterator must carry the advanced inner iterator produced by the
+// step, so the inner index advances every iteration and the loop terminates.
+// Both lowering modes observe the same filtered list. Minimal repro:
+// `[1.I64, 2, 3].iter().keep_if(|n| n > 1).collect()` returns `[2, 3]`.
+test "iterdiff: bounded list map keep_if collect agrees across inline modes" {
+    try expectSameObservationsAcrossInlineModes(
+        \\module [main]
+        \\
+        \\main : I64
+        \\main = {
+        \\    doubled : List(I64)
+        \\    doubled =
+        \\        [1.I64, 2, 3, 4, 5, 6]
+        \\            .iter()
+        \\            .map(|n| n * 2)
+        \\            .keep_if(|n| n > 5)
+        \\            .collect()
+        \\    total = List.sum(doubled)
+        \\    dbg doubled
+        \\    dbg total
+        \\    total
+        \\}
+    );
+}
 
 test "iterdiff: if-chosen iterator chains consumed by one loop agree across inline modes" {
     try expectSameObservationsAcrossInlineModes(
