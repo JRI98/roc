@@ -96,9 +96,6 @@ Big:
 - [big/unify-build-pipelines.md](big/unify-build-pipelines.md) — independent;
   benefits from `small/single-package-identity-function.md` landing first so
   the shared layer starts with one naming scheme.
-- [big/row-subsumption.md](big/row-subsumption.md) — independent of all other
-  projects, but requires a language-semantics decision before implementation
-  starts (see the file).
 
 ### Suggested overall sequence
 
@@ -125,5 +122,3 @@ leverage and keeps prerequisites satisfied:
 18. `big/decision-tree-match-compiler.md`
 19. `small/glue-consumes-committed-layouts.md`
 20. `small/structural-hoist-contexts.md`
-21. `big/row-subsumption.md` (whenever the language decision is made; nothing
-    blocks on it)
