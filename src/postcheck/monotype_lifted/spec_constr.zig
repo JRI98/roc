@@ -13347,6 +13347,14 @@ const Cloner = struct {
         }
         if (fieldFromValue(self.pass.program, receiver, field)) |value| return value;
 
+        if (receiver == .private_state) {
+            // A carried private child is the same checked data as the public
+            // field, so projection through the checked identity is exact; a
+            // missing child keeps the public-boundary invariant intact.
+            const field_value = privateStateField(self.pass.program, receiver.private_state, field) orelse return null;
+            return Value{ .private_state = field_value };
+        }
+
         const known_value_expr = switch (receiver) {
             .expr_with_known_value => |known_value_expr| known_value_expr,
             else => return null,
@@ -16228,6 +16236,19 @@ const Cloner = struct {
         }
     }
 
+    /// A direct call that optimized lowering cannot inline is a public
+    /// boundary: its arguments and captures must be ordinary public values.
+    /// Demand derivation and call cloning both consume this one predicate so
+    /// the demanded split can never omit a child a boundary later needs.
+    fn directCallIsPublicBoundary(self: *Cloner, callee: Ast.FnId) bool {
+        const source_fn = self.pass.program.fns.items[@intFromEnum(callee)];
+        const body = self.pass.originalBody(callee) orelse switch (source_fn.body) {
+            .roc => |body| body,
+            .hosted => return true,
+        };
+        return exprContainsReturn(self.pass.program, body);
+    }
+
     fn mergeCallProcDemandsInExpr(
         self: *Cloner,
         local: Ast.LocalId,
@@ -16246,6 +16267,18 @@ const Cloner = struct {
         const source_args = self.pass.program.typedLocalSpan(source_fn.args);
         if (source_args.len != args.len) {
             Common.invariant("direct call arity differed from lifted function arity");
+        }
+
+        if (self.directCallIsPublicBoundary(callee)) {
+            for (args) |arg| {
+                if (!try self.exprMayDemandLocalInCurrentContext(arg, local)) continue;
+                try self.mergeLocalDemandInExpr(local, arg, .materialize, out);
+            }
+            for (self.pass.program.typedLocalSpan(source_fn.captures)) |capture| {
+                if (!try self.boundLocalMayDemandLocalInCurrentContext(capture.local, local)) continue;
+                try self.mergeLocalDemandInCapturedLocal(local, capture, .materialize, out);
+            }
+            return;
         }
 
         for (source_args, args) |source_arg, arg| {
