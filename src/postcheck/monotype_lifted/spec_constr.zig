@@ -1950,38 +1950,206 @@ const Cloner = struct {
             }
         }
 
-        if (!has_constructor) {
-            const initial_span = try self.valuesToExprSpan(values);
-            return try self.addExpr(.{ .ty = ty, .data = .{ .loop_ = .{
-                .params = loop.params,
-                .initial_values = initial_span,
-                .body = try self.cloneExpr(loop.body),
-            } } });
-        }
-
         const change_start = self.changes.items.len;
         defer self.restore(change_start);
 
-        var new_params = std.ArrayList(Ast.TypedLocal).empty;
-        defer new_params.deinit(self.pass.allocator);
+        // A loop-carried variable that was bound to a known constructor before the
+        // loop leaves that value in `binder_subst`, keyed on its source binder.
+        // Every back edge reassigns the variable, so its pre-loop value is not
+        // what the slot carries inside the loop. Reads sharing that binder (the
+        // reassigned copies feeding `continue`) must resolve to the value the slot
+        // actually holds, so drop those pre-loop values before cloning the body.
+        for (initial_values) |initial| try self.dropCarriedBinderValue(initial);
 
-        var new_initials = std.ArrayList(Ast.ExprId).empty;
-        defer new_initials.deinit(self.pass.allocator);
+        if (has_constructor) {
+            var new_params = std.ArrayList(Ast.TypedLocal).empty;
+            defer new_params.deinit(self.pass.allocator);
 
-        for (params, shapes, values) |param, shape, value| {
-            const param_value = try self.valueFromShapeArgs(shape, &new_params);
-            try self.putSubst(param.local, param_value);
-            try self.appendExprsFromValue(shape, value, &new_initials);
+            var new_initials = std.ArrayList(Ast.ExprId).empty;
+            defer new_initials.deinit(self.pass.allocator);
+
+            const split_start = self.changes.items.len;
+            for (params, shapes, values) |param, shape, value| {
+                const param_value = try self.valueFromShapeArgs(shape, &new_params);
+                try self.putSubst(param.local, param_value);
+                try self.appendExprsFromValue(shape, value, &new_initials);
+            }
+
+            // Splitting a slot into its shape leaves is only sound when every back
+            // edge can hand those leaves back. A leaf that is not a record/tuple/
+            // scalar (a callable, tag, or nominal) cannot be recovered from a
+            // runtime value by reading fields, so such a slot is splittable only
+            // when every `continue` rebuilds it as a matching structured value. A
+            // slot reassigned from an opaque runtime value (for example a filtered
+            // iterator advanced through a runtime step result) stays whole.
+            if (try self.loopBackEdgesRecoverShapeLeaves(loop.body, shapes)) {
+                try self.loop_stack.append(self.pass.allocator, .{ .values = shapes });
+                defer _ = self.loop_stack.pop();
+
+                return try self.addExpr(.{ .ty = ty, .data = .{ .loop_ = .{
+                    .params = try self.pass.program.addTypedLocalSpan(new_params.items),
+                    .initial_values = try self.pass.program.addExprSpan(new_initials.items),
+                    .body = try self.cloneExpr(loop.body),
+                } } });
+            }
+
+            self.restore(split_start);
         }
 
-        try self.loop_stack.append(self.pass.allocator, .{ .values = shapes });
-        defer _ = self.loop_stack.pop();
-
+        const initial_span = try self.valuesToExprSpan(values);
         return try self.addExpr(.{ .ty = ty, .data = .{ .loop_ = .{
-            .params = try self.pass.program.addTypedLocalSpan(new_params.items),
-            .initial_values = try self.pass.program.addExprSpan(new_initials.items),
+            .params = loop.params,
+            .initial_values = initial_span,
             .body = try self.cloneExpr(loop.body),
         } } });
+    }
+
+    /// Remove the pre-loop `binder_subst` value for the variable carried by a
+    /// loop slot whose initial value is that variable. The removal is recorded on
+    /// the change log so it is restored when the loop clone finishes.
+    fn dropCarriedBinderValue(self: *Cloner, initial: Ast.ExprId) Allocator.Error!void {
+        const local = localExpr(self.pass.program, initial) orelse return;
+        const binder = self.pass.program.locals.items[@intFromEnum(local)].binder orelse return;
+        const previous = self.binder_subst.get(binder) orelse return;
+        try self.changes.append(self.pass.allocator, .{
+            .key = .{ .binder = binder },
+            .previous = previous,
+        });
+        _ = self.binder_subst.remove(binder);
+    }
+
+    /// Whether every `continue` for the loop being specialized can supply each
+    /// carried slot's shape leaves. Continues inside a nested loop belong to that
+    /// loop and are skipped.
+    fn loopBackEdgesRecoverShapeLeaves(self: *Cloner, expr_id: Ast.ExprId, shapes: []const Shape) Allocator.Error!bool {
+        const expr = self.pass.program.exprs.items[@intFromEnum(expr_id)];
+        switch (expr.data) {
+            .continue_ => |continue_| {
+                const cont_values = self.pass.program.exprSpan(continue_.values);
+                if (cont_values.len != shapes.len) return false;
+                for (shapes, cont_values) |shape, value_expr| {
+                    if (!try self.slotLeafRecoverable(shape, value_expr)) return false;
+                }
+                return true;
+            },
+            // A nested loop owns its own back edges.
+            .loop_ => return true,
+            .break_ => |maybe| return if (maybe) |value| try self.loopBackEdgesRecoverShapeLeaves(value, shapes) else true,
+            .nominal, .dbg, .expect => |child| return try self.loopBackEdgesRecoverShapeLeaves(child, shapes),
+            .return_ => |ret| return try self.loopBackEdgesRecoverShapeLeaves(ret.value, shapes),
+            .let_ => |let_| return (try self.loopBackEdgesRecoverShapeLeaves(let_.value, shapes)) and
+                (try self.loopBackEdgesRecoverShapeLeaves(let_.rest, shapes)),
+            .block => |block| {
+                for (self.pass.program.stmtSpan(block.statements)) |stmt| {
+                    if (!try self.loopBackEdgesRecoverShapeLeavesInStmt(stmt, shapes)) return false;
+                }
+                return try self.loopBackEdgesRecoverShapeLeaves(block.final_expr, shapes);
+            },
+            .if_ => |if_| {
+                for (self.pass.program.ifBranchSpan(if_.branches)) |branch| {
+                    if (!try self.loopBackEdgesRecoverShapeLeaves(branch.body, shapes)) return false;
+                }
+                return try self.loopBackEdgesRecoverShapeLeaves(if_.final_else, shapes);
+            },
+            .match_ => |match| {
+                for (self.pass.program.branchSpan(match.branches)) |branch| {
+                    if (!try self.loopBackEdgesRecoverShapeLeaves(branch.body, shapes)) return false;
+                }
+                return true;
+            },
+            .if_initialized_payload => |payload_switch| return (try self.loopBackEdgesRecoverShapeLeaves(payload_switch.initialized, shapes)) and
+                (try self.loopBackEdgesRecoverShapeLeaves(payload_switch.uninitialized, shapes)),
+            .try_sequence => |sequence| return try self.loopBackEdgesRecoverShapeLeaves(sequence.ok_body, shapes),
+            .try_record_sequence => |sequence| return try self.loopBackEdgesRecoverShapeLeaves(sequence.ok_body, shapes),
+            .comptime_branch_taken => |taken| return try self.loopBackEdgesRecoverShapeLeaves(taken.body, shapes),
+            else => return true,
+        }
+    }
+
+    fn loopBackEdgesRecoverShapeLeavesInStmt(self: *Cloner, stmt_id: Ast.StmtId, shapes: []const Shape) Allocator.Error!bool {
+        return switch (self.pass.program.stmts.items[@intFromEnum(stmt_id)]) {
+            .let_ => |let_| try self.loopBackEdgesRecoverShapeLeaves(let_.value, shapes),
+            .expr, .expect, .dbg => |expr| try self.loopBackEdgesRecoverShapeLeaves(expr, shapes),
+            .return_ => |ret| try self.loopBackEdgesRecoverShapeLeaves(ret.value, shapes),
+            .uninitialized, .crash => true,
+        };
+    }
+
+    /// Whether the value handed to a back edge for a slot of the given shape can
+    /// be turned into that shape's leaves. Field-readable shapes (records/tuples
+    /// bottoming in scalars) can always be read apart at runtime; other shapes
+    /// need a statically structured value matching the shape.
+    fn slotLeafRecoverable(self: *Cloner, shape: Shape, expr_id: Ast.ExprId) Allocator.Error!bool {
+        if (shapeIsFieldReadable(shape)) return true;
+        const preview = (try self.previewValue(expr_id)) orelse return false;
+        return shapeMatchesValue(self.pass.program, shape, preview);
+    }
+
+    /// Reconstruct the structured value an expression would clone to, using the
+    /// current substitutions, without emitting any IR. Returns null when the
+    /// expression does not resolve to a known constructor value; nested leaves
+    /// that do not resolve are represented by their source expression so an
+    /// enclosing constructor still previews as structured.
+    fn previewValue(self: *Cloner, expr_id: Ast.ExprId) Allocator.Error!?Value {
+        const expr = self.pass.program.exprs.items[@intFromEnum(expr_id)];
+        switch (expr.data) {
+            .local => |local| {
+                if (self.subst.get(local)) |value| return value;
+                if (self.pass.program.locals.items[@intFromEnum(local)].binder) |binder| {
+                    if (self.binder_subst.get(binder)) |value| return value;
+                }
+                return null;
+            },
+            .record => |fields_span| {
+                const source_fields = self.pass.program.fieldExprSpan(fields_span);
+                const fields = try self.pass.arena.allocator().alloc(FieldValue, source_fields.len);
+                for (source_fields, 0..) |field, index| {
+                    fields[index] = .{
+                        .name = field.name,
+                        .value = (try self.previewValue(field.value)) orelse .{ .expr = field.value },
+                    };
+                }
+                return .{ .record = .{ .ty = expr.ty, .fields = fields } };
+            },
+            .tuple => |items_span| {
+                const source_items = self.pass.program.exprSpan(items_span);
+                const items = try self.pass.arena.allocator().alloc(Value, source_items.len);
+                for (source_items, 0..) |item, index| {
+                    items[index] = (try self.previewValue(item)) orelse .{ .expr = item };
+                }
+                return .{ .tuple = .{ .ty = expr.ty, .items = items } };
+            },
+            .tag => |tag| {
+                const source_payloads = self.pass.program.exprSpan(tag.payloads);
+                const payloads = try self.pass.arena.allocator().alloc(Value, source_payloads.len);
+                for (source_payloads, 0..) |payload, index| {
+                    payloads[index] = (try self.previewValue(payload)) orelse .{ .expr = payload };
+                }
+                return .{ .tag = .{ .ty = expr.ty, .name = tag.name, .payloads = payloads } };
+            },
+            .nominal => |backing| {
+                const stored = try self.pass.arena.allocator().create(Value);
+                stored.* = (try self.previewValue(backing)) orelse .{ .expr = backing };
+                return .{ .nominal = .{ .ty = expr.ty, .backing = stored } };
+            },
+            .fn_ref => |fn_ref| {
+                const source_captures = self.pass.program.exprSpan(fn_ref.captures);
+                const captures = try self.pass.arena.allocator().alloc(Value, source_captures.len);
+                for (source_captures, 0..) |capture, index| {
+                    captures[index] = (try self.previewValue(capture)) orelse .{ .expr = capture };
+                }
+                return .{ .callable = .{ .ty = expr.ty, .fn_id = fn_ref.fn_id, .captures = captures } };
+            },
+            .field_access => |field| {
+                const receiver = (try self.previewValue(field.receiver)) orelse return null;
+                return fieldFromValue(receiver, field.field);
+            },
+            .tuple_access => |access| {
+                const receiver = (try self.previewValue(access.tuple)) orelse return null;
+                return itemFromValue(receiver, access.elem_index);
+            },
+            else => return null,
+        }
     }
 
     fn cloneBlock(self: *Cloner, ty: Type.TypeId, block: anytype) Common.LowerError!Ast.ExprId {
@@ -3711,6 +3879,28 @@ fn shapeType(shape: Shape) Type.TypeId {
         .tuple => |tuple| tuple.ty,
         .nominal => |nominal| nominal.ty,
         .callable => |callable| callable.ty,
+    };
+}
+
+/// Whether every leaf of a shape can be read out of a runtime value by field or
+/// element access. Records and tuples decompose that way when their leaves do;
+/// tags, nominals, and callables cannot be reconstructed from a runtime value.
+fn shapeIsFieldReadable(shape: Shape) bool {
+    return switch (shape) {
+        .any => true,
+        .record => |record| blk: {
+            for (record.fields) |field| {
+                if (!shapeIsFieldReadable(field.shape)) break :blk false;
+            }
+            break :blk true;
+        },
+        .tuple => |tuple| blk: {
+            for (tuple.items) |item| {
+                if (!shapeIsFieldReadable(item)) break :blk false;
+            }
+            break :blk true;
+        },
+        .tag, .nominal, .callable => false,
     };
 }
 

@@ -4628,22 +4628,23 @@ test "iterdiff: bounded list map collect agrees across inline modes" {
     );
 }
 
-// Pre-existing divergence: a filter-like adapter (`keep_if`) diverges between
-// the two lowerings under the optimized mode, independent of its consumer, and
-// the seed+step representation does NOT fix it: it is an optimizer (spec_constr)
-// miscompile, not a representation issue. The naive (`.none`) lowering evaluates
-// correctly and returns the filtered list; the optimized (`.wrappers`) lowering
-// HANGS in an unterminated step loop, for BOTH the `.collect()` consumer and a
-// hand-written `for`/append loop consumer. Minimal repro:
-// `[1.I64, 2, 3].iter().keep_if(|n| n > 1).collect()` returns `[2, 3]` under
-// `.none` but does not terminate under `.wrappers`. Root cause, confirmed from
-// the lowered LIR: the collect loop correctly builds the advanced source-iterator
-// box each iteration, but spec_constr sets the loop-carried iterator parameter
-// back to its ORIGINAL entry box (`set l28 := l2`) on the loop back-edge instead
-// of the advanced box, so the source index never advances and `keep_if` yields
-// Skip forever. Same spec_constr entry-known loop-state reset bug as the custom
-// divergence below. MUST stay commented out because a hanging test cannot run in
-// the suite; see the Phase 1 report for the minimized repro.
+// Pre-existing divergence: a filter-like adapter (`keep_if`) drives a collect
+// loop whose loop-carried source iterator advances through a runtime step
+// result. The naive (`.none`) lowering evaluates correctly and returns the
+// filtered list; the optimized (`.wrappers`) lowering does not terminate. There
+// are two independent freezes of the loop-carried state, on different layers:
+//   1. spec_constr freezes the collect loop's carried iterator to its entry
+//      value (`set l87 := entry` on the back edge). Fixed: spec_constr now keeps
+//      the carried slot whole and the back edge carries the advanced iterator.
+//   2. lambda_solved lowers the inlined step callable so its successor iterator
+//      re-reads the ORIGINAL captured inner iterator (`ref.field l201[0]`)
+//      instead of the advanced inner produced by the step, so the inner index
+//      never advances. This is the same lowered-capture freeze as the custom
+//      iterator divergence below.
+// This test cannot be activated until (2) is fixed, because a hanging test
+// cannot run in the suite. Minimal repro: `[1.I64, 2, 3].iter().keep_if(|n| n >
+// 1).collect()` returns `[2, 3]` under `.none` but does not terminate under
+// `.wrappers`.
 //
 // test "iterdiff: bounded list map keep_if collect agrees across inline modes" {
 //     try expectSameObservationsAcrossInlineModes(
