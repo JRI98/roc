@@ -869,10 +869,18 @@ const Lowerer = struct {
         capture_ty: Type.TypeId,
     ) Allocator.Error!Ast.ExprId {
         const captures = self.solved.types.captureSpan(capture_span);
-        const fields = switch (self.program.types.get(capture_ty)) {
-            .capture_record => |fields| self.program.types.captureFieldSpan(fields),
-            else => Common.invariant("callable capture payload was not a capture record"),
+        // Own a copy of the capture-record fields: lowering a capture operand
+        // below can lower a nested callable, which adds capture-record fields and
+        // may reallocate the store's capture-field backing. A borrowed field span
+        // would dangle across those calls, so read every field from this snapshot.
+        const fields = fields: {
+            const borrowed = switch (self.program.types.get(capture_ty)) {
+                .capture_record => |fields| self.program.types.captureFieldSpan(fields),
+                else => Common.invariant("callable capture payload was not a capture record"),
+            };
+            break :fields try self.allocator.dupe(Type.CaptureField, borrowed);
         };
+        defer self.allocator.free(fields);
         if (captures.len != fields.len) Common.invariant("callable capture payload arity differed from captured locals");
         if (self.solved.lifted.typedLocalSpan(self.solved.lifted.fns[@intFromEnum(fn_id)].captures).len != capture_exprs.len) {
             Common.invariant("function reference capture operand count differed from lifted function captures");
