@@ -7548,7 +7548,15 @@ const Cloner = struct {
                 if (!try self.appendFieldReadExprsFromValueCollectingLets(known_value.*, value, &new_initials, &pending_lets)) {
                     const downgrade_ty = known_valueType(known_value.*);
                     if (known_value.* == .any and sameType(self.pass.program, known_value.any, downgrade_ty)) {
-                        Common.invariant("loop initial split failed without progress");
+                        // The initial value has no ordinary public form, so
+                        // the loop is carried as demanded private state.
+                        const demanded_known_values = try self.pass.arena.allocator().alloc(DemandedKnownValue, known_values.len);
+                        for (known_values, values, demands, demanded_known_values) |entry_known, entry_value, *entry_demand, *out| {
+                            entry_demand.* = try self.loopSlotDemand(try self.expandLoopCallableCaptureDemands(entry_value, entry_demand.*));
+                            out.* = try self.demandedKnownValueFromLoopEntryDemand(entry_value, entry_known, entry_demand.*);
+                        }
+                        self.restore(change_start);
+                        return try self.cloneStateLoopFromDemandedKnownValues(ty, loop, params, values, demanded_known_values, demands, result_demand);
                     }
                     known_values[index] = .{ .any = downgrade_ty };
                     initial_split_failed = true;
@@ -8340,6 +8348,7 @@ const Cloner = struct {
         const state_loop_ty = if (compact_result) |result| result.ty else ty;
 
         var state_loop_iterations: usize = 0;
+        var compacted_entry_retry = false;
         while (true) {
             state_loop_iterations += 1;
             if (state_loop_iterations > 1000) Common.invariant("state loop demand feedback did not converge");
@@ -8397,6 +8406,17 @@ const Cloner = struct {
             const selected_entry_state_index = entry_state_index orelse {
                 _ = self.state_loop_stack.pop();
                 self.pass.program.state_loop_states.shrinkRetainingCapacity(state_start_len);
+                if (!compacted_entry_retry) {
+                    // A runtime entry edge cannot select among statically
+                    // expanded finite alternatives; carry the finite choices
+                    // compactly, exactly as continue edges do.
+                    compacted_entry_retry = true;
+                    for (values, demands, known_values) |entry_value, entry_demand, *known_out| {
+                        const demanded = (try self.demandedKnownValueFromLoopStateValueDemand(entry_value, entry_demand)) orelse known_out.*;
+                        known_out.* = try self.compactDemandedKnownValue(demanded);
+                    }
+                    continue;
+                }
                 if (compact_result != null) Common.invariant("optimized loop private result could not select an entry state");
                 const initial_span = (try self.valuesToOutputExprSpan(values)) orelse
                     Common.invariant("optimized loop entry values could neither select a state nor be emitted as ordinary loop initials");
@@ -8471,6 +8491,7 @@ const Cloner = struct {
                 self.pass.program.state_loop_states.shrinkRetainingCapacity(state_start_len);
                 _ = self.state_loop_stack.pop();
                 try self.refreshDemandedKnownValuesFromValueDemands(values, closed_demands, known_values);
+                compacted_entry_retry = false;
                 continue;
             }
 
@@ -12181,6 +12202,12 @@ const Cloner = struct {
                     if (leaf_value == .expr_with_known_value and !exprContainsEscapingControlTransfer(self.pass.program, leaf_value.expr_with_known_value.expr)) {
                         const reusable = (try self.tryMakeExprReusableForMatch(leaf_value.expr_with_known_value.expr, pending_lets)) orelse return false;
                         try out.append(self.pass.allocator, reusable);
+                        return true;
+                    }
+                    // A structured value fills a leaf slot as its ordinary
+                    // public form; the slot consumes it exactly once.
+                    if (self.valueCanMaterializePublic(leaf_value)) {
+                        try out.append(self.pass.allocator, try self.materialize(leaf_value));
                         return true;
                     }
                     return false;
@@ -21065,21 +21092,6 @@ const Cloner = struct {
                 }
                 const cloned = try self.cloneExprPlain(expr);
                 if (!self.exprReferencesAvailableBindings(cloned)) {
-                    const cloned_items = self.pass.program.exprs.items[@intFromEnum(cloned)].data;
-                    if (cloned_items == .list) {
-                        for (self.pass.program.exprSpan(cloned_items.list)) |elem| {
-                            const elem_data = self.pass.program.exprs.items[@intFromEnum(elem)].data;
-                            std.debug.print(" elem={s}", .{@tagName(elem_data)});
-                            if (elem_data == .local) {
-                                std.debug.print("(l{d} pending={any} direct={any})", .{
-                                    @intFromEnum(elem_data.local),
-                                    self.pendingLetIsActive(elem_data.local),
-                                    self.localCanBeReferencedDirectly(elem_data.local),
-                                });
-                            }
-                        }
-                    }
-                    std.debug.print("\n", .{});
                     Common.invariant("materialized expression still referenced unavailable bindings");
                 }
                 return cloned;
