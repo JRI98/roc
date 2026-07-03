@@ -2166,13 +2166,20 @@ const Cloner = struct {
     /// Bind a sunk let's pattern to one branch's result value: directly when
     /// the value substitutes wholesale, otherwise by naming its opaque leaves
     /// as pending bindings the caller pins at the branch's position — the
-    /// same computations in the same order.
+    /// same computations in the same order. Sinking a continuation into the
+    /// branches pays for itself only when a branch yields a constructor the
+    /// binding consumes structurally; an opaque branch value gains nothing
+    /// and would only duplicate the continuation, so it declines.
     fn bindPatToBranchValue(
         self: *Cloner,
         pat_id: Ast.PatId,
         source_value: Ast.ExprId,
         value: Value,
     ) Common.LowerError!bool {
+        switch (value) {
+            .expr => return false,
+            else => {},
+        }
         if (try self.bindPatToReusableValue(pat_id, value)) return true;
         const pat = self.pass.program.pats.items[@intFromEnum(pat_id)];
         const self_referential = switch (pat.data) {
