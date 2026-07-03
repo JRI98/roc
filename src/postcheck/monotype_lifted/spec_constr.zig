@@ -375,6 +375,11 @@ const Pass = struct {
     program: *Ast.Program,
     plans: []FnPlan,
     symbols: Common.SymbolGen,
+    /// Per source function: whether its body performs no observable effect.
+    /// Calls to such functions are pure computations; only calls to the
+    /// rest carry effects. Functions created during specialization are past
+    /// the end of this table and count as effectful.
+    fn_effect_free: []bool,
 
     fn init(allocator: Allocator, program: *Ast.Program) Allocator.Error!Pass {
         var arena = std.heap.ArenaAllocator.init(allocator);
@@ -395,16 +400,39 @@ const Pass = struct {
             };
         }
 
+        const fn_effect_free = try allocator.alloc(bool, program.fns.items.len);
+        errdefer allocator.free(fn_effect_free);
+        for (program.fns.items, 0..) |fn_, index| {
+            fn_effect_free[index] = fn_.body == .roc;
+        }
+        var changed = true;
+        while (changed) {
+            changed = false;
+            for (program.fns.items, 0..) |fn_, index| {
+                if (!fn_effect_free[index]) continue;
+                const body = switch (fn_.body) {
+                    .roc => |body| body,
+                    .hosted => continue,
+                };
+                if (!exprHasNoObservableEffect(program, fn_effect_free, body, true)) {
+                    fn_effect_free[index] = false;
+                    changed = true;
+                }
+            }
+        }
+
         return .{
             .allocator = allocator,
             .arena = arena,
             .program = program,
             .plans = plans,
             .symbols = .{ .next = program.next_symbol },
+            .fn_effect_free = fn_effect_free,
         };
     }
 
     fn deinit(self: *Pass) void {
+        self.allocator.free(self.fn_effect_free);
         for (self.plans) |*plan| plan.deinit(self.allocator);
         self.allocator.free(self.plans);
         self.arena.deinit();
@@ -1578,6 +1606,7 @@ const Cloner = struct {
                 } };
             },
             .let_ => |let_| return try self.cloneLetValue(let_),
+            .loop_ => |loop| return try self.cloneLoopValue(expr.ty, loop),
             .block => |block| {
                 if (try self.cloneBlockValue(block)) |value| return value;
                 return .{ .expr = try self.cloneExprPlain(expr_id) };
@@ -1829,7 +1858,7 @@ const Cloner = struct {
                 .final_else = try self.cloneExpr(if_.final_else),
             } },
             .block => |block| return try self.cloneBlock(expr.ty, block),
-            .loop_ => |loop| return try self.cloneLoop(expr.ty, loop),
+            .loop_ => |loop| return try self.materialize(try self.cloneLoopValue(expr.ty, loop)),
             .break_ => |maybe| .{ .break_ = if (maybe) |value| try self.cloneExpr(value) else null },
             .continue_ => |continue_| try self.cloneContinue(continue_),
             .if_initialized_payload => |payload_switch| .{ .if_initialized_payload = .{
@@ -1840,21 +1869,36 @@ const Cloner = struct {
                 .initialized = try self.cloneExpr(payload_switch.initialized),
                 .uninitialized = try self.cloneExpr(payload_switch.uninitialized),
             } },
-            .try_sequence => |sequence| .{ .try_sequence = .{
-                .try_expr = try self.cloneExpr(sequence.try_expr),
-                .ok_local = sequence.ok_local,
-                .err_is_cold = sequence.err_is_cold,
-                .ok_body = try self.cloneExpr(sequence.ok_body),
-            } },
-            .try_record_sequence => |sequence| .{ .try_record_sequence = .{
-                .try_expr = try self.cloneExpr(sequence.try_expr),
-                .value_local = sequence.value_local,
-                .value_field = sequence.value_field,
-                .rest_local = sequence.rest_local,
-                .rest_field = sequence.rest_field,
-                .err_is_cold = sequence.err_is_cold,
-                .ok_body = try self.cloneExpr(sequence.ok_body),
-            } },
+            .try_sequence => |sequence| blk: {
+                const try_expr = try self.cloneExpr(sequence.try_expr);
+                const shadow_start = self.changes.items.len;
+                try self.shadowLocal(sequence.ok_local);
+                const ok_body = try self.cloneExpr(sequence.ok_body);
+                self.restore(shadow_start);
+                break :blk .{ .try_sequence = .{
+                    .try_expr = try_expr,
+                    .ok_local = sequence.ok_local,
+                    .err_is_cold = sequence.err_is_cold,
+                    .ok_body = ok_body,
+                } };
+            },
+            .try_record_sequence => |sequence| blk: {
+                const try_expr = try self.cloneExpr(sequence.try_expr);
+                const shadow_start = self.changes.items.len;
+                try self.shadowLocal(sequence.value_local);
+                try self.shadowLocal(sequence.rest_local);
+                const ok_body = try self.cloneExpr(sequence.ok_body);
+                self.restore(shadow_start);
+                break :blk .{ .try_record_sequence = .{
+                    .try_expr = try_expr,
+                    .value_local = sequence.value_local,
+                    .value_field = sequence.value_field,
+                    .rest_local = sequence.rest_local,
+                    .rest_field = sequence.rest_field,
+                    .err_is_cold = sequence.err_is_cold,
+                    .ok_body = ok_body,
+                } };
+            },
             .return_ => |ret| .{ .return_ = .{
                 .value = try self.cloneExpr(ret.value),
                 .target = ret.target,
@@ -1892,10 +1936,41 @@ const Cloner = struct {
             self.restore(change_start);
             return rest;
         }
+        // A branch-built value cannot bind as one value; the binding and the
+        // let's continuation sink into the branches instead, where each
+        // branch's constructor is known.
+        if (try self.cloneLetOfCase(let_, value_expr)) |data| {
+            const rest_ty = self.pass.program.exprs.items[@intFromEnum(let_.rest)].ty;
+            return .{ .expr = try self.addExpr(.{ .ty = rest_ty, .data = data }) };
+        }
+        // Name the value's opaque leaves and pin them at this position: the
+        // same computations in the same order, but the bound name keeps its
+        // structured value for the continuation.
+        {
+            const pat = self.pass.program.pats.items[@intFromEnum(let_.bind)];
+            const self_referential = switch (pat.data) {
+                .bind => |local| localUseCountInExpr(self.pass.program, local, let_.value) != 0,
+                else => false,
+            };
+            if (!self_referential) {
+                const pending_before = self.pending.items.len;
+                const reusable = try self.makeReusableForMatch(value);
+                if (try self.bindPatToValue(let_.bind, reusable)) {
+                    const rest = try self.materialize(try self.cloneExprValue(let_.rest));
+                    self.restore(change_start);
+                    return .{ .expr = try self.flushPendingSince(pending_before, rest) };
+                }
+                self.restore(change_start);
+                self.pending.shrinkRetainingCapacity(pending_before);
+            }
+        }
+        try self.shadowPatLocals(let_.bind);
+        const rest = try self.cloneExpr(let_.rest);
+        self.restore(change_start);
         return .{ .expr = try self.addExpr(.{ .ty = self.pass.program.exprs.items[@intFromEnum(let_.rest)].ty, .data = .{ .let_ = .{
             .bind = try self.clonePat(let_.bind),
             .value = value_expr,
-            .rest = try self.cloneExpr(let_.rest),
+            .rest = rest,
             .comptime_site = let_.comptime_site,
         } } }) };
     }
@@ -1926,7 +2001,7 @@ const Cloner = struct {
         const change_before = self.changes.items.len;
         const reusable = try self.makeReusableForMatch(value);
         for (self.pending.items[pending_before..]) |pend| {
-            if (!exprHasNoObservableEffect(self.pass.program, pend.value)) {
+            if (!exprHasNoObservableEffect(self.pass.program, self.pass.fn_effect_free, pend.value, false)) {
                 self.restore(change_before);
                 self.pending.shrinkRetainingCapacity(pending_before);
                 return false;
@@ -1952,7 +2027,10 @@ const Cloner = struct {
         } else blk: {
             self.restore(change_start);
             if (try self.cloneLetOfCase(let_, value_expr)) |data| return data;
-            break :blk try self.cloneExpr(let_.rest);
+            try self.shadowPatLocals(let_.bind);
+            const rest = try self.cloneExpr(let_.rest);
+            self.restore(change_start);
+            break :blk rest;
         };
         return .{ .let_ = .{
             .bind = try self.clonePat(let_.bind),
@@ -1964,34 +2042,67 @@ const Cloner = struct {
 
     fn cloneLetOfCase(self: *Cloner, let_: anytype, value_expr: Ast.ExprId) Common.LowerError!?Ast.ExprData {
         const value_data = self.pass.program.exprs.items[@intFromEnum(value_expr)].data;
-        const match = switch (value_data) {
-            .match_ => |match| match,
+        switch (value_data) {
+            .match_ => |match| {
+                const branches = try self.pass.allocator.dupe(Ast.Branch, self.pass.program.branchSpan(match.branches));
+                defer self.pass.allocator.free(branches);
+
+                var rewritten = try self.pass.allocator.alloc(Ast.Branch, branches.len);
+                defer self.pass.allocator.free(rewritten);
+
+                for (branches, 0..) |branch, index| {
+                    const change_start = self.changes.items.len;
+                    try self.shadowPatLocals(branch.pat);
+                    const body = (try self.cloneLetCaseBranchBody(let_, branch.body)) orelse {
+                        self.restore(change_start);
+                        return null;
+                    };
+                    self.restore(change_start);
+                    rewritten[index] = .{
+                        .pat = branch.pat,
+                        .guard = branch.guard,
+                        .body = body,
+                    };
+                }
+
+                return .{ .match_ = .{
+                    .scrutinee = match.scrutinee,
+                    .branches = try self.pass.program.addBranchSpan(rewritten),
+                    .comptime_site = match.comptime_site,
+                } };
+            },
+            .if_ => |if_| {
+                const branches = try self.pass.allocator.dupe(Ast.IfBranch, self.pass.program.ifBranchSpan(if_.branches));
+                defer self.pass.allocator.free(branches);
+
+                var rewritten = try self.pass.allocator.alloc(Ast.IfBranch, branches.len);
+                defer self.pass.allocator.free(rewritten);
+
+                for (branches, 0..) |branch, index| {
+                    const body = (try self.cloneLetCaseBranchBody(let_, branch.body)) orelse return null;
+                    rewritten[index] = .{
+                        .cond = branch.cond,
+                        .body = body,
+                    };
+                }
+                const final_else = (try self.cloneLetCaseBranchBody(let_, if_.final_else)) orelse return null;
+
+                return .{ .if_ = .{
+                    .branches = try self.pass.program.addIfBranchSpan(rewritten),
+                    .final_else = final_else,
+                } };
+            },
             else => return null,
-        };
-
-        const branches = try self.pass.allocator.dupe(Ast.Branch, self.pass.program.branchSpan(match.branches));
-        defer self.pass.allocator.free(branches);
-
-        var rewritten = try self.pass.allocator.alloc(Ast.Branch, branches.len);
-        defer self.pass.allocator.free(rewritten);
-
-        for (branches, 0..) |branch, index| {
-            const body = (try self.cloneLetCaseBranchBody(let_, branch.body)) orelse return null;
-            rewritten[index] = .{
-                .pat = branch.pat,
-                .guard = branch.guard,
-                .body = body,
-            };
         }
-
-        return .{ .match_ = .{
-            .scrutinee = match.scrutinee,
-            .branches = try self.pass.program.addBranchSpan(rewritten),
-            .comptime_site = match.comptime_site,
-        } };
     }
 
     fn cloneLetCaseBranchBody(self: *Cloner, let_: anytype, branch_body: Ast.ExprId) Common.LowerError!?Ast.ExprId {
+        // The rewritten branch flushes every pending binding it creates, so
+        // it is its own region.
+        const saved_entry_marks = self.region_entry_marks;
+        self.region_entry_marks = self.effect_marks;
+        defer self.region_entry_marks = saved_entry_marks;
+
         const branch_expr = self.pass.program.exprs.items[@intFromEnum(branch_body)];
         switch (branch_expr.data) {
             .block => |block| {
@@ -2007,13 +2118,13 @@ const Cloner = struct {
                     const pending_start = self.pending.items.len;
                     const cloned = try self.cloneStmt(stmt);
                     try self.appendPendingStmtsSince(pending_start, &statements);
-                    try statements.append(self.pass.allocator, cloned);
+                    if (cloned) |cloned_stmt| try statements.append(self.pass.allocator, cloned_stmt);
                 }
 
                 const pending_final = self.pending.items.len;
                 const final_value = try self.cloneExprValue(block.final_expr);
                 const rest_ty = self.pass.program.exprs.items[@intFromEnum(let_.rest)].ty;
-                if (!try self.bindPatToReusableValue(let_.bind, final_value)) {
+                if (!try self.bindPatToBranchValue(let_.bind, block.final_expr, final_value)) {
                     if (try self.cloneDivergentAtType(block.final_expr, rest_ty)) |divergent| {
                         self.restore(change_start);
                         try self.appendPendingStmtsSince(pending_final, &statements);
@@ -2040,7 +2151,7 @@ const Cloner = struct {
                 const pending_entry = self.pending.items.len;
                 const branch_value = try self.cloneExprValue(branch_body);
                 const change_start = self.changes.items.len;
-                if (!try self.bindPatToReusableValue(let_.bind, branch_value)) {
+                if (!try self.bindPatToBranchValue(let_.bind, branch_body, branch_value)) {
                     self.restore(change_start);
                     self.pending.shrinkRetainingCapacity(pending_entry);
                     return null;
@@ -2050,6 +2161,32 @@ const Cloner = struct {
                 return rest;
             },
         }
+    }
+
+    /// Bind a sunk let's pattern to one branch's result value: directly when
+    /// the value substitutes wholesale, otherwise by naming its opaque leaves
+    /// as pending bindings the caller pins at the branch's position — the
+    /// same computations in the same order.
+    fn bindPatToBranchValue(
+        self: *Cloner,
+        pat_id: Ast.PatId,
+        source_value: Ast.ExprId,
+        value: Value,
+    ) Common.LowerError!bool {
+        if (try self.bindPatToReusableValue(pat_id, value)) return true;
+        const pat = self.pass.program.pats.items[@intFromEnum(pat_id)];
+        const self_referential = switch (pat.data) {
+            .bind => |local| localUseCountInExpr(self.pass.program, local, source_value) != 0,
+            else => false,
+        };
+        if (self_referential) return false;
+        const change_before = self.changes.items.len;
+        const pending_before = self.pending.items.len;
+        const reusable = try self.makeReusableForMatch(value);
+        if (try self.bindPatToValue(pat_id, reusable)) return true;
+        self.restore(change_before);
+        self.pending.shrinkRetainingCapacity(pending_before);
+        return false;
     }
 
     fn cloneDivergentAtType(self: *Cloner, expr_id: Ast.ExprId, ty: Type.TypeId) Common.LowerError!?Ast.ExprId {
@@ -2065,7 +2202,7 @@ const Cloner = struct {
         };
     }
 
-    fn cloneLoop(self: *Cloner, ty: Type.TypeId, loop: anytype) Common.LowerError!Ast.ExprId {
+    fn cloneLoopValue(self: *Cloner, ty: Type.TypeId, loop: anytype) Common.LowerError!Value {
         const params = try self.pass.allocator.dupe(Ast.TypedLocal, self.pass.program.typedLocalSpan(loop.params));
         defer self.pass.allocator.free(params);
         const initial_values = try self.pass.allocator.dupe(Ast.ExprId, self.pass.program.exprSpan(loop.initial_values));
@@ -2130,11 +2267,11 @@ const Cloner = struct {
             var any_failed = false;
             for (frame.slot_failed) |failed| any_failed = any_failed or failed;
             if (!any_failed) {
-                return try self.addExpr(.{ .ty = ty, .data = .{ .loop_ = .{
+                return .{ .expr = try self.addExpr(.{ .ty = ty, .data = .{ .loop_ = .{
                     .params = try self.pass.program.addTypedLocalSpan(new_params.items),
                     .initial_values = try self.pass.program.addExprSpan(new_initials.items),
                     .body = body,
-                } } });
+                } } }) };
             }
 
             self.restore(split_start);
@@ -2154,15 +2291,16 @@ const Cloner = struct {
         @memset(whole_failed, false);
 
         const initial_span = try self.valuesToExprSpan(values);
+        for (params) |param| try self.shadowLocal(param.local);
         try self.loop_stack.append(self.pass.allocator, .{ .values = whole_shapes, .slot_failed = whole_failed });
         const body = try self.cloneExpr(loop.body);
         const popped = self.loop_stack.pop() orelse Common.invariant("loop stack underflow after whole-state body clone");
         _ = popped;
-        return try self.addExpr(.{ .ty = ty, .data = .{ .loop_ = .{
+        return .{ .expr = try self.addExpr(.{ .ty = ty, .data = .{ .loop_ = .{
             .params = loop.params,
             .initial_values = initial_span,
             .body = body,
-        } } });
+        } } }) };
     }
 
     /// Remove the pre-loop `binder_subst` value for the variable carried by a
@@ -2201,7 +2339,7 @@ const Cloner = struct {
                 // A discarded effect-free expression performs no observable
                 // work, so the statement dissolves with the block.
                 .expr => |stmt_expr| {
-                    if (exprHasNoObservableEffect(self.pass.program, stmt_expr)) continue;
+                    if (exprHasNoObservableEffect(self.pass.program, self.pass.fn_effect_free, stmt_expr, false)) continue;
                     self.restore(change_start);
                     self.pending.shrinkRetainingCapacity(pending_entry);
                     return null;
@@ -2235,11 +2373,33 @@ const Cloner = struct {
 
         var statements = std.ArrayList(Ast.StmtId).empty;
         defer statements.deinit(self.pass.allocator);
-        for (source) |stmt| {
+        for (source, 0..) |stmt, index| {
+            // A binding statement is a let expression over the block's tail.
+            // Cloning it as one lets a branch-built value sink the tail into
+            // the branches, where each branch's constructor is known.
+            switch (self.pass.program.stmts.items[@intFromEnum(stmt)]) {
+                .let_ => |let_| if (!let_.recursive) {
+                    const tail = try self.pass.program.addExpr(.{ .ty = ty, .data = .{ .block = .{
+                        .statements = try self.pass.program.addStmtSpan(source[index + 1 ..]),
+                        .final_expr = block.final_expr,
+                    } } });
+                    const synthetic = try self.pass.program.addExpr(.{ .ty = ty, .data = .{ .let_ = .{
+                        .bind = let_.pat,
+                        .value = let_.value,
+                        .rest = tail,
+                        .comptime_site = let_.comptime_site,
+                    } } });
+                    return try self.addExpr(.{ .ty = ty, .data = .{ .block = .{
+                        .statements = try self.pass.program.addStmtSpan(statements.items),
+                        .final_expr = try self.cloneExpr(synthetic),
+                    } } });
+                },
+                else => {},
+            }
             const pending_start = self.pending.items.len;
             const cloned = try self.cloneStmt(stmt);
             try self.appendPendingStmtsSince(pending_start, &statements);
-            try statements.append(self.pass.allocator, cloned);
+            if (cloned) |cloned_stmt| try statements.append(self.pass.allocator, cloned_stmt);
         }
 
         return try self.addExpr(.{ .ty = ty, .data = .{ .block = .{
@@ -2837,7 +2997,7 @@ const Cloner = struct {
             var delegatable = true;
             for (self.pending.items[start..]) |pending| {
                 if (pending.marks != self.region_entry_marks or
-                    !exprHasNoObservableEffect(self.pass.program, pending.value))
+                    !exprHasNoObservableEffect(self.pass.program, self.pass.fn_effect_free, pending.value, false))
                 {
                     delegatable = false;
                     break;
@@ -2856,41 +3016,109 @@ const Cloner = struct {
     ) Common.LowerError!?Value {
         const pending_entry = self.pending.items.len;
         const scrutinee_data = self.pass.program.exprs.items[@intFromEnum(scrutinee_expr)].data;
-        const inner_match = switch (scrutinee_data) {
-            .match_ => |match| match,
-            else => return null,
-        };
 
         const outer_branches = self.pass.program.branchSpan(outer_branches_span);
         for (outer_branches) |branch| {
             if (branch.guard != null) return null;
         }
 
-        const inner_branches = try self.pass.allocator.dupe(Ast.Branch, self.pass.program.branchSpan(inner_match.branches));
-        defer self.pass.allocator.free(inner_branches);
+        switch (scrutinee_data) {
+            .match_ => |inner_match| {
+                const inner_branches = try self.pass.allocator.dupe(Ast.Branch, self.pass.program.branchSpan(inner_match.branches));
+                defer self.pass.allocator.free(inner_branches);
 
-        var rewritten = try self.pass.allocator.alloc(Ast.Branch, inner_branches.len);
-        defer self.pass.allocator.free(rewritten);
+                var rewritten = try self.pass.allocator.alloc(Ast.Branch, inner_branches.len);
+                defer self.pass.allocator.free(rewritten);
 
-        for (inner_branches, 0..) |inner_branch, index| {
-            const pending_start = self.pending.items.len;
-            const inner_value = try self.cloneExprValue(inner_branch.body);
-            const outer_value = (try self.simplifyKnownMatchValue(inner_value, outer_branches_span)) orelse {
-                self.pending.shrinkRetainingCapacity(pending_entry);
-                return null;
-            };
-            rewritten[index] = .{
-                .pat = inner_branch.pat,
-                .guard = inner_branch.guard,
-                .body = try self.flushPendingSince(pending_start, try self.materialize(outer_value)),
-            };
+                for (inner_branches, 0..) |inner_branch, index| {
+                    // Each rewritten branch flushes every pending binding it
+                    // creates, so it is its own region.
+                    const pending_start = self.pending.items.len;
+                    const saved_entry_marks = self.region_entry_marks;
+                    self.region_entry_marks = self.effect_marks;
+                    defer self.region_entry_marks = saved_entry_marks;
+                    const change_start = self.changes.items.len;
+                    try self.shadowPatLocals(inner_branch.pat);
+                    const inner_value = try self.cloneExprValue(inner_branch.body);
+                    const outer_value = (try self.distributeMatchOverValue(ty, inner_value, outer_branches_span)) orelse {
+                        self.restore(change_start);
+                        self.pending.shrinkRetainingCapacity(pending_entry);
+                        return null;
+                    };
+                    rewritten[index] = .{
+                        .pat = inner_branch.pat,
+                        .guard = inner_branch.guard,
+                        .body = try self.flushPendingSince(pending_start, try self.materialize(outer_value)),
+                    };
+                    self.restore(change_start);
+                }
+
+                return .{ .expr = try self.addExpr(.{ .ty = ty, .data = .{ .match_ = .{
+                    .scrutinee = inner_match.scrutinee,
+                    .branches = try self.pass.program.addBranchSpan(rewritten),
+                    .comptime_site = inner_match.comptime_site,
+                } } }) };
+            },
+            .if_ => |inner_if| {
+                const inner_branches = try self.pass.allocator.dupe(Ast.IfBranch, self.pass.program.ifBranchSpan(inner_if.branches));
+                defer self.pass.allocator.free(inner_branches);
+
+                var rewritten = try self.pass.allocator.alloc(Ast.IfBranch, inner_branches.len);
+                defer self.pass.allocator.free(rewritten);
+
+                for (inner_branches, 0..) |inner_branch, index| {
+                    // Each rewritten branch flushes every pending binding it
+                    // creates, so it is its own region.
+                    const pending_start = self.pending.items.len;
+                    const saved_entry_marks = self.region_entry_marks;
+                    self.region_entry_marks = self.effect_marks;
+                    defer self.region_entry_marks = saved_entry_marks;
+                    const inner_value = try self.cloneExprValue(inner_branch.body);
+                    const outer_value = (try self.distributeMatchOverValue(ty, inner_value, outer_branches_span)) orelse {
+                        self.pending.shrinkRetainingCapacity(pending_entry);
+                        return null;
+                    };
+                    rewritten[index] = .{
+                        .cond = inner_branch.cond,
+                        .body = try self.flushPendingSince(pending_start, try self.materialize(outer_value)),
+                    };
+                }
+
+                const pending_start = self.pending.items.len;
+                const saved_entry_marks = self.region_entry_marks;
+                self.region_entry_marks = self.effect_marks;
+                defer self.region_entry_marks = saved_entry_marks;
+                const else_value = try self.cloneExprValue(inner_if.final_else);
+                const outer_else = (try self.distributeMatchOverValue(ty, else_value, outer_branches_span)) orelse {
+                    self.pending.shrinkRetainingCapacity(pending_entry);
+                    return null;
+                };
+                const final_else = try self.flushPendingSince(pending_start, try self.materialize(outer_else));
+
+                return .{ .expr = try self.addExpr(.{ .ty = ty, .data = .{ .if_ = .{
+                    .branches = try self.pass.program.addIfBranchSpan(rewritten),
+                    .final_else = final_else,
+                } } }) };
+            },
+            else => return null,
         }
+    }
 
-        return .{ .expr = try self.addExpr(.{ .ty = ty, .data = .{ .match_ = .{
-            .scrutinee = inner_match.scrutinee,
-            .branches = try self.pass.program.addBranchSpan(rewritten),
-            .comptime_site = inner_match.comptime_site,
-        } } }) };
+    /// Collapse an outer match against one inner-branch result: a known
+    /// constructor selects its arm directly, and a branch-built result
+    /// distributes recursively so the arms land where the constructors are
+    /// known.
+    fn distributeMatchOverValue(
+        self: *Cloner,
+        ty: Type.TypeId,
+        inner_value: Value,
+        outer_branches_span: Ast.Span(Ast.Branch),
+    ) Common.LowerError!?Value {
+        if (try self.simplifyKnownMatchValue(inner_value, outer_branches_span)) |value| return value;
+        return switch (inner_value) {
+            .expr => |expr| try self.cloneCaseOfCaseValue(ty, expr, outer_branches_span),
+            else => null,
+        };
     }
 
     fn inlineCallableCallValue(
@@ -3121,6 +3349,52 @@ const Cloner = struct {
         return try self.bindPatToValue(pat_id, value);
     }
 
+    /// Record an identity substitution for a local bound by a retained
+    /// source pattern: the pattern's body resolves the local to the
+    /// pattern's own runtime binding, never to an outer substitution that
+    /// bound the same local id in another clone of this code.
+    fn shadowLocal(self: *Cloner, local: Ast.LocalId) Common.LowerError!void {
+        const ty = self.pass.program.locals.items[@intFromEnum(local)].ty;
+        try self.putSubst(local, .{ .expr = try self.addExpr(.{ .ty = ty, .data = .{ .local = local } }) });
+    }
+
+    fn shadowPatLocals(self: *Cloner, pat_id: Ast.PatId) Common.LowerError!void {
+        const pat = self.pass.program.pats.items[@intFromEnum(pat_id)];
+        switch (pat.data) {
+            .bind => |local| try self.shadowLocal(local),
+            .wildcard,
+            .int_lit,
+            .dec_lit,
+            .frac_f32_lit,
+            .frac_f64_lit,
+            .str_lit,
+            => {},
+            .as => |as| {
+                try self.shadowPatLocals(as.pattern);
+                try self.shadowLocal(as.local);
+            },
+            .record => |fields| for (self.pass.program.recordDestructSpan(fields)) |field| {
+                try self.shadowPatLocals(field.pattern);
+            },
+            .tuple => |items| for (self.pass.program.patSpan(items)) |child| {
+                try self.shadowPatLocals(child);
+            },
+            .tag => |tag| for (self.pass.program.patSpan(tag.payloads)) |child| {
+                try self.shadowPatLocals(child);
+            },
+            .nominal => |backing| try self.shadowPatLocals(backing),
+            .list => |list| {
+                for (self.pass.program.patSpan(list.patterns)) |child| try self.shadowPatLocals(child);
+                if (list.rest) |rest| {
+                    if (rest.pattern) |rest_pattern| try self.shadowPatLocals(rest_pattern);
+                }
+            },
+            .str_pattern => |str| for (self.pass.program.strPatternStepSpan(str.steps)) |step| {
+                if (step.capture) |capture| try self.shadowPatLocals(capture);
+            },
+        }
+    }
+
     fn clonePat(self: *Cloner, pat_id: Ast.PatId) Allocator.Error!Ast.PatId {
         const pat = self.pass.program.pats.items[@intFromEnum(pat_id)];
         const data: Ast.PatData = switch (pat.data) {
@@ -3173,7 +3447,12 @@ const Cloner = struct {
         };
     }
 
-    fn cloneStmt(self: *Cloner, stmt_id: Ast.StmtId) Common.LowerError!Ast.StmtId {
+    /// Clone one statement. A binding statement whose value's opaque leaves
+    /// can all be named dissolves instead: the caller drains the pending
+    /// bindings at this statement's position — the same computations in the
+    /// same order — and the bound name keeps its structured value for the
+    /// rest of the block. Returns null for a dissolved statement.
+    fn cloneStmt(self: *Cloner, stmt_id: Ast.StmtId) Common.LowerError!?Ast.StmtId {
         const saved_loc = self.current_loc;
         defer self.current_loc = saved_loc;
         const saved_region = self.current_region;
@@ -3185,11 +3464,37 @@ const Cloner = struct {
 
         const stmt = self.pass.program.stmts.items[@intFromEnum(stmt_id)];
         return try self.addStmt(switch (stmt) {
-            .uninitialized => |pat| .{ .uninitialized = try self.clonePat(pat) },
+            .uninitialized => |pat| blk: {
+                try self.shadowPatLocals(pat);
+                break :blk .{ .uninitialized = try self.clonePat(pat) };
+            },
             .let_ => |let_| blk: {
                 const value = try self.cloneExprValue(let_.value);
                 const value_expr = try self.materialize(value);
-                _ = try self.bindPatToReusableValue(let_.pat, value);
+                if (try self.bindPatToReusableValue(let_.pat, value)) {
+                    break :blk .{ .let_ = .{
+                        .pat = try self.clonePat(let_.pat),
+                        .value = value_expr,
+                        .recursive = let_.recursive,
+                        .comptime_site = let_.comptime_site,
+                    } };
+                }
+                const pat = self.pass.program.pats.items[@intFromEnum(let_.pat)];
+                const self_referential = switch (pat.data) {
+                    .bind => |local| localUseCountInExpr(self.pass.program, local, let_.value) != 0,
+                    else => let_.recursive,
+                };
+                if (!self_referential) {
+                    // The drained bindings sit exactly where the statement
+                    // sat, so no evaluation moves and no gate is needed.
+                    const change_before = self.changes.items.len;
+                    const pending_before = self.pending.items.len;
+                    const reusable = try self.makeReusableForMatch(value);
+                    if (try self.bindPatToValue(let_.pat, reusable)) return null;
+                    self.restore(change_before);
+                    self.pending.shrinkRetainingCapacity(pending_before);
+                }
+                try self.shadowPatLocals(let_.pat);
                 break :blk .{ .let_ = .{
                     .pat = try self.clonePat(let_.pat),
                     .value = value_expr,
@@ -3265,11 +3570,14 @@ const Cloner = struct {
         const values = try self.pass.allocator.alloc(Ast.Branch, source.len);
         defer self.pass.allocator.free(values);
         for (source, 0..) |branch, index| {
+            const change_start = self.changes.items.len;
+            try self.shadowPatLocals(branch.pat);
             values[index] = .{
                 .pat = try self.clonePat(branch.pat),
                 .guard = if (branch.guard) |guard| try self.cloneExpr(guard) else null,
                 .body = try self.cloneExpr(branch.body),
             };
+            self.restore(change_start);
         }
         return try self.pass.program.addBranchSpan(values);
     }
@@ -3587,7 +3895,16 @@ const Cloner = struct {
         // crash op and the process-seed read). Pending bindings created after
         // such an emission must not move ahead of it.
         switch (expr.data) {
-            .call_proc,
+            .call_proc => |call| {
+                const effect_free = switch (call.callee) {
+                    .lifted => |fn_id| blk: {
+                        const raw = @intFromEnum(fn_id);
+                        break :blk raw < self.pass.fn_effect_free.len and self.pass.fn_effect_free[raw];
+                    },
+                    .func => false,
+                };
+                if (!effect_free) self.effect_marks += 1;
+            },
             .call_value,
             .crash,
             .dbg,
@@ -3832,11 +4149,15 @@ const LocalUseScan = struct {
 };
 
 /// Whether evaluating an expression can produce an observable effect. Host
-/// effects enter through procedure calls, so calls of unknown target are
-/// effects; low-level ops are data operations apart from the crash op and the
-/// process-seed read. Divergence through checked arithmetic is not an effect:
-/// within one straight-line region a crash commutes with pure evaluation.
-fn exprHasNoObservableEffect(program: *const Ast.Program, expr_id: Ast.ExprId) bool {
+/// effects enter through procedure calls, so a call carries an effect unless
+/// its target's whole body is effect-free; low-level ops are data operations
+/// apart from the crash op and the process-seed read. Divergence through
+/// checked arithmetic is not an effect: within one straight-line region a
+/// crash commutes with pure evaluation.
+/// `allow_control` distinguishes the two users: classifying a whole function
+/// body tolerates control transfers (they stay inside the function), while a
+/// value being discarded or moved must not carry one.
+fn exprHasNoObservableEffect(program: *const Ast.Program, fn_effect_free: []const bool, expr_id: Ast.ExprId, allow_control: bool) bool {
     const expr = program.exprs.items[@intFromEnum(expr_id)];
     return switch (expr.data) {
         .local,
@@ -3851,71 +4172,98 @@ fn exprHasNoObservableEffect(program: *const Ast.Program, expr_id: Ast.ExprId) b
         .def_ref,
         .fn_def,
         => true,
-        .fn_ref => |fn_ref| exprSpanHasNoObservableEffect(program, fn_ref.captures),
+        .fn_ref => |fn_ref| exprSpanHasNoObservableEffect(program, fn_effect_free, fn_ref.captures, allow_control),
         .list,
         .tuple,
-        => |items| exprSpanHasNoObservableEffect(program, items),
+        => |items| exprSpanHasNoObservableEffect(program, fn_effect_free, items, allow_control),
         .record => |fields| blk: {
             for (program.fieldExprSpan(fields)) |field| {
-                if (!exprHasNoObservableEffect(program, field.value)) break :blk false;
+                if (!exprHasNoObservableEffect(program, fn_effect_free, field.value, allow_control)) break :blk false;
             }
             break :blk true;
         },
-        .tag => |tag| exprSpanHasNoObservableEffect(program, tag.payloads),
-        .nominal => |child| exprHasNoObservableEffect(program, child),
-        .field_access => |field| exprHasNoObservableEffect(program, field.receiver),
-        .tuple_access => |access| exprHasNoObservableEffect(program, access.tuple),
-        .structural_eq => |eq| exprHasNoObservableEffect(program, eq.lhs) and
-            exprHasNoObservableEffect(program, eq.rhs),
-        .structural_hash => |h| exprHasNoObservableEffect(program, h.value) and
-            exprHasNoObservableEffect(program, h.hasher),
+        .tag => |tag| exprSpanHasNoObservableEffect(program, fn_effect_free, tag.payloads, allow_control),
+        .nominal => |child| exprHasNoObservableEffect(program, fn_effect_free, child, allow_control),
+        .field_access => |field| exprHasNoObservableEffect(program, fn_effect_free, field.receiver, allow_control),
+        .tuple_access => |access| exprHasNoObservableEffect(program, fn_effect_free, access.tuple, allow_control),
+        .structural_eq => |eq| exprHasNoObservableEffect(program, fn_effect_free, eq.lhs, allow_control) and
+            exprHasNoObservableEffect(program, fn_effect_free, eq.rhs, allow_control),
+        .structural_hash => |h| exprHasNoObservableEffect(program, fn_effect_free, h.value, allow_control) and
+            exprHasNoObservableEffect(program, fn_effect_free, h.hasher, allow_control),
         .low_level => |call| switch (call.op) {
             .crash, .dict_pseudo_seed => false,
-            else => exprSpanHasNoObservableEffect(program, call.args),
+            else => exprSpanHasNoObservableEffect(program, fn_effect_free, call.args, allow_control),
         },
-        .let_ => |let_| exprHasNoObservableEffect(program, let_.value) and
-            exprHasNoObservableEffect(program, let_.rest),
+        .call_proc => |call| blk: {
+            const callee = switch (call.callee) {
+                .lifted => |fn_id| fn_id,
+                .func => break :blk false,
+            };
+            const raw = @intFromEnum(callee);
+            if (raw >= fn_effect_free.len or !fn_effect_free[raw]) break :blk false;
+            break :blk exprSpanHasNoObservableEffect(program, fn_effect_free, call.args, allow_control) and
+                exprSpanHasNoObservableEffect(program, fn_effect_free, call.captures, allow_control);
+        },
+        .let_ => |let_| exprHasNoObservableEffect(program, fn_effect_free, let_.value, allow_control) and
+            exprHasNoObservableEffect(program, fn_effect_free, let_.rest, allow_control),
         .if_ => |if_| blk: {
             for (program.ifBranchSpan(if_.branches)) |branch| {
-                if (!exprHasNoObservableEffect(program, branch.cond)) break :blk false;
-                if (!exprHasNoObservableEffect(program, branch.body)) break :blk false;
+                if (!exprHasNoObservableEffect(program, fn_effect_free, branch.cond, allow_control)) break :blk false;
+                if (!exprHasNoObservableEffect(program, fn_effect_free, branch.body, allow_control)) break :blk false;
             }
-            break :blk exprHasNoObservableEffect(program, if_.final_else);
+            break :blk exprHasNoObservableEffect(program, fn_effect_free, if_.final_else, allow_control);
         },
         .match_ => |match| blk: {
-            if (!exprHasNoObservableEffect(program, match.scrutinee)) break :blk false;
+            if (!exprHasNoObservableEffect(program, fn_effect_free, match.scrutinee, allow_control)) break :blk false;
             for (program.branchSpan(match.branches)) |branch| {
                 if (branch.guard) |guard| {
-                    if (!exprHasNoObservableEffect(program, guard)) break :blk false;
+                    if (!exprHasNoObservableEffect(program, fn_effect_free, guard, allow_control)) break :blk false;
                 }
-                if (!exprHasNoObservableEffect(program, branch.body)) break :blk false;
+                if (!exprHasNoObservableEffect(program, fn_effect_free, branch.body, allow_control)) break :blk false;
             }
             break :blk true;
         },
-        .comptime_branch_taken => |taken| exprHasNoObservableEffect(program, taken.body),
+        .block => |block| blk: {
+            for (program.stmtSpan(block.statements)) |stmt_id| {
+                const no_effect = switch (program.stmts.items[@intFromEnum(stmt_id)]) {
+                    .let_ => |let_| exprHasNoObservableEffect(program, fn_effect_free, let_.value, allow_control),
+                    .expr => |stmt_expr| exprHasNoObservableEffect(program, fn_effect_free, stmt_expr, allow_control),
+                    .uninitialized => true,
+                    .return_ => |ret| allow_control and exprHasNoObservableEffect(program, fn_effect_free, ret.value, allow_control),
+                    .expect, .dbg, .crash => false,
+                };
+                if (!no_effect) break :blk false;
+            }
+            break :blk exprHasNoObservableEffect(program, fn_effect_free, block.final_expr, allow_control);
+        },
+        // A loop contains its own back edges, so its body may transfer
+        // control regardless of the caller's tolerance.
+        .loop_ => |loop| exprSpanHasNoObservableEffect(program, fn_effect_free, loop.initial_values, allow_control) and
+            exprHasNoObservableEffect(program, fn_effect_free, loop.body, true),
+        .break_ => |maybe| allow_control and
+            (if (maybe) |value| exprHasNoObservableEffect(program, fn_effect_free, value, allow_control) else true),
+        .continue_ => |continue_| allow_control and exprSpanHasNoObservableEffect(program, fn_effect_free, continue_.values, allow_control),
+        .if_initialized_payload => |payload_switch| exprHasNoObservableEffect(program, fn_effect_free, payload_switch.cond, allow_control) and
+            exprHasNoObservableEffect(program, fn_effect_free, payload_switch.initialized, allow_control) and
+            exprHasNoObservableEffect(program, fn_effect_free, payload_switch.uninitialized, allow_control),
+        .comptime_branch_taken => |taken| exprHasNoObservableEffect(program, fn_effect_free, taken.body, allow_control),
+        .return_ => |ret| allow_control and exprHasNoObservableEffect(program, fn_effect_free, ret.value, allow_control),
         .lambda,
         .call_value,
-        .call_proc,
         .crash,
         .dbg,
         .expect,
         .expect_err,
         .comptime_exhaustiveness_failed,
-        .block,
-        .loop_,
-        .break_,
-        .continue_,
-        .return_,
-        .if_initialized_payload,
         .try_sequence,
         .try_record_sequence,
         => false,
     };
 }
 
-fn exprSpanHasNoObservableEffect(program: *const Ast.Program, span: Ast.Span(Ast.ExprId)) bool {
+fn exprSpanHasNoObservableEffect(program: *const Ast.Program, fn_effect_free: []const bool, span: Ast.Span(Ast.ExprId), allow_control: bool) bool {
     for (program.exprSpan(span)) |expr| {
-        if (!exprHasNoObservableEffect(program, expr)) return false;
+        if (!exprHasNoObservableEffect(program, fn_effect_free, expr, allow_control)) return false;
     }
     return true;
 }
