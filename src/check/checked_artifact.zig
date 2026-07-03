@@ -607,7 +607,9 @@ pub const ProvidedExportTable = struct {
     pub fn fromModule(
         allocator: Allocator,
         module: TypedCIR.Module,
-        checked_types: *const CheckedTypePublication,
+        names: *const canonical.CanonicalNameStore,
+        checked_types: *CheckedTypePublication,
+        relation_substitutions: *const PlatformRelationTypeSubstitutions,
         top_level_values: *const TopLevelValueTable,
         published_provides: []const ProvidesEntry,
     ) Allocator.Error!ProvidedExportTable {
@@ -640,11 +642,17 @@ pub const ProvidedExportTable = struct {
                 }
                 unreachable;
             };
-            const checked_type = try checkedTypeIdForRootSource(
+            const source_checked_type = try checkedTypeIdForRootSource(
                 allocator,
                 module,
                 checked_types,
                 .{ .def = def_idx },
+            );
+            const checked_type = try relation_substitutions.specializeRoot(
+                allocator,
+                names,
+                &checked_types.store,
+                source_checked_type,
             );
             switch (top_level.value) {
                 .procedure_binding => |binding| try exports.append(allocator, .{ .procedure = .{
@@ -13099,7 +13107,8 @@ pub const CheckedProcedureTemplateTable = struct {
         global_value_defs: []const CIR.Def.Idx,
         names: *canonical.CanonicalNameStore,
         owner_artifact: canonical.ArtifactRef,
-        checked_type_publication: *const CheckedTypePublication,
+        checked_type_publication: *CheckedTypePublication,
+        relation_substitutions: *const PlatformRelationTypeSubstitutions,
         checked_bodies: *CheckedBodyStore,
         intrinsic_wrappers: *IntrinsicWrapperTable,
     ) Allocator.Error!CheckedProcedureTemplateTable {
@@ -13136,18 +13145,28 @@ pub const CheckedProcedureTemplateTable = struct {
                 .def = def_idx,
                 .template = template_ref,
             });
-            const checked_fn_root = checked_type_publication.rootForSourceVar(module, module.defType(def_idx)) orelse {
+            const source_checked_fn_root = checked_type_publication.rootForSourceVar(module, module.defType(def_idx)) orelse {
                 if (builtin.mode == .Debug) {
                     std.debug.panic("checked artifact invariant violated: checked procedure function root was not published", .{});
                 }
                 unreachable;
             };
-            const checked_fn_scheme = try canonical_type_keys.schemeFromVar(
+            const source_checked_fn_scheme = try canonical_type_keys.schemeFromVar(
                 allocator,
                 module.typeStoreConst(),
                 module.identStoreConst(),
                 module.defType(def_idx),
             );
+            const checked_fn_root = try relation_substitutions.specializeRoot(
+                allocator,
+                names,
+                &checked_type_publication.store,
+                source_checked_fn_root,
+            );
+            const checked_fn_scheme = if (checked_fn_root == source_checked_fn_root)
+                source_checked_fn_scheme
+            else
+                syntheticSchemeKeyForType(checked_type_publication.store.roots.items[@intFromEnum(checked_fn_root)].key);
             const body: CheckedProcedureBody = if (intrinsic) |intrinsic_id| blk: {
                 const wrapper_id = try intrinsic_wrappers.append(allocator, template_ref, checked_fn_root, intrinsic_id);
                 break :blk .{ .intrinsic_wrapper = wrapper_id };
@@ -14073,6 +14092,80 @@ pub const PlatformAppRelationBuildResult = union(enum) {
             .missing_value => {},
         }
         self.* = undefined;
+    }
+};
+
+const PlatformRelationTypeSubstitutions = struct {
+    formals: []CheckedTypeId = &.{},
+    actuals: []CheckedTypeId = &.{},
+
+    fn fromRelation(
+        allocator: Allocator,
+        module: TypedCIR.Module,
+        module_identity: ModuleIdentity,
+        names: *canonical.CanonicalNameStore,
+        checked_types: *CheckedTypePublication,
+        declarations: *const PlatformRequiredDeclarationTable,
+        relation_artifacts: []const ImportedModuleView,
+        relation: ?PlatformAppRelation,
+    ) Allocator.Error!PlatformRelationTypeSubstitutions {
+        const active_relation = relation orelse return .{};
+        validatePlatformAppRelationForModule(
+            module,
+            module_identity,
+            names,
+            declarations,
+            active_relation,
+        );
+
+        var resolver = PlatformAppRelationTypeResolver.init(allocator, names, &checked_types.store);
+        resolver.collect_substitutions = true;
+        defer resolver.deinit();
+
+        for (active_relation.relations) |input| {
+            const declaration = declarations.lookupByDeclarationId(input.declaration) orelse {
+                checkedArtifactInvariant("platform/app relation substitution referenced unknown requirement declaration", .{});
+            };
+            _ = try platformRequiredResolvedPayloadForRelationWithResolver(
+                allocator,
+                module,
+                names,
+                checked_types,
+                relation_artifacts,
+                active_relation,
+                input,
+                declaration,
+                &resolver,
+            );
+        }
+
+        return try resolver.substitutions(allocator);
+    }
+
+    fn specializeRoot(
+        self: *const PlatformRelationTypeSubstitutions,
+        allocator: Allocator,
+        names: *const canonical.CanonicalNameStore,
+        store: *CheckedTypeStore,
+        root: CheckedTypeId,
+    ) Allocator.Error!CheckedTypeId {
+        if (self.formals.len == 0) return root;
+        var active = std.AutoHashMap(CheckedTypeId, CheckedTypeId).init(allocator);
+        defer active.deinit();
+        return try store.cloneCheckedTypeRootSubstituting(
+            allocator,
+            names,
+            root,
+            self.formals,
+            self.actuals,
+            &active,
+        );
+    }
+
+    fn deinit(self: *PlatformRelationTypeSubstitutions, allocator: Allocator) void {
+        allocator.free(self.actuals);
+        allocator.free(self.formals);
+        self.* = .{};
     }
 };
 
@@ -15196,6 +15289,32 @@ fn platformRequiredResolvedPayloadForRelation(
     input: PlatformRequirementRelationInput,
     declaration: PlatformRequiredDeclaration,
 ) Allocator.Error!CheckedTypeId {
+    var resolver = PlatformAppRelationTypeResolver.init(allocator, names, &checked_types.store);
+    defer resolver.deinit();
+    return try platformRequiredResolvedPayloadForRelationWithResolver(
+        allocator,
+        module,
+        names,
+        checked_types,
+        relation_artifacts,
+        active_relation,
+        input,
+        declaration,
+        &resolver,
+    );
+}
+
+fn platformRequiredResolvedPayloadForRelationWithResolver(
+    allocator: Allocator,
+    module: TypedCIR.Module,
+    names: *canonical.CanonicalNameStore,
+    checked_types: *CheckedTypePublication,
+    relation_artifacts: []const ImportedModuleView,
+    active_relation: PlatformAppRelation,
+    input: PlatformRequirementRelationInput,
+    declaration: PlatformRequiredDeclaration,
+    resolver: *PlatformAppRelationTypeResolver,
+) Allocator.Error!CheckedTypeId {
     const platform_payload = platformRequiredPayloadForDeclaration(module, checked_types, declaration);
     const app_view = relationArtifactByKey(relation_artifacts, active_relation.app_artifact) orelse {
         checkedArtifactInvariant("platform/app relation resolution missing app relation artifact", .{});
@@ -15208,8 +15327,6 @@ fn platformRequiredResolvedPayloadForRelation(
     defer projector.deinit();
     const projected_app_root = try projector.project(app_scheme.root);
 
-    var resolver = PlatformAppRelationTypeResolver.init(allocator, names, &checked_types.store);
-    defer resolver.deinit();
     return try resolver.merge(platform_payload, projected_app_root, .value);
 }
 
@@ -15236,6 +15353,9 @@ const PlatformAppRelationTypeResolver = struct {
     store: *CheckedTypeStore,
     finalizing: std.AutoHashMap(PlatformAppRelationFinalizeInput, CheckedTypeId),
     merging: std.AutoHashMap(PlatformAppRelationMergeInput, CheckedTypeId),
+    substitution_formals: std.ArrayList(CheckedTypeId),
+    substitution_actuals: std.ArrayList(CheckedTypeId),
+    collect_substitutions: bool = false,
 
     fn init(
         allocator: Allocator,
@@ -15248,12 +15368,26 @@ const PlatformAppRelationTypeResolver = struct {
             .store = store,
             .finalizing = std.AutoHashMap(PlatformAppRelationFinalizeInput, CheckedTypeId).init(allocator),
             .merging = std.AutoHashMap(PlatformAppRelationMergeInput, CheckedTypeId).init(allocator),
+            .substitution_formals = .empty,
+            .substitution_actuals = .empty,
         };
     }
 
     fn deinit(self: *PlatformAppRelationTypeResolver) void {
+        self.substitution_actuals.deinit(self.allocator);
+        self.substitution_formals.deinit(self.allocator);
         self.merging.deinit();
         self.finalizing.deinit();
+    }
+
+    fn substitutions(self: *const PlatformAppRelationTypeResolver, allocator: Allocator) Allocator.Error!PlatformRelationTypeSubstitutions {
+        const formals = try allocator.dupe(CheckedTypeId, self.substitution_formals.items);
+        errdefer allocator.free(formals);
+        const actuals = try allocator.dupe(CheckedTypeId, self.substitution_actuals.items);
+        return .{
+            .formals = formals,
+            .actuals = actuals,
+        };
     }
 
     fn merge(
@@ -15335,7 +15469,12 @@ const PlatformAppRelationTypeResolver = struct {
             app_root,
             context,
         );
-        if (self.store.rootForKey(result_key)) |existing| return existing;
+        if (self.store.rootForKey(result_key)) |existing| {
+            if (self.collect_substitutions) {
+                try self.collectExistingMergeSubstitutions(merge_input, existing, platform_root, platform_payload, app_root, app_payload);
+            }
+            return existing;
+        }
 
         const target = try self.store.reserveSyntheticTypeRoot(self.allocator, result_key);
         try self.merging.put(merge_input, target);
@@ -15345,6 +15484,23 @@ const PlatformAppRelationTypeResolver = struct {
         try self.store.fillSyntheticTypeRoot(self.allocator, target, result_payload);
         _ = self.merging.remove(merge_input);
         return target;
+    }
+
+    fn collectExistingMergeSubstitutions(
+        self: *PlatformAppRelationTypeResolver,
+        merge_input: PlatformAppRelationMergeInput,
+        existing: CheckedTypeId,
+        platform_root: CheckedTypeId,
+        platform_payload: CheckedTypePayload,
+        app_root: CheckedTypeId,
+        app_payload: CheckedTypePayload,
+    ) Allocator.Error!void {
+        if (self.merging.get(merge_input) != null) return;
+        try self.merging.put(merge_input, existing);
+        defer _ = self.merging.remove(merge_input);
+
+        var merged_payload = try self.mergePayload(platform_root, platform_payload, app_root, app_payload);
+        defer deinitCheckedTypePayloadBuild(self.allocator, &merged_payload);
     }
 
     fn mergePayload(
@@ -15397,19 +15553,55 @@ const PlatformAppRelationTypeResolver = struct {
 
     fn mergeIdentityWith(
         self: *PlatformAppRelationTypeResolver,
-        _: CheckedTypeId,
+        identity_root: CheckedTypeId,
         other_root: CheckedTypeId,
         other_payload: CheckedTypePayload,
         context: PlatformAppRelationMergeContext,
     ) Allocator.Error!CheckedTypeId {
-        if (checkedTypePayloadIsIdentity(other_payload)) {
-            return switch (context) {
-                .record_tail => try self.emptyRecordRoot(),
-                .tag_tail => try self.emptyTagUnionRoot(),
-                .value => other_root,
-            };
+        const resolved = if (checkedTypePayloadIsIdentity(other_payload)) switch (context) {
+            .record_tail => try self.emptyRecordRoot(),
+            .tag_tail => try self.emptyTagUnionRoot(),
+            .value => other_root,
+        } else try self.finalize(other_root, context);
+
+        if (context == .value) {
+            try self.bindIdentitySubstitution(identity_root, resolved);
         }
-        return try self.finalize(other_root, context);
+        return resolved;
+    }
+
+    fn bindIdentitySubstitution(
+        self: *PlatformAppRelationTypeResolver,
+        formal: CheckedTypeId,
+        actual: CheckedTypeId,
+    ) Allocator.Error!void {
+        if (formal == actual) return;
+        for (self.substitution_formals.items, 0..) |existing_formal, i| {
+            if (existing_formal != formal) continue;
+            const existing_actual = self.substitution_actuals.items[i];
+            if (existing_actual == actual) return;
+            const existing_key = self.store.roots.items[@intFromEnum(existing_actual)].key;
+            const actual_key = self.store.roots.items[@intFromEnum(actual)].key;
+            if (!canonicalTypeKeyEql(existing_key, actual_key)) {
+                checkedArtifactInvariant("platform/app relation assigned incompatible concrete types to one requirement identity", .{});
+            }
+            return;
+        }
+        try self.substitution_formals.append(self.allocator, formal);
+        errdefer _ = self.substitution_formals.pop();
+        try self.substitution_actuals.append(self.allocator, actual);
+    }
+
+    fn finalizeIdentity(
+        self: *PlatformAppRelationTypeResolver,
+        root: CheckedTypeId,
+        context: PlatformAppRelationMergeContext,
+    ) Allocator.Error!CheckedTypeId {
+        return switch (context) {
+            .record_tail => try self.emptyRecordRoot(),
+            .tag_tail => try self.emptyTagUnionRoot(),
+            .value => root,
+        };
     }
 
     fn finalize(
@@ -15419,11 +15611,7 @@ const PlatformAppRelationTypeResolver = struct {
     ) Allocator.Error!CheckedTypeId {
         const root_payload = self.payload(root);
         if (checkedTypePayloadIsIdentity(root_payload)) {
-            return switch (context) {
-                .record_tail => try self.emptyRecordRoot(),
-                .tag_tail => try self.emptyTagUnionRoot(),
-                .value => root,
-            };
+            return try self.finalizeIdentity(root, context);
         }
         switch (root_payload) {
             .pending => return checkedArtifactInvariant("platform/app relation finalization reached pending payload", .{}),
@@ -25207,6 +25395,30 @@ pub fn publishFromTypedModule(
 
     const global_value_defs = module_env.store.sliceDefs(module_env.global_value_defs);
 
+    var relation_type_substitutions = try PlatformRelationTypeSubstitutions.fromRelation(
+        allocator,
+        module,
+        module_identity,
+        &canonical_names,
+        &checked_type_publication,
+        &platform_required_declarations,
+        inputs.relation_artifacts,
+        inputs.platform_app_relation,
+    );
+    defer relation_type_substitutions.deinit(allocator);
+
+    var platform_requirement_relations = try PlatformRequirementRelationTable.fromRelation(
+        allocator,
+        module,
+        module_identity,
+        &canonical_names,
+        &checked_type_publication,
+        &platform_required_declarations,
+        inputs.relation_artifacts,
+        inputs.platform_app_relation,
+    );
+    errdefer platform_requirement_relations.deinit(allocator);
+
     var intrinsic_wrappers = IntrinsicWrapperTable{};
     errdefer intrinsic_wrappers.deinit(allocator);
 
@@ -25217,6 +25429,7 @@ pub fn publishFromTypedModule(
         &canonical_names,
         owner_artifact,
         &checked_type_publication,
+        &relation_type_substitutions,
         checked_bodies,
         &intrinsic_wrappers,
     );
@@ -25243,18 +25456,6 @@ pub fn publishFromTypedModule(
 
     var hosted_procs = try HostedProcTable.fromModule(allocator, module, global_value_defs, &canonical_names, &checked_procedure_templates);
     errdefer hosted_procs.deinit(allocator);
-
-    var platform_requirement_relations = try PlatformRequirementRelationTable.fromRelation(
-        allocator,
-        module,
-        module_identity,
-        &canonical_names,
-        &checked_type_publication,
-        &platform_required_declarations,
-        inputs.relation_artifacts,
-        inputs.platform_app_relation,
-    );
-    errdefer platform_requirement_relations.deinit(allocator);
 
     var platform_required_bindings = try PlatformRequiredBindingTable.fromRelation(
         allocator,
@@ -25366,7 +25567,9 @@ pub fn publishFromTypedModule(
     var provided_exports = try ProvidedExportTable.fromModule(
         allocator,
         module,
+        &canonical_names,
         &checked_type_publication,
+        &relation_type_substitutions,
         &top_level_values,
         provides,
     );
@@ -25729,6 +25932,9 @@ fn expectProvidedExportKind(
 
     const global_value_defs = module_env.store.sliceDefs(module_env.global_value_defs);
 
+    var relation_type_substitutions = PlatformRelationTypeSubstitutions{};
+    defer relation_type_substitutions.deinit(allocator);
+
     var intrinsic_wrappers = IntrinsicWrapperTable{};
     defer intrinsic_wrappers.deinit(allocator);
 
@@ -25739,6 +25945,7 @@ fn expectProvidedExportKind(
         &canonical_names,
         owner_artifact,
         &checked_type_publication,
+        &relation_type_substitutions,
         checked_bodies,
         &intrinsic_wrappers,
     );
@@ -25885,7 +26092,9 @@ fn expectProvidedExportKind(
     var provided_exports = try ProvidedExportTable.fromModule(
         allocator,
         module,
+        &canonical_names,
         &checked_type_publication,
+        &relation_type_substitutions,
         &top_level_values,
         provides,
     );
