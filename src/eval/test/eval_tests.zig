@@ -1522,8 +1522,21 @@ const core_tests = [_]TestCase{
     // nested/curried closures, closures held before application, capture-set
     // reshaping, and captures that also appear inside call arguments.
     // Repro for issue 9897 ("function reference capture count differs from its
-    // target"): the middle closure is bound and applied separately, so each
-    // fn_ref must carry exactly its target's capture slots.
+    // target"): nested callbacks capture an outer destructured binding while
+    // forwarding through another function reference.
+    .{
+        .name = "capture-id: issue 9897 nested callback captures destructured binding",
+        .source =
+        \\{
+        \\    c = |x, f| f(x)
+        \\    (a, _) = ({}, 0)
+        \\    c(0, |x| c(x, |_| a))
+        \\}
+        ,
+        .expected = .{ .inspect_str = "{}" },
+    },
+    // The middle closure is bound and applied separately, so each fn_ref must
+    // carry exactly its target's capture slots.
     .{
         .name = "capture-id: nested closure held before application",
         .source =
