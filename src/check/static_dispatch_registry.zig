@@ -638,6 +638,11 @@ pub const CheckedEvidence = union(enum) {
     constraint: EvidenceConstraintRef,
     structural: StructuralKind,
     checked_error,
+    /// The edge left this obligation's dispatcher unsolved: no value of that
+    /// type can ever reach the dispatch (e.g. the `Ok` payload of a `Try` that
+    /// is always `Err` at this edge). The obligation is vacuous; consuming it
+    /// lowers to an unreachable crash, never to a resolved call.
+    unreachable_value,
 };
 
 /// Public `EvidenceNode` declaration.
@@ -689,6 +694,11 @@ pub const StaticDispatchResolution = union(enum) {
     structural: StructuralKind,
     /// Checking rejected this site; lowering must never consume the plan.
     checked_error,
+    /// The dispatcher is a constrained var no specialization edge can ever
+    /// supply (not an evidence param of any enclosing callable and not a
+    /// defaulting literal): the dispatch is statically unreachable and lowers
+    /// to an explicit crash.
+    unreachable_dispatch,
 };
 
 /// Public `StaticDispatchCallPlan` declaration.

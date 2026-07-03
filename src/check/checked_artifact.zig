@@ -12577,23 +12577,53 @@ fn isLocalProcExpr(module: TypedCIR.Module, expr_idx: CIR.Expr.Idx) bool {
     };
 }
 
-/// Build-time-only per-template iterator-for plan refs collected by
+/// A generalized local function scope collected while walking template
+/// bodies: `constraint(depth, k)` resolutions index the innermost enclosing
+/// scope's canonical evidence params at depth 0, walking outward to the
+/// template's own params.
+const RefScopeRecord = struct {
+    /// Enclosing scope id, or `ref_scope_root` for the template itself.
+    parent: u32,
+    /// The local function's scheme root var (its decl pattern var).
+    scheme_var: Var,
+};
+
+/// Sentinel scope id: the template's own evidence params.
+const ref_scope_root: u32 = std.math.maxInt(u32);
+
+/// Build-time-only per-template data collected by
 /// `sealCheckedProcedureTemplateRefs` for the total-resolution pass; never
-/// serialized (mono looks iterator plans up by node).
+/// serialized (mono looks iterator plans up by node and receives evidence
+/// chains from its requesting edges).
 const TemplateIteratorRefs = struct {
     /// Parallel to `templates.templates`; each span indexes `pool`.
     spans: []artifact_serialize.Span = &.{},
     pool: []static_dispatch.IteratorForPlanId = &.{},
+    /// Generalized-local-function scopes, pooled across templates.
+    scopes: []RefScopeRecord = &.{},
+    /// Scope of each collected dispatch plan ref (parallel to
+    /// `StaticDispatchPlanTable.template_refs`).
+    plan_scopes: []u32 = &.{},
+    /// Scope of each collected value ref (parallel to
+    /// `ResolvedValueRefTable.template_refs`).
+    value_ref_scopes: []u32 = &.{},
+    /// Scope of each collected iterator plan ref (parallel to `pool`).
+    iterator_scopes: []u32 = &.{},
 
     fn deinit(self: *TemplateIteratorRefs, allocator: Allocator) void {
         allocator.free(self.spans);
         allocator.free(self.pool);
+        allocator.free(self.scopes);
+        allocator.free(self.plan_scopes);
+        allocator.free(self.value_ref_scopes);
+        allocator.free(self.iterator_scopes);
         self.* = .{};
     }
 };
 
 fn sealCheckedProcedureTemplateRefs(
     allocator: Allocator,
+    module: TypedCIR.Module,
     checked_bodies: *const CheckedBodyStore,
     entry_wrappers: *const EntryWrapperTable,
     templates: *CheckedProcedureTemplateTable,
@@ -12601,7 +12631,41 @@ fn sealCheckedProcedureTemplateRefs(
     resolved_value_refs: *ResolvedValueRefTable,
     template_iterator_refs: *TemplateIteratorRefs,
 ) Allocator.Error!void {
-    var collector = CheckedTemplateRefCollector.init(allocator, checked_bodies, static_dispatch_plans);
+    // Generalized local function decls with dispatch obligations: entering one
+    // while collecting pushes an evidence scope (checked lambda expr id ->
+    // decl pattern var).
+    var local_schemes = std.AutoHashMap(u32, Var).init(allocator);
+    defer local_schemes.deinit();
+    {
+        const types_store = module.typeStoreConst();
+        var enum_scratch = dispatch_evidence.Scratch{};
+        defer enum_scratch.deinit(allocator);
+        var params = std.ArrayListUnmanaged(dispatch_evidence.EvidenceParam).empty;
+        defer params.deinit(allocator);
+
+        var raw_node: u32 = 0;
+        while (raw_node < module.nodeCount()) : (raw_node += 1) {
+            if (module.nodeTag(@enumFromInt(raw_node)) != .statement_decl) continue;
+            const statement: CIR.Statement.Idx = @enumFromInt(raw_node);
+            const decl = switch (module.getStatement(statement)) {
+                .s_decl => |decl| decl,
+                else => continue,
+            };
+            switch (module.expr(decl.expr).data) {
+                .e_lambda, .e_closure => {},
+                else => continue,
+            }
+            const pattern_var = ModuleEnv.varFrom(decl.pattern);
+            if (types_store.resolveVar(pattern_var).desc.rank != .generalized) continue;
+            params.clearRetainingCapacity();
+            try dispatch_evidence.enumerateEvidenceParams(allocator, types_store, pattern_var, &enum_scratch, &params);
+            if (params.items.len == 0) continue;
+            const checked_expr = checked_bodies.exprIdForSource(decl.expr) orelse continue;
+            try local_schemes.put(@intFromEnum(checked_expr), pattern_var);
+        }
+    }
+
+    var collector = CheckedTemplateRefCollector.init(allocator, checked_bodies, static_dispatch_plans, &local_schemes);
     defer collector.deinit();
 
     // Flatten each template's collected refs into the two shared per-table pools,
@@ -12614,6 +12678,12 @@ fn sealCheckedProcedureTemplateRefs(
     errdefer dispatch_ref_pool.deinit(allocator);
     var iterator_ref_pool = std.ArrayList(static_dispatch.IteratorForPlanId).empty;
     errdefer iterator_ref_pool.deinit(allocator);
+    var value_ref_scope_pool = std.ArrayList(u32).empty;
+    errdefer value_ref_scope_pool.deinit(allocator);
+    var dispatch_ref_scope_pool = std.ArrayList(u32).empty;
+    errdefer dispatch_ref_scope_pool.deinit(allocator);
+    var iterator_scope_pool = std.ArrayList(u32).empty;
+    errdefer iterator_scope_pool.deinit(allocator);
     const iterator_spans = try allocator.alloc(artifact_serialize.Span, templates.templates.len);
     errdefer allocator.free(iterator_spans);
 
@@ -12635,6 +12705,9 @@ fn sealCheckedProcedureTemplateRefs(
         template.resolved_value_refs = try artifact_serialize.appendSpan(ResolvedValueRefTableRef, ResolvedValueRefId, &value_ref_pool, allocator, collector.value_refs.items);
         template.static_dispatch_plans = try artifact_serialize.appendSpan(@TypeOf(template.static_dispatch_plans), static_dispatch.StaticDispatchPlanId, &dispatch_ref_pool, allocator, collector.dispatch_refs.items);
         iterator_spans[template_index] = try artifact_serialize.appendSpan(artifact_serialize.Span, static_dispatch.IteratorForPlanId, &iterator_ref_pool, allocator, collector.iterator_refs.items);
+        try value_ref_scope_pool.appendSlice(allocator, collector.value_ref_scopes.items);
+        try dispatch_ref_scope_pool.appendSlice(allocator, collector.dispatch_ref_scopes.items);
+        try iterator_scope_pool.appendSlice(allocator, collector.iterator_ref_scopes.items);
     }
 
     resolved_value_refs.template_refs = try value_ref_pool.toOwnedSlice(allocator);
@@ -12642,6 +12715,10 @@ fn sealCheckedProcedureTemplateRefs(
     template_iterator_refs.* = .{
         .spans = iterator_spans,
         .pool = try iterator_ref_pool.toOwnedSlice(allocator),
+        .scopes = try allocator.dupe(RefScopeRecord, collector.scopes.items),
+        .plan_scopes = try dispatch_ref_scope_pool.toOwnedSlice(allocator),
+        .value_ref_scopes = try value_ref_scope_pool.toOwnedSlice(allocator),
+        .iterator_scopes = try iterator_scope_pool.toOwnedSlice(allocator),
     };
 }
 
@@ -12670,6 +12747,8 @@ const EvidencePass = struct {
     resolved_value_refs: *const ResolvedValueRefTable,
     build_data: *const static_dispatch.PlanTableBuildData,
     template_iterator_refs: *const TemplateIteratorRefs,
+    entry_wrappers: *const EntryWrapperTable,
+    compile_time_roots: *const CompileTimeRootTable,
 
     types: *const types.Store,
 
@@ -12682,6 +12761,13 @@ const EvidencePass = struct {
     /// Top-level def by its pattern (for self/SCC-recursive lookups that were
     /// checked without instantiation).
     def_by_pattern: std.AutoHashMap(u32, CIR.Def.Idx),
+    /// Generalized local VALUE decls (non-lambda exprs, e.g. an `if` choosing
+    /// between closures): scheme param var root -> decl pattern. Monotype
+    /// lowers such decls inline at the single type their uses unify to, so a
+    /// body plan's obligation resolves through a representative use record.
+    local_value_scheme_by_var: std.AutoHashMap(u32, u32),
+    /// First value_use record per looked-up pattern.
+    value_use_record_by_pattern: std.AutoHashMap(u32, u32),
     /// Memoized evidence node per dispatch_target record.
     node_by_record: std.AutoHashMap(u32, static_dispatch.EvidenceNodeId),
     record_in_progress: std.AutoHashMap(u32, void),
@@ -12695,14 +12781,19 @@ const EvidencePass = struct {
     evidence_params_pool: std.ArrayList(static_dispatch.EvidenceParamRecord),
 
     enum_scratch: dispatch_evidence.Scratch,
+    /// Canonical evidence params per collected local-function scope,
+    /// enumerated on demand (slices owned by the pass).
+    scope_params: std.AutoHashMap(u32, []EvidenceParam),
+    /// Scratch backing for the chain currently being resolved against.
+    chain_scratch: std.ArrayList([]const EvidenceParam),
     /// Obligations the pass could not resolve; these plans keep
     /// `unresolved_checked_plan` and monotype lowering's owner derivation
     /// still covers them during the class-by-class migration.
     unresolved_count: usize = 0,
-    /// The enclosing template's params while resolving a site's evidence
-    /// entries, so a fresh var that settled onto an enclosing where-var
-    /// forwards as `constraint(k)`.
-    current_site_params: []const EvidenceParam = &.{},
+    /// The param chain in scope while resolving a site's evidence entries, so
+    /// a fresh var that settled onto an enclosing where-var forwards as
+    /// `constraint(depth, k)`. Index 0 is the innermost generalized callable.
+    current_chain: []const []const EvidenceParam = &.{},
 
     const EvidenceParam = dispatch_evidence.EvidenceParam;
 
@@ -12719,6 +12810,8 @@ const EvidencePass = struct {
         resolved_value_refs: *const ResolvedValueRefTable,
         build_data: *const static_dispatch.PlanTableBuildData,
         template_iterator_refs: *const TemplateIteratorRefs,
+        entry_wrappers: *const EntryWrapperTable,
+        compile_time_roots: *const CompileTimeRootTable,
     ) EvidencePass {
         return .{
             .allocator = allocator,
@@ -12733,11 +12826,15 @@ const EvidencePass = struct {
             .resolved_value_refs = resolved_value_refs,
             .build_data = build_data,
             .template_iterator_refs = template_iterator_refs,
+            .entry_wrappers = entry_wrappers,
+            .compile_time_roots = compile_time_roots,
             .types = module.typeStoreConst(),
             .value_use_by_node = std.AutoHashMap(u32, u32).init(allocator),
             .target_by_fn_var = std.AutoHashMap(u32, u32).init(allocator),
             .source_by_checked_expr = std.AutoHashMap(u32, u32).init(allocator),
             .def_by_pattern = std.AutoHashMap(u32, CIR.Def.Idx).init(allocator),
+            .local_value_scheme_by_var = std.AutoHashMap(u32, u32).init(allocator),
+            .value_use_record_by_pattern = std.AutoHashMap(u32, u32).init(allocator),
             .node_by_record = std.AutoHashMap(u32, static_dispatch.EvidenceNodeId).init(allocator),
             .record_in_progress = std.AutoHashMap(u32, void).init(allocator),
             .site_seen = std.AutoHashMap(u32, void).init(allocator),
@@ -12746,6 +12843,8 @@ const EvidencePass = struct {
             .site_evidence = .empty,
             .evidence_params_pool = .empty,
             .enum_scratch = .{},
+            .scope_params = std.AutoHashMap(u32, []EvidenceParam).init(allocator),
+            .chain_scratch = .empty,
         };
     }
 
@@ -12754,6 +12853,8 @@ const EvidencePass = struct {
         self.target_by_fn_var.deinit();
         self.source_by_checked_expr.deinit();
         self.def_by_pattern.deinit();
+        self.local_value_scheme_by_var.deinit();
+        self.value_use_record_by_pattern.deinit();
         self.node_by_record.deinit();
         self.record_in_progress.deinit();
         self.site_seen.deinit();
@@ -12762,6 +12863,12 @@ const EvidencePass = struct {
         self.site_evidence.deinit(self.allocator);
         self.evidence_params_pool.deinit(self.allocator);
         self.enum_scratch.deinit(self.allocator);
+        var scope_lists = self.scope_params.valueIterator();
+        while (scope_lists.next()) |list| {
+            self.allocator.free(list.*);
+        }
+        self.scope_params.deinit();
+        self.chain_scratch.deinit(self.allocator);
     }
 
     fn run(self: *EvidencePass) Allocator.Error!void {
@@ -12782,6 +12889,22 @@ const EvidencePass = struct {
             params.clearRetainingCapacity();
             if (template_defs.get(@intFromEnum(template.template_id))) |def_idx| {
                 try self.enumerateParams(ModuleEnv.varFrom(def_idx), &params);
+            } else switch (template.body) {
+                // An entry wrapper evaluates a compile-time root; plans inside
+                // the root's body (e.g. in closures stored inside a constant)
+                // resolve against the root definition's own scheme.
+                .entry_wrapper => |wrapper_id| {
+                    const wrapper = self.entry_wrappers.get(wrapper_id);
+                    const root = self.compile_time_roots.root(wrapper.root);
+                    if (root.source_pattern) |source_pattern| {
+                        try self.enumerateParams(ModuleEnv.varFrom(source_pattern), &params);
+                    } else if (self.source_by_checked_expr.get(@intFromEnum(root.expr))) |source_node| {
+                        // Expression roots (REPL lines, eval snippets) have no
+                        // pattern; their scheme is the expression's own type.
+                        try self.enumerateParams(@enumFromInt(source_node), &params);
+                    }
+                },
+                .checked_body, .intrinsic_wrapper => {},
             }
 
             // Publish the template's evidence params in canonical order.
@@ -12794,19 +12917,24 @@ const EvidencePass = struct {
             }
             template.evidence_params = .{ .start = pool_start, .len = @intCast(params.items.len) };
 
-            const plan_refs = self.plan_table.template_refs[template.static_dispatch_plans.start .. template.static_dispatch_plans.start + template.static_dispatch_plans.len];
-            for (plan_refs) |plan_id| {
-                try self.resolvePlan(plan_id, params.items);
+            const plan_start = template.static_dispatch_plans.start;
+            const plan_refs = self.plan_table.template_refs[plan_start .. plan_start + template.static_dispatch_plans.len];
+            for (plan_refs, 0..) |plan_id, i| {
+                const chain = try self.chainFor(self.template_iterator_refs.plan_scopes[plan_start + i], params.items);
+                try self.resolvePlan(plan_id, chain);
             }
 
             const iter_span = self.template_iterator_refs.spans[template_index];
-            for (self.template_iterator_refs.pool[iter_span.start .. iter_span.start + iter_span.len]) |iter_plan_id| {
-                try self.resolveIteratorPlan(iter_plan_id, params.items);
+            for (self.template_iterator_refs.pool[iter_span.start .. iter_span.start + iter_span.len], 0..) |iter_plan_id, i| {
+                const chain = try self.chainFor(self.template_iterator_refs.iterator_scopes[iter_span.start + i], params.items);
+                try self.resolveIteratorPlan(iter_plan_id, chain);
             }
 
-            const value_refs = self.resolved_value_refs.template_refs[template.resolved_value_refs.start .. template.resolved_value_refs.start + template.resolved_value_refs.len];
-            for (value_refs) |ref_id| {
-                try self.emitSiteEvidence(ref_id, params.items);
+            const value_ref_start = template.resolved_value_refs.start;
+            const value_refs = self.resolved_value_refs.template_refs[value_ref_start .. value_ref_start + template.resolved_value_refs.len];
+            for (value_refs, 0..) |ref_id, i| {
+                const chain = try self.chainFor(self.template_iterator_refs.value_ref_scopes[value_ref_start + i], params.items);
+                try self.emitSiteEvidence(ref_id, chain);
             }
         }
 
@@ -12857,10 +12985,104 @@ const EvidencePass = struct {
             const def = module_env.store.getDef(def_idx);
             try self.def_by_pattern.put(@intFromEnum(def.pattern), def_idx);
         }
+
+        // Generalized local VALUE decls and one representative use record per
+        // looked-up pattern (see `local_value_scheme_by_var`).
+        for (module_env.scheme_instantiations.items.items, 0..) |record, i| {
+            if (record.slot_kind != @intFromEnum(ModuleEnv.SchemeInstantiationRecord.Slot.value_use)) continue;
+            if (self.module.nodeTag(@enumFromInt(record.node_idx)) != .expr_var) continue;
+            const lookup = self.module.expr(@enumFromInt(record.node_idx)).data.e_lookup_local;
+            const entry = try self.value_use_record_by_pattern.getOrPut(@intFromEnum(lookup.pattern_idx));
+            if (!entry.found_existing) entry.value_ptr.* = @intCast(i);
+        }
+        {
+            var scheme_params = std.ArrayListUnmanaged(EvidenceParam).empty;
+            defer scheme_params.deinit(self.allocator);
+            raw_node = 0;
+            while (raw_node < self.module.nodeCount()) : (raw_node += 1) {
+                if (self.module.nodeTag(@enumFromInt(raw_node)) != .statement_decl) continue;
+                const statement: CIR.Statement.Idx = @enumFromInt(raw_node);
+                const decl = switch (self.module.getStatement(statement)) {
+                    .s_decl => |decl| decl,
+                    else => continue,
+                };
+                switch (self.module.expr(decl.expr).data) {
+                    // Lambda-form local procs are evidence scopes (the
+                    // collector pushes them); value-form decls resolve through
+                    // use records instead.
+                    .e_lambda, .e_closure => continue,
+                    else => {},
+                }
+                const pattern_var = ModuleEnv.varFrom(decl.pattern);
+                if (self.types.resolveVar(pattern_var).desc.rank != .generalized) continue;
+                scheme_params.clearRetainingCapacity();
+                try self.enumerateParams(pattern_var, &scheme_params);
+                for (scheme_params.items) |param| {
+                    const root = self.types.resolveVar(param.dispatcher_var).var_;
+                    const entry = try self.local_value_scheme_by_var.getOrPut(@intFromEnum(root));
+                    if (!entry.found_existing) entry.value_ptr.* = @intFromEnum(decl.pattern);
+                }
+            }
+        }
     }
 
     fn enumerateParams(self: *EvidencePass, root: Var, out: *std.ArrayListUnmanaged(EvidenceParam)) Allocator.Error!void {
         try dispatch_evidence.enumerateEvidenceParams(self.allocator, self.types, root, &self.enum_scratch, out);
+    }
+
+    /// The param chain at `scope_id`: the scope's own params first (depth 0),
+    /// each enclosing local scope outward, then the template's params. The
+    /// returned slice aliases `chain_scratch` and is valid until the next call.
+    fn chainFor(self: *EvidencePass, scope_id: u32, template_params: []const EvidenceParam) Allocator.Error![]const []const EvidenceParam {
+        self.chain_scratch.clearRetainingCapacity();
+        var current = scope_id;
+        while (current != ref_scope_root) {
+            const scope = self.template_iterator_refs.scopes[current];
+            try self.chain_scratch.append(self.allocator, try self.paramsForScope(current, scope.scheme_var));
+            current = scope.parent;
+        }
+        try self.chain_scratch.append(self.allocator, template_params);
+        return self.chain_scratch.items;
+    }
+
+    fn paramsForScope(self: *EvidencePass, scope_id: u32, scheme_var: Var) Allocator.Error![]const EvidenceParam {
+        const entry = try self.scope_params.getOrPut(scope_id);
+        if (entry.found_existing) return entry.value_ptr.*;
+        var params = std.ArrayListUnmanaged(EvidenceParam).empty;
+        errdefer params.deinit(self.allocator);
+        try self.enumerateParams(scheme_var, &params);
+        entry.value_ptr.* = try params.toOwnedSlice(self.allocator);
+        return entry.value_ptr.*;
+    }
+
+    /// The canonical `(depth, index)` of `dispatcher_root`'s `method`
+    /// obligation in the chain, searching innermost-out.
+    fn chainParamIndex(self: *EvidencePass, chain: []const []const EvidenceParam, dispatcher_root: Var, method: canonical.MethodNameId) Allocator.Error!?static_dispatch.EvidenceConstraintRef {
+        for (chain, 0..) |params, depth| {
+            if (try self.paramIndexFor(params, dispatcher_root, method)) |k| {
+                return .{ .depth = @intCast(depth), .index = @intCast(k) };
+            }
+        }
+        return null;
+    }
+
+    /// Exact method-target lookup across every registry this publication can
+    /// see: the local registry, the direct import views, then the available
+    /// views. (Snapshot-style compiles pass the builtin module only as a
+    /// direct import, so searching `available` alone misses every
+    /// builtin-owned method.)
+    fn lookupMethodTargetAcrossViews(self: *EvidencePass, owner: static_dispatch.MethodOwner, method: canonical.MethodNameId) ?static_dispatch.MethodTarget {
+        if (static_dispatch.lookupCheckedMethodTarget(self.names, self.local_method_registry, self.import_views.available, owner, method)) |target| {
+            return target;
+        }
+        var direct_views_buf: [1]ImportedModuleView = undefined;
+        for (self.import_views.direct) |import| {
+            direct_views_buf[0] = import.view;
+            if (static_dispatch.lookupCheckedMethodTarget(self.names, self.local_method_registry, direct_views_buf[0..1], owner, method)) |target| {
+                return target;
+            }
+        }
+        return null;
     }
 
     /// The canonical param index of `dispatcher_root`'s `method` obligation.
@@ -12874,7 +13096,7 @@ const EvidencePass = struct {
         return null;
     }
 
-    fn resolvePlan(self: *EvidencePass, plan_id: static_dispatch.StaticDispatchPlanId, params: []const EvidenceParam) Allocator.Error!void {
+    fn resolvePlan(self: *EvidencePass, plan_id: static_dispatch.StaticDispatchPlanId, chain: []const []const EvidenceParam) Allocator.Error!void {
         const raw = @intFromEnum(plan_id);
         const plan = &self.plan_table.plans[raw];
         // A plan reachable from two templates (const body + entry wrapper)
@@ -12890,32 +13112,32 @@ const EvidencePass = struct {
             .encode_to => |encode_to| if (encode_to.structural_allowed) .encoder else null,
         };
         // Nested evidence built for this plan's target forwards enclosing
-        // where-vars against the same template params.
-        self.current_site_params = params;
-        defer self.current_site_params = &.{};
+        // where-vars against the same chain.
+        self.current_chain = chain;
+        defer self.current_chain = &.{};
         plan.resolution = try self.resolveObligation(
             src.dispatcher_var,
             plan.method,
             structural_kind,
             src.constraint_fn_var,
-            params,
+            chain,
         );
     }
 
-    fn resolveIteratorPlan(self: *EvidencePass, plan_id: static_dispatch.IteratorForPlanId, params: []const EvidenceParam) Allocator.Error!void {
+    fn resolveIteratorPlan(self: *EvidencePass, plan_id: static_dispatch.IteratorForPlanId, chain: []const []const EvidenceParam) Allocator.Error!void {
         const raw = @intFromEnum(plan_id);
         const plan = &self.plan_table.iterator_for_plans[raw];
         if (plan.iter.resolution != .unresolved_checked_plan) return;
 
         const src = self.build_data.iterator_plan_sources[raw];
-        self.current_site_params = params;
-        defer self.current_site_params = &.{};
+        self.current_chain = chain;
+        defer self.current_chain = &.{};
         plan.iter.resolution = try self.resolveObligation(
             src.iter_dispatcher_var,
             plan.iter.method,
             null,
             src.iter_fn_var,
-            params,
+            chain,
         );
         // The iterator type is the `iter` callable's return: dispatch `next`
         // on it.
@@ -12926,7 +13148,7 @@ const EvidencePass = struct {
                 plan.next.method,
                 null,
                 src.next_fn_var,
-                params,
+                chain,
             )
         else blk: {
             self.unresolved_count += 1;
@@ -12949,16 +13171,16 @@ const EvidencePass = struct {
         method: canonical.MethodNameId,
         structural_kind: ?static_dispatch.StructuralKind,
         constraint_fn_var: ?Var,
-        params: []const EvidenceParam,
+        chain: []const []const EvidenceParam,
     ) Allocator.Error!static_dispatch.StaticDispatchResolution {
         const resolved = self.types.resolveVar(dispatcher_var);
         switch (resolved.desc.content) {
             .err => return .checked_error,
-            .flex => |flex| return self.resolveVarObligation(resolved.var_, flex.constraints, method, structural_kind, params),
-            .rigid => |rigid| return self.resolveVarObligation(resolved.var_, rigid.constraints, method, structural_kind, params),
+            .flex => |flex| return self.resolveVarObligation(resolved.var_, flex.constraints, method, structural_kind, chain),
+            .rigid => |rigid| return self.resolveVarObligation(resolved.var_, rigid.constraints, method, structural_kind, chain),
             .alias, .structure => {
                 if (self.methodOwnerForSourceContent(resolved.var_)) |owner| {
-                    if (static_dispatch.lookupCheckedMethodTarget(self.names, self.local_method_registry, self.import_views.available, owner, method)) |target| {
+                    if (self.lookupMethodTargetAcrossViews(owner, method)) |target| {
                         const node = try self.evidenceNodeForTarget(target, constraint_fn_var);
                         return .{ .direct = node };
                     }
@@ -12990,47 +13212,61 @@ const EvidencePass = struct {
         constraints: types.StaticDispatchConstraint.SafeList.Range,
         method: canonical.MethodNameId,
         structural_kind: ?static_dispatch.StructuralKind,
-        params: []const EvidenceParam,
+        chain: []const []const EvidenceParam,
     ) Allocator.Error!static_dispatch.StaticDispatchResolution {
-        _ = structural_kind;
-        if (try self.paramIndexFor(params, dispatcher_root, method)) |k| {
-            return .{ .constraint = .{ .depth = 0, .index = @intCast(k) } };
+        if (try self.chainParamIndex(chain, dispatcher_root, method)) |ref| {
+            return .{ .constraint = ref };
         }
 
-        // Not an evidence param of the enclosing template. A var whose
-        // obligations all come from literal conversions defaults at
-        // monomorphic specialization (Dec for numerals, Str for quotes and
-        // interpolations); resolve the plan to that default's method now.
+        // Not an evidence param of any enclosing callable, so no edge pins it
+        // and monotype materializes it by `numericDefaultPhaseForConstraints`
+        // — the same rule that stamps `numeric_default_phase` on published
+        // type variables (Dec for numerals and defaultable arithmetic
+        // operators, Str for quotes and interpolations). Every obligation on
+        // the var resolves against that default owner now.
         const constraint_slice = self.types.sliceStaticDispatchConstraints(constraints);
-        var all_literal = constraint_slice.len > 0;
-        for (constraint_slice) |constraint| {
-            if (constraint.origin.literalKind() == null) all_literal = false;
-        }
-        if (all_literal) {
-            if (self.literalDefaultTarget(constraint_slice[0], method)) |target| {
+        if (numericDefaultPhaseForConstraints(self.module, constraints)) |phase| {
+            const owner: static_dispatch.MethodOwner = switch (phase) {
+                .mono_specialization => .{ .builtin = .dec },
+                .mono_specialization_str => .{ .builtin = .str },
+                // `checking_finalized` is stamped only on vars checking already
+                // resolved; an unresolved one cannot carry it.
+                .checking_finalized => return .checked_error,
+            };
+            if (self.lookupMethodTargetAcrossViews(owner, method)) |target| {
                 const node = try self.evidenceNodeForTarget(target, null);
                 return .{ .direct = node };
             }
         }
 
-        // Constrained vars of a generalized local function (or another scope
-        // this pass does not model yet) stay unresolved; monotype owner
-        // derivation covers them until the class migration completes.
-        self.unresolved_count += 1;
-        return .unresolved_checked_plan;
-    }
+        // A generalized local VALUE decl lowers inline at the single type its
+        // uses unify to; resolve the obligation through a representative use
+        // instantiation.
+        if (self.local_value_scheme_by_var.get(@intFromEnum(dispatcher_root))) |pattern_raw| {
+            if (self.value_use_record_by_pattern.get(pattern_raw)) |record_idx| {
+                const module_env = self.module.moduleEnvConst();
+                const record = module_env.scheme_instantiations.items.items[record_idx];
+                const pairs = module_env.scheme_instantiation_pairs.items.items[record.pairs_start .. record.pairs_start + record.pairs_len];
+                if (pairFor(pairs, dispatcher_root)) |fresh| {
+                    var fresh_fn: ?Var = null;
+                    const idents = self.module.identStoreConst();
+                    for (constraint_slice) |constraint| {
+                        if (try self.names.internMethodIdent(idents, constraint.fn_name) != method) continue;
+                        fresh_fn = pairFor(pairs, self.types.resolveVar(constraint.fn_var).var_);
+                        break;
+                    }
+                    return self.resolveObligation(fresh, method, structural_kind, fresh_fn, chain);
+                }
+            }
+        }
 
-    fn literalDefaultTarget(
-        self: *EvidencePass,
-        constraint: types.StaticDispatchConstraint,
-        method: canonical.MethodNameId,
-    ) ?static_dispatch.MethodTarget {
-        const kind = constraint.origin.literalKind() orelse return null;
-        const owner: static_dispatch.MethodOwner = switch (kind) {
-            .numeral => .{ .builtin = .dec },
-            .quote, .interpolation => .{ .builtin = .str },
-        };
-        return static_dispatch.lookupCheckedMethodTarget(self.names, self.local_method_registry, self.import_views.available, owner, method);
+        // No edge can ever supply this dispatcher (not a param of any
+        // enclosing callable, no defaulting literal). For structural-allowed
+        // modes the vacuous shape decomposes structurally (equality of values
+        // that never exist is defined); a value dispatch is statically
+        // unreachable and lowers to an explicit crash.
+        if (structural_kind) |kind| return .{ .structural = kind };
+        return .unreachable_dispatch;
     }
 
     /// The method owner of a settled source var, walking alias content
@@ -13164,16 +13400,31 @@ const EvidencePass = struct {
         const method = try self.names.internMethodIdent(idents, param.constraint.fn_name);
         const structural_kind = self.structuralKindForMethodIdent(param.constraint.fn_name);
 
-        const resolution = try self.resolveObligation(var_, method, structural_kind, fresh_fn_var, self.current_site_params);
+        const resolution = try self.resolveObligation(var_, method, structural_kind, fresh_fn_var, self.current_chain);
         return switch (resolution) {
             .direct => |node| .{ .direct = node },
             .constraint => |ref| .{ .constraint = ref },
             .structural => |kind| .{ .structural = kind },
-            .checked_error => .checked_error,
+            .checked_error => blk: {
+                if (@import("builtin").mode == .Debug) {
+                    std.log.scoped(.checked_evidence).debug("evidence entry checked_error: method={s} content={s}", .{
+                        self.module.identStoreConst().getText(param.constraint.fn_name),
+                        @tagName(self.types.resolveVar(var_).desc.content),
+                    });
+                }
+                break :blk .checked_error;
+            },
+            .unreachable_dispatch => .unreachable_value,
             .unresolved_checked_plan => blk: {
                 // Track alongside plan-level gaps; consumers treat missing
                 // evidence like a checked error until the migration finishes.
                 self.unresolved_count += 1;
+                if (@import("builtin").mode == .Debug) {
+                    std.log.scoped(.checked_evidence).debug("evidence entry unresolved: method={s} content={s}", .{
+                        self.module.identStoreConst().getText(param.constraint.fn_name),
+                        @tagName(self.types.resolveVar(var_).desc.content),
+                    });
+                }
                 break :blk .checked_error;
             },
         };
@@ -13198,15 +13449,15 @@ const EvidencePass = struct {
     /// Publish site evidence for one value reference within the current
     /// template: how each of the referenced scheme's obligations was
     /// satisfied at that use.
-    fn emitSiteEvidence(self: *EvidencePass, ref_id: ResolvedValueRefId, params: []const EvidenceParam) Allocator.Error!void {
+    fn emitSiteEvidence(self: *EvidencePass, ref_id: ResolvedValueRefId, chain: []const []const EvidenceParam) Allocator.Error!void {
         const rec = self.resolved_value_refs.records[@intFromEnum(ref_id)];
         const site_key = @intFromEnum(rec.expr);
         if (self.site_seen.contains(site_key)) return;
 
         const source_node = self.source_by_checked_expr.get(site_key) orelse return;
 
-        self.current_site_params = params;
-        defer self.current_site_params = &.{};
+        self.current_chain = chain;
+        defer self.current_chain = &.{};
 
         if (self.value_use_by_node.get(source_node)) |record_idx| {
             const span = try self.evidenceRefsForRecord(record_idx);
@@ -13220,10 +13471,10 @@ const EvidencePass = struct {
         // generic def is checked against the shared pre-generalization vars,
         // so its obligations forward to the enclosing template's own params
         // by var identity.
-        try self.emitRecursiveUseEvidence(source_node, site_key, params);
+        try self.emitRecursiveUseEvidence(source_node, site_key, chain);
     }
 
-    fn emitRecursiveUseEvidence(self: *EvidencePass, source_node: u32, site_key: u32, params: []const EvidenceParam) Allocator.Error!void {
+    fn emitRecursiveUseEvidence(self: *EvidencePass, source_node: u32, site_key: u32, chain: []const []const EvidenceParam) Allocator.Error!void {
         if (self.module.nodeTag(@enumFromInt(source_node)) != .expr_var) return;
         const lookup = self.module.expr(@enumFromInt(source_node)).data.e_lookup_local;
         const callee_def = self.def_by_pattern.get(@intFromEnum(lookup.pattern_idx)) orelse return;
@@ -13241,8 +13492,8 @@ const EvidencePass = struct {
         for (callee_params.items) |callee_param| {
             const dispatcher_root = self.types.resolveVar(callee_param.dispatcher_var).var_;
             const method = try self.names.internMethodIdent(idents, callee_param.constraint.fn_name);
-            if (try self.paramIndexFor(params, dispatcher_root, method)) |k| {
-                entries.appendAssumeCapacity(.{ .constraint = .{ .depth = 0, .index = @intCast(k) } });
+            if (try self.chainParamIndex(chain, dispatcher_root, method)) |ref| {
+                entries.appendAssumeCapacity(.{ .constraint = ref });
             } else {
                 self.unresolved_count += 1;
                 entries.appendAssumeCapacity(.checked_error);
@@ -13279,6 +13530,8 @@ fn resolveTotalDispatchPlans(
     resolved_value_refs: *const ResolvedValueRefTable,
     build_data: *const static_dispatch.PlanTableBuildData,
     template_iterator_refs: *const TemplateIteratorRefs,
+    entry_wrappers: *const EntryWrapperTable,
+    compile_time_roots: *const CompileTimeRootTable,
 ) Allocator.Error!void {
     var pass = EvidencePass.init(
         allocator,
@@ -13293,6 +13546,8 @@ fn resolveTotalDispatchPlans(
         resolved_value_refs,
         build_data,
         template_iterator_refs,
+        entry_wrappers,
+        compile_time_roots,
     );
     defer pass.deinit();
     try pass.run();
@@ -13352,9 +13607,20 @@ const CheckedTemplateRefCollector = struct {
     allocator: Allocator,
     checked_bodies: *const CheckedBodyStore,
     static_dispatch_plans: *const static_dispatch.StaticDispatchPlanTable,
+    /// Generalized-with-obligations local function decls (checked lambda expr
+    /// id -> decl pattern var), prebuilt by the seal pass; entering one pushes
+    /// an evidence scope.
+    local_schemes: *const std.AutoHashMap(u32, Var),
     value_refs: std.ArrayList(ResolvedValueRefId),
     dispatch_refs: std.ArrayList(static_dispatch.StaticDispatchPlanId),
     iterator_refs: std.ArrayList(static_dispatch.IteratorForPlanId),
+    /// Scope of each collected ref, parallel to the three ref lists.
+    value_ref_scopes: std.ArrayList(u32),
+    dispatch_ref_scopes: std.ArrayList(u32),
+    iterator_ref_scopes: std.ArrayList(u32),
+    /// Pooled across templates (ids are global); the stack resets per template.
+    scopes: std.ArrayList(RefScopeRecord),
+    scope_stack: std.ArrayList(u32),
     visited_exprs: std.AutoHashMap(CheckedExprId, void),
     visited_patterns: std.AutoHashMap(CheckedPatternId, void),
     visited_statements: std.AutoHashMap(CheckedStatementId, void),
@@ -13363,14 +13629,21 @@ const CheckedTemplateRefCollector = struct {
         allocator: Allocator,
         checked_bodies: *const CheckedBodyStore,
         static_dispatch_plans: *const static_dispatch.StaticDispatchPlanTable,
+        local_schemes: *const std.AutoHashMap(u32, Var),
     ) CheckedTemplateRefCollector {
         return .{
             .allocator = allocator,
             .checked_bodies = checked_bodies,
             .static_dispatch_plans = static_dispatch_plans,
+            .local_schemes = local_schemes,
             .value_refs = .empty,
             .dispatch_refs = .empty,
             .iterator_refs = .empty,
+            .value_ref_scopes = .empty,
+            .dispatch_ref_scopes = .empty,
+            .iterator_ref_scopes = .empty,
+            .scopes = .empty,
+            .scope_stack = .empty,
             .visited_exprs = std.AutoHashMap(CheckedExprId, void).init(allocator),
             .visited_patterns = std.AutoHashMap(CheckedPatternId, void).init(allocator),
             .visited_statements = std.AutoHashMap(CheckedStatementId, void).init(allocator),
@@ -13384,15 +13657,40 @@ const CheckedTemplateRefCollector = struct {
         self.dispatch_refs.deinit(self.allocator);
         self.iterator_refs.deinit(self.allocator);
         self.value_refs.deinit(self.allocator);
+        self.value_ref_scopes.deinit(self.allocator);
+        self.dispatch_ref_scopes.deinit(self.allocator);
+        self.iterator_ref_scopes.deinit(self.allocator);
+        self.scopes.deinit(self.allocator);
+        self.scope_stack.deinit(self.allocator);
     }
 
     fn clear(self: *CheckedTemplateRefCollector) void {
         self.value_refs.clearRetainingCapacity();
         self.dispatch_refs.clearRetainingCapacity();
         self.iterator_refs.clearRetainingCapacity();
+        self.value_ref_scopes.clearRetainingCapacity();
+        self.dispatch_ref_scopes.clearRetainingCapacity();
+        self.iterator_ref_scopes.clearRetainingCapacity();
+        // `scopes` pools across templates; only the stack resets.
+        self.scope_stack.clearRetainingCapacity();
         self.visited_exprs.clearRetainingCapacity();
         self.visited_patterns.clearRetainingCapacity();
         self.visited_statements.clearRetainingCapacity();
+    }
+
+    fn currentScope(self: *const CheckedTemplateRefCollector) u32 {
+        if (self.scope_stack.items.len == 0) return ref_scope_root;
+        return self.scope_stack.items[self.scope_stack.items.len - 1];
+    }
+
+    fn appendValueRef(self: *CheckedTemplateRefCollector, ref_id: ResolvedValueRefId) Allocator.Error!void {
+        try self.value_refs.append(self.allocator, ref_id);
+        try self.value_ref_scopes.append(self.allocator, self.currentScope());
+    }
+
+    fn appendDispatchRef(self: *CheckedTemplateRefCollector, plan_id: static_dispatch.StaticDispatchPlanId) Allocator.Error!void {
+        try self.dispatch_refs.append(self.allocator, plan_id);
+        try self.dispatch_ref_scopes.append(self.allocator, self.currentScope());
     }
 
     fn collectExpr(self: *CheckedTemplateRefCollector, expr_id: CheckedExprId) Allocator.Error!void {
@@ -13402,37 +13700,37 @@ const CheckedTemplateRefCollector = struct {
         const expr = self.checked_bodies.expr(expr_id);
         switch (expr.data) {
             .lookup_local => |lookup| {
-                if (lookup.resolved) |ref_id| try self.value_refs.append(self.allocator, ref_id);
+                if (lookup.resolved) |ref_id| try self.appendValueRef(ref_id);
             },
             .lookup_external => |ref_id| {
-                if (ref_id) |id| try self.value_refs.append(self.allocator, id);
+                if (ref_id) |id| try self.appendValueRef(id);
             },
             .lookup_required => |ref_id| {
-                if (ref_id) |id| try self.value_refs.append(self.allocator, id);
+                if (ref_id) |id| try self.appendValueRef(id);
             },
             .dispatch_call,
             .method_eq,
             .type_dispatch_call,
             => |plan_id| {
                 const id = plan_id orelse checkedArtifactInvariant("checked dispatch expression reached template closure collection without a static-dispatch plan", .{});
-                try self.dispatch_refs.append(self.allocator, id);
+                try self.appendDispatchRef(id);
                 try self.collectStaticDispatchPlanArgs(id);
             },
             .interpolation => |interpolation| {
                 const id = interpolation.plan orelse checkedArtifactInvariant("checked interpolation expression reached template closure collection without a static-dispatch plan", .{});
-                try self.dispatch_refs.append(self.allocator, id);
+                try self.appendDispatchRef(id);
                 try self.collectStaticDispatchPlanArgs(id);
             },
             .num_from_numeral,
             .typed_num_from_numeral,
             => |plan_id| {
                 const id = plan_id orelse checkedArtifactInvariant("checked from_numeral expression reached template closure collection without a dispatch plan", .{});
-                try self.dispatch_refs.append(self.allocator, id);
+                try self.appendDispatchRef(id);
                 try self.collectStaticDispatchPlanArgs(id);
             },
             .str_from_quote => |quote| {
                 const id = quote.plan orelse checkedArtifactInvariant("checked from_quote expression reached template closure collection without a dispatch plan", .{});
-                try self.dispatch_refs.append(self.allocator, id);
+                try self.appendDispatchRef(id);
                 try self.collectStaticDispatchPlanArgs(id);
             },
             .str,
@@ -13457,7 +13755,7 @@ const CheckedTemplateRefCollector = struct {
                 try self.collectExpr(if_.final_else);
             },
             .call => |call| {
-                if (call.direct_target) |target| try self.value_refs.append(self.allocator, target);
+                if (call.direct_target) |target| try self.appendValueRef(target);
                 try self.collectExpr(call.func);
                 for (call.args) |arg| try self.collectExpr(arg);
             },
@@ -13574,6 +13872,7 @@ const CheckedTemplateRefCollector = struct {
             checkedArtifactInvariant("checked template iterator-for plan id was outside the plan table", .{});
         }
         try self.iterator_refs.append(self.allocator, plan_id);
+        try self.iterator_ref_scopes.append(self.allocator, self.currentScope());
         const plan = self.static_dispatch_plans.iterator_for_plans[raw];
         try self.collectIteratorDispatchCall(plan.iter);
         try self.collectIteratorDispatchCall(plan.next);
@@ -13643,7 +13942,18 @@ const CheckedTemplateRefCollector = struct {
         switch (statement.data) {
             .decl => |decl| {
                 try self.collectPattern(decl.pattern);
-                try self.collectExpr(decl.expr);
+                if (self.local_schemes.get(@intFromEnum(decl.expr))) |scheme_var| {
+                    // A generalized local function with dispatch obligations:
+                    // plans and refs inside its body resolve against its own
+                    // evidence params at depth 0.
+                    const scope_id: u32 = @intCast(self.scopes.items.len);
+                    try self.scopes.append(self.allocator, .{ .parent = self.currentScope(), .scheme_var = scheme_var });
+                    try self.scope_stack.append(self.allocator, scope_id);
+                    defer _ = self.scope_stack.pop();
+                    try self.collectExpr(decl.expr);
+                } else {
+                    try self.collectExpr(decl.expr);
+                }
             },
             .var_ => |var_| {
                 try self.collectPattern(var_.pattern);
@@ -24159,7 +24469,7 @@ pub const CheckedModuleArtifact = struct {
     /// Manual discriminant for `SERIALIZED_VERSION_HASH`: bump to force a cache /
     /// baked-blob invalidation for a layout change the structural fingerprint below
     /// cannot observe (e.g. a semantic change to how a field is interpreted).
-    const serialized_layout_version: u32 = 8;
+    const serialized_layout_version: u32 = 9;
 
     /// Comptime fingerprint of `Serialized`'s layout, mirroring
     /// `cache_module.MODULE_ENV_VERSION_HASH`. It is appended to the baked builtin
@@ -26373,6 +26683,7 @@ pub fn publishFromTypedModule(
     errdefer template_iterator_refs.deinit(allocator);
     try sealCheckedProcedureTemplateRefs(
         allocator,
+        module,
         checked_bodies,
         &entry_wrappers,
         &checked_procedure_templates,
@@ -26394,6 +26705,8 @@ pub fn publishFromTypedModule(
         &resolved_value_refs,
         &plan_build_data,
         &template_iterator_refs,
+        &entry_wrappers,
+        &compile_time_roots,
     );
     template_iterator_refs.deinit(allocator);
     plan_build_data.deinit(allocator);
@@ -26917,6 +27230,7 @@ fn expectProvidedExportKind(
     defer template_iterator_refs.deinit(allocator);
     try sealCheckedProcedureTemplateRefs(
         allocator,
+        module,
         checked_bodies,
         &entry_wrappers,
         &checked_procedure_templates,
@@ -26938,6 +27252,8 @@ fn expectProvidedExportKind(
         &resolved_value_refs,
         &plan_build_data,
         &template_iterator_refs,
+        &entry_wrappers,
+        &compile_time_roots,
     );
 
     var provided_exports = try ProvidedExportTable.fromModule(
@@ -28090,8 +28406,8 @@ test "SERIALIZED_VERSION_HASH golden value" {
     // change, bump `serialized_layout_version` and replace the golden bytes below with
     // the ones this assertion prints.
     const golden: [32]u8 = .{
-        0x3A, 0xB7, 0x61, 0x32, 0x4C, 0x83, 0x50, 0x8F, 0x70, 0x41, 0xC8, 0xD9, 0x2E, 0x4F, 0x6E, 0x6A,
-        0xE3, 0x05, 0xBA, 0xC6, 0xE9, 0xDB, 0x6A, 0xBE, 0x00, 0x6B, 0x43, 0xD2, 0x1B, 0xB5, 0x49, 0xE9,
+        0x21, 0xAE, 0x8F, 0x13, 0x9F, 0x41, 0x29, 0xCD, 0x94, 0xD1, 0x6E, 0x17, 0x0A, 0x79, 0x3C, 0xC5,
+        0x21, 0xEA, 0xAC, 0x53, 0x0D, 0xA0, 0x4E, 0x6A, 0x5E, 0xAB, 0x02, 0x4D, 0x16, 0x3D, 0x23, 0x4A,
     };
     try std.testing.expectEqualSlices(u8, &golden, &CheckedModuleArtifact.SERIALIZED_VERSION_HASH);
 }

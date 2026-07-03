@@ -84,6 +84,10 @@ pub const SpecializationCounters = struct {
     specialization_type_digest_cache_misses: u64 = 0,
     specialization_type_digest_nodes_visited: u64 = 0,
     exact_type_checks: u64 = 0,
+    /// Total-dispatch migration audit: obligations still resolved by owner
+    /// derivation instead of published evidence. Must reach zero before the
+    /// derivation path is deleted.
+    evidence_missing: u64 = 0,
 };
 
 /// Lower checked modules and explicit roots into Monotype IR.
@@ -123,15 +127,7 @@ pub fn run(
         verifyMonotypeTypeStore(&program);
         verifyMonotypeCompletedTypeIds(&program);
         verifyMonotypeCallTargets(&program);
-        if (builder.evidence_missing_count > 0) {
-            // Total-dispatch migration audit: obligations still resolved by
-            // owner derivation instead of published evidence. Must reach zero
-            // before the derivation path is deleted.
-            std.log.scoped(.monotype).debug(
-                "dispatch evidence gaps covered by owner derivation: {d}",
-                .{builder.evidence_missing_count},
-            );
-        }
+        builder.countBy("evidence_missing", builder.evidence_missing_count);
     }
 
     return program;
@@ -186,6 +182,10 @@ const MethodLookup = struct {
 const SpecEvidence = union(enum) {
     target: *const SpecEvidenceTarget,
     structural: static_dispatch.StructuralKind,
+    /// The edge left the obligation's dispatcher unsolved: no value of that
+    /// type can ever reach the dispatch, which lowers to an explicit
+    /// unreachable crash.
+    unreachable_value,
     /// The edge's obligation was rejected during checking, or publication left
     /// it unresolved (migration gap). Consuming it falls back to owner
     /// derivation until the class-by-class migration completes.
@@ -234,6 +234,7 @@ fn specEvidenceEql(a: SpecEvidence, b: SpecEvidence) bool {
             .structural => |b_kind| a_kind == b_kind,
             else => false,
         },
+        .unreachable_value => b == .unreachable_value,
         .unavailable => b == .unavailable,
     };
 }
@@ -757,6 +758,16 @@ const Builder = struct {
     fn countBy(self: *Builder, comptime field: []const u8, amount: usize) void {
         if (self.counters) |counters| {
             @field(counters, field) += @intCast(amount);
+        }
+    }
+
+    /// Record one dispatch obligation the published evidence could not cover
+    /// (owner derivation resolves it during the migration). The tagged debug
+    /// log drives the audit that must reach zero before derivation is deleted.
+    fn evidenceGap(self: *Builder, comptime reason: []const u8, context: []const u8) void {
+        self.evidence_missing_count += 1;
+        if (@import("builtin").mode == .Debug) {
+            std.log.scoped(.monotype).debug("evidence gap [" ++ reason ++ "]: {s}", .{context});
         }
     }
 
@@ -1513,7 +1524,12 @@ const Builder = struct {
             // Requesting edges that predate full evidence threading (or gaps
             // publication counted) leave the vector short; owner derivation
             // still resolves those obligations during the migration.
-            self.evidence_missing_count += template.evidence_params.len - spec_evidence.len;
+            const proc_base = view.names.procBase(template_ref.proc_base);
+            const template_name = if (proc_base.export_name) |export_name| view.names.exportNameText(export_name) else "<unnamed>";
+            var short = template.evidence_params.len - spec_evidence.len;
+            while (short > 0) : (short -= 1) {
+                self.evidenceGap("spec-vector-short", template_name);
+            }
         }
         body_ctx.source_region_override = source_region_override;
         body_ctx.current_entry_root = current_entry_root;
@@ -6308,6 +6324,11 @@ const BodyContext = struct {
     /// created for the same specialization (dispatch call contexts, nested
     /// non-generalized closures) share the owning specialization's chain.
     evidence: EvidenceChain = .{},
+    /// While restoring a constant's stored value at a use site, the evidence
+    /// vector that use supplied for the constant's own obligations. Closures
+    /// restored from the constant lower their bodies against this chain
+    /// (their plans' `constraint(k)` refs index the constant's scheme).
+    restore_evidence: EvidenceChain = .{},
 
     const PatternLiteralGuard = struct {
         local: DraftLocalId,
@@ -8953,7 +8974,7 @@ const BodyContext = struct {
                     .data = .{ .fn_def = .{ .fn_id = draftFinalFn(fn_id) } },
                 });
             },
-            .callable_eval_template => |template_id| try self.lowerCallableEvalBindingValue(view, template_id, mono_fn_ty),
+            .callable_eval_template => |template_id| try self.lowerCallableEvalBindingValue(view, template_id, mono_fn_ty, evidence),
         };
     }
 
@@ -8962,7 +8983,12 @@ const BodyContext = struct {
         view: ModuleView,
         template_id: checked.CallableEvalTemplateId,
         mono_fn_ty: Type.TypeId,
+        evidence: []const SpecEvidence,
     ) Allocator.Error!DraftExprId {
+        const previous_restore_evidence = self.restore_evidence;
+        self.restore_evidence = .{ .vector = evidence };
+        defer self.restore_evidence = previous_restore_evidence;
+
         const raw = @intFromEnum(template_id);
         if (raw >= view.callable_eval_templates.templates.len) {
             Common.invariant("callable eval binding referenced a missing checked template");
@@ -14727,9 +14753,9 @@ const BodyContext = struct {
         }
 
         switch (record.ref) {
-            .top_level_const => |const_use| return try self.restoreConstUseAtType(const_use, ty),
-            .imported_const => |const_use| return try self.restoreConstUseAtType(const_use, ty),
-            .platform_required_const => |required| return try self.restoreConstUseAtType(required.const_use, ty),
+            .top_level_const => |const_use| return try self.restoreConstUseAtType(const_use, ty, try self.evidenceForUseSite(record.expr)),
+            .imported_const => |const_use| return try self.restoreConstUseAtType(const_use, ty, try self.evidenceForUseSite(record.expr)),
+            .platform_required_const => |required| return try self.restoreConstUseAtType(required.const_use, ty, try self.evidenceForUseSite(record.expr)),
             .local_param,
             .local_value,
             .local_mutable_version,
@@ -14829,10 +14855,15 @@ const BodyContext = struct {
         self: *BodyContext,
         const_use: checked.ConstUseTemplate,
         ty: Type.TypeId,
+        use_evidence: []const SpecEvidence,
     ) Allocator.Error!DraftExprId {
         const requested_ty = const_use.requested_source_ty_payload orelse
             Common.invariant("checked const use reached Monotype without a requested checked type");
         try self.constrainTypeToMono(requested_ty, ty);
+
+        const previous_restore_evidence = self.restore_evidence;
+        self.restore_evidence = .{ .vector = use_evidence };
+        defer self.restore_evidence = previous_restore_evidence;
 
         const store_view = self.builder.moduleForId(checked.constModuleId(const_use.const_ref));
         const template = store_view.const_templates.get(const_use.const_ref);
@@ -14868,7 +14899,9 @@ const BodyContext = struct {
         );
 
         var body_ctx = try BodyContext.init(self.allocator, self.builder, store_view, eval.entry_template, self.graph, self.draft);
-        body_ctx.evidence = self.evidence;
+        // The re-lowered constant body's plans index the constant's own
+        // scheme; the use edge supplied that vector.
+        body_ctx.evidence = self.restore_evidence;
         defer body_ctx.deinit();
         body_ctx.source_region_override = source_region_override;
         body_ctx.current_entry_root = current_entry_root;
@@ -15085,11 +15118,11 @@ const BodyContext = struct {
             .nested => {
                 const fn_view = self.builder.moduleForConstFnDef(fn_value.fn_def);
                 var fn_ctx = try BodyContext.init(self.allocator, self.builder, fn_view, ownerTemplateForConstFnDef(fn_value.fn_def), self.graph, self.draft);
-                fn_ctx.evidence = self.evidence;
+                fn_ctx.evidence = self.restore_evidence;
                 defer fn_ctx.deinit();
                 return try self.builder.lowerNestedFnFromContext(&fn_ctx, checkedLambdaExprIdForConstFn(fn_view, fn_value.fn_def), template, null);
             },
-            else => try self.builder.lowerFnTemplateDefFromContext(self, template, &.{}),
+            else => try self.builder.lowerFnTemplateDefFromContext(self, template, self.restore_evidence.vector),
         };
     }
 
@@ -15103,7 +15136,7 @@ const BodyContext = struct {
     ) Allocator.Error!DraftExprId {
         const fn_view = self.builder.moduleForConstFnDef(fn_value.fn_def);
         var fn_ctx = try BodyContext.init(self.allocator, self.builder, fn_view, ownerTemplateForConstFnDef(fn_value.fn_def), self.graph, self.draft);
-        fn_ctx.evidence = self.evidence;
+        fn_ctx.evidence = self.restore_evidence;
         defer fn_ctx.deinit();
         fn_ctx.current_fn_key = restoredConstFnContextKey(store_view.key, fn_id, fn_value.source_fn_key);
         try fn_ctx.constrainTypeToMono(fn_value.source_fn_ty, ty);
@@ -16964,13 +16997,14 @@ const BodyContext = struct {
             },
             .constraint => |constraint_ref| {
                 const entry = self.evidence.at(constraint_ref) orelse {
-                    self.builder.evidence_missing_count += 1;
+                    self.builder.evidenceGap("materialize-chain-miss", "");
                     return .unavailable;
                 };
                 return entry;
             },
             .structural => |kind| return .{ .structural = kind },
             .checked_error => return .unavailable,
+            .unreachable_value => return .unreachable_value,
         }
     }
 
@@ -17006,10 +17040,10 @@ const BodyContext = struct {
                 const entry = self.evidence.at(constraint_ref) orelse return &.{};
                 return switch (entry) {
                     .target => |target| target.nested,
-                    .structural, .unavailable => &.{},
+                    .structural, .unreachable_value, .unavailable => &.{},
                 };
             },
-            .structural, .checked_error, .unresolved_checked_plan => return &.{},
+            .structural, .checked_error, .unreachable_dispatch, .unresolved_checked_plan => return &.{},
         }
     }
 
@@ -17025,10 +17059,10 @@ const BodyContext = struct {
                 const entry = self.evidence.at(constraint_ref) orelse return &.{};
                 return switch (entry) {
                     .target => |target| target.nested,
-                    .structural, .unavailable => &.{},
+                    .structural, .unreachable_value, .unavailable => &.{},
                 };
             },
-            .structural, .checked_error, .unresolved_checked_plan => return &.{},
+            .structural, .checked_error, .unreachable_dispatch, .unresolved_checked_plan => return &.{},
         }
     }
 
@@ -17043,7 +17077,7 @@ const BodyContext = struct {
             // the total-dispatch migration lands; until then the owner
             // derivation below still resolves them, and the debug dual-run
             // asserts the two agree.
-            .constraint, .structural, .checked_error, .unresolved_checked_plan => {},
+            .constraint, .structural, .checked_error, .unreachable_dispatch, .unresolved_checked_plan => {},
         }
 
         const derived: ?MethodLookup = blk: {
@@ -17070,7 +17104,7 @@ const BodyContext = struct {
             .direct => unreachable,
             .constraint => |constraint_ref| {
                 const entry = self.evidence.at(constraint_ref) orelse {
-                    self.builder.evidence_missing_count += 1;
+                    self.builder.evidenceGap("dispatch-chain-miss", self.view.names.methodNameText(plan.method));
                     return;
                 };
                 switch (entry) {
@@ -17084,14 +17118,20 @@ const BodyContext = struct {
                     .structural => {
                         if (derived != null) Common.invariant("dispatch evidence chose structural but owner derivation found a target");
                     },
-                    .unavailable => self.builder.evidence_missing_count += 1,
+                    .unreachable_value => {
+                        if (derived != null) Common.invariant("dispatch evidence marked the obligation unreachable but owner derivation found a target");
+                    },
+                    .unavailable => self.builder.evidenceGap("dispatch-entry-unavailable", self.view.names.methodNameText(plan.method)),
                 }
             },
             .structural => {
                 if (derived != null) Common.invariant("dispatch plan resolved structural but owner derivation found a target");
             },
             .checked_error => {},
-            .unresolved_checked_plan => self.builder.evidence_missing_count += 1,
+            .unreachable_dispatch => {
+                if (derived != null) Common.invariant("dispatch plan classified unreachable but owner derivation found a target");
+            },
+            .unresolved_checked_plan => self.builder.evidenceGap("plan-unresolved", self.view.names.methodNameText(plan.method)),
         }
     }
 
