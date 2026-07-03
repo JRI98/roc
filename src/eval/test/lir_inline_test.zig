@@ -4949,3 +4949,36 @@ test "spec constr keeps a same-binder scalar distinct from a substituted aggrega
         }
     }
 }
+
+fn bareListIterCollectLoopIsScalar(shape: ProcShape) bool {
+    return shape.join_count >= 1 and
+        shape.max_join_param_count >= 5 and
+        shape.list_get_unsafe_count >= 1 and
+        shape.list_append_unsafe_count >= 1 and
+        shape.erased_call_count == 0 and
+        shape.direct_call_count == 0;
+}
+
+test "bare list iter collect carries scalar list state in the loop" {
+    const allocator = std.testing.allocator;
+    const source =
+        \\module [main]
+        \\
+        \\main : () -> List(I64)
+        \\main = || [1.I64, 2, 3].iter().collect()
+    ;
+    var optimized = try lowerModule(allocator, source, .wrappers);
+    defer optimized.deinit(allocator);
+
+    // The consumer loop carries the list-iter state as scalar loop variables
+    // (length payload, list, index) plus the output list, and indexes the
+    // list directly per element. No reachable proc dispatches through the
+    // erased step callable and no per-element call remains.
+    try std.testing.expect(try reachableProcShape(allocator, &optimized.lowered, bareListIterCollectLoopIsScalar));
+    try std.testing.expect(!try reachableIterCollectShape(allocator, &optimized.lowered, .generic));
+    try std.testing.expect(!try reachableIterCollectShape(allocator, &optimized.lowered, .specialized));
+    try expectNoReachableErasedCallableLowering(allocator, &optimized.lowered);
+    // The carried state still materializes once per loop exit (owned by the
+    // zero-allocation slice); per-element execution allocates nothing.
+    try std.testing.expectEqual(@as(usize, 2), try reachableProcShapeFieldTotal(allocator, &optimized.lowered, "box_box_count"));
+}
