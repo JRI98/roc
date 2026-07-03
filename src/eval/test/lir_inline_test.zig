@@ -4631,30 +4631,33 @@ test "iterdiff: if-chosen iterator chains consumed by one loop agree across inli
 }
 
 test "iterdiff: branch-chosen append search with early return agrees across inline modes" {
-    // Rocci's `on_screen_collided!` shape: a zero-accumulator `for` over a
-    // branch-chosen append chain that returns early on the first match. The
-    // branch-append peel factors the shared base iteration out and replays the
-    // per-element check over each arm's appended items; the returned first-match
-    // element pins the exact pull order (base elements, then appended items in
-    // append order, with the early return short-circuiting). Both lowerings must
-    // return the same element for every `(selector, target)` probe.
+    // Rocci's `on_screen_collided!` shape exactly: a zero-accumulator `for` over
+    // a branch-chosen append chain of record elements that returns early on the
+    // first match. The branch-append peel factors the shared base iteration out
+    // and replays the per-element check over each arm's appended items (binding
+    // each appended record's fields directly); the returned first-match value
+    // pins the exact pull order (base elements, then appended items in append
+    // order, with the early return short-circuiting). Both lowerings must return
+    // the same value for every `(selector, target)` probe.
     try expectSameObservationsAcrossInlineModes(
         \\module [main]
         \\
+        \\Point : { x : I64, y : I64 }
+        \\
         \\find : U64, I64 -> I64
         \\find = |selector, target| {
-        \\    base = [10.I64, 20, 30].iter()
+        \\    base = [{ x: 10, y: 1 }, { x: 20, y: 2 }, { x: 30, y: 3 }].iter()
         \\    chosen =
         \\        if selector == 2 {
-        \\            base.append(40).append(50)
+        \\            base.append({ x: 40, y: 4 }).append({ x: 50, y: 5 })
         \\        } else if selector == 1 {
-        \\            base.append(60)
+        \\            base.append({ x: 60, y: 6 })
         \\        } else {
         \\            base
         \\        }
-        \\    for x in chosen {
+        \\    for { x, y } in chosen {
         \\        if x >= target {
-        \\            return x
+        \\            return x + y
         \\        }
         \\    }
         \\    -1
