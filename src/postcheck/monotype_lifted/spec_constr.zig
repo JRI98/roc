@@ -350,6 +350,10 @@ const PendingLet = struct {
     local: Ast.LocalId,
     ty: Type.TypeId,
     value: Ast.ExprId,
+    /// The cloner's effect-mark count when this binding was created. A
+    /// binding created after an effect was emitted in its region must not
+    /// move to the region's start, because it would cross that effect.
+    marks: usize,
 };
 
 const LoopPattern = struct {
@@ -1074,13 +1078,27 @@ const Pass = struct {
             var rewritten_args = std.ArrayList(Ast.ExprId).empty;
             defer rewritten_args.deinit(self.allocator);
 
-            if (try self.appendExistingCallArgs(spec.pattern, args, &rewritten_args)) {
-                self.program.exprs.items[@intFromEnum(expr_id)].data = .{ .call_proc = .{
+            var cloner = Cloner.initForRewrite(self);
+            defer cloner.deinit();
+
+            if (try self.appendExistingCallArgs(&cloner, spec.pattern, args, &rewritten_args)) {
+                const new_call: Ast.ExprData = .{ .call_proc = .{
                     .callee = .{ .lifted = spec.fn_id orelse Common.invariant("call-pattern specialization id was not assigned before rewriting") },
                     .args = try self.program.addExprSpan(rewritten_args.items),
                     .captures = call.captures,
                     .is_cold = call.is_cold,
                 } };
+                if (cloner.pending.items.len == 0) {
+                    self.program.exprs.items[@intFromEnum(expr_id)].data = new_call;
+                } else {
+                    // Decomposing the argument created bindings its leaves
+                    // reference; the rewritten call site becomes a let chain
+                    // ending in the specialized call.
+                    const call_ty = self.program.exprs.items[@intFromEnum(expr_id)].ty;
+                    const call_expr = try cloner.addExpr(.{ .ty = call_ty, .data = new_call });
+                    const wrapped = try cloner.flushPendingSince(0, call_expr);
+                    self.program.exprs.items[@intFromEnum(expr_id)].data = self.program.exprs.items[@intFromEnum(wrapped)].data;
+                }
                 return;
             }
         }
@@ -1088,14 +1106,12 @@ const Pass = struct {
 
     fn appendExistingCallArgs(
         self: *Pass,
+        cloner: *Cloner,
         pattern: CallPattern,
         args: []const Ast.ExprId,
         out: *std.ArrayList(Ast.ExprId),
     ) Allocator.Error!bool {
         if (pattern.args.len != args.len) Common.invariant("call-pattern arity differed from direct call arity");
-        var cloner = Cloner.initForRewrite(self);
-        defer cloner.deinit();
-
         for (pattern.args, args) |shape, arg| {
             const value = try cloner.cloneExprValue(arg);
             if (!shapeMatchesValue(self.program, shape, value)) return false;
@@ -1311,6 +1327,17 @@ const Cloner = struct {
     inline_stack: std.ArrayList(Ast.FnId),
     callable_stack: std.ArrayList(ActiveCallable),
     loop_stack: std.ArrayList(LoopPattern),
+    /// Bindings created while producing a structured value, not yet emitted.
+    /// Each holds a fresh local the value's leaves reference. They are
+    /// emitted — oldest outermost, preserving evaluation order — at the
+    /// nearest enclosing region boundary (`cloneExpr`), or earlier by any
+    /// construct that pins its value with `resolvePending`.
+    pending: std.ArrayList(PendingLet),
+    /// Count of effect-bearing expressions emitted so far. Compared against
+    /// `region_entry_marks` to decide whether a pending binding may move to
+    /// its region's start without crossing an effect.
+    effect_marks: usize,
+    region_entry_marks: usize,
     inline_direct_calls: bool,
     inline_direct_requires_known_arg: bool,
     current_loc: SourceLoc,
@@ -1327,6 +1354,9 @@ const Cloner = struct {
             .inline_stack = .empty,
             .callable_stack = .empty,
             .loop_stack = .empty,
+            .pending = .empty,
+            .effect_marks = 0,
+            .region_entry_marks = 0,
             .inline_direct_calls = true,
             .inline_direct_requires_known_arg = true,
             .current_loc = SourceLoc.none,
@@ -1345,6 +1375,9 @@ const Cloner = struct {
             .inline_stack = .empty,
             .callable_stack = .empty,
             .loop_stack = .empty,
+            .pending = .empty,
+            .effect_marks = 0,
+            .region_entry_marks = 0,
             .inline_direct_calls = true,
             .inline_direct_requires_known_arg = false,
             .current_loc = SourceLoc.none,
@@ -1353,6 +1386,7 @@ const Cloner = struct {
     }
 
     fn deinit(self: *Cloner) void {
+        self.pending.deinit(self.pass.allocator);
         self.inline_stack.deinit(self.pass.allocator);
         self.callable_stack.deinit(self.pass.allocator);
         self.loop_stack.deinit(self.pass.allocator);
@@ -1465,7 +1499,15 @@ const Cloner = struct {
         if (expr_loc.hasLocation()) self.current_loc = expr_loc;
         const expr_region = self.pass.program.exprRegion(expr_id);
         if (!expr_region.isEmpty()) self.current_region = expr_region;
-        return try self.materialize(try self.cloneExprValue(expr_id));
+
+        // Region boundary: pending bindings created below this expression are
+        // emitted here, where they dominate every leaf reference inside it.
+        const pending_start = self.pending.items.len;
+        const saved_entry_marks = self.region_entry_marks;
+        self.region_entry_marks = self.effect_marks;
+        defer self.region_entry_marks = saved_entry_marks;
+        const result = try self.materialize(try self.cloneExprValue(expr_id));
+        return try self.flushPendingSince(pending_start, result);
     }
 
     fn cloneExprValue(self: *Cloner, expr_id: Ast.ExprId) Common.LowerError!Value {
@@ -1884,46 +1926,56 @@ const Cloner = struct {
         switch (branch_expr.data) {
             .block => |block| {
                 const change_start = self.changes.items.len;
+                const pending_entry = self.pending.items.len;
 
                 const source = try self.pass.allocator.dupe(Ast.StmtId, self.pass.program.stmtSpan(block.statements));
                 defer self.pass.allocator.free(source);
 
-                const statements = try self.pass.allocator.alloc(Ast.StmtId, source.len);
-                defer self.pass.allocator.free(statements);
-                for (source, 0..) |stmt, index| {
-                    statements[index] = try self.cloneStmt(stmt);
+                var statements = std.ArrayList(Ast.StmtId).empty;
+                defer statements.deinit(self.pass.allocator);
+                for (source) |stmt| {
+                    const pending_start = self.pending.items.len;
+                    const cloned = try self.cloneStmt(stmt);
+                    try self.appendPendingStmtsSince(pending_start, &statements);
+                    try statements.append(self.pass.allocator, cloned);
                 }
 
+                const pending_final = self.pending.items.len;
                 const final_value = try self.cloneExprValue(block.final_expr);
                 const rest_ty = self.pass.program.exprs.items[@intFromEnum(let_.rest)].ty;
                 if (!try self.bindPatToReusableValue(let_.bind, final_value)) {
                     if (try self.cloneDivergentAtType(block.final_expr, rest_ty)) |divergent| {
                         self.restore(change_start);
+                        try self.appendPendingStmtsSince(pending_final, &statements);
                         return try self.addExpr(.{ .ty = rest_ty, .data = .{ .block = .{
-                            .statements = try self.pass.program.addStmtSpan(statements),
+                            .statements = try self.pass.program.addStmtSpan(statements.items),
                             .final_expr = divergent,
                         } } });
                     }
                     self.restore(change_start);
+                    self.pending.shrinkRetainingCapacity(pending_entry);
                     return null;
                 }
 
+                try self.appendPendingStmtsSince(pending_final, &statements);
                 const rest = try self.cloneExpr(let_.rest);
                 self.restore(change_start);
 
                 return try self.addExpr(.{ .ty = rest_ty, .data = .{ .block = .{
-                    .statements = try self.pass.program.addStmtSpan(statements),
+                    .statements = try self.pass.program.addStmtSpan(statements.items),
                     .final_expr = rest,
                 } } });
             },
             else => {
+                const pending_entry = self.pending.items.len;
                 const branch_value = try self.cloneExprValue(branch_body);
                 const change_start = self.changes.items.len;
                 if (!try self.bindPatToReusableValue(let_.bind, branch_value)) {
                     self.restore(change_start);
+                    self.pending.shrinkRetainingCapacity(pending_entry);
                     return null;
                 }
-                const rest = try self.cloneExpr(let_.rest);
+                const rest = try self.flushPendingSince(pending_entry, try self.cloneExpr(let_.rest));
                 self.restore(change_start);
                 return rest;
             },
@@ -2065,14 +2117,17 @@ const Cloner = struct {
         const source = try self.pass.allocator.dupe(Ast.StmtId, self.pass.program.stmtSpan(block.statements));
         defer self.pass.allocator.free(source);
 
-        const statements = try self.pass.allocator.alloc(Ast.StmtId, source.len);
-        defer self.pass.allocator.free(statements);
-        for (source, 0..) |stmt, index| {
-            statements[index] = try self.cloneStmt(stmt);
+        var statements = std.ArrayList(Ast.StmtId).empty;
+        defer statements.deinit(self.pass.allocator);
+        for (source) |stmt| {
+            const pending_start = self.pending.items.len;
+            const cloned = try self.cloneStmt(stmt);
+            try self.appendPendingStmtsSince(pending_start, &statements);
+            try statements.append(self.pass.allocator, cloned);
         }
 
         return try self.addExpr(.{ .ty = ty, .data = .{ .block = .{
-            .statements = try self.pass.program.addStmtSpan(statements),
+            .statements = try self.pass.program.addStmtSpan(statements.items),
             .final_expr = try self.cloneExpr(block.final_expr),
         } } });
     }
@@ -2362,17 +2417,15 @@ const Cloner = struct {
             if (!matches) continue;
             if (branch.guard != null) return null;
 
-            var pending_lets = std.ArrayList(PendingLet).empty;
-            defer pending_lets.deinit(self.pass.allocator);
-
+            const pending_start = self.pending.items.len;
             const change_start = self.changes.items.len;
             const unsafe_count = self.unsafeLeafCount(scrutinee);
-            if (try self.bindPatToMatchValue(branch.pat, scrutinee, branch.body, unsafe_count, &pending_lets) == null) {
+            if (try self.bindPatToMatchValue(branch.pat, scrutinee, branch.body, unsafe_count) == null) {
                 Common.invariant("known constructor match changed after reusable payload binding");
             }
             const body = try self.cloneExprValue(branch.body);
             self.restore(change_start);
-            return try self.wrapPendingLets(body, pending_lets.items);
+            return try self.resolvePending(pending_start, body);
         }
         Common.invariant("known constructor match had no matching branch");
     }
@@ -2383,24 +2436,23 @@ const Cloner = struct {
         value: Value,
         body: Ast.ExprId,
         unsafe_count: usize,
-        pending_lets: *std.ArrayList(PendingLet),
     ) Common.LowerError!?Value {
         const pat = self.pass.program.pats.items[@intFromEnum(pat_id)];
         switch (pat.data) {
             .bind => |local| {
-                const prepared = try self.valueForMatchLocal(local, value, body, unsafe_count, pending_lets);
+                const prepared = try self.valueForMatchLocal(local, value, body, unsafe_count);
                 try self.putSubst(local, prepared);
                 return prepared;
             },
-            .wildcard => return try self.makeReusableForMatch(value, pending_lets),
+            .wildcard => return try self.makeReusableForMatch(value),
             .as => |as| {
                 const as_uses = localUseCountInExpr(self.pass.program, as.local, body);
                 const base = if (self.valueCanSubstitute(value) or
                     (unsafe_count == 1 and as_uses == 1 and localUseBeforeEffect(self.pass.program, as.local, body)))
                     value
                 else
-                    try self.makeReusableForMatch(value, pending_lets);
-                const prepared = (try self.bindPatToMatchValue(as.pattern, base, body, unsafe_count, pending_lets)) orelse return null;
+                    try self.makeReusableForMatch(value);
+                const prepared = (try self.bindPatToMatchValue(as.pattern, base, body, unsafe_count)) orelse return null;
                 try self.putSubst(as.local, prepared);
                 return prepared;
             },
@@ -2410,7 +2462,7 @@ const Cloner = struct {
                 const prepared_fields = try self.pass.arena.allocator().alloc(FieldValue, record.fields.len);
                 for (record.fields, 0..) |field, index| {
                     if (recordPatField(fields, field.name)) |field_pat| {
-                        const prepared = (try self.bindPatToMatchValue(field_pat, field.value, body, unsafe_count, pending_lets)) orelse return null;
+                        const prepared = (try self.bindPatToMatchValue(field_pat, field.value, body, unsafe_count)) orelse return null;
                         prepared_fields[index] = .{
                             .name = field.name,
                             .value = prepared,
@@ -2418,7 +2470,7 @@ const Cloner = struct {
                     } else {
                         prepared_fields[index] = .{
                             .name = field.name,
-                            .value = try self.makeReusableForMatch(field.value, pending_lets),
+                            .value = try self.makeReusableForMatch(field.value),
                         };
                     }
                 }
@@ -2433,7 +2485,7 @@ const Cloner = struct {
                 if (pats.len != tuple.items.len) return null;
                 const items = try self.pass.arena.allocator().alloc(Value, tuple.items.len);
                 for (pats, tuple.items, 0..) |child_pat, child_value, index| {
-                    items[index] = (try self.bindPatToMatchValue(child_pat, child_value, body, unsafe_count, pending_lets)) orelse return null;
+                    items[index] = (try self.bindPatToMatchValue(child_pat, child_value, body, unsafe_count)) orelse return null;
                 }
                 return Value{ .tuple = .{
                     .ty = tuple.ty,
@@ -2447,7 +2499,7 @@ const Cloner = struct {
                 if (pats.len != tag.payloads.len) return null;
                 const payloads = try self.pass.arena.allocator().alloc(Value, tag.payloads.len);
                 for (pats, tag.payloads, 0..) |child_pat, child_value, index| {
-                    payloads[index] = (try self.bindPatToMatchValue(child_pat, child_value, body, unsafe_count, pending_lets)) orelse return null;
+                    payloads[index] = (try self.bindPatToMatchValue(child_pat, child_value, body, unsafe_count)) orelse return null;
                 }
                 return Value{ .tag = .{
                     .ty = tag.ty,
@@ -2461,7 +2513,7 @@ const Cloner = struct {
                     else => return null,
                 };
                 const backing = try self.pass.arena.allocator().create(Value);
-                backing.* = (try self.bindPatToMatchValue(backing_pat, nominal.backing.*, body, unsafe_count, pending_lets)) orelse return null;
+                backing.* = (try self.bindPatToMatchValue(backing_pat, nominal.backing.*, body, unsafe_count)) orelse return null;
                 return Value{ .nominal = .{
                     .ty = nominal.ty,
                     .backing = backing,
@@ -2486,7 +2538,6 @@ const Cloner = struct {
         value: Value,
         body: Ast.ExprId,
         unsafe_count: usize,
-        pending_lets: *std.ArrayList(PendingLet),
     ) Common.LowerError!Value {
         const uses = localUseCountInExpr(self.pass.program, local, body);
         if (self.valueCanSubstitute(value) or
@@ -2494,7 +2545,7 @@ const Cloner = struct {
         {
             return value;
         }
-        return try self.makeReusableForMatch(value, pending_lets);
+        return try self.makeReusableForMatch(value);
     }
 
     fn valueForInlineLocal(
@@ -2503,7 +2554,6 @@ const Cloner = struct {
         value: Value,
         body: Ast.ExprId,
         unsafe_count: usize,
-        pending_lets: *std.ArrayList(PendingLet),
     ) Common.LowerError!Value {
         const uses = localUseCountInExpr(self.pass.program, local, body);
         if (self.valueCanSubstitute(value) or
@@ -2511,7 +2561,7 @@ const Cloner = struct {
         {
             return value;
         }
-        return try self.makeReusableForMatch(value, pending_lets);
+        return try self.makeReusableForMatch(value);
     }
 
     fn unsafeLeafCount(self: *Cloner, value: Value) usize {
@@ -2541,16 +2591,17 @@ const Cloner = struct {
         };
     }
 
-    fn makeReusableForMatch(self: *Cloner, value: Value, pending_lets: *std.ArrayList(PendingLet)) Common.LowerError!Value {
+    fn makeReusableForMatch(self: *Cloner, value: Value) Common.LowerError!Value {
         if (self.valueCanSubstitute(value)) return value;
         return switch (value) {
             .expr => |expr| blk: {
                 const ty = self.pass.program.exprs.items[@intFromEnum(expr)].ty;
                 const local = try self.pass.program.addLocal(self.pass.symbols.fresh(), ty);
-                try pending_lets.append(self.pass.allocator, .{
+                try self.pending.append(self.pass.allocator, .{
                     .local = local,
                     .ty = ty,
                     .value = expr,
+                    .marks = self.effect_marks,
                 });
                 break :blk Value{ .expr = try self.addExpr(.{
                     .ty = ty,
@@ -2560,7 +2611,7 @@ const Cloner = struct {
             .tag => |tag| blk: {
                 const payloads = try self.pass.arena.allocator().alloc(Value, tag.payloads.len);
                 for (tag.payloads, 0..) |payload, index| {
-                    payloads[index] = try self.makeReusableForMatch(payload, pending_lets);
+                    payloads[index] = try self.makeReusableForMatch(payload);
                 }
                 break :blk Value{ .tag = .{
                     .ty = tag.ty,
@@ -2573,7 +2624,7 @@ const Cloner = struct {
                 for (record.fields, 0..) |field, index| {
                     fields[index] = .{
                         .name = field.name,
-                        .value = try self.makeReusableForMatch(field.value, pending_lets),
+                        .value = try self.makeReusableForMatch(field.value),
                     };
                 }
                 break :blk Value{ .record = .{
@@ -2584,7 +2635,7 @@ const Cloner = struct {
             .tuple => |tuple| blk: {
                 const items = try self.pass.arena.allocator().alloc(Value, tuple.items.len);
                 for (tuple.items, 0..) |item, index| {
-                    items[index] = try self.makeReusableForMatch(item, pending_lets);
+                    items[index] = try self.makeReusableForMatch(item);
                 }
                 break :blk Value{ .tuple = .{
                     .ty = tuple.ty,
@@ -2593,7 +2644,7 @@ const Cloner = struct {
             },
             .nominal => |nominal| blk: {
                 const backing = try self.pass.arena.allocator().create(Value);
-                backing.* = try self.makeReusableForMatch(nominal.backing.*, pending_lets);
+                backing.* = try self.makeReusableForMatch(nominal.backing.*);
                 break :blk Value{ .nominal = .{
                     .ty = nominal.ty,
                     .backing = backing,
@@ -2602,7 +2653,7 @@ const Cloner = struct {
             .callable => |callable| blk: {
                 const captures = try self.pass.arena.allocator().alloc(Value, callable.captures.len);
                 for (callable.captures, 0..) |capture, index| {
-                    captures[index] = try self.makeReusableForMatch(capture, pending_lets);
+                    captures[index] = try self.makeReusableForMatch(capture);
                 }
                 break :blk Value{ .callable = .{
                     .ty = callable.ty,
@@ -2613,15 +2664,17 @@ const Cloner = struct {
         };
     }
 
-    fn wrapPendingLets(self: *Cloner, body: Value, pending_lets: []const PendingLet) Common.LowerError!Value {
-        if (pending_lets.len == 0) return body;
-
-        const ty = valueType(self.pass.program, body);
-        var result = try self.materialize(body);
-        var index = pending_lets.len;
-        while (index > 0) {
+    /// Emit the pending bindings created at or after `start` as a let chain
+    /// around `expr`, oldest outermost so evaluation order is preserved, and
+    /// drop them from the stack.
+    fn flushPendingSince(self: *Cloner, start: usize, expr: Ast.ExprId) Common.LowerError!Ast.ExprId {
+        if (self.pending.items.len <= start) return expr;
+        const ty = self.pass.program.exprs.items[@intFromEnum(expr)].ty;
+        var result = expr;
+        var index = self.pending.items.len;
+        while (index > start) {
             index -= 1;
-            const pending = pending_lets[index];
+            const pending = self.pending.items[index];
             const pat = try self.pass.program.addPat(.{
                 .ty = pending.ty,
                 .data = .{ .bind = pending.local },
@@ -2632,7 +2685,51 @@ const Cloner = struct {
                 .rest = result,
             } } });
         }
-        return .{ .expr = result };
+        self.pending.shrinkRetainingCapacity(start);
+        return result;
+    }
+
+    /// Emit the pending bindings created at or after `start` as let
+    /// statements, oldest first, and drop them from the stack. Used where a
+    /// statement list is being built, so the bindings dominate the statement
+    /// whose cloning created them and everything after it.
+    fn appendPendingStmtsSince(self: *Cloner, start: usize, out: *std.ArrayList(Ast.StmtId)) Common.LowerError!void {
+        for (self.pending.items[start..]) |pending| {
+            const pat = try self.pass.program.addPat(.{
+                .ty = pending.ty,
+                .data = .{ .bind = pending.local },
+            });
+            try out.append(self.pass.allocator, try self.addStmt(.{ .let_ = .{
+                .pat = pat,
+                .value = pending.value,
+            } }));
+        }
+        self.pending.shrinkRetainingCapacity(start);
+    }
+
+    /// Resolve the pending bindings a construct created while producing
+    /// `body`. A structured value whose bindings are all effect-free
+    /// computations, created in a region that has emitted no effect, keeps
+    /// its structure: the bindings stay pending and the region boundary
+    /// emits them, where they still dominate every leaf reference and cross
+    /// only effect-free evaluation. Anything else pins the value here — it
+    /// is materialized and wrapped so evaluation order and count stay
+    /// exactly as written.
+    fn resolvePending(self: *Cloner, start: usize, body: Value) Common.LowerError!Value {
+        if (self.pending.items.len <= start) return body;
+        if (body != .expr) {
+            var delegatable = true;
+            for (self.pending.items[start..]) |pending| {
+                if (pending.marks != self.region_entry_marks or
+                    !exprHasNoObservableEffect(self.pass.program, pending.value))
+                {
+                    delegatable = false;
+                    break;
+                }
+            }
+            if (delegatable) return body;
+        }
+        return .{ .expr = try self.flushPendingSince(start, try self.materialize(body)) };
     }
 
     fn cloneCaseOfCaseValue(
@@ -2641,6 +2738,7 @@ const Cloner = struct {
         scrutinee_expr: Ast.ExprId,
         outer_branches_span: Ast.Span(Ast.Branch),
     ) Common.LowerError!?Value {
+        const pending_entry = self.pending.items.len;
         const scrutinee_data = self.pass.program.exprs.items[@intFromEnum(scrutinee_expr)].data;
         const inner_match = switch (scrutinee_data) {
             .match_ => |match| match,
@@ -2659,12 +2757,16 @@ const Cloner = struct {
         defer self.pass.allocator.free(rewritten);
 
         for (inner_branches, 0..) |inner_branch, index| {
+            const pending_start = self.pending.items.len;
             const inner_value = try self.cloneExprValue(inner_branch.body);
-            const outer_value = (try self.simplifyKnownMatchValue(inner_value, outer_branches_span)) orelse return null;
+            const outer_value = (try self.simplifyKnownMatchValue(inner_value, outer_branches_span)) orelse {
+                self.pending.shrinkRetainingCapacity(pending_entry);
+                return null;
+            };
             rewritten[index] = .{
                 .pat = inner_branch.pat,
                 .guard = inner_branch.guard,
-                .body = try self.materialize(outer_value),
+                .body = try self.flushPendingSince(pending_start, try self.materialize(outer_value)),
             };
         }
 
@@ -2717,16 +2819,14 @@ const Cloner = struct {
             Common.invariant("callable value capture count differed from lifted function capture count");
         }
 
-        var pending_lets = std.ArrayList(PendingLet).empty;
-        defer pending_lets.deinit(self.pass.allocator);
-
+        const pending_start = self.pending.items.len;
         const change_start = self.changes.items.len;
         defer self.restore(change_start);
 
         const prepared_captures = try self.pass.allocator.alloc(Value, callable.captures.len);
         defer self.pass.allocator.free(prepared_captures);
         for (source_captures, callable.captures, 0..) |source_capture, capture_value, index| {
-            prepared_captures[index] = try self.makeReusableForMatch(capture_value, &pending_lets);
+            prepared_captures[index] = try self.makeReusableForMatch(capture_value);
             try self.putSubst(source_capture.local, prepared_captures[index]);
         }
 
@@ -2743,7 +2843,7 @@ const Cloner = struct {
         const prepared_args = try self.pass.allocator.alloc(Value, arg_values.len);
         defer self.pass.allocator.free(prepared_args);
         for (source_args, arg_values, 0..) |source_arg, arg_value, index| {
-            prepared_args[index] = try self.valueForInlineLocal(source_arg.local, arg_value, body, unsafe_count, &pending_lets);
+            prepared_args[index] = try self.valueForInlineLocal(source_arg.local, arg_value, body, unsafe_count);
         }
 
         try self.inline_stack.append(self.pass.allocator, callable.fn_id);
@@ -2756,7 +2856,7 @@ const Cloner = struct {
             try self.putSubst(source_arg.local, arg_value);
         }
 
-        return try self.wrapPendingLets(try self.cloneExprValue(body), pending_lets.items);
+        return try self.resolvePending(pending_start, try self.cloneExprValue(body));
     }
 
     fn inlineDirectCallValue(
@@ -2784,9 +2884,7 @@ const Cloner = struct {
         defer self.pass.allocator.free(args);
         if (source_args.len != args.len) Common.invariant("direct call arity differed from lifted function arity");
 
-        var pending_lets = std.ArrayList(PendingLet).empty;
-        defer pending_lets.deinit(self.pass.allocator);
-
+        const pending_start = self.pending.items.len;
         const change_start = self.changes.items.len;
         defer self.restore(change_start);
 
@@ -2817,13 +2915,13 @@ const Cloner = struct {
         const prepared_captures = try self.pass.allocator.alloc(Value, capture_values.len);
         defer self.pass.allocator.free(prepared_captures);
         for (captures, capture_values, 0..) |capture, capture_value, index| {
-            prepared_captures[index] = try self.valueForInlineLocal(capture.local, capture_value, body, unsafe_count, &pending_lets);
+            prepared_captures[index] = try self.valueForInlineLocal(capture.local, capture_value, body, unsafe_count);
         }
 
         const prepared_args = try self.pass.allocator.alloc(Value, arg_values.len);
         defer self.pass.allocator.free(prepared_args);
         for (source_args, arg_values, 0..) |source_arg, arg_value, index| {
-            prepared_args[index] = try self.valueForInlineLocal(source_arg.local, arg_value, body, unsafe_count, &pending_lets);
+            prepared_args[index] = try self.valueForInlineLocal(source_arg.local, arg_value, body, unsafe_count);
         }
 
         try self.inline_stack.append(self.pass.allocator, callee);
@@ -2839,7 +2937,7 @@ const Cloner = struct {
             try self.putSubst(source_arg.local, arg_value);
         }
 
-        return try self.wrapPendingLets(try self.cloneExprValue(body), pending_lets.items);
+        return try self.resolvePending(pending_start, try self.cloneExprValue(body));
     }
 
     fn bindPatToValue(self: *Cloner, pat_id: Ast.PatId, value: Value) Common.LowerError!bool {
@@ -3368,6 +3466,25 @@ const Cloner = struct {
     }
 
     fn addExpr(self: *Cloner, expr: Ast.Expr) Allocator.Error!Ast.ExprId {
+        // Track emissions that carry an observable effect (host effects enter
+        // through calls; low-level ops are data operations apart from the
+        // crash op and the process-seed read). Pending bindings created after
+        // such an emission must not move ahead of it.
+        switch (expr.data) {
+            .call_proc,
+            .call_value,
+            .crash,
+            .dbg,
+            .expect,
+            .expect_err,
+            .comptime_exhaustiveness_failed,
+            => self.effect_marks += 1,
+            .low_level => |call| switch (call.op) {
+                .crash, .dict_pseudo_seed => self.effect_marks += 1,
+                else => {},
+            },
+            else => {},
+        }
         const saved_loc = self.pass.program.current_loc;
         defer self.pass.program.current_loc = saved_loc;
         const saved_region = self.pass.program.current_region;
@@ -3597,6 +3714,95 @@ const LocalUseScan = struct {
     found_before_effect: bool = false,
     found_after_effect: bool = false,
 };
+
+/// Whether evaluating an expression can produce an observable effect. Host
+/// effects enter through procedure calls, so calls of unknown target are
+/// effects; low-level ops are data operations apart from the crash op and the
+/// process-seed read. Divergence through checked arithmetic is not an effect:
+/// within one straight-line region a crash commutes with pure evaluation.
+fn exprHasNoObservableEffect(program: *const Ast.Program, expr_id: Ast.ExprId) bool {
+    const expr = program.exprs.items[@intFromEnum(expr_id)];
+    return switch (expr.data) {
+        .local,
+        .unit,
+        .int_lit,
+        .frac_f32_lit,
+        .frac_f64_lit,
+        .dec_lit,
+        .str_lit,
+        .uninitialized,
+        .uninitialized_payload,
+        .def_ref,
+        .fn_def,
+        => true,
+        .fn_ref => |fn_ref| exprSpanHasNoObservableEffect(program, fn_ref.captures),
+        .list,
+        .tuple,
+        => |items| exprSpanHasNoObservableEffect(program, items),
+        .record => |fields| blk: {
+            for (program.fieldExprSpan(fields)) |field| {
+                if (!exprHasNoObservableEffect(program, field.value)) break :blk false;
+            }
+            break :blk true;
+        },
+        .tag => |tag| exprSpanHasNoObservableEffect(program, tag.payloads),
+        .nominal => |child| exprHasNoObservableEffect(program, child),
+        .field_access => |field| exprHasNoObservableEffect(program, field.receiver),
+        .tuple_access => |access| exprHasNoObservableEffect(program, access.tuple),
+        .structural_eq => |eq| exprHasNoObservableEffect(program, eq.lhs) and
+            exprHasNoObservableEffect(program, eq.rhs),
+        .structural_hash => |h| exprHasNoObservableEffect(program, h.value) and
+            exprHasNoObservableEffect(program, h.hasher),
+        .low_level => |call| switch (call.op) {
+            .crash, .dict_pseudo_seed => false,
+            else => exprSpanHasNoObservableEffect(program, call.args),
+        },
+        .let_ => |let_| exprHasNoObservableEffect(program, let_.value) and
+            exprHasNoObservableEffect(program, let_.rest),
+        .if_ => |if_| blk: {
+            for (program.ifBranchSpan(if_.branches)) |branch| {
+                if (!exprHasNoObservableEffect(program, branch.cond)) break :blk false;
+                if (!exprHasNoObservableEffect(program, branch.body)) break :blk false;
+            }
+            break :blk exprHasNoObservableEffect(program, if_.final_else);
+        },
+        .match_ => |match| blk: {
+            if (!exprHasNoObservableEffect(program, match.scrutinee)) break :blk false;
+            for (program.branchSpan(match.branches)) |branch| {
+                if (branch.guard) |guard| {
+                    if (!exprHasNoObservableEffect(program, guard)) break :blk false;
+                }
+                if (!exprHasNoObservableEffect(program, branch.body)) break :blk false;
+            }
+            break :blk true;
+        },
+        .comptime_branch_taken => |taken| exprHasNoObservableEffect(program, taken.body),
+        .lambda,
+        .call_value,
+        .call_proc,
+        .crash,
+        .dbg,
+        .expect,
+        .expect_err,
+        .comptime_exhaustiveness_failed,
+        .block,
+        .loop_,
+        .break_,
+        .continue_,
+        .return_,
+        .if_initialized_payload,
+        .try_sequence,
+        .try_record_sequence,
+        => false,
+    };
+}
+
+fn exprSpanHasNoObservableEffect(program: *const Ast.Program, span: Ast.Span(Ast.ExprId)) bool {
+    for (program.exprSpan(span)) |expr| {
+        if (!exprHasNoObservableEffect(program, expr)) return false;
+    }
+    return true;
+}
 
 fn localUseBeforeEffect(program: *const Ast.Program, local: Ast.LocalId, expr_id: Ast.ExprId) bool {
     var scan: LocalUseScan = .{};
