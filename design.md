@@ -2841,46 +2841,74 @@ append it to a new cache file after the program is complete.
 
 ### Static Dispatch In Monotype
 
-Static dispatch is resolved while producing Monotype IR.
+Static dispatch is DECIDED during checking and CONSUMED during Monotype
+lowering. Every dispatch site leaves checking with an explicit resolution on
+its plan:
 
-For each checked dispatch plan in a body specialization:
+- `direct(evidence_node)` — checking proved the concrete target. The evidence
+  node names the target and carries evidence for the target's own obligations
+  (its nested `where`-clause constraints), recursively.
+- `constraint(depth, k)` — the dispatcher is the k-th evidence param of the
+  d-th enclosing generalized callable. Each specialization edge supplies the
+  answer: dictionary passing resolved entirely at compile time.
+- `structural(kind)` — the checker chose the compiler-derived structural
+  implementation (equality, hashing, parsing, encoding) for an ownerless
+  shape.
+- `checked_error` — checking rejected the site; executing it anyway (running a
+  program with reported errors) lowers to an explicit crash.
+- `unreachable_dispatch` — the dispatcher is a constrained variable no
+  specialization edge can ever supply and no default applies: the dispatch is
+  statically unreachable and lowers to an explicit crash.
 
-1. Instantiate the checked dispatcher type into the current Monotype type
-   store.
-2. Instantiate the checked callable type into the current Monotype type store.
-3. Lower every checked operand into the current body specialization.
-4. Derive the concrete `MethodOwner` from the instantiated dispatcher type.
-5. Look up `(MethodOwner, MethodNameId)` in the checked method registry.
-6. Instantiate the target method callable type and verify it matches the plan's
-   callable type.
-7. Emit a direct `call_proc`, or emit structural equality when the checked plan
-   explicitly permits it.
+Nothing else exists. Monotype lowering never derives a method owner from type
+content, never searches a registry by method name, and never intersects
+constraints to guess a target.
 
-Any failure after checking is a compiler bug. Monotype lowering must not search
-for possible owners by intersecting method registries or constraints.
+**Evidence params.** Every type scheme with dispatch obligations has one
+canonical, order-deterministic list of (dispatcher var, constraint) pairs —
+its evidence params — enumerated purely from the scheme's type structure
+(depth-first: function args then return, type arguments then backing, row
+fields and tags then extension, constraints emitted at each var's first
+occurrence, then constraint fn types walked the same way). Index `k` in this
+list is the shared identity between a plan's `constraint(k)` resolution and
+the k-th evidence entry a call edge supplies. The definition's module and any
+importing module enumerate identical lists from their structural copies of the
+scheme.
 
-Owner derivation is a type-content operation, not a registry operation.
-Monotype type lowering preserves owner-bearing type identity in builtin and
-named type nodes for every dispatcher type.
+**Edges supply evidence.** Checking persists, for every instantiation of a
+constrained scheme, the (pristine var, fresh var) pairs of its constrained
+vars. Publication resolves each instantiation edge's obligations — against the
+enclosing callable's own evidence params (producing `constraint(k)` again),
+against concrete types (producing `direct` targets through exact registry
+lookups), through the monomorphic default rule, or structurally — and stores
+the result as site evidence keyed by the use expression. Monotype lowering
+materializes a specialization's evidence vector at each call edge and passes
+it to the callee specialization; a plan resolved `constraint(k)` reads entry
+`k` of the innermost vector (walking lexical parents for nested local
+functions by `depth`).
 
-`type_def` covers named nominal, opaque, and alias definitions that can own
-methods. Transparent backing representation is separate from this owner head.
-Monotype lowering may later erase or reinterpret transparent wrappers for value
-representation, but static dispatch reads the owner head before the dispatch
-node is removed.
+**The default rule.** A constrained var no edge can pin follows exactly the
+rule Monotype uses to materialize unresolved variables: numeral literals and
+defaultable arithmetic operators default to `Dec`, quote and interpolation
+literals default to `Str`, and every obligation on such a var resolves against
+the default owner during checking. Structural-capable obligations on other
+unpinnable vars resolve structurally; the rest are statically unreachable.
 
-The owner algorithm is fixed:
+**Compiler-generated edges.** Structural derivations and builtin helpers call
+methods on component types with no checked instantiation record. For these,
+each published evidence param also carries the semantic PATH from its scheme's
+callable to the dispatcher's first occurrence (argument positions, type
+arguments, row labels — labels rather than positions, because Monotype sorts
+rows). Monotype resolves such a target's obligations by walking those paths
+over the concrete monomorphic callable at the consumption site, recursively:
+component owners resolve through exact registry lookups, ownerless shapes take
+the structural implementations.
 
-1. Fully resolve the instantiated dispatcher type.
-2. Compute its `DispatchOwnerHead` from Monotype type content.
-3. If the head is `builtin`, use that builtin owner.
-4. If the head is `type_def`, use that exact `TypeDef`.
-5. If the head is `none` and the checked dispatch plan permits derived `is_eq`,
-   emit structural equality.
-6. Otherwise stop with a compiler invariant failure.
-
-The algorithm never asks the method registry "which owners could match this
-constraint?" The registry only answers exact lookups after the owner is known.
+Exact registry lookups — `(MethodOwner, MethodNameId)` — happen during
+checking and publication, and during path synthesis for compiler-generated
+edges. The registry only ever answers exact lookups after the owner is known
+from checked type content; no stage asks "which owners could match this
+constraint?".
 
 ### Iterator `for`
 

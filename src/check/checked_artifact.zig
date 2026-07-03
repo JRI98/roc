@@ -12901,11 +12901,13 @@ const EvidencePass = struct {
                     const root = self.compile_time_roots.root(wrapper.root);
                     if (root.source_pattern) |source_pattern| {
                         try self.enumerateParams(ModuleEnv.varFrom(source_pattern), &params);
-                    } else if (self.source_by_checked_expr.get(@intFromEnum(root.expr))) |source_node| {
-                        // Expression roots (REPL lines, eval snippets) have no
-                        // pattern; their scheme is the expression's own type.
-                        try self.enumerateParams(@enumFromInt(source_node), &params);
                     }
+                    // Expression roots (REPL lines, eval snippets) have no
+                    // pattern and no callers: nothing can supply evidence, so
+                    // their obligations classify like never-pinned vars
+                    // (mono-default mirroring, structural, vacuous) instead of
+                    // becoming unsuppliable scheme params.
+
                 },
                 .checked_body, .intrinsic_wrapper => {},
             }
@@ -12951,6 +12953,30 @@ const EvidencePass = struct {
                 const chain = try self.chainFor(self.template_iterator_refs.value_ref_scopes[value_ref_start + i], params.items);
                 try self.emitSiteEvidence(ref_id, chain);
             }
+        }
+
+        // Root edges are their templates' only callers (nothing instantiates
+        // a compile-time root). Resolve each pattern'd root's evidence now —
+        // the chain is empty, so every obligation lands on a chain-free
+        // resolution (concrete target, mono-default owner, structural,
+        // vacuous) — published as site evidence keyed by the root's body
+        // expression for the drain and const-eval entries to consume.
+        for (self.compile_time_roots.roots) |root| {
+            const source_pattern = root.source_pattern orelse continue;
+            params.clearRetainingCapacity();
+            try self.enumerateParams(ModuleEnv.varFrom(source_pattern), &params);
+            if (params.items.len == 0) continue;
+            const site_key = @intFromEnum(root.expr);
+            if (self.site_seen.contains(site_key)) continue;
+            var entries = std.ArrayListUnmanaged(static_dispatch.CheckedEvidence).empty;
+            defer entries.deinit(self.allocator);
+            try entries.ensureTotalCapacity(self.allocator, params.items.len);
+            for (params.items) |param| {
+                entries.appendAssumeCapacity(try self.evidenceForVar(param, param.dispatcher_var, param.constraint.fn_var));
+            }
+            const span = try self.appendEvidenceRefs(entries.items);
+            try self.site_seen.put(site_key, {});
+            try self.site_evidence.append(self.allocator, .{ .key = site_key, .start = span.start, .len = span.len });
         }
 
         // Any plan the template walk did not reach stays unresolved for the

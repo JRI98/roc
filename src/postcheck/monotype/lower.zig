@@ -1549,16 +1549,48 @@ const Builder = struct {
         var body_ctx = try BodyContext.init(self.allocator, self, view, template_ref, graph, &body_draft);
         body_ctx.evidence = .{ .vector = spec_evidence };
         if (spec_evidence.len < template.evidence_params.len) {
-            // Requesting edges that predate full evidence threading (or gaps
-            // publication counted) leave the vector short; owner derivation
-            // still resolves those obligations during the migration.
-            const proc_base = view.names.procBase(template_ref.proc_base);
-            const template_name = if (proc_base.export_name) |export_name| view.names.exportNameText(export_name) else "<unnamed>";
-            var short = template.evidence_params.len - spec_evidence.len;
-            while (short > 0) : (short -= 1) {
-                self.evidenceGap("spec-vector-short", template_name);
-                if (@import("builtin").mode == .Debug) {
-                    std.log.scoped(.monotype).debug("  in module: {s}", .{view.module_env.module_name});
+            // An entry wrapper's only caller is the root edge itself;
+            // publication resolved that edge's evidence (chain-free: concrete
+            // targets, mono-default owners, structural, vacuous) as site
+            // evidence keyed by the root's body expression.
+            var filled = false;
+            if (try body_ctx.rootEdgeEvidence(view, template)) |root_evidence| {
+                body_ctx.evidence = .{ .vector = root_evidence };
+                filled = true;
+            } else if (template.body != .intrinsic_wrapper) {
+                // Root-edge request scheduled after publication (eval/REPL
+                // entries): resolve the obligations from the template's own
+                // dispatcher paths over the requested callable — the sealed
+                // mono type carries the checker's defaults.
+                const synthesized = try body_ctx.synthesizeParamsEvidence(view, template, lower_fn_ty);
+                var complete = synthesized.len == template.evidence_params.len;
+                for (synthesized) |entry| {
+                    if (entry == .unavailable) complete = false;
+                }
+                if (complete) {
+                    body_ctx.evidence = .{ .vector = synthesized };
+                    filled = true;
+                }
+            }
+            if (!filled) {
+                // Requesting edges that predate full evidence threading (or
+                // gaps publication counted) leave the vector short; owner
+                // derivation still resolves those obligations during the
+                // migration.
+                const proc_base = view.names.procBase(template_ref.proc_base);
+                const template_name = if (proc_base.export_name) |export_name| view.names.exportNameText(export_name) else "<unnamed>";
+                var short = template.evidence_params.len - spec_evidence.len;
+                while (short > 0) : (short -= 1) {
+                    self.evidenceGap("spec-vector-short", template_name);
+                    if (@import("builtin").mode == .Debug) {
+                        const params = view.templates.evidenceParams(&template);
+                        const missing = params[spec_evidence.len + short - 1];
+                        std.log.scoped(.monotype).debug("  in module: {s} missing param {d}: {s}", .{
+                            view.module_env.module_name,
+                            spec_evidence.len + short - 1,
+                            view.names.methodNameText(missing.method),
+                        });
+                    }
                 }
             }
         }
@@ -14905,6 +14937,36 @@ const BodyContext = struct {
         };
     }
 
+    /// Publication-resolved root-edge evidence for a compile-time root's
+    /// template (site evidence keyed by the root's body expression),
+    /// materialized. `template` bounds the expected param count.
+    fn rootEdgeEvidenceByExpr(
+        self: *BodyContext,
+        view: ModuleView,
+        root_expr: checked.CheckedExprId,
+        template: checked.CheckedProcedureTemplate,
+    ) Allocator.Error!?[]const SpecEvidence {
+        const refs = view.static_dispatch_plans.siteEvidence(root_expr) orelse return null;
+        if (refs.len != template.evidence_params.len) return null;
+        return try self.materializeEvidence(refs);
+    }
+
+    /// Root-edge evidence for a template that is (or evaluates) a
+    /// compile-time root: an entry wrapper, or a checked body whose root
+    /// expression is a root's body (the root drain requests those directly).
+    fn rootEdgeEvidence(
+        self: *BodyContext,
+        view: ModuleView,
+        template: checked.CheckedProcedureTemplate,
+    ) Allocator.Error!?[]const SpecEvidence {
+        const root_expr = switch (template.body) {
+            .entry_wrapper => |wrapper_id| view.compile_time_roots.root(view.entry_wrappers.get(wrapper_id).root).expr,
+            .checked_body => |body_id| view.bodies.body(body_id).root_expr,
+            .intrinsic_wrapper => return null,
+        };
+        return try self.rootEdgeEvidenceByExpr(view, root_expr, template);
+    }
+
     fn lowerConstEvalTemplateUse(
         self: *BodyContext,
         store_view: ModuleView,
@@ -14931,8 +14993,16 @@ const BodyContext = struct {
 
         var body_ctx = try BodyContext.init(self.allocator, self.builder, store_view, eval.entry_template, self.graph, self.draft);
         // The re-lowered constant body's plans index the constant's own
-        // scheme; the use edge supplied that vector.
+        // scheme; the use edge supplied that vector. Wrapper entries reached
+        // without a use edge (the root drain itself) take publication's
+        // root-edge evidence.
         body_ctx.evidence = self.restore_evidence;
+        if (self.restore_evidence.vector.len < entry_template.evidence_params.len) {
+            const eval_root = store_view.compile_time_roots.root(body.root);
+            if (try self.rootEdgeEvidenceByExpr(store_view, eval_root.expr, entry_template)) |root_evidence| {
+                body_ctx.evidence = .{ .vector = root_evidence };
+            }
+        }
         defer body_ctx.deinit();
         body_ctx.source_region_override = source_region_override;
         body_ctx.current_entry_root = current_entry_root;
@@ -17440,24 +17510,35 @@ const BodyContext = struct {
         callable_mono_ty: Type.TypeId,
     ) Allocator.Error![]const SpecEvidence {
         const template = lookup.view.templates.get(template_ref.template);
-        const params = lookup.view.templates.evidenceParams(&template);
+        return try self.synthesizeParamsEvidence(lookup.view, template, callable_mono_ty);
+    }
+
+    /// Resolve a template's obligations from its published dispatcher paths
+    /// over the concrete monomorphic callable.
+    fn synthesizeParamsEvidence(
+        self: *BodyContext,
+        view: ModuleView,
+        template: checked.CheckedProcedureTemplate,
+        callable_mono_ty: Type.TypeId,
+    ) Allocator.Error![]const SpecEvidence {
+        const params = view.templates.evidenceParams(&template);
         if (params.len == 0) return &.{};
 
         const arena = self.builder.evidence_arena.allocator();
         const out = try arena.alloc(SpecEvidence, params.len);
         for (params, 0..) |param, i| {
-            const path = lookup.view.templates.evidenceParamPath(param);
+            const path = view.templates.evidenceParamPath(param);
             if (path.len == 0) {
-                self.builder.evidenceGap("synthesize-pathless", lookup.view.names.methodNameText(param.method));
+                self.builder.evidenceGap("synthesize-pathless", view.names.methodNameText(param.method));
                 out[i] = .unavailable;
                 continue;
             }
-            const component_ty = try self.walkEvidencePath(lookup.view, callable_mono_ty, path) orelse {
-                self.builder.evidenceGap("synthesize-path-miss", lookup.view.names.methodNameText(param.method));
+            const component_ty = try self.walkEvidencePath(view, callable_mono_ty, path) orelse {
+                self.builder.evidenceGap("synthesize-path-miss", view.names.methodNameText(param.method));
                 out[i] = .unavailable;
                 continue;
             };
-            out[i] = try self.synthesizeComponentEvidence(lookup.view, param.method, component_ty);
+            out[i] = try self.synthesizeComponentEvidence(view, param.method, component_ty);
         }
         return out;
     }
