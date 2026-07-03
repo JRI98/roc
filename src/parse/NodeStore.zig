@@ -435,8 +435,6 @@ pub fn addHeader(store: *NodeStore, header: AST.Header) std.mem.Allocator.Error!
             node.data.lhs = @intFromEnum(app.provides);
             node.data.rhs = @intFromEnum(app.packages);
             node.region = app.region;
-
-            try store.extra_data.append(store.gpa, @intFromEnum(app.platform_idx));
         },
         .module => |mod| {
             node.tag = .module_header;
