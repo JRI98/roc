@@ -13,7 +13,7 @@ const TestEnv = @import("./TestEnv.zig");
 
 const Var = @import("types").Var;
 
-fn defVar(env: *const ModuleEnv, name: []const u8) !Var {
+fn defVar(env: *const ModuleEnv, name: []const u8) error{TestUnexpectedResult}!Var {
     const idents = env.getIdentStoreConst();
     const defs_slice = env.store.sliceDefs(env.all_defs);
     for (defs_slice) |def_idx| {
@@ -31,7 +31,7 @@ fn defVar(env: *const ModuleEnv, name: []const u8) !Var {
 }
 
 /// Find an associated method's def var by method name via the method-defs map.
-fn methodDefVar(env: *ModuleEnv, name: []const u8) !Var {
+fn methodDefVar(env: *ModuleEnv, name: []const u8) error{TestUnexpectedResult}!Var {
     const idents = env.getIdentStoreConst();
     for (env.method_defs.entries.items) |entry| {
         if (std.mem.eql(u8, name, idents.getText(entry.key.methodIdent()))) {
@@ -46,7 +46,7 @@ fn enumerate(
     env: *const ModuleEnv,
     root: Var,
     out: *std.ArrayListUnmanaged(dispatch_evidence.EvidenceParam),
-) !void {
+) std.mem.Allocator.Error!void {
     var scratch = dispatch_evidence.Scratch{};
     defer scratch.deinit(gpa);
     try dispatch_evidence.enumerateEvidenceParams(gpa, &env.types, root, &scratch, out);

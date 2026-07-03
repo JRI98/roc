@@ -25,11 +25,9 @@
 
 const std = @import("std");
 const types_mod = @import("types");
-const base = @import("base");
 
 const Allocator = std.mem.Allocator;
 const Var = types_mod.Var;
-const Ident = base.Ident;
 const StaticDispatchConstraint = types_mod.StaticDispatchConstraint;
 
 /// One semantic step from a type to one of its components. `data` is a

@@ -292,53 +292,6 @@ const MethodDispatch = struct {
     method: names.MethodNameId,
 };
 
-fn methodOwnerOrder(a: static_dispatch.MethodOwner, b: static_dispatch.MethodOwner) std.math.Order {
-    const a_tag = methodOwnerTagRank(a);
-    const b_tag = methodOwnerTagRank(b);
-    if (a_tag != b_tag) return orderU32(a_tag, b_tag);
-
-    return switch (a) {
-        .nominal => |a_nominal| switch (b) {
-            .nominal => |b_nominal| blk: {
-                const module_order = orderEnum(names.ModuleIdentityId, a_nominal.module, b_nominal.module);
-                if (module_order != .eq) break :blk module_order;
-                const type_order = orderEnum(names.TypeNameId, a_nominal.type_name, b_nominal.type_name);
-                if (type_order != .eq) break :blk type_order;
-                break :blk orderOptionalU32(a_nominal.source_decl, b_nominal.source_decl);
-            },
-            else => unreachable,
-        },
-        .builtin => |a_builtin| switch (b) {
-            .builtin => |b_builtin| orderEnum(static_dispatch.BuiltinOwner, a_builtin, b_builtin),
-            else => unreachable,
-        },
-    };
-}
-
-fn methodOwnerTagRank(owner: static_dispatch.MethodOwner) u32 {
-    return switch (owner) {
-        .nominal => 0,
-        .builtin => 1,
-    };
-}
-
-fn orderOptionalU32(a: ?u32, b: ?u32) std.math.Order {
-    if (a) |a_value| {
-        return if (b) |b_value| orderU32(a_value, b_value) else .gt;
-    }
-    return if (b == null) .eq else .lt;
-}
-
-fn orderEnum(comptime T: type, a: T, b: T) std.math.Order {
-    return orderU32(@intFromEnum(a), @intFromEnum(b));
-}
-
-fn orderU32(a: u32, b: u32) std.math.Order {
-    if (a < b) return .lt;
-    if (a > b) return .gt;
-    return .eq;
-}
-
 const FunctionShape = struct {
     args: Type.Span,
     ret: Type.TypeId,
