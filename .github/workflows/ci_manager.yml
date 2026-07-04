@@ -141,12 +141,26 @@ jobs:
         with:
           arch: x64
 
-      - name: Run MiniCI
+      # Dep fetching and compilation happen here, where network flakes surface
+      # on stdout for flaky-retry to match. The minici run below then hits a
+      # warm cache and goes straight to the run steps, so its failures are
+      # genuine and never retried.
+      - name: Build MiniCI binaries
         uses: ./.github/actions/flaky-retry
         with:
-          command: zig build minici
+          command: zig build build-ci
           error_string_contains: "HttpConnectionClosing|build.zig.zon|TemporaryNameServerFailure|error: cannot download|EndOfStream|WriteFailed|503|Timeout|bad HTTP response code"
           retry_count: 3
+
+      - name: Run MiniCI
+        run: zig build minici
+
+      - name: Upload MiniCI report and logs
+        if: failure()
+        uses: actions/upload-artifact@v4 # ratchet:actions/upload-artifact@v4
+        with:
+          name: minici-${{ matrix.os }}
+          path: zig-out/minici/
 
   finish:
     needs: [check-changes, zig-minici]
