@@ -83,10 +83,11 @@ regions: Region.List,
 imported_modules: []const *const ModuleEnv,
 /// Module envs whose public APIs are semantically visible through imported checked data.
 owner_modules: []const *const ModuleEnv,
-/// Module envs whose public APIs are semantically visible through direct imports.
-/// These are not lexically importable, and CIR import indexes never refer to
-/// this set. It exists only for owner lookups on copied imported types.
-owner_module_envs: std.StringHashMap(*const ModuleEnv),
+/// Env-local identity (in `cir`'s module identity table) that types minted
+/// from compiler-builtin declarations carry as their `origin_module`: the
+/// Builtin module's deep content identity (or this module's own identity when
+/// checking the Builtin module itself, whose content identity is identical).
+builtin_origin_identity: base.ModuleIdentity.Idx,
 /// Map of auto-imported type names (like "Str", "List", "Bool") to their defining modules.
 /// This is used to resolve type names that are automatically available without explicit imports.
 auto_imported_types: ?*const std.AutoHashMap(Ident.Idx, can.Can.AutoImportedType),
@@ -1026,8 +1027,6 @@ const Constraint = union(enum) {
 /// Context for type checking: module identity, builtin type references, and the Builtin module itself.
 /// This is passed to Check.init() to provide access to auto-imported types from Builtin.
 pub const BuiltinContext = struct {
-    /// The name of the module being type-checked
-    module_name: base.Ident.Idx,
     /// Statement index of Bool type in the current module (injected from Builtin.bin)
     bool_stmt: can.CIR.Statement.Idx,
     /// Statement index of Try type in the current module (injected from Builtin.bin)
@@ -1128,8 +1127,30 @@ fn initAssumePrepared(
     regions: *const Region.List,
     builtin_ctx: BuiltinContext,
 ) std.mem.Allocator.Error!Self {
-    var owner_module_envs = try buildOwnerModuleEnvMap(gpa, imported_modules, owner_modules);
-    errdefer owner_module_envs.deinit();
+    // Finalize this module's deep content identity before any unification: the
+    // unifier only ever compares precomputed identities. Idempotent — the
+    // coordinator already finalized coordinator-driven modules (it needs the
+    // identity for the checked-cache key probe); this covers every other
+    // checking entry point (tests, snapshot tool, playground, builtin bake)
+    // with the same inputs: the resolved direct imports.
+    try cir.ensureContentIdentity(imported_modules);
+
+    // Resolve the env-local identity that builtin-origin types minted during
+    // this check will carry. When a separate Builtin module env exists, rebase
+    // its content identity into this module's table; when checking the Builtin
+    // module itself, its own identity IS the builtin identity.
+    const builtin_origin_identity = blk: {
+        if (builtin_ctx.builtin_module) |builtin_env| {
+            const builtin_hash = builtin_env.contentIdentityHash() orelse {
+                std.debug.panic(
+                    "type checker invariant violated: Builtin module env has no content identity while checking module '{s}'",
+                    .{cir.module_name},
+                );
+            };
+            break :blk try cir.internModuleIdentity(builtin_hash, cir.idents.builtin_module);
+        }
+        break :blk cir.selfModuleIdentity();
+    };
 
     var import_mapping = try createImportMapping(
         gpa,
@@ -1146,7 +1167,7 @@ fn initAssumePrepared(
         .cir = cir,
         .imported_modules = imported_modules,
         .owner_modules = owner_modules,
-        .owner_module_envs = owner_module_envs,
+        .builtin_origin_identity = builtin_origin_identity,
         .auto_imported_types = auto_imported_types,
         .regions = blk: {
             var owned = Region.List{};
@@ -1250,41 +1271,6 @@ fn initAssumePrepared(
     return self;
 }
 
-fn buildOwnerModuleEnvMap(
-    gpa: std.mem.Allocator,
-    imported_modules: []const *const ModuleEnv,
-    owner_modules: []const *const ModuleEnv,
-) std.mem.Allocator.Error!std.StringHashMap(*const ModuleEnv) {
-    var map = std.StringHashMap(*const ModuleEnv).init(gpa);
-    errdefer map.deinit();
-
-    for (imported_modules) |imported_env| {
-        if (imported_env.module_role == .builtin) continue;
-        try putOwnerModuleEnvNames(&map, imported_env);
-    }
-    for (owner_modules) |owner_env| {
-        if (owner_env.module_role == .builtin) continue;
-        try putOwnerModuleEnvNames(&map, owner_env);
-    }
-
-    return map;
-}
-
-fn putOwnerModuleEnvNames(
-    map: *std.StringHashMap(*const ModuleEnv),
-    module_env: *const ModuleEnv,
-) std.mem.Allocator.Error!void {
-    if (!module_env.qualified_module_ident.isNone()) {
-        try map.put(module_env.getIdent(module_env.qualified_module_ident), module_env);
-    }
-    if (!module_env.display_module_name_idx.isNone()) {
-        try map.put(module_env.getIdent(module_env.display_module_name_idx), module_env);
-    }
-    if (module_env.module_name.len > 0) {
-        try map.put(module_env.module_name, module_env);
-    }
-}
-
 /// Call this after Check has been stored at its final location to set up the import_mapping pointer.
 /// This is needed because returning Check by value invalidates the pointer set during init.
 pub fn fixupTypeWriter(self: *Self) void {
@@ -1297,7 +1283,6 @@ pub fn deinit(self: *Self) void {
     self.problems.deinit(self.gpa);
     self.snapshots.deinit();
     self.import_mapping.deinit();
-    self.owner_module_envs.deinit();
     self.unify_scratch.deinit();
     self.occurs_scratch.deinit();
     self.seen_annos.deinit();
@@ -2805,7 +2790,7 @@ fn unifyEnv(self: *Self) unifier.Env {
         // problems is owned by self.gpa.
         .problems_gpa = self.gpa,
         .ident_store = self.cir.getIdentStoreConst(),
-        .qualified_module_ident = self.cir.qualified_module_ident,
+        .self_module_identity = self.cir.selfModuleIdentity(),
         .types = self.types,
         .problems = &self.problems,
         .snapshots = &self.snapshots,
@@ -3466,11 +3451,8 @@ const BuiltinParseSpecDecl = enum {
     tag_union,
 };
 
-fn builtinOriginModule(self: *const Self) Ident.Idx {
-    return if (self.builtin_ctx.builtin_module) |_|
-        self.cir.idents.builtin_module
-    else
-        self.builtin_ctx.module_name;
+fn builtinOriginModule(self: *const Self) base.ModuleIdentity.Idx {
+    return self.builtin_origin_identity;
 }
 
 fn isCheckingBuiltinModuleDirectly(self: *const Self) bool {
@@ -4634,19 +4616,6 @@ fn checkFileInternal(self: *Self, skip_numeric_defaults: bool) std.mem.Allocator
     defer self.env_pool.release(env);
 
     std.debug.assert(env.rank() == .generalized);
-
-    // When checking the Builtin module directly (e.g., `roc check Builtin.roc`),
-    // the normal pipeline assigns a package-qualified module name like "module.Builtin".
-    // But the pre-compiled Builtin binary uses the unqualified "Builtin" as origin_module
-    // for all its types. This causes type mismatches when locally-defined types (using
-    // "module.Builtin") are unified with types from the pre-compiled module (using "Builtin").
-    // Fix: use the unqualified "Builtin" to match the pre-compiled module's convention.
-    if (self.builtin_ctx.builtin_module != null and self.isCheckingBuiltinModuleDirectly()) {
-        self.builtin_ctx.module_name = self.cir.idents.builtin_module;
-        // Also update qualified_module_ident so that opaque type checks
-        // (canLiftInner) allow pattern matching on types defined in this module.
-        self.cir.qualified_module_ident = self.cir.idents.builtin_module;
-    }
 
     // Copy builtin types (Bool, Try) into this module's type store
     // Note that bool_var and try_var will have generalized rank
@@ -7990,8 +7959,8 @@ fn generateStmtTypeDeclType(
     }
 }
 
-fn aliasOriginModule(self: *const Self) Ident.Idx {
-    return self.builtin_ctx.module_name;
+fn aliasOriginModule(self: *const Self) base.ModuleIdentity.Idx {
+    return self.cir.selfModuleIdentity();
 }
 
 fn predeclareAliasDecl(
@@ -8036,7 +8005,7 @@ fn predeclareNominalDecl(
             .{ .ident_idx = header.relative_name },
             backing_var,
             header_vars,
-            self.builtin_ctx.module_name,
+            self.cir.selfModuleIdentity(),
             @intFromEnum(decl_var),
             nominal.is_opaque,
             self.cir.module_role == .builtin,
@@ -8143,7 +8112,7 @@ fn generateNominalDecl(
                 .{ .ident_idx = header.relative_name },
                 ModuleEnv.varFrom(nominal.anno),
                 header_vars,
-                self.builtin_ctx.module_name,
+                self.cir.selfModuleIdentity(),
                 @intFromEnum(decl_idx),
                 nominal.is_opaque,
                 self.cir.module_role == .builtin,
@@ -8467,7 +8436,7 @@ fn generateAnnoTypeInPlace(self: *Self, anno_idx: CIR.TypeAnno.Idx, env: *Env, c
                                             .{ .ident_idx = this_decl.name },
                                             this_decl.backing_var,
                                             &.{},
-                                            self.builtin_ctx.module_name,
+                                            self.cir.selfModuleIdentity(),
                                             @intFromEnum(this_decl.idx),
                                             this_decl.is_opaque,
                                             self.cir.module_role == .builtin,
@@ -8575,7 +8544,7 @@ fn generateAnnoTypeInPlace(self: *Self, anno_idx: CIR.TypeAnno.Idx, env: *Env, c
                                             .{ .ident_idx = this_decl.name },
                                             this_decl.backing_var,
                                             anno_arg_vars,
-                                            self.builtin_ctx.module_name,
+                                            self.cir.selfModuleIdentity(),
                                             @intFromEnum(this_decl.idx),
                                             this_decl.is_opaque,
                                             self.cir.module_role == .builtin,
@@ -12085,7 +12054,7 @@ fn toInspectMethodVarForAlias(
 
 fn methodOwnerEnv(
     self: *Self,
-    origin_module: Ident.Idx,
+    origin_module: base.ModuleIdentity.Idx,
     source_decl: ?u32,
     origin_is_builtin: bool,
 ) Allocator.Error!struct { *const ModuleEnv, bool } {
@@ -12097,9 +12066,14 @@ const OwnerEnvCandidate = struct {
     is_this_module: bool,
 };
 
+/// Resolve the module env that declares a type from the type's content-based
+/// origin identity: an exact 32-byte hash comparison against each candidate
+/// env's own content identity. No name matching — two envs match the same
+/// origin only when their transitive module content is byte-identical, in
+/// which case they are interchangeable as type owners by definition.
 fn ownerEnvForOriginModule(
     self: *const Self,
-    origin_module: Ident.Idx,
+    origin_module: base.ModuleIdentity.Idx,
     source_decl: ?u32,
     origin_is_builtin: bool,
     context: []const u8,
@@ -12108,42 +12082,49 @@ fn ownerEnvForOriginModule(
         return self.builtinOwnerEnvForSourceDecl(source_decl, context);
     }
 
-    const origin_text = self.cir.getIdent(origin_module);
-    const owner_source_decl = nonBuiltinOwnerSourceDecl(source_decl, context, origin_text);
+    const origin_hash = self.cir.moduleIdentityHash(origin_module);
+    const owner_source_decl = nonBuiltinOwnerSourceDecl(source_decl, context, self.cir.moduleIdentityDisplayText(origin_module));
 
-    var found: ?OwnerEnvCandidate = null;
-    considerOwnerEnvCandidate(&found, self.cir, true, origin_text, owner_source_decl, context);
+    if (ownerEnvIdentityMatches(self.cir, origin_hash)) {
+        debugAssertOwnerEnvSourceDecl(self.cir, owner_source_decl, context);
+        return .{ self.cir, true };
+    }
     for (self.imported_modules) |imported_env| {
         if (imported_env.module_role == .builtin) continue;
-        considerOwnerEnvCandidate(&found, imported_env, false, origin_text, owner_source_decl, context);
+        if (ownerEnvIdentityMatches(imported_env, origin_hash)) {
+            debugAssertOwnerEnvSourceDecl(imported_env, owner_source_decl, context);
+            return .{ imported_env, false };
+        }
     }
     for (self.owner_modules) |owner_env| {
         if (owner_env.module_role == .builtin) continue;
-        considerOwnerEnvCandidate(&found, owner_env, false, origin_text, owner_source_decl, context);
-    }
-
-    if (found) |owner| return .{ owner.env, owner.is_this_module };
-
-    if (self.owner_module_envs.get(origin_text)) |owner_env| {
-        if (!ownerModuleEnvSourceDeclMatches(owner_env, owner_source_decl)) {
-            if (builtin.mode == .Debug) {
-                std.debug.panic(
-                    "type checker invariant violated: {s} owner {s} resolved by name to an environment without source_decl={d}",
-                    .{ context, origin_text, owner_source_decl },
-                );
-            }
-            unreachable;
+        if (ownerEnvIdentityMatches(owner_env, origin_hash)) {
+            debugAssertOwnerEnvSourceDecl(owner_env, owner_source_decl, context);
+            return .{ owner_env, false };
         }
-        return .{ owner_env, false };
     }
 
     if (builtin.mode == .Debug) {
         std.debug.panic(
             "type checker invariant violated: unable to find module environment for {s} owner from module {s}, source_decl={d}, origin_is_builtin={}",
-            .{ context, origin_text, owner_source_decl, origin_is_builtin },
+            .{ context, self.cir.moduleIdentityDisplayText(origin_module), owner_source_decl, origin_is_builtin },
         );
     }
     unreachable;
+}
+
+fn ownerEnvIdentityMatches(candidate: *const ModuleEnv, origin_hash: *const base.ModuleIdentity.Hash) bool {
+    const candidate_hash = candidate.contentIdentityHash() orelse return false;
+    return base.ModuleIdentity.eql(candidate_hash, origin_hash);
+}
+
+fn debugAssertOwnerEnvSourceDecl(candidate: *const ModuleEnv, source_decl: u32, context: []const u8) void {
+    if (builtin.mode != .Debug) return;
+    if (ownerModuleEnvSourceDeclMatches(candidate, source_decl)) return;
+    std.debug.panic(
+        "type checker invariant violated: {s} owner resolved by content identity to module '{s}' whose node {d} is not a type declaration",
+        .{ context, candidate.module_name, source_decl },
+    );
 }
 
 fn nonBuiltinOwnerSourceDecl(source_decl: ?u32, context: []const u8, origin_text: []const u8) u32 {
@@ -12205,45 +12186,6 @@ fn maybeBuiltinOwnerEnvForSourceDecl(
     }
 
     return null;
-}
-
-fn considerOwnerEnvCandidate(
-    found: *?OwnerEnvCandidate,
-    candidate: *const ModuleEnv,
-    is_this_module: bool,
-    origin_text: []const u8,
-    source_decl: u32,
-    context: []const u8,
-) void {
-    if (!ownerModuleEnvNameMatches(candidate, origin_text)) return;
-    if (!ownerModuleEnvSourceDeclMatches(candidate, source_decl)) return;
-
-    if (found.*) |existing| {
-        if (existing.env == candidate) return;
-        if (builtin.mode == .Debug) {
-            std.debug.panic(
-                "type checker invariant violated: {s} owner {s} resolves to multiple module environments",
-                .{ context, origin_text },
-            );
-        }
-        unreachable;
-    }
-
-    found.* = .{ .env = candidate, .is_this_module = is_this_module };
-}
-
-fn ownerModuleEnvNameMatches(candidate: *const ModuleEnv, origin_text: []const u8) bool {
-    if (!candidate.qualified_module_ident.isNone() and
-        Ident.textEql(candidate.getIdent(candidate.qualified_module_ident), origin_text))
-    {
-        return true;
-    }
-    if (!candidate.display_module_name_idx.isNone() and
-        Ident.textEql(candidate.getIdent(candidate.display_module_name_idx), origin_text))
-    {
-        return true;
-    }
-    return candidate.module_name.len > 0 and Ident.textEql(candidate.module_name, origin_text);
 }
 
 fn ownerModuleEnvSourceDeclMatches(candidate: *const ModuleEnv, source_decl: u32) bool {
@@ -14652,8 +14594,8 @@ fn copyVar(self: *Self, other_module_var: Var, other_module_env: *const ModuleEn
         self.types,
         other_module_var,
         &self.var_map,
-        other_module_env.getIdentStoreConst(),
-        self.cir.getIdentStore(),
+        other_module_env,
+        self.cir,
         self.gpa,
     );
 
@@ -14733,7 +14675,7 @@ fn checkNominalTypeUsage(
 
         // If this nominal type is opaque and we're not in the defining module
         // then report an error
-        if (!nominal_type.canLiftInner(self.cir.qualified_module_ident)) {
+        if (!nominal_type.canLiftInner(self.cir.selfModuleIdentity())) {
             _ = try self.problems.appendProblem(self.cir.gpa, .{ .cannot_access_opaque_nominal = .{
                 .var_ = target_var,
                 .nominal_type_name = nominal_type.ident.ident_idx,

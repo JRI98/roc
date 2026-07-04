@@ -120,7 +120,7 @@ pub const Env = struct {
     /// allocator that created the problem store (see `appendProblem` below).
     problems_gpa: Allocator,
     ident_store: *const Ident.Store,
-    qualified_module_ident: Ident.Idx,
+    self_module_identity: base.ModuleIdentity.Idx,
     types: *types_mod.Store,
     problems: *problem_mod.Store,
     snapshots: *snapshot_mod.Store,
@@ -161,7 +161,7 @@ pub fn unify(env: *const Env, a: Var, b: Var, opts: Options) std.mem.Allocator.E
     env.unify_scratch.reset();
 
     // Unify
-    var unifier = Unifier.init(env.ident_store, env.qualified_module_ident, env.types, env.unify_scratch, env.occurs_scratch);
+    var unifier = Unifier.init(env.ident_store, env.self_module_identity, env.types, env.unify_scratch, env.occurs_scratch);
     unifier.scheduleGuardedPair(a, b, .abort) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
     };
@@ -215,7 +215,7 @@ const Unifier = struct {
     const Self = @This();
 
     ident_store: *const Ident.Store,
-    qualified_module_ident: Ident.Idx,
+    self_module_identity: base.ModuleIdentity.Idx,
     types_store: *types_mod.Store,
     scratch: *Scratch,
     occurs_scratch: *occurs.Scratch,
@@ -226,14 +226,14 @@ const Unifier = struct {
     /// Init unifier
     pub fn init(
         ident_store: *const Ident.Store,
-        qualified_module_ident: Ident.Idx,
+        self_module_identity: base.ModuleIdentity.Idx,
         types_store: *types_mod.Store,
         scratch: *Scratch,
         occurs_scratch: *occurs.Scratch,
     ) Unifier {
         return .{
             .ident_store = ident_store,
-            .qualified_module_ident = qualified_module_ident,
+            .self_module_identity = self_module_identity,
             .types_store = types_store,
             .scratch = scratch,
             .occurs_scratch = occurs_scratch,
@@ -726,7 +726,7 @@ const Unifier = struct {
                     },
                     .empty_tag_union => {
                         // If this nominal is opaque and we're not in the origin module, error
-                        if (!a_type.canLiftInner(self.qualified_module_ident)) {
+                        if (!a_type.canLiftInner(self.self_module_identity)) {
                             return error.TypeMismatch;
                         }
 
@@ -748,7 +748,7 @@ const Unifier = struct {
                     },
                     .empty_record => {
                         // If this nominal is opaque and we're not in the origin module, error
-                        if (!a_type.canLiftInner(self.qualified_module_ident)) {
+                        if (!a_type.canLiftInner(self.self_module_identity)) {
                             return error.TypeMismatch;
                         }
 
@@ -848,7 +848,7 @@ const Unifier = struct {
                     },
                     .nominal_type => |b_type| {
                         // If this nominal is opaque and we're not in the origin module, error
-                        if (!b_type.canLiftInner(self.qualified_module_ident)) {
+                        if (!b_type.canLiftInner(self.self_module_identity)) {
                             return error.TypeMismatch;
                         }
 
@@ -894,7 +894,7 @@ const Unifier = struct {
                     },
                     .nominal_type => |b_type| {
                         // If this nominal is opaque and we're not in the origin module, error
-                        if (!b_type.canLiftInner(self.qualified_module_ident)) {
+                        if (!b_type.canLiftInner(self.self_module_identity)) {
                             return error.TypeMismatch;
                         }
 
@@ -975,7 +975,7 @@ const Unifier = struct {
                     },
                     .nominal_type => |b_type| {
                         // If this nominal is opaque and we're not in the origin module, error
-                        if (!b_type.canLiftInner(self.qualified_module_ident)) {
+                        if (!b_type.canLiftInner(self.self_module_identity)) {
                             return error.TypeMismatch;
                         }
 
@@ -1402,7 +1402,7 @@ const Unifier = struct {
         defer trace.end();
 
         // If this nominal is opaque and we're not in the origin module, error
-        if (!nominal_type.canLiftInner(self.qualified_module_ident)) {
+        if (!nominal_type.canLiftInner(self.self_module_identity)) {
             return error.TypeMismatch;
         }
 
@@ -1493,7 +1493,7 @@ const Unifier = struct {
         defer trace.end();
 
         // If this nominal is opaque and we're not in the origin module, error
-        if (!nominal_type.canLiftInner(self.qualified_module_ident)) {
+        if (!nominal_type.canLiftInner(self.self_module_identity)) {
             return error.TypeMismatch;
         }
 
@@ -2780,28 +2780,28 @@ const WorkFrame = union(enum) {
 /// Public helper functions for tests
 pub fn partitionFields(
     ident_store: *const Ident.Store,
-    qualified_module_ident: Ident.Idx,
+    self_module_identity: base.ModuleIdentity.Idx,
     types_store: *types_mod.Store,
     scratch: *Scratch,
     occurs_scratch: *occurs.Scratch,
     a_fields_range: RecordFieldSafeList.Range,
     b_fields_range: RecordFieldSafeList.Range,
 ) std.mem.Allocator.Error!Unifier.PartitionedRecordFields {
-    var unifier = Unifier.init(ident_store, qualified_module_ident, types_store, scratch, occurs_scratch);
+    var unifier = Unifier.init(ident_store, self_module_identity, types_store, scratch, occurs_scratch);
     return try unifier.partitionFields(scratch, a_fields_range, b_fields_range);
 }
 
 /// Partitions tags from two tag ranges for unification.
 pub fn partitionTags(
     ident_store: *const Ident.Store,
-    qualified_module_ident: Ident.Idx,
+    self_module_identity: base.ModuleIdentity.Idx,
     types_store: *types_mod.Store,
     scratch: *Scratch,
     occurs_scratch: *occurs.Scratch,
     a_tags_range: TagSafeList.Range,
     b_tags_range: TagSafeList.Range,
 ) std.mem.Allocator.Error!Unifier.PartitionedTags {
-    var unifier = Unifier.init(ident_store, qualified_module_ident, types_store, scratch, occurs_scratch);
+    var unifier = Unifier.init(ident_store, self_module_identity, types_store, scratch, occurs_scratch);
     return try unifier.partitionTags(scratch, a_tags_range, b_tags_range);
 }
 
@@ -3115,8 +3115,19 @@ pub const Scratch = struct {
     }
 };
 
+// Identity equality is two integer comparisons with no ident-store access:
+// `origin_module` is an env-local index of the declaring module's deep
+// CONTENT identity (see `base.module_identity`), so the answer never depends
+// on which pipeline built an artifact, what the coordinator named a package,
+// or what directory the build ran in. The within-module discriminator is the
+// declaration: the packed source-decl statement when present (statement
+// indices are stable across checked modules because equal content identities
+// imply byte-identical module source), and the type ident only for
+// declaration-less synthetic nominals. The ident comparison cannot replace
+// the statement for decl-backed builtins, whose minted idents ("U8") and
+// declared relative names ("Num.U8") are spelled differently.
 fn sameAliasIdentity(a: Alias, b: Alias) bool {
-    if (!a.origin_module.eql(b.origin_module)) return false;
+    if (a.origin_module != b.origin_module) return false;
     if (a.source_decl.present or b.source_decl.present) {
         return a.source_decl.eql(b.source_decl);
     }
@@ -3124,7 +3135,7 @@ fn sameAliasIdentity(a: Alias, b: Alias) bool {
 }
 
 fn sameNominalIdentity(a: NominalType, b: NominalType) bool {
-    if (!a.origin_module.eql(b.origin_module)) return false;
+    if (a.origin_module != b.origin_module) return false;
     const a_source_decl = a.sourceDecl();
     const b_source_decl = b.sourceDecl();
     if (a_source_decl.present or b_source_decl.present) {

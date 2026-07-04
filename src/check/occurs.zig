@@ -16,7 +16,6 @@ const base = @import("base");
 const collections = @import("collections");
 const types = @import("types");
 
-const Ident = base.Ident;
 const MkSafeList = collections.SafeList;
 const Store = types.Store;
 const DescStoreIdx = types.DescStoreIdx;
@@ -422,7 +421,7 @@ test "occurs: no recursion through two levels (v1 = Box(v2), v2 = Str)" {
         undefined,
         backing_var,
         &.{v2},
-        Ident.Idx{ .attributes = .{ .effectful = false, .ignored = false, .reassignable = false }, .idx = 0 },
+        base.ModuleIdentity.Idx.NONE,
         false,
     ));
     try types_store.setRootVarContent(v2, Content{ .structure = .empty_record });
@@ -490,7 +489,7 @@ test "occurs: recursive alias (v = Alias(List v))" {
         types.TypeIdent{ .ident_idx = undefined },
         backing_var,
         &.{arg},
-        Ident.Idx.NONE,
+        base.ModuleIdentity.Idx.NONE,
     ));
 
     const result = occurs(&types_store, &scratch, v);
@@ -515,7 +514,7 @@ test "occurs: alias with no recursion (v = Alias Str)" {
         types.TypeIdent{ .ident_idx = undefined },
         backing_var,
         &.{arg_var},
-        Ident.Idx.NONE,
+        base.ModuleIdentity.Idx.NONE,
     ));
 
     const result = occurs(&types_store, &scratch, alias_var);
@@ -568,7 +567,7 @@ test "occurs: nested recursive tag union (v = [ Cons(elem, Box(v)) ] )" {
         undefined,
         box_backing_var,
         &.{linked_list},
-        Ident.Idx{ .attributes = .{ .effectful = false, .ignored = false, .reassignable = false }, .idx = 0 },
+        base.ModuleIdentity.Idx.NONE,
         false,
     ));
 
@@ -611,7 +610,7 @@ test "occurs: recursive tag union (v = List: [ Cons(Elem, List), Nil ])" {
         undefined,
         backing_var,
         &.{},
-        Ident.Idx{ .attributes = .{ .effectful = false, .ignored = false, .reassignable = false }, .idx = 0 },
+        base.ModuleIdentity.Idx.NONE,
         false,
     ));
 
@@ -651,7 +650,7 @@ test "occurs: recursive tag union with multiple nominals (TypeA := TypeB, TypeB 
         undefined,
         type_b_backing,
         &.{},
-        Ident.Idx{ .attributes = .{ .effectful = false, .ignored = false, .reassignable = false }, .idx = 0 },
+        base.ModuleIdentity.Idx.NONE,
         false,
     ));
 
@@ -660,7 +659,7 @@ test "occurs: recursive tag union with multiple nominals (TypeA := TypeB, TypeB 
         undefined,
         type_b_nominal,
         &.{},
-        Ident.Idx{ .attributes = .{ .effectful = false, .ignored = false, .reassignable = false }, .idx = 0 },
+        base.ModuleIdentity.Idx.NONE,
         false,
     ));
 
@@ -703,7 +702,7 @@ test "occurs: valid nominal recursion does not hide later invalid recursion" {
         undefined,
         list_backing,
         &.{},
-        Ident.Idx{ .attributes = .{ .effectful = false, .ignored = false, .reassignable = false }, .idx = 0 },
+        base.ModuleIdentity.Idx.NONE,
         false,
     ));
 
@@ -742,7 +741,7 @@ test "occurs: valid nominal return recursion does not hide invalid argument recu
         undefined,
         list_backing,
         &.{},
-        Ident.Idx{ .attributes = .{ .effectful = false, .ignored = false, .reassignable = false }, .idx = 0 },
+        base.ModuleIdentity.Idx.NONE,
         false,
     ));
 
@@ -790,7 +789,7 @@ test "occurs: anonymous recursion in a nominal's type argument is not valid (reg
         undefined,
         wrapper_backing,
         &.{inner},
-        Ident.Idx{ .attributes = .{ .effectful = false, .ignored = false, .reassignable = false }, .idx = 0 },
+        base.ModuleIdentity.Idx.NONE,
         false,
     ));
 
@@ -827,7 +826,7 @@ test "occurs: anonymous recursion below a buried nominal is not valid (regressio
         undefined,
         inner,
         &.{},
-        Ident.Idx{ .attributes = .{ .effectful = false, .ignored = false, .reassignable = false }, .idx = 0 },
+        base.ModuleIdentity.Idx.NONE,
         false,
     ));
 
