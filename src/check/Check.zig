@@ -344,6 +344,33 @@ has_can_diagnostics: bool,
 /// non-literal/non-`is_eq` dispatch constraint, and does not resolve into the
 /// pinnable set can never be pinned, so its dispatch is reported as ambiguous.
 instantiation_dispatchers: std.ArrayListUnmanaged(InstantiationDispatcher),
+/// Worklist for the local ambiguity judgment. Every dispatch-constrained
+/// receiver var enters this list at the moment it acquires a constraint —
+/// either at a creation site (method call, desugared binop/unaryop,
+/// pattern-literal equality) or when instantiating a constrained scheme
+/// created it. The judgment consumes entries locally: candidates whose var
+/// generalizes are judged at that generalization event (the var is frozen
+/// from then on); candidates left non-generalized (value-restricted bindings,
+/// pre-def instantiations) are judged once at end of check, after the final
+/// constraint fixpoint has had its chance to pin them.
+ambiguity_candidates: std.ArrayListUnmanaged(AmbiguityCandidate),
+/// Index into `ambiguity_candidates` where the currently-processing top-level
+/// def's entries begin. Generalization events scan only from here: entries
+/// below the cursor belong to earlier defs and are either already judged or
+/// awaiting the end-of-check residual judgment.
+ambiguity_candidates_def_start: usize = 0,
+/// Ambiguity verdicts produced by the local judgment, applied (problem
+/// reports + runtime-error poisoning) in one batch at end of check so that
+/// problem order and CIR mutation timing match the settled-state contract the
+/// old end-of-check sweeps established.
+ambiguity_verdicts: std.ArrayListUnmanaged(AmbiguityVerdict),
+/// Cursor into `checked_lambda_params` marking the currently-processing
+/// top-level def's first lambda, so a generalization event's pinnable set
+/// includes exactly this def's lambda parameters.
+checked_lambda_params_def_start: usize = 0,
+/// Cursor into `open_literal_vars` marking the currently-processing top-level
+/// def's first open literal, mirroring `checked_lambda_params_def_start`.
+open_literal_vars_def_start: usize = 0,
 /// How many `instantiation_dispatchers` the end-of-check sweep has already
 /// enqueued for validation. Discharging one instantiated constraint can
 /// instantiate further constrained schemes (a generic method target with its
@@ -482,6 +509,53 @@ const InstantiationDispatcher = struct {
     /// binding (`_ = ...`). A generalized, body-required where-clause created
     /// there is not an exposed polymorphic obligation; the value has been thrown
     /// away, so the obligation must be reported and poisoned.
+    discarded_binding_rhs: bool,
+};
+
+/// One dispatch-constrained receiver var awaiting the local ambiguity
+/// judgment (see `ambiguity_candidates`).
+const AmbiguityCandidate = struct {
+    /// The receiver (dispatcher) var as recorded at the creation or
+    /// instantiation site. Resolved through the union-find at judgment time —
+    /// unification may have merged it with other receivers since.
+    var_: Var,
+    /// For `.instantiation` candidates: the expression whose checking
+    /// instantiated the constrained scheme (see
+    /// `InstantiationDispatcher.instantiation_expr`). Always null for
+    /// `.creation` candidates.
+    instantiation_expr: ?CIR.Expr.Idx,
+    source: Source,
+    /// See `InstantiationDispatcher.discarded_binding_rhs`.
+    discarded_binding_rhs: bool,
+    /// Set once the candidate has been judged (either verdict or acquittal) so
+    /// later events and the end-of-check residual pass skip it.
+    judged: bool = false,
+
+    const Source = enum(u8) {
+        /// The constraint was created directly at a dispatch expression the
+        /// user wrote (method call, desugared operator, pattern-literal
+        /// equality). Judged under the def-site policy: a declared
+        /// `where_clause` contract or an open literal on the same receiver
+        /// legitimizes it.
+        creation,
+        /// The receiver was created by instantiating a generalized constrained
+        /// scheme. Judged under the per-instantiation policy: an instantiated
+        /// `where_clause` contract is an obligation THIS call had to satisfy,
+        /// gated on an in-module dispatch use or a body-forced contract.
+        instantiation,
+    };
+};
+
+/// A candidate the local judgment found unpinnable at its judgment event. The
+/// verdict is applied — problem report plus runtime-error poisoning — in one
+/// batch at end of check (`applyAmbiguityVerdicts`), where the type store has
+/// fully settled and CIR mutation can no longer perturb later checking.
+const AmbiguityVerdict = struct {
+    /// The receiver var, resolved at judgment time.
+    var_: Var,
+    /// Copied from the candidate (see `AmbiguityCandidate`).
+    instantiation_expr: ?CIR.Expr.Idx,
+    source: AmbiguityCandidate.Source,
     discarded_binding_rhs: bool,
 };
 
@@ -1272,6 +1346,8 @@ fn initAssumePrepared(
         .hoist_selection_suppressed_depth = 0,
         .has_can_diagnostics = if (cir.store.scratch) |scratch| scratch.diagnostics.top() > 0 else false,
         .instantiation_dispatchers = .empty,
+        .ambiguity_candidates = .empty,
+        .ambiguity_verdicts = .empty,
         .open_literal_vars = .empty,
         .open_numeral_literals = .empty,
         .pending_tuple_accesses = .empty,
@@ -1382,6 +1458,8 @@ pub fn deinit(self: *Self) void {
     self.deferred_def_unifications.deinit(self.gpa);
     self.deferred_platform_required_unifications.deinit(self.gpa);
     self.instantiation_dispatchers.deinit(self.gpa);
+    self.ambiguity_candidates.deinit(self.gpa);
+    self.ambiguity_verdicts.deinit(self.gpa);
     self.scratch_evidence_pairs.deinit(self.gpa);
     self.open_literal_vars.deinit(self.gpa);
     self.open_numeral_literals.deinit(self.gpa);
@@ -3615,6 +3693,12 @@ fn instantiateVarHelp(
                             .instantiation_expr = self.discarded_binding_rhs_expr orelse self.instantiation_source_expr,
                             .discarded_binding_rhs = self.discarded_binding_rhs_expr != null,
                         });
+                        try self.recordAmbiguityCandidate(
+                            fresh_var,
+                            .instantiation,
+                            self.discarded_binding_rhs_expr orelse self.instantiation_source_expr,
+                            self.discarded_binding_rhs_expr != null,
+                        );
                     }
                 }
             }
@@ -6367,6 +6451,25 @@ fn constraintIntroExpr(constraint: StaticDispatchConstraint) ?CIR.Expr.Idx {
     return @enumFromInt(raw);
 }
 
+/// Record a dispatch-constrained receiver on the ambiguity worklist (see
+/// `ambiguity_candidates`). The var is stored as recorded and resolved through
+/// the union-find at judgment time, so receivers merged by later unification
+/// are deduplicated by the judgment's reported-var set rather than here.
+fn recordAmbiguityCandidate(
+    self: *Self,
+    receiver_var: Var,
+    source: AmbiguityCandidate.Source,
+    instantiation_expr: ?CIR.Expr.Idx,
+    discarded_binding_rhs: bool,
+) std.mem.Allocator.Error!void {
+    try self.ambiguity_candidates.append(self.gpa, .{
+        .var_ = receiver_var,
+        .instantiation_expr = instantiation_expr,
+        .source = source,
+        .discarded_binding_rhs = discarded_binding_rhs,
+    });
+}
+
 fn interpolationConstraintIdForFnVar(self: *Self, fn_var: Var) ?InterpolationConstraintId {
     if (self.interpolation_constraint_ids_by_fn_var.count() == 0) return null;
 
@@ -8097,6 +8200,20 @@ fn checkDef(self: *Self, def_idx: CIR.Def.Idx, env: *Env) std.mem.Allocator.Erro
     const saved_processing_def = self.current_processing_def;
     self.current_processing_def = def_idx;
     defer self.current_processing_def = saved_processing_def;
+
+    // Scope the ambiguity-judgment cursors to this def: a generalization event
+    // inside it judges only candidates recorded while checking it, against a
+    // pinnable frontier built from its own lambda params and open literals.
+    // Saved/restored (not reset) because dependency defs check re-entrantly.
+    const saved_ambiguity_candidates_def_start = self.ambiguity_candidates_def_start;
+    self.ambiguity_candidates_def_start = self.ambiguity_candidates.items.len;
+    defer self.ambiguity_candidates_def_start = saved_ambiguity_candidates_def_start;
+    const saved_checked_lambda_params_def_start = self.checked_lambda_params_def_start;
+    self.checked_lambda_params_def_start = self.checked_lambda_params.items.len;
+    defer self.checked_lambda_params_def_start = saved_checked_lambda_params_def_start;
+    const saved_open_literal_vars_def_start = self.open_literal_vars_def_start;
+    self.open_literal_vars_def_start = self.open_literal_vars.items.len;
+    defer self.open_literal_vars_def_start = saved_open_literal_vars_def_start;
 
     // Make as processing
     const def_name = self.getPatternIdent(def.pattern);
@@ -14394,6 +14511,7 @@ fn mkBinopConstraint(
     );
 
     _ = try self.unify(constrained_var, lhs_var, env);
+    try self.recordAmbiguityCandidate(lhs_var, .creation, null, false);
 }
 
 fn publishBinopDispatchExpr(
@@ -14476,6 +14594,7 @@ fn mkUnaryOp(
     );
 
     _ = try self.unify(constrained_var, arg_var, env);
+    try self.recordAmbiguityCandidate(arg_var, .creation, null, false);
 }
 
 fn publishUnaryDispatchExpr(
@@ -14654,6 +14773,7 @@ fn mkReceiverDispatchConstraint(
     );
 
     _ = try self.unify(constrained_var, receiver_var, env);
+    try self.recordAmbiguityCandidate(receiver_var, .creation, null, false);
     return constraint_fn_var;
 }
 
@@ -14689,6 +14809,7 @@ fn mkTypeMethodCallConstraint(
     );
 
     _ = try self.unify(constrained_var, dispatcher_var, env);
+    try self.recordAmbiguityCandidate(dispatcher_var, .creation, null, false);
     return constraint_fn_var;
 }
 
