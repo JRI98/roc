@@ -150,12 +150,18 @@ pub const CallableIdentity = union(enum(u8)) {
     generated: GeneratedId,
 };
 
-/// Full specialization identity: callable plus source and closed function types.
+/// Full specialization identity: callable plus source function type and the
+/// closed monomorphic function type the reserving call site REQUESTED.
+///
+/// The identity is immutable: it is written once when the record is reserved
+/// and never rewritten. Body evidence that refines the requested type is data
+/// on the `SpecRecord` (`request_fn_ty`/`solved_fn_ty` views), reachable
+/// through additional lookup aliases — never a rekey of this identity.
 pub const SpecIdentity = struct {
     callable: CallableIdentity,
     source_fn_ty_digest: names.TypeDigest,
-    mono_fn_ty_digest: names.TypeDigest,
-    mono_fn_ty: Type.TypeId,
+    request_fn_ty_digest: names.TypeDigest,
+    request_fn_ty: Type.TypeId,
 };
 
 /// Lifecycle state for a specialization record.
@@ -166,8 +172,19 @@ pub const SpecStatus = enum(u8) {
 };
 
 /// Durable record describing one reserved, lowering, or ready specialization.
+///
+/// `identity` is the immutable creation-time key. The type views are data:
+/// `request_fn_ty` starts as the identity's requested type and may be refined
+/// once, while still `.reserved`, when the requester's graph seals deferred
+/// request types; `solved_fn_ty` mirrors the request view until `.ready`
+/// records the body's solved type. Both views only ever become more specific;
+/// a finished record is never widened (one-way snapshot rule).
 pub const SpecRecord = struct {
     identity: SpecIdentity,
+    request_fn_ty: Type.TypeId,
+    request_fn_ty_digest: names.TypeDigest,
+    solved_fn_ty: Type.TypeId,
+    solved_fn_ty_digest: names.TypeDigest,
     fn_id: FnId,
     status: SpecStatus,
 };
@@ -848,7 +865,9 @@ pub const ProgramView = struct {
         if (!self.types.frozen) return .type_store_not_frozen;
 
         for (self.specs) |spec| {
-            if (!self.typeRefInBounds(spec.identity.mono_fn_ty)) return .spec_type_out_of_bounds;
+            if (!self.typeRefInBounds(spec.identity.request_fn_ty)) return .spec_type_out_of_bounds;
+            if (!self.typeRefInBounds(spec.request_fn_ty)) return .spec_type_out_of_bounds;
+            if (!self.typeRefInBounds(spec.solved_fn_ty)) return .spec_type_out_of_bounds;
         }
         for (self.fns) |fn_| {
             if (!self.typeRefInBounds(fn_.source.mono_fn_ty)) return .fn_type_out_of_bounds;
@@ -1472,9 +1491,13 @@ test "monotype program view exposes read-only side arrays" {
         .identity = .{
             .callable = .{ .proc_template = .{ .module = .{}, .proc_base = 0, .template = 0 } },
             .source_fn_ty_digest = .{},
-            .mono_fn_ty_digest = .{},
-            .mono_fn_ty = unit_ty,
+            .request_fn_ty_digest = .{},
+            .request_fn_ty = unit_ty,
         },
+        .request_fn_ty = unit_ty,
+        .request_fn_ty_digest = .{},
+        .solved_fn_ty = unit_ty,
+        .solved_fn_ty_digest = .{},
         .fn_id = fn_id,
         .status = .reserved,
     });

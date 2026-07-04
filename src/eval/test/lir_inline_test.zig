@@ -317,14 +317,15 @@ fn specRecordMatches(
 ) Allocator.Error!bool {
     if (!std.meta.eql(candidate.identity.callable, expected.identity.callable)) return false;
     if (!digestBytesEqual(candidate.identity.source_fn_ty_digest, expected.identity.source_fn_ty_digest)) return false;
-    if (!digestBytesEqual(candidate.identity.mono_fn_ty_digest, expected.identity.mono_fn_ty_digest)) return false;
+    if (!digestBytesEqual(candidate.identity.request_fn_ty_digest, expected.identity.request_fn_ty_digest)) return false;
+    if (!digestBytesEqual(candidate.solved_fn_ty_digest, expected.solved_fn_ty_digest)) return false;
     return try MonoType.typeEqlAcrossStores(
         allocator,
         name_store,
         candidate_types,
-        candidate.identity.mono_fn_ty,
+        candidate.solved_fn_ty,
         expected_types,
-        expected.identity.mono_fn_ty,
+        expected.solved_fn_ty,
     );
 }
 
@@ -360,7 +361,7 @@ fn expectSpecsCoveredByCachedOrLoaded(
 }
 
 fn isUnaryPrimitiveFnSpec(view: MonoAst.ProgramView, record: MonoAst.SpecRecord, primitive: MonoType.Primitive) bool {
-    const func = switch (view.types.get(record.identity.mono_fn_ty)) {
+    const func = switch (view.types.get(record.solved_fn_ty)) {
         .func => |func| func,
         else => return false,
     };
