@@ -13395,18 +13395,12 @@ const EvidencePass = struct {
                             return .{ .builtin = static_dispatch.builtinOwnerForCheckedBuiltin(builtin_nominal) };
                         }
                         const idents = self.module.identStoreConst();
-                        const module_name = self.names.internModuleIdent(idents, nominal.origin_module) catch return null;
-                        if (nominal.sourceDeclOptional()) |source_decl| {
-                            return .{ .source_decl = .{
-                                .module_name = module_name,
-                                .statement = source_decl,
-                            } };
-                        }
+                        const module_identity_id = self.names.internModuleIdentity(self.module.moduleEnvConst().moduleIdentityHash(nominal.origin_module)) catch return null;
                         const type_name = self.names.internTypeIdent(idents, nominal.ident.ident_idx) catch return null;
                         return .{ .nominal = .{
-                            .module_name = module_name,
+                            .module = module_identity_id,
                             .type_name = type_name,
-                            .source_decl = null,
+                            .source_decl = nominal.sourceDeclOptional(),
                         } };
                     },
                     else => return null,
@@ -15647,6 +15641,860 @@ fn platformRequiredPayloadForDeclaration(
         }
         unreachable;
     };
+}
+
+fn specializeResolvedStaticDispatchPlanCallables(
+    allocator: Allocator,
+    names: *canonical.CanonicalNameStore,
+    store: *CheckedTypeStore,
+    artifact_key: CheckedModuleArtifactKey,
+    module_idx: u32,
+    direct_imports: []const PublishImportArtifact,
+    available_artifacts: []const ImportedModuleView,
+    plans: *static_dispatch.StaticDispatchPlanTable,
+) Allocator.Error!void {
+    for (plans.plans) |*plan| {
+        const node_id = switch (plan.resolution) {
+            .direct => |node_id| node_id,
+            .constraint, .structural, .checked_error, .unreachable_dispatch => continue,
+        };
+        const target = plans.evidenceNode(node_id).target;
+        const target_callable = try projectResolvedDispatchTargetCallable(
+            allocator,
+            names,
+            store,
+            artifact_key,
+            module_idx,
+            direct_imports,
+            available_artifacts,
+            target,
+        );
+        plan.callable_ty = try instantiateResolvedDispatchTargetCallable(
+            allocator,
+            names,
+            store,
+            target_callable,
+            plan.callable_ty,
+        );
+    }
+    for (plans.iterator_for_plans) |*iterator_plan| {
+        inline for (.{ &iterator_plan.iter, &iterator_plan.next }) |call| {
+            switch (call.resolution) {
+                .direct => |node_id| {
+                    const target = plans.evidenceNode(node_id).target;
+                    const target_callable = try projectResolvedDispatchTargetCallable(
+                        allocator,
+                        names,
+                        store,
+                        artifact_key,
+                        module_idx,
+                        direct_imports,
+                        available_artifacts,
+                        target,
+                    );
+                    call.callable_ty = try instantiateResolvedDispatchTargetCallable(
+                        allocator,
+                        names,
+                        store,
+                        target_callable,
+                        call.callable_ty,
+                    );
+                },
+                .constraint, .structural, .checked_error, .unreachable_dispatch => {},
+            }
+        }
+    }
+}
+
+fn projectResolvedDispatchTargetCallable(
+    allocator: Allocator,
+    names: *canonical.CanonicalNameStore,
+    store: *CheckedTypeStore,
+    artifact_key: CheckedModuleArtifactKey,
+    module_idx: u32,
+    direct_imports: []const PublishImportArtifact,
+    available_artifacts: []const ImportedModuleView,
+    target: static_dispatch.MethodTarget,
+) Allocator.Error!CheckedTypeId {
+    const target_key = switch (target.kind) {
+        .local_proc => return target.callable_ty,
+        .generated_structural_parser,
+        .generated_structural_encoder,
+        => {
+            if (target.module_idx == module_idx) return target.callable_ty;
+            const imported = importedModuleViewByModuleIdx(available_artifacts, target.module_idx) orelse direct: {
+                for (direct_imports) |import| {
+                    if (import.view.module_identity.module_idx == target.module_idx) break :direct import.view;
+                }
+                checkedArtifactInvariant("resolved generated structural dispatch target module was not available during checked publication", .{});
+            };
+            var projector = CheckedTypeStoreImportProjector.init(allocator, store, names, imported);
+            defer projector.deinit();
+            return try projector.project(target.callable_ty);
+        },
+        .procedure => |procedure| checkedArtifactKeyFromArtifactRef(procedure.template.artifact),
+    };
+    if (checkedArtifactKeyEql(target_key, artifact_key)) return target.callable_ty;
+
+    // Snapshot-style compiles pass the builtin module only as a DIRECT
+    // import; total resolution makes builtin-owned direct targets ubiquitous,
+    // so search both view sets.
+    const imported = importedModuleViewByKey(available_artifacts, target_key) orelse direct: {
+        for (direct_imports) |import| {
+            if (checkedArtifactKeyEql(import.key, target_key)) break :direct import.view;
+        }
+        checkedArtifactInvariant("resolved dispatch target artifact was not available during checked publication", .{});
+    };
+    var projector = CheckedTypeStoreImportProjector.init(allocator, store, names, imported);
+    defer projector.deinit();
+    return try projector.project(target.callable_ty);
+}
+
+fn instantiateResolvedDispatchTargetCallable(
+    allocator: Allocator,
+    names: *const canonical.CanonicalNameStore,
+    store: *CheckedTypeStore,
+    target_callable: CheckedTypeId,
+    plan_callable: CheckedTypeId,
+) Allocator.Error!CheckedTypeId {
+    const target_fn = checkedFunctionPayload(store, target_callable, "resolved dispatch target callable");
+    const plan_fn = checkedFunctionPayload(store, plan_callable, "resolved dispatch plan callable");
+    if (target_fn.args.len != plan_fn.args.len) {
+        checkedArtifactInvariant("resolved dispatch target arity differed from plan arity", .{});
+    }
+    const target_args = try allocator.dupe(CheckedTypeId, target_fn.args);
+    defer allocator.free(target_args);
+    const plan_args = try allocator.dupe(CheckedTypeId, plan_fn.args);
+    defer allocator.free(plan_args);
+    const plan_ret = plan_fn.ret;
+
+    var target_formals = std.ArrayList(CheckedTypeId).empty;
+    defer target_formals.deinit(allocator);
+    var target_actuals = std.ArrayList(CheckedTypeId).empty;
+    defer target_actuals.deinit(allocator);
+    var active = std.AutoHashMap(PlatformRequirementTypePair, void).init(allocator);
+    defer active.deinit();
+    var target_conflicts = std.AutoHashMap(CheckedTypeId, void).init(allocator);
+    defer target_conflicts.deinit();
+
+    for (target_args, plan_args) |target_arg, plan_arg| {
+        try collectResolvedDispatchTargetSubstitutions(
+            allocator,
+            names,
+            store,
+            target_arg,
+            plan_arg,
+            &target_formals,
+            &target_actuals,
+            &active,
+            &target_conflicts,
+        );
+    }
+
+    var clone_active = std.AutoHashMap(CheckedTypeId, CheckedTypeId).init(allocator);
+    defer clone_active.deinit();
+    const instantiated_target = try store.cloneCheckedTypeRootSubstituting(
+        allocator,
+        names,
+        target_callable,
+        target_formals.items,
+        target_actuals.items,
+        &clone_active,
+    );
+    const target_instantiated_fn = checkedFunctionPayload(store, instantiated_target, "instantiated resolved dispatch target callable");
+    const target_instantiated_args = try allocator.dupe(CheckedTypeId, target_instantiated_fn.args);
+    defer allocator.free(target_instantiated_args);
+    const target_instantiated_ret = target_instantiated_fn.ret;
+
+    var plan_formals = std.ArrayList(CheckedTypeId).empty;
+    defer plan_formals.deinit(allocator);
+    var plan_actuals = std.ArrayList(CheckedTypeId).empty;
+    defer plan_actuals.deinit(allocator);
+
+    active.clearRetainingCapacity();
+    for (target_instantiated_args, plan_args) |target_arg, plan_arg| {
+        try collectDispatchPlanIdentitySubstitutions(
+            allocator,
+            names,
+            store,
+            target_arg,
+            plan_arg,
+            &plan_formals,
+            &plan_actuals,
+            &active,
+        );
+    }
+    active.clearRetainingCapacity();
+    try collectDispatchPlanIdentitySubstitutions(
+        allocator,
+        names,
+        store,
+        target_instantiated_ret,
+        plan_ret,
+        &plan_formals,
+        &plan_actuals,
+        &active,
+    );
+
+    clone_active.clearRetainingCapacity();
+    return try store.cloneCheckedTypeRootSubstituting(
+        allocator,
+        names,
+        plan_callable,
+        plan_formals.items,
+        plan_actuals.items,
+        &clone_active,
+    );
+}
+
+fn checkedFunctionPayload(
+    store: *const CheckedTypeStore,
+    root: CheckedTypeId,
+    comptime context: []const u8,
+) CheckedFunctionType {
+    var current = root;
+    var remaining = store.payloads.items.len;
+    while (true) {
+        switch (store.payload(current)) {
+            .alias => |alias| current = alias.backing,
+            .function => |function| return function,
+            else => checkedArtifactInvariant(context ++ " was not a function", .{}),
+        }
+        if (remaining == 0) {
+            checkedArtifactInvariant(context ++ " alias chain was cyclic", .{});
+        }
+        remaining -= 1;
+    }
+}
+
+fn collectResolvedDispatchTargetSubstitutions(
+    allocator: Allocator,
+    names: *const canonical.CanonicalNameStore,
+    store: *CheckedTypeStore,
+    target: CheckedTypeId,
+    plan: CheckedTypeId,
+    formals: *std.ArrayList(CheckedTypeId),
+    actuals: *std.ArrayList(CheckedTypeId),
+    active: *std.AutoHashMap(PlatformRequirementTypePair, void),
+    conflicts: *std.AutoHashMap(CheckedTypeId, void),
+) Allocator.Error!void {
+    if (target == plan) return;
+
+    const pair = PlatformRequirementTypePair{
+        .expected = @intFromEnum(target),
+        .actual = @intFromEnum(plan),
+    };
+    if (active.contains(pair)) return;
+    try active.put(pair, {});
+    defer _ = active.remove(pair);
+
+    const target_payload = store.payload(target);
+    const plan_payload = store.payload(plan);
+
+    if (checkedTypePayloadIsIdentity(target_payload)) {
+        try appendConsistentDispatchTargetSubstitution(formals, actuals, conflicts, allocator, target, plan);
+        return;
+    }
+    if (checkedTypePayloadIsIdentity(plan_payload)) return;
+
+    switch (target_payload) {
+        .alias => |alias| return try collectResolvedDispatchTargetSubstitutions(
+            allocator,
+            names,
+            store,
+            alias.backing,
+            plan,
+            formals,
+            actuals,
+            active,
+            conflicts,
+        ),
+        else => {},
+    }
+    switch (plan_payload) {
+        .alias => |alias| return try collectResolvedDispatchTargetSubstitutions(
+            allocator,
+            names,
+            store,
+            target,
+            alias.backing,
+            formals,
+            actuals,
+            active,
+            conflicts,
+        ),
+        else => {},
+    }
+
+    switch (target_payload) {
+        .function => |target_fn| {
+            const plan_fn = switch (plan_payload) {
+                .function => |function| function,
+                else => return,
+            };
+            if (target_fn.args.len != plan_fn.args.len) return;
+            for (target_fn.args, plan_fn.args) |target_arg, plan_arg| {
+                try collectResolvedDispatchTargetSubstitutions(
+                    allocator,
+                    names,
+                    store,
+                    target_arg,
+                    plan_arg,
+                    formals,
+                    actuals,
+                    active,
+                    conflicts,
+                );
+            }
+        },
+        .nominal => |target_nominal| {
+            const plan_nominal = switch (plan_payload) {
+                .nominal => |nominal| nominal,
+                else => {
+                    if (!target_nominal.is_opaque) {
+                        try collectResolvedDispatchTargetSubstitutions(
+                            allocator,
+                            names,
+                            store,
+                            target_nominal.backing,
+                            plan,
+                            formals,
+                            actuals,
+                            active,
+                            conflicts,
+                        );
+                    }
+                    return;
+                },
+            };
+            if (target_nominal.name != plan_nominal.name or
+                target_nominal.origin_module != plan_nominal.origin_module or
+                target_nominal.source_decl != plan_nominal.source_decl or
+                target_nominal.builtin != plan_nominal.builtin or
+                target_nominal.args.len != plan_nominal.args.len)
+            {
+                return;
+            }
+            for (target_nominal.args, plan_nominal.args) |target_arg, plan_arg| {
+                try collectResolvedDispatchTargetSubstitutions(
+                    allocator,
+                    names,
+                    store,
+                    target_arg,
+                    plan_arg,
+                    formals,
+                    actuals,
+                    active,
+                    conflicts,
+                );
+            }
+            if (!target_nominal.is_opaque) {
+                try collectResolvedDispatchTargetSubstitutions(
+                    allocator,
+                    names,
+                    store,
+                    target_nominal.backing,
+                    plan_nominal.backing,
+                    formals,
+                    actuals,
+                    active,
+                    conflicts,
+                );
+            }
+        },
+        .tuple => |target_items| {
+            const plan_items = switch (plan_payload) {
+                .tuple => |items| items,
+                else => return,
+            };
+            if (target_items.len != plan_items.len) return;
+            for (target_items, plan_items) |target_item, plan_item| {
+                try collectResolvedDispatchTargetSubstitutions(
+                    allocator,
+                    names,
+                    store,
+                    target_item,
+                    plan_item,
+                    formals,
+                    actuals,
+                    active,
+                    conflicts,
+                );
+            }
+        },
+        .empty_record,
+        .record,
+        .record_unbound,
+        => try collectResolvedDispatchRecordSubstitutions(
+            allocator,
+            names,
+            store,
+            target_payload,
+            plan_payload,
+            formals,
+            actuals,
+            active,
+            conflicts,
+        ),
+        .empty_tag_union,
+        .tag_union,
+        => try collectResolvedDispatchTagSubstitutions(
+            allocator,
+            names,
+            store,
+            target_payload,
+            plan_payload,
+            formals,
+            actuals,
+            active,
+            conflicts,
+        ),
+        else => {},
+    }
+}
+
+fn collectResolvedDispatchRecordSubstitutions(
+    allocator: Allocator,
+    names: *const canonical.CanonicalNameStore,
+    store: *CheckedTypeStore,
+    target_payload: CheckedTypePayload,
+    plan_payload: CheckedTypePayload,
+    formals: *std.ArrayList(CheckedTypeId),
+    actuals: *std.ArrayList(CheckedTypeId),
+    active: *std.AutoHashMap(PlatformRequirementTypePair, void),
+    conflicts: *std.AutoHashMap(CheckedTypeId, void),
+) Allocator.Error!void {
+    const target_parts = recordParts(target_payload) orelse return;
+    const plan_parts = recordParts(plan_payload) orelse return;
+    const target_row = try flattenPlatformRequirementRecordRow(allocator, store, target_parts.fields, target_parts.ext);
+    defer target_row.deinit(allocator);
+    const plan_row = try flattenPlatformRequirementRecordRow(allocator, store, plan_parts.fields, plan_parts.ext);
+    defer plan_row.deinit(allocator);
+
+    for (target_row.fields) |target_field| {
+        const plan_field = findRecordField(names, plan_row.fields, target_field.name) orelse continue;
+        try collectResolvedDispatchTargetSubstitutions(
+            allocator,
+            names,
+            store,
+            target_field.ty,
+            plan_field.ty,
+            formals,
+            actuals,
+            active,
+            conflicts,
+        );
+    }
+
+    if (target_row.tail) |target_tail| {
+        if (plan_row.tail) |plan_tail| {
+            try collectResolvedDispatchTargetSubstitutions(
+                allocator,
+                names,
+                store,
+                target_tail,
+                plan_tail,
+                formals,
+                actuals,
+                active,
+                conflicts,
+            );
+        }
+    }
+}
+
+fn collectResolvedDispatchTagSubstitutions(
+    allocator: Allocator,
+    names: *const canonical.CanonicalNameStore,
+    store: *CheckedTypeStore,
+    target_payload: CheckedTypePayload,
+    plan_payload: CheckedTypePayload,
+    formals: *std.ArrayList(CheckedTypeId),
+    actuals: *std.ArrayList(CheckedTypeId),
+    active: *std.AutoHashMap(PlatformRequirementTypePair, void),
+    conflicts: *std.AutoHashMap(CheckedTypeId, void),
+) Allocator.Error!void {
+    const target_union = tagUnionParts(target_payload) orelse return;
+    const plan_union = tagUnionParts(plan_payload) orelse return;
+    const target_row = try flattenPlatformRequirementTagRow(allocator, store, target_union.tags, target_union.ext);
+    defer target_row.deinit(allocator);
+    const plan_row = try flattenPlatformRequirementTagRow(allocator, store, plan_union.tags, plan_union.ext);
+    defer plan_row.deinit(allocator);
+
+    for (target_row.tags) |target_tag| {
+        const plan_tag = findTag(names, plan_row.tags, target_tag.name) orelse continue;
+        const target_args = target_tag.argsSlice(store);
+        const plan_args = plan_tag.argsSlice(store);
+        if (target_args.len != plan_args.len) continue;
+        for (target_args, plan_args) |target_arg, plan_arg| {
+            try collectResolvedDispatchTargetSubstitutions(
+                allocator,
+                names,
+                store,
+                target_arg,
+                plan_arg,
+                formals,
+                actuals,
+                active,
+                conflicts,
+            );
+        }
+    }
+
+    if (target_row.tail) |target_tail| {
+        if (plan_row.tail) |plan_tail| {
+            try collectResolvedDispatchTargetSubstitutions(
+                allocator,
+                names,
+                store,
+                target_tail,
+                plan_tail,
+                formals,
+                actuals,
+                active,
+                conflicts,
+            );
+        }
+    }
+}
+
+fn collectDispatchPlanIdentitySubstitutions(
+    allocator: Allocator,
+    names: *const canonical.CanonicalNameStore,
+    store: *CheckedTypeStore,
+    target: CheckedTypeId,
+    plan: CheckedTypeId,
+    formals: *std.ArrayList(CheckedTypeId),
+    actuals: *std.ArrayList(CheckedTypeId),
+    active: *std.AutoHashMap(PlatformRequirementTypePair, void),
+) Allocator.Error!void {
+    if (target == plan) return;
+
+    const pair = PlatformRequirementTypePair{
+        .expected = @intFromEnum(target),
+        .actual = @intFromEnum(plan),
+    };
+    if (active.contains(pair)) return;
+    try active.put(pair, {});
+    defer _ = active.remove(pair);
+
+    const target_payload = store.payload(target);
+    const plan_payload = store.payload(plan);
+
+    if (checkedTypePayloadIsIdentity(plan_payload)) {
+        if (!checkedTypePayloadIsIdentity(target_payload)) {
+            try appendUniqueCheckedTypeSubstitution(formals, actuals, allocator, plan, target);
+        }
+        return;
+    }
+    if (checkedTypePayloadIsIdentity(target_payload)) return;
+
+    switch (target_payload) {
+        .alias => |alias| return try collectDispatchPlanIdentitySubstitutions(
+            allocator,
+            names,
+            store,
+            alias.backing,
+            plan,
+            formals,
+            actuals,
+            active,
+        ),
+        else => {},
+    }
+    switch (plan_payload) {
+        .alias => |alias| return try collectDispatchPlanIdentitySubstitutions(
+            allocator,
+            names,
+            store,
+            target,
+            alias.backing,
+            formals,
+            actuals,
+            active,
+        ),
+        else => {},
+    }
+
+    switch (target_payload) {
+        .function => |target_fn| {
+            const plan_fn = switch (plan_payload) {
+                .function => |function| function,
+                else => return,
+            };
+            if (target_fn.args.len != plan_fn.args.len) return;
+            for (target_fn.args, plan_fn.args) |target_arg, plan_arg| {
+                try collectDispatchPlanIdentitySubstitutions(
+                    allocator,
+                    names,
+                    store,
+                    target_arg,
+                    plan_arg,
+                    formals,
+                    actuals,
+                    active,
+                );
+            }
+            try collectDispatchPlanIdentitySubstitutions(
+                allocator,
+                names,
+                store,
+                target_fn.ret,
+                plan_fn.ret,
+                formals,
+                actuals,
+                active,
+            );
+        },
+        .nominal => |target_nominal| {
+            const plan_nominal = switch (plan_payload) {
+                .nominal => |nominal| nominal,
+                else => {
+                    if (!target_nominal.is_opaque) {
+                        try collectDispatchPlanIdentitySubstitutions(
+                            allocator,
+                            names,
+                            store,
+                            target_nominal.backing,
+                            plan,
+                            formals,
+                            actuals,
+                            active,
+                        );
+                    }
+                    return;
+                },
+            };
+            if (target_nominal.name != plan_nominal.name or
+                target_nominal.origin_module != plan_nominal.origin_module or
+                target_nominal.source_decl != plan_nominal.source_decl or
+                target_nominal.builtin != plan_nominal.builtin or
+                target_nominal.args.len != plan_nominal.args.len)
+            {
+                return;
+            }
+            for (target_nominal.args, plan_nominal.args) |target_arg, plan_arg| {
+                try collectDispatchPlanIdentitySubstitutions(
+                    allocator,
+                    names,
+                    store,
+                    target_arg,
+                    plan_arg,
+                    formals,
+                    actuals,
+                    active,
+                );
+            }
+            if (!target_nominal.is_opaque) {
+                try collectDispatchPlanIdentitySubstitutions(
+                    allocator,
+                    names,
+                    store,
+                    target_nominal.backing,
+                    plan_nominal.backing,
+                    formals,
+                    actuals,
+                    active,
+                );
+            }
+        },
+        .tuple => |target_items| {
+            const plan_items = switch (plan_payload) {
+                .tuple => |items| items,
+                else => return,
+            };
+            if (target_items.len != plan_items.len) return;
+            for (target_items, plan_items) |target_item, plan_item| {
+                try collectDispatchPlanIdentitySubstitutions(
+                    allocator,
+                    names,
+                    store,
+                    target_item,
+                    plan_item,
+                    formals,
+                    actuals,
+                    active,
+                );
+            }
+        },
+        .empty_record,
+        .record,
+        .record_unbound,
+        => try collectDispatchPlanRecordIdentitySubstitutions(
+            allocator,
+            names,
+            store,
+            target_payload,
+            plan_payload,
+            formals,
+            actuals,
+            active,
+        ),
+        .empty_tag_union,
+        .tag_union,
+        => try collectDispatchPlanTagIdentitySubstitutions(
+            allocator,
+            names,
+            store,
+            target_payload,
+            plan_payload,
+            formals,
+            actuals,
+            active,
+        ),
+        else => {},
+    }
+}
+
+fn collectDispatchPlanRecordIdentitySubstitutions(
+    allocator: Allocator,
+    names: *const canonical.CanonicalNameStore,
+    store: *CheckedTypeStore,
+    target_payload: CheckedTypePayload,
+    plan_payload: CheckedTypePayload,
+    formals: *std.ArrayList(CheckedTypeId),
+    actuals: *std.ArrayList(CheckedTypeId),
+    active: *std.AutoHashMap(PlatformRequirementTypePair, void),
+) Allocator.Error!void {
+    const target_parts = recordParts(target_payload) orelse return;
+    const plan_parts = recordParts(plan_payload) orelse return;
+    const target_row = try flattenPlatformRequirementRecordRow(allocator, store, target_parts.fields, target_parts.ext);
+    defer target_row.deinit(allocator);
+    const plan_row = try flattenPlatformRequirementRecordRow(allocator, store, plan_parts.fields, plan_parts.ext);
+    defer plan_row.deinit(allocator);
+
+    for (target_row.fields) |target_field| {
+        const plan_field = findRecordField(names, plan_row.fields, target_field.name) orelse continue;
+        try collectDispatchPlanIdentitySubstitutions(
+            allocator,
+            names,
+            store,
+            target_field.ty,
+            plan_field.ty,
+            formals,
+            actuals,
+            active,
+        );
+    }
+
+    if (target_row.tail) |target_tail| {
+        if (plan_row.tail) |plan_tail| {
+            try collectDispatchPlanIdentitySubstitutions(
+                allocator,
+                names,
+                store,
+                target_tail,
+                plan_tail,
+                formals,
+                actuals,
+                active,
+            );
+        }
+    }
+}
+
+fn collectDispatchPlanTagIdentitySubstitutions(
+    allocator: Allocator,
+    names: *const canonical.CanonicalNameStore,
+    store: *CheckedTypeStore,
+    target_payload: CheckedTypePayload,
+    plan_payload: CheckedTypePayload,
+    formals: *std.ArrayList(CheckedTypeId),
+    actuals: *std.ArrayList(CheckedTypeId),
+    active: *std.AutoHashMap(PlatformRequirementTypePair, void),
+) Allocator.Error!void {
+    const target_union = tagUnionParts(target_payload) orelse return;
+    const plan_union = tagUnionParts(plan_payload) orelse return;
+    const target_row = try flattenPlatformRequirementTagRow(allocator, store, target_union.tags, target_union.ext);
+    defer target_row.deinit(allocator);
+    const plan_row = try flattenPlatformRequirementTagRow(allocator, store, plan_union.tags, plan_union.ext);
+    defer plan_row.deinit(allocator);
+
+    for (target_row.tags) |target_tag| {
+        const plan_tag = findTag(names, plan_row.tags, target_tag.name) orelse continue;
+        const target_args = target_tag.argsSlice(store);
+        const plan_args = plan_tag.argsSlice(store);
+        if (target_args.len != plan_args.len) continue;
+        for (target_args, plan_args) |target_arg, plan_arg| {
+            try collectDispatchPlanIdentitySubstitutions(
+                allocator,
+                names,
+                store,
+                target_arg,
+                plan_arg,
+                formals,
+                actuals,
+                active,
+            );
+        }
+    }
+
+    if (target_row.tail) |target_tail| {
+        if (plan_row.tail) |plan_tail| {
+            try collectDispatchPlanIdentitySubstitutions(
+                allocator,
+                names,
+                store,
+                target_tail,
+                plan_tail,
+                formals,
+                actuals,
+                active,
+            );
+        }
+    }
+}
+
+fn appendConsistentDispatchTargetSubstitution(
+    formals: *std.ArrayList(CheckedTypeId),
+    actuals: *std.ArrayList(CheckedTypeId),
+    conflicts: *std.AutoHashMap(CheckedTypeId, void),
+    allocator: Allocator,
+    formal: CheckedTypeId,
+    actual: CheckedTypeId,
+) Allocator.Error!void {
+    if (conflicts.contains(formal)) return;
+
+    for (formals.items, actuals.items, 0..) |existing_formal, existing_actual, i| {
+        if (existing_formal != formal) continue;
+        if (existing_actual == actual) return;
+
+        try conflicts.put(formal, {});
+        _ = formals.orderedRemove(i);
+        _ = actuals.orderedRemove(i);
+        return;
+    }
+
+    try formals.append(allocator, formal);
+    try actuals.append(allocator, actual);
+}
+
+fn appendUniqueCheckedTypeSubstitution(
+    formals: *std.ArrayList(CheckedTypeId),
+    actuals: *std.ArrayList(CheckedTypeId),
+    allocator: Allocator,
+    formal: CheckedTypeId,
+    actual: CheckedTypeId,
+) Allocator.Error!void {
+    for (formals.items, actuals.items) |existing_formal, existing_actual| {
+        if (existing_formal != formal) continue;
+        if (existing_actual != actual) {
+            checkedArtifactInvariant("checked type substitution mapped one formal to multiple actuals", .{});
+        }
+        return;
+    }
+    try formals.append(allocator, formal);
+    try actuals.append(allocator, actual);
+}
+
+fn importedModuleViewByModuleIdx(
+    artifacts: []const ImportedModuleView,
+    module_idx: u32,
+) ?ImportedModuleView {
+    for (artifacts) |artifact| {
+        if (artifact.module_identity.module_idx == module_idx) return artifact;
+    }
+    return null;
 }
 
 fn importedModuleViewByKey(
@@ -26844,6 +27692,21 @@ pub fn publishFromTypedModule(
         &entry_wrappers,
         &compile_time_roots,
     );
+
+    // Resolutions now carry every direct target (evidence nodes); project the
+    // targets' callables across artifacts by content identity and specialize
+    // each call's recorded callable against them (issue 9914's projection,
+    // running after total resolution instead of during table construction).
+    try specializeResolvedStaticDispatchPlanCallables(
+        allocator,
+        &canonical_names,
+        checked_types,
+        artifact_key,
+        module_idx,
+        inputs.imports,
+        inputs.available_artifacts,
+        &static_dispatch_plans,
+    );
     template_iterator_refs.deinit(allocator);
     plan_build_data.deinit(allocator);
 
@@ -28577,8 +29440,8 @@ test "SERIALIZED_VERSION_HASH golden value" {
     // change, bump `serialized_layout_version` and replace the golden bytes below with
     // the ones this assertion prints.
     const golden: [32]u8 = .{
-        0x00, 0x3B, 0xEC, 0x91, 0xA5, 0xDC, 0xE0, 0x34, 0xB3, 0x35, 0xDF, 0x81, 0x03, 0x7E, 0xD5, 0x1D,
-        0xD4, 0xD9, 0xC6, 0x29, 0xD8, 0x55, 0x18, 0x24, 0xBC, 0x48, 0x3D, 0x8E, 0x70, 0x75, 0xE6, 0x99,
+        0x73, 0x3F, 0x40, 0x0B, 0xCE, 0x63, 0x5B, 0xCB, 0x8C, 0x8B, 0xBD, 0x8D, 0x67, 0xE8, 0x75, 0xD5,
+        0x82, 0x24, 0x09, 0x23, 0x13, 0xFB, 0xC8, 0x15, 0xCD, 0x0A, 0x6D, 0xCD, 0x0E, 0x8B, 0xC6, 0x17,
     };
     try std.testing.expectEqualSlices(u8, &golden, &CheckedModuleArtifact.SERIALIZED_VERSION_HASH);
 }

@@ -866,12 +866,8 @@ const Builder = struct {
         for (view.method_registry.entries) |entry| {
             const owner: static_dispatch.MethodOwner = switch (entry.key.owner) {
                 .builtin => |builtin| .{ .builtin = builtin },
-                .source_decl => |decl| .{ .source_decl = .{
-                    .module_name = try self.moduleName(view, decl.module_name),
-                    .statement = decl.statement,
-                } },
                 .nominal => |nominal| .{ .nominal = .{
-                    .module_name = try self.moduleName(view, nominal.module_name),
+                    .module = try self.moduleIdentity(view, nominal.module),
                     .type_name = try self.typeName(view, nominal.type_name),
                     .source_decl = nominal.source_decl,
                 } },
