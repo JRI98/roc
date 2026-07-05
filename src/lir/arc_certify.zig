@@ -28,6 +28,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const build_options = @import("build_options");
+const collections = @import("collections");
 const core = @import("lir_core");
 const layout_mod = @import("layout");
 const arc_sig = @import("arc_sig.zig");
@@ -35,6 +36,7 @@ const arc_solve = @import("arc_solve.zig");
 
 const LIR = core.LIR;
 const LirStore = core.LirStore;
+const GuardedList = collections.GuardedList;
 const Allocator = std.mem.Allocator;
 
 /// Join-state budget for full-store certification. The production bound is
@@ -259,7 +261,9 @@ fn certifyUniqueArgs(
                         diag.set("stmt={d}: unique_args bit outside the op's runtime-checked argument mask", .{stmt_index});
                         return error.Certification;
                     }
-                    for (store.getLocalSpan(assign.args), 0..) |arg, position| {
+                    const args = store.getLocalSpan(assign.args);
+                    for (0..GuardedList.borrowLen(args)) |position| {
+                        const arg = GuardedList.at(args, position);
                         if (position >= 64) break;
                         const bit = @as(u64, 1) << @as(u6, @intCast(position));
                         if ((assign.unique_args & bit) == 0) continue;
@@ -271,7 +275,9 @@ fn certifyUniqueArgs(
                     }
                 },
                 .switch_stmt => |s| {
-                    for (store.getCFSwitchBranches(s.branches)) |branch| {
+                    const branches = store.getCFSwitchBranches(s.branches);
+                    for (0..GuardedList.borrowLen(branches)) |branch_index| {
+                        const branch = GuardedList.at(branches, branch_index);
                         try stack.append(allocator, branch.body);
                     }
                     try stack.append(allocator, s.default_branch);
@@ -288,7 +294,9 @@ fn certifyUniqueArgs(
                     try stack.append(allocator, s.on_miss);
                 },
                 .str_match_set => |s| {
-                    for (store.getStrMatchArms(s.arms)) |arm| {
+                    const arms = store.getStrMatchArms(s.arms);
+                    for (0..GuardedList.borrowLen(arms)) |arm_index| {
+                        const arm = GuardedList.at(arms, arm_index);
                         try stack.append(allocator, arm.on_match);
                     }
                     try stack.append(allocator, s.on_miss);
@@ -309,9 +317,10 @@ fn certifyUniqueArgs(
 /// True when the local is a parameter of the proc and the proc's signature
 /// seeds it born-unique (a mode-specialized variant whose caller proved the
 /// dying argument unique).
-fn paramSeededUnique(sig: arc_sig.RcSig, params: []const LIR.LocalId, local: LIR.LocalId) bool {
+fn paramSeededUnique(sig: arc_sig.RcSig, params: anytype, local: LIR.LocalId) bool {
     if (sig.unique_params == 0) return false;
-    for (params, 0..) |param, position| {
+    for (0..GuardedList.borrowLen(params)) |position| {
+        const param = GuardedList.at(params, position);
         if (position >= 64) break;
         if (param != local) continue;
         return (sig.unique_params >> @as(u6, @intCast(position))) & 1 != 0;
@@ -442,7 +451,11 @@ fn writeFailureContext(
         if (store.localName(l)) |name| context.append(" local_name={s}", .{name});
     }
     context.append("\n  args:", .{});
-    for (store.getLocalSpan(proc.args)) |arg| context.append(" {d}", .{@intFromEnum(arg)});
+    const proc_args = store.getLocalSpan(proc.args);
+    for (0..GuardedList.borrowLen(proc_args)) |arg_index| {
+        const arg = GuardedList.at(proc_args, arg_index);
+        context.append(" {d}", .{@intFromEnum(arg)});
+    }
     context.append("\n", .{});
 
     var reachable = std.AutoHashMap(LIR.CFStmtId, void).init(store.allocator);
@@ -458,7 +471,9 @@ fn writeFailureContext(
                 .runtime_error, .comptime_exhaustiveness_failed, .loop_continue, .loop_break, .jump, .ret, .crash, .expect_err => {},
                 .comptime_branch_taken => |s| walk.append(store.allocator, s.next) catch return,
                 .switch_stmt => |s| {
-                    for (store.getCFSwitchBranches(s.branches)) |branch| {
+                    const branches = store.getCFSwitchBranches(s.branches);
+                    for (0..GuardedList.borrowLen(branches)) |branch_index| {
+                        const branch = GuardedList.at(branches, branch_index);
                         walk.append(store.allocator, branch.body) catch return;
                     }
                     walk.append(store.allocator, s.default_branch) catch return;
@@ -471,7 +486,9 @@ fn writeFailureContext(
                     walk.append(store.allocator, s.on_miss) catch return;
                 },
                 .str_match_set => |s| {
-                    for (store.getStrMatchArms(s.arms)) |arm| {
+                    const arms = store.getStrMatchArms(s.arms);
+                    for (0..GuardedList.borrowLen(arms)) |arm_index| {
+                        const arm = GuardedList.at(arms, arm_index);
                         walk.append(store.allocator, arm.on_match) catch return;
                     }
                     walk.append(store.allocator, s.on_miss) catch return;
@@ -555,7 +572,9 @@ fn writeFailureContext(
             }),
             .switch_stmt => |s| {
                 context.append(" cond={d} default={d}", .{ @intFromEnum(s.cond), @intFromEnum(s.default_branch) });
-                for (store.getCFSwitchBranches(s.branches)) |branch| {
+                const branches = store.getCFSwitchBranches(s.branches);
+                for (0..GuardedList.borrowLen(branches)) |branch_index| {
+                    const branch = GuardedList.at(branches, branch_index);
                     context.append(" branch({d}->{d})", .{ branch.value, @intFromEnum(branch.body) });
                 }
                 if (s.continuation) |continuation| context.append(" continuation={d}", .{@intFromEnum(continuation)});
@@ -587,7 +606,9 @@ fn writeFailureContext(
 
 fn appendLocalSpan(context: *FailureContext, store: *const LirStore, span: LIR.LocalSpan) void {
     context.append("[", .{});
-    for (store.getLocalSpan(span), 0..) |local, index| {
+    const locals = store.getLocalSpan(span);
+    for (0..GuardedList.borrowLen(locals)) |index| {
+        const local = GuardedList.at(locals, index);
         if (index > 0) context.append(", ", .{});
         context.append("{d}", .{@intFromEnum(local)});
     }
@@ -639,7 +660,9 @@ fn stmtMentionsLocal(store: *const LirStore, stmt: LIR.CFStmt, needle: LIR.Local
         .switch_initialized_payload => |s| s.cond == needle or s.payload == needle,
         .str_match => |s| blk: {
             if (s.source == needle) break :blk true;
-            for (store.getStrMatchSteps(s.steps)) |step| {
+            const steps = store.getStrMatchSteps(s.steps);
+            for (0..GuardedList.borrowLen(steps)) |step_index| {
+                const step = GuardedList.at(steps, step_index);
                 switch (step.capture) {
                     .discard => {},
                     .view => |local| if (local == needle) break :blk true,
@@ -649,8 +672,12 @@ fn stmtMentionsLocal(store: *const LirStore, stmt: LIR.CFStmt, needle: LIR.Local
         },
         .str_match_set => |s| blk: {
             if (s.source == needle) break :blk true;
-            for (store.getStrMatchArms(s.arms)) |arm| {
-                for (store.getStrMatchSteps(arm.steps)) |step| {
+            const arms = store.getStrMatchArms(s.arms);
+            for (0..GuardedList.borrowLen(arms)) |arm_index| {
+                const arm = GuardedList.at(arms, arm_index);
+                const steps = store.getStrMatchSteps(arm.steps);
+                for (0..GuardedList.borrowLen(steps)) |step_index| {
+                    const step = GuardedList.at(steps, step_index);
                     switch (step.capture) {
                         .discard => {},
                         .view => |local| if (local == needle) break :blk true,
@@ -665,7 +692,9 @@ fn stmtMentionsLocal(store: *const LirStore, stmt: LIR.CFStmt, needle: LIR.Local
 }
 
 fn spanHasLocal(store: *const LirStore, span: LIR.LocalSpan, needle: LIR.LocalId) bool {
-    for (store.getLocalSpan(span)) |local| {
+    const locals = store.getLocalSpan(span);
+    for (0..GuardedList.borrowLen(locals)) |index| {
+        const local = GuardedList.at(locals, index);
         if (local == needle) return true;
     }
     return false;
@@ -1266,7 +1295,9 @@ const Certifier = struct {
         self.local_dense.items.len = self.store.localCount();
         @memset(self.local_dense.items, no_dense);
 
-        for (self.store.getLocalSpan(proc.args)) |param| {
+        const proc_args = self.store.getLocalSpan(proc.args);
+        for (0..GuardedList.borrowLen(proc_args)) |param_index| {
+            const param = GuardedList.at(proc_args, param_index);
             try self.noteProcLocal(param);
         }
 
@@ -1371,7 +1402,9 @@ const Certifier = struct {
                 },
                 .switch_stmt => |switch_stmt| {
                     try self.noteProcLocal(switch_stmt.cond);
-                    for (self.store.getCFSwitchBranches(switch_stmt.branches)) |branch| {
+                    const branches = self.store.getCFSwitchBranches(switch_stmt.branches);
+                    for (0..GuardedList.borrowLen(branches)) |branch_index| {
+                        const branch = GuardedList.at(branches, branch_index);
                         try stack.append(self.allocator, branch.body);
                     }
                     try stack.append(self.allocator, switch_stmt.default_branch);
@@ -1387,7 +1420,9 @@ const Certifier = struct {
                 },
                 .str_match => |str_match| {
                     try self.noteProcLocal(str_match.source);
-                    for (self.store.getStrMatchSteps(str_match.steps)) |step| {
+                    const steps = self.store.getStrMatchSteps(str_match.steps);
+                    for (0..GuardedList.borrowLen(steps)) |step_index| {
+                        const step = GuardedList.at(steps, step_index);
                         switch (step.capture) {
                             .discard => {},
                             .view => |local| try self.noteProcLocal(local),
@@ -1398,8 +1433,12 @@ const Certifier = struct {
                 },
                 .str_match_set => |str_match_set| {
                     try self.noteProcLocal(str_match_set.source);
-                    for (self.store.getStrMatchArms(str_match_set.arms)) |arm| {
-                        for (self.store.getStrMatchSteps(arm.steps)) |step| {
+                    const arms = self.store.getStrMatchArms(str_match_set.arms);
+                    for (0..GuardedList.borrowLen(arms)) |arm_index| {
+                        const arm = GuardedList.at(arms, arm_index);
+                        const steps = self.store.getStrMatchSteps(arm.steps);
+                        for (0..GuardedList.borrowLen(steps)) |step_index| {
+                            const step = GuardedList.at(steps, step_index);
                             switch (step.capture) {
                                 .discard => {},
                                 .view => |local| try self.noteProcLocal(local),
@@ -1438,7 +1477,9 @@ const Certifier = struct {
         relevant: *std.bit_set.DynamicBitSetUnmanaged,
         span: LIR.LocalSpan,
     ) void {
-        for (self.store.getLocalSpan(span)) |local| {
+        const locals = self.store.getLocalSpan(span);
+        for (0..GuardedList.borrowLen(locals)) |index| {
+            const local = GuardedList.at(locals, index);
             self.noteExposedReadLocal(relevant, local);
         }
     }
@@ -1645,7 +1686,9 @@ const Certifier = struct {
                         try self.appendReadBeforeRebindSuccessor(&graph, &work, node_index, continuation);
                     }
                     try self.appendReadBeforeRebindSuccessor(&graph, &work, node_index, switch_stmt.default_branch);
-                    for (self.store.getCFSwitchBranches(switch_stmt.branches)) |branch| {
+                    const branches = self.store.getCFSwitchBranches(switch_stmt.branches);
+                    for (0..GuardedList.borrowLen(branches)) |branch_index| {
+                        const branch = GuardedList.at(branches, branch_index);
                         try self.appendReadBeforeRebindSuccessor(&graph, &work, node_index, branch.body);
                     }
                 },
@@ -1656,7 +1699,9 @@ const Certifier = struct {
                 },
                 .str_match => |str_match| {
                     self.noteExposedReadLocal(&graph.nodes.items[node_index].reads, str_match.source);
-                    for (self.store.getStrMatchSteps(str_match.steps)) |step| {
+                    const steps = self.store.getStrMatchSteps(str_match.steps);
+                    for (0..GuardedList.borrowLen(steps)) |step_index| {
+                        const step = GuardedList.at(steps, step_index);
                         switch (step.capture) {
                             .discard => {},
                             // Captures are branch-local definitions. The graph
@@ -1672,8 +1717,12 @@ const Certifier = struct {
                 },
                 .str_match_set => |str_match_set| {
                     self.noteExposedReadLocal(&graph.nodes.items[node_index].reads, str_match_set.source);
-                    for (self.store.getStrMatchArms(str_match_set.arms)) |arm| {
-                        for (self.store.getStrMatchSteps(arm.steps)) |step| {
+                    const arms = self.store.getStrMatchArms(str_match_set.arms);
+                    for (0..GuardedList.borrowLen(arms)) |arm_index| {
+                        const arm = GuardedList.at(arms, arm_index);
+                        const steps = self.store.getStrMatchSteps(arm.steps);
+                        for (0..GuardedList.borrowLen(steps)) |step_index| {
+                            const step = GuardedList.at(steps, step_index);
                             switch (step.capture) {
                                 .discard => {},
                                 .view => {},
@@ -1833,7 +1882,10 @@ const Certifier = struct {
         if (params.len != conditions.len or params.len != masks.len) {
             std.debug.panic("ARC borrow certifier invariant violated: maybe-uninitialized join metadata arity mismatch", .{});
         }
-        for (params, conditions, masks) |param, condition, mask| {
+        for (0..GuardedList.borrowLen(params)) |index| {
+            const param = GuardedList.at(params, index);
+            const condition = GuardedList.at(conditions, index);
+            const mask = GuardedList.at(masks, index);
             if (param == local) return .{ .local = condition, .mask = mask };
         }
         return null;
@@ -1980,7 +2032,9 @@ const Certifier = struct {
     }
 
     fn noteProcLocalSpan(self: *Certifier, span: LIR.LocalSpan) Allocator.Error!void {
-        for (self.store.getLocalSpan(span)) |local| {
+        const locals = self.store.getLocalSpan(span);
+        for (0..GuardedList.borrowLen(locals)) |index| {
+            const local = GuardedList.at(locals, index);
             try self.noteProcLocal(local);
         }
     }
@@ -2006,7 +2060,9 @@ const Certifier = struct {
         var state = try State.init(self.allocator, self.store.localCount());
         {
             errdefer state.deinit();
-            for (self.store.getLocalSpan(proc.args), 0..) |param, index| {
+            const proc_args = self.store.getLocalSpan(proc.args);
+            for (0..GuardedList.borrowLen(proc_args)) |index| {
+                const param = GuardedList.at(proc_args, index);
                 if (!self.isRc(param)) continue;
                 switch (self.current_sig.paramMode(index)) {
                     .owned => _ = try self.bindFresh(&state, param, 1, &.{}),
@@ -2140,9 +2196,11 @@ const Certifier = struct {
                 },
                 .assign_tag => |assign| {
                     if (assign.payload) |payload| {
-                        try self.applyAggregate(&state, assign.target, &.{payload});
+                        const operands = [_]LIR.LocalId{payload};
+                        try self.applyAggregate(&state, assign.target, &operands);
                     } else {
-                        try self.applyAggregate(&state, assign.target, &.{});
+                        const operands = [_]LIR.LocalId{};
+                        try self.applyAggregate(&state, assign.target, &operands);
                     }
                     cursor = assign.next;
                 },
@@ -2194,7 +2252,9 @@ const Certifier = struct {
                 },
                 .switch_stmt => |switch_stmt| {
                     _ = try self.requireLive(&state, switch_stmt.cond);
-                    for (self.store.getCFSwitchBranches(switch_stmt.branches)) |branch| {
+                    const branches = self.store.getCFSwitchBranches(switch_stmt.branches);
+                    for (0..GuardedList.borrowLen(branches)) |branch_index| {
+                        const branch = GuardedList.at(branches, branch_index);
                         var branch_state = try state.clone();
                         errdefer branch_state.deinit();
                         try work.append(self.allocator, .{ .segment = .{ .cursor = branch.body, .state = branch_state, .origin_join = segment.origin_join } });
@@ -2253,7 +2313,9 @@ const Certifier = struct {
                     const source_value = try self.requireLive(&state, str_match.source);
                     var match_state = try state.clone();
                     errdefer match_state.deinit();
-                    for (self.store.getStrMatchSteps(str_match.steps)) |step| {
+                    const steps = self.store.getStrMatchSteps(str_match.steps);
+                    for (0..GuardedList.borrowLen(steps)) |step_index| {
+                        const step = GuardedList.at(steps, step_index);
                         switch (step.capture) {
                             .discard => {},
                             .view => |local| if (self.isRc(local)) {
@@ -2270,10 +2332,14 @@ const Certifier = struct {
                 },
                 .str_match_set => |str_match_set| {
                     const source_value = try self.requireLive(&state, str_match_set.source);
-                    for (self.store.getStrMatchArms(str_match_set.arms)) |arm| {
+                    const arms = self.store.getStrMatchArms(str_match_set.arms);
+                    for (0..GuardedList.borrowLen(arms)) |arm_index| {
+                        const arm = GuardedList.at(arms, arm_index);
                         var match_state = try state.clone();
                         errdefer match_state.deinit();
-                        for (self.store.getStrMatchSteps(arm.steps)) |step| {
+                        const steps = self.store.getStrMatchSteps(arm.steps);
+                        for (0..GuardedList.borrowLen(steps)) |step_index| {
+                            const step = GuardedList.at(steps, step_index);
                             switch (step.capture) {
                                 .discard => {},
                                 .view => |local| if (self.isRc(local)) {
@@ -2446,12 +2512,14 @@ const Certifier = struct {
         const arg_locals = self.store.getLocalSpan(args);
 
         var arg_values_buffer: [64]ValueId = undefined;
-        for (arg_locals, 0..) |arg, index| {
+        for (0..GuardedList.borrowLen(arg_locals)) |index| {
+            const arg = GuardedList.at(arg_locals, index);
             const value = try self.requireLive(state, arg);
             if (index < arg_values_buffer.len) arg_values_buffer[index] = value;
         }
 
-        for (arg_locals, 0..) |arg, index| {
+        for (0..GuardedList.borrowLen(arg_locals)) |index| {
+            const arg = GuardedList.at(arg_locals, index);
             if (!self.isRc(arg)) continue;
             switch (callee_sig.paramMode(index)) {
                 .owned => {
@@ -2471,7 +2539,8 @@ const Certifier = struct {
                 .borrowed => {
                     var lenders_buffer: [64]ValueId = undefined;
                     var lender_count: usize = 0;
-                    for (arg_locals, 0..) |arg, index| {
+                    for (0..GuardedList.borrowLen(arg_locals)) |index| {
+                        const arg = GuardedList.at(arg_locals, index);
                         if (index >= 64) break;
                         const bit = @as(u64, 1) << @as(u6, @intCast(index));
                         if ((callee_sig.ret_lenders & bit) == 0) continue;
@@ -2491,13 +2560,15 @@ const Certifier = struct {
         const arg_locals = self.store.getLocalSpan(assign.args);
 
         var arg_values_buffer: [64]ValueId = undefined;
-        for (arg_locals, 0..) |arg, index| {
+        for (0..GuardedList.borrowLen(arg_locals)) |index| {
+            const arg = GuardedList.at(arg_locals, index);
             const value = try self.requireLive(state, arg);
             if (index < arg_values_buffer.len) arg_values_buffer[index] = value;
         }
 
         // Consumed positions transfer one unit each into the op.
-        for (arg_locals, 0..) |arg, index| {
+        for (0..GuardedList.borrowLen(arg_locals)) |index| {
+            const arg = GuardedList.at(arg_locals, index);
             if (index >= 64) break;
             if (!self.isRc(arg)) continue;
             const bit = @as(u64, 1) << @as(u6, @intCast(index));
@@ -2512,7 +2583,8 @@ const Certifier = struct {
                 // arguments; it borrows until the trailing incref lands.
                 var lenders_buffer: [64]ValueId = undefined;
                 var lender_count: usize = 0;
-                for (arg_locals, 0..) |arg, index| {
+                for (0..GuardedList.borrowLen(arg_locals)) |index| {
+                    const arg = GuardedList.at(arg_locals, index);
                     if (index >= lenders_buffer.len) break;
                     if (!self.isRc(arg)) continue;
                     lenders_buffer[lender_count] = arg_values_buffer[index];
@@ -2534,7 +2606,8 @@ const Certifier = struct {
 
         // Retained positions are stored inside the result; the trailing
         // incref restores the unit the op moved into its result.
-        for (arg_locals, 0..) |arg, index| {
+        for (0..GuardedList.borrowLen(arg_locals)) |index| {
+            const arg = GuardedList.at(arg_locals, index);
             if (index >= 64) break;
             if (!self.isRc(arg)) continue;
             const bit = @as(u64, 1) << @as(u6, @intCast(index));
@@ -2547,10 +2620,11 @@ const Certifier = struct {
         self: *Certifier,
         state: *State,
         target: LIR.LocalId,
-        operands: []const LIR.LocalId,
+        operands: anytype,
     ) CertifyError!void {
         var operand_values_buffer: [64]ValueId = undefined;
-        for (operands, 0..) |operand, index| {
+        for (0..GuardedList.borrowLen(operands)) |index| {
+            const operand = GuardedList.at(operands, index);
             const value = try self.requireLive(state, operand);
             if (index < operand_values_buffer.len) operand_values_buffer[index] = value;
         }
@@ -2560,7 +2634,8 @@ const Certifier = struct {
             target_value = try self.bindFresh(state, target, 1, &.{});
         }
 
-        for (operands, 0..) |operand, index| {
+        for (0..GuardedList.borrowLen(operands)) |index| {
+            const operand = GuardedList.at(operands, index);
             if (!self.isRc(operand)) continue;
             const value = if (index < operand_values_buffer.len)
                 operand_values_buffer[index]

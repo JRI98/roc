@@ -9,7 +9,7 @@ const layout = @import("layout");
 const lir_defs = @import("LIR.zig");
 
 const Allocator = std.mem.Allocator;
-const GuardedList = collections.GuardedList;
+pub const GuardedList = collections.GuardedList;
 
 const CFStmt = lir_defs.CFStmt;
 const CFStmtId = lir_defs.CFStmtId;
@@ -39,6 +39,16 @@ pub const ProcDebugName = extern struct {
 };
 
 const Self = @This();
+
+/// Guarded immutable span borrow for a named `LirStore` backing list.
+pub fn StoreSpanBorrow(comptime T: type, comptime field_name: []const u8) type {
+    return GuardedList.BorrowSpan(T, "LirStore." ++ field_name);
+}
+
+/// Guarded mutable span borrow for a named `LirStore` backing list.
+pub fn StoreSpanBorrowMut(comptime T: type, comptime field_name: []const u8) type {
+    return GuardedList.BorrowSpanMut(T, "LirStore." ++ field_name);
+}
 
 cf_stmts: GuardedList.List(CFStmt, "LirStore.cf_stmts"),
 cf_switch_branches: GuardedList.List(CFSwitchBranch, "LirStore.cf_switch_branches"),
@@ -257,9 +267,8 @@ pub fn addPatternSpan(self: *Self, ids: []const LirPatternId) Allocator.Error!Li
 }
 
 /// Returns the pattern ids for a given span.
-pub fn getPatternSpan(self: *const Self, span: LirPatternSpan) []const LirPatternId {
-    if (span.len == 0) return &.{};
-    return self.pattern_ids.unsafeRawItemsForView()[span.start .. span.start + span.len];
+pub fn getPatternSpan(self: *const Self, span: LirPatternSpan) StoreSpanBorrow(LirPatternId, "pattern_ids") {
+    return self.pattern_ids.borrowSpan(span.start, span.len);
 }
 
 /// Returns a fresh synthetic symbol for compiler-generated locals and procs.
@@ -369,18 +378,8 @@ pub fn addLocalSpan(self: *Self, ids: []const LocalId) Allocator.Error!LocalSpan
 }
 
 /// Resolves a local-id span to its stored slice.
-pub fn getLocalSpan(self: *const Self, span: LocalSpan) []const LocalId {
-    if (span.len == 0) return &.{};
-    if (builtin.mode == .Debug) {
-        const end = @as(u64, span.start) + @as(u64, span.len);
-        if (end > self.local_ids.len()) {
-            std.debug.panic(
-                "LirStore invariant violated: local-id span start={d} len={d} exceeds local-id storage len={d}",
-                .{ span.start, span.len, self.local_ids.len() },
-            );
-        }
-    }
-    return self.local_ids.unsafeRawItemsForView()[span.start..][0..span.len];
+pub fn getLocalSpan(self: *const Self, span: LocalSpan) StoreSpanBorrow(LocalId, "local_ids") {
+    return self.local_ids.borrowSpan(span.start, span.len);
 }
 
 /// Stores u64 values and returns the corresponding flat-storage span.
@@ -393,18 +392,8 @@ pub fn addU64Span(self: *Self, values: []const u64) Allocator.Error!U64Span {
 }
 
 /// Resolves a u64 span to its stored slice.
-pub fn getU64Span(self: *const Self, span: U64Span) []const u64 {
-    if (span.len == 0) return &.{};
-    if (builtin.mode == .Debug) {
-        const end = @as(u64, span.start) + @as(u64, span.len);
-        if (end > self.u64s.len()) {
-            std.debug.panic(
-                "LirStore invariant violated: u64 span start={d} len={d} exceeds u64 storage len={d}",
-                .{ span.start, span.len, self.u64s.len() },
-            );
-        }
-    }
-    return self.u64s.unsafeRawItemsForView()[span.start..][0..span.len];
+pub fn getU64Span(self: *const Self, span: U64Span) StoreSpanBorrow(u64, "u64s") {
+    return self.u64s.borrowSpan(span.start, span.len);
 }
 
 /// Appends a statement/control-flow node and returns its id.
@@ -518,33 +507,13 @@ pub fn addCFSwitchBranches(self: *Self, branches: []const CFSwitchBranch) Alloca
 }
 
 /// Resolves a switch-branch span to its stored slice.
-pub fn getCFSwitchBranches(self: *const Self, span: CFSwitchBranchSpan) []const CFSwitchBranch {
-    if (span.len == 0) return &.{};
-    if (builtin.mode == .Debug) {
-        const end = @as(u64, span.start) + @as(u64, span.len);
-        if (end > self.cf_switch_branches.len()) {
-            std.debug.panic(
-                "LirStore invariant violated: switch-branch span start={d} len={d} exceeds switch-branch storage len={d}",
-                .{ span.start, span.len, self.cf_switch_branches.len() },
-            );
-        }
-    }
-    return self.cf_switch_branches.unsafeRawItemsForView()[span.start..][0..span.len];
+pub fn getCFSwitchBranches(self: *const Self, span: CFSwitchBranchSpan) StoreSpanBorrow(CFSwitchBranch, "cf_switch_branches") {
+    return self.cf_switch_branches.borrowSpan(span.start, span.len);
 }
 
 /// Resolves a switch-branch span to its stored mutable slice.
-pub fn getCFSwitchBranchesMut(self: *Self, span: CFSwitchBranchSpan) []CFSwitchBranch {
-    if (span.len == 0) return self.cf_switch_branches.unsafeRawItemsMutForStore()[0..0];
-    if (builtin.mode == .Debug) {
-        const end = @as(u64, span.start) + @as(u64, span.len);
-        if (end > self.cf_switch_branches.len()) {
-            std.debug.panic(
-                "LirStore invariant violated: mutable switch-branch span start={d} len={d} exceeds switch-branch storage len={d}",
-                .{ span.start, span.len, self.cf_switch_branches.len() },
-            );
-        }
-    }
-    return self.cf_switch_branches.unsafeRawItemsMutForStore()[span.start..][0..span.len];
+pub fn getCFSwitchBranchesMut(self: *Self, span: CFSwitchBranchSpan) StoreSpanBorrowMut(CFSwitchBranch, "cf_switch_branches") {
+    return self.cf_switch_branches.borrowSpanMut(span.start, span.len);
 }
 
 /// Appends string-match steps and returns the corresponding flat-storage span.
@@ -557,18 +526,8 @@ pub fn addStrMatchSteps(self: *Self, steps: []const StrMatchStep) Allocator.Erro
 }
 
 /// Resolves a string-match-step span to its stored slice.
-pub fn getStrMatchSteps(self: *const Self, span: StrMatchStepSpan) []const StrMatchStep {
-    if (span.len == 0) return &.{};
-    if (builtin.mode == .Debug) {
-        const end = @as(u64, span.start) + @as(u64, span.len);
-        if (end > self.str_match_steps.len()) {
-            std.debug.panic(
-                "LirStore invariant violated: string-match-step span start={d} len={d} exceeds string-match-step storage len={d}",
-                .{ span.start, span.len, self.str_match_steps.len() },
-            );
-        }
-    }
-    return self.str_match_steps.unsafeRawItemsForView()[span.start..][0..span.len];
+pub fn getStrMatchSteps(self: *const Self, span: StrMatchStepSpan) StoreSpanBorrow(StrMatchStep, "str_match_steps") {
+    return self.str_match_steps.borrowSpan(span.start, span.len);
 }
 
 /// Appends string-match arms and returns the corresponding flat-storage span.
@@ -581,33 +540,13 @@ pub fn addStrMatchArms(self: *Self, arms: []const StrMatchArm) Allocator.Error!S
 }
 
 /// Resolves a string-match-arm span to its stored slice.
-pub fn getStrMatchArms(self: *const Self, span: StrMatchArmSpan) []const StrMatchArm {
-    if (span.len == 0) return &.{};
-    if (builtin.mode == .Debug) {
-        const end = @as(u64, span.start) + @as(u64, span.len);
-        if (end > self.str_match_arms.len()) {
-            std.debug.panic(
-                "LirStore invariant violated: string-match-arm span start={d} len={d} exceeds string-match-arm storage len={d}",
-                .{ span.start, span.len, self.str_match_arms.len() },
-            );
-        }
-    }
-    return self.str_match_arms.unsafeRawItemsForView()[span.start..][0..span.len];
+pub fn getStrMatchArms(self: *const Self, span: StrMatchArmSpan) StoreSpanBorrow(StrMatchArm, "str_match_arms") {
+    return self.str_match_arms.borrowSpan(span.start, span.len);
 }
 
 /// Resolves a string-match-arm span to its stored mutable slice.
-pub fn getStrMatchArmsMut(self: *Self, span: StrMatchArmSpan) []StrMatchArm {
-    if (span.len == 0) return self.str_match_arms.unsafeRawItemsMutForStore()[0..0];
-    if (builtin.mode == .Debug) {
-        const end = @as(u64, span.start) + @as(u64, span.len);
-        if (end > self.str_match_arms.len()) {
-            std.debug.panic(
-                "LirStore invariant violated: mutable string-match-arm span start={d} len={d} exceeds string-match-arm storage len={d}",
-                .{ span.start, span.len, self.str_match_arms.len() },
-            );
-        }
-    }
-    return self.str_match_arms.unsafeRawItemsMutForStore()[span.start..][0..span.len];
+pub fn getStrMatchArmsMut(self: *Self, span: StrMatchArmSpan) StoreSpanBorrowMut(StrMatchArm, "str_match_arms") {
+    return self.str_match_arms.borrowSpanMut(span.start, span.len);
 }
 
 /// Appends join-point entries and returns the corresponding flat-storage span.
@@ -620,33 +559,13 @@ pub fn addJoinPointSpan(self: *Self, join_points: []const JoinPoint) Allocator.E
 }
 
 /// Resolves a join-point span to its stored slice.
-pub fn getJoinPointSpan(self: *const Self, span: JoinPointSpan) []const JoinPoint {
-    if (span.len == 0) return &.{};
-    if (builtin.mode == .Debug) {
-        const end = @as(u64, span.start) + @as(u64, span.len);
-        if (end > self.join_points.len()) {
-            std.debug.panic(
-                "LirStore invariant violated: join-point span start={d} len={d} exceeds join-point storage len={d}",
-                .{ span.start, span.len, self.join_points.len() },
-            );
-        }
-    }
-    return self.join_points.unsafeRawItemsForView()[span.start..][0..span.len];
+pub fn getJoinPointSpan(self: *const Self, span: JoinPointSpan) StoreSpanBorrow(JoinPoint, "join_points") {
+    return self.join_points.borrowSpan(span.start, span.len);
 }
 
 /// Resolves a join-point span to its stored mutable slice.
-pub fn getJoinPointSpanMut(self: *Self, span: JoinPointSpan) []JoinPoint {
-    if (span.len == 0) return self.join_points.unsafeRawItemsMutForStore()[0..0];
-    if (builtin.mode == .Debug) {
-        const end = @as(u64, span.start) + @as(u64, span.len);
-        if (end > self.join_points.len()) {
-            std.debug.panic(
-                "LirStore invariant violated: mutable join-point span start={d} len={d} exceeds join-point storage len={d}",
-                .{ span.start, span.len, self.join_points.len() },
-            );
-        }
-    }
-    return self.join_points.unsafeRawItemsMutForStore()[span.start..][0..span.len];
+pub fn getJoinPointSpanMut(self: *Self, span: JoinPointSpan) StoreSpanBorrowMut(JoinPoint, "join_points") {
+    return self.join_points.borrowSpanMut(span.start, span.len);
 }
 
 /// Appends a proc specification and returns its id.
@@ -695,6 +614,23 @@ pub fn getLocalNamesRaw(self: *const Self) []const u32 {
 /// Returns the stored proc specification for the given id.
 pub fn getProcSpec(self: *const Self, idx: LirProcSpecId) LirProcSpec {
     return self.proc_specs.get(@intFromEnum(idx));
+}
+
+/// Updates the body for a stored proc specification.
+pub fn setProcSpecBody(self: *Self, idx: LirProcSpecId, body: ?CFStmtId) void {
+    self.proc_specs.getPtrImmediate(@intFromEnum(idx)).body = body;
+}
+
+/// Updates the final join-point span for a stored proc specification.
+pub fn setProcSpecJoinPoints(self: *Self, idx: LirProcSpecId, join_points: JoinPointSpan) void {
+    self.proc_specs.getPtrImmediate(@intFromEnum(idx)).join_points = join_points;
+}
+
+/// Updates body and final join points after all fallible/appending work has completed.
+pub fn setProcSpecBodyAndJoinPoints(self: *Self, idx: LirProcSpecId, body: ?CFStmtId, join_points: JoinPointSpan) void {
+    const proc = self.proc_specs.getPtrImmediate(@intFromEnum(idx));
+    proc.body = body;
+    proc.join_points = join_points;
 }
 
 /// Returns a mutable pointer to the stored proc specification for the given id.
@@ -775,7 +711,9 @@ pub fn compactCFStmts(self: *Self, reachable: []const bool) void {
 
 /// Reports whether any local in a span has a layout that requires stack probing.
 pub fn localSpanNeedsStackProbe(self: *const Self, layouts: *const layout.Store, span: LocalSpan) bool {
-    for (self.getLocalSpan(span)) |local| {
+    const locals = self.getLocalSpan(span);
+    for (0..locals.len) |index| {
+        const local = GuardedList.at(locals, index);
         if (lir_defs.layoutNeedsStackProbe(layouts, self.getLocal(local).layout_idx)) return true;
     }
     return false;

@@ -20,8 +20,14 @@ const GuardedList = collections.GuardedList;
 
 const checked = check.CheckedModule;
 
+/// Guarded growable list for mutable Lambda Mono program storage.
 pub fn ProgramList(comptime T: type, comptime field_name: []const u8) type {
     return GuardedList.List(T, "lambda_mono.Program." ++ field_name);
+}
+
+/// Guarded immutable span borrow for a named Lambda Mono program list.
+pub fn ProgramSpanBorrow(comptime T: type, comptime field_name: []const u8) type {
+    return GuardedList.BorrowSpan(T, "lambda_mono.Program." ++ field_name);
 }
 
 /// Identifier for an expression in Lambda Mono IR.
@@ -697,40 +703,40 @@ pub const Program = struct {
         return .{ .start = start, .len = @intCast(values.len) };
     }
 
-    pub fn exprSpan(self: *const Program, span_: Span(ExprId)) []const ExprId {
-        return self.expr_ids.unsafeRawItemsForView()[span_.start..][0..span_.len];
+    pub fn exprSpan(self: *const Program, span_: Span(ExprId)) ProgramSpanBorrow(ExprId, "expr_ids") {
+        return self.expr_ids.borrowSpan(span_.start, span_.len);
     }
 
-    pub fn patSpan(self: *const Program, span_: Span(PatId)) []const PatId {
-        return self.pat_ids.unsafeRawItemsForView()[span_.start..][0..span_.len];
+    pub fn patSpan(self: *const Program, span_: Span(PatId)) ProgramSpanBorrow(PatId, "pat_ids") {
+        return self.pat_ids.borrowSpan(span_.start, span_.len);
     }
 
-    pub fn typedLocalSpan(self: *const Program, span_: Span(TypedLocal)) []const TypedLocal {
-        return self.typed_locals.unsafeRawItemsForView()[span_.start..][0..span_.len];
+    pub fn typedLocalSpan(self: *const Program, span_: Span(TypedLocal)) ProgramSpanBorrow(TypedLocal, "typed_locals") {
+        return self.typed_locals.borrowSpan(span_.start, span_.len);
     }
 
-    pub fn stmtSpan(self: *const Program, span_: Span(StmtId)) []const StmtId {
-        return self.stmt_ids.unsafeRawItemsForView()[span_.start..][0..span_.len];
+    pub fn stmtSpan(self: *const Program, span_: Span(StmtId)) ProgramSpanBorrow(StmtId, "stmt_ids") {
+        return self.stmt_ids.borrowSpan(span_.start, span_.len);
     }
 
-    pub fn fieldExprSpan(self: *const Program, span_: Span(FieldExpr)) []const FieldExpr {
-        return self.field_exprs.unsafeRawItemsForView()[span_.start..][0..span_.len];
+    pub fn fieldExprSpan(self: *const Program, span_: Span(FieldExpr)) ProgramSpanBorrow(FieldExpr, "field_exprs") {
+        return self.field_exprs.borrowSpan(span_.start, span_.len);
     }
 
-    pub fn recordDestructSpan(self: *const Program, span_: Span(RecordDestruct)) []const RecordDestruct {
-        return self.record_destructs.unsafeRawItemsForView()[span_.start..][0..span_.len];
+    pub fn recordDestructSpan(self: *const Program, span_: Span(RecordDestruct)) ProgramSpanBorrow(RecordDestruct, "record_destructs") {
+        return self.record_destructs.borrowSpan(span_.start, span_.len);
     }
 
-    pub fn strPatternStepSpan(self: *const Program, span_: Span(StrPatternStep)) []const StrPatternStep {
-        return self.str_pattern_steps.unsafeRawItemsForView()[span_.start..][0..span_.len];
+    pub fn strPatternStepSpan(self: *const Program, span_: Span(StrPatternStep)) ProgramSpanBorrow(StrPatternStep, "str_pattern_steps") {
+        return self.str_pattern_steps.borrowSpan(span_.start, span_.len);
     }
 
-    pub fn branchSpan(self: *const Program, span_: Span(Branch)) []const Branch {
-        return self.branches.unsafeRawItemsForView()[span_.start..][0..span_.len];
+    pub fn branchSpan(self: *const Program, span_: Span(Branch)) ProgramSpanBorrow(Branch, "branches") {
+        return self.branches.borrowSpan(span_.start, span_.len);
     }
 
-    pub fn ifBranchSpan(self: *const Program, span_: Span(IfBranch)) []const IfBranch {
-        return self.if_branches.unsafeRawItemsForView()[span_.start..][0..span_.len];
+    pub fn ifBranchSpan(self: *const Program, span_: Span(IfBranch)) ProgramSpanBorrow(IfBranch, "if_branches") {
+        return self.if_branches.borrowSpan(span_.start, span_.len);
     }
 
     pub fn fnCount(self: *const Program) usize {

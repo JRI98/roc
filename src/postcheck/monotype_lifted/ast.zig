@@ -15,8 +15,14 @@ const Type = @import("../monotype/type.zig");
 const names = check.CheckedNames;
 const GuardedList = collections.GuardedList;
 
+/// Guarded growable list for mutable Monotype Lifted program storage.
 pub fn ProgramList(comptime T: type, comptime field_name: []const u8) type {
     return GuardedList.List(T, "monotype_lifted.Program." ++ field_name);
+}
+
+/// Guarded immutable span borrow for a named Monotype Lifted program list.
+pub fn ProgramSpanBorrow(comptime T: type, comptime field_name: []const u8) type {
+    return GuardedList.BorrowSpan(T, "monotype_lifted.Program." ++ field_name);
 }
 
 /// Identifier for an expression in Monotype Lifted IR.
@@ -861,16 +867,16 @@ pub const Program = struct {
         return .{ .start = start, .len = @intCast(values.len) };
     }
 
-    pub fn exprSpan(self: *const Program, span_: Span(ExprId)) []const ExprId {
-        return self.expr_ids.unsafeRawItemsForView()[span_.start..][0..span_.len];
+    pub fn exprSpan(self: *const Program, span_: Span(ExprId)) ProgramSpanBorrow(ExprId, "expr_ids") {
+        return self.expr_ids.borrowSpan(span_.start, span_.len);
     }
 
-    pub fn patSpan(self: *const Program, span_: Span(PatId)) []const PatId {
-        return self.pat_ids.unsafeRawItemsForView()[span_.start..][0..span_.len];
+    pub fn patSpan(self: *const Program, span_: Span(PatId)) ProgramSpanBorrow(PatId, "pat_ids") {
+        return self.pat_ids.borrowSpan(span_.start, span_.len);
     }
 
-    pub fn typedLocalSpan(self: *const Program, span_: Span(TypedLocal)) []const TypedLocal {
-        return self.typed_locals.unsafeRawItemsForView()[span_.start..][0..span_.len];
+    pub fn typedLocalSpan(self: *const Program, span_: Span(TypedLocal)) ProgramSpanBorrow(TypedLocal, "typed_locals") {
+        return self.typed_locals.borrowSpan(span_.start, span_.len);
     }
 
     /// The CaptureId of a local. Every local that participates in a capture set
@@ -888,32 +894,32 @@ pub const Program = struct {
         return local.capture_id.?;
     }
 
-    pub fn stmtSpan(self: *const Program, span_: Span(StmtId)) []const StmtId {
-        return self.stmt_ids.unsafeRawItemsForView()[span_.start..][0..span_.len];
+    pub fn stmtSpan(self: *const Program, span_: Span(StmtId)) ProgramSpanBorrow(StmtId, "stmt_ids") {
+        return self.stmt_ids.borrowSpan(span_.start, span_.len);
     }
 
-    pub fn fieldExprSpan(self: *const Program, span_: Span(FieldExpr)) []const FieldExpr {
-        return self.field_exprs.unsafeRawItemsForView()[span_.start..][0..span_.len];
+    pub fn fieldExprSpan(self: *const Program, span_: Span(FieldExpr)) ProgramSpanBorrow(FieldExpr, "field_exprs") {
+        return self.field_exprs.borrowSpan(span_.start, span_.len);
     }
 
-    pub fn fnDefCaptureSpan(self: *const Program, span_: Span(FnDefCapture)) []const FnDefCapture {
-        return self.fn_def_captures.unsafeRawItemsForView()[span_.start..][0..span_.len];
+    pub fn fnDefCaptureSpan(self: *const Program, span_: Span(FnDefCapture)) ProgramSpanBorrow(FnDefCapture, "fn_def_captures") {
+        return self.fn_def_captures.borrowSpan(span_.start, span_.len);
     }
 
-    pub fn captureOperandSpan(self: *const Program, span_: Span(CaptureOperand)) []const CaptureOperand {
-        return self.capture_operands.unsafeRawItemsForView()[span_.start..][0..span_.len];
+    pub fn captureOperandSpan(self: *const Program, span_: Span(CaptureOperand)) ProgramSpanBorrow(CaptureOperand, "capture_operands") {
+        return self.capture_operands.borrowSpan(span_.start, span_.len);
     }
 
-    pub fn recordDestructSpan(self: *const Program, span_: Span(RecordDestruct)) []const RecordDestruct {
-        return self.record_destructs.unsafeRawItemsForView()[span_.start..][0..span_.len];
+    pub fn recordDestructSpan(self: *const Program, span_: Span(RecordDestruct)) ProgramSpanBorrow(RecordDestruct, "record_destructs") {
+        return self.record_destructs.borrowSpan(span_.start, span_.len);
     }
 
-    pub fn strPatternStepSpan(self: *const Program, span_: Span(Mono.StrPatternStep)) []const Mono.StrPatternStep {
-        return self.str_pattern_steps.unsafeRawItemsForView()[span_.start..][0..span_.len];
+    pub fn strPatternStepSpan(self: *const Program, span_: Span(Mono.StrPatternStep)) ProgramSpanBorrow(Mono.StrPatternStep, "str_pattern_steps") {
+        return self.str_pattern_steps.borrowSpan(span_.start, span_.len);
     }
 
-    pub fn branchSpan(self: *const Program, span_: Span(Branch)) []const Branch {
-        return self.branches.unsafeRawItemsForView()[span_.start..][0..span_.len];
+    pub fn branchSpan(self: *const Program, span_: Span(Branch)) ProgramSpanBorrow(Branch, "branches") {
+        return self.branches.borrowSpan(span_.start, span_.len);
     }
 
     /// The two pieces direct LIR lowering needs to consider folding away the
@@ -949,7 +955,9 @@ pub const Program = struct {
         };
         if (!self.exprIsListMapCanReuseOp(callee_body)) return null;
 
-        for (self.branchSpan(branches_span)) |branch| {
+        const branches = self.branchSpan(branches_span);
+        for (0..branches.len) |index| {
+            const branch = GuardedList.at(branches, index);
             if (branch.guard != null) return null;
             switch (self.pats.unsafeRawItemsForView()[@intFromEnum(branch.pat)].data) {
                 .wildcard => return .{ .call_args = call.args, .zero_branch_body = branch.body },
@@ -979,8 +987,8 @@ pub const Program = struct {
         };
     }
 
-    pub fn ifBranchSpan(self: *const Program, span_: Span(IfBranch)) []const IfBranch {
-        return self.if_branches.unsafeRawItemsForView()[span_.start..][0..span_.len];
+    pub fn ifBranchSpan(self: *const Program, span_: Span(IfBranch)) ProgramSpanBorrow(IfBranch, "if_branches") {
+        return self.if_branches.borrowSpan(span_.start, span_.len);
     }
 
     pub fn exprCount(self: *const Program) usize {

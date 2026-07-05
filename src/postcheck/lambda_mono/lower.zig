@@ -1,6 +1,7 @@
 //! Lambda Solved IR to Lambda Mono IR.
 
 const std = @import("std");
+const collections = @import("collections");
 
 const Common = @import("../common.zig");
 const Lifted = @import("../monotype_lifted/ast.zig");
@@ -10,6 +11,7 @@ const Ast = @import("ast.zig");
 const Type = @import("type.zig");
 
 const Allocator = std.mem.Allocator;
+const GuardedList = collections.GuardedList;
 
 /// Whether inline expects should materialize during lowering.
 pub const InlineExpectMode = enum {
@@ -491,7 +493,9 @@ const Lowerer = struct {
         };
         if (captures.len != fields.len) Common.invariant("function capture argument arity differed from capture slots");
 
-        for (captures, fields) |capture, field| {
+        for (0..captures.len) |index| {
+            const capture = captures[index];
+            const field = GuardedList.at(fields, index);
             if (capture.capture_id != field.capture_id) {
                 Common.invariant("function capture argument fields differed from capture slots");
             }
@@ -720,7 +724,9 @@ const Lowerer = struct {
         return switch (self.program.types.get(ty)) {
             .callable => |variants| blk: {
                 const fn_symbol = self.solved.lifted.fns[@intFromEnum(fn_id)].symbol;
-                for (self.program.types.fnVariantSpan(variants)) |variant| {
+                const variant_span = self.program.types.fnVariantSpan(variants);
+                for (0..variant_span.len) |index| {
+                    const variant = GuardedList.at(variant_span, index);
                     if (variant.source != fn_symbol) continue;
                     break :blk .{ .callable = .{
                         .ty = ty,
@@ -732,7 +738,9 @@ const Lowerer = struct {
             },
             .erased_fn => |erased| blk: {
                 const fn_symbol = self.solved.lifted.fns[@intFromEnum(fn_id)].symbol;
-                for (self.program.types.fnVariantSpan(erased.members)) |variant| {
+                const variant_span = self.program.types.fnVariantSpan(erased.members);
+                for (0..variant_span.len) |index| {
+                    const variant = GuardedList.at(variant_span, index);
                     if (variant.source != fn_symbol) continue;
                     break :blk .{ .packed_erased_fn = .{
                         .target = variant.target,
@@ -809,7 +817,9 @@ const Lowerer = struct {
             .callable => |variants| blk: {
                 const branches = try self.allocator.alloc(Ast.Branch, variants.len);
                 defer self.allocator.free(branches);
-                for (self.program.types.fnVariantSpan(variants), 0..) |variant, i| {
+                const variant_span = self.program.types.fnVariantSpan(variants);
+                for (0..variant_span.len) |i| {
+                    const variant = GuardedList.at(variant_span, i);
                     const payload_pat = if (variant.capture_ty) |capture_ty| blk_payload: {
                         const local = try self.program.addLocal(self.symbols.fresh(), capture_ty);
                         break :blk_payload try self.program.addPat(.{ .ty = capture_ty, .data = .{ .bind = local } });
@@ -866,7 +876,7 @@ const Lowerer = struct {
     fn buildCaptureRecordFromExprs(
         self: *Lowerer,
         capture_span: SolvedType.Span,
-        capture_operands: []const Lifted.CaptureOperand,
+        capture_operands: anytype,
         capture_ty: Type.TypeId,
     ) Allocator.Error!Ast.ExprId {
         const captures = self.solved.types.captureSpan(capture_span);
@@ -883,7 +893,10 @@ const Lowerer = struct {
         // ascending CaptureId order, so the join is an exact indexed walk.
         const values = try self.allocator.alloc(Ast.ExprId, captures.len);
         defer self.allocator.free(values);
-        for (captures, fields, capture_operands, 0..) |capture, field, operand, i| {
+        for (0..captures.len) |i| {
+            const capture = captures[i];
+            const field = GuardedList.at(fields, i);
+            const operand = GuardedList.at(capture_operands, i);
             if (capture.capture_id != field.capture_id) {
                 Common.invariant("callable capture payload fields differed from captured locals");
             }
@@ -942,7 +955,8 @@ const Lowerer = struct {
         const steps = try self.allocator.alloc(Ast.StrPatternStep, input_steps.len);
         defer self.allocator.free(steps);
 
-        for (input_steps, 0..) |step, i| {
+        for (0..input_steps.len) |i| {
+            const step = GuardedList.at(input_steps, i);
             steps[i] = .{
                 .capture = if (step.capture) |capture| try self.lowerPat(capture) else null,
                 .delimiter = step.delimiter,
@@ -1221,10 +1235,12 @@ const Lowerer = struct {
         return try self.program.addExprSpan(lowered);
     }
 
-    fn lowerExprSlice(self: *Lowerer, exprs: []const Lifted.ExprId) Allocator.Error![]Ast.ExprId {
+    fn lowerExprSlice(self: *Lowerer, exprs: anytype) Allocator.Error![]Ast.ExprId {
         const lowered = try self.allocator.alloc(Ast.ExprId, exprs.len);
         errdefer self.allocator.free(lowered);
-        for (exprs, 0..) |expr, i| lowered[i] = try self.lowerExpr(expr);
+        for (0..exprs.len) |i| {
+            lowered[i] = try self.lowerExpr(GuardedList.at(exprs, i));
+        }
         return lowered;
     }
 
@@ -1232,7 +1248,9 @@ const Lowerer = struct {
         const input_items = self.solved.lifted.patSpan(span);
         const lowered = try self.allocator.alloc(Ast.PatId, input_items.len);
         defer self.allocator.free(lowered);
-        for (input_items, 0..) |item, i| lowered[i] = try self.lowerPat(item);
+        for (0..input_items.len) |i| {
+            lowered[i] = try self.lowerPat(GuardedList.at(input_items, i));
+        }
         return try self.program.addPatSpan(lowered);
     }
 
@@ -1240,7 +1258,9 @@ const Lowerer = struct {
         const input_items = self.solved.lifted.stmtSpan(span);
         const lowered = try self.allocator.alloc(Ast.StmtId, input_items.len);
         defer self.allocator.free(lowered);
-        for (input_items, 0..) |item, i| lowered[i] = try self.lowerStmt(item);
+        for (0..input_items.len) |i| {
+            lowered[i] = try self.lowerStmt(GuardedList.at(input_items, i));
+        }
         return try self.program.addStmtSpan(lowered);
     }
 
@@ -1248,7 +1268,8 @@ const Lowerer = struct {
         const input_items = self.solved.lifted.typedLocalSpan(span);
         const lowered = try self.allocator.alloc(Ast.TypedLocal, input_items.len);
         defer self.allocator.free(lowered);
-        for (input_items, 0..) |item, i| {
+        for (0..input_items.len) |i| {
+            const item = GuardedList.at(input_items, i);
             const lifted_local = self.solved.lifted.locals[@intFromEnum(item.local)];
             const ty = try self.lowerTypeByLiftedLocal(lifted_local.id);
             lowered[i] = .{ .local = try self.localFor(item.local, ty), .ty = ty };
@@ -1267,7 +1288,8 @@ const Lowerer = struct {
         const input_items = self.solved.lifted.fieldExprSpan(span);
         const lowered = try self.allocator.alloc(Ast.FieldExpr, input_items.len);
         defer self.allocator.free(lowered);
-        for (input_items, 0..) |field, i| {
+        for (0..input_items.len) |i| {
+            const field = GuardedList.at(input_items, i);
             lowered[i] = .{
                 .name = field.name,
                 .value = try self.lowerExpr(field.value),
@@ -1280,7 +1302,8 @@ const Lowerer = struct {
         const input_items = self.solved.lifted.recordDestructSpan(span);
         const lowered = try self.allocator.alloc(Ast.RecordDestruct, input_items.len);
         defer self.allocator.free(lowered);
-        for (input_items, 0..) |field, i| {
+        for (0..input_items.len) |i| {
+            const field = GuardedList.at(input_items, i);
             lowered[i] = .{
                 .name = field.name,
                 .pattern = try self.lowerPat(field.pattern),
@@ -1293,7 +1316,8 @@ const Lowerer = struct {
         const input_items = self.solved.lifted.branchSpan(span);
         const lowered = try self.allocator.alloc(Ast.Branch, input_items.len);
         defer self.allocator.free(lowered);
-        for (input_items, 0..) |branch, i| {
+        for (0..input_items.len) |i| {
+            const branch = GuardedList.at(input_items, i);
             lowered[i] = .{
                 .pat = try self.lowerPat(branch.pat),
                 .guard = if (branch.guard) |guard| try self.lowerExpr(guard) else null,
@@ -1307,7 +1331,8 @@ const Lowerer = struct {
         const input_items = self.solved.lifted.ifBranchSpan(span);
         const lowered = try self.allocator.alloc(Ast.IfBranch, input_items.len);
         defer self.allocator.free(lowered);
-        for (input_items, 0..) |branch, i| {
+        for (0..input_items.len) |i| {
+            const branch = GuardedList.at(input_items, i);
             lowered[i] = .{
                 .cond = try self.lowerExpr(branch.cond),
                 .body = try self.lowerExpr(branch.body),

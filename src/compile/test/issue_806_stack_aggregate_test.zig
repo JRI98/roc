@@ -3,6 +3,7 @@
 const std = @import("std");
 const layout = @import("layout");
 const lir = @import("lir");
+const GuardedList = lir.LirStore.GuardedList;
 
 const harness = @import("lower_to_lir_harness.zig");
 
@@ -486,7 +487,9 @@ fn spanHasUnsafeLargeAggregateLocal(
     layouts: *const layout.Store,
     span: lir.LocalSpan,
 ) bool {
-    for (store.getLocalSpan(span)) |local| {
+    const locals = store.getLocalSpan(span);
+    for (0..locals.len) |i| {
+        const local = GuardedList.at(locals, i);
         if (isUnsafeLargeAggregateLocal(store, layouts, local)) return true;
     }
     return false;
@@ -536,7 +539,9 @@ fn patternSpanHasUnsafeLargeAggregate(
     layouts: *const layout.Store,
     span: lir.LirPatternSpan,
 ) bool {
-    for (store.getPatternSpan(span)) |pattern_id| {
+    const pattern_ids = store.getPatternSpan(span);
+    for (0..pattern_ids.len) |i| {
+        const pattern_id = GuardedList.at(pattern_ids, i);
         if (patternHasUnsafeLargeAggregate(store, layouts, pattern_id)) return true;
     }
     return false;

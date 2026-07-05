@@ -17,6 +17,11 @@ fn StoreList(comptime T: type, comptime field_name: []const u8) type {
     return GuardedList.List(T, "monotype.Type.Store." ++ field_name);
 }
 
+/// Guarded immutable span borrow for a named Monotype type-store list.
+pub fn StoreSpanBorrow(comptime T: type, comptime field_name: []const u8) type {
+    return GuardedList.BorrowSpan(T, "monotype.Type.Store." ++ field_name);
+}
+
 /// Identifier for a monomorphic type in this store.
 pub const TypeId = enum(u32) { _ };
 
@@ -286,16 +291,16 @@ pub const Store = struct {
         return self.types.unsafeRawItemsForView()[@intFromEnum(ty)];
     }
 
-    pub fn span(self: *const Store, span_: Span) []const TypeId {
-        return self.spans.unsafeRawItemsForView()[span_.start..][0..span_.len];
+    pub fn span(self: *const Store, span_: Span) StoreSpanBorrow(TypeId, "spans") {
+        return self.spans.borrowSpan(span_.start, span_.len);
     }
 
-    pub fn fieldSpan(self: *const Store, span_: Span) []const Field {
-        return self.fields.unsafeRawItemsForView()[span_.start..][0..span_.len];
+    pub fn fieldSpan(self: *const Store, span_: Span) StoreSpanBorrow(Field, "fields") {
+        return self.fields.borrowSpan(span_.start, span_.len);
     }
 
-    pub fn tagSpan(self: *const Store, span_: Span) []const Tag {
-        return self.tags.unsafeRawItemsForView()[span_.start..][0..span_.len];
+    pub fn tagSpan(self: *const Store, span_: Span) StoreSpanBorrow(Tag, "tags") {
+        return self.tags.borrowSpan(span_.start, span_.len);
     }
 
     pub fn addDeclaredFields(self: *Store, values: []const DeclaredField) std.mem.Allocator.Error!Span {
@@ -306,8 +311,8 @@ pub const Store = struct {
         return .{ .start = start, .len = @intCast(values.len) };
     }
 
-    pub fn declaredFieldSpan(self: *const Store, span_: Span) []const DeclaredField {
-        return self.declared_fields.unsafeRawItemsForView()[span_.start..][0..span_.len];
+    pub fn declaredFieldSpan(self: *const Store, span_: Span) StoreSpanBorrow(DeclaredField, "declared_fields") {
+        return self.declared_fields.borrowSpan(span_.start, span_.len);
     }
 
     const Mark = struct {
@@ -766,7 +771,8 @@ pub const Store = struct {
     ) void {
         const values = self.span(span_);
         writeU32(hasher, @intCast(values.len));
-        for (values) |child| {
+        for (0..values.len) |index| {
+            const child = GuardedList.at(values, index);
             self.writeCachedChildDigest(name_store, hasher, child, named_mode, ctx, stats);
         }
     }
@@ -827,7 +833,8 @@ pub const Store = struct {
                 writeBytes(hasher, "record");
                 const field_slice = self.fieldSpan(fields);
                 writeU32(hasher, @intCast(field_slice.len));
-                for (field_slice) |field| {
+                for (0..field_slice.len) |index| {
+                    const field = GuardedList.at(field_slice, index);
                     writeBytes(hasher, name_store.recordFieldLabelText(field.name));
                     self.writeCachedChildDigest(name_store, hasher, field.ty, named_mode, ctx, stats);
                 }
@@ -840,7 +847,8 @@ pub const Store = struct {
                 writeBytes(hasher, "tag_union");
                 const tag_slice = self.tagSpan(tags);
                 writeU32(hasher, @intCast(tag_slice.len));
-                for (tag_slice) |tag| {
+                for (0..tag_slice.len) |index| {
+                    const tag = GuardedList.at(tag_slice, index);
                     writeBytes(hasher, name_store.tagLabelText(tag.name));
                     self.writeCachedTypeSpanDigest(name_store, hasher, tag.payloads, named_mode, ctx, stats);
                 }
@@ -894,7 +902,8 @@ pub const Store = struct {
         writeBytes(hasher, "declared_order");
         const entries = self.declaredFieldSpan(declared_order);
         writeU32(hasher, @intCast(entries.len));
-        for (entries) |entry| {
+        for (0..entries.len) |index| {
+            const entry = GuardedList.at(entries, index);
             switch (entry) {
                 .named => |field_name| {
                     writeBytes(hasher, "named");
@@ -982,7 +991,8 @@ pub const Store = struct {
                 writeBytes(hasher, "record");
                 const field_slice = self.fieldSpan(fields);
                 writeU32(hasher, @intCast(field_slice.len));
-                for (field_slice) |field| {
+                for (0..field_slice.len) |index| {
+                    const field = GuardedList.at(field_slice, index);
                     writeBytes(hasher, name_store.recordFieldLabelText(field.name));
                     self.writeTypeDigest(name_store, hasher, field.ty, visiting, named_mode);
                 }
@@ -995,7 +1005,8 @@ pub const Store = struct {
                 writeBytes(hasher, "tag_union");
                 const tag_slice = self.tagSpan(tags);
                 writeU32(hasher, @intCast(tag_slice.len));
-                for (tag_slice) |tag| {
+                for (0..tag_slice.len) |index| {
+                    const tag = GuardedList.at(tag_slice, index);
                     writeBytes(hasher, name_store.tagLabelText(tag.name));
                     self.writeTypeSpanDigest(name_store, hasher, tag.payloads, visiting, named_mode);
                 }
@@ -1031,7 +1042,8 @@ pub const Store = struct {
     ) void {
         const values = self.span(span_);
         writeU32(hasher, @intCast(values.len));
-        for (values) |child| {
+        for (0..values.len) |index| {
+            const child = GuardedList.at(values, index);
             self.writeTypeDigest(name_store, hasher, child, visiting, named_mode);
         }
     }
@@ -1062,7 +1074,8 @@ pub const Store = struct {
         writeBytes(hasher, "declared_order");
         const entries = self.declaredFieldSpan(declared_order);
         writeU32(hasher, @intCast(entries.len));
-        for (entries) |entry| {
+        for (0..entries.len) |index| {
+            const entry = GuardedList.at(entries, index);
             switch (entry) {
                 .named => |field_name| {
                     writeBytes(hasher, "named");
@@ -1631,15 +1644,15 @@ pub const Interner = opaque {
         return self.constStore().get(ty);
     }
 
-    pub fn span(self: *const Interner, span_: Span) []const TypeId {
+    pub fn span(self: *const Interner, span_: Span) StoreSpanBorrow(TypeId, "spans") {
         return self.constStore().span(span_);
     }
 
-    pub fn fieldSpan(self: *const Interner, span_: Span) []const Field {
+    pub fn fieldSpan(self: *const Interner, span_: Span) StoreSpanBorrow(Field, "fields") {
         return self.constStore().fieldSpan(span_);
     }
 
-    pub fn tagSpan(self: *const Interner, span_: Span) []const Tag {
+    pub fn tagSpan(self: *const Interner, span_: Span) StoreSpanBorrow(Tag, "tags") {
         return self.constStore().tagSpan(span_);
     }
 
@@ -2149,11 +2162,11 @@ test "monotype type interner normalizes record and tag rows" {
     try std.testing.expectEqual(first_tags, second_tags);
 
     const record_fields = interner.fieldSpan(interner.get(first_record).record);
-    try std.testing.expectEqual(a_field, record_fields[0].name);
-    try std.testing.expectEqual(b_field, record_fields[1].name);
+    try std.testing.expectEqual(a_field, GuardedList.at(record_fields, 0).name);
+    try std.testing.expectEqual(b_field, GuardedList.at(record_fields, 1).name);
     const tag_fields = interner.tagSpan(interner.get(first_tags).tag_union);
-    try std.testing.expectEqual(a_tag, tag_fields[0].name);
-    try std.testing.expectEqual(b_tag, tag_fields[1].name);
+    try std.testing.expectEqual(a_tag, GuardedList.at(tag_fields, 0).name);
+    try std.testing.expectEqual(b_tag, GuardedList.at(tag_fields, 1).name);
 }
 
 test "monotype type interner preserves tag payload order" {
@@ -2172,9 +2185,9 @@ test "monotype type interner preserves tag payload order" {
     });
 
     const tags_ = interner.tagSpan(interner.get(tag_ty).tag_union);
-    const stored_payloads = interner.span(tags_[0].payloads);
-    try std.testing.expectEqual(first, stored_payloads[0]);
-    try std.testing.expectEqual(second, stored_payloads[1]);
+    const stored_payloads = interner.span(GuardedList.at(tags_, 0).payloads);
+    try std.testing.expectEqual(first, GuardedList.at(stored_payloads, 0));
+    try std.testing.expectEqual(second, GuardedList.at(stored_payloads, 1));
 }
 
 test "monotype type interner checks exact equality after digest match" {
@@ -2222,7 +2235,7 @@ test "monotype type interner seals recursive root before exposing type id" {
 
     const fields = interner.fieldSpan(interner.get(root).record);
     try std.testing.expectEqual(@as(usize, 1), fields.len);
-    try std.testing.expectEqual(root, fields[0].ty);
+    try std.testing.expectEqual(root, GuardedList.at(fields, 0).ty);
     try std.testing.expectEqual(@as(?Store.VerifyError, null), interner.verify());
 }
 
@@ -2279,7 +2292,8 @@ test "monotype type interner seals multi-node recursive group privately" {
     try std.testing.expectEqual(first, second);
     try std.testing.expectEqual(@as(usize, 2), interner.view().types.len);
 
-    const step_ty = interner.fieldSpan(interner.get(first).record)[0].ty;
+    const fields = interner.fieldSpan(interner.get(first).record);
+    const step_ty = GuardedList.at(fields, 0).ty;
     const step_fn = interner.get(step_ty).func;
     try std.testing.expectEqual(first, step_fn.ret);
 }
@@ -2372,8 +2386,8 @@ test "monotype row entries retain checked label ids" {
     const payloads = try store.addSpan(&.{i64_ty});
     const tags = try store.addTags(&.{.{ .name = tag_name, .checked_name = tag_name, .payloads = payloads }});
 
-    try std.testing.expectEqual(field_name, store.fieldSpan(fields)[0].name);
-    try std.testing.expectEqual(tag_name, store.tagSpan(tags)[0].name);
+    try std.testing.expectEqual(field_name, GuardedList.at(store.fieldSpan(fields), 0).name);
+    try std.testing.expectEqual(tag_name, GuardedList.at(store.tagSpan(tags), 0).name);
 }
 
 test "monotype empty spans use shared empty descriptor" {

@@ -16,8 +16,14 @@ const checked = check.CheckedModule;
 const names = check.CheckedNames;
 const GuardedList = collections.GuardedList;
 
+/// Guarded growable list for mutable Monotype program storage.
 pub fn ProgramList(comptime T: type, comptime field_name: []const u8) type {
     return GuardedList.List(T, "monotype.Program." ++ field_name);
+}
+
+/// Guarded immutable span borrow for a named Monotype program list.
+pub fn ProgramSpanBorrow(comptime T: type, comptime field_name: []const u8) type {
+    return GuardedList.BorrowSpan(T, "monotype.Program." ++ field_name);
 }
 
 /// Monotype ids are local to the `ProgramView` or mapped shard that owns the
@@ -1649,28 +1655,28 @@ pub const ProgramBuilder = struct {
         return .{ .start = start, .len = @intCast(ids.len) };
     }
 
-    pub fn exprSpan(self: *const ProgramBuilder, span_: Span(ExprId)) []const ExprId {
-        return self.expr_ids.unsafeRawItemsForView()[span_.start..][0..span_.len];
+    pub fn exprSpan(self: *const ProgramBuilder, span_: Span(ExprId)) ProgramSpanBorrow(ExprId, "expr_ids") {
+        return self.expr_ids.borrowSpan(span_.start, span_.len);
     }
 
-    pub fn patSpan(self: *const ProgramBuilder, span_: Span(PatId)) []const PatId {
-        return self.pat_ids.unsafeRawItemsForView()[span_.start..][0..span_.len];
+    pub fn patSpan(self: *const ProgramBuilder, span_: Span(PatId)) ProgramSpanBorrow(PatId, "pat_ids") {
+        return self.pat_ids.borrowSpan(span_.start, span_.len);
     }
 
-    pub fn typedLocalSpan(self: *const ProgramBuilder, span_: Span(TypedLocal)) []const TypedLocal {
-        return self.typed_locals.unsafeRawItemsForView()[span_.start..][0..span_.len];
+    pub fn typedLocalSpan(self: *const ProgramBuilder, span_: Span(TypedLocal)) ProgramSpanBorrow(TypedLocal, "typed_locals") {
+        return self.typed_locals.borrowSpan(span_.start, span_.len);
     }
 
-    pub fn stmtSpan(self: *const ProgramBuilder, span_: Span(StmtId)) []const StmtId {
-        return self.stmt_ids.unsafeRawItemsForView()[span_.start..][0..span_.len];
+    pub fn stmtSpan(self: *const ProgramBuilder, span_: Span(StmtId)) ProgramSpanBorrow(StmtId, "stmt_ids") {
+        return self.stmt_ids.borrowSpan(span_.start, span_.len);
     }
 
-    pub fn fieldExprSpan(self: *const ProgramBuilder, span_: Span(FieldExpr)) []const FieldExpr {
-        return self.field_exprs.unsafeRawItemsForView()[span_.start..][0..span_.len];
+    pub fn fieldExprSpan(self: *const ProgramBuilder, span_: Span(FieldExpr)) ProgramSpanBorrow(FieldExpr, "field_exprs") {
+        return self.field_exprs.borrowSpan(span_.start, span_.len);
     }
 
-    pub fn fnDefCaptureSpan(self: *const ProgramBuilder, span_: Span(FnDefCapture)) []const FnDefCapture {
-        return self.fn_def_captures.unsafeRawItemsForView()[span_.start..][0..span_.len];
+    pub fn fnDefCaptureSpan(self: *const ProgramBuilder, span_: Span(FnDefCapture)) ProgramSpanBorrow(FnDefCapture, "fn_def_captures") {
+        return self.fn_def_captures.borrowSpan(span_.start, span_.len);
     }
 
     pub fn addCaptureOperandSpan(self: *ProgramBuilder, values: []const CaptureOperand) std.mem.Allocator.Error!Span(CaptureOperand) {
@@ -1679,8 +1685,8 @@ pub const ProgramBuilder = struct {
         return .{ .start = start, .len = @intCast(values.len) };
     }
 
-    pub fn captureOperandSpan(self: *const ProgramBuilder, span_: Span(CaptureOperand)) []const CaptureOperand {
-        return self.capture_operands.unsafeRawItemsForView()[span_.start..][0..span_.len];
+    pub fn captureOperandSpan(self: *const ProgramBuilder, span_: Span(CaptureOperand)) ProgramSpanBorrow(CaptureOperand, "capture_operands") {
+        return self.capture_operands.borrowSpan(span_.start, span_.len);
     }
 
     /// The CaptureId of a local. Every local that participates in a capture set
@@ -1690,20 +1696,20 @@ pub const ProgramBuilder = struct {
             Common.invariant("Monotype capture local had no CaptureId");
     }
 
-    pub fn recordDestructSpan(self: *const ProgramBuilder, span_: Span(RecordDestruct)) []const RecordDestruct {
-        return self.record_destructs.unsafeRawItemsForView()[span_.start..][0..span_.len];
+    pub fn recordDestructSpan(self: *const ProgramBuilder, span_: Span(RecordDestruct)) ProgramSpanBorrow(RecordDestruct, "record_destructs") {
+        return self.record_destructs.borrowSpan(span_.start, span_.len);
     }
 
-    pub fn strPatternStepSpan(self: *const ProgramBuilder, span_: Span(StrPatternStep)) []const StrPatternStep {
-        return self.str_pattern_steps.unsafeRawItemsForView()[span_.start..][0..span_.len];
+    pub fn strPatternStepSpan(self: *const ProgramBuilder, span_: Span(StrPatternStep)) ProgramSpanBorrow(StrPatternStep, "str_pattern_steps") {
+        return self.str_pattern_steps.borrowSpan(span_.start, span_.len);
     }
 
-    pub fn branchSpan(self: *const ProgramBuilder, span_: Span(Branch)) []const Branch {
-        return self.branches.unsafeRawItemsForView()[span_.start..][0..span_.len];
+    pub fn branchSpan(self: *const ProgramBuilder, span_: Span(Branch)) ProgramSpanBorrow(Branch, "branches") {
+        return self.branches.borrowSpan(span_.start, span_.len);
     }
 
-    pub fn ifBranchSpan(self: *const ProgramBuilder, span_: Span(IfBranch)) []const IfBranch {
-        return self.if_branches.unsafeRawItemsForView()[span_.start..][0..span_.len];
+    pub fn ifBranchSpan(self: *const ProgramBuilder, span_: Span(IfBranch)) ProgramSpanBorrow(IfBranch, "if_branches") {
+        return self.if_branches.borrowSpan(span_.start, span_.len);
     }
 };
 
@@ -1762,7 +1768,7 @@ test "completed monotype type id verifier requires frozen in-bounds type ids" {
     defer program.deinit();
 
     const unit_ty = try program.types.add(.zst);
-    _ = try program.addExpr(.{ .ty = unit_ty, .data = .unit });
+    const expr_id = try program.addExpr(.{ .ty = unit_ty, .data = .unit });
 
     try std.testing.expectEqual(
         CompletedTypeIdVerifyError.type_store_not_frozen,
@@ -1772,9 +1778,9 @@ test "completed monotype type id verifier requires frozen in-bounds type ids" {
     program.freeze();
     try std.testing.expectEqual(@as(?CompletedTypeIdVerifyError, null), program.view().verifyCompletedTypeIds());
 
-    var out_of_bounds_expr = program.getExpr(@enumFromInt(0));
+    var out_of_bounds_expr = program.getExpr(expr_id);
     out_of_bounds_expr.ty = @enumFromInt(99);
-    program.setExpr(@enumFromInt(0), out_of_bounds_expr);
+    program.setExpr(expr_id, out_of_bounds_expr);
     try std.testing.expectEqual(
         CompletedTypeIdVerifyError.expr_type_out_of_bounds,
         program.view().verifyCompletedTypeIds().?,
@@ -1951,31 +1957,19 @@ const MoveAllocatorForResultLocationTest = struct {
         return .{ .ptr = self, .vtable = &vtable };
     }
 
-    fn alloc(ctx: *anyopaque, len: usize, alignment: std.mem.Alignment, ret_addr: usize) ?[*]u8 {
-        _ = ctx;
+    fn alloc(_: *anyopaque, len: usize, alignment: std.mem.Alignment, ret_addr: usize) ?[*]u8 {
         return std.heap.page_allocator.rawAlloc(len, alignment, ret_addr);
     }
 
-    fn resize(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) bool {
-        _ = ctx;
-        _ = memory;
-        _ = alignment;
-        _ = new_len;
-        _ = ret_addr;
+    fn resize(_: *anyopaque, _: []u8, _: std.mem.Alignment, _: usize, _: usize) bool {
         return false;
     }
 
-    fn remap(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) ?[*]u8 {
-        _ = ctx;
-        _ = memory;
-        _ = alignment;
-        _ = new_len;
-        _ = ret_addr;
+    fn remap(_: *anyopaque, _: []u8, _: std.mem.Alignment, _: usize, _: usize) ?[*]u8 {
         return null;
     }
 
-    fn free(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, ret_addr: usize) void {
-        _ = ctx;
+    fn free(_: *anyopaque, memory: []u8, alignment: std.mem.Alignment, ret_addr: usize) void {
         std.heap.page_allocator.rawFree(memory, alignment, ret_addr);
     }
 };

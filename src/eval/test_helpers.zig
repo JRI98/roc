@@ -33,6 +33,7 @@ const LayoutStore = @import("layout").Store;
 const LayoutIdx = @import("layout").Idx;
 const LirProcSpecId = lir.LirProcSpecId;
 const LirImage = lir.LirImage;
+const GuardedList = lir.LirStore.GuardedList;
 
 /// Errors surfaced by shared eval test helpers.
 pub const TestHelperError = Allocator.Error || std.DynLib.Error || std.Io.File.OpenError || std.Io.File.Reader.Error || std.Io.File.Writer.Error || std.Io.File.StatError || std.Io.File.ReadPositionalError || std.Io.Writer.Error || check.CheckedArtifact.CompileTimeFinalizer.Error || error{
@@ -1793,7 +1794,8 @@ pub fn mainProcArgLayouts(allocator: Allocator, lowered: *const LoweredProgram) 
     const proc = lowered.view.store.getProcSpec(lowered.mainProc());
     const arg_locals = lowered.view.store.getLocalSpan(proc.args);
     const arg_layouts = try allocator.alloc(LayoutIdx, arg_locals.len);
-    for (arg_locals, 0..) |local_id, i| {
+    for (0..arg_locals.len) |i| {
+        const local_id = GuardedList.at(arg_locals, i);
         arg_layouts[i] = lowered.view.store.getLocal(local_id).layout_idx;
     }
     return arg_layouts;

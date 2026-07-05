@@ -10,6 +10,7 @@ const builtin = @import("builtin");
 const Allocator = std.mem.Allocator;
 const debug_guards = builtin.mode == .Debug;
 
+/// Growable list wrapper that checks stale borrows in Debug and erases to `std.ArrayList` otherwise.
 pub fn List(comptime T: type, comptime list_name: []const u8) type {
     return struct {
         const Self = @This();
@@ -164,7 +165,7 @@ pub fn List(comptime T: type, comptime list_name: []const u8) type {
                 return .{
                     .list = self,
                     .start = start,
-                    .span_len = span_len,
+                    .len = span_len,
                     .generation = self.currentGeneration(),
                 };
             } else {
@@ -178,7 +179,7 @@ pub fn List(comptime T: type, comptime list_name: []const u8) type {
                 return .{
                     .list = self,
                     .start = start,
-                    .span_len = span_len,
+                    .len = span_len,
                     .generation = self.currentGeneration(),
                 };
             } else {
@@ -275,6 +276,7 @@ pub fn List(comptime T: type, comptime list_name: []const u8) type {
     };
 }
 
+/// Read-only span borrow type for a guarded list.
 pub fn BorrowSpan(comptime T: type, comptime list_name: []const u8) type {
     if (!debug_guards) return []const T;
 
@@ -283,12 +285,8 @@ pub fn BorrowSpan(comptime T: type, comptime list_name: []const u8) type {
 
         list: *const List(T, list_name),
         start: usize,
-        span_len: usize,
+        len: usize,
         generation: u64,
-
-        pub fn len(self: Self) usize {
-            return self.span_len;
-        }
 
         pub fn at(self: Self, index: usize) T {
             self.assertElementAccess(index);
@@ -296,22 +294,22 @@ pub fn BorrowSpan(comptime T: type, comptime list_name: []const u8) type {
         }
 
         pub fn assertValid(self: Self) void {
-            if (self.span_len == 0) return;
+            if (self.len == 0) return;
             self.assertCurrent("span validation");
         }
 
         fn assertElementAccess(self: Self, index: usize) void {
-            if (index >= self.span_len) {
+            if (index >= self.len) {
                 std.debug.panic(
                     "guarded list invalidated: {s}: span access index={d} exceeds borrowed len={d}",
-                    .{ list_name, index, self.span_len },
+                    .{ list_name, index, self.len },
                 );
             }
             self.assertCurrent("span element access");
         }
 
         fn assertCurrent(self: Self, operation: []const u8) void {
-            assertRangeInBounds(list_name, self.list.__guarded_backing.items.len, self.start, self.span_len);
+            assertRangeInBounds(list_name, self.list.__guarded_backing.items.len, self.start, self.len);
             if (self.list.__guarded_generation != self.generation) {
                 std.debug.panic(
                     "guarded list invalidated: {s}: {s}; borrowed start={d} len={d} generation={d} current_generation={d} current_len={d}",
@@ -319,7 +317,7 @@ pub fn BorrowSpan(comptime T: type, comptime list_name: []const u8) type {
                         list_name,
                         operation,
                         self.start,
-                        self.span_len,
+                        self.len,
                         self.generation,
                         self.list.__guarded_generation,
                         self.list.__guarded_backing.items.len,
@@ -330,6 +328,7 @@ pub fn BorrowSpan(comptime T: type, comptime list_name: []const u8) type {
     };
 }
 
+/// Mutable span borrow type for a guarded list.
 pub fn BorrowSpanMut(comptime T: type, comptime list_name: []const u8) type {
     if (!debug_guards) return []T;
 
@@ -338,12 +337,8 @@ pub fn BorrowSpanMut(comptime T: type, comptime list_name: []const u8) type {
 
         list: *List(T, list_name),
         start: usize,
-        span_len: usize,
+        len: usize,
         generation: u64,
-
-        pub fn len(self: Self) usize {
-            return self.span_len;
-        }
 
         pub fn at(self: Self, index: usize) T {
             self.assertElementAccess(index);
@@ -361,22 +356,22 @@ pub fn BorrowSpanMut(comptime T: type, comptime list_name: []const u8) type {
         }
 
         pub fn assertValid(self: Self) void {
-            if (self.span_len == 0) return;
+            if (self.len == 0) return;
             self.assertCurrent("mutable span validation");
         }
 
         fn assertElementAccess(self: Self, index: usize) void {
-            if (index >= self.span_len) {
+            if (index >= self.len) {
                 std.debug.panic(
                     "guarded list invalidated: {s}: mutable span access index={d} exceeds borrowed len={d}",
-                    .{ list_name, index, self.span_len },
+                    .{ list_name, index, self.len },
                 );
             }
             self.assertCurrent("mutable span element access");
         }
 
         fn assertCurrent(self: Self, operation: []const u8) void {
-            assertRangeInBounds(list_name, self.list.__guarded_backing.items.len, self.start, self.span_len);
+            assertRangeInBounds(list_name, self.list.__guarded_backing.items.len, self.start, self.len);
             if (self.list.__guarded_generation != self.generation) {
                 std.debug.panic(
                     "guarded list invalidated: {s}: {s}; borrowed start={d} len={d} generation={d} current_generation={d} current_len={d}",
@@ -384,7 +379,7 @@ pub fn BorrowSpanMut(comptime T: type, comptime list_name: []const u8) type {
                         list_name,
                         operation,
                         self.start,
-                        self.span_len,
+                        self.len,
                         self.generation,
                         self.list.__guarded_generation,
                         self.list.__guarded_backing.items.len,
@@ -395,6 +390,7 @@ pub fn BorrowSpanMut(comptime T: type, comptime list_name: []const u8) type {
     };
 }
 
+/// Mutable element pointer borrow type for a guarded list.
 pub fn BorrowPtr(comptime T: type, comptime list_name: []const u8) type {
     if (!debug_guards) return *T;
 
@@ -439,6 +435,7 @@ pub fn BorrowPtr(comptime T: type, comptime list_name: []const u8) type {
     };
 }
 
+/// Read-only element pointer borrow type for a guarded list.
 pub fn BorrowPtrConst(comptime T: type, comptime list_name: []const u8) type {
     if (!debug_guards) return *const T;
 
@@ -473,33 +470,74 @@ pub fn BorrowPtrConst(comptime T: type, comptime list_name: []const u8) type {
     };
 }
 
+/// Returns the length of a slice or guarded span borrow.
 pub fn borrowLen(borrow: anytype) usize {
     const Borrow = @TypeOf(borrow);
     return switch (@typeInfo(Borrow)) {
-        .pointer => |ptr| if (ptr.size == .slice) borrow.len else @compileError("borrowLen expected a slice or guarded span"),
-        .@"struct" => borrow.len(),
+        .pointer => |ptr| switch (ptr.size) {
+            .slice => borrow.len,
+            .one => switch (@typeInfo(ptr.child)) {
+                .array => |array| array.len,
+                else => 1,
+            },
+            else => @compileError("borrowLen expected a slice, array pointer, or guarded span"),
+        },
+        .@"struct" => borrow.len,
         else => @compileError("borrowLen expected a slice or guarded span"),
     };
 }
 
+/// Reads one element from a slice or guarded span borrow.
 pub fn at(borrow: anytype, index: usize) BorrowElement(@TypeOf(borrow)) {
     const Borrow = @TypeOf(borrow);
     return switch (@typeInfo(Borrow)) {
-        .pointer => |ptr| if (ptr.size == .slice) borrow[index] else @compileError("at expected a slice or guarded span"),
+        .pointer => |ptr| switch (ptr.size) {
+            .slice => borrow[index],
+            .one => switch (@typeInfo(ptr.child)) {
+                .array => |array| if (array.len == 0) unreachable else borrow[index],
+                else => blk: {
+                    std.debug.assert(index == 0);
+                    break :blk borrow.*;
+                },
+            },
+            else => @compileError("at expected a slice, array pointer, or guarded span"),
+        },
         .@"struct" => borrow.at(index),
         else => @compileError("at expected a slice or guarded span"),
     };
 }
 
+/// Copies a slice or guarded span borrow into owned memory.
+pub fn dupe(allocator: Allocator, comptime T: type, borrow: anytype) Allocator.Error![]T {
+    const len = borrowLen(borrow);
+    const copied = try allocator.alloc(T, len);
+    for (0..len) |index| {
+        copied[index] = at(borrow, index);
+    }
+    return copied;
+}
+
+/// Returns a mutable element pointer from a slice or guarded mutable span borrow.
 pub fn atPtr(borrow: anytype, index: usize) *BorrowElement(@TypeOf(borrow)) {
     const Borrow = @TypeOf(borrow);
     return switch (@typeInfo(Borrow)) {
-        .pointer => |ptr| if (ptr.size == .slice) &borrow[index] else @compileError("atPtr expected a mutable slice or guarded mutable span"),
+        .pointer => |ptr| switch (ptr.size) {
+            .slice => &borrow[index],
+            .one => switch (@typeInfo(ptr.child)) {
+                .array => &borrow[index],
+                else => blk: {
+                    std.debug.assert(index == 0);
+                    break :blk borrow;
+                },
+            },
+            else => @compileError("atPtr expected a mutable slice, array pointer, or guarded mutable span"),
+        },
         .@"struct" => borrow.atPtr(index),
         else => @compileError("atPtr expected a mutable slice or guarded mutable span"),
     };
 }
 
+/// Reads the element behind a raw pointer or guarded pointer borrow.
 pub fn ptrGet(ptr_borrow: anytype) PtrBorrowElement(@TypeOf(ptr_borrow)) {
     const PtrBorrow = @TypeOf(ptr_borrow);
     return switch (@typeInfo(PtrBorrow)) {
@@ -509,6 +547,7 @@ pub fn ptrGet(ptr_borrow: anytype) PtrBorrowElement(@TypeOf(ptr_borrow)) {
     };
 }
 
+/// Writes the element behind a raw pointer or guarded pointer borrow.
 pub fn ptrSet(ptr_borrow: anytype, value: PtrBorrowElement(@TypeOf(ptr_borrow))) void {
     const PtrBorrow = @TypeOf(ptr_borrow);
     switch (@typeInfo(PtrBorrow)) {
@@ -521,8 +560,14 @@ pub fn ptrSet(ptr_borrow: anytype, value: PtrBorrowElement(@TypeOf(ptr_borrow)))
 fn BorrowElement(comptime Borrow: type) type {
     return switch (@typeInfo(Borrow)) {
         .pointer => |ptr| blk: {
-            if (ptr.size != .slice) @compileError("expected slice borrow");
-            break :blk ptr.child;
+            switch (ptr.size) {
+                .slice => break :blk ptr.child,
+                .one => switch (@typeInfo(ptr.child)) {
+                    .array => |array| break :blk array.child,
+                    else => break :blk ptr.child,
+                },
+                else => @compileError("expected slice, array pointer, or guarded span"),
+            }
         },
         .@"struct" => @typeInfo(@TypeOf(Borrow.at)).@"fn".return_type.?,
         else => @compileError("expected slice or guarded span"),

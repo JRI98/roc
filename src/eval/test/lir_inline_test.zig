@@ -10,6 +10,7 @@ const helpers = eval.test_helpers;
 
 const Allocator = std.mem.Allocator;
 const LIR = lir.LIR;
+const GuardedList = lir.LirStore.GuardedList;
 const layout_mod = @import("layout");
 const LayoutIdx = layout_mod.Idx;
 const MonoAst = postcheck.Monotype.Ast;
@@ -404,7 +405,8 @@ fn mainProcArgLayouts(
     const arg_layouts = try allocator.alloc(LayoutIdx, arg_locals.len);
     errdefer allocator.free(arg_layouts);
 
-    for (arg_locals, 0..) |local_id, index| {
+    for (0..arg_locals.len) |index| {
+        const local_id = GuardedList.at(arg_locals, index);
         arg_layouts[index] = lowered.lir_result.store.getLocal(local_id).layout_idx;
     }
 
@@ -814,7 +816,9 @@ fn collectAssignCallProcs(
             .switch_stmt => |stmt| {
                 if (stmt.continuation) |continuation| try work.append(allocator, continuation);
                 try work.append(allocator, stmt.default_branch);
-                for (lowered.lir_result.store.getCFSwitchBranches(stmt.branches)) |branch| {
+                const branches = lowered.lir_result.store.getCFSwitchBranches(stmt.branches);
+                for (0..branches.len) |i| {
+                    const branch = GuardedList.at(branches, i);
                     try work.append(allocator, branch.body);
                 }
             },
@@ -827,7 +831,9 @@ fn collectAssignCallProcs(
                 try work.append(allocator, stmt.on_miss);
             },
             .str_match_set => |stmt| {
-                for (lowered.lir_result.store.getStrMatchArms(stmt.arms)) |arm| {
+                const arms = lowered.lir_result.store.getStrMatchArms(stmt.arms);
+                for (0..arms.len) |i| {
+                    const arm = GuardedList.at(arms, i);
                     try work.append(allocator, arm.on_match);
                 }
                 try work.append(allocator, stmt.on_miss);
@@ -930,7 +936,9 @@ fn collectProcShape(
                 shape.switch_count += 1;
                 if (stmt.continuation) |continuation| try work.append(allocator, continuation);
                 try work.append(allocator, stmt.default_branch);
-                for (lowered.lir_result.store.getCFSwitchBranches(stmt.branches)) |branch| {
+                const branches = lowered.lir_result.store.getCFSwitchBranches(stmt.branches);
+                for (0..branches.len) |i| {
+                    const branch = GuardedList.at(branches, i);
                     try work.append(allocator, branch.body);
                 }
             },
@@ -945,7 +953,9 @@ fn collectProcShape(
             },
             .str_match_set => |stmt| {
                 shape.str_match_set_count += 1;
-                for (lowered.lir_result.store.getStrMatchArms(stmt.arms)) |arm| {
+                const arms = lowered.lir_result.store.getStrMatchArms(stmt.arms);
+                for (0..arms.len) |i| {
+                    const arm = GuardedList.at(arms, i);
                     try work.append(allocator, arm.on_match);
                 }
                 try work.append(allocator, stmt.on_miss);
@@ -1091,15 +1101,29 @@ fn markReachableLiftedExpr(
         .uninitialized_payload,
         => {},
         .fn_ref => |fn_ref| {
-            for (program.captureOperandSpan(fn_ref.captures)) |operand| {
+            const operands = program.captureOperandSpan(fn_ref.captures);
+            for (0..operands.len) |i| {
+                const operand = GuardedList.at(operands, i);
                 markReachableLiftedExpr(program, operand.value, reachable);
             }
         },
         .list,
         .tuple,
-        => |items| for (program.exprSpan(items)) |child| markReachableLiftedExpr(program, child, reachable),
-        .record => |fields| for (program.fieldExprSpan(fields)) |field| markReachableLiftedExpr(program, field.value, reachable),
-        .tag => |tag| for (program.exprSpan(tag.payloads)) |payload| markReachableLiftedExpr(program, payload, reachable),
+        => |items| {
+            const children = program.exprSpan(items);
+            for (0..children.len) |i| markReachableLiftedExpr(program, GuardedList.at(children, i), reachable);
+        },
+        .record => |fields| {
+            const field_exprs = program.fieldExprSpan(fields);
+            for (0..field_exprs.len) |i| {
+                const field = GuardedList.at(field_exprs, i);
+                markReachableLiftedExpr(program, field.value, reachable);
+            }
+        },
+        .tag => |tag| {
+            const payloads = program.exprSpan(tag.payloads);
+            for (0..payloads.len) |i| markReachableLiftedExpr(program, GuardedList.at(payloads, i), reachable);
+        },
         .nominal,
         .dbg,
         .expect,
@@ -1130,13 +1154,22 @@ fn markReachableLiftedExpr(
         => {},
         .call_value => |call| {
             markReachableLiftedExpr(program, call.callee, reachable);
-            for (program.exprSpan(call.args)) |arg| markReachableLiftedExpr(program, arg, reachable);
+            const args = program.exprSpan(call.args);
+            for (0..args.len) |i| markReachableLiftedExpr(program, GuardedList.at(args, i), reachable);
         },
         .call_proc => |call| {
-            for (program.exprSpan(call.args)) |arg| markReachableLiftedExpr(program, arg, reachable);
-            for (program.captureOperandSpan(call.captures)) |operand| markReachableLiftedExpr(program, operand.value, reachable);
+            const args = program.exprSpan(call.args);
+            for (0..args.len) |i| markReachableLiftedExpr(program, GuardedList.at(args, i), reachable);
+            const operands = program.captureOperandSpan(call.captures);
+            for (0..operands.len) |i| {
+                const operand = GuardedList.at(operands, i);
+                markReachableLiftedExpr(program, operand.value, reachable);
+            }
         },
-        .low_level => |call| for (program.exprSpan(call.args)) |arg| markReachableLiftedExpr(program, arg, reachable),
+        .low_level => |call| {
+            const args = program.exprSpan(call.args);
+            for (0..args.len) |i| markReachableLiftedExpr(program, GuardedList.at(args, i), reachable);
+        },
         .field_access => |field| markReachableLiftedExpr(program, field.receiver, reachable),
         .tuple_access => |access| markReachableLiftedExpr(program, access.tuple, reachable),
         .structural_eq => |eq| {
@@ -1149,28 +1182,37 @@ fn markReachableLiftedExpr(
         },
         .match_ => |match| {
             markReachableLiftedExpr(program, match.scrutinee, reachable);
-            for (program.branchSpan(match.branches)) |branch| {
+            const branches = program.branchSpan(match.branches);
+            for (0..branches.len) |i| {
+                const branch = GuardedList.at(branches, i);
                 if (branch.guard) |guard| markReachableLiftedExpr(program, guard, reachable);
                 markReachableLiftedExpr(program, branch.body, reachable);
             }
         },
         .if_ => |if_| {
-            for (program.ifBranchSpan(if_.branches)) |branch| {
+            const branches = program.ifBranchSpan(if_.branches);
+            for (0..branches.len) |i| {
+                const branch = GuardedList.at(branches, i);
                 markReachableLiftedExpr(program, branch.cond, reachable);
                 markReachableLiftedExpr(program, branch.body, reachable);
             }
             markReachableLiftedExpr(program, if_.final_else, reachable);
         },
         .block => |block| {
-            for (program.stmtSpan(block.statements)) |stmt| markReachableLiftedStmt(program, stmt, reachable);
+            const statements = program.stmtSpan(block.statements);
+            for (0..statements.len) |i| markReachableLiftedStmt(program, GuardedList.at(statements, i), reachable);
             markReachableLiftedExpr(program, block.final_expr, reachable);
         },
         .loop_ => |loop| {
-            for (program.exprSpan(loop.initial_values)) |initial| markReachableLiftedExpr(program, initial, reachable);
+            const initial_values = program.exprSpan(loop.initial_values);
+            for (0..initial_values.len) |i| markReachableLiftedExpr(program, GuardedList.at(initial_values, i), reachable);
             markReachableLiftedExpr(program, loop.body, reachable);
         },
         .break_ => |maybe| if (maybe) |value| markReachableLiftedExpr(program, value, reachable),
-        .continue_ => |continue_| for (program.exprSpan(continue_.values)) |value| markReachableLiftedExpr(program, value, reachable),
+        .continue_ => |continue_| {
+            const values = program.exprSpan(continue_.values);
+            for (0..values.len) |i| markReachableLiftedExpr(program, GuardedList.at(values, i), reachable);
+        },
     }
 }
 

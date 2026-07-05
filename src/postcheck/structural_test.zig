@@ -98,7 +98,9 @@ test "Monotype record expression lowering does not keep mutable field-store slic
 
     try expectContains(lower_record_expr, "const target_fields");
     try expectContains(lower_record_expr, "const target_field_count");
-    try expectContains(lower_record_expr, "self.builder.program.types.fieldSpan(target_fields)[i]");
+    try expectContains(lower_record_expr, "const target_field_borrow = self.builder.program.types.fieldSpan(target_fields);");
+    try expectContains(lower_record_expr, "const target_field_copy = try GuardedList.dupe(self.allocator, Type.Field, target_field_borrow);");
+    try expectContains(lower_record_expr, "const field = target_field_copy[i];");
     try std.testing.expect(std.mem.find(u8, lower_record_expr, "for (target_fields") == null);
 }
 

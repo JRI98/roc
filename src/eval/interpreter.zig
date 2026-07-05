@@ -15,6 +15,7 @@ const layout_mod = @import("layout");
 const lir = @import("lir");
 const LIR = lir.LIR;
 const LirStore = lir.LirStore;
+const GuardedList = LirStore.GuardedList;
 const lir_value = @import("value.zig");
 const host_trampoline = @import("host_trampoline.zig");
 const builtins = @import("builtins");
@@ -375,8 +376,8 @@ pub const Interpreter = struct {
     };
 
     const FramePlan = struct {
-        locals: []const LocalId,
-        join_points: []const LIR.JoinPoint,
+        locals: LirStore.StoreSpanBorrow(LocalId, "local_ids"),
+        join_points: LirStore.StoreSpanBorrow(LIR.JoinPoint, "join_points"),
         free_slots: std.ArrayListUnmanaged([]LocalSlot) = .empty,
 
         fn deinit(self: *FramePlan, allocator: Allocator) void {
@@ -403,7 +404,7 @@ pub const Interpreter = struct {
             const target = @intFromEnum(local_id);
             while (low < high) {
                 const mid = low + (high - low) / 2;
-                const current = @intFromEnum(self.locals[mid]);
+                const current = @intFromEnum(GuardedList.at(self.locals, mid));
                 if (current == target) return mid;
                 if (current < target) {
                     low = mid + 1;
@@ -420,8 +421,9 @@ pub const Interpreter = struct {
             const target = @intFromEnum(join_point_id);
             while (low < high) {
                 const mid = low + (high - low) / 2;
-                const current = @intFromEnum(self.join_points[mid].id);
-                if (current == target) return self.join_points[mid];
+                const join_point = GuardedList.at(self.join_points, mid);
+                const current = @intFromEnum(join_point.id);
+                if (current == target) return join_point;
                 if (current < target) {
                     low = mid + 1;
                 } else {
@@ -912,7 +914,8 @@ pub const Interpreter = struct {
         const arg_ids = view.store.getLocalSpan(proc.args);
         const arg_layouts = try self.allocator.alloc(layout_mod.Idx, arg_ids.len);
         defer self.allocator.free(arg_layouts);
-        for (arg_ids, 0..) |local_id, i| {
+        for (0..arg_ids.len) |i| {
+            const local_id = GuardedList.at(arg_ids, i);
             arg_layouts[i] = view.store.getLocal(local_id).layout_idx;
         }
 
@@ -1031,7 +1034,8 @@ pub const Interpreter = struct {
                 );
                 const params = self.store.getLocalSpan(proc.args);
                 debugPrint("  proc params:", .{});
-                for (params) |param| {
+                for (0..params.len) |i| {
+                    const param = GuardedList.at(params, i);
                     debugPrint(" {d}:layout={d}", .{
                         @intFromEnum(param),
                         @intFromEnum(self.store.getLocal(param).layout_idx),
@@ -1467,7 +1471,9 @@ pub const Interpreter = struct {
                             @intFromEnum(self.store.getLocal(assign.target).layout_idx),
                         },
                     );
-                    for (self.store.getLocalSpan(assign.args)) |arg_local| {
+                    const arg_locals = self.store.getLocalSpan(assign.args);
+                    for (0..arg_locals.len) |i| {
+                        const arg_local = GuardedList.at(arg_locals, i);
                         debugPrint("{d}:layout={d} ", .{
                             @intFromEnum(arg_local),
                             @intFromEnum(self.store.getLocal(arg_local).layout_idx),
@@ -1660,7 +1666,10 @@ pub const Interpreter = struct {
             );
         }
 
-        for (params, args, arg_layouts, 0..) |param, arg, arg_layout, i| {
+        for (0..params.len) |i| {
+            const param = GuardedList.at(params, i);
+            const arg = args[i];
+            const arg_layout = arg_layouts[i];
             const param_layout = self.store.getLocal(param).layout_idx;
             if (proc_spec.abi == .erased_callable and i + 1 == params.len) {
                 if (param_layout != .opaque_ptr or arg_layout != .opaque_ptr) {
@@ -1756,7 +1765,9 @@ pub const Interpreter = struct {
         const plan = &self.frame_plans[@intFromEnum(proc_id)];
         const slots = try plan.acquireSlots(self.allocator);
         @memset(slots, .{ .assigned = false, .val = Value.zst });
-        for (slots, plan.locals) |*slot, local_id| {
+        for (0..plan.locals.len) |i| {
+            const slot = &slots[i];
+            const local_id = GuardedList.at(plan.locals, i);
             const layout_idx = self.store.getLocal(local_id).layout_idx;
             if (self.layout_store.getLayout(layout_idx).tag == .zst) {
                 slot.assigned = true;
@@ -2063,12 +2074,14 @@ pub const Interpreter = struct {
                                 @intFromEnum(switch_stmt.default_branch),
                             },
                         );
-                        for (branches) |branch| {
+                        for (0..branches.len) |i| {
+                            const branch = GuardedList.at(branches, i);
                             trace.log("  branch value={d} body={d}", .{ branch.value, @intFromEnum(branch.body) });
                         }
                     }
                     var target = switch_stmt.default_branch;
-                    for (branches) |branch| {
+                    for (0..branches.len) |i| {
+                        const branch = GuardedList.at(branches, i);
                         if (branch.value == cond_value) {
                             target = branch.body;
                             break;
@@ -2152,7 +2165,8 @@ pub const Interpreter = struct {
         const args = self.store.getLocalSpan(proc_spec.args);
         if (args.len > 0) {
             debugPrint("  args:", .{});
-            for (args) |arg| {
+            for (0..args.len) |i| {
+                const arg = GuardedList.at(args, i);
                 const layout_idx = self.store.getLocal(arg).layout_idx;
                 debugPrint(" {d}:{d}", .{ @intFromEnum(arg), @intFromEnum(layout_idx) });
             }
@@ -2223,7 +2237,9 @@ pub const Interpreter = struct {
                         @intFromEnum(assign.proc),
                         @intFromEnum(assign.target),
                     });
-                    for (self.store.getLocalSpan(assign.args)) |arg_local| {
+                    const arg_locals = self.store.getLocalSpan(assign.args);
+                    for (0..arg_locals.len) |i| {
+                        const arg_local = GuardedList.at(arg_locals, i);
                         debugPrint("{d} ", .{@intFromEnum(arg_local)});
                     }
                     debugPrint("next={d}\n", .{@intFromEnum(assign.next)});
@@ -2251,7 +2267,9 @@ pub const Interpreter = struct {
                         @intFromEnum(assign.target),
                         @tagName(assign.op),
                     });
-                    for (self.store.getLocalSpan(assign.args)) |arg_local| {
+                    const arg_locals = self.store.getLocalSpan(assign.args);
+                    for (0..arg_locals.len) |i| {
+                        const arg_local = GuardedList.at(arg_locals, i);
                         debugPrint("{d} ", .{@intFromEnum(arg_local)});
                     }
                     debugPrint("next={d}\n", .{@intFromEnum(assign.next)});
@@ -2270,7 +2288,9 @@ pub const Interpreter = struct {
                         @intFromEnum(stmt_id),
                         @intFromEnum(assign.target),
                     });
-                    for (self.store.getLocalSpan(assign.fields)) |field_local| {
+                    const field_locals = self.store.getLocalSpan(assign.fields);
+                    for (0..field_locals.len) |i| {
+                        const field_local = GuardedList.at(field_locals, i);
                         debugPrint("{d} ", .{@intFromEnum(field_local)});
                     }
                     debugPrint("next={d}\n", .{
@@ -2372,7 +2392,8 @@ pub const Interpreter = struct {
                     });
                     stack.append(self.evalAllocator(), switch_stmt.default_branch) catch return;
                     const branches = self.store.getCFSwitchBranches(switch_stmt.branches);
-                    for (branches) |branch| {
+                    for (0..branches.len) |i| {
+                        const branch = GuardedList.at(branches, i);
                         debugPrint("        branch {d} -> {d}\n", .{
                             branch.value,
                             @intFromEnum(branch.body),
@@ -2409,7 +2430,9 @@ pub const Interpreter = struct {
                         str_match_set.arms.len,
                         @intFromEnum(str_match_set.on_miss),
                     });
-                    for (self.store.getStrMatchArms(str_match_set.arms)) |arm| {
+                    const arms = self.store.getStrMatchArms(str_match_set.arms);
+                    for (0..arms.len) |i| {
+                        const arm = GuardedList.at(arms, i);
                         stack.append(self.evalAllocator(), arm.on_match) catch return;
                     }
                     stack.append(self.evalAllocator(), str_match_set.on_miss) catch return;
@@ -2425,7 +2448,9 @@ pub const Interpreter = struct {
                         @intFromEnum(stmt_id),
                         @intFromEnum(join.id),
                     });
-                    for (self.store.getLocalSpan(join.params)) |param_local| {
+                    const params = self.store.getLocalSpan(join.params);
+                    for (0..params.len) |i| {
+                        const param_local = GuardedList.at(params, i);
                         debugPrint("{d} ", .{@intFromEnum(param_local)});
                     }
                     debugPrint("body={d} remainder={d}\n", .{
@@ -2463,26 +2488,33 @@ pub const Interpreter = struct {
         }
     }
 
-    fn collectLocalValues(self: *LirInterpreter, frame: *const Frame, locals: []const LocalId) Error![]Value {
+    fn collectLocalValues(self: *LirInterpreter, frame: *const Frame, locals: anytype) Error![]Value {
         if (locals.len == 0) return &.{};
         const values = try self.arena.allocator().alloc(Value, locals.len);
-        for (locals, 0..) |local_id, i| {
+        for (0..locals.len) |i| {
+            const local_id = GuardedList.at(locals, i);
             values[i] = try self.getLocalChecked(frame, local_id);
         }
         return values;
     }
 
-    fn localLayouts(self: *LirInterpreter, locals: []const LocalId) Error![]layout_mod.Idx {
+    fn localLayouts(self: *LirInterpreter, locals: anytype) Error![]layout_mod.Idx {
         if (locals.len == 0) return &.{};
         const layouts = try self.arena.allocator().alloc(layout_mod.Idx, locals.len);
-        for (locals, 0..) |local_id, i| layouts[i] = self.store.getLocal(local_id).layout_idx;
+        for (0..locals.len) |i| {
+            const local_id = GuardedList.at(locals, i);
+            layouts[i] = self.store.getLocal(local_id).layout_idx;
+        }
         return layouts;
     }
 
     fn localLayoutsFromSpan(self: *LirInterpreter, locals: LocalSpan) Error![]const layout_mod.Idx {
         const local_ids = self.store.getLocalSpan(locals);
         const layouts = try self.arena.allocator().alloc(layout_mod.Idx, local_ids.len);
-        for (local_ids, 0..) |local_id, i| layouts[i] = self.store.getLocal(local_id).layout_idx;
+        for (0..local_ids.len) |i| {
+            const local_id = GuardedList.at(local_ids, i);
+            layouts[i] = self.store.getLocal(local_id).layout_idx;
+        }
         return layouts;
     }
 
@@ -2813,7 +2845,8 @@ pub const Interpreter = struct {
         var proc_args = try self.arena.allocator().alloc(Value, proc_arg_locals.len);
         var proc_arg_layouts = try self.arena.allocator().alloc(layout_mod.Idx, proc_arg_locals.len);
 
-        for (proc_arg_locals[0..explicit_arg_count], 0..) |local, i| {
+        for (0..explicit_arg_count) |i| {
+            const local = GuardedList.at(proc_arg_locals, i);
             const arg_layout = self.store.getLocal(local).layout_idx;
             proc_arg_layouts[i] = arg_layout;
             const size = self.helper.sizeOf(arg_layout);
@@ -3102,7 +3135,8 @@ pub const Interpreter = struct {
                 .{ @intFromEnum(struct_layout), field_locals.len, expected_field_count },
             );
         }
-        for (field_locals, 0..) |field_local, i| {
+        for (0..field_locals.len) |i| {
+            const field_local = GuardedList.at(field_locals, i);
             const field_size = self.layout_store.getStructFieldSizeByOriginalIndex(
                 base_layout_val.getStruct().idx,
                 @intCast(i),
@@ -3230,7 +3264,8 @@ pub const Interpreter = struct {
         const elems_rc = self.builtinInternalContainsRefcounted("interpreter.assign_list.elem_rc", elem_layout);
         const elem_data = try self.allocRocDataWithRc(total_elem_bytes, elem_alignment, elems_rc);
         const elem_layout_val = self.layout_store.getLayout(elem_layout);
-        for (elem_locals, 0..) |elem_local, i| {
+        for (0..elem_locals.len) |i| {
+            const elem_local = GuardedList.at(elem_locals, i);
             const offset = i * elem_size;
             const elem_value = try self.coerceExplicitRefValueToLayout(
                 try self.getLocalChecked(frame, elem_local),
@@ -3540,7 +3575,9 @@ pub const Interpreter = struct {
         const source_value = try self.getLocalChecked(frame, str_match_set.source);
         const source_rs = valueToRocStr(source_value);
         const source_bytes = self.readRocStr(source_value);
-        for (self.store.getStrMatchArms(str_match_set.arms)) |arm| {
+        const arms = self.store.getStrMatchArms(str_match_set.arms);
+        for (0..arms.len) |i| {
+            const arm = GuardedList.at(arms, i);
             if (try self.execStrMatchArm(frame, stmt_id, source_rs, source_bytes, arm)) {
                 return arm.on_match;
             }
@@ -3561,7 +3598,8 @@ pub const Interpreter = struct {
 
         var cursor: usize = prefix.len;
         const steps = self.store.getStrMatchSteps(arm.steps);
-        for (steps, 0..) |step, step_i| {
+        for (0..steps.len) |step_i| {
+            const step = GuardedList.at(steps, step_i);
             const delimiter = self.store.getStringLiteral(step.delimiter);
             const is_final_tail_capture = arm.end == .tail and step_i + 1 == steps.len and delimiter.len == 0;
             const result = LIR.strMatchStep(source_bytes, cursor, delimiter, is_final_tail_capture) orelse return false;

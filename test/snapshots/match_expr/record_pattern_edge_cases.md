@@ -16,7 +16,7 @@ match ... {
 }
 ~~~
 # EXPECTED
-UNCONDITIONAL CONDITION - record_pattern_edge_cases.md:1:1:1:1
+UNCONDITIONAL CONDITION - record_pattern_edge_cases.md:1:7:1:10
 # PROBLEMS
 
 ┌─────────────────────────┐
@@ -24,8 +24,8 @@ UNCONDITIONAL CONDITION - record_pattern_edge_cases.md:1:1:1:1
 └┬────────────────────────┘  this match will always inspect the same value.   │
  │                                                                            │
  │  match ... {                                                               │
- │  ‾                                                                         │
- └────────────────────────────────────────── record_pattern_edge_cases.md:1:1 ┘
+ │        ‾‾‾                                                                 │
+ └────────────────────────────────────────── record_pattern_edge_cases.md:1:7 ┘
 
 
 # TOKENS

@@ -6,12 +6,14 @@
 
 const std = @import("std");
 const base = @import("base");
+const collections = @import("collections");
 const core = @import("lir_core");
 
 const Allocator = std.mem.Allocator;
 const LIR = core.LIR;
 const LirProgram = core.Program;
 const LirStore = core.LirStore;
+const GuardedList = collections.GuardedList;
 
 /// Remove proc specs unreachable from `root_procs` and explicit constant
 /// callable plans, then rewrite every retained proc reference to the compact
@@ -135,7 +137,9 @@ const Pass = struct {
     fn markProcBodyEdges(self: *Pass, proc_id: LIR.LirProcSpecId) Allocator.Error!void {
         const proc = self.store.getProcSpec(proc_id);
         if (proc.body) |body| try self.stmt_stack.append(self.allocator, body);
-        for (self.store.getJoinPointSpan(proc.join_points)) |join_point| {
+        const join_points = self.store.getJoinPointSpan(proc.join_points);
+        for (0..join_points.len) |index| {
+            const join_point = GuardedList.at(join_points, index);
             try self.stmt_stack.append(self.allocator, join_point.body);
         }
 
@@ -178,7 +182,9 @@ const Pass = struct {
                 .switch_stmt => |s| {
                     if (s.continuation) |continuation| try self.pushStmt(continuation);
                     try self.pushStmt(s.default_branch);
-                    for (self.store.getCFSwitchBranches(s.branches)) |branch| {
+                    const branches = self.store.getCFSwitchBranches(s.branches);
+                    for (0..branches.len) |index| {
+                        const branch = GuardedList.at(branches, index);
                         try self.pushStmt(branch.body);
                     }
                 },
@@ -191,7 +197,9 @@ const Pass = struct {
                     try self.pushStmt(s.on_miss);
                 },
                 .str_match_set => |s| {
-                    for (self.store.getStrMatchArms(s.arms)) |arm| {
+                    const arms = self.store.getStrMatchArms(s.arms);
+                    for (0..arms.len) |index| {
+                        const arm = GuardedList.at(arms, index);
                         try self.pushStmt(arm.on_match);
                     }
                     try self.pushStmt(s.on_miss);
@@ -322,7 +330,9 @@ const Pass = struct {
                     const default_branch = s.default_branch;
                     s.default_branch = self.remapStmt(default_branch);
                     try self.pushStmt(default_branch);
-                    for (self.store.getCFSwitchBranchesMut(s.branches)) |*branch| {
+                    const branches = self.store.getCFSwitchBranchesMut(s.branches);
+                    for (0..branches.len) |index| {
+                        const branch = GuardedList.atPtr(branches, index);
                         const branch_body = branch.body;
                         branch.body = self.remapStmt(branch_body);
                         try self.pushStmt(branch_body);
@@ -345,7 +355,9 @@ const Pass = struct {
                     try self.pushStmt(on_miss);
                 },
                 .str_match_set => |*s| {
-                    for (self.store.getStrMatchArmsMut(s.arms)) |*arm| {
+                    const arms = self.store.getStrMatchArmsMut(s.arms);
+                    for (0..arms.len) |index| {
+                        const arm = GuardedList.atPtr(arms, index);
                         const on_match = arm.on_match;
                         arm.on_match = self.remapStmt(on_match);
                         try self.pushStmt(on_match);
@@ -400,7 +412,9 @@ const Pass = struct {
             if (!self.reachable[index]) continue;
             const proc = self.store.getProcSpecPtr(@enumFromInt(@as(u32, @intCast(index))));
             if (proc.body) |body| proc.body = self.remapStmt(body);
-            for (self.store.getJoinPointSpanMut(proc.join_points)) |*join_point| {
+            const join_points = self.store.getJoinPointSpanMut(proc.join_points);
+            for (0..join_points.len) |join_index| {
+                const join_point = GuardedList.atPtr(join_points, join_index);
                 join_point.body = self.remapStmt(join_point.body);
             }
         }
@@ -487,7 +501,9 @@ const Pass = struct {
         for (0..self.store.procSpecCount()) |proc_index| {
             const proc = self.store.getProcSpec(@enumFromInt(@as(u32, @intCast(proc_index))));
             if (proc.body) |body| self.verifyStmtRef(body, stmt_count);
-            for (self.store.getJoinPointSpan(proc.join_points)) |join_point| {
+            const join_points = self.store.getJoinPointSpan(proc.join_points);
+            for (0..join_points.len) |index| {
+                const join_point = GuardedList.at(join_points, index);
                 self.verifyStmtRef(join_point.body, stmt_count);
             }
         }
@@ -554,7 +570,9 @@ const Pass = struct {
             .switch_stmt => |s| {
                 if (s.continuation) |continuation| self.verifyStmtRef(continuation, stmt_count);
                 self.verifyStmtRef(s.default_branch, stmt_count);
-                for (self.store.getCFSwitchBranches(s.branches)) |branch| {
+                const branches = self.store.getCFSwitchBranches(s.branches);
+                for (0..branches.len) |index| {
+                    const branch = GuardedList.at(branches, index);
                     self.verifyStmtRef(branch.body, stmt_count);
                 }
             },
@@ -567,7 +585,9 @@ const Pass = struct {
                 self.verifyStmtRef(s.on_miss, stmt_count);
             },
             .str_match_set => |s| {
-                for (self.store.getStrMatchArms(s.arms)) |arm| {
+                const arms = self.store.getStrMatchArms(s.arms);
+                for (0..arms.len) |index| {
+                    const arm = GuardedList.at(arms, index);
                     self.verifyStmtRef(arm.on_match, stmt_count);
                 }
                 self.verifyStmtRef(s.on_miss, stmt_count);
