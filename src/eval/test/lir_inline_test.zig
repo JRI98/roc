@@ -2990,6 +2990,28 @@ test "iter alloc static: branch-chosen iterator is zero-alloc" {
     );
 }
 
+// The base `[list].iter().fold` must lower with no boxed iterator state and no
+// erased callable dispatch: the list literal may allocate its backing store, but
+// the iterator itself must carry its step closure inline by value. This asserts
+// only the iterator-attributable counts (box_box / erased_call / packed_erased);
+// the list's own `list_with_capacity` is expected and not asserted here.
+test "iter alloc static: base list fold is zero-alloc" {
+    const allocator = std.testing.allocator;
+    var optimized = try lowerModuleWithOptions(allocator,
+        \\module [main]
+        \\
+        \\main : I64
+        \\main = {
+        \\    xs = [1.I64, 2, 3, 4, 5]
+        \\    Iter.fold(xs.iter(), 0, |a, b| a + b)
+        \\}
+    , .wrappers, .{ .tag_reachability = true });
+    defer optimized.deinit(allocator);
+    try expectReachableProcShapeFieldEqual(allocator, &optimized.lowered, "box_box_count", 0);
+    try expectReachableProcShapeFieldEqual(allocator, &optimized.lowered, "erased_call_count", 0);
+    try expectReachableProcShapeFieldEqual(allocator, &optimized.lowered, "packed_erased_fn_count", 0);
+}
+
 fn reachableReturnSlotProcCount(
     allocator: Allocator,
     lowered: *const lir.CheckedPipeline.LoweredProgram,
@@ -5161,7 +5183,8 @@ test "bare list iter collect carries scalar list state in the loop" {
     try std.testing.expect(!try reachableIterCollectShape(allocator, &optimized.lowered, .generic));
     try std.testing.expect(!try reachableIterCollectShape(allocator, &optimized.lowered, .specialized));
     try expectNoReachableErasedCallableLowering(allocator, &optimized.lowered);
-    // The carried state still materializes once per loop exit (owned by the
-    // zero-allocation slice); per-element execution allocates nothing.
-    try std.testing.expectEqual(@as(usize, 2), try reachableProcShapeFieldTotal(allocator, &optimized.lowered, "box_box_count"));
+    // The list-iter carries its step closure inline by value, so the loop state
+    // needs no boxed iterator state at all; the only allocation is the output
+    // list itself.
+    try std.testing.expectEqual(@as(usize, 0), try reachableProcShapeFieldTotal(allocator, &optimized.lowered, "box_box_count"));
 }

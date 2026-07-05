@@ -889,6 +889,24 @@ const Builder = struct {
         };
     }
 
+    /// The builtin `Iter`/`Stream` nominals carry no `CheckedBuiltinNominal`
+    /// tag, so recognize them by their declaring module and name to stamp a
+    /// `BuiltinOwner`. Downstream layout/erasure stages read that owner to keep
+    /// the step closure inline instead of erasing it to a boxed callable.
+    fn builtinOwnerForNominal(
+        self: *Builder,
+        view: ModuleView,
+        nominal: checked.CheckedNominalType,
+    ) ?static_dispatch.BuiltinOwner {
+        _ = self;
+        if (builtinOwner(nominal.builtin)) |owner| return owner;
+        if (!Ident.textEql(view.names.moduleNameText(nominal.origin_module), "Builtin")) return null;
+        const name_text = view.names.typeNameText(nominal.name);
+        if (Ident.textEql(name_text, "Iter")) return .iter;
+        if (Ident.textEql(name_text, "Stream")) return .stream;
+        return null;
+    }
+
     fn declaredModuleForAlias(self: *Builder, view: ModuleView, alias: checked.CheckedAliasType) names.CheckedModuleDigest {
         return self.moduleDigestForOrigin(view, alias.origin_module);
     }
@@ -1895,7 +1913,7 @@ const Builder = struct {
                     .named_type = .{ .module = self.declaredModuleForNominal(view, nominal), .ty = checked_ty },
                     .def = try self.typeDef(view, nominal.origin_module, nominal.name, nominal.source_decl),
                     .kind = if (nominal.is_opaque) .@"opaque" else .nominal,
-                    .builtin_owner = builtinOwner(nominal.builtin),
+                    .builtin_owner = self.builtinOwnerForNominal(view, nominal),
                     .args = try self.program.types.addSpan(args),
                     .backing = switch (nominal.representation) {
                         .opaque_without_backing => null,
@@ -7777,7 +7795,7 @@ const BodyContext = struct {
             .named_type = .{ .module = self.builder.declaredModuleForNominal(self.view, nominal), .ty = checked_ty },
             .def = try self.builder.typeDef(self.view, nominal.origin_module, nominal.name, nominal.source_decl),
             .kind = if (nominal.is_opaque) .@"opaque" else .nominal,
-            .builtin_owner = builtinOwner(nominal.builtin),
+            .builtin_owner = self.builder.builtinOwnerForNominal(self.view, nominal),
             .args = args,
             .backing = backing,
             .declared_order = try self.instDeclaredOrderForNominal(nominal),

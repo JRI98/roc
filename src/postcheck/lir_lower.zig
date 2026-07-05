@@ -3972,6 +3972,8 @@ const Lowerer = struct {
             .crypto_sha256_hasher,
             .crypto_blake3_digest,
             .crypto_blake3_hasher,
+            .iter,
+            .stream,
             => null,
         };
     }

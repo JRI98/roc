@@ -6667,6 +6667,11 @@ const Lowerer = struct {
         return switch (owner) {
             .fields,
             .parse_tag_union_spec,
+            // `Iter`/`Stream` instances of one item type share a nominal but
+            // carry different step captures per chain, so their layouts must be
+            // distinguished by backing rather than by nominal identity alone.
+            .iter,
+            .stream,
             => true,
             else => false,
         };
@@ -6814,6 +6819,62 @@ const Lowerer = struct {
         return false;
     }
 
+    fn typeContainsErasedFn(self: *Lowerer, ty: Type.TypeId) Common.LowerError!bool {
+        var visited = std.AutoHashMap(Type.TypeId, void).init(self.allocator);
+        defer visited.deinit();
+        return try self.typeContainsErasedFnInner(ty, &visited);
+    }
+
+    fn typeContainsErasedFnInner(
+        self: *Lowerer,
+        ty: Type.TypeId,
+        visited: *std.AutoHashMap(Type.TypeId, void),
+    ) Common.LowerError!bool {
+        if (visited.contains(ty)) return false;
+        try visited.put(ty, {});
+
+        return switch (self.types.get(ty)) {
+            .erased_fn => true,
+            .callable, .primitive, .zst, .erased_capture_ptr => false,
+            .list => |elem| try self.typeContainsErasedFnInner(elem, visited),
+            .box => |elem| try self.typeContainsErasedFnInner(elem, visited),
+            .tuple => |items| try self.typeSpanContainsErasedFn(items, visited),
+            .record => |fields| blk: {
+                for (self.types.fieldSpan(fields)) |field| {
+                    if (try self.typeContainsErasedFnInner(field.ty, visited)) break :blk true;
+                }
+                break :blk false;
+            },
+            .capture_record => |fields| blk: {
+                for (self.types.captureFieldSpan(fields)) |field| {
+                    if (try self.typeContainsErasedFnInner(field.ty, visited)) break :blk true;
+                }
+                break :blk false;
+            },
+            .tag_union => |tags| blk: {
+                for (self.types.tagSpan(tags)) |tag| {
+                    if (try self.typeSpanContainsErasedFn(tag.payloads, visited)) break :blk true;
+                }
+                break :blk false;
+            },
+            .named => |named| if (named.backing) |backing|
+                try self.typeContainsErasedFnInner(backing.ty, visited)
+            else
+                false,
+        };
+    }
+
+    fn typeSpanContainsErasedFn(
+        self: *Lowerer,
+        span: Type.Span,
+        visited: *std.AutoHashMap(Type.TypeId, void),
+    ) Common.LowerError!bool {
+        for (self.types.span(span)) |ty| {
+            if (try self.typeContainsErasedFnInner(ty, visited)) return true;
+        }
+        return false;
+    }
+
     fn layoutOfType(self: *Lowerer, ty: Type.TypeId) Common.LowerError!layout.Idx {
         if (self.knownLayoutForType(ty)) |existing| return existing;
         if (try self.knownLayoutForEquivalentNamedType(ty)) |existing| {
@@ -6878,9 +6939,14 @@ const Lowerer = struct {
 
             switch (self.lowerer.types.get(ty)) {
                 .named => |named| if (named.backing) |backing| {
+                    const owner_backs_inline_callable = if (named.builtin_owner) |owner|
+                        check.StaticDispatchRegistry.isIteratorOwner(owner)
+                    else
+                        false;
                     if (named.kind == .@"opaque" and
                         self.lowerer.types.get(backing.ty) == .record and
-                        try self.lowerer.typeContainsCallable(backing.ty))
+                        !owner_backs_inline_callable and
+                        try self.lowerer.typeContainsErasedFn(backing.ty))
                     {
                         const node = try self.graph.reserveNode(self.lowerer.allocator);
                         self.local_nodes[index] = node;
@@ -7126,6 +7192,8 @@ const Lowerer = struct {
             .crypto_sha256_hasher,
             .crypto_blake3_digest,
             .crypto_blake3_hasher,
+            .iter,
+            .stream,
             => null,
         };
     }

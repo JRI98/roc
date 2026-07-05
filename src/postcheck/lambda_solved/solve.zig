@@ -910,13 +910,17 @@ const Solver = struct {
     fn markErasedCallablesReachedByType(self: *Solver, ty: Type.TypeVarId) Allocator.Error!void {
         var active = std.AutoHashMap(Type.TypeVarId, void).init(self.allocator);
         defer active.deinit();
-        try self.markErasedCallablesReachedByTypeInner(ty, &active);
+        try self.markErasedCallablesReachedByTypeInner(ty, &active, false);
     }
 
     fn markErasedCallablesReachedByTypeInner(
         self: *Solver,
         ty: Type.TypeVarId,
         active: *std.AutoHashMap(Type.TypeVarId, void),
+        // True while walking the backing of a bounded `Iter`/`Stream` nominal.
+        // Its step closure stays a lambda set (inline captures) rather than
+        // erasing to a boxed callable; every other function still erases.
+        in_iter_backing: bool,
     ) Allocator.Error!void {
         const root = self.program.types.root(ty);
         if (active.contains(root)) return;
@@ -927,47 +931,55 @@ const Solver = struct {
             .link => Common.invariant("Lambda Solved root returned a link"),
             .unbound, .forall, .primitive, .zst, .erased => {},
             .func => |func| {
-                const erased = try self.program.types.add(.{ .erased = .{
-                    .source_fn_ty = try self.solvedTypeDigest(root),
-                    .members = .empty(),
-                } });
-                try self.unify(func.callable, erased);
-                for (self.program.types.span(func.args)) |arg| {
-                    try self.markErasedCallablesReachedByTypeInner(arg, active);
+                if (in_iter_backing) {
+                    try self.markErasedCallablesReachedByTypeInner(func.callable, active, false);
+                } else {
+                    const erased = try self.program.types.add(.{ .erased = .{
+                        .source_fn_ty = try self.solvedTypeDigest(root),
+                        .members = .empty(),
+                    } });
+                    try self.unify(func.callable, erased);
                 }
-                try self.markErasedCallablesReachedByTypeInner(func.ret, active);
+                for (self.program.types.span(func.args)) |arg| {
+                    try self.markErasedCallablesReachedByTypeInner(arg, active, false);
+                }
+                try self.markErasedCallablesReachedByTypeInner(func.ret, active, false);
             },
-            .list => |elem| try self.markErasedCallablesReachedByTypeInner(elem, active),
-            .box => |elem| try self.markErasedCallablesReachedByTypeInner(elem, active),
+            .list => |elem| try self.markErasedCallablesReachedByTypeInner(elem, active, in_iter_backing),
+            .box => |elem| try self.markErasedCallablesReachedByTypeInner(elem, active, in_iter_backing),
             .tuple => |items| {
                 for (self.program.types.span(items)) |item| {
-                    try self.markErasedCallablesReachedByTypeInner(item, active);
+                    try self.markErasedCallablesReachedByTypeInner(item, active, in_iter_backing);
                 }
             },
             .record => |fields| {
                 for (self.program.types.fieldSpan(fields)) |field| {
-                    try self.markErasedCallablesReachedByTypeInner(field.ty, active);
+                    try self.markErasedCallablesReachedByTypeInner(field.ty, active, in_iter_backing);
                 }
             },
             .tag_union => |tags| {
                 for (self.program.types.tagSpan(tags)) |tag| {
                     for (self.program.types.span(tag.payloads)) |payload| {
-                        try self.markErasedCallablesReachedByTypeInner(payload, active);
+                        try self.markErasedCallablesReachedByTypeInner(payload, active, in_iter_backing);
                     }
                 }
             },
             .named => |named| {
                 for (self.program.types.span(named.args)) |arg| {
-                    try self.markErasedCallablesReachedByTypeInner(arg, active);
+                    try self.markErasedCallablesReachedByTypeInner(arg, active, false);
                 }
                 if (named.backing) |backing| {
-                    try self.markErasedCallablesReachedByTypeInner(backing.ty, active);
+                    const backing_is_iter = if (named.builtin_owner) |owner|
+                        static_dispatch.isIteratorOwner(owner)
+                    else
+                        false;
+                    try self.markErasedCallablesReachedByTypeInner(backing.ty, active, backing_is_iter);
                 }
             },
             .lambda_set => |members| {
                 for (self.program.types.memberSpan(members)) |member| {
                     for (self.program.types.captureSpan(member.captures)) |capture| {
-                        try self.markErasedCallablesReachedByTypeInner(capture.ty, active);
+                        try self.markErasedCallablesReachedByTypeInner(capture.ty, active, in_iter_backing);
                     }
                 }
             },
