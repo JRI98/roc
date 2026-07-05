@@ -652,6 +652,10 @@ fn osCanonicalize(_: ?*anyopaque, std_io: std.Io, path: []const u8, allocator: A
         error.AccessDenied => error.AccessDenied,
         else => error.IoError,
     };
+    // musl realpath can leave Memcheck taint on bytes it has actually written.
+    if (builtin.link_libc and std.valgrind.runningOnValgrind() != 0) {
+        std.valgrind.memcheck.makeMemDefined(buffer[0..len]);
+    }
     return allocator.dupe(u8, buffer[0..len]) catch error.OutOfMemory;
 }
 
