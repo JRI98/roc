@@ -4322,6 +4322,33 @@ pub fn build(b: *std.Build) void {
         run_watch_cli_test_step.dependOn(&run_watch_test.step);
     }
 
+    // MiniCI output-filter tests. MiniCI is a standalone host build tool that
+    // only imports `std`, so it needs no module wiring.
+    {
+        const minici_test = b.addTest(.{
+            .name = "minici_test",
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("src/build/minici.zig"),
+                .target = b.graph.host,
+                .optimize = .Debug,
+            }),
+            .filters = test_filters,
+        });
+        build_test_zig_step.dependOn(&minici_test.step);
+
+        const run_minici_test = b.addRunArtifact(minici_test);
+        if (run_args.len != 0) {
+            run_minici_test.addArgs(run_args);
+        }
+        tests_summary.addRun(&run_minici_test.step);
+
+        const run_minici_test_step = b.step(
+            "run-test-zig-minici",
+            "Run MiniCI output-filter Zig tests",
+        );
+        run_minici_test_step.dependOn(&run_minici_test.step);
+    }
+
     // Add check for forbidden patterns in type checker code
     const check_patterns = CheckTypeCheckerPatternsStep.create(b);
     run_check_type_checker_patterns_step.dependOn(&check_patterns.step);
