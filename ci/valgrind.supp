@@ -46,3 +46,12 @@
    fun:realpath
    fun:Io.Threaded.dirRealPathFilePosix
 }
+
+{
+   musl-realpath-readlink-bufsiz-dir-realpath
+   Memcheck:Param
+   readlink(bufsiz)
+   fun:readlink
+   fun:realpath
+   fun:Io.Threaded.dirRealPathFilePosix
+}
