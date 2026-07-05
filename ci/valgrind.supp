@@ -29,3 +29,11 @@
    fun:realpath
    fun:Io.Threaded.dirRealPathFilePosix
 }
+
+{
+   musl-realpath-value-dir-realpath
+   Memcheck:Value8
+   ...
+   fun:realpath
+   fun:Io.Threaded.dirRealPathFilePosix
+}
