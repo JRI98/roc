@@ -115,6 +115,7 @@ comptime {
         std.testing.refAllDecls(cli_problem);
         std.testing.refAllDecls(@import("embedded_lld").stack_probe);
         std.testing.refAllDecls(@import("ReplLine.zig"));
+        std.testing.refAllDecls(@import("ReplSession.zig"));
     }
 }
 const libc_finder = @import("libc_finder.zig");

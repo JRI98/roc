@@ -27,3 +27,12 @@
    fun:realpath
    fun:Io.Threaded.dirRealPathFilePosix
 }
+
+{
+   musl-realpath-small-copy-dir-realpath
+   Memcheck:Cond
+   fun:copySmallLength
+   fun:memcpy
+   fun:realpath
+   fun:Io.Threaded.dirRealPathFilePosix
+}

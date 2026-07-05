@@ -1243,6 +1243,27 @@ const Solver = struct {
             return;
         }
 
+        // An empty tag union is the seal for a slot that no value reached: a
+        // variable that was defaulted at Monotype materialization rather than
+        // constrained by evidence (see Monotype import, which re-enters it as an
+        // unresolved node instead of a closed row). Two representations of the
+        // same runtime type can therefore disagree here — most visibly in the
+        // phantom argument types of a function value that is inspected but never
+        // called (`|x, y| x + y` rendered as `<function>`), where the callee's
+        // own body solves an argument to a concrete number while the referencing
+        // site left the shared variable to seal as `[]`. Such a slot fixes no
+        // layout, so it yields to a concrete peer instead of tripping the
+        // exact-match invariant, matching how the Monotype layer lets local
+        // evidence supersede an empty tag union.
+        if (isEmptyTagUnion(left) and !isEmptyTagUnion(right)) {
+            self.program.types.set(a, .{ .link = b });
+            return;
+        }
+        if (isEmptyTagUnion(right) and !isEmptyTagUnion(left)) {
+            self.program.types.set(b, .{ .link = a });
+            return;
+        }
+
         switch (left) {
             .primitive => |left_primitive| switch (right) {
                 .primitive => |right_primitive| {
@@ -1381,6 +1402,15 @@ const Solver = struct {
             else
                 null,
             else => null,
+        };
+    }
+
+    /// A tag union with no tags is the materialized seal for an unconstrained
+    /// slot; it is uninhabited and fixes no layout.
+    fn isEmptyTagUnion(content: Type.Content) bool {
+        return switch (content) {
+            .tag_union => |tags| tags.count() == 0,
+            else => false,
         };
     }
 

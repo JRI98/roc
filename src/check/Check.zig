@@ -306,6 +306,10 @@ hoist_selected_bindings: std.AutoHashMapUnmanaged(CIR.Pattern.Idx, u32),
 /// expression selection and local binding selection from duplicating the same
 /// root.
 hoist_selected_exprs: std.AutoHashMapUnmanaged(CIR.Expr.Idx, u32),
+/// Expressions whose original subtrees were replaced with explicit runtime
+/// errors after hoist selection had already seen them. Selected roots and
+/// dependencies inside these subtrees must be pruned before publication.
+hoist_invalidated_exprs: std.AutoHashMapUnmanaged(CIR.Expr.Idx, void),
 /// Sparse roots selected during checking. Publication consumes this slice and
 /// turns the entries into checked compile-time roots.
 selected_hoisted_roots: std.ArrayListUnmanaged(hoist_roots.SelectedHoistedRoot),
@@ -692,16 +696,18 @@ const HoistSelectionTransaction = struct {
         const known = self.checker.hoist_known_values.get(pattern) orelse return false;
         return switch (known) {
             .binding_rhs => |expr| {
+                if (self.checker.hoistExprInvalidated(expr)) return false;
                 const root_index = try self.stageExprRoot(expr, pattern);
                 try self.stageKnownUpdate(pattern, root_index);
                 return true;
             },
             .pattern_extraction => |extraction| {
+                if (self.checker.hoistExprInvalidated(extraction.base_expr)) return false;
                 const root_index = try self.stagePatternExtractionRoot(pattern, extraction);
                 try self.stageKnownUpdate(pattern, root_index);
                 return true;
             },
-            .selected_root => true,
+            .selected_root => |root_index| !self.checker.selectedHoistedRootInvalidated(root_index),
             .unavailable_runtime => false,
         };
     }
@@ -1229,6 +1235,7 @@ fn initAssumePrepared(
         .hoist_contextual_binding_scope_patterns = .empty,
         .hoist_selected_bindings = .{},
         .hoist_selected_exprs = .{},
+        .hoist_invalidated_exprs = .{},
         .selected_hoisted_roots = .empty,
         .executable_root_defs = .empty,
         .last_hoist_result = null,
@@ -1309,6 +1316,7 @@ pub fn deinit(self: *Self) void {
     self.hoist_contextual_binding_scope_patterns.deinit(self.gpa);
     self.hoist_selected_bindings.deinit(self.gpa);
     self.hoist_selected_exprs.deinit(self.gpa);
+    self.hoist_invalidated_exprs.deinit(self.gpa);
     for (self.selected_hoisted_roots.items) |*root| {
         hoist_roots.deinitSelectedRoot(self.gpa, root);
     }
@@ -1470,6 +1478,7 @@ fn finishHoistFrame(self: *Self, expr: CIR.Expr.Idx, does_fx: bool) Allocator.Er
 
         if (should_flush_child_candidates) {
             for (self.hoist_expr_candidates.items[frame.candidate_start..]) |candidate| {
+                if (self.hoistExprInvalidated(candidate)) continue;
                 _ = try transaction.stageExprRoot(candidate, null);
             }
         }
@@ -1998,10 +2007,9 @@ fn ensureHoistedBindingRoot(self: *Self, pattern: CIR.Pattern.Idx) Allocator.Err
 fn hoistKnownBindingAvailable(self: *Self, pattern: CIR.Pattern.Idx) bool {
     const known = self.hoist_known_values.get(pattern) orelse return false;
     return switch (known) {
-        .binding_rhs,
-        .pattern_extraction,
-        .selected_root,
-        => true,
+        .binding_rhs => |expr| !self.hoistExprInvalidated(expr),
+        .pattern_extraction => |extraction| !self.hoistExprInvalidated(extraction.base_expr),
+        .selected_root => |root_index| !self.selectedHoistedRootInvalidated(root_index),
         .unavailable_runtime => false,
     };
 }
@@ -2034,6 +2042,233 @@ fn ensureHoistedExprRoot(self: *Self, expr: CIR.Expr.Idx, pattern: ?CIR.Pattern.
     const root_index = try transaction.stageExprRoot(expr, pattern);
     try transaction.commit();
     return root_index;
+}
+
+fn hoistExprInvalidated(self: *const Self, expr: CIR.Expr.Idx) bool {
+    return self.hoist_invalidated_exprs.contains(expr);
+}
+
+fn moduleHoistExprInvalidated(self: *const Self, module: *const ModuleEnv, expr: CIR.Expr.Idx) bool {
+    return module == self.cir and self.hoistExprInvalidated(expr);
+}
+
+fn selectedHoistedRootInvalidated(self: *const Self, root_index: u32) bool {
+    if (root_index >= self.selected_hoisted_roots.items.len) {
+        std.debug.panic("check invariant violated: hoist-known selected root index out of range", .{});
+    }
+    return self.hoistExprInvalidated(self.selected_hoisted_roots.items[root_index].expr);
+}
+
+fn replaceExprWithRuntimeError(
+    self: *Self,
+    expr_idx: CIR.Expr.Idx,
+    diagnostic_idx: CIR.Diagnostic.Idx,
+) Allocator.Error!void {
+    try self.invalidateHoistedExprSubtree(expr_idx);
+    self.cir.store.replaceExprWithRuntimeError(expr_idx, diagnostic_idx);
+}
+
+fn invalidateHoistedExprSubtree(self: *Self, root: CIR.Expr.Idx) Allocator.Error!void {
+    var work: std.ArrayListUnmanaged(CIR.Expr.Idx) = .empty;
+    defer work.deinit(self.gpa);
+
+    try self.markHoistInvalidatedExprChildren(root, &work);
+    var next: usize = 0;
+    while (next < work.items.len) : (next += 1) {
+        try self.markHoistInvalidatedExprChildren(work.items[next], &work);
+    }
+}
+
+fn markHoistInvalidatedExpr(
+    self: *Self,
+    expr: CIR.Expr.Idx,
+    work: *std.ArrayListUnmanaged(CIR.Expr.Idx),
+) Allocator.Error!void {
+    const entry = try self.hoist_invalidated_exprs.getOrPut(self.gpa, expr);
+    if (entry.found_existing) return;
+    try work.append(self.gpa, expr);
+}
+
+fn markHoistInvalidatedExprSpan(
+    self: *Self,
+    span: CIR.Expr.Span,
+    work: *std.ArrayListUnmanaged(CIR.Expr.Idx),
+) Allocator.Error!void {
+    for (self.cir.store.sliceExpr(span)) |expr| {
+        try self.markHoistInvalidatedExpr(expr, work);
+    }
+}
+
+fn markHoistInvalidatedStatementSpan(
+    self: *Self,
+    span: CIR.Statement.Span,
+    work: *std.ArrayListUnmanaged(CIR.Expr.Idx),
+) Allocator.Error!void {
+    for (self.cir.store.sliceStatements(span)) |statement| {
+        try self.markHoistInvalidatedStatementExprs(statement, work);
+    }
+}
+
+fn markHoistInvalidatedStatementExprs(
+    self: *Self,
+    statement: CIR.Statement.Idx,
+    work: *std.ArrayListUnmanaged(CIR.Expr.Idx),
+) Allocator.Error!void {
+    switch (self.cir.store.getStatement(statement)) {
+        .s_decl => |decl| try self.markHoistInvalidatedExpr(decl.expr, work),
+        .s_var => |var_| try self.markHoistInvalidatedExpr(var_.expr, work),
+        .s_reassign => |reassign| try self.markHoistInvalidatedExpr(reassign.expr, work),
+        .s_dbg => |dbg| try self.markHoistInvalidatedExpr(dbg.expr, work),
+        .s_expr => |expr| try self.markHoistInvalidatedExpr(expr.expr, work),
+        .s_expect => |expect| try self.markHoistInvalidatedExpr(expect.body, work),
+        .s_for => |for_| {
+            try self.markHoistInvalidatedExpr(for_.expr, work);
+            try self.markHoistInvalidatedExpr(for_.body, work);
+        },
+        .s_while => |while_| {
+            try self.markHoistInvalidatedExpr(while_.cond, work);
+            try self.markHoistInvalidatedExpr(while_.body, work);
+        },
+        .s_infinite_loop => |loop| {
+            try self.markHoistInvalidatedExpr(loop.cond, work);
+            try self.markHoistInvalidatedExpr(loop.body, work);
+        },
+        .s_breakable_loop => |loop| {
+            try self.markHoistInvalidatedExpr(loop.cond, work);
+            try self.markHoistInvalidatedExpr(loop.body, work);
+        },
+        .s_return => |ret| {
+            try self.markHoistInvalidatedExpr(ret.expr, work);
+            try self.markHoistInvalidatedExpr(ret.lambda, work);
+        },
+        .s_var_uninitialized,
+        .s_crash,
+        .s_break,
+        .s_import,
+        .s_alias_decl,
+        .s_nominal_decl,
+        .s_type_anno,
+        .s_type_var_alias,
+        .s_runtime_error,
+        => {},
+    }
+}
+
+fn markHoistInvalidatedExprChildren(
+    self: *Self,
+    expr: CIR.Expr.Idx,
+    work: *std.ArrayListUnmanaged(CIR.Expr.Idx),
+) Allocator.Error!void {
+    switch (self.cir.store.getExpr(expr)) {
+        .e_str => |str| try self.markHoistInvalidatedExprSpan(str.span, work),
+        .e_list => |list| try self.markHoistInvalidatedExprSpan(list.elems, work),
+        .e_tuple => |tuple| try self.markHoistInvalidatedExprSpan(tuple.elems, work),
+        .e_match => |match| {
+            try self.markHoistInvalidatedExpr(match.cond, work);
+            for (self.cir.store.sliceMatchBranches(match.branches)) |branch_idx| {
+                const branch = self.cir.store.getMatchBranch(branch_idx);
+                if (branch.guard) |guard| try self.markHoistInvalidatedExpr(guard, work);
+                try self.markHoistInvalidatedExpr(branch.value, work);
+            }
+        },
+        .e_if => |if_| {
+            for (self.cir.store.sliceIfBranches(if_.branches)) |branch_idx| {
+                const branch = self.cir.store.getIfBranch(branch_idx);
+                try self.markHoistInvalidatedExpr(branch.cond, work);
+                try self.markHoistInvalidatedExpr(branch.body, work);
+            }
+            try self.markHoistInvalidatedExpr(if_.final_else, work);
+        },
+        .e_call => |call| {
+            try self.markHoistInvalidatedExpr(call.func, work);
+            try self.markHoistInvalidatedExprSpan(call.args, work);
+        },
+        .e_record => |record| {
+            for (self.cir.store.sliceRecordFields(record.fields)) |field_idx| {
+                try self.markHoistInvalidatedExpr(self.cir.store.getRecordField(field_idx).value, work);
+            }
+            if (record.ext) |ext| try self.markHoistInvalidatedExpr(ext, work);
+        },
+        .e_block => |block| {
+            try self.markHoistInvalidatedStatementSpan(block.stmts, work);
+            try self.markHoistInvalidatedExpr(block.final_expr, work);
+        },
+        .e_tag => |tag| try self.markHoistInvalidatedExprSpan(tag.args, work),
+        .e_nominal => |nominal| try self.markHoistInvalidatedExpr(nominal.backing_expr, work),
+        .e_nominal_external => |nominal| try self.markHoistInvalidatedExpr(nominal.backing_expr, work),
+        .e_closure => |closure| try self.markHoistInvalidatedExpr(closure.lambda_idx, work),
+        .e_lambda => |lambda| try self.markHoistInvalidatedExpr(lambda.body, work),
+        .e_binop => |binop| {
+            try self.markHoistInvalidatedExpr(binop.lhs, work);
+            try self.markHoistInvalidatedExpr(binop.rhs, work);
+        },
+        .e_unary_minus => |unary| try self.markHoistInvalidatedExpr(unary.expr, work),
+        .e_unary_not => |unary| try self.markHoistInvalidatedExpr(unary.expr, work),
+        .e_field_access => |field| try self.markHoistInvalidatedExpr(field.receiver, work),
+        .e_method_call => |call| {
+            try self.markHoistInvalidatedExpr(call.receiver, work);
+            try self.markHoistInvalidatedExprSpan(call.args, work);
+        },
+        .e_dispatch_call => |call| {
+            try self.markHoistInvalidatedExpr(call.receiver, work);
+            try self.markHoistInvalidatedExprSpan(call.args, work);
+        },
+        .e_interpolation => |interpolation| {
+            try self.markHoistInvalidatedExpr(interpolation.first, work);
+            try self.markHoistInvalidatedExprSpan(interpolation.parts, work);
+        },
+        .e_structural_eq => |eq| {
+            try self.markHoistInvalidatedExpr(eq.lhs, work);
+            try self.markHoistInvalidatedExpr(eq.rhs, work);
+        },
+        .e_structural_hash => |hash| {
+            try self.markHoistInvalidatedExpr(hash.value, work);
+            try self.markHoistInvalidatedExpr(hash.hasher, work);
+        },
+        .e_method_eq => |eq| {
+            try self.markHoistInvalidatedExpr(eq.lhs, work);
+            try self.markHoistInvalidatedExpr(eq.rhs, work);
+        },
+        .e_type_method_call => |call| try self.markHoistInvalidatedExprSpan(call.args, work),
+        .e_type_dispatch_call => |call| try self.markHoistInvalidatedExprSpan(call.args, work),
+        .e_tuple_access => |access| try self.markHoistInvalidatedExpr(access.tuple, work),
+        .e_dbg => |dbg| try self.markHoistInvalidatedExpr(dbg.expr, work),
+        .e_expect_err => |expect_err| try self.markHoistInvalidatedExpr(expect_err.expr, work),
+        .e_expect => |expect| try self.markHoistInvalidatedExpr(expect.body, work),
+        .e_return => |ret| {
+            try self.markHoistInvalidatedExpr(ret.expr, work);
+            try self.markHoistInvalidatedExpr(ret.lambda, work);
+        },
+        .e_for => |for_| {
+            try self.markHoistInvalidatedExpr(for_.expr, work);
+            try self.markHoistInvalidatedExpr(for_.body, work);
+        },
+        .e_run_low_level => |run| try self.markHoistInvalidatedExprSpan(run.args, work),
+        .e_num,
+        .e_frac_f32,
+        .e_frac_f64,
+        .e_dec,
+        .e_dec_small,
+        .e_num_from_numeral,
+        .e_typed_int,
+        .e_typed_frac,
+        .e_typed_num_from_numeral,
+        .e_str_segment,
+        .e_bytes_literal,
+        .e_lookup_local,
+        .e_lookup_external,
+        .e_lookup_required,
+        .e_empty_list,
+        .e_empty_record,
+        .e_zero_argument_tag,
+        .e_runtime_error,
+        .e_crash,
+        .e_ellipsis,
+        .e_anno_only,
+        .e_break,
+        .e_hosted_lambda,
+        => {},
+    }
 }
 
 fn debugAssertHoistSelectionConsistent(self: *const Self) void {
@@ -2090,6 +2325,7 @@ const HoistSelectionTestState = struct {
         checker.hoist_contextual_binding_scope_patterns = .empty;
         checker.hoist_selected_bindings = .{};
         checker.hoist_selected_exprs = .{};
+        checker.hoist_invalidated_exprs = .{};
         checker.selected_hoisted_roots = .empty;
         checker.last_hoist_result = null;
         checker.hoist_suppressed_depth = 0;
@@ -2116,6 +2352,7 @@ const HoistSelectionTestState = struct {
         self.checker.hoist_contextual_binding_scope_patterns.deinit(self.allocator);
         self.checker.hoist_selected_bindings.deinit(self.allocator);
         self.checker.hoist_selected_exprs.deinit(self.allocator);
+        self.checker.hoist_invalidated_exprs.deinit(self.allocator);
         for (self.checker.selected_hoisted_roots.items) |*root| {
             hoist_roots.deinitSelectedRoot(self.allocator, root);
         }
@@ -2439,6 +2676,7 @@ fn patternIsTopLevel(self: *Self, pattern: CIR.Pattern.Idx) bool {
 }
 
 fn exprCanBeHoistedRoot(self: *Self, expr: CIR.Expr.Idx) bool {
+    if (self.hoistExprInvalidated(expr)) return false;
     if (self.varIsFunctionType(ModuleEnv.varFrom(expr))) return false;
     return switch (self.cir.store.getExpr(expr)) {
         .e_lookup_local => false,
@@ -2506,6 +2744,7 @@ fn exprCanBeHoistedRoot(self: *Self, expr: CIR.Expr.Idx) bool {
 /// eligibility: function/lambda/closure and observable expression frames may
 /// contain closed child work, but they cannot cover that work as data roots.
 fn exprCanCoverHoistedChildren(self: *Self, expr: CIR.Expr.Idx) bool {
+    if (self.hoistExprInvalidated(expr)) return false;
     if (self.varIsFunctionType(ModuleEnv.varFrom(expr))) return false;
     return switch (self.cir.store.getExpr(expr)) {
         .e_lookup_local,
@@ -2569,6 +2808,7 @@ fn exprCanCoverHoistedChildren(self: *Self, expr: CIR.Expr.Idx) bool {
 }
 
 fn exprCanBeHoistedBindingRoot(self: *Self, expr: CIR.Expr.Idx) bool {
+    if (self.hoistExprInvalidated(expr)) return false;
     if (self.varIsFunctionType(ModuleEnv.varFrom(expr))) return false;
     return switch (self.cir.store.getExpr(expr)) {
         .e_lookup_local => true,
@@ -4848,7 +5088,7 @@ fn pruneSelectedHoistedRootsAfterSolving(self: *Self) Allocator.Error!void {
     var kept_pattern_count: u32 = 0;
     for (self.selected_hoisted_roots.items, 0..) |root, i| {
         keep_oracle.current_root_index = i;
-        const intrinsic = try self.hoistedRootIsIntrinsicallyKept(root);
+        const intrinsic = !self.hoistExprInvalidated(root.expr) and try self.hoistedRootIsIntrinsicallyKept(root);
         const deps = intrinsic and try self.hoistedRootDependenciesAreKept(root.expr, &keep_oracle);
         if (!intrinsic) continue;
         if (!deps) continue;
@@ -4903,6 +5143,7 @@ fn hoistedRootIsIntrinsicallyKept(
         ModuleEnv.varFrom(pattern)
     else
         ModuleEnv.varFrom(root.expr);
+    if (self.cir.store.getExpr(root.expr) == .e_runtime_error) return true;
     if (isFunctionDef(&self.cir.store, self.cir.store.getExpr(root.expr))) return false;
     if (self.varIsFunctionType(type_var)) return false;
     return try self.varIsConcreteHoistedConstType(type_var);
@@ -5147,6 +5388,7 @@ fn hoistedRootDependenciesAreKeptInternal(
     context: *HoistedDependencyContext,
     keep_oracle: *const HoistedRootKeepOracle,
 ) Allocator.Error!bool {
+    if (self.hoistExprInvalidated(expr)) return false;
     if (self.exprHasDedicatedLiteralConversionRoot(expr)) return false;
 
     return switch (self.cir.store.getExpr(expr)) {
@@ -5168,9 +5410,9 @@ fn hoistedRootDependenciesAreKeptInternal(
         .e_empty_list,
         .e_empty_record,
         .e_zero_argument_tag,
+        .e_runtime_error,
         => true,
         .e_lookup_required,
-        .e_runtime_error,
         .e_ellipsis,
         .e_anno_only,
         .e_crash,
@@ -5273,6 +5515,7 @@ fn hoistedExprAllowsStoredConst(
     expr: CIR.Expr.Idx,
     context: *HoistedDependencyContext,
 ) Allocator.Error!bool {
+    if (self.moduleHoistExprInvalidated(module, expr)) return false;
     return switch (module.store.getExpr(expr)) {
         .e_run_low_level => |run| run.op != .dict_pseudo_seed and
             try self.hoistedExprSpanAllowsStoredConst(module, run.args, context),
@@ -6404,7 +6647,7 @@ fn reportAmbiguousStaticDispatchPerInstantiation(
                 const diagnostic_idx = try self.cir.addDiagnostic(.{ .erroneous_value_expr = .{
                     .region = dispatch_use.region,
                 } });
-                self.cir.store.replaceExprWithRuntimeError(dispatch_use.expr_idx, diagnostic_idx);
+                try self.replaceExprWithRuntimeError(dispatch_use.expr_idx, diagnostic_idx);
             }
         } else if (body_forced) {
             // A body-forced where-clause with no in-module dispatch use (the
@@ -6420,7 +6663,7 @@ fn reportAmbiguousStaticDispatchPerInstantiation(
                     const diagnostic_idx = try self.cir.addDiagnostic(.{ .erroneous_value_expr = .{
                         .region = primary.?,
                     } });
-                    self.cir.store.replaceExprWithRuntimeError(inst_expr, diagnostic_idx);
+                    try self.replaceExprWithRuntimeError(inst_expr, diagnostic_idx);
                 }
             } else {
                 // A dispatcher created outside `checkExpr` has no recorded source
@@ -6461,7 +6704,7 @@ fn reportAmbiguousStaticDispatchPerInstantiation(
                 const diagnostic_idx = try self.cir.addDiagnostic(.{ .erroneous_value_expr = .{
                     .region = self.cir.store.getExprRegion(expr_idx),
                 } });
-                self.cir.store.replaceExprWithRuntimeError(expr_idx, diagnostic_idx);
+                try self.replaceExprWithRuntimeError(expr_idx, diagnostic_idx);
                 runtime_error_inserted = true;
             }
         }
@@ -6627,7 +6870,7 @@ fn reportAmbiguousStaticDispatch(
         const diagnostic_idx = try self.cir.addDiagnostic(.{ .erroneous_value_expr = .{
             .region = region,
         } });
-        self.cir.store.replaceExprWithRuntimeError(expr_idx, diagnostic_idx);
+        try self.replaceExprWithRuntimeError(expr_idx, diagnostic_idx);
     }
 }
 
@@ -14989,14 +15232,14 @@ fn poisonRecursiveNonFunctionProcessingDef(
         } });
 
     if (self.cir.store.getExpr(def.expr) != .e_runtime_error) {
-        self.cir.store.replaceExprWithRuntimeError(def.expr, diagnostic_idx);
+        try self.replaceExprWithRuntimeError(def.expr, diagnostic_idx);
     }
     try self.erroneous_value_exprs.put(self.gpa, def.expr, {});
     try self.erroneous_value_patterns.put(self.gpa, def.pattern, {});
 
     if (use_expr) |expr_idx| {
         if (self.cir.store.getExpr(expr_idx) != .e_runtime_error) {
-            self.cir.store.replaceExprWithRuntimeError(expr_idx, diagnostic_idx);
+            try self.replaceExprWithRuntimeError(expr_idx, diagnostic_idx);
         }
         try self.erroneous_value_exprs.put(self.gpa, expr_idx, {});
         try self.unifyWith(ModuleEnv.varFrom(expr_idx), .err, env);
@@ -15060,7 +15303,7 @@ fn poisonErroneousValueUses(self: *Self) Allocator.Error!void {
             .ident = ident,
             .region = self.cir.store.getExprRegion(entry.expr_idx),
         } });
-        self.cir.store.replaceExprWithRuntimeError(entry.expr_idx, diagnostic_idx);
+        try self.replaceExprWithRuntimeError(entry.expr_idx, diagnostic_idx);
     }
 }
 
@@ -15071,7 +15314,7 @@ fn poisonErroneousValueExprs(self: *Self) Allocator.Error!void {
         const diagnostic_idx = try self.cir.addDiagnostic(.{ .erroneous_value_expr = .{
             .region = self.cir.store.getExprRegion(expr_idx.*),
         } });
-        self.cir.store.replaceExprWithRuntimeError(expr_idx.*, diagnostic_idx);
+        try self.replaceExprWithRuntimeError(expr_idx.*, diagnostic_idx);
     }
 }
 
