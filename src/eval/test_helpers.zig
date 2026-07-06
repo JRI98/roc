@@ -993,7 +993,7 @@ const ComptimeProblemReporting = enum {
 
 fn problemBlocksCheckedArtifact(problem: check.problem.Problem) bool {
     return switch (problem) {
-        .redundant_pattern, .unmatchable_pattern, .comptime_unused_branch, .comptime_condition, .literal_defaulted => false,
+        .effectful_function_name, .redundant_pattern, .unmatchable_pattern, .comptime_unused_branch, .comptime_condition, .literal_defaulted => false,
         else => true,
     };
 }
