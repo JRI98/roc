@@ -5197,7 +5197,49 @@ fn copyBuiltinTypes(self: *Self) Allocator.Error!void {
     }
 
     // Try type is accessed via external references, no need to copy it here
+
+    // Ensure this module's type store carries a declaration-table entry for
+    // every builtin nominal declaration. The checker synthesizes applications
+    // of these directly (List, Box, Try, number types, ...) without going
+    // through copyVar, so the entries must be present up front for keyed
+    // declaration lookups to resolve.
+    try self.ensureBuiltinNominalDeclEntries();
+
     self.builtin_types_copied = true;
+}
+
+/// Copy the declaration-table entries for all builtin nominal declarations
+/// from the Builtin module env into this module's type store. No-op when
+/// checking the Builtin module itself (its declarations register locally
+/// during type-decl processing).
+fn ensureBuiltinNominalDeclEntries(self: *Self) Allocator.Error!void {
+    const trace = tracy.trace(@src());
+    defer trace.end();
+
+    if (self.isCheckingBuiltinModuleDirectly()) return;
+    const builtin_env = self.builtin_ctx.builtin_module orelse return;
+    const indices = self.builtin_ctx.builtin_indices orelse {
+        if (builtin.mode == .Debug) {
+            std.debug.panic("type checker invariant violated: builtin module env present without builtin indices", .{});
+        }
+        unreachable;
+    };
+
+    self.var_map.clearRetainingCapacity();
+
+    inline for (CIR.builtin_type_specs) |spec| {
+        try copy_import.ensureNominalDeclForStatement(
+            &builtin_env.types,
+            self.types,
+            @intFromEnum(@field(indices, spec.type_field)),
+            &self.var_map,
+            builtin_env,
+            self.cir,
+            self.gpa,
+        );
+    }
+
+    try self.postProcessCopiedVars(Region.zero());
 }
 
 /// Public `checkFile` function.
@@ -5399,6 +5441,40 @@ fn checkFileInternal(self: *Self, skip_numeric_defaults: bool) std.mem.Allocator
     try self.reportNonExhaustiveLambdaParams(&env);
 
     try self.pruneSelectedHoistedRootsAfterSolving();
+
+    self.debugAssertNominalDeclTableComplete();
+}
+
+/// Debug-only invariant check: every nominal application in this store that
+/// carries a source declaration can resolve its declaration in this store's
+/// declaration table. Local declarations register during type-decl
+/// processing; imported ones are copied in by `copy_import`; builtin ones are
+/// ensured up front by `ensureBuiltinNominalDeclEntries`. A miss here means a
+/// nominal application was minted without its declaration being reachable.
+fn debugAssertNominalDeclTableComplete(self: *const Self) void {
+    if (builtin.mode != .Debug) return;
+
+    var var_int: u32 = 0;
+    const num_vars: u32 = @intCast(self.types.len());
+    while (var_int < num_vars) : (var_int += 1) {
+        const resolved = self.types.resolveVar(@enumFromInt(var_int));
+        if (!resolved.is_root) continue;
+        const content = resolved.desc.content;
+        if (content != .structure) continue;
+        if (content.structure != .nominal_type) continue;
+        const nominal = content.structure.nominal_type;
+        if (!nominal.sourceDecl().present) continue;
+        if (self.types.lookupNominalDecl(nominal) == null) {
+            std.debug.panic(
+                "type checker invariant violated: nominal application '{s}' (origin {}, statement {}) has no declaration table entry in its store",
+                .{
+                    self.cir.getIdentStoreConst().getText(nominal.ident.ident_idx),
+                    @intFromEnum(nominal.origin_module),
+                    nominal.sourceDecl().statement,
+                },
+            );
+        }
+    }
 }
 
 fn pruneSelectedHoistedRootsAfterSolving(self: *Self) Allocator.Error!void {
@@ -8427,6 +8503,8 @@ pub fn checkExprRepl(self: *Self, expr_idx: CIR.Expr.Idx) std.mem.Allocator.Erro
 
     // Check for infinite types
     try self.checkForInfiniteType(CIR.Expr.Idx, expr_idx);
+
+    self.debugAssertNominalDeclTableComplete();
 }
 
 /// Check a REPL expression, also type-checking any definitions (for local type declarations)
@@ -8496,6 +8574,8 @@ pub fn checkExprReplWithDefs(self: *Self, expr_idx: CIR.Expr.Idx) std.mem.Alloca
 
     try self.reportPolymorphicConstrainedExpr(expr_idx);
     try self.poisonErroneousValueUses();
+
+    self.debugAssertNominalDeclTableComplete();
 }
 
 // defs //
@@ -9170,6 +9250,41 @@ fn predeclareNominalDecl(
         ),
         env,
     );
+
+    try self.registerLocalNominalDecl(
+        @intFromEnum(decl_var),
+        header.relative_name,
+        header_vars,
+        backing_var,
+        nominal.is_opaque,
+    );
+}
+
+/// Register (or refresh) the declaration-table entry for a local nominal
+/// type declaration. The entry carries exactly the identity bits that nominal
+/// applications of this declaration embed, so keyed lookups resolve for every
+/// application in this store.
+fn registerLocalNominalDecl(
+    self: *Self,
+    decl_statement: u32,
+    name: Ident.Idx,
+    header_vars: []const Var,
+    backing_var: Var,
+    is_opaque: bool,
+) Allocator.Error!void {
+    const builtin_origin = self.cir.module_role == .builtin;
+    _ = try self.types.registerNominalDecl(.{
+        .ident = .{ .ident_idx = name },
+        .origin_module = self.cir.selfModuleIdentity(),
+        .source = try types_mod.NominalType.Source.initChecked(
+            try types_mod.SourceDecl.fromStatementWithBuiltinOriginChecked(decl_statement, builtin_origin),
+            is_opaque,
+            builtin_origin,
+        ),
+        .formals = try self.types.appendVars(header_vars),
+        .backing = backing_var,
+        .flags = .{ .valid = true },
+    });
 }
 
 fn predeclaredAliasArgs(self: *const Self, decl_var: Var) ?[]Var {
@@ -9276,6 +9391,14 @@ fn generateNominalDecl(
                 self.cir.module_role == .builtin,
             ),
             env,
+        );
+
+        try self.registerLocalNominalDecl(
+            @intFromEnum(decl_idx),
+            header.relative_name,
+            header_vars,
+            ModuleEnv.varFrom(nominal.anno),
+            nominal.is_opaque,
         );
     }
 
@@ -16019,6 +16142,16 @@ fn copyVar(self: *Self, other_module_var: Var, other_module_env: *const ModuleEn
 
     const region = if (mb_region) |region| region else base.Region.zero();
 
+    try self.postProcessCopiedVars(region);
+
+    return copied_var;
+}
+
+/// Bookkeeping for vars newly minted in this store by a cross-module copy
+/// (`self.var_map` holds source var -> fresh local var): fill in regions for
+/// error reporting and register copied open literals on the defaulting
+/// worklist.
+fn postProcessCopiedVars(self: *Self, region: Region) std.mem.Allocator.Error!void {
     // If we had to insert any new type variables, ensure that we have
     // corresponding regions for them. This is essential for error reporting.
     if (self.var_map.count() > 0) {
@@ -16048,8 +16181,6 @@ fn copyVar(self: *Self, other_module_var: Var, other_module_env: *const ModuleEn
 
     // Assert that we have regions for every type variable
     self.debugAssertArraysInSync();
-
-    return copied_var;
 }
 
 // nominal type checking helpers //

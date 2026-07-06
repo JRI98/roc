@@ -43,7 +43,8 @@ pub const Constants = struct {
     /// 18: Exact-numeral pipeline: parser-owned numeral digit tables, the
     ///     exact-numeral pattern node, and NumeralInfo constraint payloads.
     /// 19: Annotation node payload records a precomputed `contains_underscore` flag.
-    pub const CACHE_VERSION = 19;
+    /// 20: Nominal declaration table serialized with the type store.
+    pub const CACHE_VERSION = 20;
 };
 
 /// Configuration for the Roc cache system.

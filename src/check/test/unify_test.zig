@@ -2136,7 +2136,9 @@ const DeclaringModule = struct {
         gpa.free(self.owned_source);
     }
 
-    /// A nominal type var as its declaring module would produce it.
+    /// A nominal type var as its declaring module would produce it, including
+    /// the declaration-table entry the checker registers for every local
+    /// nominal declaration.
     fn mkNominalVar(self: *DeclaringModule, type_name: []const u8, source_decl: u32) std.mem.Allocator.Error!Var {
         const ident = try self.env.insertIdent(Ident.for_text(type_name));
         const backing = try self.env.types.freshFromContent(Content{ .structure = .empty_record });
@@ -2148,6 +2150,18 @@ const DeclaringModule = struct {
             source_decl,
             false,
         );
+        _ = try self.env.types.registerNominalDecl(.{
+            .ident = .{ .ident_idx = ident },
+            .origin_module = self.env.selfModuleIdentity(),
+            .source = try types_mod.NominalType.Source.initChecked(
+                try types_mod.SourceDecl.fromStatementChecked(source_decl),
+                false,
+                false,
+            ),
+            .formals = Var.SafeList.Range.empty(),
+            .backing = backing,
+            .flags = .{ .valid = true },
+        });
         return try self.env.types.freshFromContent(content);
     }
 };

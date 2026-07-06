@@ -185,7 +185,7 @@ main = (helper1(val), helper2(val))
 		(e-lambda
 			(args
 				(p-assign (ident "test")))
-			(e-dispatch-call (method "to_str") (constraint-fn-var 214)
+			(e-dispatch-call (method "to_str") (constraint-fn-var 450)
 				(receiver
 					(e-lookup-local
 						(p-assign (ident "test"))))
@@ -199,7 +199,7 @@ main = (helper1(val), helper2(val))
 		(e-lambda
 			(args
 				(p-assign (ident "x")))
-			(e-dispatch-call (method "to_str") (constraint-fn-var 222)
+			(e-dispatch-call (method "to_str") (constraint-fn-var 458)
 				(receiver
 					(e-lookup-local
 						(p-assign (ident "x"))))
@@ -218,7 +218,7 @@ main = (helper1(val), helper2(val))
 		(e-lambda
 			(args
 				(p-assign (ident "x")))
-			(e-dispatch-call (method "to_str2") (constraint-fn-var 230)
+			(e-dispatch-call (method "to_str2") (constraint-fn-var 466)
 				(receiver
 					(e-lookup-local
 						(p-assign (ident "x"))))
@@ -245,12 +245,12 @@ main = (helper1(val), helper2(val))
 		(p-assign (ident "main"))
 		(e-tuple
 			(elems
-				(e-call (constraint-fn-var 310)
+				(e-call (constraint-fn-var 546)
 					(e-lookup-local
 						(p-assign (ident "helper1")))
 					(e-lookup-local
 						(p-assign (ident "val"))))
-				(e-call (constraint-fn-var 315)
+				(e-call (constraint-fn-var 551)
 					(e-lookup-local
 						(p-assign (ident "helper2")))
 					(e-lookup-local

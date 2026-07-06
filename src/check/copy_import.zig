@@ -12,6 +12,7 @@
 //! the single cross-env identity resolution mechanism — no name matching.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const base = @import("base");
 const can = @import("can");
 const types_mod = @import("types");
@@ -304,6 +305,8 @@ fn copyNominalType(ctx: *const CopyContext, source_nominal: NominalType) std.mem
     const translated_ident = try ctx.copyIdent(source_nominal.ident.ident_idx);
     const translated_origin = try ctx.copyOriginModule(source_nominal.origin_module);
 
+    try ensureNominalDeclCopied(ctx, source_nominal, translated_origin);
+
     var dest_args = std.ArrayList(Var).empty;
     defer dest_args.deinit(ctx.dest_store.gpa);
 
@@ -325,6 +328,118 @@ fn copyNominalType(ctx: *const CopyContext, source_nominal: NominalType) std.mem
         .origin_module = translated_origin,
         .source = source_nominal.source,
     };
+}
+
+/// Ensure the destination store's nominal declaration table has an entry for
+/// the declaration behind `source_nominal`, copying it from the source store's
+/// table on first encounter. This runs once per (destination module,
+/// declaration): every later application of the same declaration finds the
+/// key already present and returns immediately, so declaration data crosses a
+/// module boundary at most once regardless of how many applications do.
+///
+/// The entry is reserved (key registered) before its formals and backing are
+/// copied so that self-referential backing templates terminate: copying the
+/// template's own recursive application re-enters this function and finds the
+/// key already present.
+fn ensureNominalDeclCopied(
+    ctx: *const CopyContext,
+    source_nominal: NominalType,
+    translated_origin: base.ModuleIdentity.Idx,
+) std.mem.Allocator.Error!void {
+    const source_decl = source_nominal.sourceDecl();
+    // A nominal without a source declaration has no key and no declaration
+    // table entry (only possible for hand-constructed types in tests).
+    if (!source_decl.present) return;
+
+    if (ctx.dest_store.lookupNominalDeclByKey(translated_origin, source_decl.statement) != null) return;
+
+    const source_decl_idx = ctx.source_store.lookupNominalDecl(source_nominal) orelse {
+        // Invariant: every nominal application in a store can resolve its
+        // declaration in that store, so a keyed application without a source
+        // table entry is a compiler bug.
+        if (builtin.mode == .Debug) {
+            std.debug.panic(
+                "copy_import invariant violated: nominal '{s}' has a source declaration but no declaration table entry in its source store",
+                .{ctx.sourceIdents().getText(source_nominal.ident.ident_idx)},
+            );
+        }
+        unreachable;
+    };
+
+    try copyNominalDeclEntry(ctx, ctx.source_store.getNominalDecl(source_decl_idx), translated_origin);
+}
+
+/// Ensure the destination store has a declaration-table entry for the nominal
+/// declaration at `statement` in the source module env, keyed under the source
+/// module's own identity rebased into the destination env. No-op when the
+/// source store has no entry for that statement (e.g. an alias declaration) or
+/// when the destination already has one.
+///
+/// Newly created destination vars are recorded in `var_mapping`; the caller
+/// owns follow-up bookkeeping for them (regions, worklists), exactly as with
+/// `copyVar`.
+pub fn ensureNominalDeclForStatement(
+    source_store: *const TypesStore,
+    dest_store: *TypesStore,
+    statement: u32,
+    var_mapping: *VarMapping,
+    source_env: *const ModuleEnv,
+    dest_env: *ModuleEnv,
+    allocator: std.mem.Allocator,
+) std.mem.Allocator.Error!void {
+    const ctx = CopyContext{
+        .source_store = source_store,
+        .dest_store = dest_store,
+        .var_mapping = var_mapping,
+        .source_env = source_env,
+        .dest_env = dest_env,
+        .allocator = allocator,
+    };
+
+    const source_origin = source_env.selfModuleIdentity();
+    const source_decl_idx = source_store.lookupNominalDeclByKey(source_origin, statement) orelse return;
+    const translated_origin = try ctx.copyOriginModule(source_origin);
+    if (dest_store.lookupNominalDeclByKey(translated_origin, statement) != null) return;
+
+    try copyNominalDeclEntry(&ctx, source_store.getNominalDecl(source_decl_idx), translated_origin);
+}
+
+/// Copy one declaration-table entry (formals + backing template) into the
+/// destination store. The key is reserved before the graph copy so that
+/// self-referential backing templates terminate: copying the template's own
+/// recursive application re-enters `ensureNominalDeclCopied` and finds the key
+/// already present. Nothing reads the reserved entry's formals/backing while
+/// the copy is in flight — lookups only test key presence.
+fn copyNominalDeclEntry(
+    ctx: *const CopyContext,
+    source_entry: types_mod.NominalDecl,
+    translated_origin: base.ModuleIdentity.Idx,
+) std.mem.Allocator.Error!void {
+    const translated_ident = try ctx.copyIdent(source_entry.ident.ident_idx);
+    const reserved_idx = try ctx.dest_store.registerNominalDecl(.{
+        .ident = types_mod.TypeIdent{ .ident_idx = translated_ident },
+        .origin_module = translated_origin,
+        .source = source_entry.source,
+        .formals = Var.SafeList.Range.empty(),
+        .backing = @enumFromInt(0),
+        .flags = source_entry.flags,
+    });
+
+    var dest_formals = std.ArrayList(Var).empty;
+    defer dest_formals.deinit(ctx.dest_store.gpa);
+    const source_formals = ctx.source_store.sliceVars(source_entry.formals);
+    for (source_formals) |source_formal| {
+        const dest_formal = try copyVarCtx(ctx, source_formal);
+        try dest_formals.append(ctx.dest_store.gpa, dest_formal);
+    }
+    const dest_formals_range = try ctx.dest_store.appendVars(dest_formals.items);
+
+    const dest_backing = try copyVarCtx(ctx, source_entry.backing);
+
+    var dest_entry = ctx.dest_store.getNominalDecl(reserved_idx);
+    dest_entry.formals = dest_formals_range;
+    dest_entry.backing = dest_backing;
+    ctx.dest_store.setNominalDecl(reserved_idx, dest_entry);
 }
 
 fn copyStaticDispatchConstraints(

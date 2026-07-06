@@ -47,6 +47,7 @@ const TypeIdent = types.TypeIdent;
 const Alias = types.Alias;
 const FlatType = types.FlatType;
 const NominalType = types.NominalType;
+const NominalDecl = types.NominalDecl;
 const Record = types.Record;
 const StaticDispatchConstraint = types.StaticDispatchConstraint;
 const SourceDecl = types.SourceDecl;
@@ -63,6 +64,28 @@ pub const ResolvedVarDesc = struct {
 
 /// Two variables & descs
 pub const ResolvedVarDescs = struct { a: ResolvedVarDesc, b: ResolvedVarDesc };
+
+/// One entry in the store's sorted nominal-declaration lookup index: a
+/// declaration key (origin module identity, source statement) mapped to the
+/// declaration's stable index in `Store.nominal_decls`. The index list is kept
+/// sorted by key so lookups are a binary search; declarations themselves are
+/// append-only so `NominalDecl.Idx` values stay stable across registrations.
+const NominalDeclIndexEntry = struct {
+    origin_module: base.ModuleIdentity.Idx,
+    statement: u32,
+    decl: NominalDecl.Idx,
+
+    const SafeList = collections.SafeList(@This());
+
+    /// Total order over declaration keys: origin module identity index first,
+    /// then statement.
+    fn orderByKey(origin_module: base.ModuleIdentity.Idx, statement: u32, entry: @This()) std.math.Order {
+        const lhs_origin = @intFromEnum(origin_module);
+        const rhs_origin = @intFromEnum(entry.origin_module);
+        if (lhs_origin != rhs_origin) return std.math.order(lhs_origin, rhs_origin);
+        return std.math.order(statement, entry.statement);
+    }
+};
 
 /// Reperents either type data *or* a symlink to another type variable
 pub const Slot = union(enum) {
@@ -110,6 +133,16 @@ pub const Store = struct {
     tags: TagSafeMultiList,
     static_dispatch_constraints: StaticDispatchConstraint.SafeList,
 
+    /// The nominal declaration table: one entry per nominal declaration whose
+    /// applications can appear in this store (local declarations plus every
+    /// imported declaration copied in by `copy_import`). Append-only, so
+    /// `NominalDecl.Idx` values are stable; keyed lookups go through the
+    /// sorted `nominal_decl_index`.
+    nominal_decls: NominalDecl.SafeList,
+    /// Sorted (origin module identity, statement) -> declaration index. Kept
+    /// sorted on insert; lookups binary-search.
+    nominal_decl_index: NominalDeclIndexEntry.SafeList,
+
     /// Undo trail for speculative unification. While a probe is active
     /// (`savepoint_active`), every in-place write to a slot or descriptor that
     /// existed before the probe began (index < `spec_baseline_*`) is journaled
@@ -156,6 +189,10 @@ pub const Store = struct {
             .record_fields = try RecordFieldSafeMultiList.initCapacity(gpa, child_capacity),
             .tags = try TagSafeMultiList.initCapacity(gpa, child_capacity),
             .static_dispatch_constraints = try StaticDispatchConstraint.SafeList.initCapacity(gpa, child_capacity),
+
+            // nominal declaration table (modules typically declare few types)
+            .nominal_decls = try NominalDecl.SafeList.initCapacity(gpa, 16),
+            .nominal_decl_index = try NominalDeclIndexEntry.SafeList.initCapacity(gpa, 16),
         };
     }
 
@@ -185,6 +222,10 @@ pub const Store = struct {
         self.tags.deinit(self.gpa);
         self.static_dispatch_constraints.deinit(self.gpa);
 
+        // nominal declaration table
+        self.nominal_decls.deinit(self.gpa);
+        self.nominal_decl_index.deinit(self.gpa);
+
         // speculation undo trail
         self.slot_trail.deinit(self.gpa);
         self.desc_trail.deinit(self.gpa);
@@ -200,6 +241,8 @@ pub const Store = struct {
             .record_fields = try self.record_fields.clone(gpa),
             .tags = try self.tags.clone(gpa),
             .static_dispatch_constraints = try self.static_dispatch_constraints.clone(gpa),
+            .nominal_decls = try self.nominal_decls.clone(gpa),
+            .nominal_decl_index = try self.nominal_decl_index.clone(gpa),
         };
     }
 
@@ -1009,6 +1052,101 @@ pub const Store = struct {
         return self.vars.iterRange(span);
     }
 
+    // nominal declaration table //
+
+    /// Register a nominal declaration, or update it if its key is already
+    /// present (a declaration is re-registered when its body is generated
+    /// after predeclaration). Returns the declaration's stable index.
+    ///
+    /// Must not run inside a unification savepoint: the declaration table is
+    /// not journaled, so a rollback could not undo the registration.
+    pub fn registerNominalDecl(self: *Self, decl: NominalDecl) Allocator.Error!NominalDecl.Idx {
+        std.debug.assert(!self.savepoint_active);
+        std.debug.assert(decl.source.sourceDecl().present);
+
+        const statement = decl.statement();
+        const entries = self.nominal_decl_index.items.items;
+        var lo: usize = 0;
+        var hi: usize = entries.len;
+        while (lo < hi) {
+            const mid = lo + (hi - lo) / 2;
+            switch (NominalDeclIndexEntry.orderByKey(decl.origin_module, statement, entries[mid])) {
+                .lt => hi = mid,
+                .gt => lo = mid + 1,
+                .eq => {
+                    const existing = entries[mid].decl;
+                    self.nominal_decls.set(existing, decl);
+                    return existing;
+                },
+            }
+        }
+
+        const decl_idx = try self.nominal_decls.append(self.gpa, decl);
+        try self.nominal_decl_index.items.insert(self.gpa, lo, .{
+            .origin_module = decl.origin_module,
+            .statement = statement,
+            .decl = decl_idx,
+        });
+        return decl_idx;
+    }
+
+    /// Look up a nominal declaration by its key: the declaring module's
+    /// env-local identity index plus the declaration statement in that module.
+    pub fn lookupNominalDeclByKey(
+        self: *const Self,
+        origin_module: base.ModuleIdentity.Idx,
+        statement: u32,
+    ) ?NominalDecl.Idx {
+        const entries = self.nominal_decl_index.items.items;
+        var lo: usize = 0;
+        var hi: usize = entries.len;
+        while (lo < hi) {
+            const mid = lo + (hi - lo) / 2;
+            switch (NominalDeclIndexEntry.orderByKey(origin_module, statement, entries[mid])) {
+                .lt => hi = mid,
+                .gt => lo = mid + 1,
+                .eq => return entries[mid].decl,
+            }
+        }
+        return null;
+    }
+
+    /// Look up the declaration for a nominal application. Returns null only
+    /// when the application carries no source declaration (possible for
+    /// hand-constructed types in tests; checker-created applications always
+    /// carry one).
+    pub fn lookupNominalDecl(self: *const Self, nominal: NominalType) ?NominalDecl.Idx {
+        const source_decl = nominal.sourceDecl();
+        if (!source_decl.present) return null;
+        return self.lookupNominalDeclByKey(nominal.origin_module, source_decl.statement);
+    }
+
+    /// Get a nominal declaration by index.
+    pub fn getNominalDecl(self: *const Self, idx: NominalDecl.Idx) NominalDecl {
+        return self.nominal_decls.get(idx).*;
+    }
+
+    /// Overwrite a nominal declaration entry in place (used by copy_import to
+    /// fill a reserved entry once its formals and backing have been copied).
+    pub fn setNominalDecl(self: *Self, idx: NominalDecl.Idx, decl: NominalDecl) void {
+        std.debug.assert(!self.savepoint_active);
+        self.nominal_decls.set(idx, decl);
+    }
+
+    /// Mark a nominal declaration invalid (malformed backing or invalid
+    /// recursion). Applications of invalid declarations poison to err.
+    pub fn markNominalDeclInvalid(self: *Self, idx: NominalDecl.Idx) void {
+        std.debug.assert(!self.savepoint_active);
+        var decl = self.nominal_decls.get(idx).*;
+        decl.flags.valid = false;
+        self.nominal_decls.set(idx, decl);
+    }
+
+    /// The number of registered nominal declarations.
+    pub fn nominalDeclCount(self: *const Self) u64 {
+        return self.nominal_decls.len();
+    }
+
     // rank //
 
     /// Set the rank for a descriptor
@@ -1192,6 +1330,8 @@ pub const Store = struct {
         record_fields: RecordFieldSafeMultiList.Serialized,
         tags: TagSafeMultiList.Serialized,
         static_dispatch_constraints: StaticDispatchConstraint.SafeList.Serialized,
+        nominal_decls: NominalDecl.SafeList.Serialized,
+        nominal_decl_index: NominalDeclIndexEntry.SafeList.Serialized,
 
         /// Serialize a Store into this Serialized struct, appending data to the writer
         pub fn serialize(
@@ -1207,6 +1347,8 @@ pub const Store = struct {
             try self.record_fields.serialize(&store.record_fields, allocator, writer);
             try self.tags.serialize(&store.tags, allocator, writer);
             try self.static_dispatch_constraints.serialize(&store.static_dispatch_constraints, allocator, writer);
+            try self.nominal_decls.serialize(&store.nominal_decls, allocator, writer);
+            try self.nominal_decl_index.serialize(&store.nominal_decl_index, allocator, writer);
 
             // Set gpa to all zeros; the space needs to be here,
             // but the value will be set separately during deserialization.
@@ -1226,6 +1368,8 @@ pub const Store = struct {
                 .record_fields = self.record_fields.deserializeInto(base_addr),
                 .tags = self.tags.deserializeInto(base_addr),
                 .static_dispatch_constraints = self.static_dispatch_constraints.deserializeInto(base_addr),
+                .nominal_decls = self.nominal_decls.deserializeInto(base_addr),
+                .nominal_decl_index = self.nominal_decl_index.deserializeInto(base_addr),
             };
         }
 
@@ -1240,6 +1384,8 @@ pub const Store = struct {
                 .record_fields = try self.record_fields.deserializeWithCopy(base_addr, gpa),
                 .tags = try self.tags.deserializeWithCopy(base_addr, gpa),
                 .static_dispatch_constraints = try self.static_dispatch_constraints.deserializeWithCopy(base_addr, gpa),
+                .nominal_decls = try self.nominal_decls.deserializeWithCopy(base_addr, gpa),
+                .nominal_decl_index = try self.nominal_decl_index.deserializeWithCopy(base_addr, gpa),
             };
         }
     };
@@ -1262,6 +1408,8 @@ pub const Store = struct {
             .record_fields = (try self.record_fields.serialize(allocator, writer)).*,
             .tags = (try self.tags.serialize(allocator, writer)).*,
             .static_dispatch_constraints = (try self.static_dispatch_constraints.serialize(allocator, writer)).*,
+            .nominal_decls = (try self.nominal_decls.serialize(allocator, writer)).*,
+            .nominal_decl_index = (try self.nominal_decl_index.serialize(allocator, writer)).*,
         };
 
         return @constCast(offset_self);
@@ -1275,6 +1423,8 @@ pub const Store = struct {
         self.record_fields.relocate(offset);
         self.tags.relocate(offset);
         self.static_dispatch_constraints.relocate(offset);
+        self.nominal_decls.relocate(offset);
+        self.nominal_decl_index.relocate(offset);
     }
 
     /// Calculate the size needed to serialize this Store
@@ -1285,9 +1435,11 @@ pub const Store = struct {
         const tags_size = self.tags.serializedSize();
         const vars_size = self.vars.serializedSize();
         const static_dispatch_constraints_size = self.static_dispatch_constraints.serializedSize();
+        const nominal_decls_size = self.nominal_decls.serializedSize();
+        const nominal_decl_index_size = self.nominal_decl_index.serializedSize();
 
         // Add alignment padding for each component
-        var total_size: usize = @sizeOf(u32) * 6; // size headers
+        var total_size: usize = @sizeOf(u32) * 8; // size headers
         total_size = std.mem.alignForward(usize, total_size, SERIALIZATION_ALIGNMENT);
 
         total_size += slots_size;
@@ -1306,6 +1458,12 @@ pub const Store = struct {
         total_size = std.mem.alignForward(usize, total_size, SERIALIZATION_ALIGNMENT.toByteUnits());
 
         total_size += static_dispatch_constraints_size;
+        total_size = std.mem.alignForward(usize, total_size, SERIALIZATION_ALIGNMENT.toByteUnits());
+
+        total_size += nominal_decls_size;
+        total_size = std.mem.alignForward(usize, total_size, SERIALIZATION_ALIGNMENT.toByteUnits());
+
+        total_size += nominal_decl_index_size;
         total_size = std.mem.alignForward(usize, total_size, SERIALIZATION_ALIGNMENT);
 
         // Align to SERIALIZATION_ALIGNMENT to maintain alignment for subsequent data
@@ -1807,6 +1965,123 @@ test "Store basic CompactWriter roundtrip" {
 
     const deser_redirect_resolved = deserialized.resolveVar(redirect_var);
     try std.testing.expectEqual(deser_flex_resolved.desc_idx, deser_redirect_resolved.desc_idx);
+}
+
+fn testNominalDecl(origin_module: base.ModuleIdentity.Idx, statement: u32, backing: Var) !NominalDecl {
+    return NominalDecl{
+        .ident = .{ .ident_idx = @bitCast(@as(u32, 1)) },
+        .origin_module = origin_module,
+        .source = try NominalType.Source.initChecked(
+            try SourceDecl.fromStatementChecked(statement),
+            false,
+            false,
+        ),
+        .formals = Var.SafeList.Range.empty(),
+        .backing = backing,
+        .flags = .{ .valid = true },
+    };
+}
+
+test "nominal declaration table: register, lookup, upsert" {
+    const gpa = std.testing.allocator;
+
+    var store = try Store.init(gpa);
+    defer store.deinit();
+
+    const backing_a = try store.fresh();
+    const backing_b = try store.fresh();
+    const backing_c = try store.fresh();
+
+    const origin_0: base.ModuleIdentity.Idx = @enumFromInt(0);
+    const origin_1: base.ModuleIdentity.Idx = @enumFromInt(1);
+
+    // Register out of key order to exercise sorted insertion.
+    const idx_b = try store.registerNominalDecl(try testNominalDecl(origin_1, 5, backing_b));
+    const idx_a = try store.registerNominalDecl(try testNominalDecl(origin_0, 9, backing_a));
+    const idx_c = try store.registerNominalDecl(try testNominalDecl(origin_1, 2, backing_c));
+
+    try std.testing.expectEqual(@as(u64, 3), store.nominalDeclCount());
+    try std.testing.expectEqual(idx_a, store.lookupNominalDeclByKey(origin_0, 9).?);
+    try std.testing.expectEqual(idx_b, store.lookupNominalDeclByKey(origin_1, 5).?);
+    try std.testing.expectEqual(idx_c, store.lookupNominalDeclByKey(origin_1, 2).?);
+    try std.testing.expectEqual(@as(?NominalDecl.Idx, null), store.lookupNominalDeclByKey(origin_0, 5));
+    try std.testing.expectEqual(@as(?NominalDecl.Idx, null), store.lookupNominalDeclByKey(origin_1, 9));
+
+    try std.testing.expectEqual(backing_a, store.getNominalDecl(idx_a).backing);
+
+    // Re-registering the same key updates in place and keeps the index stable.
+    var updated = try testNominalDecl(origin_0, 9, backing_c);
+    const formal = try store.fresh();
+    updated.formals = try store.appendVars(&.{formal});
+    const idx_a_again = try store.registerNominalDecl(updated);
+    try std.testing.expectEqual(idx_a, idx_a_again);
+    try std.testing.expectEqual(@as(u64, 3), store.nominalDeclCount());
+    try std.testing.expectEqual(backing_c, store.getNominalDecl(idx_a).backing);
+    try std.testing.expectEqual(@as(u32, 1), store.getNominalDecl(idx_a).formals.count);
+
+    // Validity flips in place.
+    try std.testing.expect(store.getNominalDecl(idx_b).isValid());
+    store.markNominalDeclInvalid(idx_b);
+    try std.testing.expect(!store.getNominalDecl(idx_b).isValid());
+
+    // Lookup through a nominal application resolves by (origin, statement).
+    const app_content = try store.mkNominalWithSourceDecl(
+        .{ .ident_idx = @bitCast(@as(u32, 1)) },
+        backing_b,
+        &.{},
+        origin_1,
+        5,
+        false,
+    );
+    const app = app_content.structure.nominal_type;
+    try std.testing.expectEqual(idx_b, store.lookupNominalDecl(app).?);
+}
+
+test "nominal declaration table: CompactWriter roundtrip" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    const CompactWriter = collections.CompactWriter;
+
+    var original = try Store.init(gpa);
+    defer original.deinit();
+
+    const formal = try original.freshFromContent(Content{ .rigid = Rigid.init(@bitCast(@as(u32, 7))) });
+    const backing = try original.freshFromContent(Content{ .structure = .empty_record });
+
+    const origin: base.ModuleIdentity.Idx = @enumFromInt(3);
+    var decl = try testNominalDecl(origin, 11, backing);
+    decl.formals = try original.appendVars(&.{formal});
+    _ = try original.registerNominalDecl(decl);
+
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    const file = try tmp_dir.dir.createFile(io, "test_nominal_decls.dat", .{ .read = true });
+    defer file.close(io);
+
+    var writer = CompactWriter.init();
+    defer writer.deinit(gpa);
+
+    _ = try original.serialize(gpa, &writer);
+    try writer.writeGather(file, io);
+
+    const file_size = writer.total_bytes;
+    const buffer = try gpa.alignedAlloc(u8, std.mem.Alignment.@"16", @intCast(file_size));
+    defer gpa.free(buffer);
+
+    _ = try file.readPositionalAll(io, buffer, 0);
+
+    const deserialized = @as(*Store, @ptrCast(@alignCast(buffer.ptr)));
+    deserialized.relocate(@as(isize, @intCast(@intFromPtr(buffer.ptr))));
+
+    try std.testing.expectEqual(@as(u64, 1), deserialized.nominalDeclCount());
+    const deser_idx = deserialized.lookupNominalDeclByKey(origin, 11).?;
+    const deser_decl = deserialized.getNominalDecl(deser_idx);
+    try std.testing.expectEqual(backing, deser_decl.backing);
+    try std.testing.expect(deser_decl.isValid());
+    const deser_formals = deserialized.sliceVars(deser_decl.formals);
+    try std.testing.expectEqual(@as(usize, 1), deser_formals.len);
+    try std.testing.expectEqual(formal, deser_formals[0]);
 }
 
 test "Store comprehensive CompactWriter roundtrip" {

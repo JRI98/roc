@@ -204,25 +204,25 @@ main! = |_| {
 										(e-if
 											(if-branches
 												(if-branch
-													(e-dispatch-call (method "is_gt") (constraint-fn-var 201)
+													(e-dispatch-call (method "is_gt") (constraint-fn-var 437)
 														(receiver
 															(e-lookup-local
 																(p-assign (ident "start"))))
 														(args
 															(e-num (value "0"))))
 													(e-block
-														(e-call (constraint-fn-var 520)
+														(e-call (constraint-fn-var 756)
 															(e-lookup-local
 																(p-assign (ident "slice")))
 															(e-lookup-local
 																(p-assign (ident "rest")))
-															(e-dispatch-call (method "minus") (constraint-fn-var 327)
+															(e-dispatch-call (method "minus") (constraint-fn-var 563)
 																(receiver
 																	(e-lookup-local
 																		(p-assign (ident "start"))))
 																(args
 																	(e-num (value "1"))))
-															(e-dispatch-call (method "minus") (constraint-fn-var 440)
+															(e-dispatch-call (method "minus") (constraint-fn-var 676)
 																(receiver
 																	(e-lookup-local
 																		(p-assign (ident "end"))))
@@ -242,16 +242,16 @@ main! = |_| {
 																	(p-assign (ident "x"))))))))
 											(if-else
 												(e-block
-													(e-call (constraint-fn-var 885)
+													(e-call (constraint-fn-var 1121)
 														(e-lookup-external
 															(builtin))
-														(e-call (constraint-fn-var 814)
+														(e-call (constraint-fn-var 1050)
 															(e-lookup-local
 																(p-assign (ident "slice")))
 															(e-lookup-local
 																(p-assign (ident "rest")))
 															(e-num (value "0"))
-															(e-dispatch-call (method "minus") (constraint-fn-var 734)
+															(e-dispatch-call (method "minus") (constraint-fn-var 970)
 																(receiver
 																	(e-lookup-local
 																		(p-assign (ident "end"))))

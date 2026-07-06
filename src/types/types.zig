@@ -575,6 +575,67 @@ pub const NominalType = struct {
     }
 };
 
+/// A nominal type declaration: the single owner of the declaration's formal
+/// type parameters and backing template within one type store.
+///
+/// Declarations are keyed by (origin module identity, source declaration
+/// statement) in the store's declaration table (`Store.nominal_decls`). Local
+/// declarations are registered when the checker processes the declaration
+/// statement; imported declarations are copied into the destination store the
+/// first time a nominal application of theirs crosses the module boundary
+/// (see `copy_import.zig`), so every store is self-contained: any nominal
+/// application present in a store can resolve its declaration in that same
+/// store.
+pub const NominalDecl = struct {
+    /// Display name of the declaration. Never part of identity.
+    ident: TypeIdent,
+    /// Env-local index of the declaring module's deep content identity in the
+    /// owning module env's identity table (see `base.module_identity`).
+    origin_module: ModuleIdentity.Idx,
+    /// Packed statement locator plus opacity and builtin-origin bits — the
+    /// same bits nominal applications of this declaration carry. The
+    /// statement must be present: a declaration entry without a source
+    /// statement has no key and cannot be registered.
+    source: NominalType.Source,
+    /// The declaration's formal type parameters (rigid vars), in declaration
+    /// order. Instantiating the backing for a nominal application substitutes
+    /// the application's actual args for these, positionally.
+    formals: Var.SafeList.Range,
+    /// The declaration's backing template. It references `formals` and is
+    /// never unified against directly — backing access instantiates a copy
+    /// with actual args substituted for formals.
+    backing: Var,
+    /// Declaration flags, padding-free so serialized bytes are deterministic.
+    flags: Flags,
+
+    /// Declaration flags. Packed to a full u32 so `NominalDecl` has no
+    /// implicit padding bytes (the declaration table serializes raw).
+    pub const Flags = packed struct(u32) {
+        /// False once the declaration is known invalid (malformed backing or
+        /// invalid recursion). Applications of invalid declarations poison
+        /// to err.
+        valid: bool,
+        _unused: u31 = 0,
+    };
+
+    /// The statement index of this declaration in its origin module env.
+    pub fn statement(self: NominalDecl) u32 {
+        const source_decl = self.source.sourceDecl();
+        std.debug.assert(source_decl.present);
+        return source_decl.statement;
+    }
+
+    /// Whether this declaration is well-formed.
+    pub fn isValid(self: NominalDecl) bool {
+        return self.flags.valid;
+    }
+
+    /// A safe list of nominal declarations
+    pub const SafeList = MkSafeList(@This());
+    /// An index into a safe list of nominal declarations
+    pub const Idx = SafeList.Idx;
+};
+
 // functions //
 
 /// Represents a function

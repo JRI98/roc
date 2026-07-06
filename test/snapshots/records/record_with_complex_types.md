@@ -198,7 +198,7 @@ EndOfFile,
 			(e-lambda
 				(args
 					(p-assign (ident "x")))
-				(e-dispatch-call (method "plus") (constraint-fn-var 360)
+				(e-dispatch-call (method "plus") (constraint-fn-var 596)
 					(receiver
 						(e-lookup-local
 							(p-assign (ident "x"))))
