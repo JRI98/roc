@@ -1677,6 +1677,16 @@ pub const Coordinator = struct {
 
             try views.append(allocator, view);
 
+            for (view.direct_import_artifact_keys) |dependency_key| {
+                const artifact = self.checkedArtifactByKey(dependency_key) orelse {
+                    if (builtin.mode == .Debug) {
+                        std.debug.panic("compile.coordinator missing direct dependency checked artifact", .{});
+                    }
+                    unreachable;
+                };
+                try pending.append(allocator, check.CheckedArtifact.importedView(artifact));
+            }
+
             for (view.public_api_dependencies.type_owner_artifacts) |dependency_key| {
                 const artifact = self.checkedArtifactByKey(dependency_key) orelse {
                     if (builtin.mode == .Debug) {

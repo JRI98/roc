@@ -180,6 +180,7 @@ pub const MethodRegistry = struct {
         module: TypedCIR.Module,
         names: *canonical.CanonicalNameStore,
         local_templates: *const ProcedureTemplateLookup,
+        available_artifacts: anytype,
         checked_types: anytype,
         checked_bodies: anytype,
     ) Allocator.Error!MethodRegistry {
@@ -202,7 +203,7 @@ pub const MethodRegistry = struct {
         const module_name = try names.internModuleIdent(idents, module.qualifiedModuleIdent());
 
         for (module.methodDefEntries()) |entry| {
-            const method_ident = module_env.lookupMethodIdentForOwnerConst(entry.key.owner, entry.key.methodIdent()) orelse {
+            const method_ident = module_env.lookupMethodIdentForMethodOwnerConst(entry.key.ownerIdent(), entry.key.methodIdent()) orelse {
                 if (@import("builtin").mode == .Debug) {
                     std.debug.panic(
                         "checked static dispatch registry invariant violated: method def for owner {d} method {d} has no method ident",
@@ -239,7 +240,7 @@ pub const MethodRegistry = struct {
 
             try entries.append(allocator, .{
                 .key = .{
-                    .owner = try methodOwnerForRegistryEntry(module, names, entry.key.owner),
+                    .owner = try methodOwnerForRegistryEntry(module, names, available_artifacts, entry.key.ownerIdent()),
                     .method = try names.internMethodIdent(idents, entry.key.methodIdent()),
                 },
                 .target = .{
@@ -408,23 +409,24 @@ fn localProcedureExpr(module: TypedCIR.Module, expr_idx: CIR.Expr.Idx) bool {
 fn methodOwnerForRegistryEntry(
     module: TypedCIR.Module,
     names: *canonical.CanonicalNameStore,
-    owner_stmt: CIR.Statement.Idx,
+    available_artifacts: anytype,
+    owner: ModuleEnv.MethodOwner,
 ) Allocator.Error!MethodOwner {
-    if (builtinOwnerForRegistryEntry(module, owner_stmt)) |owner| {
-        return .{ .builtin = owner };
+    const owner_env = methodOwnerEnvForRegistryEntry(module, available_artifacts, owner);
+    if (builtinOwnerForRegistryEntry(owner_env, owner.owner)) |builtin_owner| {
+        return .{ .builtin = builtin_owner };
     }
 
-    const module_env = module.moduleEnvConst();
-    const identity_hash = module_env.contentIdentityHash() orelse {
+    const identity_hash = owner_env.contentIdentityHash() orelse {
         if (@import("builtin").mode == .Debug) {
             std.debug.panic(
                 "checked static dispatch registry invariant violated: module '{s}' has no content identity",
-                .{module_env.module_name},
+                .{owner_env.module_name},
             );
         }
         unreachable;
     };
-    const stmt = module_env.store.getStatement(owner_stmt);
+    const stmt = owner_env.store.getStatement(owner.owner);
     const header_idx = switch (stmt) {
         .s_nominal_decl => |nominal| nominal.header,
         .s_alias_decl => |alias| alias.header,
@@ -432,25 +434,81 @@ fn methodOwnerForRegistryEntry(
             if (@import("builtin").mode == .Debug) {
                 std.debug.panic(
                     "checked static dispatch registry invariant violated: method owner statement {d} is not a type declaration",
-                    .{@intFromEnum(owner_stmt)},
+                    .{@intFromEnum(owner.owner)},
                 );
             }
             unreachable;
         },
     };
-    const header = module_env.store.getTypeHeader(header_idx);
+    const header = owner_env.store.getTypeHeader(header_idx);
     return .{ .nominal = .{
         .module = try names.internModuleIdentity(identity_hash),
-        .type_name = try names.internTypeIdent(module.identStoreConst(), header.relative_name),
-        .source_decl = @intFromEnum(owner_stmt),
+        .type_name = try names.internTypeIdent(owner_env.getIdentStoreConst(), header.relative_name),
+        .source_decl = @intFromEnum(owner.owner),
     } };
 }
 
-fn builtinOwnerForRegistryEntry(
+fn methodOwnerEnvForRegistryEntry(
     module: TypedCIR.Module,
+    available_artifacts: anytype,
+    owner: ModuleEnv.MethodOwner,
+) *const ModuleEnv {
+    const module_env = module.moduleEnvConst();
+    const owner_hash = methodOwnerIdentityHashForRegistryEntry(module_env, owner);
+
+    if (ownerEnvIdentityMatches(module_env, owner_hash)) return module_env;
+
+    for (available_artifacts) |artifact| {
+        const candidate = artifact.module_env;
+        if (ownerEnvIdentityMatches(candidate, owner_hash)) return candidate;
+    }
+
+    if (@import("builtin").mode == .Debug) {
+        std.debug.panic(
+            "checked static dispatch registry invariant violated: could not find owner module '{s}' for receiver method",
+            .{module.getIdent(owner.moduleIdent())},
+        );
+    }
+    unreachable;
+}
+
+fn methodOwnerIdentityHashForRegistryEntry(
+    module_env: *const ModuleEnv,
+    owner: ModuleEnv.MethodOwner,
+) *const base.ModuleIdentity.Hash {
+    if (owner.moduleIdent().eql(module_env.qualified_module_ident)) {
+        return module_env.contentIdentityHash() orelse {
+            if (@import("builtin").mode == .Debug) {
+                std.debug.panic(
+                    "checked static dispatch registry invariant violated: local module '{s}' has no content identity",
+                    .{module_env.module_name},
+                );
+            }
+            unreachable;
+        };
+    }
+
+    const owner_identity = module_env.moduleIdentityForDisplayIdent(owner.moduleIdent()) orelse {
+        if (@import("builtin").mode == .Debug) {
+            std.debug.panic(
+                "checked static dispatch registry invariant violated: receiver owner module '{s}' has no content identity in module '{s}'",
+                .{ module_env.getIdent(owner.moduleIdent()), module_env.module_name },
+            );
+        }
+        unreachable;
+    };
+    return module_env.moduleIdentityHash(owner_identity);
+}
+
+fn ownerEnvIdentityMatches(candidate: *const ModuleEnv, owner_hash: *const base.ModuleIdentity.Hash) bool {
+    const candidate_hash = candidate.contentIdentityHash() orelse return false;
+    return base.ModuleIdentity.eql(candidate_hash, owner_hash);
+}
+
+fn builtinOwnerForRegistryEntry(
+    module_env: *const ModuleEnv,
     owner_stmt: CIR.Statement.Idx,
 ) ?BuiltinOwner {
-    const module_env = module.moduleEnvConst();
     const common = module_env.idents;
     if (module_env.module_role != .builtin) return null;
 

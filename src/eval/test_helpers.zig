@@ -1199,6 +1199,8 @@ fn parseAndCanonicalizeProgramWithRootModeReporting(
 
     const publish_imports = try publishImportKeysWithBuiltin(allocator, import_artifacts, pre_published_builtin);
     defer allocator.free(publish_imports);
+    const available_artifacts = try importedViewsFromPublishImports(allocator, publish_imports);
+    defer allocator.free(available_artifacts);
 
     var explicit_root_storage: [1]check.CheckedArtifact.ExplicitRootRequestInput = undefined;
     var explicit_roots: []const check.CheckedArtifact.ExplicitRootRequestInput = &.{};
@@ -1229,6 +1231,7 @@ fn parseAndCanonicalizeProgramWithRootModeReporting(
         .{
             .module_env_storage = .{ .checked_source = main_checked.module_env },
             .imports = publish_imports,
+            .available_artifacts = available_artifacts,
             .explicit_roots = explicit_roots,
             .compile_time_finalizer = CompileTimeFinalization.finalizer(),
             .problem_store = switch (problem_reporting) {
@@ -1568,13 +1571,17 @@ fn publishImportArtifacts(
             const module_idx: u32 = @intCast(extra_i + 2);
             if (!directImportsArePublished(typed_cir_modules.module(module_idx), published_keys.items)) continue;
 
-            const artifact = try check.CheckedArtifact.publishFromTypedModule(
+            const available_artifacts = try importedViewsFromPublishImports(allocator, published_keys.items);
+            defer allocator.free(available_artifacts);
+
+            var artifact = try check.CheckedArtifact.publishFromTypedModule(
                 allocator,
                 typed_cir_modules,
                 module_idx,
                 .{
                     .module_env_storage = .{ .checked_source = extra_modules[extra_i].module_env },
                     .imports = published_keys.items,
+                    .available_artifacts = available_artifacts,
                     .compile_time_finalizer = CompileTimeFinalization.finalizer(),
                 },
             );
@@ -1605,6 +1612,17 @@ fn publishImportArtifacts(
     }
 
     return try artifacts.toOwnedSlice(allocator);
+}
+
+fn importedViewsFromPublishImports(
+    allocator: Allocator,
+    imports: []const check.CheckedArtifact.PublishImportArtifact,
+) TestHelperError![]check.CheckedArtifact.ImportedModuleView {
+    const views = try allocator.alloc(check.CheckedArtifact.ImportedModuleView, imports.len);
+    for (imports, 0..) |import, i| {
+        views[i] = import.view;
+    }
+    return views;
 }
 
 fn directImportsArePublished(

@@ -17,12 +17,14 @@ const occurs = @import("occurs.zig");
 const problem = @import("problem.zig");
 const snapshot_mod = @import("snapshot.zig");
 const exhaustive = @import("exhaustive.zig");
+const ExhaustivenessContext = @import("exhaustiveness_context.zig");
 const hoist_roots = @import("hoist_roots.zig");
 
 const MkSafeList = collections.SafeList;
 
 const CIR = can.CIR;
 const ModuleEnv = can.ModuleEnv;
+const PatternRefutability = can.PatternRefutability;
 const Allocator = std.mem.Allocator;
 const Ident = base.Ident;
 const Region = base.Region;
@@ -244,11 +246,8 @@ checking_binding_rhs_pattern: ?CIR.Pattern.Idx = null,
 /// the value is explicitly discarded, so no caller can later pin return-only
 /// where-clause obligations created by the RHS.
 discarded_binding_rhs_expr: ?CIR.Expr.Idx = null,
-/// Nonzero while checking source that constructs a compile-time value. Static
-/// exhaustiveness diagnostics under this depth are empirical candidates: the
-/// compile-time finalizer either observes them executing, reports their generated
-/// miss path, or discards them if the source was not reached.
-empirical_exhaustiveness_depth: u32 = 0,
+/// Tracks whether static exhaustiveness diagnostics are compile-time candidates.
+exhaustiveness_context: ExhaustivenessContext.Context = .{},
 /// Deferred def-level unifications (def_var = ptrn_var = expr_var).
 /// These must happen AFTER generalization to avoid lowering expr_var's rank
 /// before generalization can process it, but BEFORE eql constraint resolution
@@ -8223,8 +8222,8 @@ fn checkDef(self: *Self, def_idx: CIR.Def.Idx, env: *Env) std.mem.Allocator.Erro
         }
     };
 
-    self.empirical_exhaustiveness_depth += 1;
-    defer self.empirical_exhaustiveness_depth -= 1;
+    const exhaustiveness_scope = self.exhaustiveness_context.enterCompileTimeRoot();
+    defer exhaustiveness_scope.leave();
 
     // Infer types for the body, checking against the instantiated annotation.
     // Ordinary top-level constants are already compile-time roots, so nested
@@ -10120,42 +10119,236 @@ fn getPatternIdent(self: *const Self, ptrn_idx: CIR.Pattern.Idx) ?Ident.Idx {
     }
 }
 
+const CirPatternRefutabilityAdapter = struct {
+    pub const PatternId = CIR.Pattern.Idx;
+
+    checker: *const Self,
+
+    pub fn patternClass(self: @This(), pattern_idx: PatternId) PatternRefutability.PatternClass {
+        const pattern = self.checker.cir.store.getPattern(pattern_idx);
+        return switch (pattern) {
+            .assign,
+            .underscore,
+            .runtime_error,
+            => .cannot_miss,
+            .as,
+            .nominal,
+            .nominal_external,
+            => .child,
+            .tuple => .sequence,
+            .record_destructure => .record,
+            .list => .list,
+            .applied_tag,
+            .num_literal,
+            .small_dec_literal,
+            .dec_literal,
+            .frac_f32_literal,
+            .frac_f64_literal,
+            .str_literal,
+            .str_interpolation,
+            => .can_miss,
+        };
+    }
+
+    pub fn child(self: @This(), pattern_idx: PatternId) PatternId {
+        const pattern = self.checker.cir.store.getPattern(pattern_idx);
+        return switch (pattern) {
+            .as => |as_pattern| as_pattern.pattern,
+            .nominal => |nominal| nominal.backing_pattern,
+            .nominal_external => |nominal| nominal.backing_pattern,
+            .assign,
+            .applied_tag,
+            .record_destructure,
+            .list,
+            .tuple,
+            .num_literal,
+            .small_dec_literal,
+            .dec_literal,
+            .frac_f32_literal,
+            .frac_f64_literal,
+            .str_literal,
+            .str_interpolation,
+            .underscore,
+            .runtime_error,
+            => unreachable,
+        };
+    }
+
+    pub fn sequenceLen(self: @This(), pattern_idx: PatternId) usize {
+        const pattern = self.checker.cir.store.getPattern(pattern_idx);
+        return switch (pattern) {
+            .tuple => |tuple| self.checker.cir.store.slicePatterns(tuple.patterns).len,
+            .assign,
+            .as,
+            .applied_tag,
+            .nominal,
+            .nominal_external,
+            .record_destructure,
+            .list,
+            .num_literal,
+            .small_dec_literal,
+            .dec_literal,
+            .frac_f32_literal,
+            .frac_f64_literal,
+            .str_literal,
+            .str_interpolation,
+            .underscore,
+            .runtime_error,
+            => unreachable,
+        };
+    }
+
+    pub fn sequenceChild(self: @This(), pattern_idx: PatternId, index: usize) PatternId {
+        const pattern = self.checker.cir.store.getPattern(pattern_idx);
+        return switch (pattern) {
+            .tuple => |tuple| self.checker.cir.store.slicePatterns(tuple.patterns)[index],
+            .assign,
+            .as,
+            .applied_tag,
+            .nominal,
+            .nominal_external,
+            .record_destructure,
+            .list,
+            .num_literal,
+            .small_dec_literal,
+            .dec_literal,
+            .frac_f32_literal,
+            .frac_f64_literal,
+            .str_literal,
+            .str_interpolation,
+            .underscore,
+            .runtime_error,
+            => unreachable,
+        };
+    }
+
+    pub fn recordLen(self: @This(), pattern_idx: PatternId) usize {
+        const pattern = self.checker.cir.store.getPattern(pattern_idx);
+        return switch (pattern) {
+            .record_destructure => |destructure| self.checker.cir.store.sliceRecordDestructs(destructure.destructs).len,
+            .assign,
+            .as,
+            .applied_tag,
+            .nominal,
+            .nominal_external,
+            .list,
+            .tuple,
+            .num_literal,
+            .small_dec_literal,
+            .dec_literal,
+            .frac_f32_literal,
+            .frac_f64_literal,
+            .str_literal,
+            .str_interpolation,
+            .underscore,
+            .runtime_error,
+            => unreachable,
+        };
+    }
+
+    pub fn recordChild(self: @This(), pattern_idx: PatternId, index: usize) PatternId {
+        const pattern = self.checker.cir.store.getPattern(pattern_idx);
+        return switch (pattern) {
+            .record_destructure => |destructure| blk: {
+                const destruct_idx = self.checker.cir.store.sliceRecordDestructs(destructure.destructs)[index];
+                const destruct = self.checker.cir.store.getRecordDestruct(destruct_idx);
+                break :blk destruct.kind.toPatternIdx();
+            },
+            .assign,
+            .as,
+            .applied_tag,
+            .nominal,
+            .nominal_external,
+            .list,
+            .tuple,
+            .num_literal,
+            .small_dec_literal,
+            .dec_literal,
+            .frac_f32_literal,
+            .frac_f64_literal,
+            .str_literal,
+            .str_interpolation,
+            .underscore,
+            .runtime_error,
+            => unreachable,
+        };
+    }
+
+    pub fn listFixedLen(self: @This(), pattern_idx: PatternId) usize {
+        const pattern = self.checker.cir.store.getPattern(pattern_idx);
+        return switch (pattern) {
+            .list => |list| self.checker.cir.store.slicePatterns(list.patterns).len,
+            .assign,
+            .as,
+            .applied_tag,
+            .nominal,
+            .nominal_external,
+            .record_destructure,
+            .tuple,
+            .num_literal,
+            .small_dec_literal,
+            .dec_literal,
+            .frac_f32_literal,
+            .frac_f64_literal,
+            .str_literal,
+            .str_interpolation,
+            .underscore,
+            .runtime_error,
+            => unreachable,
+        };
+    }
+
+    pub fn listHasRest(self: @This(), pattern_idx: PatternId) bool {
+        const pattern = self.checker.cir.store.getPattern(pattern_idx);
+        return switch (pattern) {
+            .list => |list| list.rest_info != null,
+            .assign,
+            .as,
+            .applied_tag,
+            .nominal,
+            .nominal_external,
+            .record_destructure,
+            .tuple,
+            .num_literal,
+            .small_dec_literal,
+            .dec_literal,
+            .frac_f32_literal,
+            .frac_f64_literal,
+            .str_literal,
+            .str_interpolation,
+            .underscore,
+            .runtime_error,
+            => unreachable,
+        };
+    }
+
+    pub fn listRestPattern(self: @This(), pattern_idx: PatternId) ?PatternId {
+        const pattern = self.checker.cir.store.getPattern(pattern_idx);
+        return switch (pattern) {
+            .list => |list| list.rest_info.?.pattern,
+            .assign,
+            .as,
+            .applied_tag,
+            .nominal,
+            .nominal_external,
+            .record_destructure,
+            .tuple,
+            .num_literal,
+            .small_dec_literal,
+            .dec_literal,
+            .frac_f32_literal,
+            .frac_f64_literal,
+            .str_literal,
+            .str_interpolation,
+            .underscore,
+            .runtime_error,
+            => unreachable,
+        };
+    }
+};
+
 fn patternNeedsExhaustiveness(self: *const Self, pattern_idx: CIR.Pattern.Idx) bool {
-    const pattern = self.cir.store.getPattern(pattern_idx);
-    return switch (pattern) {
-        .assign, .underscore, .runtime_error => false,
-        .as => |as_pattern| self.patternNeedsExhaustiveness(as_pattern.pattern),
-        .applied_tag,
-        .list,
-        .num_literal,
-        .small_dec_literal,
-        .dec_literal,
-        .frac_f32_literal,
-        .frac_f64_literal,
-        .str_literal,
-        .str_interpolation,
-        => true,
-        .tuple => |tuple| {
-            for (self.cir.store.slicePatterns(tuple.patterns)) |elem_pattern_idx| {
-                if (self.patternNeedsExhaustiveness(elem_pattern_idx)) return true;
-            }
-            return false;
-        },
-        .record_destructure => |destructure| {
-            for (self.cir.store.sliceRecordDestructs(destructure.destructs)) |destruct_idx| {
-                const destruct = self.cir.store.getRecordDestruct(destruct_idx);
-                const sub_pattern_idx = switch (destruct.kind) {
-                    .Required => |sub_pattern| sub_pattern,
-                    .SubPattern => |sub_pattern| sub_pattern,
-                    .Rest => |sub_pattern| sub_pattern,
-                };
-                if (self.patternNeedsExhaustiveness(sub_pattern_idx)) return true;
-            }
-            return false;
-        },
-        .nominal => |nominal| self.patternNeedsExhaustiveness(nominal.backing_pattern),
-        .nominal_external => |nominal| self.patternNeedsExhaustiveness(nominal.backing_pattern),
-    };
+    return PatternRefutability.canMiss(CirPatternRefutabilityAdapter, .{ .checker = self }, pattern_idx);
 }
 
 const PatternBinding = struct {
@@ -11374,9 +11567,8 @@ fn checkExpr(self: *Self, expr_idx: CIR.Expr.Idx, env: *Env, expected: Expected)
 
             // Check the the body of the expr
             // If we have an expected function, use that as the expr's expected type
-            const saved_empirical_exhaustiveness_depth = self.empirical_exhaustiveness_depth;
-            self.empirical_exhaustiveness_depth = 0;
-            defer self.empirical_exhaustiveness_depth = saved_empirical_exhaustiveness_depth;
+            const exhaustiveness_scope = self.exhaustiveness_context.resetForRuntimeFunction();
+            defer exhaustiveness_scope.leave();
 
             const body_is_delayed_dependency = !is_immediate_callee;
             if (body_is_delayed_dependency) self.delayed_dependency_depth += 1;
@@ -12450,6 +12642,61 @@ const OwnerEnvCandidate = struct {
     is_this_module: bool,
 };
 
+const StaticDispatchMethodBinding = struct {
+    env: *const ModuleEnv,
+    is_this_module: bool,
+    binding: ModuleEnv.MethodBinding,
+};
+
+fn lookupStaticDispatchMethodBinding(
+    self: *const Self,
+    owner_env: *const ModuleEnv,
+    owner_source_decl: ?u32,
+    method_source_env: *const ModuleEnv,
+    method_ident: Ident.Idx,
+) ?StaticDispatchMethodBinding {
+    if (self.lookupStaticDispatchMethodBindingInEnv(owner_env, owner_env, owner_source_decl, method_source_env, method_ident)) |found| {
+        return found;
+    }
+
+    if (owner_env != self.cir) {
+        if (self.lookupStaticDispatchMethodBindingInEnv(self.cir, owner_env, owner_source_decl, method_source_env, method_ident)) |found| {
+            return found;
+        }
+    }
+
+    for (self.imported_modules) |candidate_env| {
+        if (candidate_env == owner_env or candidate_env == self.cir) continue;
+        if (self.lookupStaticDispatchMethodBindingInEnv(candidate_env, owner_env, owner_source_decl, method_source_env, method_ident)) |found| {
+            return found;
+        }
+    }
+
+    return null;
+}
+
+fn lookupStaticDispatchMethodBindingInEnv(
+    self: *const Self,
+    candidate_env: *const ModuleEnv,
+    owner_env: *const ModuleEnv,
+    owner_source_decl: ?u32,
+    method_source_env: *const ModuleEnv,
+    method_ident: Ident.Idx,
+) ?StaticDispatchMethodBinding {
+    const binding = candidate_env.lookupMethodBindingFromOwnerAndMethodEnvsConst(
+        owner_env,
+        owner_source_decl,
+        method_source_env,
+        method_ident,
+    ) orelse return null;
+
+    return .{
+        .env = candidate_env,
+        .is_this_module = candidate_env == self.cir,
+        .binding = binding,
+    };
+}
+
 /// Resolve the module env that declares a type from the type's content-based
 /// origin identity: an exact 32-byte hash comparison against each candidate
 /// env's own content identity. No name matching — two envs match the same
@@ -12897,7 +13144,7 @@ fn closeAbsentConstructedPayloadVars(
 }
 
 fn pendingExhaustivenessMode(self: *const Self) ProblemStore.PendingStaticExhaustivenessMode {
-    return if (self.empirical_exhaustiveness_depth == 0) .static else .empirical;
+    return self.exhaustiveness_context.pendingStaticMode();
 }
 
 fn checkDestructureExhaustiveness(
@@ -14369,7 +14616,7 @@ fn reportMissingNominalMethodForBinop(
         return false;
     }
     const original_env = self.getNominalOriginEnv(nominal_type);
-    if (original_env.lookupMethodBindingFromEnvAndDeclConst(self.cir, nominal_type.sourceDeclOptional(), method_name) == null) {
+    if (self.lookupStaticDispatchMethodBinding(original_env, nominal_type.sourceDeclOptional(), self.cir, method_name) == null) {
         try self.reportMissingNominalMethodForBinopConstraint(lhs_var, rhs_var, expr_var, method_name, env, region);
         return true;
     }
@@ -16497,13 +16744,12 @@ fn numeralCandidateStructurallyRefuted(
     // would mint.
     const candidate_source_decl = self.sourceDeclForBuiltinNominal(.{ .num = candidate_kind });
     const candidate_origin_module = self.builtinOriginModule();
-    const original_env, const is_this_module = self.ownerEnvForOriginModule(
+    const owner_env, _ = self.ownerEnvForOriginModule(
         candidate_origin_module,
         candidate_source_decl,
         true,
         "static dispatch candidate",
     );
-    const method_types: *const types_mod.Store = if (is_this_module) self.types else &original_env.types;
 
     var found_refuting_pair = false;
     for (self.types.sliceStaticDispatchConstraints(constraint_range)) |constraint| {
@@ -16511,12 +16757,14 @@ fn numeralCandidateStructurallyRefuted(
 
         // Method lookup short of instantiation — same env, owner decl, and method
         // ident the probe's lookup uses, via the same const lookup.
-        const method_binding = original_env.lookupMethodBindingFromEnvAndDeclConst(
-            self.cir,
+        const method_lookup = self.lookupStaticDispatchMethodBinding(
+            owner_env,
             candidate_source_decl,
+            self.cir,
             constraint.fn_name,
         ) orelse return true;
-        const def_var: Var = ModuleEnv.varFrom(method_binding.type_node_idx);
+        const method_types: *const types_mod.Store = if (method_lookup.is_this_module) self.types else &method_lookup.env.types;
+        const def_var: Var = ModuleEnv.varFrom(method_lookup.binding.type_node_idx);
 
         // From here on, refutation needs the closed-world structural walk;
         // any uncertainty falls through to the probe (return false).
@@ -16620,27 +16868,29 @@ fn staticDispatchConstraintAcceptsCandidate(
     // Scope-proof token only; not otherwise consulted.
     const candidate_resolved = self.types.resolveVar(candidate_var);
     const nominal_type = candidate_resolved.desc.content.unwrapNominalType() orelse return false;
-    const original_env, const is_this_module = self.ownerEnvForOriginModule(
+    const owner_env, _ = self.ownerEnvForOriginModule(
         nominal_type.origin_module,
         nominal_type.sourceDeclOptional(),
         nominal_type.originIsBuiltin(),
         "static dispatch candidate",
     );
 
-    const method_binding = original_env.lookupMethodBindingFromEnvAndDeclConst(
-        self.cir,
+    const method_lookup = self.lookupStaticDispatchMethodBinding(
+        owner_env,
         nominal_type.sourceDeclOptional(),
+        self.cir,
         constraint.fn_name,
     ) orelse return false;
-    const def_var: Var = ModuleEnv.varFrom(method_binding.type_node_idx);
+    const method_env = method_lookup.env;
+    const def_var: Var = ModuleEnv.varFrom(method_lookup.binding.type_node_idx);
 
-    const method_var = if (is_this_module) blk: {
+    const method_var = if (method_lookup.is_this_module) blk: {
         if (self.types.resolveVar(def_var).desc.rank == .generalized) {
             break :blk try self.instantiateVar(def_var, env, .use_last_var);
         }
         break :blk def_var;
     } else blk: {
-        const copied_var = try self.copyVar(def_var, original_env, self.getRegionAt(candidate_var));
+        const copied_var = try self.copyVar(def_var, method_env, self.getRegionAt(candidate_var));
         break :blk try self.instantiateVar(copied_var, env, .{ .explicit = self.getRegionAt(candidate_var) });
     };
 
@@ -16985,7 +17235,7 @@ fn checkStaticDispatchConstraints(self: *Self, env: *Env, is_numeric_default_pas
                 const original_module_ident = nominal_type.origin_module;
 
                 // Check if the nominal type in question is defined in this module
-                const original_env, const is_this_module = self.ownerEnvForOriginModule(
+                const original_env, _ = self.ownerEnvForOriginModule(
                     original_module_ident,
                     nominal_type.sourceDeclOptional(),
                     nominal_type.originIsBuiltin(),
@@ -17144,15 +17394,16 @@ fn checkStaticDispatchConstraints(self: *Self, env: *Env, is_numeric_default_pas
                             .unsupported => {},
                         }
                     }
-                    const method_binding = if (constraint.fn_name.eql(self.cir.idents.is_eq) and
+                    const method_lookup = if (constraint.fn_name.eql(self.cir.idents.is_eq) and
                         try self.nominalSupportsStructuralDerive(nominal_type))
                     blk: {
-                        const exact_method_binding = original_env.lookupMethodBindingFromEnvAndDeclConst(
-                            self.cir,
+                        const exact_method_lookup = self.lookupStaticDispatchMethodBinding(
+                            original_env,
                             nominal_type.sourceDeclOptional(),
+                            self.cir,
                             constraint.fn_name,
                         );
-                        if (exact_method_binding == null and try self.nominalSupportsStructuralDerive(nominal_type)) {
+                        if (exact_method_lookup == null and try self.nominalSupportsStructuralDerive(nominal_type)) {
                             try self.satisfyDerivedIsEqConstraint(
                                 deferred_constraint.var_,
                                 constraint,
@@ -17162,7 +17413,7 @@ fn checkStaticDispatchConstraints(self: *Self, env: *Env, is_numeric_default_pas
                             );
                             continue;
                         }
-                        break :blk exact_method_binding orelse {
+                        break :blk exact_method_lookup orelse {
                             try self.reportConstraintError(
                                 deferred_constraint.var_,
                                 constraint,
@@ -17175,12 +17426,13 @@ fn checkStaticDispatchConstraints(self: *Self, env: *Env, is_numeric_default_pas
                     } else if (constraint.fn_name.eql(self.cir.idents.to_hash) and
                         try self.nominalSupportsStructuralDerive(nominal_type))
                     blk: {
-                        const exact_method_binding = original_env.lookupMethodBindingFromEnvAndDeclConst(
-                            self.cir,
+                        const exact_method_lookup = self.lookupStaticDispatchMethodBinding(
+                            original_env,
                             nominal_type.sourceDeclOptional(),
+                            self.cir,
                             constraint.fn_name,
                         );
-                        if (exact_method_binding == null) {
+                        if (exact_method_lookup == null) {
                             try self.satisfyDerivedToHashConstraint(
                                 deferred_constraint.var_,
                                 constraint,
@@ -17190,8 +17442,8 @@ fn checkStaticDispatchConstraints(self: *Self, env: *Env, is_numeric_default_pas
                             );
                             continue;
                         }
-                        break :blk exact_method_binding.?;
-                    } else original_env.lookupMethodBindingFromEnvAndDeclConst(self.cir, nominal_type.sourceDeclOptional(), constraint.fn_name) orelse {
+                        break :blk exact_method_lookup.?;
+                    } else self.lookupStaticDispatchMethodBinding(original_env, nominal_type.sourceDeclOptional(), self.cir, constraint.fn_name) orelse {
                         // Method name doesn't exist in target module
                         try self.reportConstraintError(
                             deferred_constraint.var_,
@@ -17206,13 +17458,16 @@ fn checkStaticDispatchConstraints(self: *Self, env: *Env, is_numeric_default_pas
                         self.rewriteEqBinopAsMethodEq(constraint);
                     }
 
+                    const method_env = method_lookup.env;
+                    const method_is_this_module = method_lookup.is_this_module;
+                    const method_binding = method_lookup.binding;
                     const def_idx = method_binding.def_idx;
                     const method_type_var: Var = ModuleEnv.varFrom(method_binding.type_node_idx);
-                    const def = original_env.store.getDef(def_idx);
+                    const def = method_env.store.getDef(def_idx);
                     // Track whether we just processed or referenced a cycle participant.
                     var cycle_method_expr_var: ?Var = null;
 
-                    if (is_this_module) {
+                    if (method_is_this_module) {
                         // Check if we've processed this def already.
                         const mb_processing_def = self.top_level_ptrns.get(def.pattern);
                         if (mb_processing_def) |processing_def| {
@@ -17296,14 +17551,14 @@ fn checkStaticDispatchConstraints(self: *Self, env: *Env, is_numeric_default_pas
                         // Cycle participant or recursive self-dispatch: use the
                         // fresh flex var instead of def_var to avoid rank lowering.
                         break :blk expr_var_for_method;
-                    } else if (is_this_module) blk: {
+                    } else if (method_is_this_module) blk: {
                         if (self.types.resolveVar(method_type_var).desc.rank == .generalized) {
                             break :blk try self.instantiateVar(method_type_var, env, .use_last_var);
                         }
                         break :blk method_type_var;
                     } else blk: {
                         // Copy the method from the other module's type store
-                        const copied_var = try self.copyVar(method_type_var, original_env, region);
+                        const copied_var = try self.copyVar(method_type_var, method_env, region);
                         break :blk try self.instantiateVar(copied_var, env, .{ .explicit = region });
                     };
                     self.evidence_target_site = null;
@@ -17359,7 +17614,7 @@ fn checkStaticDispatchConstraints(self: *Self, env: *Env, is_numeric_default_pas
 
                 // Get the module ident that this alias type was defined in
                 const original_module_ident = alias.origin_module;
-                const original_env, const is_this_module = self.ownerEnvForOriginModule(
+                const original_env, _ = self.ownerEnvForOriginModule(
                     original_module_ident,
                     alias.source_decl.toOptional(),
                     alias.source_decl.originIsBuiltin(),
@@ -17389,12 +17644,13 @@ fn checkStaticDispatchConstraints(self: *Self, env: *Env, is_numeric_default_pas
                         try self.ensureCustomInterpolationPartsChecked(constraint, env);
                     }
                     if (constraint.fn_name.eql(self.cir.idents.is_eq)) {
-                        const method_binding = original_env.lookupMethodBindingFromTwoEnvsAndDeclConst(
+                        const method_lookup = self.lookupStaticDispatchMethodBinding(
+                            original_env,
                             alias.source_decl.toOptional(),
                             self.cir,
                             constraint.fn_name,
                         );
-                        if (method_binding == null) {
+                        if (method_lookup == null) {
                             const backing_var = self.types.getAliasBackingVar(alias);
                             if (try self.varSupportsIsEq(backing_var)) {
                                 try self.satisfyDerivedIsEqConstraint(
@@ -17415,12 +17671,13 @@ fn checkStaticDispatchConstraints(self: *Self, env: *Env, is_numeric_default_pas
                         }
                     }
                     if (constraint.fn_name.eql(self.cir.idents.to_hash)) {
-                        const method_binding = original_env.lookupMethodBindingFromTwoEnvsAndDeclConst(
+                        const method_lookup = self.lookupStaticDispatchMethodBinding(
+                            original_env,
                             alias.source_decl.toOptional(),
                             self.cir,
                             constraint.fn_name,
                         );
-                        if (method_binding == null) {
+                        if (method_lookup == null) {
                             const backing_var = self.types.getAliasBackingVar(alias);
                             if (try self.varSupportsToHash(backing_var)) {
                                 try self.satisfyDerivedToHashConstraint(
@@ -17486,7 +17743,8 @@ fn checkStaticDispatchConstraints(self: *Self, env: *Env, is_numeric_default_pas
                         }
                     }
 
-                    const method_binding = original_env.lookupMethodBindingFromTwoEnvsAndDeclConst(
+                    const method_lookup = self.lookupStaticDispatchMethodBinding(
+                        original_env,
                         alias.source_decl.toOptional(),
                         self.cir,
                         constraint.fn_name,
@@ -17500,15 +17758,18 @@ fn checkStaticDispatchConstraints(self: *Self, env: *Env, is_numeric_default_pas
                         );
                         continue;
                     };
+                    const method_env = method_lookup.env;
+                    const method_is_this_module = method_lookup.is_this_module;
+                    const method_binding = method_lookup.binding;
                     const def_idx = method_binding.def_idx;
                     if (constraint.fn_name.eql(self.cir.idents.is_eq)) {
                         self.rewriteEqBinopAsMethodEq(constraint);
                     }
 
                     const method_type_var: Var = ModuleEnv.varFrom(method_binding.type_node_idx);
-                    const def = original_env.store.getDef(def_idx);
+                    const def = method_env.store.getDef(def_idx);
                     var cycle_method_expr_var: ?Var = null;
-                    if (is_this_module) {
+                    if (method_is_this_module) {
                         const mb_processing_def = self.top_level_ptrns.get(def.pattern);
                         if (mb_processing_def) |processing_def| {
                             std.debug.assert(processing_def.def_idx == def_idx);
@@ -17576,13 +17837,13 @@ fn checkStaticDispatchConstraints(self: *Self, env: *Env, is_numeric_default_pas
                     };
                     const method_var = if (cycle_method_expr_var) |expr_var_for_method| blk: {
                         break :blk expr_var_for_method;
-                    } else if (is_this_module) blk: {
+                    } else if (method_is_this_module) blk: {
                         if (self.types.resolveVar(method_type_var).desc.rank == .generalized) {
                             break :blk try self.instantiateVar(method_type_var, env, .use_last_var);
                         }
                         break :blk method_type_var;
                     } else blk: {
-                        const copied_var = try self.copyVar(method_type_var, original_env, region);
+                        const copied_var = try self.copyVar(method_type_var, method_env, region);
                         break :blk try self.instantiateVar(copied_var, env, .{ .explicit = region });
                     };
                     self.evidence_target_site = null;
@@ -19790,22 +20051,23 @@ fn parseFormatMethodVarForEncoding(
     return switch (resolved.desc.content) {
         .structure => |structure| switch (structure) {
             .nominal_type => |nominal| blk: {
-                const original_env, const is_this_module = self.ownerEnvForOriginModule(
+                const original_env, _ = self.ownerEnvForOriginModule(
                     nominal.origin_module,
                     nominal.sourceDeclOptional(),
                     nominal.originIsBuiltin(),
                     "parser format method",
                 );
-                const binding = original_env.lookupMethodBindingFromEnvAndDeclConst(
-                    self.cir,
+                const method_lookup = self.lookupStaticDispatchMethodBinding(
+                    original_env,
                     nominal.sourceDeclOptional(),
+                    self.cir,
                     method_name,
                 ) orelse break :blk null;
                 break :blk .{
                     .var_ = (try self.methodVarFromOriginalEnv(
-                        original_env,
-                        is_this_module,
-                        binding.type_node_idx,
+                        method_lookup.env,
+                        method_lookup.is_this_module,
+                        method_lookup.binding.type_node_idx,
                         nominal.ident.ident_idx,
                         env,
                         region,
@@ -19816,22 +20078,23 @@ fn parseFormatMethodVarForEncoding(
             else => null,
         },
         .alias => |alias| blk: {
-            const original_env, const is_this_module = self.ownerEnvForOriginModule(
+            const original_env, _ = self.ownerEnvForOriginModule(
                 alias.origin_module,
                 alias.source_decl.toOptional(),
                 alias.source_decl.originIsBuiltin(),
                 "parser format method",
             );
-            const binding = original_env.lookupMethodBindingFromTwoEnvsAndDeclConst(
+            const method_lookup = self.lookupStaticDispatchMethodBinding(
+                original_env,
                 alias.source_decl.toOptional(),
                 self.cir,
                 method_name,
             ) orelse break :blk null;
             break :blk .{
                 .var_ = (try self.methodVarFromOriginalEnv(
-                    original_env,
-                    is_this_module,
-                    binding.type_node_idx,
+                    method_lookup.env,
+                    method_lookup.is_this_module,
+                    method_lookup.binding.type_node_idx,
                     alias.ident.ident_idx,
                     env,
                     region,
@@ -20475,28 +20738,29 @@ fn validateDerivedParseNominal(
         return try self.validateDerivedParseVar(try_info.ok_var, encoding_var, state_var, err_var, constraint, env, region, visited, .shape);
     }
 
-    const original_env, const is_this_module = self.ownerEnvForOriginModule(
+    const original_env, _ = self.ownerEnvForOriginModule(
         nominal.origin_module,
         nominal.sourceDeclOptional(),
         nominal.originIsBuiltin(),
         "parser nominal field",
     );
-    const method_binding = original_env.lookupMethodBindingFromEnvAndDeclConst(
-        self.cir,
+    const method_lookup = self.lookupStaticDispatchMethodBinding(
+        original_env,
         nominal.sourceDeclOptional(),
+        self.cir,
         self.cir.idents.parser_for,
     ) orelse {
         return try self.reportDerivedParseMissingMethod(nominal_var, self.cir.idents.parser_for, constraint, env);
     };
 
-    const method_type_var: Var = ModuleEnv.varFrom(method_binding.type_node_idx);
-    const method_var = if (is_this_module) blk: {
+    const method_type_var: Var = ModuleEnv.varFrom(method_lookup.binding.type_node_idx);
+    const method_var = if (method_lookup.is_this_module) blk: {
         if (self.types.resolveVar(method_type_var).desc.rank == .generalized) {
             break :blk try self.instantiateVar(method_type_var, env, .use_last_var);
         }
         break :blk method_type_var;
     } else blk: {
-        const copied_var = try self.copyVar(method_type_var, original_env, region);
+        const copied_var = try self.copyVar(method_type_var, method_lookup.env, region);
         break :blk try self.instantiateVar(copied_var, env, .{ .explicit = region });
     };
 
@@ -20901,28 +21165,29 @@ fn validateDerivedEncodeNominal(
         return try self.validateDerivedEncodeVar(info.ok_var, encoding_var, state_var, err_var, constraint, env, region, visited);
     }
 
-    const original_env, const is_this_module = self.ownerEnvForOriginModule(
+    const original_env, _ = self.ownerEnvForOriginModule(
         nominal.origin_module,
         nominal.sourceDeclOptional(),
         nominal.originIsBuiltin(),
         "encoder_for nominal field",
     );
-    const method_binding = original_env.lookupMethodBindingFromEnvAndDeclConst(
-        self.cir,
+    const method_lookup = self.lookupStaticDispatchMethodBinding(
+        original_env,
         nominal.sourceDeclOptional(),
+        self.cir,
         self.cir.idents.encoder_for,
     ) orelse {
         return try self.reportDerivedParseMissingMethod(nominal_var, self.cir.idents.encoder_for, constraint, env);
     };
 
-    const method_type_var: Var = ModuleEnv.varFrom(method_binding.type_node_idx);
-    const method_var = if (is_this_module) blk: {
+    const method_type_var: Var = ModuleEnv.varFrom(method_lookup.binding.type_node_idx);
+    const method_var = if (method_lookup.is_this_module) blk: {
         if (self.types.resolveVar(method_type_var).desc.rank == .generalized) {
             break :blk try self.instantiateVar(method_type_var, env, .use_last_var);
         }
         break :blk method_type_var;
     } else blk: {
-        const copied_var = try self.copyVar(method_type_var, original_env, region);
+        const copied_var = try self.copyVar(method_type_var, method_lookup.env, region);
         break :blk try self.instantiateVar(copied_var, env, .{ .explicit = region });
     };
 
