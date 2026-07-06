@@ -955,7 +955,7 @@ pub fn Compiler(comptime Ctx: type) type {
         /// joinJump(JoinPointId) CFStmtId
         /// addExitJoin(id, body, remainder) CFStmtId      // empty params
         /// failTerminal() CFStmtId                        // per checker verdict
-        /// lirTempForType(ty) LirLocal
+        /// lirLocalForOcc(step: Step, ty, parent: ?LirLocal) LirLocal
         /// lirLocalU16/lirLocalU64() LirLocal
         /// isZstLirLocal(LirLocal) bool
         /// readDiscriminant(target, source, next) CFStmtId
@@ -1209,7 +1209,11 @@ pub fn Compiler(comptime Ctx: type) type {
                     // string arm, which registers them before entering the
                     // subtree; reaching here for one is a compiler bug.
                     std.debug.assert(entry.step != .str_capture);
-                    gop.value_ptr.value = try self.ctx.lirTempForType(entry.ty);
+                    // Parents materialize before children (interning order),
+                    // so the parent's value local is already available for
+                    // layout-derived allocations (callable payloads).
+                    const parent = if (occ == .root) null else env.locals.get(entry.parent).?.value;
+                    gop.value_ptr.value = try self.ctx.lirLocalForOcc(entry.step, entry.ty, parent);
                     try extractions.append(self.arena, .{ .occ = occ, .what = .value });
                 }
                 if (use.disc and gop.value_ptr.disc == null) {

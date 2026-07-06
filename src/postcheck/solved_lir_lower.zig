@@ -4615,7 +4615,9 @@ const Lowerer = struct {
             return try self.l.result.store.addCFStmt(.{ .runtime_error = {} });
         }
 
-        pub fn lirTempForType(self: MatchTreeCtx, ty: Type.TypeId) Common.LowerError!LIR.LocalId {
+        pub fn lirLocalForOcc(self: MatchTreeCtx, step: match_tree.Step, ty: Type.TypeId, parent: ?LIR.LocalId) Common.LowerError!LIR.LocalId {
+            _ = step;
+            _ = parent;
             return try self.l.addTemp(ty);
         }
 
