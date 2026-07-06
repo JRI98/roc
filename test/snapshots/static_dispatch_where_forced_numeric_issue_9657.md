@@ -80,11 +80,11 @@ EndOfFile,
 					(ty (name "I64"))
 					(ty (name "I64"))))
 			(where
-				(method (module-of "a") (name "decode")
+				(method (module-of "a") (name "decode") (effectful false)
 					(args
 						(ty (name "I64")))
 					(ty-var (raw "a")))
-				(method (module-of "b") (name "encode")
+				(method (module-of "b") (name "encode") (effectful false)
 					(args
 						(ty-var (raw "b")))
 					(ty (name "I64")))))
@@ -218,11 +218,11 @@ use_it = {
 						(ty-lookup (name "I64") (builtin))
 						(ty-lookup (name "I64") (builtin)))))
 			(where
-				(method (ty-rigid-var-lookup (ty-rigid-var (name "a"))) (name "decode")
+				(method (ty-rigid-var-lookup (ty-rigid-var (name "a"))) (name "decode") (effectful false)
 					(args
 						(ty-lookup (name "I64") (builtin)))
 					(ty-rigid-var-lookup (ty-rigid-var (name "a"))))
-				(method (ty-rigid-var-lookup (ty-rigid-var (name "b"))) (name "encode")
+				(method (ty-rigid-var-lookup (ty-rigid-var (name "b"))) (name "encode") (effectful false)
 					(args
 						(ty-rigid-var-lookup (ty-rigid-var (name "b"))))
 					(ty-lookup (name "I64") (builtin))))))

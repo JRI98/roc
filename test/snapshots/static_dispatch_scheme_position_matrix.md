@@ -126,7 +126,7 @@ EndOfFile,
 				(ty-var (raw "a"))
 				(ty (name "I128")))
 			(where
-				(method (module-of "a") (name "to_i128")
+				(method (module-of "a") (name "to_i128") (effectful false)
 					(args
 						(ty-var (raw "a")))
 					(ty (name "I128")))))
@@ -151,7 +151,7 @@ EndOfFile,
 					(ty-var (raw "a")))
 				(ty (name "I128")))
 			(where
-				(method (module-of "a") (name "to_i128")
+				(method (module-of "a") (name "to_i128") (effectful false)
 					(args
 						(ty-var (raw "a")))
 					(ty (name "I128")))))
@@ -187,7 +187,7 @@ EndOfFile,
 				(ty-record)
 				(ty-var (raw "a")))
 			(where
-				(method (module-of "a") (name "gen")
+				(method (module-of "a") (name "gen") (effectful false)
 					(args
 						(ty-record))
 					(ty-var (raw "a")))))
@@ -215,11 +215,11 @@ EndOfFile,
 				(ty (name "Str"))
 				(ty (name "Str")))
 			(where
-				(method (module-of "a") (name "parse")
+				(method (module-of "a") (name "parse") (effectful false)
 					(args
 						(ty (name "Str")))
 					(ty-var (raw "a")))
-				(method (module-of "a") (name "show")
+				(method (module-of "a") (name "show") (effectful false)
 					(args
 						(ty-var (raw "a")))
 					(ty (name "Str")))))
@@ -305,7 +305,7 @@ roundtrip = parse_show("hi")
 				(ty-rigid-var (name "a"))
 				(ty-lookup (name "I128") (builtin)))
 			(where
-				(method (ty-rigid-var-lookup (ty-rigid-var (name "a"))) (name "to_i128")
+				(method (ty-rigid-var-lookup (ty-rigid-var (name "a"))) (name "to_i128") (effectful false)
 					(args
 						(ty-rigid-var-lookup (ty-rigid-var (name "a"))))
 					(ty-lookup (name "I128") (builtin))))))
@@ -353,7 +353,7 @@ roundtrip = parse_show("hi")
 					(ty-rigid-var (name "a")))
 				(ty-lookup (name "I128") (builtin)))
 			(where
-				(method (ty-rigid-var-lookup (ty-rigid-var (name "a"))) (name "to_i128")
+				(method (ty-rigid-var-lookup (ty-rigid-var (name "a"))) (name "to_i128") (effectful false)
 					(args
 						(ty-rigid-var-lookup (ty-rigid-var (name "a"))))
 					(ty-lookup (name "I128") (builtin))))))
@@ -379,7 +379,7 @@ roundtrip = parse_show("hi")
 				(ty-record)
 				(ty-rigid-var (name "a")))
 			(where
-				(method (ty-rigid-var-lookup (ty-rigid-var (name "a"))) (name "gen")
+				(method (ty-rigid-var-lookup (ty-rigid-var (name "a"))) (name "gen") (effectful false)
 					(args
 						(ty-record))
 					(ty-rigid-var-lookup (ty-rigid-var (name "a")))))))
@@ -400,11 +400,11 @@ roundtrip = parse_show("hi")
 				(ty-lookup (name "Str") (builtin))
 				(ty-lookup (name "Str") (builtin)))
 			(where
-				(method (ty-rigid-var (name "a")) (name "parse")
+				(method (ty-rigid-var (name "a")) (name "parse") (effectful false)
 					(args
 						(ty-lookup (name "Str") (builtin)))
 					(ty-rigid-var-lookup (ty-rigid-var (name "a"))))
-				(method (ty-rigid-var-lookup (ty-rigid-var (name "a"))) (name "show")
+				(method (ty-rigid-var-lookup (ty-rigid-var (name "a"))) (name "show") (effectful false)
 					(args
 						(ty-rigid-var-lookup (ty-rigid-var (name "a"))))
 					(ty-lookup (name "Str") (builtin))))))
