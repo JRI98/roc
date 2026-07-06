@@ -680,8 +680,8 @@ alias roots union-find representatives for concrete structures.
 
 The checked module cache is the only checked cache boundary in this design.
 Checked module cache entries are trusted compiler-produced cache entries, not
-adversarial inputs. Cache reads validate only the cache header, format version,
-payload hash, key, serialized layout, and ordinary binary decoding. They must
+adversarial inputs. Cache reads validate only the cache header,
+entry-version hash, key, serialized layout, and ordinary binary decoding. They must
 not rerun checked validation, reselect hoisted roots, reconstruct checked data,
 or walk checked expressions to prove that cached checked data is still complete.
 Correctness belongs to the producer path that writes the cache entry, and
@@ -691,8 +691,8 @@ versions.
 `ModuleEnv` contains `CommonEnv.strings`, a `base.StringLiteral.Store`. That
 store is part of the checked module cache data. A cache hit materializes it as a
 view of its byte buffer and stops. Cache reads must not scan the string entries,
-rebuild a string interning table, check every string length header, check every
-static refcount word, or check every entry alignment. This design adds no
+rebuild a string interning table, check every string length header, or check
+every entry boundary. This design adds no
 store-specific release-build validation; cache reads perform only the existing
 cache-entry admission and decode checks before trusting the blob. Once those
 pass, the internal string buffer structure is a producer invariant. Debug builds
@@ -700,8 +700,14 @@ may assert this invariant while constructing fresh stores and in focused store
 tests; optimized cache reads consume the store directly.
 
 String literal deduplication is a build-time concern. The durable
-`StringLiteral.Store` owns only the static-refcounted byte buffer plus `get` and
-iteration by `StringLiteral.Idx`. It has no insert API and no dedup index.
+`StringLiteral.Store` owns only portable checked string bytes plus `get` and
+iteration by `StringLiteral.Idx`. Each entry is encoded as:
+
+```text
+len: u32 little-endian | bytes
+```
+
+It has no insert API and no dedup index.
 Fresh construction uses `StringLiteral.Builder` state paired with a `Store`.
 That state may live in a wrapper or in the build owner that owns the store, but
 it is always transient. The builder index is never serialized, never stored in
@@ -713,18 +719,18 @@ normal cache path.
 The byte interning algorithm has one owner shared by identifier names, checked
 name stores, and string-literal builders. Storage policies own only id encoding,
 text lookup, and append layout. For string literals, appending a new entry writes
-exactly the current static-data layout:
-
-```text
-len: u32 | padding to isize | static refcount: isize(0) | bytes
-```
-
-and returns the content byte offset as `StringLiteral.Idx`. Duplicate input
+the portable checked entry layout above and returns the content byte offset as
+`StringLiteral.Idx`. Duplicate input
 bytes must return the existing content offset. The hash table is an accelerator
 only: hash matches must still compare exact byte length and contents before an
 existing id is reused. The shared interning algorithm is comptime-policy
 specialized, so string literals, identifier names, and checked name stores do
 not pay a runtime storage-kind branch.
+
+Runtime static string layout is generated later by the target-specific static
+data emitter. The checked cache must not store native pointer-width padding,
+static refcount words, allocation headers, or any other runtime `RocStr` layout
+bytes.
 
 The string-literal builder must reject impossible `u32` length or content-offset
 overflow as a compiler invariant: debug builds assert or panic with the
