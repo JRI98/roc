@@ -11,12 +11,14 @@
 const std = @import("std");
 const check = @import("check");
 const base = @import("base");
+const collections = @import("collections");
 
 const Common = @import("../common.zig");
 const Ast = @import("ast.zig");
 const Type = @import("type.zig");
 
 const Allocator = std.mem.Allocator;
+const GuardedList = collections.GuardedList;
 const checked = check.CheckedModule;
 const names = check.CheckedNames;
 const static_dispatch = check.StaticDispatchRegistry;
@@ -1174,7 +1176,8 @@ pub const InstGraph = struct {
                 // so it imports as an unresolved node rather than a closed row.
                 if (span.len == 0) break :blk .{ .unresolved = InstVariable.row(.empty_tag_union) };
                 const inst_tags = try self.arena().alloc(InstTag, span.len);
-                for (span, 0..) |tag, index| {
+                for (0..span.len) |index| {
+                    const tag = GuardedList.at(span, index);
                     inst_tags[index] = .{
                         .name = tag.name,
                         .checked_name = tag.checked_name,
@@ -1195,7 +1198,8 @@ pub const InstGraph = struct {
                 const span = types.fieldSpan(fields);
                 if (span.len == 0) break :blk .empty_record;
                 const inst_fields = try self.arena().alloc(InstField, span.len);
-                for (span, 0..) |field, index| {
+                for (0..span.len) |index| {
+                    const field = GuardedList.at(span, index);
                     inst_fields[index] = .{
                         .name = field.name,
                         .ty = try self.importMono(field.ty),
@@ -1225,9 +1229,10 @@ pub const InstGraph = struct {
         return node;
     }
 
-    fn importMonoSlice(self: *InstGraph, tys: []const Type.TypeId) Allocator.Error![]NodeId {
+    fn importMonoSlice(self: *InstGraph, tys: anytype) Allocator.Error![]NodeId {
         const out = try self.arena().alloc(NodeId, tys.len);
-        for (tys, 0..) |ty, index| {
+        for (0..tys.len) |index| {
+            const ty = GuardedList.at(tys, index);
             out[index] = try self.importMono(ty);
         }
         return out;
@@ -1237,7 +1242,8 @@ pub const InstGraph = struct {
         const fields = self.types.declaredFieldSpan(span);
         if (fields.len == 0) return &.{};
         const out = try self.arena().alloc(InstDeclaredField, fields.len);
-        for (fields, 0..) |field, index| {
+        for (0..fields.len) |index| {
+            const field = GuardedList.at(fields, index);
             out[index] = switch (field) {
                 .named => |name| .{ .named = name },
                 .padding => |ty| .{ .padding = try self.importMono(ty) },
@@ -1342,13 +1348,17 @@ pub const InstGraph = struct {
                 break :blk try self.typeContainsGraphView(func.ret, seen);
             },
             .record => |fields| blk: {
-                for (self.types.fieldSpan(fields)) |field| {
+                const field_span = self.types.fieldSpan(fields);
+                for (0..field_span.len) |index| {
+                    const field = GuardedList.at(field_span, index);
                     if (try self.typeContainsGraphView(field.ty, seen)) break :blk true;
                 }
                 break :blk false;
             },
             .tag_union => |tags| blk: {
-                for (self.types.tagSpan(tags)) |tag| {
+                const tag_span = self.types.tagSpan(tags);
+                for (0..tag_span.len) |index| {
+                    const tag = GuardedList.at(tag_span, index);
                     if (try self.typeSpanContainsGraphView(tag.payloads, seen)) break :blk true;
                 }
                 break :blk false;
@@ -1358,7 +1368,9 @@ pub const InstGraph = struct {
                 if (named.backing) |backing| {
                     if (try self.typeContainsGraphView(backing.ty, seen)) break :blk true;
                 }
-                for (self.types.declaredFieldSpan(named.declared_order)) |field| {
+                const declared_fields = self.types.declaredFieldSpan(named.declared_order);
+                for (0..declared_fields.len) |index| {
+                    const field = GuardedList.at(declared_fields, index);
                     switch (field) {
                         .named => {},
                         .padding => |padding| if (try self.typeContainsGraphView(padding, seen)) break :blk true,
@@ -1374,7 +1386,9 @@ pub const InstGraph = struct {
         span: Type.Span,
         seen: *std.AutoHashMap(Type.TypeId, void),
     ) Allocator.Error!bool {
-        for (self.types.span(span)) |child| {
+        const children = self.types.span(span);
+        for (0..children.len) |index| {
+            const child = GuardedList.at(children, index);
             if (try self.typeContainsGraphView(child, seen)) return true;
         }
         return false;
@@ -1522,13 +1536,17 @@ pub const InstGraph = struct {
     fn monoSliceWithReuse(
         self: *InstGraph,
         nodes_slice: []const NodeId,
-        existing: ?[]const Type.TypeId,
+        existing: ?Type.Span,
     ) Allocator.Error![]Type.TypeId {
         const out = try self.arena().alloc(Type.TypeId, nodes_slice.len);
         for (nodes_slice, 0..) |node, index| {
+            const existing_ty: ?Type.TypeId = if (existing) |span| existing_ty: {
+                const old = self.types.span(span);
+                break :existing_ty if (old.len == nodes_slice.len) GuardedList.at(old, index) else null;
+            } else null;
             out[index] = try self.monoForWithReuse(
                 node,
-                if (existing) |old| old[index] else null,
+                existing_ty,
             );
         }
         return out;
@@ -1539,11 +1557,7 @@ pub const InstGraph = struct {
         nodes_slice: []const NodeId,
         existing: ?Type.Span,
     ) Allocator.Error!Type.Span {
-        const existing_slice: ?[]const Type.TypeId = if (existing) |span| blk: {
-            const old = self.types.span(span);
-            break :blk if (old.len == nodes_slice.len) old else null;
-        } else null;
-        const values = try self.monoSliceWithReuse(nodes_slice, existing_slice);
+        const values = try self.monoSliceWithReuse(nodes_slice, existing);
         if (existing) |span| {
             if (typeSpanEql(self.types.span(span), values)) return span;
         }
@@ -1557,7 +1571,9 @@ pub const InstGraph = struct {
     ) ?Type.TypeId {
         const span = existing orelse return null;
         const wanted = self.fieldLabelText(name);
-        for (self.types.fieldSpan(span)) |field| {
+        const fields = self.types.fieldSpan(span);
+        for (0..fields.len) |index| {
+            const field = GuardedList.at(fields, index);
             if (Ident.textEql(wanted, self.fieldLabelText(field.name))) return field.ty;
         }
         return null;
@@ -1567,13 +1583,15 @@ pub const InstGraph = struct {
         self: *InstGraph,
         existing: ?Type.Span,
         tag: InstTag,
-    ) ?[]const Type.TypeId {
+    ) ?Type.Span {
         const span = existing orelse return null;
         const wanted = self.tagLabelText(tag.name);
-        for (self.types.tagSpan(span)) |old_tag| {
+        const tags = self.types.tagSpan(span);
+        for (0..tags.len) |index| {
+            const old_tag = GuardedList.at(tags, index);
             if (!Ident.textEql(wanted, self.tagLabelText(old_tag.name))) continue;
             const old_payloads = self.types.span(old_tag.payloads);
-            return if (old_payloads.len == tag.payloads.len) old_payloads else null;
+            return if (old_payloads.len == tag.payloads.len) old_tag.payloads else null;
         }
         return null;
     }
@@ -1808,7 +1826,7 @@ pub const GraphTypeFinals = struct {
     }
 
     fn sealTypeSpan(self: *GraphTypeFinals, span: Type.Span) Allocator.Error!Type.Span {
-        const sealed = try self.graph.allocator.dupe(Type.TypeId, self.graph.types.span(span));
+        const sealed = try GuardedList.dupe(self.graph.allocator, Type.TypeId, self.graph.types.span(span));
         defer self.graph.allocator.free(sealed);
         if (sealed.len == 0) return .empty();
         for (sealed) |*ty| {
@@ -1832,7 +1850,7 @@ pub const GraphTypeFinals = struct {
     }
 
     fn sealStoredFieldSpan(self: *GraphTypeFinals, span: Type.Span) Allocator.Error!Type.Span {
-        const fields = try self.graph.allocator.dupe(Type.Field, self.graph.types.fieldSpan(span));
+        const fields = try GuardedList.dupe(self.graph.allocator, Type.Field, self.graph.types.fieldSpan(span));
         defer self.graph.allocator.free(fields);
         if (fields.len == 0) return .empty();
         for (fields) |*field| {
@@ -1857,7 +1875,7 @@ pub const GraphTypeFinals = struct {
     }
 
     fn sealStoredTagSpan(self: *GraphTypeFinals, span: Type.Span) Allocator.Error!Type.Span {
-        const tags = try self.graph.allocator.dupe(Type.Tag, self.graph.types.tagSpan(span));
+        const tags = try GuardedList.dupe(self.graph.allocator, Type.Tag, self.graph.types.tagSpan(span));
         defer self.graph.allocator.free(tags);
         if (tags.len == 0) return .empty();
         for (tags) |*tag| {
@@ -1880,7 +1898,7 @@ pub const GraphTypeFinals = struct {
     }
 
     fn sealStoredDeclaredFieldSpan(self: *GraphTypeFinals, span: Type.Span) Allocator.Error!Type.Span {
-        const sealed = try self.graph.allocator.dupe(Type.DeclaredField, self.graph.types.declaredFieldSpan(span));
+        const sealed = try GuardedList.dupe(self.graph.allocator, Type.DeclaredField, self.graph.types.declaredFieldSpan(span));
         defer self.graph.allocator.free(sealed);
         if (sealed.len == 0) return .empty();
         for (sealed) |*field| {
@@ -1953,34 +1971,42 @@ fn assertNoDuplicatePendingTags(name_store: *const names.NameStore, tags: []cons
     }
 }
 
-fn typeSpanEql(left: []const Type.TypeId, right: []const Type.TypeId) bool {
+fn typeSpanEql(left: anytype, right: anytype) bool {
     if (left.len != right.len) return false;
-    for (left, right) |left_ty, right_ty| {
+    for (0..left.len) |index| {
+        const left_ty = GuardedList.at(left, index);
+        const right_ty = GuardedList.at(right, index);
         if (left_ty != right_ty) return false;
     }
     return true;
 }
 
-fn recordSpanEql(left: []const Type.Field, right: []const Type.Field) bool {
+fn recordSpanEql(left: anytype, right: anytype) bool {
     if (left.len != right.len) return false;
-    for (left, right) |left_field, right_field| {
+    for (0..left.len) |index| {
+        const left_field = GuardedList.at(left, index);
+        const right_field = GuardedList.at(right, index);
         if (left_field.name != right_field.name or left_field.ty != right_field.ty) return false;
     }
     return true;
 }
 
-fn tagSpanEql(types: *const Type.Store, left: []const Type.Tag, right: []const InstGraph.PendingTag) bool {
+fn tagSpanEql(types: *const Type.Store, left: anytype, right: anytype) bool {
     if (left.len != right.len) return false;
-    for (left, right) |left_tag, right_tag| {
+    for (0..left.len) |index| {
+        const left_tag = GuardedList.at(left, index);
+        const right_tag = GuardedList.at(right, index);
         if (left_tag.name != right_tag.name or left_tag.checked_name != right_tag.checked_name) return false;
         if (!typeSpanEql(types.span(left_tag.payloads), right_tag.payloads)) return false;
     }
     return true;
 }
 
-fn declaredFieldSpanEql(left: []const Type.DeclaredField, right: []const Type.DeclaredField) bool {
+fn declaredFieldSpanEql(left: anytype, right: anytype) bool {
     if (left.len != right.len) return false;
-    for (left, right) |left_field, right_field| {
+    for (0..left.len) |index| {
+        const left_field = GuardedList.at(left, index);
+        const right_field = GuardedList.at(right, index);
         switch (left_field) {
             .named => |left_name| switch (right_field) {
                 .named => |right_name| if (left_name != right_name) return false,
@@ -2194,7 +2220,7 @@ test "issue 9647: row refills do not duplicate dependencies or materialized span
     const parents = graph.row_parents.get(graph.find(ext)) orelse
         return error.TestExpectedEqual;
     try std.testing.expectEqual(@as(usize, 1), parents.items.len);
-    try std.testing.expectEqual(@as(usize, 1), type_store.fields.items.len);
+    try std.testing.expectEqual(@as(usize, 1), type_store.view().fields.len);
 }
 
 test "alias unification does not make the alias its own backing" {
@@ -2324,7 +2350,7 @@ test "sealed graph function copy recursively seals graph-owned argument views" {
     defer finals.deinit();
     const sealed_fn = try finals.sealType(draft_fn);
     try std.testing.expect(sealed_fn != draft_fn);
-    const sealed_arg = type_store.span(type_store.get(sealed_fn).func.args)[0];
+    const sealed_arg = GuardedList.at(type_store.span(type_store.get(sealed_fn).func.args), 0);
     try std.testing.expectEqual(@as(usize, 1), type_store.fieldSpan(type_store.get(sealed_arg).record).len);
 
     const extra_fields = try graph.arena().alloc(InstField, 1);
@@ -2336,7 +2362,7 @@ test "sealed graph function copy recursively seals graph-owned argument views" {
     try graph.unify(ext, extra);
     try graph.drainDirty();
 
-    const draft_arg = type_store.span(type_store.get(draft_fn).func.args)[0];
+    const draft_arg = GuardedList.at(type_store.span(type_store.get(draft_fn).func.args), 0);
     try std.testing.expectEqual(@as(usize, 2), type_store.fieldSpan(type_store.get(draft_arg).record).len);
     try std.testing.expectEqual(@as(usize, 1), type_store.fieldSpan(type_store.get(sealed_arg).record).len);
 }

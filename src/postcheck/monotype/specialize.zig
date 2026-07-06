@@ -174,10 +174,11 @@ const RefinedDigestShadow = struct {
 /// Direct specialization reservation table keyed by callable identity, source
 /// type digest, and closed requested (or solved-alias) type digest.
 pub const SpecBuilder = struct {
+    const RecordList = Ast.ProgramList(Ast.SpecRecord, "specs");
     allocator: std.mem.Allocator,
     names: *const names.NameStore,
     types: *const Type.Store,
-    records: *std.ArrayList(Ast.SpecRecord),
+    records: *RecordList,
     loaded_records: std.ArrayList(LoadedSpec),
     lookup: std.AutoHashMap(SpecLookupAddress, std.ArrayList(SpecEntryId)),
     counters: ?*Counters,
@@ -188,7 +189,7 @@ pub const SpecBuilder = struct {
         allocator: std.mem.Allocator,
         name_store: *const names.NameStore,
         type_store: *const Type.Store,
-        records: *std.ArrayList(Ast.SpecRecord),
+        records: *RecordList,
     ) SpecBuilder {
         return .{
             .allocator = allocator,
@@ -269,7 +270,7 @@ pub const SpecBuilder = struct {
             };
         }
 
-        const spec_id: Ast.SpecId = @enumFromInt(@as(u32, @intCast(self.records.items.len)));
+        const spec_id: Ast.SpecId = @enumFromInt(@as(u32, @intCast(self.records.len())));
         try self.records.append(self.allocator, .{
             .identity = identity,
             .request_fn_ty = identity.request_fn_ty,
@@ -479,8 +480,8 @@ pub const SpecBuilder = struct {
 
     fn recordPtr(self: *SpecBuilder, spec: Ast.SpecId) *Ast.SpecRecord {
         const index = @intFromEnum(spec);
-        if (index >= self.records.items.len) invariant("Monotype spec builder referenced a missing record");
-        return &self.records.items[index];
+        if (index >= self.records.len()) invariant("Monotype spec builder referenced a missing record");
+        return self.records.getPtrImmediate(index);
     }
 
     fn countCandidatesBy(self: *SpecBuilder, callable: Ast.CallableIdentity, amount: usize) void {
@@ -530,10 +531,11 @@ pub const SpecBuilder = struct {
     }
 
     fn lookupIntegrityErrorDebug(self: *const SpecBuilder) ?IntegrityError {
-        if (self.reserved_identities.items.len != self.records.items.len) {
+        if (self.reserved_identities.items.len != self.records.len()) {
             return .identity_shadow_diverged;
         }
-        for (self.records.items, self.reserved_identities.items) |record, reserved_identity| {
+        for (0..self.records.len(), self.reserved_identities.items) |index, reserved_identity| {
+            const record = self.records.get(index);
             if (!identityEql(record.identity, reserved_identity)) {
                 return .identity_rewritten_after_reserve;
             }
@@ -542,7 +544,8 @@ pub const SpecBuilder = struct {
         // Forward: every record must be reachable from each address its
         // history requires (creation identity, every refinement, the current
         // request view, and the solved view once ready).
-        for (self.records.items, 0..) |record, index| {
+        for (0..self.records.len()) |index| {
+            const record = self.records.get(index);
             const spec: Ast.SpecId = @enumFromInt(@as(u32, @intCast(index)));
             if (!self.recordReachableAt(spec, record, record.identity.request_fn_ty_digest)) {
                 return .record_missing_expected_key;
@@ -570,7 +573,7 @@ pub const SpecBuilder = struct {
                     .local => |spec_id| spec_id,
                     .loaded => continue,
                 };
-                const record = self.records.items[@intFromEnum(spec_id)];
+                const record = self.records.get(@intFromEnum(spec_id));
                 if (!self.addressInRecordHistory(spec_id, record, entry.key_ptr.*)) {
                     return .record_reachable_from_foreign_key;
                 }
@@ -650,7 +653,7 @@ test "monotype spec builder reuses exact specialization identities" {
     const unit_ty = try type_store.add(.zst);
     const identity = testSpecIdentity(unit_ty, digestWithFirstByte(1), digestWithFirstByte(2));
 
-    var records = std.ArrayList(Ast.SpecRecord).empty;
+    var records = Ast.ProgramList(Ast.SpecRecord, "specs").empty;
     defer records.deinit(std.testing.allocator);
 
     var builder = SpecBuilder.init(std.testing.allocator, &name_store, &type_store, &records);
@@ -668,17 +671,17 @@ test "monotype spec builder reuses exact specialization identities" {
     try std.testing.expectEqual(first.spec, second.spec);
     try std.testing.expectEqual(Ast.FnSlot{ .local = requested_fn }, first.target);
     try std.testing.expectEqual(Ast.FnSlot{ .local = requested_fn }, second.target);
-    try std.testing.expectEqual(@as(usize, 1), builder.records.items.len);
+    try std.testing.expectEqual(@as(usize, 1), builder.records.len());
     const found = (try builder.find(identity)) orelse return error.TestUnexpectedResult;
     try std.testing.expectEqual(first.spec, @as(?Ast.SpecId, found.local.spec));
     try std.testing.expectEqual(requested_fn, found.local.fn_id);
 
     const first_spec = first.spec orelse return error.TestUnexpectedResult;
     builder.markLowering(first_spec);
-    try std.testing.expectEqual(Ast.SpecStatus.lowering, builder.records.items[@intFromEnum(first_spec)].status);
+    try std.testing.expectEqual(Ast.SpecStatus.lowering, builder.records.get(@intFromEnum(first_spec)).status);
     try builder.markReady(first_spec, unit_ty, identity.request_fn_ty_digest);
-    try std.testing.expectEqual(Ast.SpecStatus.ready, builder.records.items[@intFromEnum(first_spec)].status);
-    try std.testing.expectEqual(requested_fn, builder.records.items[@intFromEnum(first_spec)].fn_id);
+    try std.testing.expectEqual(Ast.SpecStatus.ready, builder.records.get(@intFromEnum(first_spec)).status);
+    try std.testing.expectEqual(requested_fn, builder.records.get(@intFromEnum(first_spec)).fn_id);
     builder.validateLookupIntegrity();
 }
 
@@ -696,7 +699,7 @@ test "monotype spec builder keeps identity immutable and aliases the solved type
     const solved_digest = digestWithFirstByte(3);
     const solved_shaped_identity = testSpecIdentity(solved_ty, source_digest, solved_digest);
 
-    var records = std.ArrayList(Ast.SpecRecord).empty;
+    var records = Ast.ProgramList(Ast.SpecRecord, "specs").empty;
     defer records.deinit(std.testing.allocator);
 
     var builder = SpecBuilder.init(std.testing.allocator, &name_store, &type_store, &records);
@@ -713,7 +716,7 @@ test "monotype spec builder keeps identity immutable and aliases the solved type
 
     // The identity still records the requested type; only the record data
     // carries the solved view.
-    const record = builder.records.items[@intFromEnum(spec)];
+    const record = builder.records.get(@intFromEnum(spec));
     try std.testing.expectEqual(request_ty, record.identity.request_fn_ty);
     try std.testing.expectEqual(solved_ty, record.solved_fn_ty);
 
@@ -731,7 +734,7 @@ test "monotype spec builder keeps identity immutable and aliases the solved type
     const repeated = try builder.reserve(solved_shaped_identity, @enumFromInt(2));
     try std.testing.expect(!repeated.created);
     try std.testing.expectEqual(@as(?Ast.SpecId, spec), repeated.spec);
-    try std.testing.expectEqual(@as(usize, 1), records.items.len);
+    try std.testing.expectEqual(@as(usize, 1), records.len());
     builder.validateLookupIntegrity();
 }
 
@@ -749,7 +752,7 @@ test "monotype spec builder refines a reserved request through an alias entry" {
     const sealed_digest = digestWithFirstByte(3);
     const sealed_identity = testSpecIdentity(sealed_ty, source_digest, sealed_digest);
 
-    var records = std.ArrayList(Ast.SpecRecord).empty;
+    var records = Ast.ProgramList(Ast.SpecRecord, "specs").empty;
     defer records.deinit(std.testing.allocator);
 
     var builder = SpecBuilder.init(std.testing.allocator, &name_store, &type_store, &records);
@@ -762,7 +765,7 @@ test "monotype spec builder refines a reserved request through an alias entry" {
 
     // The identity still records the creation-time request; the record's
     // request view carries the sealed shape.
-    const record = builder.records.items[@intFromEnum(spec)];
+    const record = builder.records.get(@intFromEnum(spec));
     try std.testing.expectEqual(request_ty, record.identity.request_fn_ty);
     try std.testing.expectEqual(sealed_ty, record.request_fn_ty);
     try std.testing.expectEqual(Ast.SpecStatus.reserved, record.status);
@@ -775,7 +778,7 @@ test "monotype spec builder refines a reserved request through an alias entry" {
     const repeated = try builder.reserve(sealed_identity, @enumFromInt(2));
     try std.testing.expect(!repeated.created);
     try std.testing.expectEqual(@as(?Ast.SpecId, spec), repeated.spec);
-    try std.testing.expectEqual(@as(usize, 1), records.items.len);
+    try std.testing.expectEqual(@as(usize, 1), records.len());
     builder.validateLookupIntegrity();
 }
 
@@ -790,7 +793,7 @@ test "monotype spec builder keeps checked module boundary in callable identity" 
     const source_digest = digestWithFirstByte(1);
     const request_digest = digestWithFirstByte(2);
 
-    var records = std.ArrayList(Ast.SpecRecord).empty;
+    var records = Ast.ProgramList(Ast.SpecRecord, "specs").empty;
     defer records.deinit(std.testing.allocator);
 
     var builder = SpecBuilder.init(std.testing.allocator, &name_store, &type_store, &records);
@@ -809,7 +812,7 @@ test "monotype spec builder keeps checked module boundary in callable identity" 
     try std.testing.expect(first.spec != second.spec);
     try std.testing.expectEqual(first.spec, repeated_first.spec);
     try std.testing.expectEqual(Ast.FnSlot{ .local = @enumFromInt(1) }, repeated_first.target);
-    try std.testing.expectEqual(@as(usize, 2), builder.records.items.len);
+    try std.testing.expectEqual(@as(usize, 2), builder.records.len());
     builder.validateLookupIntegrity();
 }
 
@@ -840,7 +843,7 @@ test "monotype spec builder uses exact type equality after digest match" {
     } });
 
     const forced_digest = digestWithFirstByte(9);
-    var records = std.ArrayList(Ast.SpecRecord).empty;
+    var records = Ast.ProgramList(Ast.SpecRecord, "specs").empty;
     defer records.deinit(std.testing.allocator);
 
     var builder = SpecBuilder.init(std.testing.allocator, &name_store, &type_store, &records);
@@ -852,7 +855,7 @@ test "monotype spec builder uses exact type equality after digest match" {
     try std.testing.expect(first.created);
     try std.testing.expect(second.created);
     try std.testing.expect(first.spec != second.spec);
-    try std.testing.expectEqual(@as(usize, 2), builder.records.items.len);
+    try std.testing.expectEqual(@as(usize, 2), builder.records.len());
     builder.validateLookupIntegrity();
 }
 
@@ -895,7 +898,7 @@ test "monotype spec builder reuses loaded records through exact cross-store type
     loaded_record.solved_fn_ty = loaded_str;
     loaded_record.solved_fn_ty_digest = solved_digest;
 
-    var records = std.ArrayList(Ast.SpecRecord).empty;
+    var records = Ast.ProgramList(Ast.SpecRecord, "specs").empty;
     defer records.deinit(allocator);
 
     var builder = SpecBuilder.init(allocator, &name_store, &current_types, &records);
@@ -917,7 +920,7 @@ test "monotype spec builder reuses loaded records through exact cross-store type
     try std.testing.expectEqual(@as(?LookupResult, null), try builder.find(request_shaped));
     const local_miss = try builder.reserve(request_shaped, @enumFromInt(1));
     try std.testing.expect(local_miss.created);
-    try std.testing.expectEqual(@as(usize, 1), builder.records.items.len);
+    try std.testing.expectEqual(@as(usize, 1), builder.records.len());
 
     const solved_hit_again = try builder.reserve(solved_shaped, @enumFromInt(2));
     try std.testing.expect(!solved_hit_again.created);
@@ -960,7 +963,7 @@ test "monotype spec builder rejects loaded records when exact cross-store type e
     const current_identity = testSpecIdentity(current_unit, source_digest, forced_request_digest);
     const loaded_identity = testSpecIdentity(loaded_str, source_digest, forced_request_digest);
 
-    var records = std.ArrayList(Ast.SpecRecord).empty;
+    var records = Ast.ProgramList(Ast.SpecRecord, "specs").empty;
     defer records.deinit(allocator);
 
     var builder = SpecBuilder.init(allocator, &name_store, &current_types, &records);
@@ -974,7 +977,7 @@ test "monotype spec builder rejects loaded records when exact cross-store type e
     try std.testing.expect(miss.created);
     try std.testing.expect(miss.spec != null);
     try std.testing.expectEqual(Ast.FnSlot{ .local = @as(Ast.FnId, @enumFromInt(1)) }, miss.target);
-    try std.testing.expectEqual(@as(usize, 1), builder.records.items.len);
+    try std.testing.expectEqual(@as(usize, 1), builder.records.len());
     builder.validateLookupIntegrity();
 }
 
@@ -1011,7 +1014,7 @@ test "monotype spec builder prefers local records over loaded records" {
     const source_digest = digestWithFirstByte(1);
     const shared_solved_digest = digestWithFirstByte(9);
 
-    var records = std.ArrayList(Ast.SpecRecord).empty;
+    var records = Ast.ProgramList(Ast.SpecRecord, "specs").empty;
     defer records.deinit(allocator);
 
     var builder = SpecBuilder.init(allocator, &name_store, &current_types, &records);
@@ -1054,7 +1057,7 @@ test "monotype spec builder validator catches a hand-corrupted identity" {
     const str_ty = try type_store.add(.{ .primitive = .str });
     const identity = testSpecIdentity(unit_ty, digestWithFirstByte(1), digestWithFirstByte(2));
 
-    var records = std.ArrayList(Ast.SpecRecord).empty;
+    var records = Ast.ProgramList(Ast.SpecRecord, "specs").empty;
     defer records.deinit(std.testing.allocator);
 
     var builder = SpecBuilder.init(std.testing.allocator, &name_store, &type_store, &records);
@@ -1066,8 +1069,8 @@ test "monotype spec builder validator catches a hand-corrupted identity" {
 
     // Rewrite the identity behind the builder's back — the exact mutation the
     // immutable-identity design forbids.
-    records.items[@intFromEnum(spec)].identity.request_fn_ty = str_ty;
-    records.items[@intFromEnum(spec)].identity.request_fn_ty_digest = digestWithFirstByte(3);
+    records.getPtrImmediate(@intFromEnum(spec)).identity.request_fn_ty = str_ty;
+    records.getPtrImmediate(@intFromEnum(spec)).identity.request_fn_ty_digest = digestWithFirstByte(3);
     try std.testing.expectEqual(
         @as(?SpecBuilder.IntegrityError, .identity_rewritten_after_reserve),
         builder.lookupIntegrityError(),
@@ -1075,9 +1078,9 @@ test "monotype spec builder validator catches a hand-corrupted identity" {
 
     // Restore the identity but corrupt the request view instead: the record
     // is no longer reachable from the key its history requires.
-    records.items[@intFromEnum(spec)].identity.request_fn_ty = identity.request_fn_ty;
-    records.items[@intFromEnum(spec)].identity.request_fn_ty_digest = identity.request_fn_ty_digest;
-    records.items[@intFromEnum(spec)].request_fn_ty_digest = digestWithFirstByte(4);
+    records.getPtrImmediate(@intFromEnum(spec)).identity.request_fn_ty = identity.request_fn_ty;
+    records.getPtrImmediate(@intFromEnum(spec)).identity.request_fn_ty_digest = identity.request_fn_ty_digest;
+    records.getPtrImmediate(@intFromEnum(spec)).request_fn_ty_digest = digestWithFirstByte(4);
     try std.testing.expectEqual(
         @as(?SpecBuilder.IntegrityError, .record_missing_expected_key),
         builder.lookupIntegrityError(),

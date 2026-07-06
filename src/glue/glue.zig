@@ -23,6 +23,7 @@ const backend = @import("backend");
 const roc_target = @import("roc_target");
 const layout = @import("layout");
 const lir = @import("lir");
+const GuardedList = lir.LirStore.GuardedList;
 
 const ModuleEnv = can.ModuleEnv;
 const BuildEnv = compile.BuildEnv;
@@ -757,8 +758,9 @@ fn argLayoutsForProc(
     const arg_layouts = try allocator.alloc(layout.Idx, arg_ids.len);
     errdefer allocator.free(arg_layouts);
 
-    for (arg_ids, 0..) |local_id, i| {
-        arg_layouts[i] = store.locals.items[@intFromEnum(local_id)].layout_idx;
+    for (0..arg_ids.len) |i| {
+        const local_id = GuardedList.at(arg_ids, i);
+        arg_layouts[i] = store.getLocal(local_id).layout_idx;
     }
 
     return arg_layouts;

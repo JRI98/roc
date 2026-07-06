@@ -3902,6 +3902,56 @@ pub fn build(b: *std.Build) void {
         tests_summary.setRunSerialization();
     }
 
+    const guarded_list_violation_exe = b.addExecutable(.{
+        .name = "guarded_list_violation_test",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/collections/guarded_list_violation_test.zig"),
+            .target = target,
+            .optimize = .Debug,
+            .link_libc = true,
+        }),
+    });
+    guarded_list_violation_exe.root_module.addImport("collections", roc_modules.collections);
+    guarded_list_violation_exe.root_module.addImport("check", roc_modules.check);
+    guarded_list_violation_exe.root_module.addImport("layout", roc_modules.layout);
+    guarded_list_violation_exe.root_module.addImport("lir", roc_modules.lir);
+    guarded_list_violation_exe.root_module.addImport("postcheck", roc_modules.postcheck);
+
+    const run_guarded_list_violations_step = b.step(
+        "run-test-guarded-list-violations",
+        "Run guarded-list expected-failure checks",
+    );
+    const guarded_list_violation_cases = [_]struct {
+        name: []const u8,
+        list_name: []const u8,
+    }{
+        .{ .name = "span_append_move", .list_name = "guarded_list_violation_test.values" },
+        .{ .name = "ptr_append_move", .list_name = "guarded_list_violation_test.values" },
+        .{ .name = "span_ensure_move", .list_name = "guarded_list_violation_test.values" },
+        .{ .name = "span_append_slice_move", .list_name = "guarded_list_violation_test.values" },
+        .{ .name = "span_restore_below_range", .list_name = "guarded_list_violation_test.values" },
+        .{ .name = "ptr_restore_below_index", .list_name = "guarded_list_violation_test.values" },
+        .{ .name = "span_clear", .list_name = "guarded_list_violation_test.values" },
+        .{ .name = "span_ownership_transfer", .list_name = "guarded_list_violation_test.values" },
+        .{ .name = "lir_proc_specs", .list_name = "LirStore.proc_specs" },
+        .{ .name = "lir_local_span", .list_name = "LirStore.local_ids" },
+        .{ .name = "lifted_fns", .list_name = "monotype_lifted.Program.fns" },
+        .{ .name = "lifted_expr_ids", .list_name = "monotype_lifted.Program.expr_ids" },
+        .{ .name = "mono_exprs", .list_name = "monotype.Program.exprs" },
+        .{ .name = "mono_type_spans", .list_name = "monotype.Type.Store.spans" },
+        .{ .name = "mono_type_fields", .list_name = "monotype.Type.Store.fields" },
+        .{ .name = "lambda_mono_expr_ids", .list_name = "lambda_mono.Program.expr_ids" },
+        .{ .name = "lambda_mono_type_spans", .list_name = "lambda_mono.Type.Store.spans" },
+    };
+    for (guarded_list_violation_cases) |case| {
+        const run_violation = b.addRunArtifact(guarded_list_violation_exe);
+        run_violation.addArg(case.name);
+        run_violation.expectStdErrMatch(b.fmt("guarded list invalidated: {s}", .{case.list_name}));
+        run_guarded_list_violations_step.dependOn(&run_violation.step);
+    }
+    build_test_zig_step.dependOn(&guarded_list_violation_exe.step);
+    run_test_zig_step.dependOn(run_guarded_list_violations_step);
+
     for (module_tests_result.tests) |module_test| {
         // Add compiled builtins to tests that canonicalize ordinary modules.
         if (std.mem.eql(u8, module_test.test_step.name, "can") or std.mem.eql(u8, module_test.test_step.name, "check") or std.mem.eql(u8, module_test.test_step.name, "eval") or std.mem.eql(u8, module_test.test_step.name, "compile") or std.mem.eql(u8, module_test.test_step.name, "lsp_unit") or std.mem.eql(u8, module_test.test_step.name, "lsp_integration")) {

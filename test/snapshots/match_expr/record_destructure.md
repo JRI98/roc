@@ -12,7 +12,7 @@ match ... {
 }
 ~~~
 # EXPECTED
-UNCONDITIONAL CONDITION - record_destructure.md:1:1:1:1
+UNCONDITIONAL CONDITION - record_destructure.md:1:7:1:10
 # PROBLEMS
 
 ┌─────────────────────────┐
@@ -20,8 +20,8 @@ UNCONDITIONAL CONDITION - record_destructure.md:1:1:1:1
 └┬────────────────────────┘  this match will always inspect the same value.   │
  │                                                                            │
  │  match ... {                                                               │
- │  ‾                                                                         │
- └───────────────────────────────────────────────── record_destructure.md:1:1 ┘
+ │        ‾‾‾                                                                 │
+ └───────────────────────────────────────────────── record_destructure.md:1:7 ┘
 
 
 # TOKENS

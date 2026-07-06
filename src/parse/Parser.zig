@@ -3216,10 +3216,10 @@ fn runExprStatementKernel(
                 }
                 if (tok == .TripleDot) {
                     const start = self.pos;
+                    self.advance();
                     const expr = try self.store.addExpr(.{ .ellipsis = .{
                         .region = .{ .start = start, .end = self.pos },
                     } });
-                    self.advance();
                     expr_finish_state = .{ .start = start, .min_bp = expr_state.min_bp, .expr = expr };
                     continue :expr_kernel .suffix;
                 }

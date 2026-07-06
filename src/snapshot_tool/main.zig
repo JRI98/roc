@@ -20,6 +20,7 @@ const reporting = @import("reporting");
 const check = @import("check");
 const compile = @import("compile");
 const lir = @import("lir");
+const GuardedList = lir.LirStore.GuardedList;
 const layout = @import("layout");
 const backend = @import("backend");
 const fmt = @import("fmt");
@@ -3799,7 +3800,8 @@ fn snapshotNativeEntrypoints(
         var arg_layouts_owned = true;
         errdefer if (arg_layouts_owned) allocator.free(arg_layouts);
 
-        for (arg_locals, 0..) |local_id, i| {
+        for (0..arg_locals.len) |i| {
+            const local_id = GuardedList.at(arg_locals, i);
             arg_layouts[i] = lowered.lir_result.store.getLocal(local_id).layout_idx;
         }
 

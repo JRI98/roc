@@ -61,6 +61,7 @@ const ipc = @import("ipc");
 const fmt = @import("fmt");
 const eval = @import("eval");
 const lir = @import("lir");
+const GuardedList = lir.LirStore.GuardedList;
 const echo_platform = @import("echo_platform");
 const lsp = @import("lsp");
 const ansi_term = @import("ansi_term.zig");
@@ -1178,7 +1179,8 @@ fn buildShimEntrypoints(
         const spec = store.getProcSpec(entrypoint.root_proc);
         const arg_locals = store.getLocalSpan(spec.args);
         const arg_layouts = try ctx.arena.alloc(layout.Idx, arg_locals.len);
-        for (arg_locals, 0..) |local_id, i| {
+        for (0..arg_locals.len) |i| {
+            const local_id = GuardedList.at(arg_locals, i);
             arg_layouts[i] = store.getLocal(local_id).layout_idx;
         }
         shim_entrypoints[ordinal] = .{
@@ -1913,7 +1915,8 @@ fn entrypointAbiDigestFromLirData(
         const spec = store.getProcSpec(entrypoint.root_proc);
         const arg_locals = store.getLocalSpan(spec.args);
         const arg_layouts = try ctx.arena.alloc(layout.Idx, arg_locals.len);
-        for (arg_locals, 0..) |local_id, i| {
+        for (0..arg_locals.len) |i| {
+            const local_id = GuardedList.at(arg_locals, i);
             arg_layouts[i] = store.getLocal(local_id).layout_idx;
         }
         const lowered = layout.abi.lower(ctx.arena, layouts, abi_target, arg_layouts, spec.ret_layout, false) catch return error.OutOfMemory;
@@ -5381,8 +5384,9 @@ fn argLayoutsForProc(
     const arg_layouts = try allocator.alloc(layout.Idx, arg_ids.len);
     errdefer allocator.free(arg_layouts);
 
-    for (arg_ids, 0..) |local_id, i| {
-        arg_layouts[i] = store.locals.items[@intFromEnum(local_id)].layout_idx;
+    for (0..arg_ids.len) |i| {
+        const local_id = GuardedList.at(arg_ids, i);
+        arg_layouts[i] = store.getLocal(local_id).layout_idx;
     }
 
     return arg_layouts;
@@ -6819,7 +6823,8 @@ fn nativeBuildEntrypoints(
         const proc_spec = lowered.lir_result.store.getProcSpec(root_proc);
         const arg_locals = lowered.lir_result.store.getLocalSpan(proc_spec.args);
         const arg_layouts = try ctx.arena.alloc(layout.Idx, arg_locals.len);
-        for (arg_locals, 0..) |local_id, i| {
+        for (0..arg_locals.len) |i| {
+            const local_id = GuardedList.at(arg_locals, i);
             arg_layouts[i] = lowered.lir_result.store.getLocal(local_id).layout_idx;
         }
 

@@ -5,6 +5,7 @@ const check = @import("check");
 const can = @import("can");
 const builtins = @import("builtins");
 const base = @import("base");
+const collections = @import("collections");
 
 const Common = @import("../common.zig");
 const Ast = @import("ast.zig");
@@ -28,6 +29,8 @@ const ExhaustivenessContext = check.ExhaustivenessContext;
 const names = check.CheckedNames;
 const static_dispatch = check.StaticDispatchRegistry;
 const Ident = base.Ident;
+const GuardedList = collections.GuardedList;
+const TypeFieldSpanBorrow = Type.StoreSpanBorrow(Type.Field, "fields");
 const PatternRefutability = can.PatternRefutability;
 
 /// Internal control surface for Monotype specialization cache integration.
@@ -123,7 +126,7 @@ pub fn run(
 /// program completes: reservations are drained by the graph that made them,
 /// and `SpecBuilder` owns the only `reserved → lowering → ready` transitions.
 fn verifyMonotypeSpecsReady(program: *const Ast.Program) void {
-    for (program.specs.items) |record| {
+    for (program.specsView()) |record| {
         if (record.status != .ready) {
             Common.invariant("completed Monotype program contained an unfinished specialization record");
         }
@@ -363,12 +366,12 @@ const FinalBodyOutputCounts = struct {
 
     fn fromProgram(program: *const Ast.Program) FinalBodyOutputCounts {
         return .{
-            .exprs = program.exprs.items.len,
-            .pats = program.pats.items.len,
-            .locals = program.locals.items.len,
-            .typed_locals = program.typed_locals.items.len,
-            .layout_requests = program.layout_requests.items.len,
-            .runtime_schema_requests = program.runtime_schema_requests.items.len,
+            .exprs = program.exprCount(),
+            .pats = program.patCount(),
+            .locals = program.localCount(),
+            .typed_locals = program.typedLocalCount(),
+            .layout_requests = program.layoutRequestCount(),
+            .runtime_schema_requests = program.runtimeSchemaRequestCount(),
         };
     }
 
@@ -924,12 +927,12 @@ const Builder = struct {
         else
             Common.invariant("root request reached Monotype without a checked procedure template or procedure source");
         try self.appendRuntimeSchemaRequestsForDef(def);
-        try self.program.roots.append(self.allocator, .{ .def = def, .request = request });
+        try self.program.addRoot(.{ .def = def, .request = request });
     }
 
     fn lowerLayoutRequest(self: *Builder, checked_ty: checked.CheckedTypeId) Allocator.Error!void {
         const ty = try self.lowerType(moduleView(self.root_view), checked_ty);
-        try self.program.layout_requests.append(self.allocator, .{
+        try self.program.addLayoutRequest(.{
             .checked_type = checked_ty,
             .ty = ty,
         });
@@ -941,15 +944,14 @@ const Builder = struct {
         const ret_ty = try self.lowerType(type_view, request.data.checked_type);
         const const_node = self.providedConstNode(request.data);
         const body = try self.restoreConstNodeAtType(const_node.module, type_view, const_node.id, ret_ty);
-        const def: Ast.DefId = @enumFromInt(@as(u32, @intCast(self.program.defs.items.len)));
-        try self.program.defs.append(self.allocator, .{
+        const def = try self.program.addDef(.{
             .symbol = self.symbols.fresh(),
             .fn_def = null,
             .args = Ast.Span(Ast.TypedLocal).empty(),
             .body = .{ .roc = body },
             .ret = ret_ty,
         });
-        try self.program.layout_requests.append(self.allocator, .{
+        try self.program.addLayoutRequest(.{
             .checked_type = request.data.checked_type,
             .ty = ret_ty,
             .def = def,
@@ -958,8 +960,10 @@ const Builder = struct {
     }
 
     fn appendRuntimeSchemaRequestsForDef(self: *Builder, def: Ast.DefId) Allocator.Error!void {
-        const fn_ = self.program.defs.items[@intFromEnum(def)];
-        for (self.program.typedLocalSpan(fn_.args)) |arg| {
+        const fn_ = self.program.getDef(def);
+        const args = self.program.typedLocalSpan(fn_.args);
+        for (0..GuardedList.borrowLen(args)) |index| {
+            const arg = GuardedList.at(args, index);
             try self.appendRuntimeSchemaRequestsForType(arg.ty);
         }
         try self.appendRuntimeSchemaRequestsForType(fn_.ret);
@@ -981,7 +985,9 @@ const Builder = struct {
 
         switch (self.program.types.get(ty)) {
             .named => |named| {
-                for (self.program.types.span(named.args)) |arg| {
+                const args = self.program.types.span(named.args);
+                for (0..GuardedList.borrowLen(args)) |index| {
+                    const arg = GuardedList.at(args, index);
                     try self.appendRuntimeSchemaRequestsForTypeInner(arg, active);
                 }
                 const backing = named.backing orelse return;
@@ -991,18 +997,26 @@ const Builder = struct {
                 try self.appendRuntimeSchemaRequestsForTypeInner(backing.ty, active);
             },
             .record => |fields| {
-                for (self.program.types.fieldSpan(fields)) |field| {
+                const field_span = self.program.types.fieldSpan(fields);
+                for (0..GuardedList.borrowLen(field_span)) |index| {
+                    const field = GuardedList.at(field_span, index);
                     try self.appendRuntimeSchemaRequestsForTypeInner(field.ty, active);
                 }
             },
             .tuple => |items| {
-                for (self.program.types.span(items)) |item| {
+                const item_span = self.program.types.span(items);
+                for (0..GuardedList.borrowLen(item_span)) |index| {
+                    const item = GuardedList.at(item_span, index);
                     try self.appendRuntimeSchemaRequestsForTypeInner(item, active);
                 }
             },
             .tag_union => |tags| {
-                for (self.program.types.tagSpan(tags)) |tag| {
-                    for (self.program.types.span(tag.payloads)) |payload| {
+                const tag_span = self.program.types.tagSpan(tags);
+                for (0..GuardedList.borrowLen(tag_span)) |tag_index| {
+                    const tag = GuardedList.at(tag_span, tag_index);
+                    const payload_span = self.program.types.span(tag.payloads);
+                    for (0..GuardedList.borrowLen(payload_span)) |payload_index| {
+                        const payload = GuardedList.at(payload_span, payload_index);
                         try self.appendRuntimeSchemaRequestsForTypeInner(payload, active);
                     }
                 }
@@ -1011,7 +1025,9 @@ const Builder = struct {
             .box,
             => |elem| try self.appendRuntimeSchemaRequestsForTypeInner(elem, active),
             .func => |func| {
-                for (self.program.types.span(func.args)) |arg| {
+                const args = self.program.types.span(func.args);
+                for (0..GuardedList.borrowLen(args)) |index| {
+                    const arg = GuardedList.at(args, index);
                     try self.appendRuntimeSchemaRequestsForTypeInner(arg, active);
                 }
                 try self.appendRuntimeSchemaRequestsForTypeInner(func.ret, active);
@@ -1037,12 +1053,12 @@ const Builder = struct {
     }
 
     fn appendRuntimeSchemaRequest(self: *Builder, request: Ast.RuntimeSchemaRequest) Allocator.Error!void {
-        for (self.program.runtime_schema_requests.items) |existing| {
+        for (self.program.runtimeSchemaRequestsView()) |existing| {
             if (existing.def.module == request.def.module and existing.def.type_name == request.def.type_name) {
                 return;
             }
         }
-        try self.program.runtime_schema_requests.append(self.allocator, request);
+        try self.program.addRuntimeSchemaRequest(request);
     }
 
     fn lowerProcedureUseRoot(
@@ -1059,7 +1075,8 @@ const Builder = struct {
         const arg_exprs = try self.allocator.alloc(Ast.ExprId, arg_tys.len);
         defer self.allocator.free(arg_exprs);
 
-        for (arg_tys, 0..) |arg_ty, i| {
+        for (0..GuardedList.borrowLen(arg_tys)) |i| {
+            const arg_ty = GuardedList.at(arg_tys, i);
             const local = try self.program.addLocal(self.symbols.fresh(), arg_ty);
             args[i] = .{ .local = local, .ty = arg_ty };
             arg_exprs[i] = try self.program.addExpr(.{ .ty = arg_ty, .data = .{ .local = local } });
@@ -1074,15 +1091,13 @@ const Builder = struct {
             } },
         });
 
-        const def: Ast.DefId = @enumFromInt(@as(u32, @intCast(self.program.defs.items.len)));
-        try self.program.defs.append(self.allocator, .{
+        return try self.program.addDef(.{
             .symbol = self.symbols.fresh(),
             .fn_def = null,
             .args = try self.program.addTypedLocalSpan(args),
             .body = .{ .roc = body },
             .ret = fn_data.ret,
         });
-        return def;
     }
 
     fn lowerProcedureBindingRoot(
@@ -1099,7 +1114,8 @@ const Builder = struct {
         const arg_exprs = try self.allocator.alloc(Ast.ExprId, arg_tys.len);
         defer self.allocator.free(arg_exprs);
 
-        for (arg_tys, 0..) |arg_ty, i| {
+        for (0..GuardedList.borrowLen(arg_tys)) |i| {
+            const arg_ty = GuardedList.at(arg_tys, i);
             const local = try self.program.addLocal(self.symbols.fresh(), arg_ty);
             args[i] = .{ .local = local, .ty = arg_ty };
             arg_exprs[i] = try self.program.addExpr(.{ .ty = arg_ty, .data = .{ .local = local } });
@@ -1115,15 +1131,13 @@ const Builder = struct {
             } },
         });
 
-        const def: Ast.DefId = @enumFromInt(@as(u32, @intCast(self.program.defs.items.len)));
-        try self.program.defs.append(self.allocator, .{
+        return try self.program.addDef(.{
             .symbol = self.symbols.fresh(),
             .fn_def = null,
             .args = try self.program.addTypedLocalSpan(args),
             .body = .{ .roc = body },
             .ret = fn_data.ret,
         });
-        return def;
     }
 
     fn lowerProcedureBindingValue(
@@ -1267,7 +1281,7 @@ const Builder = struct {
         if (reserved_fn_id) |fn_id| {
             const existing = self.lowered_templates.get(fn_id) orelse
                 Common.invariant("deferred Monotype procedure template request referenced a missing reservation");
-            const record = &self.program.specs.items[@intFromEnum(existing.spec)];
+            const record = self.program.getSpec(existing.spec);
             switch (record.status) {
                 .ready,
                 .lowering,
@@ -1320,11 +1334,12 @@ const Builder = struct {
             symbol: Common.Symbol,
         };
         const reservation: Reservation = if (reserved_def) |def_id| blk: {
-            const def = &self.program.defs.items[@intFromEnum(def_id)];
+            var def = self.program.getDef(def_id);
             const fn_id = def.fn_id orelse
                 Common.invariant("reserved Monotype procedure template definition had no function id");
             def.fn_def = fn_template;
-            self.program.fns.items[@intFromEnum(fn_id)].source = fn_template;
+            self.program.setDef(def_id, def);
+            self.program.setFnSource(fn_id, fn_template);
             break :blk .{
                 .def = def_id,
                 .fn_id = fn_id,
@@ -1334,11 +1349,10 @@ const Builder = struct {
             const symbol = self.symbols.fresh();
             try self.registerProcDebugNameForTemplate(symbol, view, template_ref);
             const fn_id = try self.program.addFn(fn_template);
-            const def_id: Ast.DefId = @enumFromInt(@as(u32, @intCast(self.program.defs.items.len)));
             // The definition fills once its body lowers; a recursive request
             // that reuses this entry meanwhile reads the requested template,
             // which is the same specialization by construction.
-            try self.program.defs.append(self.allocator, .{
+            const def_id = try self.program.addDef(.{
                 .symbol = symbol,
                 .fn_def = fn_template,
                 .fn_id = fn_id,
@@ -1367,15 +1381,15 @@ const Builder = struct {
             .hosted => {
                 const fn_data = self.functionShape(lower_fn_ty, "hosted procedure template root type was not a function");
                 const args = try self.typedLocalsForArgs(self.program.types.span(fn_data.args));
-                self.program.defs.items[@intFromEnum(reservation.def)] = .{
+                self.program.setDef(reservation.def, .{
                     .symbol = reservation.symbol,
                     .fn_def = fn_template,
                     .fn_id = reservation.fn_id,
                     .args = args,
                     .body = .hosted,
                     .ret = fn_data.ret,
-                };
-                self.program.fns.items[@intFromEnum(reservation.fn_id)].source = fn_template;
+                });
+                self.program.setFnSource(reservation.fn_id, fn_template);
                 try self.markTemplateReady(reservation.fn_id, lower_fn_ty);
                 return reservation.def;
             },
@@ -1498,16 +1512,16 @@ const Builder = struct {
         // adopt this recorded template directly.
         var def_template = fn_template;
         def_template.mono_fn_ty = final_fn_ty;
-        self.program.fns.items[@intFromEnum(reservation.fn_id)].source = def_template;
+        self.program.setFnSource(reservation.fn_id, def_template);
         const sealed_fn_data = self.functionShape(final_fn_ty, "checked procedure template root type was not a function");
-        self.program.defs.items[@intFromEnum(reservation.def)] = .{
+        self.program.setDef(reservation.def, .{
             .symbol = reservation.symbol,
             .fn_def = def_template,
             .fn_id = reservation.fn_id,
             .args = body_ids.typedLocalSpan(lowered.args),
             .body = .{ .roc = body_ids.expr(lowered.body) },
             .ret = sealed_fn_data.ret,
-        };
+        });
         try self.markTemplateReady(reservation.fn_id, final_fn_ty);
         return reservation.def;
     }
@@ -1565,10 +1579,9 @@ const Builder = struct {
         const view = self.moduleForDigest(names.procTemplateModuleDigest(template_ref));
         const fn_template = self.fnDefForTemplate(view, template_ref, source_fn_ty, source_fn_key, fn_ty);
         const fn_id = try self.program.addFn(fn_template);
-        const def_id: Ast.DefId = @enumFromInt(@as(u32, @intCast(self.program.defs.items.len)));
         const symbol = self.symbols.fresh();
         try self.registerProcDebugNameForTemplate(symbol, view, template_ref);
-        try self.program.defs.append(self.allocator, .{
+        const def_id = try self.program.addDef(.{
             .symbol = symbol,
             .fn_def = fn_template,
             .fn_id = fn_id,
@@ -1611,10 +1624,11 @@ const Builder = struct {
         try self.spec_store.markReady(entry.spec, fn_ty, self.specializationTypeDigest(fn_ty));
     }
 
-    fn typedLocalsForArgs(self: *Builder, arg_tys: []const Type.TypeId) Allocator.Error!Ast.Span(Ast.TypedLocal) {
-        const args = try self.allocator.alloc(Ast.TypedLocal, arg_tys.len);
+    fn typedLocalsForArgs(self: *Builder, arg_tys: anytype) Allocator.Error!Ast.Span(Ast.TypedLocal) {
+        const args = try self.allocator.alloc(Ast.TypedLocal, GuardedList.borrowLen(arg_tys));
         defer self.allocator.free(args);
-        for (arg_tys, 0..) |arg_ty, index| {
+        for (0..GuardedList.borrowLen(arg_tys)) |index| {
+            const arg_ty = GuardedList.at(arg_tys, index);
             args[index] = .{
                 .local = try self.program.addLocal(self.symbols.fresh(), arg_ty),
                 .ty = arg_ty,
@@ -1958,7 +1972,8 @@ const Builder = struct {
             .zst => return null,
             else => return null,
         };
-        for (fields) |field| {
+        for (0..GuardedList.borrowLen(fields)) |index| {
+            const field = GuardedList.at(fields, index);
             if (Ident.textEql(self.program.names.recordFieldLabelText(field.name), text)) return field;
         }
         return null;
@@ -1982,12 +1997,11 @@ const Builder = struct {
     fn generatedParseTagUnionSpecBackingInfo(self: *Builder, spec_ty: Type.TypeId) bool {
         if (!self.typeHasBuiltinOwner(spec_ty, .parse_tag_union_spec)) return false;
         const backing_ty = self.namedBackingType(spec_ty) orelse return false;
-        const record_fields = switch (self.shapeContent(backing_ty)) {
-            .record => |span| self.program.types.fieldSpan(span),
-            .zst => &.{},
+        return switch (self.shapeContent(backing_ty)) {
+            .record => |span| self.program.types.fieldSpan(span).len != 0,
+            .zst => false,
             else => return false,
         };
-        return record_fields.len != 0;
     }
 
     fn monoTypeHasGeneratedOpaqueEvidence(self: *Builder, ty: Type.TypeId) Allocator.Error!bool {
@@ -2015,13 +2029,17 @@ const Builder = struct {
                 {
                     break :blk true;
                 }
-                for (self.program.types.span(named.args)) |arg| {
+                const args = self.program.types.span(named.args);
+                for (0..GuardedList.borrowLen(args)) |index| {
+                    const arg = GuardedList.at(args, index);
                     if (try self.monoTypeHasGeneratedOpaqueEvidenceInner(arg, visited)) break :blk true;
                 }
                 if (named.backing) |backing| {
                     if (try self.monoTypeHasGeneratedOpaqueEvidenceInner(backing.ty, visited)) break :blk true;
                 }
-                for (self.program.types.declaredFieldSpan(named.declared_order)) |field| {
+                const declared_fields = self.program.types.declaredFieldSpan(named.declared_order);
+                for (0..GuardedList.borrowLen(declared_fields)) |index| {
+                    const field = GuardedList.at(declared_fields, index);
                     switch (field) {
                         .named => {},
                         .padding => |padding| if (try self.monoTypeHasGeneratedOpaqueEvidenceInner(padding, visited)) break :blk true,
@@ -2030,20 +2048,28 @@ const Builder = struct {
                 break :blk false;
             },
             .record => |fields| blk: {
-                for (self.program.types.fieldSpan(fields)) |field| {
+                const field_span = self.program.types.fieldSpan(fields);
+                for (0..GuardedList.borrowLen(field_span)) |index| {
+                    const field = GuardedList.at(field_span, index);
                     if (try self.monoTypeHasGeneratedOpaqueEvidenceInner(field.ty, visited)) break :blk true;
                 }
                 break :blk false;
             },
             .tuple => |items| blk: {
-                for (self.program.types.span(items)) |item| {
+                const item_span = self.program.types.span(items);
+                for (0..GuardedList.borrowLen(item_span)) |index| {
+                    const item = GuardedList.at(item_span, index);
                     if (try self.monoTypeHasGeneratedOpaqueEvidenceInner(item, visited)) break :blk true;
                 }
                 break :blk false;
             },
             .tag_union => |tags| blk: {
-                for (self.program.types.tagSpan(tags)) |tag| {
-                    for (self.program.types.span(tag.payloads)) |payload| {
+                const tag_span = self.program.types.tagSpan(tags);
+                for (0..GuardedList.borrowLen(tag_span)) |tag_index| {
+                    const tag = GuardedList.at(tag_span, tag_index);
+                    const payload_span = self.program.types.span(tag.payloads);
+                    for (0..GuardedList.borrowLen(payload_span)) |payload_index| {
+                        const payload = GuardedList.at(payload_span, payload_index);
                         if (try self.monoTypeHasGeneratedOpaqueEvidenceInner(payload, visited)) break :blk true;
                     }
                 }
@@ -2052,7 +2078,9 @@ const Builder = struct {
             .list => |elem| try self.monoTypeHasGeneratedOpaqueEvidenceInner(elem, visited),
             .box => |elem| try self.monoTypeHasGeneratedOpaqueEvidenceInner(elem, visited),
             .func => |function| blk: {
-                for (self.program.types.span(function.args)) |arg| {
+                const args = self.program.types.span(function.args);
+                for (0..GuardedList.borrowLen(args)) |index| {
+                    const arg = GuardedList.at(args, index);
                     if (try self.monoTypeHasGeneratedOpaqueEvidenceInner(arg, visited)) break :blk true;
                 }
                 break :blk try self.monoTypeHasGeneratedOpaqueEvidenceInner(function.ret, visited);
@@ -2098,7 +2126,9 @@ const Builder = struct {
     fn tagPayloadSpan(self: *Builder, ty: Type.TypeId, name: names.TagNameId) Type.Span {
         return switch (self.shapeContent(ty)) {
             .tag_union => |tags| {
-                for (self.program.types.tagSpan(tags)) |tag| {
+                const tag_span = self.program.types.tagSpan(tags);
+                for (0..GuardedList.borrowLen(tag_span)) |index| {
+                    const tag = GuardedList.at(tag_span, index);
                     if (self.program.names.tagLabelTextEql(tag.name, name)) return tag.payloads;
                 }
                 Common.invariant("tag pattern was absent from checked tag-union type");
@@ -2173,7 +2203,8 @@ const Builder = struct {
     fn sameNominalArgs(self: *Builder, actual_span: Type.Span, expected: []const Type.TypeId) bool {
         const actual = self.program.types.span(actual_span);
         if (actual.len != expected.len) return false;
-        for (actual, expected) |actual_ty, expected_ty| {
+        for (expected, 0..) |expected_ty, index| {
+            const actual_ty = GuardedList.at(actual, index);
             if (actual_ty == expected_ty) continue;
             const actual_digest = self.program.types.specializationDigest(&self.program.names, actual_ty);
             const expected_digest = self.program.types.specializationDigest(&self.program.names, expected_ty);
@@ -2182,18 +2213,20 @@ const Builder = struct {
         return true;
     }
 
-    fn tupleItemTypes(self: *Builder, ty: Type.TypeId) []const Type.TypeId {
+    fn tupleItemTypes(self: *Builder, ty: Type.TypeId) Type.StoreSpanBorrow(Type.TypeId, "spans") {
         return self.program.types.span(self.tupleItemSpan(ty));
     }
 
     fn recordFieldType(self: *Builder, ty: Type.TypeId, name: names.RecordFieldNameId) Type.TypeId {
-        for (self.program.types.fieldSpan(self.recordFieldsSpan(ty))) |field| {
+        const fields = self.program.types.fieldSpan(self.recordFieldsSpan(ty));
+        for (0..GuardedList.borrowLen(fields)) |index| {
+            const field = GuardedList.at(fields, index);
             if (self.program.names.recordFieldLabelTextEql(field.name, name)) return field.ty;
         }
         Common.invariant("record pattern field was absent from checked record type");
     }
 
-    fn tagPayloadTypes(self: *Builder, ty: Type.TypeId, name: names.TagNameId) []const Type.TypeId {
+    fn tagPayloadTypes(self: *Builder, ty: Type.TypeId, name: names.TagNameId) Type.StoreSpanBorrow(Type.TypeId, "spans") {
         return self.program.types.span(self.tagPayloadSpan(ty, name));
     }
 
@@ -2684,7 +2717,7 @@ const Builder = struct {
     }
 
     fn defFnId(self: *Builder, def: Ast.DefId) Ast.FnId {
-        return self.program.defs.items[@intFromEnum(def)].fn_id orelse
+        return self.program.getDef(def).fn_id orelse
             Common.invariant("Monotype procedure template definition had no function id");
     }
 
@@ -2809,7 +2842,7 @@ const Builder = struct {
         const lowered = try request.ctx.lowerNestedFunction(request.expr_id, body_fn_ty);
         var def_template = fn_template;
         def_template.mono_fn_ty = body_fn_ty;
-        self.program.fns.items[@intFromEnum(fn_id)].source = def_template;
+        self.program.setFnSource(fn_id, def_template);
         _ = try request.ctx.draft.addNestedDef(.{
             .symbol = self.symbols.fresh(),
             .fn_def = .{
@@ -2861,15 +2894,19 @@ const Builder = struct {
 
         try self.spec_store.refineRequest(entry.spec, fn_ty, self.specializationTypeDigest(fn_ty));
 
-        const fn_template = &self.program.fns.items[@intFromEnum(fn_id)].source;
+        var fn_record = self.program.getFn(fn_id);
+        const fn_template = &fn_record.source;
         fn_template.mono_fn_ty = fn_ty;
-        const def = &self.program.defs.items[@intFromEnum(entry.def)];
+        self.program.setFn(fn_id, fn_record);
+
+        var def = self.program.getDef(entry.def);
         if (def.fn_def) |*def_template| {
             def_template.mono_fn_ty = fn_ty;
         } else {
             Common.invariant("reserved Monotype procedure template definition had no function template");
         }
         def.ret = self.functionShape(fn_ty, "deferred procedure template root type was not a function").ret;
+        self.program.setDef(entry.def, def);
     }
 
     /// Process the specialization body requests this specialization enqueued
@@ -2953,7 +2990,7 @@ const Builder = struct {
     ) Allocator.Error!void {
         for (body_draft.nested_defs.items) |def| {
             const fn_id = ids.fnTarget(def.fn_id);
-            const fn_template = self.program.fns.items[@intFromEnum(fn_id)].source;
+            const fn_template = self.program.getFn(fn_id).source;
             switch (fn_template.fn_def) {
                 .nested => {},
                 else => Common.invariant("nested draft definition did not reference a nested function"),
@@ -3187,7 +3224,7 @@ const Builder = struct {
         bound: *std.AutoHashMap(Ast.LocalId, void),
         active_fns: *std.AutoHashMap(Ast.FnId, void),
     ) Allocator.Error!bool {
-        const expr = self.program.exprs.items[@intFromEnum(expr_id)];
+        const expr = self.program.getExpr(expr_id);
         switch (expr.data) {
             .local => |local| return self.localDependsOnTarget(local, target, bound),
             .unit,
@@ -3384,11 +3421,11 @@ const Builder = struct {
         local: Ast.LocalId,
     ) bool {
         if (bound.contains(local)) return true;
-        const local_data = self.program.locals.items[@intFromEnum(local)];
+        const local_data = self.program.getLocal(local);
         const binder = local_data.binder orelse return false;
         var iter = bound.keyIterator();
         while (iter.next()) |active| {
-            const active_data = self.program.locals.items[@intFromEnum(active.*)];
+            const active_data = self.program.getLocal(active.*);
             if (active_data.binder == null or active_data.binder.? != binder) continue;
             if (self.sameMonotype(active_data.ty, local_data.ty)) return true;
         }
@@ -3397,8 +3434,8 @@ const Builder = struct {
 
     fn sameLocalIdentity(self: *Builder, lhs: Ast.LocalId, rhs: Ast.LocalId) bool {
         if (lhs == rhs) return true;
-        const lhs_data = self.program.locals.items[@intFromEnum(lhs)];
-        const rhs_data = self.program.locals.items[@intFromEnum(rhs)];
+        const lhs_data = self.program.getLocal(lhs);
+        const rhs_data = self.program.getLocal(rhs);
         if (lhs_data.binder == null or rhs_data.binder == null or lhs_data.binder.? != rhs_data.binder.?) {
             return false;
         }
@@ -3420,7 +3457,7 @@ const Builder = struct {
         active_fns: *std.AutoHashMap(Ast.FnId, void),
         added: *std.ArrayList(Ast.LocalId),
     ) Allocator.Error!bool {
-        const stmt = self.program.stmts.items[@intFromEnum(stmt_id)];
+        const stmt = self.program.getStmt(stmt_id);
         switch (stmt) {
             .uninitialized => |pat| {
                 try self.bindPatLocals(pat, bound, added);
@@ -3456,11 +3493,11 @@ const Builder = struct {
         try active_fns.put(fn_id, {});
         defer _ = active_fns.remove(fn_id);
 
-        for (self.program.defs.items) |def| {
+        for (self.program.defsView()) |def| {
             if (def.fn_id == null or def.fn_id.? != fn_id) continue;
             return try self.fnBodyDependsOnFreeLocal(def.args, def.body, target, caller_bound, active_fns);
         }
-        for (self.program.nested_defs.items) |def| {
+        for (self.program.nestedDefsView()) |def| {
             if (def.fn_id != fn_id) continue;
             return try self.fnBodyDependsOnFreeLocal(def.args, .{ .roc = def.body }, target, caller_bound, active_fns);
         }
@@ -3504,7 +3541,7 @@ const Builder = struct {
         bound: *std.AutoHashMap(Ast.LocalId, void),
         added: *std.ArrayList(Ast.LocalId),
     ) Allocator.Error!void {
-        const pat = self.program.pats.items[@intFromEnum(pat_id)];
+        const pat = self.program.getPat(pat_id);
         switch (pat.data) {
             .bind => |local| {
                 try bound.put(local, {});
@@ -3731,13 +3768,13 @@ const Builder = struct {
         const callable_node = try fn_ctx.instantiateDispatchPlanCallNodeFromCaller(plan.callable_ty, &fn_ctx, expr.ty, plan_args, ty);
         const callable_mono_ty = try graph.sealNode(callable_node);
         const fn_data = self.functionShape(callable_mono_ty, "stored parser constructor had a non-function type");
-        const arg_tys = try self.allocator.dupe(Type.TypeId, self.program.types.span(fn_data.args));
+        const arg_tys = try GuardedList.dupe(self.allocator, Type.TypeId, self.program.types.span(fn_data.args));
         defer self.allocator.free(arg_tys);
         if (arg_tys.len != 1) Common.invariant("stored parser constructor had an unexpected arity");
         if (!fn_ctx.sameType(fn_data.ret, ty)) Common.invariant("stored parser constructor result type differed from restored function type");
 
         const runtime_fn = self.functionShape(ty, "stored parser runtime value had a non-function type");
-        const runtime_arg_tys = try self.allocator.dupe(Type.TypeId, self.program.types.span(runtime_fn.args));
+        const runtime_arg_tys = try GuardedList.dupe(self.allocator, Type.TypeId, self.program.types.span(runtime_fn.args));
         defer self.allocator.free(runtime_arg_tys);
         if (runtime_arg_tys.len != 1) Common.invariant("stored parser runtime function had an unexpected arity");
 
@@ -3839,13 +3876,13 @@ const Builder = struct {
         const callable_node = try fn_ctx.instantiateDispatchPlanCallNodeFromCaller(plan.callable_ty, &fn_ctx, expr.ty, plan_args, ty);
         const callable_mono_ty = try graph.sealNode(callable_node);
         const fn_data = self.functionShape(callable_mono_ty, "stored encoder_for constructor had a non-function type");
-        const arg_tys = try self.allocator.dupe(Type.TypeId, self.program.types.span(fn_data.args));
+        const arg_tys = try GuardedList.dupe(self.allocator, Type.TypeId, self.program.types.span(fn_data.args));
         defer self.allocator.free(arg_tys);
         if (arg_tys.len != 1) Common.invariant("stored encoder_for constructor had an unexpected arity");
         if (!fn_ctx.sameType(fn_data.ret, ty)) Common.invariant("stored encoder_for constructor result type differed from restored function type");
 
         const runtime_fn = self.functionShape(ty, "stored encoder_for runtime value had a non-function type");
-        const runtime_arg_tys = try self.allocator.dupe(Type.TypeId, self.program.types.span(runtime_fn.args));
+        const runtime_arg_tys = try GuardedList.dupe(self.allocator, Type.TypeId, self.program.types.span(runtime_fn.args));
         defer self.allocator.free(runtime_arg_tys);
         if (runtime_arg_tys.len != 2) Common.invariant("stored encoder_for runtime function had an unexpected arity");
 
@@ -4041,7 +4078,8 @@ const Builder = struct {
         const lowered = try self.allocator.alloc(Ast.ExprId, items.len);
         defer self.allocator.free(lowered);
         for (items, 0..) |item, index| {
-            const item_ty = self.program.types.span(item_span)[index];
+            const item_tys = self.program.types.span(item_span);
+            const item_ty = GuardedList.at(item_tys, index);
             lowered[index] = try self.restoreConstNodeAtType(store_view, type_view, item, item_ty);
         }
         return try self.program.addExprSpan(lowered);
@@ -4060,7 +4098,8 @@ const Builder = struct {
         const lowered = try self.allocator.alloc(Ast.FieldExpr, items.len);
         defer self.allocator.free(lowered);
         for (items, 0..) |item, index| {
-            const field = self.program.types.fieldSpan(field_span)[index];
+            const fields = self.program.types.fieldSpan(field_span);
+            const field = GuardedList.at(fields, index);
             lowered[index] = .{
                 .name = field.name,
                 .value = try self.restoreConstNodeAtType(store_view, type_view, item, field.ty),
@@ -4083,7 +4122,8 @@ const Builder = struct {
         const lowered = try self.allocator.alloc(Ast.ExprId, tag.payloads.len);
         defer self.allocator.free(lowered);
         for (tag.payloads, 0..) |payload, index| {
-            const payload_ty = self.program.types.span(payload_span)[index];
+            const payload_tys = self.program.types.span(payload_span);
+            const payload_ty = GuardedList.at(payload_tys, index);
             lowered[index] = try self.restoreConstNodeAtType(store_view, type_view, payload, payload_ty);
         }
         return try self.program.addExprSpan(lowered);
@@ -4103,7 +4143,7 @@ const Builder = struct {
         };
     }
 
-    fn constRecordFields(self: *Builder, ty: Type.TypeId) []const Type.Field {
+    fn constRecordFields(self: *Builder, ty: Type.TypeId) Type.StoreSpanBorrow(Type.Field, "fields") {
         return self.program.types.fieldSpan(self.recordFieldsSpan(ty));
     }
 
@@ -4131,8 +4171,7 @@ const Builder = struct {
         };
         if (self.inspect_defs.get(address)) |entry| return entry.id();
 
-        const def_id: Ast.DefId = @enumFromInt(@as(u32, @intCast(self.program.defs.items.len)));
-        try self.program.defs.append(self.allocator, undefined);
+        const def_id = try self.program.addDef(undefined);
         try self.inspect_defs.put(address, .{ .reserved = def_id });
 
         const arg_local = try self.program.addLocal(self.symbols.fresh(), value_ty);
@@ -4140,13 +4179,13 @@ const Builder = struct {
         const body = try self.inspectBody(arg_expr, value_ty, value_ty, str_ty);
 
         const args = try self.program.addTypedLocalSpan(&.{.{ .local = arg_local, .ty = value_ty }});
-        self.program.defs.items[@intFromEnum(def_id)] = .{
+        self.program.setDef(def_id, .{
             .symbol = self.symbols.fresh(),
             .fn_def = null,
             .args = args,
             .body = .{ .roc = body },
             .ret = str_ty,
-        };
+        });
         try self.inspect_defs.put(address, .{ .ready = def_id });
         return def_id;
     }
@@ -4232,9 +4271,9 @@ const Builder = struct {
         return try self.lowLevelExpr(primitiveInspectLowLevelOp(primitive), &args, str_ty);
     }
 
-    fn inspectTuple(self: *Builder, value: Ast.ExprId, items: []const Type.TypeId, str_ty: Type.TypeId) Allocator.Error!Ast.ExprId {
+    fn inspectTuple(self: *Builder, value: Ast.ExprId, items: anytype, str_ty: Type.TypeId) Allocator.Error!Ast.ExprId {
         if (items.len == 0) return try self.stringExpr("()", str_ty);
-        const stable_items = try self.allocator.dupe(Type.TypeId, items);
+        const stable_items = try GuardedList.dupe(self.allocator, Type.TypeId, items);
         defer self.allocator.free(stable_items);
 
         var out = try self.stringExpr("(", str_ty);
@@ -4249,9 +4288,9 @@ const Builder = struct {
         return try self.concatExpr(out, try self.stringExpr(")", str_ty), str_ty);
     }
 
-    fn inspectRecord(self: *Builder, value: Ast.ExprId, fields: []const Type.Field, str_ty: Type.TypeId) Allocator.Error!Ast.ExprId {
+    fn inspectRecord(self: *Builder, value: Ast.ExprId, fields: anytype, str_ty: Type.TypeId) Allocator.Error!Ast.ExprId {
         if (fields.len == 0) return try self.stringExpr("{}", str_ty);
-        const stable_fields = try self.allocator.dupe(Type.Field, fields);
+        const stable_fields = try GuardedList.dupe(self.allocator, Type.Field, fields);
         defer self.allocator.free(stable_fields);
 
         var out = try self.stringExpr("{ ", str_ty);
@@ -4268,7 +4307,7 @@ const Builder = struct {
         return try self.concatExpr(out, try self.stringExpr(" }", str_ty), str_ty);
     }
 
-    fn inspectTagUnion(self: *Builder, value: Ast.ExprId, value_ty: Type.TypeId, tags: []const Type.Tag, str_ty: Type.TypeId) Allocator.Error!Ast.ExprId {
+    fn inspectTagUnion(self: *Builder, value: Ast.ExprId, value_ty: Type.TypeId, tags: anytype, str_ty: Type.TypeId) Allocator.Error!Ast.ExprId {
         if (tags.len == 0) {
             const msg = try self.program.addStringLiteral("uninhabited value reached Str.inspect");
             return try self.program.addExpr(.{
@@ -4276,14 +4315,14 @@ const Builder = struct {
                 .data = .{ .crash = msg },
             });
         }
-        const stable_tags = try self.allocator.dupe(Type.Tag, tags);
+        const stable_tags = try GuardedList.dupe(self.allocator, Type.Tag, tags);
         defer self.allocator.free(stable_tags);
 
         const branches = try self.allocator.alloc(Ast.Branch, stable_tags.len);
         defer self.allocator.free(branches);
 
         for (stable_tags, 0..) |tag, i| {
-            const payload_tys = try self.allocator.dupe(Type.TypeId, self.program.types.span(tag.payloads));
+            const payload_tys = try GuardedList.dupe(self.allocator, Type.TypeId, self.program.types.span(tag.payloads));
             defer self.allocator.free(payload_tys);
             const payload_pats = try self.allocator.alloc(Ast.PatId, payload_tys.len);
             defer self.allocator.free(payload_pats);
@@ -4444,7 +4483,7 @@ const Builder = struct {
     fn singleTypeArg(self: *Builder, span: Type.Span, comptime owner: []const u8) Type.TypeId {
         const args = self.program.types.span(span);
         if (args.len != 1) Common.invariant(owner ++ " type reached Monotype inspect lowering without one type argument");
-        return args[0];
+        return GuardedList.at(args, 0);
     }
 
     fn localExpr(self: *Builder, local: Ast.LocalId, ty: Type.TypeId) Allocator.Error!Ast.ExprId {
@@ -5324,26 +5363,26 @@ const BodyDraftStore = struct {
 
     fn finalIdOffsets(program: *const Ast.Program) FinalIdOffsets {
         return .{
-            .fn_start = @intCast(program.fns.items.len),
-            .def_start = @intCast(program.defs.items.len),
-            .nested_def_start = @intCast(program.nested_defs.items.len),
-            .expr_start = @intCast(program.exprs.items.len),
-            .pat_start = @intCast(program.pats.items.len),
-            .stmt_start = @intCast(program.stmts.items.len),
-            .local_start = @intCast(program.locals.items.len),
-            .string_literal_start = @intCast(program.string_literals.items.len),
-            .comptime_site_start = @intCast(program.comptime_sites.items.len),
-            .expr_ids_start = @intCast(program.expr_ids.items.len),
-            .pat_ids_start = @intCast(program.pat_ids.items.len),
-            .typed_locals_start = @intCast(program.typed_locals.items.len),
-            .stmt_ids_start = @intCast(program.stmt_ids.items.len),
-            .field_expr_start = @intCast(program.field_exprs.items.len),
-            .fn_def_capture_start = @intCast(program.fn_def_captures.items.len),
-            .record_destruct_start = @intCast(program.record_destructs.items.len),
-            .str_pattern_step_start = @intCast(program.str_pattern_steps.items.len),
-            .branch_start = @intCast(program.branches.items.len),
-            .if_branch_start = @intCast(program.if_branches.items.len),
-            .source_file_start = @intCast(program.source_files.items.len),
+            .fn_start = @intCast(program.fnCount()),
+            .def_start = @intCast(program.defCount()),
+            .nested_def_start = @intCast(program.nestedDefCount()),
+            .expr_start = @intCast(program.exprCount()),
+            .pat_start = @intCast(program.patCount()),
+            .stmt_start = @intCast(program.stmtCount()),
+            .local_start = @intCast(program.localCount()),
+            .string_literal_start = @intCast(program.stringLiteralCount()),
+            .comptime_site_start = @intCast(program.comptimeSiteCount()),
+            .expr_ids_start = @intCast(program.exprIdCount()),
+            .pat_ids_start = @intCast(program.patIdCount()),
+            .typed_locals_start = @intCast(program.typedLocalCount()),
+            .stmt_ids_start = @intCast(program.stmtIdCount()),
+            .field_expr_start = @intCast(program.fieldExprCount()),
+            .fn_def_capture_start = @intCast(program.fnDefCaptureCount()),
+            .record_destruct_start = @intCast(program.recordDestructCount()),
+            .str_pattern_step_start = @intCast(program.strPatternStepCount()),
+            .branch_start = @intCast(program.branchCount()),
+            .if_branch_start = @intCast(program.ifBranchCount()),
+            .source_file_start = @intCast(program.sourceFileCount()),
         };
     }
 
@@ -5500,7 +5539,7 @@ const BodyDraftStore = struct {
             const sealed_fn_id = if (def.fn_id) |fn_id| ids.fnTarget(fn_id) else null;
             if (sealed_fn_def) |template| {
                 if (sealed_fn_id) |fn_id| {
-                    program.fns.items[@intFromEnum(fn_id)].source = template;
+                    program.setFnSource(fn_id, template);
                 }
             }
             program.defs.appendAssumeCapacity(.{
@@ -5517,7 +5556,7 @@ const BodyDraftStore = struct {
         for (self.nested_defs.items) |def| {
             const sealed_fn_def = try BodyDraftStore.sealFnTemplate(graph, sealer, def.fn_def);
             const sealed_fn_id = ids.fnTarget(def.fn_id);
-            program.fns.items[@intFromEnum(sealed_fn_id)].source = sealed_fn_def;
+            program.setFnSource(sealed_fn_id, sealed_fn_def);
             program.nested_defs.appendAssumeCapacity(.{
                 .symbol = def.symbol,
                 .fn_def = sealed_fn_def,
@@ -6105,9 +6144,10 @@ const BodyContext = struct {
         var hasher = std.crypto.hash.sha2.Sha256.init(.{});
         hasher.update("roc.parser_precomputed_record");
         const fields = self.recordFieldsForShape(shape_ty);
-        var count = std.mem.nativeToLittle(u32, @intCast(fields.len));
+        var count = std.mem.nativeToLittle(u32, @intCast(GuardedList.borrowLen(fields)));
         hasher.update(std.mem.asBytes(&count));
-        for (fields) |field| {
+        for (0..GuardedList.borrowLen(fields)) |index| {
+            const field = GuardedList.at(fields, index);
             const label = self.builder.program.names.recordFieldLabelText(field.name);
             var label_len = std.mem.nativeToLittle(u32, @intCast(label.len));
             hasher.update(std.mem.asBytes(&label_len));
@@ -6618,9 +6658,9 @@ const BodyContext = struct {
         return try self.lowLevelExpr(primitiveInspectLowLevelOp(primitive), &args, str_ty);
     }
 
-    fn inspectTuple(self: *BodyContext, value: DraftExprId, items: []const Type.TypeId, str_ty: Type.TypeId) Allocator.Error!DraftExprId {
+    fn inspectTuple(self: *BodyContext, value: DraftExprId, items: anytype, str_ty: Type.TypeId) Allocator.Error!DraftExprId {
         if (items.len == 0) return try self.stringExpr("()", str_ty);
-        const stable_items = try self.allocator.dupe(Type.TypeId, items);
+        const stable_items = try GuardedList.dupe(self.allocator, Type.TypeId, items);
         defer self.allocator.free(stable_items);
 
         var out = try self.stringExpr("(", str_ty);
@@ -6635,9 +6675,9 @@ const BodyContext = struct {
         return try self.concatExpr(out, try self.stringExpr(")", str_ty), str_ty);
     }
 
-    fn inspectRecord(self: *BodyContext, value: DraftExprId, fields: []const Type.Field, str_ty: Type.TypeId) Allocator.Error!DraftExprId {
+    fn inspectRecord(self: *BodyContext, value: DraftExprId, fields: anytype, str_ty: Type.TypeId) Allocator.Error!DraftExprId {
         if (fields.len == 0) return try self.stringExpr("{}", str_ty);
-        const stable_fields = try self.allocator.dupe(Type.Field, fields);
+        const stable_fields = try GuardedList.dupe(self.allocator, Type.Field, fields);
         defer self.allocator.free(stable_fields);
 
         var out = try self.stringExpr("{ ", str_ty);
@@ -6654,7 +6694,7 @@ const BodyContext = struct {
         return try self.concatExpr(out, try self.stringExpr(" }", str_ty), str_ty);
     }
 
-    fn inspectTagUnion(self: *BodyContext, value: DraftExprId, value_ty: Type.TypeId, tags: []const Type.Tag, str_ty: Type.TypeId) Allocator.Error!DraftExprId {
+    fn inspectTagUnion(self: *BodyContext, value: DraftExprId, value_ty: Type.TypeId, tags: anytype, str_ty: Type.TypeId) Allocator.Error!DraftExprId {
         if (tags.len == 0) {
             const msg = try self.addStringLiteral("uninhabited value reached Str.inspect");
             return try self.addExpr(.{
@@ -6662,14 +6702,14 @@ const BodyContext = struct {
                 .data = .{ .crash = msg },
             });
         }
-        const stable_tags = try self.allocator.dupe(Type.Tag, tags);
+        const stable_tags = try GuardedList.dupe(self.allocator, Type.Tag, tags);
         defer self.allocator.free(stable_tags);
 
         const branches = try self.allocator.alloc(DraftBranch, stable_tags.len);
         defer self.allocator.free(branches);
 
         for (stable_tags, 0..) |tag, i| {
-            const payload_tys = try self.allocator.dupe(Type.TypeId, self.builder.program.types.span(tag.payloads));
+            const payload_tys = try GuardedList.dupe(self.allocator, Type.TypeId, self.builder.program.types.span(tag.payloads));
             defer self.allocator.free(payload_tys);
             const payload_pats = try self.allocator.alloc(DraftPatId, payload_tys.len);
             defer self.allocator.free(payload_pats);
@@ -7931,7 +7971,7 @@ const BodyContext = struct {
 
     fn lowerStrInspectIntrinsic(self: *BodyContext, fn_ty: Type.TypeId, ret_ty: Type.TypeId) Allocator.Error!LoweredTemplateBody {
         const fn_data = self.builder.functionShape(fn_ty, "Str.inspect intrinsic had a non-function type");
-        const arg_tys = try self.allocator.dupe(Type.TypeId, self.builder.program.types.span(fn_data.args));
+        const arg_tys = try GuardedList.dupe(self.allocator, Type.TypeId, self.builder.program.types.span(fn_data.args));
         defer self.allocator.free(arg_tys);
         if (arg_tys.len != 1) Common.invariant("Str.inspect intrinsic requires exactly one argument");
 
@@ -7948,7 +7988,7 @@ const BodyContext = struct {
 
     fn lowerLambdaTemplate(self: *BodyContext, lambda: anytype, fn_ty: Type.TypeId) Allocator.Error!LoweredTemplateBody {
         const fn_data = self.builder.functionShape(fn_ty, "lambda template had a non-function type");
-        const arg_tys = try self.allocator.dupe(Type.TypeId, self.builder.program.types.span(fn_data.args));
+        const arg_tys = try GuardedList.dupe(self.allocator, Type.TypeId, self.builder.program.types.span(fn_data.args));
         defer self.allocator.free(arg_tys);
         if (arg_tys.len != lambda.args.len) Common.invariant("lambda template arity differs from concrete function type");
 
@@ -8836,10 +8876,12 @@ const BodyContext = struct {
         const fields_value = try self.lowerParseIntrinsicArgAtType(args[0], arg_tys[0]);
         const rename_value = try self.lowerParseIntrinsicArgAtType(args[1], arg_tys[1]);
         if (self.generatedFieldNamesBackingValueFieldNames(arg_tys[0])) |backing_fields| {
+            const stable_backing_fields = try GuardedList.dupe(self.allocator, Type.Field, backing_fields);
+            defer self.allocator.free(stable_backing_fields);
             const fields_local = try self.addLocal(self.builder.symbols.fresh(), ret_ty);
             const rename_local = try self.addLocal(self.builder.symbols.fresh(), arg_tys[1]);
             var body = try self.lowerGeneratedFieldNamesRenameFieldNames(
-                backing_fields,
+                stable_backing_fields,
                 ret_ty,
                 fields_local,
                 rename_local,
@@ -8896,17 +8938,19 @@ const BodyContext = struct {
     ) Allocator.Error!DraftExprId {
         const info = self.generatedFieldNamesBackingInfoFromBacking(fields_backing_ty) orelse
             Common.invariant("generated FieldNames value expected a generated backing type");
-        if (backing_fields.len != info.item_fields.len) Common.invariant("generated FieldNames rename arity differed from item count");
+        const item_fields = try GuardedList.dupe(self.allocator, Type.Field, info.item_fields);
+        defer self.allocator.free(item_fields);
+        if (backing_fields.len != item_fields.len) Common.invariant("generated FieldNames rename arity differed from item count");
         const str_ty = try self.builder.primitiveType(.str);
-        const lowered_items = try self.allocator.alloc(DraftFieldExpr, info.item_fields.len);
+        const lowered_items = try self.allocator.alloc(DraftFieldExpr, item_fields.len);
         defer self.allocator.free(lowered_items);
-        const item_locals = try self.allocator.alloc(DraftLocalId, info.item_fields.len);
+        const item_locals = try self.allocator.alloc(DraftLocalId, item_fields.len);
         defer self.allocator.free(item_locals);
-        const item_exprs = try self.allocator.alloc(DraftExprId, info.item_fields.len);
+        const item_exprs = try self.allocator.alloc(DraftExprId, item_fields.len);
         defer self.allocator.free(item_exprs);
-        const renamed_name_locals = try self.allocator.alloc(DraftLocalId, info.item_fields.len);
+        const renamed_name_locals = try self.allocator.alloc(DraftLocalId, item_fields.len);
         defer self.allocator.free(renamed_name_locals);
-        const renamed_name_exprs = try self.allocator.alloc(DraftExprId, info.item_fields.len);
+        const renamed_name_exprs = try self.allocator.alloc(DraftExprId, item_fields.len);
         defer self.allocator.free(renamed_name_exprs);
 
         const items_expr = try self.addExpr(.{
@@ -8918,7 +8962,7 @@ const BodyContext = struct {
         });
         const items_local = try self.addLocal(self.builder.symbols.fresh(), info.items_field.ty);
 
-        for (info.item_fields, 0..) |field, index| {
+        for (item_fields, 0..) |field, index| {
             const field_ty = field.ty;
             item_exprs[index] = try self.addExpr(.{
                 .ty = field_ty,
@@ -8960,7 +9004,8 @@ const BodyContext = struct {
         const bound_exprs = try self.fieldNameBoundExprsFromLocals(renamed_name_locals, null, info.shortest_field.ty);
         const shortest_expr = bound_exprs[0];
         const longest_expr = bound_exprs[1];
-        const backing_type_fields = self.builder.program.types.fieldSpan(self.builder.recordFieldsSpan(fields_backing_ty));
+        const backing_type_fields = try GuardedList.dupe(self.allocator, Type.Field, self.builder.program.types.fieldSpan(self.builder.recordFieldsSpan(fields_backing_ty)));
+        defer self.allocator.free(backing_type_fields);
         const backing_values = try self.allocator.alloc(DraftFieldExpr, backing_type_fields.len);
         defer self.allocator.free(backing_values);
         for (backing_type_fields, 0..) |field, index| {
@@ -8986,7 +9031,7 @@ const BodyContext = struct {
             .data = .{ .nominal = backing_expr },
         });
         var body = renamed_fields;
-        var index = info.item_fields.len;
+        var index = item_fields.len;
         while (index > 0) {
             index -= 1;
             body = try self.wrapLet(
@@ -8998,7 +9043,7 @@ const BodyContext = struct {
             );
             body = try self.wrapLet(
                 item_locals[index],
-                info.item_fields[index].ty,
+                item_fields[index].ty,
                 item_exprs[index],
                 body,
                 fields_ty,
@@ -9018,7 +9063,8 @@ const BodyContext = struct {
         if (!self.typeHasBuiltinOwner(ret_ty, .u64)) Common.invariant("FieldNames name bound result was not U64");
 
         const shape_ty = self.fieldsShapeType(arg_tys[0]);
-        const fields = self.recordFieldsForShape(shape_ty);
+        const fields = try GuardedList.dupe(self.allocator, Type.Field, self.recordFieldsForShape(shape_ty));
+        defer self.allocator.free(fields);
         const fields_value = try self.lowerParseIntrinsicArgAtType(args[0], arg_tys[0]);
         if (self.generatedFieldNamesBackingInfo(arg_tys[0])) |info| {
             const fields_local = try self.addLocal(self.builder.symbols.fresh(), arg_tys[0]);
@@ -9190,16 +9236,18 @@ const BodyContext = struct {
     ) Allocator.Error!DraftExprId {
         const info = self.generatedFieldNamesBackingInfoFromBacking(fields_backing_ty) orelse
             Common.invariant("generated FieldNames backing did not have the expected shape");
-        if (info.item_fields.len != renamed_field_locals.len) Common.invariant("generated FieldNames backing arity differed from renamed field count");
+        const item_fields = try GuardedList.dupe(self.allocator, Type.Field, info.item_fields);
+        defer self.allocator.free(item_fields);
+        if (item_fields.len != renamed_field_locals.len) Common.invariant("generated FieldNames backing arity differed from renamed field count");
         if (renamed_field_lengths) |lengths| {
             if (lengths.len != renamed_field_locals.len) Common.invariant("generated FieldNames backing length arity differed from renamed field count");
         }
 
         const str_ty = try self.builder.primitiveType(.str);
-        const item_values = try self.allocator.alloc(DraftFieldExpr, info.item_fields.len);
+        const item_values = try self.allocator.alloc(DraftFieldExpr, item_fields.len);
         defer self.allocator.free(item_values);
 
-        for (info.item_fields, 0..) |field, index| {
+        for (item_fields, 0..) |field, index| {
             const name_expr = try self.localExpr(renamed_field_locals[index], str_ty);
             const name_len_expr = if (renamed_field_lengths) |lengths|
                 try self.intLiteralExpr(lengths[index], try self.builder.primitiveType(.u64))
@@ -9229,7 +9277,8 @@ const BodyContext = struct {
         const backing_type_fields = self.builder.program.types.fieldSpan(self.builder.recordFieldsSpan(fields_backing_ty));
         const backing_values = try self.allocator.alloc(DraftFieldExpr, backing_type_fields.len);
         defer self.allocator.free(backing_values);
-        for (backing_type_fields, 0..) |field, index| {
+        for (0..GuardedList.borrowLen(backing_type_fields)) |index| {
+            const field = GuardedList.at(backing_type_fields, index);
             const label = self.builder.program.names.recordFieldLabelText(field.name);
             backing_values[index] = .{
                 .name = field.name,
@@ -9413,7 +9462,8 @@ const BodyContext = struct {
         if (args.len != expected_arity or arg_tys.len != expected_arity) Common.invariant("FieldNames iterator reached Monotype with an unexpected arity");
 
         const shape_ty = self.fieldsShapeType(arg_tys[0]);
-        const fields = self.recordFieldsForShape(shape_ty);
+        const fields = try GuardedList.dupe(self.allocator, Type.Field, self.recordFieldsForShape(shape_ty));
+        defer self.allocator.free(fields);
         const backing_ty = self.builder.namedBackingType(ret_ty) orelse
             Common.invariant("FieldNames iterator result was not an Iter nominal type");
         const len_field = self.recordFieldByText(backing_ty, "len_if_known");
@@ -9487,7 +9537,7 @@ const BodyContext = struct {
         items_field: Type.Field,
         shortest_field: Type.Field,
         longest_field: Type.Field,
-        item_fields: []const Type.Field,
+        item_fields: TypeFieldSpanBorrow,
     };
 
     fn generatedFieldNamesBackingInfo(
@@ -9510,7 +9560,7 @@ const BodyContext = struct {
         if (!self.typeHasBuiltinOwner(longest_field.ty, .u64)) return null;
         const item_fields = switch (self.builder.shapeContent(items_field.ty)) {
             .record => |span| self.builder.program.types.fieldSpan(span),
-            .zst => &.{},
+            .zst => self.builder.program.types.fieldSpan(.empty()),
             else => return null,
         };
         return .{
@@ -9526,10 +9576,11 @@ const BodyContext = struct {
         fields_ty: Type.TypeId,
         field_handle_ty: Type.TypeId,
         expected_count: usize,
-    ) ?[]const Type.Field {
+    ) ?TypeFieldSpanBorrow {
         const info = self.generatedFieldNamesBackingInfo(fields_ty) orelse return null;
         if (info.item_fields.len != expected_count) return null;
-        for (info.item_fields) |field| {
+        for (0..GuardedList.borrowLen(info.item_fields)) |index| {
+            const field = GuardedList.at(info.item_fields, index);
             if (!self.sameType(field.ty, field_handle_ty)) return null;
         }
         return info.item_fields;
@@ -9538,9 +9589,10 @@ const BodyContext = struct {
     fn generatedFieldNamesBackingValueFieldNames(
         self: *BodyContext,
         fields_ty: Type.TypeId,
-    ) ?[]const Type.Field {
+    ) ?TypeFieldSpanBorrow {
         const info = self.generatedFieldNamesBackingInfo(fields_ty) orelse return null;
-        for (info.item_fields) |field| {
+        for (0..GuardedList.borrowLen(info.item_fields)) |index| {
+            const field = GuardedList.at(info.item_fields, index);
             if (!self.typeHasBuiltinOwner(field.ty, .field)) return null;
         }
         return info.item_fields;
@@ -9551,7 +9603,7 @@ const BodyContext = struct {
     }
 
     const GeneratedParseTagUnionSpecBackingInfo = struct {
-        record_fields: []const Type.Field,
+        record_fields: TypeFieldSpanBorrow,
     };
 
     fn generatedParseTagUnionSpecBackingInfo(
@@ -9562,7 +9614,7 @@ const BodyContext = struct {
         const backing_ty = self.builder.namedBackingType(spec_ty) orelse return null;
         const record_fields = switch (self.builder.shapeContent(backing_ty)) {
             .record => |span| self.builder.program.types.fieldSpan(span),
-            .zst => &.{},
+            .zst => self.builder.program.types.fieldSpan(.empty()),
             else => return null,
         };
         if (record_fields.len == 0) return null;
@@ -9588,7 +9640,9 @@ const BodyContext = struct {
 
     fn functionHasGeneratedOpaqueEvidence(self: *BodyContext, fn_ty: Type.TypeId) bool {
         const function = self.builder.functionShape(fn_ty, "generated opaque evidence check requested for a non-function type");
-        for (self.builder.program.types.span(function.args)) |arg| {
+        const args = self.builder.program.types.span(function.args);
+        for (0..GuardedList.borrowLen(args)) |index| {
+            const arg = GuardedList.at(args, index);
             if (self.isGeneratedOpaqueEvidenceType(arg)) return true;
         }
         return self.isGeneratedOpaqueEvidenceType(function.ret);
@@ -9619,7 +9673,8 @@ const BodyContext = struct {
         var changed = false;
         const public_args = try self.allocator.alloc(Type.TypeId, args.len);
         defer self.allocator.free(public_args);
-        for (args, 0..) |arg, index| {
+        for (0..GuardedList.borrowLen(args)) |index| {
+            const arg = GuardedList.at(args, index);
             public_args[index] = try self.publicOpaqueUnificationType(arg);
             if (public_args[index] != arg) changed = true;
         }
@@ -9632,7 +9687,7 @@ const BodyContext = struct {
 
     fn lowerFieldNamesValueIter(
         self: *BodyContext,
-        backing_fields: []const Type.Field,
+        backing_fields: anytype,
         fields_ty: Type.TypeId,
         fields_local: DraftLocalId,
         field_handle_ty: Type.TypeId,
@@ -9650,7 +9705,9 @@ const BodyContext = struct {
             Common.invariant("generated FieldNames value expected a named backing type");
         const info = self.generatedFieldNamesBackingInfoFromBacking(fields_backing_ty) orelse
             Common.invariant("generated FieldNames value expected a generated backing type");
-        if (backing_fields.len != info.item_fields.len) Common.invariant("generated FieldNames iterator arity differed from item count");
+        const item_fields = try GuardedList.dupe(self.allocator, Type.Field, info.item_fields);
+        defer self.allocator.free(item_fields);
+        if (GuardedList.borrowLen(backing_fields) != item_fields.len) Common.invariant("generated FieldNames iterator arity differed from item count");
         const backing_local = try self.addLocal(self.builder.symbols.fresh(), fields_backing_ty);
         const items_expr = try self.addExpr(.{
             .ty = info.items_field.ty,
@@ -9661,7 +9718,7 @@ const BodyContext = struct {
         });
         const items_local = try self.addLocal(self.builder.symbols.fresh(), info.items_field.ty);
         const body = try self.lowerFieldNamesValueIterFromIndex(
-            info.item_fields,
+            item_fields,
             info.items_field.ty,
             items_local,
             0,
@@ -10024,7 +10081,7 @@ const BodyContext = struct {
         const one_tag = self.monoTagByText(step_ret_ty, "One");
         const one_payloads = self.builder.program.types.span(one_tag.payloads);
         if (one_payloads.len != 1) Common.invariant("Iter step One tag did not have one record payload");
-        const one_payload = try self.lowerInterpolationOnePayload(one_payloads[0], item_expr, rest_expr);
+        const one_payload = try self.lowerInterpolationOnePayload(GuardedList.at(one_payloads, 0), item_expr, rest_expr);
         const one_body = try self.addExpr(.{ .ty = step_ret_ty, .data = .{ .tag = .{
             .name = one_tag.name,
             .payloads = try self.addExprSpan(&[_]DraftExprId{one_payload}),
@@ -10052,7 +10109,7 @@ const BodyContext = struct {
         const one_tag = self.monoTagByText(step_ret_ty, "One");
         const one_payloads = self.builder.program.types.span(one_tag.payloads);
         if (one_payloads.len != 1) Common.invariant("Iter step One tag did not have one record payload");
-        const one_payload = try self.lowerInterpolationOnePayload(one_payloads[0], item_local_expr, rest_expr);
+        const one_payload = try self.lowerInterpolationOnePayload(GuardedList.at(one_payloads, 0), item_local_expr, rest_expr);
         const one_body = try self.addExpr(.{ .ty = step_ret_ty, .data = .{ .tag = .{
             .name = one_tag.name,
             .payloads = try self.addExprSpan(&[_]DraftExprId{one_payload}),
@@ -10061,7 +10118,7 @@ const BodyContext = struct {
         const skip_tag = self.monoTagByText(step_ret_ty, "Skip");
         const skip_payloads = self.builder.program.types.span(skip_tag.payloads);
         if (skip_payloads.len != 1) Common.invariant("Iter step Skip tag did not have one record payload");
-        const skip_payload = try self.lowerInterpolationSkipPayload(skip_payloads[0], rest_expr);
+        const skip_payload = try self.lowerInterpolationSkipPayload(GuardedList.at(skip_payloads, 0), rest_expr);
         const skip_body = try self.addExpr(.{ .ty = step_ret_ty, .data = .{ .tag = .{
             .name = skip_tag.name,
             .payloads = try self.addExprSpan(&[_]DraftExprId{skip_payload}),
@@ -10091,7 +10148,8 @@ const BodyContext = struct {
         const lowered = try self.allocator.alloc(DraftFieldExpr, fields.len);
         defer self.allocator.free(lowered);
 
-        for (fields, 0..) |field, i| {
+        for (0..GuardedList.borrowLen(fields)) |i| {
+            const field = GuardedList.at(fields, i);
             const label = self.builder.program.names.recordFieldLabelText(field.name);
             lowered[i] = .{
                 .name = field.name,
@@ -10192,7 +10250,8 @@ const BodyContext = struct {
         var saw_name = false;
         var saw_index = false;
         var saw_name_len = false;
-        for (fields, 0..) |field, i| {
+        for (0..GuardedList.borrowLen(fields)) |i| {
+            const field = GuardedList.at(fields, i);
             const label = self.builder.program.names.recordFieldLabelText(field.name);
             lowered[i] = .{
                 .name = field.name,
@@ -10231,18 +10290,22 @@ const BodyContext = struct {
             .named => |named| blk: {
                 const args = self.builder.program.types.span(named.args);
                 if (args.len != 1) Common.invariant("FieldNames nominal did not have one type argument");
-                break :blk args[0];
+                break :blk GuardedList.at(args, 0);
             },
             else => Common.invariant("FieldNames value was not a named type"),
         };
     }
 
-    fn recordFieldsForShape(self: *BodyContext, shape_ty: Type.TypeId) []const Type.Field {
+    fn recordFieldsForShape(self: *BodyContext, shape_ty: Type.TypeId) TypeFieldSpanBorrow {
         return switch (self.builder.shapeContent(shape_ty)) {
             .record => |span| self.builder.program.types.fieldSpan(span),
-            .zst => &.{},
+            .zst => self.builder.program.types.fieldSpan(.empty()),
             else => Common.invariant("FieldNames metadata requested for a non-record shape"),
         };
+    }
+
+    fn dupeRecordFieldsForShape(self: *BodyContext, shape_ty: Type.TypeId) Allocator.Error![]Type.Field {
+        return try GuardedList.dupe(self.allocator, Type.Field, self.recordFieldsForShape(shape_ty));
     }
 
     fn parserRecordFieldRank(
@@ -10325,7 +10388,7 @@ const BodyContext = struct {
             .list => |elem_ty| try self.buildParserConstructionPrecomputedPlan(plan, elem_ty, encoding_expr, encoding_ty, str_ty),
             .box => |payload_ty| try self.buildParserConstructionPrecomputedPlan(plan, payload_ty, encoding_expr, encoding_ty, str_ty),
             .tuple => |span| {
-                const item_tys = try self.allocator.dupe(Type.TypeId, self.builder.program.types.span(span));
+                const item_tys = try GuardedList.dupe(self.allocator, Type.TypeId, self.builder.program.types.span(span));
                 defer self.allocator.free(item_tys);
                 for (item_tys) |elem_ty| {
                     try self.buildParserConstructionPrecomputedPlan(plan, elem_ty, encoding_expr, encoding_ty, str_ty);
@@ -10333,8 +10396,12 @@ const BodyContext = struct {
             },
             .record, .zst => try self.buildParserConstructionRecordPrecomputedPlan(plan, shape_ty, encoding_expr, encoding_ty, str_ty),
             .tag_union => |span| {
-                for (self.builder.program.types.tagSpan(span)) |tag| {
-                    for (self.builder.program.types.span(tag.payloads)) |payload_ty| {
+                const tags = try GuardedList.dupe(self.allocator, Type.Tag, self.builder.program.types.tagSpan(span));
+                defer self.allocator.free(tags);
+                for (tags) |tag| {
+                    const payload_tys = try GuardedList.dupe(self.allocator, Type.TypeId, self.builder.program.types.span(tag.payloads));
+                    defer self.allocator.free(payload_tys);
+                    for (payload_tys) |payload_ty| {
                         try self.buildParserConstructionPrecomputedPlan(plan, payload_ty, encoding_expr, encoding_ty, str_ty);
                     }
                 }
@@ -10367,7 +10434,7 @@ const BodyContext = struct {
             .list => |elem_ty| try self.buildEncodeConstructionPrecomputedPlan(plan, elem_ty, encoding_expr, encoding_ty, str_ty),
             .box => |payload_ty| try self.buildEncodeConstructionPrecomputedPlan(plan, payload_ty, encoding_expr, encoding_ty, str_ty),
             .tuple => |span| {
-                const item_tys = try self.allocator.dupe(Type.TypeId, self.builder.program.types.span(span));
+                const item_tys = try GuardedList.dupe(self.allocator, Type.TypeId, self.builder.program.types.span(span));
                 defer self.allocator.free(item_tys);
                 for (item_tys) |elem_ty| {
                     try self.buildEncodeConstructionPrecomputedPlan(plan, elem_ty, encoding_expr, encoding_ty, str_ty);
@@ -10375,13 +10442,19 @@ const BodyContext = struct {
             },
             .record, .zst => {
                 try self.buildEncodeConstructionRecordPrecomputedPlan(plan, shape_ty, encoding_expr, encoding_ty, str_ty);
-                for (self.recordFieldsForShape(shape_ty)) |field| {
+                const fields = try self.dupeRecordFieldsForShape(shape_ty);
+                defer self.allocator.free(fields);
+                for (fields) |field| {
                     try self.buildEncodeConstructionPrecomputedPlan(plan, self.encodeRecordFieldPayloadType(field.ty, encoding_ty), encoding_expr, encoding_ty, str_ty);
                 }
             },
             .tag_union => |span| {
-                for (self.builder.program.types.tagSpan(span)) |tag| {
-                    for (self.builder.program.types.span(tag.payloads)) |payload_ty| {
+                const tags = try GuardedList.dupe(self.allocator, Type.Tag, self.builder.program.types.tagSpan(span));
+                defer self.allocator.free(tags);
+                for (tags) |tag| {
+                    const payload_tys = try GuardedList.dupe(self.allocator, Type.TypeId, self.builder.program.types.span(tag.payloads));
+                    defer self.allocator.free(payload_tys);
+                    for (payload_tys) |payload_ty| {
                         try self.buildEncodeConstructionPrecomputedPlan(plan, payload_ty, encoding_expr, encoding_ty, str_ty);
                     }
                 }
@@ -10416,7 +10489,7 @@ const BodyContext = struct {
             .list => |elem_ty| try self.buildEncodeRestoredPrecomputedPlan(plan, fn_value, store_view, fn_view, elem_ty, encoding_ty, str_ty),
             .box => |payload_ty| try self.buildEncodeRestoredPrecomputedPlan(plan, fn_value, store_view, fn_view, payload_ty, encoding_ty, str_ty),
             .tuple => |span| {
-                const item_tys = try self.allocator.dupe(Type.TypeId, self.builder.program.types.span(span));
+                const item_tys = try GuardedList.dupe(self.allocator, Type.TypeId, self.builder.program.types.span(span));
                 defer self.allocator.free(item_tys);
                 for (item_tys) |elem_ty| {
                     try self.buildEncodeRestoredPrecomputedPlan(plan, fn_value, store_view, fn_view, elem_ty, encoding_ty, str_ty);
@@ -10424,13 +10497,19 @@ const BodyContext = struct {
             },
             .record, .zst => {
                 try self.buildEncodeRestoredRecordPrecomputedPlan(plan, fn_value, store_view, fn_view, shape_ty, str_ty);
-                for (self.recordFieldsForShape(shape_ty)) |field| {
+                const fields = try self.dupeRecordFieldsForShape(shape_ty);
+                defer self.allocator.free(fields);
+                for (fields) |field| {
                     try self.buildEncodeRestoredPrecomputedPlan(plan, fn_value, store_view, fn_view, self.encodeRecordFieldPayloadType(field.ty, encoding_ty), encoding_ty, str_ty);
                 }
             },
             .tag_union => |span| {
-                for (self.builder.program.types.tagSpan(span)) |tag| {
-                    for (self.builder.program.types.span(tag.payloads)) |payload_ty| {
+                const tags = try GuardedList.dupe(self.allocator, Type.Tag, self.builder.program.types.tagSpan(span));
+                defer self.allocator.free(tags);
+                for (tags) |tag| {
+                    const payload_tys = try GuardedList.dupe(self.allocator, Type.TypeId, self.builder.program.types.span(tag.payloads));
+                    defer self.allocator.free(payload_tys);
+                    for (payload_tys) |payload_ty| {
                         try self.buildEncodeRestoredPrecomputedPlan(plan, fn_value, store_view, fn_view, payload_ty, encoding_ty, str_ty);
                     }
                 }
@@ -10449,7 +10528,8 @@ const BodyContext = struct {
     ) Allocator.Error!void {
         if (self.parserPlanContains(plan, shape_ty)) return;
 
-        const fields = self.recordFieldsForShape(shape_ty);
+        const fields = try self.dupeRecordFieldsForShape(shape_ty);
+        defer self.allocator.free(fields);
         const locals = try self.allocator.alloc(DraftLocalId, fields.len);
         const values = try self.allocator.alloc(DraftExprId, fields.len);
         var inserted = false;
@@ -10493,7 +10573,8 @@ const BodyContext = struct {
     ) Allocator.Error!void {
         if (self.parserPlanContains(plan, shape_ty)) return;
 
-        const fields = self.recordFieldsForShape(shape_ty);
+        const fields = try self.dupeRecordFieldsForShape(shape_ty);
+        defer self.allocator.free(fields);
         const locals = try self.allocator.alloc(DraftLocalId, fields.len);
         const values = try self.allocator.alloc(DraftExprId, fields.len);
         var inserted = false;
@@ -10536,7 +10617,8 @@ const BodyContext = struct {
     ) Allocator.Error!void {
         if (self.parserPlanContains(plan, shape_ty)) return;
 
-        const fields = self.recordFieldsForShape(shape_ty);
+        const fields = try self.dupeRecordFieldsForShape(shape_ty);
+        defer self.allocator.free(fields);
         const locals = try self.allocator.alloc(DraftLocalId, fields.len);
         const values = try self.allocator.alloc(DraftExprId, fields.len);
         var inserted = false;
@@ -10598,7 +10680,7 @@ const BodyContext = struct {
             .list => |elem_ty| try self.buildParserRestoredPrecomputedPlan(plan, fn_value, store_view, fn_view, elem_ty, str_ty),
             .box => |payload_ty| try self.buildParserRestoredPrecomputedPlan(plan, fn_value, store_view, fn_view, payload_ty, str_ty),
             .tuple => |span| {
-                const item_tys = try self.allocator.dupe(Type.TypeId, self.builder.program.types.span(span));
+                const item_tys = try GuardedList.dupe(self.allocator, Type.TypeId, self.builder.program.types.span(span));
                 defer self.allocator.free(item_tys);
                 for (item_tys) |elem_ty| {
                     try self.buildParserRestoredPrecomputedPlan(plan, fn_value, store_view, fn_view, elem_ty, str_ty);
@@ -10606,8 +10688,12 @@ const BodyContext = struct {
             },
             .record, .zst => try self.buildParserRestoredRecordPrecomputedPlan(plan, fn_value, store_view, fn_view, shape_ty, str_ty),
             .tag_union => |span| {
-                for (self.builder.program.types.tagSpan(span)) |tag| {
-                    for (self.builder.program.types.span(tag.payloads)) |payload_ty| {
+                const tags = try GuardedList.dupe(self.allocator, Type.Tag, self.builder.program.types.tagSpan(span));
+                defer self.allocator.free(tags);
+                for (tags) |tag| {
+                    const payload_tys = try GuardedList.dupe(self.allocator, Type.TypeId, self.builder.program.types.span(tag.payloads));
+                    defer self.allocator.free(payload_tys);
+                    for (payload_tys) |payload_ty| {
                         try self.buildParserRestoredPrecomputedPlan(plan, fn_value, store_view, fn_view, payload_ty, str_ty);
                     }
                 }
@@ -10656,7 +10742,7 @@ const BodyContext = struct {
             .list => |elem_ty| try self.appendParserPrecomputedRecordShapes(plan, shapes, seen, elem_ty),
             .box => |payload_ty| try self.appendParserPrecomputedRecordShapes(plan, shapes, seen, payload_ty),
             .tuple => |span| {
-                const item_tys = try self.allocator.dupe(Type.TypeId, self.builder.program.types.span(span));
+                const item_tys = try GuardedList.dupe(self.allocator, Type.TypeId, self.builder.program.types.span(span));
                 defer self.allocator.free(item_tys);
                 for (item_tys) |elem_ty| {
                     try self.appendParserPrecomputedRecordShapes(plan, shapes, seen, elem_ty);
@@ -10666,13 +10752,19 @@ const BodyContext = struct {
                 if (plan == null or self.parserPlanContains(plan.?, shape_ty)) {
                     try shapes.append(self.allocator, shape_ty);
                 }
-                for (self.recordFieldsForShape(shape_ty)) |field| {
+                const fields = try self.dupeRecordFieldsForShape(shape_ty);
+                defer self.allocator.free(fields);
+                for (fields) |field| {
                     try self.appendParserPrecomputedRecordShapes(plan, shapes, seen, field.ty);
                 }
             },
             .tag_union => |span| {
-                for (self.builder.program.types.tagSpan(span)) |tag| {
-                    for (self.builder.program.types.span(tag.payloads)) |payload_ty| {
+                const tags = try GuardedList.dupe(self.allocator, Type.Tag, self.builder.program.types.tagSpan(span));
+                defer self.allocator.free(tags);
+                for (tags) |tag| {
+                    const payload_tys = try GuardedList.dupe(self.allocator, Type.TypeId, self.builder.program.types.span(tag.payloads));
+                    defer self.allocator.free(payload_tys);
+                    for (payload_tys) |payload_ty| {
                         try self.appendParserPrecomputedRecordShapes(plan, shapes, seen, payload_ty);
                     }
                 }
@@ -10708,7 +10800,8 @@ const BodyContext = struct {
         defer self.allocator.free(outer_fields);
 
         for (record_shapes, 0..) |record_shape, record_index| {
-            const record_fields = self.recordFieldsForShape(record_shape);
+            const record_fields = try self.dupeRecordFieldsForShape(record_shape);
+            defer self.allocator.free(record_fields);
             const inner_fields = try self.allocator.alloc(Type.Field, record_fields.len);
             defer self.allocator.free(inner_fields);
 
@@ -10739,7 +10832,8 @@ const BodyContext = struct {
         plan: *const ParserPrecomputedPlan,
     ) Allocator.Error!DraftExprId {
         const str_ty = try self.builder.primitiveType(.str);
-        const backing_fields = self.builder.program.types.fieldSpan(self.builder.recordFieldsSpan(spec_backing_ty));
+        const backing_fields = try GuardedList.dupe(self.allocator, Type.Field, self.builder.program.types.fieldSpan(self.builder.recordFieldsSpan(spec_backing_ty)));
+        defer self.allocator.free(backing_fields);
         if (backing_fields.len != record_shapes.len) Common.invariant("generated tag-union spec backing arity differed from record shape count");
 
         const outer_values = try self.allocator.alloc(DraftFieldExpr, record_shapes.len);
@@ -10748,7 +10842,8 @@ const BodyContext = struct {
         for (record_shapes, backing_fields, 0..) |record_shape, backing_field, record_index| {
             const precomputed = self.parserPlanGet(plan, record_shape) orelse
                 Common.invariant("generated tag-union spec requested missing parser precomputed record");
-            const inner_fields = self.builder.program.types.fieldSpan(self.builder.recordFieldsSpan(backing_field.ty));
+            const inner_fields = try GuardedList.dupe(self.allocator, Type.Field, self.builder.program.types.fieldSpan(self.builder.recordFieldsSpan(backing_field.ty)));
+            defer self.allocator.free(inner_fields);
             if (inner_fields.len != precomputed.renamed_field_locals.len) {
                 Common.invariant("generated tag-union spec record arity differed from precomputed record");
             }
@@ -10791,7 +10886,8 @@ const BodyContext = struct {
         const record_shapes = try self.parserPrecomputedRecordShapesForTagUnion(null, union_ty);
         defer self.allocator.free(record_shapes);
 
-        const backing_fields = self.builder.program.types.fieldSpan(self.builder.recordFieldsSpan(spec_backing_ty));
+        const backing_fields = try GuardedList.dupe(self.allocator, Type.Field, self.builder.program.types.fieldSpan(self.builder.recordFieldsSpan(spec_backing_ty)));
+        defer self.allocator.free(backing_fields);
         if (backing_fields.len != record_shapes.len) {
             Common.invariant("generated tag-union spec backing arity differed from payload record shape count");
         }
@@ -10800,8 +10896,10 @@ const BodyContext = struct {
         for (record_shapes, backing_fields) |record_shape, backing_field| {
             if (self.parserPlanContains(plan, record_shape)) continue;
 
-            const record_fields = self.recordFieldsForShape(record_shape);
-            const backing_record_fields = self.builder.program.types.fieldSpan(self.builder.recordFieldsSpan(backing_field.ty));
+            const record_fields = try self.dupeRecordFieldsForShape(record_shape);
+            defer self.allocator.free(record_fields);
+            const backing_record_fields = try GuardedList.dupe(self.allocator, Type.Field, self.builder.program.types.fieldSpan(self.builder.recordFieldsSpan(backing_field.ty)));
+            defer self.allocator.free(backing_record_fields);
             if (backing_record_fields.len != record_fields.len) {
                 Common.invariant("generated tag-union spec record arity differed from payload record arity");
             }
@@ -10859,7 +10957,8 @@ const BodyContext = struct {
     ) Allocator.Error!void {
         if (self.parserPlanContains(plan, shape_ty)) return;
 
-        const fields = self.recordFieldsForShape(shape_ty);
+        const fields = try self.dupeRecordFieldsForShape(shape_ty);
+        defer self.allocator.free(fields);
         const locals = try self.allocator.alloc(DraftLocalId, fields.len);
         const values = try self.allocator.alloc(DraftExprId, fields.len);
         const lengths = try self.allocator.alloc(u32, fields.len);
@@ -10942,8 +11041,8 @@ const BodyContext = struct {
         const parse_arg_tys = self.builder.program.types.span(parse_fn.args);
         if (!Ident.textEql(selected.tag_text, "TagUnion")) {
             if (parse_arg_tys.len != 2) Common.invariant("parser target scalar method had an unexpected arity");
-            if (!self.sameType(parse_arg_tys[0], encoding_ty)) Common.invariant("parser target encoding type differed from input encoding type");
-            if (!self.sameType(parse_arg_tys[1], state_ty)) Common.invariant("parser target state type differed from input state type");
+            if (!self.sameType(GuardedList.at(parse_arg_tys, 0), encoding_ty)) Common.invariant("parser target encoding type differed from input encoding type");
+            if (!self.sameType(GuardedList.at(parse_arg_tys, 1), state_ty)) Common.invariant("parser target state type differed from input state type");
 
             const parse_args = [_]DraftExprId{ encoding_expr, state_expr };
             return try self.addExpr(.{
@@ -10955,8 +11054,8 @@ const BodyContext = struct {
             });
         }
         if (parse_arg_tys.len != 3) Common.invariant("parser target tag-union method had an unexpected arity");
-        if (!self.sameType(parse_arg_tys[0], encoding_ty)) Common.invariant("parser target tag-union encoding type differed from input encoding type");
-        if (!self.sameType(parse_arg_tys[2], state_ty)) Common.invariant("parser target tag-union state type differed from input state type");
+        if (!self.sameType(GuardedList.at(parse_arg_tys, 0), encoding_ty)) Common.invariant("parser target tag-union encoding type differed from input encoding type");
+        if (!self.sameType(GuardedList.at(parse_arg_tys, 2), state_ty)) Common.invariant("parser target tag-union state type differed from input state type");
 
         const record_shapes = if (precomputed_plan) |plan|
             try self.parserPrecomputedRecordShapesForTagUnion(plan, shape_ty)
@@ -10967,8 +11066,8 @@ const BodyContext = struct {
         const has_generated_spec = precomputed_plan != null and record_shapes.len != 0;
         const spec_ty = if (has_generated_spec) blk: {
             const spec_backing_ty = try self.generatedParseTagUnionSpecBackingType(record_shapes);
-            break :blk try self.cloneNamedTypeWithArgs(parse_arg_tys[1], &.{shape_ty}, spec_backing_ty);
-        } else parse_arg_tys[1];
+            break :blk try self.cloneNamedTypeWithArgs(GuardedList.at(parse_arg_tys, 1), &.{shape_ty}, spec_backing_ty);
+        } else GuardedList.at(parse_arg_tys, 1);
         const callable_mono_ty = if (has_generated_spec)
             try self.methodTargetMonoTypeFromArgsPreservingArgs(parse_lookup, &.{ encoding_ty, spec_ty, state_ty }, ret_ty)
         else
@@ -10976,9 +11075,9 @@ const BodyContext = struct {
         const callable_fn = self.builder.functionShape(callable_mono_ty, "parser target tag-union method was not a function");
         const callable_arg_tys = self.builder.program.types.span(callable_fn.args);
         if (callable_arg_tys.len != 3) Common.invariant("parser target tag-union method had an unexpected arity");
-        if (!self.sameType(callable_arg_tys[0], encoding_ty)) Common.invariant("parser target tag-union encoding type differed from generated input encoding type");
-        if (!self.sameType(callable_arg_tys[1], spec_ty)) Common.invariant("parser target tag-union spec type differed from generated spec type");
-        if (!self.sameType(callable_arg_tys[2], state_ty)) Common.invariant("parser target tag-union state type differed from generated input state type");
+        if (!self.sameType(GuardedList.at(callable_arg_tys, 0), encoding_ty)) Common.invariant("parser target tag-union encoding type differed from generated input encoding type");
+        if (!self.sameType(GuardedList.at(callable_arg_tys, 1), spec_ty)) Common.invariant("parser target tag-union spec type differed from generated spec type");
+        if (!self.sameType(GuardedList.at(callable_arg_tys, 2), state_ty)) Common.invariant("parser target tag-union state type differed from generated input state type");
 
         const final_spec_expr = if (has_generated_spec) blk: {
             const plan = precomputed_plan orelse Common.invariant("generated tag-union spec requested without a precomputed plan");
@@ -11015,9 +11114,9 @@ const BodyContext = struct {
         const parse_ok_ty = try self.parseResultOkType(shape_ty, state_ty);
         if (!self.sameType(ret_info.ok_ty, parse_ok_ty)) Common.invariant("record parser return Ok type differed from generated parse result");
 
-        const record_fields = try self.allocator.dupe(Type.Field, switch (self.builder.shapeContent(shape_ty)) {
+        const record_fields = try GuardedList.dupe(self.allocator, Type.Field, switch (self.builder.shapeContent(shape_ty)) {
             .record => |span| self.builder.program.types.fieldSpan(span),
-            .zst => &.{},
+            .zst => self.builder.program.types.fieldSpan(.empty()),
             else => Common.invariant("record parser requested for a non-record shape"),
         });
         defer self.allocator.free(record_fields);
@@ -11061,7 +11160,7 @@ const BodyContext = struct {
         const parse_lookup = self.methodLookupForTypeName(encoding_ty, "parse_record_field");
         const generic_callable_ty = try self.methodTargetMonoTypeFromArgAtIndexIsolated(parse_lookup, 2, state_ty);
         const generic_parse_fn = self.builder.functionShape(generic_callable_ty, "parse_record_field target method was not a function");
-        const generic_arg_tys = try self.allocator.dupe(Type.TypeId, self.builder.program.types.span(generic_parse_fn.args));
+        const generic_arg_tys = try GuardedList.dupe(self.allocator, Type.TypeId, self.builder.program.types.span(generic_parse_fn.args));
         defer self.allocator.free(generic_arg_tys);
         if (generic_arg_tys.len != 3) Common.invariant("parse_record_field target method had an unexpected arity");
         if (!self.sameType(generic_arg_tys[0], encoding_ty)) Common.invariant("parse_record_field encoding type differed from input encoding type");
@@ -11083,9 +11182,9 @@ const BodyContext = struct {
         const parse_fn = self.builder.functionShape(callable_mono_ty, "parse_record_field target method was not a function");
         const parse_arg_tys = self.builder.program.types.span(parse_fn.args);
         if (parse_arg_tys.len != 3) Common.invariant("parse_record_field target method had an unexpected arity");
-        if (!self.sameType(parse_arg_tys[0], encoding_ty)) Common.invariant("parse_record_field encoding type differed from input encoding type");
-        if (!self.sameType(parse_arg_tys[1], fields_ty)) Common.invariant("parse_record_field fields type differed from generated field set type");
-        if (!self.sameType(parse_arg_tys[2], state_ty)) Common.invariant("parse_record_field state type differed from input state type");
+        if (!self.sameType(GuardedList.at(parse_arg_tys, 0), encoding_ty)) Common.invariant("parse_record_field encoding type differed from input encoding type");
+        if (!self.sameType(GuardedList.at(parse_arg_tys, 1), fields_ty)) Common.invariant("parse_record_field fields type differed from generated field set type");
+        if (!self.sameType(GuardedList.at(parse_arg_tys, 2), state_ty)) Common.invariant("parse_record_field state type differed from input state type");
 
         const str_ty = try self.builder.primitiveType(.str);
         var owned_renamed_field_locals: ?[]DraftLocalId = null;
@@ -11629,9 +11728,9 @@ const BodyContext = struct {
         record_slots: ParseRecordSlots,
         precomputed_plan: ?*const ParserPrecomputedPlan,
     ) Allocator.Error!DraftExprId {
-        const fields = try self.allocator.dupe(Type.Field, switch (self.builder.shapeContent(shape_ty)) {
+        const fields = try GuardedList.dupe(self.allocator, Type.Field, switch (self.builder.shapeContent(shape_ty)) {
             .record => |span| self.builder.program.types.fieldSpan(span),
-            .zst => &.{},
+            .zst => self.builder.program.types.fieldSpan(.empty()),
             else => Common.invariant("record direct field dispatch requested for a non-record shape"),
         });
         defer self.allocator.free(fields);
@@ -11702,9 +11801,9 @@ const BodyContext = struct {
         renamed_field_texts: ?[]const []const u8,
         mode: RecordFieldMatchMode,
     ) Allocator.Error!DraftExprId {
-        const fields = try self.allocator.dupe(Type.Field, switch (self.builder.shapeContent(shape_ty)) {
+        const fields = try GuardedList.dupe(self.allocator, Type.Field, switch (self.builder.shapeContent(shape_ty)) {
             .record => |span| self.builder.program.types.fieldSpan(span),
-            .zst => &.{},
+            .zst => self.builder.program.types.fieldSpan(.empty()),
             else => Common.invariant("record named field dispatch requested for a non-record shape"),
         });
         defer self.allocator.free(fields);
@@ -11771,8 +11870,8 @@ const BodyContext = struct {
         const skip_fn = self.builder.functionShape(callable_mono_ty, "skip_record_field target method was not a function");
         const arg_tys = self.builder.program.types.span(skip_fn.args);
         if (arg_tys.len != 2) Common.invariant("skip_record_field target method had an unexpected arity");
-        if (!self.sameType(arg_tys[0], encoding_ty)) Common.invariant("skip_record_field encoding type differed from record encoding type");
-        if (!self.sameType(arg_tys[1], state_ty)) Common.invariant("skip_record_field state type differed from record state type");
+        if (!self.sameType(GuardedList.at(arg_tys, 0), encoding_ty)) Common.invariant("skip_record_field encoding type differed from record encoding type");
+        if (!self.sameType(GuardedList.at(arg_tys, 1), state_ty)) Common.invariant("skip_record_field state type differed from record state type");
 
         const skip_expr = try self.addExpr(.{
             .ty = skip_try_ty,
@@ -11864,7 +11963,7 @@ const BodyContext = struct {
         switch (self.builder.shapeContent(shape_ty)) {
             .list => |elem_ty| return try self.lowerParseListFromState(elem_ty, shape_ty, encoding_expr, encoding_ty, state_expr, state_ty, ret_ty, precomputed_plan),
             .tuple => |items| {
-                const item_tys = try self.allocator.dupe(Type.TypeId, self.builder.program.types.span(items));
+                const item_tys = try GuardedList.dupe(self.allocator, Type.TypeId, self.builder.program.types.span(items));
                 defer self.allocator.free(item_tys);
                 return try self.lowerParseTupleFromState(item_tys, shape_ty, encoding_expr, encoding_ty, state_expr, state_ty, ret_ty, precomputed_plan);
             },
@@ -12497,7 +12596,7 @@ const BodyContext = struct {
         var index = tags.len;
         while (index > 0) {
             index -= 1;
-            const tag = tags[index];
+            const tag = GuardedList.at(tags, index);
             const tag_text = self.builder.program.names.tagLabelText(tag.name);
             const tag_name_expr = try self.stringExpr(tag_text, str_ty);
             const key_expr = try self.localExpr(key_local, str_ty);
@@ -12763,8 +12862,8 @@ const BodyContext = struct {
         const parse_null_fn = self.builder.functionShape(parse_null_mono_ty, "parse_null target method was not a function");
         const parse_null_arg_tys = self.builder.program.types.span(parse_null_fn.args);
         if (parse_null_arg_tys.len != 2) Common.invariant("parse_null target method had an unexpected arity");
-        if (!self.sameType(parse_null_arg_tys[0], encoding_ty)) Common.invariant("parse_null encoding type differed from input encoding type");
-        if (!self.sameType(parse_null_arg_tys[1], state_ty)) Common.invariant("parse_null state type differed from input state type");
+        if (!self.sameType(GuardedList.at(parse_null_arg_tys, 0), encoding_ty)) Common.invariant("parse_null encoding type differed from input encoding type");
+        if (!self.sameType(GuardedList.at(parse_null_arg_tys, 1), state_ty)) Common.invariant("parse_null state type differed from input state type");
         if (!self.sameType(parse_null_fn.ret, null_try_ty)) Common.invariant("parse_null return type differed from generated Try type");
 
         const parse_null_expr = try self.addExpr(.{
@@ -12841,7 +12940,7 @@ const BodyContext = struct {
         const parse_fn = self.builder.functionShape(callable_mono_ty, "custom parser target was not a function");
         const parse_arg_tys = self.builder.program.types.span(parse_fn.args);
         if (parse_arg_tys.len != 1) Common.invariant("custom parser target had an unexpected arity");
-        if (!self.sameType(parse_arg_tys[0], encoding_ty)) Common.invariant("custom parser encoding type differed from input encoding type");
+        if (!self.sameType(GuardedList.at(parse_arg_tys, 0), encoding_ty)) Common.invariant("custom parser encoding type differed from input encoding type");
         if (!self.sameType(parse_fn.ret, runtime_fn_ty)) Common.invariant("custom parser runtime function type differed from expected type");
 
         const ret_info = self.tryInfo(ret_ty);
@@ -12850,7 +12949,8 @@ const BodyContext = struct {
             else => Common.invariant("custom parser result Ok type was not a parse result record"),
         };
         var found_value = false;
-        for (parse_ok_fields) |field| {
+        for (0..GuardedList.borrowLen(parse_ok_fields)) |index| {
+            const field = GuardedList.at(parse_ok_fields, index);
             const field_text = self.builder.program.names.recordFieldLabelText(field.name);
             if (Ident.textEql(field_text, "value")) {
                 found_value = true;
@@ -13075,7 +13175,7 @@ const BodyContext = struct {
     fn singleTagPayloadType(self: *BodyContext, tag: Type.Tag, comptime context: []const u8) Type.TypeId {
         const payloads = self.builder.program.types.span(tag.payloads);
         if (payloads.len != 1) Common.invariant(context ++ " had an unexpected payload count");
-        return payloads[0];
+        return GuardedList.at(payloads, 0);
     }
 
     fn recordPayloadFieldAccess(
@@ -13109,9 +13209,9 @@ const BodyContext = struct {
         const ret_info = self.tryInfo(ret_ty);
         if (!self.sameType(ret_info.ok_ty, record_ty)) Common.invariant("record finish Try Ok type differed from record type");
 
-        const record_fields = try self.allocator.dupe(Type.Field, switch (self.builder.shapeContent(record_ty)) {
+        const record_fields = try GuardedList.dupe(self.allocator, Type.Field, switch (self.builder.shapeContent(record_ty)) {
             .record => |span| self.builder.program.types.fieldSpan(span),
-            .zst => &.{},
+            .zst => self.builder.program.types.fieldSpan(.empty()),
             else => Common.invariant("record finish Ok type was not a record"),
         });
         defer self.allocator.free(record_fields);
@@ -13241,7 +13341,7 @@ const BodyContext = struct {
         const encoding_local = try self.addLocal(self.builder.symbols.fresh(), encoding_ty);
         const slot_local = try self.addLocal(self.builder.symbols.fresh(), state_ty);
         const missing_local = try self.addLocal(self.builder.symbols.fresh(), missing_ty);
-        const tags = try self.allocator.dupe(Type.Tag, self.builder.program.types.tagSpan(tag_span));
+        const tags = try GuardedList.dupe(self.allocator, Type.Tag, self.builder.program.types.tagSpan(tag_span));
         defer self.allocator.free(tags);
 
         var precomputed_plan = ParserPrecomputedPlan.init(self.allocator);
@@ -13317,7 +13417,7 @@ const BodyContext = struct {
         precomputed_plan: ?*const ParserPrecomputedPlan,
     ) Allocator.Error!DraftExprId {
         const ret_info = self.tryInfo(ret_ty);
-        const payload_tys = try self.allocator.dupe(Type.TypeId, self.builder.program.types.span(tag.payloads));
+        const payload_tys = try GuardedList.dupe(self.allocator, Type.TypeId, self.builder.program.types.span(tag.payloads));
         defer self.allocator.free(payload_tys);
         if (payload_tys.len > 1) {
             return try self.decodedTagUnionArrayPayloadValue(
@@ -13603,8 +13703,8 @@ const BodyContext = struct {
         const rename_fn = self.builder.functionShape(callable_mono_ty, "rename_field target method was not a function");
         const arg_tys = self.builder.program.types.span(rename_fn.args);
         if (arg_tys.len != 2) Common.invariant("rename_field target method had an unexpected arity");
-        if (!self.sameType(arg_tys[0], encoding_ty)) Common.invariant("rename_field encoding argument differed from parser encoding type");
-        if (!self.sameType(arg_tys[1], str_ty)) Common.invariant("rename_field name argument differed from Str");
+        if (!self.sameType(GuardedList.at(arg_tys, 0), encoding_ty)) Common.invariant("rename_field encoding argument differed from parser encoding type");
+        if (!self.sameType(GuardedList.at(arg_tys, 1), str_ty)) Common.invariant("rename_field name argument differed from Str");
         if (!self.sameType(rename_fn.ret, str_ty)) Common.invariant("rename_field return type differed from Str");
         return try self.addExpr(.{
             .ty = str_ty,
@@ -14777,7 +14877,8 @@ const BodyContext = struct {
         const lowered = try self.allocator.alloc(DraftExprId, items.len);
         defer self.allocator.free(lowered);
         for (items, 0..) |item, index| {
-            const item_ty = self.builder.program.types.span(item_span)[index];
+            const item_tys = self.builder.program.types.span(item_span);
+            const item_ty = GuardedList.at(item_tys, index);
             lowered[index] = try self.restoreConstNodeAtType(store_view, type_view, item, item_ty);
         }
         return try self.addExprSpan(lowered);
@@ -14796,7 +14897,8 @@ const BodyContext = struct {
         const lowered = try self.allocator.alloc(DraftFieldExpr, items.len);
         defer self.allocator.free(lowered);
         for (items, 0..) |item, index| {
-            const field = self.builder.program.types.fieldSpan(field_span)[index];
+            const fields = self.builder.program.types.fieldSpan(field_span);
+            const field = GuardedList.at(fields, index);
             lowered[index] = .{
                 .name = field.name,
                 .value = try self.restoreConstNodeAtType(store_view, type_view, item, field.ty),
@@ -14819,7 +14921,8 @@ const BodyContext = struct {
         const lowered = try self.allocator.alloc(DraftExprId, tag.payloads.len);
         defer self.allocator.free(lowered);
         for (tag.payloads, 0..) |payload, index| {
-            const payload_ty = self.builder.program.types.span(payload_span)[index];
+            const payload_tys = self.builder.program.types.span(payload_span);
+            const payload_ty = GuardedList.at(payload_tys, index);
             lowered[index] = try self.restoreConstNodeAtType(store_view, type_view, payload, payload_ty);
         }
         return try self.addExprSpan(lowered);
@@ -14839,7 +14942,7 @@ const BodyContext = struct {
         };
     }
 
-    fn constRecordFields(self: *BodyContext, ty: Type.TypeId) []const Type.Field {
+    fn constRecordFields(self: *BodyContext, ty: Type.TypeId) Type.StoreSpanBorrow(Type.Field, "fields") {
         return self.builder.program.types.fieldSpan(self.builder.recordFieldsSpan(ty));
     }
 
@@ -15026,13 +15129,13 @@ const BodyContext = struct {
         const callable_node = try fn_ctx.instantiateDispatchPlanCallNodeFromCaller(plan.callable_ty, &fn_ctx, expr.ty, plan_args, ty);
         const callable_mono_ty = try self.graph.sealNode(callable_node);
         const fn_data = self.builder.functionShape(callable_mono_ty, "stored parser constructor had a non-function type");
-        const arg_tys = try self.allocator.dupe(Type.TypeId, self.builder.program.types.span(fn_data.args));
+        const arg_tys = try GuardedList.dupe(self.allocator, Type.TypeId, self.builder.program.types.span(fn_data.args));
         defer self.allocator.free(arg_tys);
         if (arg_tys.len != 1) Common.invariant("stored parser constructor had an unexpected arity");
         if (!fn_ctx.sameType(fn_data.ret, ty)) Common.invariant("stored parser constructor result type differed from restored function type");
 
         const runtime_fn = self.builder.functionShape(ty, "stored parser runtime value had a non-function type");
-        const runtime_arg_tys = try self.allocator.dupe(Type.TypeId, self.builder.program.types.span(runtime_fn.args));
+        const runtime_arg_tys = try GuardedList.dupe(self.allocator, Type.TypeId, self.builder.program.types.span(runtime_fn.args));
         defer self.allocator.free(runtime_arg_tys);
         if (runtime_arg_tys.len != 1) Common.invariant("stored parser runtime function had an unexpected arity");
 
@@ -15119,13 +15222,13 @@ const BodyContext = struct {
         const callable_node = try fn_ctx.instantiateDispatchPlanCallNodeFromCaller(plan.callable_ty, &fn_ctx, expr.ty, plan_args, ty);
         const callable_mono_ty = try self.graph.sealNode(callable_node);
         const fn_data = self.builder.functionShape(callable_mono_ty, "stored encoder_for constructor had a non-function type");
-        const arg_tys = try self.allocator.dupe(Type.TypeId, self.builder.program.types.span(fn_data.args));
+        const arg_tys = try GuardedList.dupe(self.allocator, Type.TypeId, self.builder.program.types.span(fn_data.args));
         defer self.allocator.free(arg_tys);
         if (arg_tys.len != 1) Common.invariant("stored encoder_for constructor had an unexpected arity");
         if (!fn_ctx.sameType(fn_data.ret, ty)) Common.invariant("stored encoder_for constructor result type differed from restored function type");
 
         const runtime_fn = self.builder.functionShape(ty, "stored encoder_for runtime value had a non-function type");
-        const runtime_arg_tys = try self.allocator.dupe(Type.TypeId, self.builder.program.types.span(runtime_fn.args));
+        const runtime_arg_tys = try GuardedList.dupe(self.allocator, Type.TypeId, self.builder.program.types.span(runtime_fn.args));
         defer self.allocator.free(runtime_arg_tys);
         if (runtime_arg_tys.len != 2) Common.invariant("stored encoder_for runtime function had an unexpected arity");
 
@@ -15231,10 +15334,10 @@ const BodyContext = struct {
     fn lowerExprSpanAtTypes(
         self: *BodyContext,
         checked_exprs: []const checked.CheckedExprId,
-        tys: []const Type.TypeId,
+        tys: anytype,
     ) Allocator.Error!DraftSpan(DraftExprId) {
-        if (checked_exprs.len != tys.len) Common.invariant("call argument arity differs from concrete function type");
-        const stable_tys = try self.allocator.dupe(Type.TypeId, tys);
+        if (checked_exprs.len != GuardedList.borrowLen(tys)) Common.invariant("call argument arity differs from concrete function type");
+        const stable_tys = try GuardedList.dupe(self.allocator, Type.TypeId, tys);
         defer self.allocator.free(stable_tys);
         const lowered = try self.allocator.alloc(DraftExprId, checked_exprs.len);
         defer self.allocator.free(lowered);
@@ -15252,11 +15355,11 @@ const BodyContext = struct {
     fn lowerDispatchOperandsAtTypes(
         self: *BodyContext,
         operands: []const static_dispatch.StaticDispatchOperand,
-        tys: []const Type.TypeId,
+        tys: anytype,
         pre_lowered: ?PreLoweredOperand,
     ) Allocator.Error!DraftSpan(DraftExprId) {
-        if (operands.len != tys.len) Common.invariant("dispatch argument arity differs from concrete function type");
-        const stable_tys = try self.allocator.dupe(Type.TypeId, tys);
+        if (operands.len != GuardedList.borrowLen(tys)) Common.invariant("dispatch argument arity differs from concrete function type");
+        const stable_tys = try GuardedList.dupe(self.allocator, Type.TypeId, tys);
         defer self.allocator.free(stable_tys);
         const lowered = try self.allocator.alloc(DraftExprId, operands.len);
         defer self.allocator.free(lowered);
@@ -15379,7 +15482,8 @@ const BodyContext = struct {
         const lowered = try self.allocator.alloc(DraftFieldExpr, fields.len);
         defer self.allocator.free(lowered);
 
-        for (fields, 0..) |field, i| {
+        for (0..GuardedList.borrowLen(fields)) |i| {
+            const field = GuardedList.at(fields, i);
             const label = self.builder.program.names.recordFieldLabelText(field.name);
             lowered[i] = .{
                 .name = field.name,
@@ -15410,7 +15514,7 @@ const BodyContext = struct {
         const known_tag = self.monoTagByText(ty, "Known");
         const payloads = self.builder.program.types.span(known_tag.payloads);
         if (payloads.len != 1) Common.invariant("Iter.len_if_known Known tag did not have one payload");
-        const count = try self.intLiteralExpr(@intCast(remaining), payloads[0]);
+        const count = try self.intLiteralExpr(@intCast(remaining), GuardedList.at(payloads, 0));
         return try self.addExpr(.{ .ty = ty, .data = .{ .tag = .{
             .name = known_tag.name,
             .payloads = try self.addExprSpan(&[_]DraftExprId{count}),
@@ -15449,8 +15553,8 @@ const BodyContext = struct {
         if (item_fields.len != 2) Common.invariant("generated interpolation iterator item was not a pair");
 
         const part = interpolation.parts[index];
-        const value_expr = try self.lowerExprAtType(part.value, item_fields[0]);
-        const segment_expr = try self.lowerExprAtType(part.following_segment, item_fields[1]);
+        const value_expr = try self.lowerExprAtType(part.value, GuardedList.at(item_fields, 0));
+        const segment_expr = try self.lowerExprAtType(part.following_segment, GuardedList.at(item_fields, 1));
         const item_expr = try self.addExpr(.{ .ty = item_ty, .data = .{
             .tuple = try self.addExprSpan(&[_]DraftExprId{ value_expr, segment_expr }),
         } });
@@ -15458,7 +15562,7 @@ const BodyContext = struct {
         const one_tag = self.monoTagByText(step_ret_ty, "One");
         const payloads = self.builder.program.types.span(one_tag.payloads);
         if (payloads.len != 1) Common.invariant("Iter step One tag did not have one record payload");
-        const payload_ty = payloads[0];
+        const payload_ty = GuardedList.at(payloads, 0);
         const payload_expr = try self.lowerInterpolationOnePayload(payload_ty, item_expr, rest_expr);
 
         const body = try self.addExpr(.{ .ty = step_ret_ty, .data = .{ .tag = .{
@@ -15478,7 +15582,8 @@ const BodyContext = struct {
         const lowered = try self.allocator.alloc(DraftFieldExpr, fields.len);
         defer self.allocator.free(lowered);
 
-        for (fields, 0..) |field, i| {
+        for (0..GuardedList.borrowLen(fields)) |i| {
+            const field = GuardedList.at(fields, i);
             const label = self.builder.program.names.recordFieldLabelText(field.name);
             lowered[i] = .{
                 .name = field.name,
@@ -15529,7 +15634,8 @@ const BodyContext = struct {
             .zst => return null,
             else => return null,
         };
-        for (fields) |field| {
+        for (0..GuardedList.borrowLen(fields)) |index| {
+            const field = GuardedList.at(fields, index);
             if (Ident.textEql(self.builder.program.names.recordFieldLabelText(field.name), text)) return field;
         }
         return null;
@@ -15540,7 +15646,7 @@ const BodyContext = struct {
             .named => |named| blk: {
                 const args = self.builder.program.types.span(named.args);
                 if (args.len != 1) Common.invariant("Iter nominal did not have one type argument");
-                break :blk args[0];
+                break :blk GuardedList.at(args, 0);
             },
             else => Common.invariant("generated interpolation iterator expected named Iter type"),
         };
@@ -15745,7 +15851,9 @@ const BodyContext = struct {
         const expected_entries = self.builder.program.types.declaredFieldSpan(expected);
         const actual_entries = self.builder.program.types.declaredFieldSpan(actual);
         if (expected_entries.len != actual_entries.len) return false;
-        for (expected_entries, actual_entries) |expected_entry, actual_entry| {
+        for (0..GuardedList.borrowLen(expected_entries)) |index| {
+            const expected_entry = GuardedList.at(expected_entries, index);
+            const actual_entry = GuardedList.at(actual_entries, index);
             switch (expected_entry) {
                 .named => |expected_name| switch (actual_entry) {
                     .named => |actual_name| if (expected_name != actual_name) return false,
@@ -15769,7 +15877,9 @@ const BodyContext = struct {
         const expected_items = self.builder.program.types.span(expected);
         const actual_items = self.builder.program.types.span(actual);
         if (expected_items.len != actual_items.len) return false;
-        for (expected_items, actual_items) |expected_item, actual_item| {
+        for (0..GuardedList.borrowLen(expected_items)) |index| {
+            const expected_item = GuardedList.at(expected_items, index);
+            const actual_item = GuardedList.at(actual_items, index);
             if (!self.sameTypeInner(expected_item, actual_item, visiting)) return false;
         }
         return true;
@@ -15784,7 +15894,9 @@ const BodyContext = struct {
         const expected_fields = self.builder.program.types.fieldSpan(expected);
         const actual_fields = self.builder.program.types.fieldSpan(actual);
         if (expected_fields.len != actual_fields.len) return false;
-        for (expected_fields, actual_fields) |expected_field, actual_field| {
+        for (0..GuardedList.borrowLen(expected_fields)) |index| {
+            const expected_field = GuardedList.at(expected_fields, index);
+            const actual_field = GuardedList.at(actual_fields, index);
             if (expected_field.name != actual_field.name) return false;
             if (!self.sameTypeInner(expected_field.ty, actual_field.ty, visiting)) return false;
         }
@@ -15800,7 +15912,9 @@ const BodyContext = struct {
         const expected_tags = self.builder.program.types.tagSpan(expected);
         const actual_tags = self.builder.program.types.tagSpan(actual);
         if (expected_tags.len != actual_tags.len) return false;
-        for (expected_tags, actual_tags) |expected_tag, actual_tag| {
+        for (0..GuardedList.borrowLen(expected_tags)) |index| {
+            const expected_tag = GuardedList.at(expected_tags, index);
+            const actual_tag = GuardedList.at(actual_tags, index);
             if (expected_tag.name != actual_tag.name) return false;
             if (!self.sameTypeSpans(expected_tag.payloads, actual_tag.payloads, visiting)) return false;
         }
@@ -15819,9 +15933,11 @@ const BodyContext = struct {
         const base_ty = if (base_record) |base_expr| try self.exprType(base_expr) else ty;
         const base_local = if (base_record) |_| try self.addLocal(self.builder.symbols.fresh(), base_ty) else null;
         const base_expr = if (base_local) |local| try self.localExpr(local, base_ty) else null;
+        const target_field_list = try GuardedList.dupe(self.allocator, Type.Field, self.builder.program.types.fieldSpan(target_fields));
+        defer self.allocator.free(target_field_list);
 
         for (0..target_field_count) |i| {
-            const field = self.builder.program.types.fieldSpan(target_fields)[i];
+            const field = target_field_list[i];
             const value = if (try self.recordUpdateFieldValue(record.fields, field.name)) |field_value|
                 try self.lowerExprAtType(field_value, field.ty)
             else if (base_expr) |base_value|
@@ -15972,7 +16088,7 @@ const BodyContext = struct {
 
         var callable_mono_ty = try call_ctx.instantiateDispatchPlanCallTypeFromCaller(plan.callable_ty, self, checked_ret_ty, plan_args, expected_ret_ty);
         var plan_fn_data = self.builder.functionShape(callable_mono_ty, "checked dispatch plan had a non-function type");
-        const plan_arg_tys = try self.allocator.dupe(Type.TypeId, self.builder.program.types.span(plan_fn_data.args));
+        const plan_arg_tys = try GuardedList.dupe(self.allocator, Type.TypeId, self.builder.program.types.span(plan_fn_data.args));
         defer self.allocator.free(plan_arg_tys);
         var plan_ret_ty = plan_fn_data.ret;
 
@@ -16023,7 +16139,9 @@ const BodyContext = struct {
                     if (refreshed_args.len != plan_arg_tys.len) {
                         Common.invariant("checked dispatch plan arity changed after dispatcher pre-lowering");
                     }
-                    @memcpy(plan_arg_tys, refreshed_args);
+                    for (0..GuardedList.borrowLen(refreshed_args)) |arg_index| {
+                        plan_arg_tys[arg_index] = GuardedList.at(refreshed_args, arg_index);
+                    }
                     plan_arg_tys[index] = lowered_ty;
                     plan_ret_ty = plan_fn_data.ret;
                     dispatcher_ty = lowered_ty;
@@ -16150,7 +16268,7 @@ const BodyContext = struct {
 
         const callable_mono_ty = try call_ctx.instantiateNumeralPlanCallType(plan.callable_ty, self, checked_ret_ty, target_ty, plan_args);
         const plan_fn_data = self.builder.functionShape(callable_mono_ty, "checked from_numeral plan had a non-function type");
-        const plan_arg_tys = try self.allocator.dupe(Type.TypeId, self.builder.program.types.span(plan_fn_data.args));
+        const plan_arg_tys = try GuardedList.dupe(self.allocator, Type.TypeId, self.builder.program.types.span(plan_fn_data.args));
         defer self.allocator.free(plan_arg_tys);
         const try_ty = plan_fn_data.ret;
 
@@ -16185,7 +16303,7 @@ const BodyContext = struct {
         const ok_tag = self.monoTagByText(try_ty, "Ok");
         const ok_payloads = self.builder.program.types.span(ok_tag.payloads);
         if (ok_payloads.len != 1) Common.invariant("numeral conversion root Try.Ok did not carry one payload");
-        const result = try self.lowerNumeralCallRaw(expr.ty, plan, ok_payloads[0]);
+        const result = try self.lowerNumeralCallRaw(expr.ty, plan, GuardedList.at(ok_payloads, 0));
         if (!self.sameType(result.try_ty, try_ty)) {
             Common.invariant("numeral conversion root type differed from the from_numeral result type");
         }
@@ -16279,7 +16397,7 @@ const BodyContext = struct {
         const payloads = self.builder.program.types.span(literal_tag.payloads);
         if (payloads.len != 1) Common.invariant("Numeral Literal tag must have one record payload");
 
-        const record_expr = try self.lowerNumeralRecord(literal, payloads[0]);
+        const record_expr = try self.lowerNumeralRecord(literal, GuardedList.at(payloads, 0));
         const backing_expr = try self.addExpr(.{
             .ty = backing_ty,
             .data = .{ .tag = .{
@@ -16305,11 +16423,13 @@ const BodyContext = struct {
         const field_count: usize = @intCast(field_span.len);
         const lowered = try self.allocator.alloc(DraftFieldExpr, field_count);
         defer self.allocator.free(lowered);
+        const fields = try GuardedList.dupe(self.allocator, Type.Field, self.builder.program.types.fieldSpan(field_span));
+        defer self.allocator.free(fields);
 
         const before = self.view.module_env.numeralDigitsBefore(literal);
         const after = self.view.module_env.numeralDigitsAfter(literal);
         for (0..field_count) |i| {
-            const field = self.builder.program.types.fieldSpan(field_span)[i];
+            const field = fields[i];
             const label = self.builder.program.names.recordFieldLabelText(field.name);
             const value = if (Ident.textEql(label, "is_negative"))
                 try self.boolLiteral(literal.isNegative(), field.ty)
@@ -16361,7 +16481,7 @@ const BodyContext = struct {
         const ok_payloads = self.builder.program.types.span(ok_tag.payloads);
         const err_payloads = self.builder.program.types.span(err_tag.payloads);
         if (ok_payloads.len != 1) Common.invariant("Try.Ok from from_numeral did not carry one payload");
-        if (!self.sameType(ok_payloads[0], target_ty)) {
+        if (!self.sameType(GuardedList.at(ok_payloads, 0), target_ty)) {
             Common.invariant("Try.Ok from from_numeral carried a type different from the literal target type");
         }
 
@@ -16375,7 +16495,8 @@ const BodyContext = struct {
 
         const err_payload_pats = try self.allocator.alloc(DraftPatId, err_payloads.len);
         defer self.allocator.free(err_payload_pats);
-        for (err_payloads, 0..) |payload_ty, i| {
+        for (0..GuardedList.borrowLen(err_payloads)) |i| {
+            const payload_ty = GuardedList.at(err_payloads, i);
             err_payload_pats[i] = try self.addPat(.{ .ty = payload_ty, .data = .wildcard });
         }
         const err_pat = try self.addPat(.{ .ty = try_ty, .data = .{ .tag = .{
@@ -16402,7 +16523,9 @@ const BodyContext = struct {
     fn monoTagByTextOptional(self: *BodyContext, ty: Type.TypeId, text: []const u8) ?Type.Tag {
         return switch (self.builder.shapeContent(ty)) {
             .tag_union => |span| {
-                for (self.builder.program.types.tagSpan(span)) |tag| {
+                const tags = self.builder.program.types.tagSpan(span);
+                for (0..GuardedList.borrowLen(tags)) |index| {
+                    const tag = GuardedList.at(tags, index);
                     if (Ident.textEql(self.builder.program.names.tagLabelText(tag.name), text)) return tag;
                 }
                 return null;
@@ -16426,7 +16549,7 @@ const BodyContext = struct {
         };
         const args = self.builder.program.types.span(named.args);
         if (args.len != 1) Common.invariant("builtin Set type had an unexpected arity");
-        return args[0];
+        return GuardedList.at(args, 0);
     }
 
     const DictEntryShape = struct {
@@ -16442,7 +16565,7 @@ const BodyContext = struct {
         };
         const args = self.builder.program.types.span(named.args);
         if (args.len != 2) Common.invariant("builtin Dict type had an unexpected arity");
-        return .{ .key_ty = args[0], .value_ty = args[1] };
+        return .{ .key_ty = GuardedList.at(args, 0), .value_ty = GuardedList.at(args, 1) };
     }
 
     fn listType(self: *BodyContext, elem_ty: Type.TypeId) Allocator.Error!Type.TypeId {
@@ -16464,7 +16587,7 @@ const BodyContext = struct {
         const from_list_fn = self.builder.functionShape(callable_mono_ty, "Set.from_list target method was not a function");
         const arg_tys = self.builder.program.types.span(from_list_fn.args);
         if (arg_tys.len != 1) Common.invariant("Set.from_list target method had an unexpected arity");
-        if (!self.sameType(arg_tys[0], list_ty)) Common.invariant("Set.from_list argument type differed from generated List type");
+        if (!self.sameType(GuardedList.at(arg_tys, 0), list_ty)) Common.invariant("Set.from_list argument type differed from generated List type");
         if (!self.sameType(from_list_fn.ret, set_ty)) Common.invariant("Set.from_list return type differed from Set type");
 
         return try self.addExpr(.{
@@ -16487,7 +16610,7 @@ const BodyContext = struct {
         const to_list_fn = self.builder.functionShape(callable_mono_ty, "Set.to_list target method was not a function");
         const arg_tys = self.builder.program.types.span(to_list_fn.args);
         if (arg_tys.len != 1) Common.invariant("Set.to_list target method had an unexpected arity");
-        if (!self.sameType(arg_tys[0], set_ty)) Common.invariant("Set.to_list argument type differed from Set type");
+        if (!self.sameType(GuardedList.at(arg_tys, 0), set_ty)) Common.invariant("Set.to_list argument type differed from Set type");
         if (!self.sameType(to_list_fn.ret, list_ty)) Common.invariant("Set.to_list return type differed from generated List type");
 
         return try self.addExpr(.{
@@ -16510,7 +16633,7 @@ const BodyContext = struct {
         const with_capacity_fn = self.builder.functionShape(callable_mono_ty, "Dict.with_capacity target method was not a function");
         const arg_tys = self.builder.program.types.span(with_capacity_fn.args);
         if (arg_tys.len != 1) Common.invariant("Dict.with_capacity target method had an unexpected arity");
-        if (!self.sameType(arg_tys[0], capacity_ty)) Common.invariant("Dict.with_capacity argument type differed from generated capacity type");
+        if (!self.sameType(GuardedList.at(arg_tys, 0), capacity_ty)) Common.invariant("Dict.with_capacity argument type differed from generated capacity type");
         if (!self.sameType(with_capacity_fn.ret, dict_ty)) Common.invariant("Dict.with_capacity return type differed from Dict type");
 
         return try self.addExpr(.{
@@ -16536,9 +16659,9 @@ const BodyContext = struct {
         const insert_fn = self.builder.functionShape(callable_mono_ty, "Dict.insert target method was not a function");
         const arg_tys = self.builder.program.types.span(insert_fn.args);
         if (arg_tys.len != 3) Common.invariant("Dict.insert target method had an unexpected arity");
-        if (!self.sameType(arg_tys[0], dict_ty)) Common.invariant("Dict.insert dict argument type differed from Dict type");
-        if (!self.sameType(arg_tys[1], key_ty)) Common.invariant("Dict.insert key argument type differed from key type");
-        if (!self.sameType(arg_tys[2], value_ty)) Common.invariant("Dict.insert value argument type differed from value type");
+        if (!self.sameType(GuardedList.at(arg_tys, 0), dict_ty)) Common.invariant("Dict.insert dict argument type differed from Dict type");
+        if (!self.sameType(GuardedList.at(arg_tys, 1), key_ty)) Common.invariant("Dict.insert key argument type differed from key type");
+        if (!self.sameType(GuardedList.at(arg_tys, 2), value_ty)) Common.invariant("Dict.insert value argument type differed from value type");
         if (!self.sameType(insert_fn.ret, dict_ty)) Common.invariant("Dict.insert return type differed from Dict type");
 
         return try self.addExpr(.{
@@ -16561,7 +16684,7 @@ const BodyContext = struct {
         const to_list_fn = self.builder.functionShape(callable_mono_ty, "Dict.to_list target method was not a function");
         const arg_tys = self.builder.program.types.span(to_list_fn.args);
         if (arg_tys.len != 1) Common.invariant("Dict.to_list target method had an unexpected arity");
-        if (!self.sameType(arg_tys[0], dict_ty)) Common.invariant("Dict.to_list argument type differed from Dict type");
+        if (!self.sameType(GuardedList.at(arg_tys, 0), dict_ty)) Common.invariant("Dict.to_list argument type differed from Dict type");
         if (!self.sameType(to_list_fn.ret, list_ty)) Common.invariant("Dict.to_list return type differed from generated List type");
 
         return try self.addExpr(.{
@@ -16664,7 +16787,8 @@ const BodyContext = struct {
         };
         const tags = self.builder.program.types.tagSpan(tags_span);
         if (tags.len == 0) return null;
-        for (tags) |tag| {
+        for (0..GuardedList.borrowLen(tags)) |index| {
+            const tag = GuardedList.at(tags, index);
             if (self.builder.program.types.span(tag.payloads).len != 0) return null;
         }
         return tags_span;
@@ -16690,7 +16814,7 @@ const BodyContext = struct {
         const plan_args = plan.argsSlice(self.view.static_dispatch_plans);
         const callable_mono_ty = try call_ctx.instantiateDispatchPlanCallTypeFromCaller(plan.callable_ty, self, checked_ret_ty, plan_args, expected_ret_ty);
         const plan_fn_data = self.builder.functionShape(callable_mono_ty, "checked dispatch plan had a non-function type");
-        const plan_arg_tys = try self.allocator.dupe(Type.TypeId, self.builder.program.types.span(plan_fn_data.args));
+        const plan_arg_tys = try GuardedList.dupe(self.allocator, Type.TypeId, self.builder.program.types.span(plan_fn_data.args));
         defer self.allocator.free(plan_arg_tys);
         const plan_ret_ty = plan_fn_data.ret;
         const dispatcher_ty = try self.dispatcherMonoType(plan, plan_arg_tys);
@@ -17160,7 +17284,7 @@ const BodyContext = struct {
                     .func => |func| {
                         const args = self.builder.program.types.span(func.args);
                         if (path_step.data >= args.len) return null;
-                        ty = args[path_step.data];
+                        ty = GuardedList.at(args, path_step.data);
                     },
                     else => return null,
                 },
@@ -17172,7 +17296,7 @@ const BodyContext = struct {
                     .named => |named| {
                         const args = self.builder.program.types.span(named.args);
                         if (path_step.data >= args.len) return null;
-                        ty = args[path_step.data];
+                        ty = GuardedList.at(args, path_step.data);
                     },
                     // Builtin containers erase to dedicated nodes: their
                     // single type argument is the payload.
@@ -17193,7 +17317,7 @@ const BodyContext = struct {
                     .tuple => |span| {
                         const elems = self.builder.program.types.span(span);
                         if (path_step.data >= elems.len) return null;
-                        ty = elems[path_step.data];
+                        ty = GuardedList.at(elems, path_step.data);
                     },
                     else => return null,
                 },
@@ -17201,7 +17325,8 @@ const BodyContext = struct {
                     .record => |span| {
                         const label = try self.builder.recordFieldName(view, @enumFromInt(path_step.data));
                         const fields = self.builder.program.types.fieldSpan(span);
-                        ty = for (fields) |field| {
+                        ty = for (0..GuardedList.borrowLen(fields)) |index| {
+                            const field = GuardedList.at(fields, index);
                             if (field.name == label) break field.ty;
                         } else return null;
                     },
@@ -17211,7 +17336,8 @@ const BodyContext = struct {
                     .tag_union => |span| {
                         const label = try self.builder.tagName(view, @enumFromInt(path_step.data));
                         const tags = self.builder.program.types.tagSpan(span);
-                        const tag = for (tags) |tag| {
+                        const tag = for (0..GuardedList.borrowLen(tags)) |index| {
+                            const tag = GuardedList.at(tags, index);
                             if (tag.name == label) break tag;
                         } else return null;
                         // The next step must be the payload index.
@@ -17236,7 +17362,7 @@ const BodyContext = struct {
         if (rest[0].stepKind() != .tag_payload_index) return null;
         const payloads = self.builder.program.types.span(tag.payloads);
         if (rest[0].data >= payloads.len) return null;
-        return try self.walkEvidencePath(view, payloads[rest[0].data], rest[1..]);
+        return try self.walkEvidencePath(view, GuardedList.at(payloads, rest[0].data), rest[1..]);
     }
 
     fn methodTargetCalleeWithMono(
@@ -17391,7 +17517,7 @@ const BodyContext = struct {
         const fn_data = self.builder.functionShape(callable_mono_ty, "checked structural " ++ noun ++ " target had a non-function type");
         // Copy because the recursive operand lowering below may reallocate
         // types.span, dangling the slice; only the scalar derived type escapes.
-        const arg_tys = try self.allocator.dupe(Type.TypeId, self.builder.program.types.span(fn_data.args));
+        const arg_tys = try GuardedList.dupe(self.allocator, Type.TypeId, self.builder.program.types.span(fn_data.args));
         defer self.allocator.free(arg_tys);
         if (arg_tys.len != 2) Common.invariant("structural " ++ noun ++ " callable type must have two operands");
         const first = if (pre_lowered != null and pre_lowered.?.index == 0)
@@ -17420,14 +17546,14 @@ const BodyContext = struct {
         if (!parser.structural_allowed) Common.invariant("structural parser dispatch plan did not permit structural parser lowering");
 
         const fn_data = self.builder.functionShape(callable_mono_ty, "checked structural parser target had a non-function type");
-        const arg_tys = try self.allocator.dupe(Type.TypeId, self.builder.program.types.span(fn_data.args));
+        const arg_tys = try GuardedList.dupe(self.allocator, Type.TypeId, self.builder.program.types.span(fn_data.args));
         defer self.allocator.free(arg_tys);
         const plan_args = plan.argsSlice(self.view.static_dispatch_plans);
         if (arg_tys.len != 1 or plan_args.len != 1) Common.invariant("structural parser callable type must have one encoding argument");
         if (!self.sameType(fn_data.ret, ret_ty)) Common.invariant("structural parser return type differed from dispatch expression type");
 
         const runtime_fn = self.builder.functionShape(ret_ty, "checked structural parser return had a non-function type");
-        const runtime_arg_tys = try self.allocator.dupe(Type.TypeId, self.builder.program.types.span(runtime_fn.args));
+        const runtime_arg_tys = try GuardedList.dupe(self.allocator, Type.TypeId, self.builder.program.types.span(runtime_fn.args));
         defer self.allocator.free(runtime_arg_tys);
         if (runtime_arg_tys.len != 1) Common.invariant("structural parser runtime function must have one state argument");
 
@@ -17448,12 +17574,16 @@ const BodyContext = struct {
                         if (!self.parseFieldTypeIsSupported(payload_ty, false)) Common.invariant("structural parser box payload type was not supported");
                     },
                     .tuple => |span| {
-                        for (self.builder.program.types.span(span)) |elem_ty| {
+                        const elem_tys = self.builder.program.types.span(span);
+                        for (0..GuardedList.borrowLen(elem_tys)) |index| {
+                            const elem_ty = GuardedList.at(elem_tys, index);
                             if (!self.parseFieldTypeIsSupported(elem_ty, false)) Common.invariant("structural parser tuple element type was not supported");
                         }
                     },
                     .record => |fields_span| blk: {
-                        for (self.builder.program.types.fieldSpan(fields_span)) |field| {
+                        const fields = self.builder.program.types.fieldSpan(fields_span);
+                        for (0..GuardedList.borrowLen(fields)) |index| {
+                            const field = GuardedList.at(fields, index);
                             if (!self.parseFieldTypeIsSupported(field.ty, true)) Common.invariant("structural parser record field type was not supported");
                         }
                         break :blk;
@@ -17461,8 +17591,11 @@ const BodyContext = struct {
                     .tag_union => |tags_span| blk: {
                         const tags = self.builder.program.types.tagSpan(tags_span);
                         if (tags.len == 0) Common.invariant("structural parser empty tag union reached postcheck lowering");
-                        for (tags) |tag| {
-                            for (self.builder.program.types.span(tag.payloads)) |payload_ty| {
+                        for (0..GuardedList.borrowLen(tags)) |tag_index| {
+                            const tag = GuardedList.at(tags, tag_index);
+                            const payload_tys = self.builder.program.types.span(tag.payloads);
+                            for (0..GuardedList.borrowLen(payload_tys)) |payload_index| {
+                                const payload_ty = GuardedList.at(payload_tys, payload_index);
                                 if (!self.parseFieldTypeIsSupported(payload_ty, false)) Common.invariant("structural parser tag-union payload type was not supported");
                             }
                         }
@@ -17542,14 +17675,14 @@ const BodyContext = struct {
         if (!encoder_for.structural_allowed) Common.invariant("structural encoder_for dispatch plan did not permit structural encoder_for lowering");
 
         const fn_data = self.builder.functionShape(callable_mono_ty, "checked structural encoder_for target had a non-function type");
-        const arg_tys = try self.allocator.dupe(Type.TypeId, self.builder.program.types.span(fn_data.args));
+        const arg_tys = try GuardedList.dupe(self.allocator, Type.TypeId, self.builder.program.types.span(fn_data.args));
         defer self.allocator.free(arg_tys);
         const plan_args = plan.argsSlice(self.view.static_dispatch_plans);
         if (arg_tys.len != 1 or plan_args.len != 1) Common.invariant("structural encoder_for callable type must have one encoding argument");
         if (!self.sameType(fn_data.ret, ret_ty)) Common.invariant("structural encoder_for return type differed from dispatch expression type");
 
         const runtime_fn = self.builder.functionShape(ret_ty, "checked structural encoder_for return had a non-function type");
-        const runtime_arg_tys = try self.allocator.dupe(Type.TypeId, self.builder.program.types.span(runtime_fn.args));
+        const runtime_arg_tys = try GuardedList.dupe(self.allocator, Type.TypeId, self.builder.program.types.span(runtime_fn.args));
         defer self.allocator.free(runtime_arg_tys);
         if (runtime_arg_tys.len != 2) Common.invariant("structural encoder_for runtime function must have value and state arguments");
 
@@ -17650,7 +17783,7 @@ const BodyContext = struct {
         switch (self.builder.shapeContent(shape_ty)) {
             .list => |elem_ty| return try self.lowerEncodeListToState(elem_ty, value_expr, encoding_expr, encoding_ty, state_expr, state_ty, ret_ty, precomputed_plan),
             .tuple => |items| {
-                const item_tys = try self.allocator.dupe(Type.TypeId, self.builder.program.types.span(items));
+                const item_tys = try GuardedList.dupe(self.allocator, Type.TypeId, self.builder.program.types.span(items));
                 defer self.allocator.free(item_tys);
                 return try self.lowerEncodeTupleToState(item_tys, value_expr, encoding_expr, encoding_ty, state_expr, state_ty, ret_ty, precomputed_plan);
             },
@@ -18146,7 +18279,8 @@ const BodyContext = struct {
         ret_ty: Type.TypeId,
     ) Allocator.Error!DraftExprId {
         const str_ty = try self.builder.primitiveType(.str);
-        const tags = self.builder.program.types.tagSpan(tags_span);
+        const tags = try GuardedList.dupe(self.allocator, Type.Tag, self.builder.program.types.tagSpan(tags_span));
+        defer self.allocator.free(tags);
         const branches = try self.allocator.alloc(DraftBranch, tags.len);
         defer self.allocator.free(branches);
         for (tags, 0..) |tag, index| {
@@ -18323,9 +18457,9 @@ const BodyContext = struct {
         const ret_info = self.tryInfo(ret_ty);
         if (!self.sameType(ret_info.ok_ty, state_ty)) Common.invariant("encoder_for record return Ok type differed from state type");
 
-        const record_fields = try self.allocator.dupe(Type.Field, switch (self.builder.shapeContent(shape_ty)) {
+        const record_fields = try GuardedList.dupe(self.allocator, Type.Field, switch (self.builder.shapeContent(shape_ty)) {
             .record => |span| self.builder.program.types.fieldSpan(span),
-            .zst => &.{},
+            .zst => self.builder.program.types.fieldSpan(.empty()),
             else => Common.invariant("encoder_for record requested for a non-record shape"),
         });
         defer self.allocator.free(record_fields);
@@ -18715,7 +18849,7 @@ const BodyContext = struct {
         ret_ty: Type.TypeId,
         precomputed_plan: ?*const ParserPrecomputedPlan,
     ) Allocator.Error!DraftExprId {
-        const tags = try self.allocator.dupe(Type.Tag, self.builder.program.types.tagSpan(tags_span));
+        const tags = try GuardedList.dupe(self.allocator, Type.Tag, self.builder.program.types.tagSpan(tags_span));
         defer self.allocator.free(tags);
         if (tags.len == 0) Common.invariant("encoder_for selected an empty tag union");
 
@@ -18724,7 +18858,7 @@ const BodyContext = struct {
         defer self.allocator.free(branches);
 
         for (tags, 0..) |tag, tag_index| {
-            const payload_tys = try self.allocator.dupe(Type.TypeId, self.builder.program.types.span(tag.payloads));
+            const payload_tys = try GuardedList.dupe(self.allocator, Type.TypeId, self.builder.program.types.span(tag.payloads));
             defer self.allocator.free(payload_tys);
 
             const payload_pats = try self.allocator.alloc(DraftPatId, payload_tys.len);
@@ -18960,9 +19094,11 @@ const BodyContext = struct {
     fn encodeTagUnionTypeIsSupported(self: *BodyContext, tags_span: Type.Span, encoding_ty: Type.TypeId) bool {
         const tags = self.builder.program.types.tagSpan(tags_span);
         if (tags.len == 0) return false;
-        for (tags) |tag| {
+        for (0..GuardedList.borrowLen(tags)) |tag_index| {
+            const tag = GuardedList.at(tags, tag_index);
             const payloads = self.builder.program.types.span(tag.payloads);
-            for (payloads) |payload_ty| {
+            for (0..GuardedList.borrowLen(payloads)) |payload_index| {
+                const payload_ty = GuardedList.at(payloads, payload_index);
                 if (!self.encodeFieldTypeIsSupported(payload_ty, encoding_ty)) return false;
             }
         }
@@ -18988,7 +19124,7 @@ const BodyContext = struct {
         const encode_fn = self.builder.functionShape(callable_mono_ty, "custom encoder_for target was not a function");
         const encode_arg_tys = self.builder.program.types.span(encode_fn.args);
         if (encode_arg_tys.len != 1) Common.invariant("custom encoder_for target had an unexpected arity");
-        if (!self.sameType(encode_arg_tys[0], encoding_ty)) Common.invariant("custom encoder_for encoding type differed from input encoding type");
+        if (!self.sameType(GuardedList.at(encode_arg_tys, 0), encoding_ty)) Common.invariant("custom encoder_for encoding type differed from input encoding type");
         if (!self.sameType(encode_fn.ret, runtime_fn_ty)) Common.invariant("custom encoder_for runtime function type differed from expected type");
 
         const encoder_expr = try self.addExpr(.{
@@ -19020,7 +19156,9 @@ const BodyContext = struct {
         const encode_fn = self.builder.functionShape(callable_mono_ty, "encoder_for target method was not a function");
         const actual_arg_tys = self.builder.program.types.span(encode_fn.args);
         if (actual_arg_tys.len != arg_tys.len) Common.invariant("encoder_for target method had an unexpected arity");
-        for (actual_arg_tys, arg_tys) |actual, expected| {
+        for (0..GuardedList.borrowLen(actual_arg_tys)) |index| {
+            const actual = GuardedList.at(actual_arg_tys, index);
+            const expected = arg_tys[index];
             if (!self.sameType(actual, expected)) Common.invariant("encoder_for target method argument type differed from expected type");
         }
         if (!self.sameType(encode_fn.ret, ret_ty)) Common.invariant("encoder_for target method return type differed from expected type");
@@ -19046,7 +19184,9 @@ const BodyContext = struct {
         const parse_fn = self.builder.functionShape(callable_mono_ty, "parser_for target method was not a function");
         const actual_arg_tys = self.builder.program.types.span(parse_fn.args);
         if (actual_arg_tys.len != arg_tys.len) Common.invariant("parser_for target method had an unexpected arity");
-        for (actual_arg_tys, arg_tys) |actual, expected| {
+        for (0..GuardedList.borrowLen(actual_arg_tys)) |index| {
+            const actual = GuardedList.at(actual_arg_tys, index);
+            const expected = arg_tys[index];
             if (!self.sameType(actual, expected)) Common.invariant("parser_for target method argument type differed from expected type");
         }
         if (!self.sameType(parse_fn.ret, ret_ty)) Common.invariant("parser_for target method return type differed from expected type");
@@ -19196,8 +19336,8 @@ const BodyContext = struct {
         if (ok_payloads.len != 1 or err_payloads.len != 1) Common.invariant("Try tags must each carry one payload");
         return .{
             .backing_ty = backing_ty,
-            .ok_ty = ok_payloads[0],
-            .err_ty = err_payloads[0],
+            .ok_ty = GuardedList.at(ok_payloads, 0),
+            .err_ty = GuardedList.at(err_payloads, 0),
             .ok_tag = ok_tag,
             .err_tag = err_tag,
         };
@@ -19212,8 +19352,8 @@ const BodyContext = struct {
         if (ok_payloads.len != 1 or err_payloads.len != 1) return null;
         return .{
             .backing_ty = backing_ty,
-            .ok_ty = ok_payloads[0],
-            .err_ty = err_payloads[0],
+            .ok_ty = GuardedList.at(ok_payloads, 0),
+            .err_ty = GuardedList.at(err_payloads, 0),
             .ok_tag = ok_tag,
             .err_tag = err_tag,
         };
@@ -19236,9 +19376,10 @@ const BodyContext = struct {
     ) Allocator.Error!Type.TypeId {
         const template_backing = self.builder.namedBackingType(template_try_ty) orelse Common.invariant("Try template type had no backing");
         const template_tags = switch (self.builder.shapeContent(template_backing)) {
-            .tag_union => |span| self.builder.program.types.tagSpan(span),
+            .tag_union => |span| try GuardedList.dupe(self.allocator, Type.Tag, self.builder.program.types.tagSpan(span)),
             else => Common.invariant("Try template backing type was not a tag union"),
         };
+        defer self.allocator.free(template_tags);
         const tags = try self.allocator.alloc(Type.Tag, template_tags.len);
         defer self.allocator.free(tags);
 
@@ -19393,7 +19534,9 @@ const BodyContext = struct {
     fn recordFieldType(self: *BodyContext, record_ty: Type.TypeId, field_name: names.RecordFieldNameId) Type.TypeId {
         return switch (self.builder.shapeContent(record_ty)) {
             .record => |fields_span| {
-                for (self.builder.program.types.fieldSpan(fields_span)) |field| {
+                const fields = self.builder.program.types.fieldSpan(fields_span);
+                for (0..GuardedList.borrowLen(fields)) |index| {
+                    const field = GuardedList.at(fields, index);
                     if (field.name == field_name) return field.ty;
                 }
                 Common.invariant("record field was absent from monotype record");
@@ -19419,13 +19562,17 @@ const BodyContext = struct {
             .list => |elem_ty| self.parseFieldTypeIsSupported(elem_ty, false),
             .box => |payload_ty| self.parseFieldTypeIsSupported(payload_ty, false),
             .tuple => |span| blk: {
-                for (self.builder.program.types.span(span)) |elem_ty| {
+                const elem_tys = self.builder.program.types.span(span);
+                for (0..GuardedList.borrowLen(elem_tys)) |index| {
+                    const elem_ty = GuardedList.at(elem_tys, index);
                     if (!self.parseFieldTypeIsSupported(elem_ty, false)) break :blk false;
                 }
                 break :blk true;
             },
             .record => |fields_span| blk: {
-                for (self.builder.program.types.fieldSpan(fields_span)) |field| {
+                const fields = self.builder.program.types.fieldSpan(fields_span);
+                for (0..GuardedList.borrowLen(fields)) |index| {
+                    const field = GuardedList.at(fields, index);
                     if (!self.parseFieldTypeIsSupported(field.ty, true)) break :blk false;
                 }
                 break :blk true;
@@ -19433,8 +19580,11 @@ const BodyContext = struct {
             .tag_union => |tags_span| blk: {
                 const tags = self.builder.program.types.tagSpan(tags_span);
                 if (tags.len == 0) break :blk false;
-                for (tags) |tag| {
-                    for (self.builder.program.types.span(tag.payloads)) |payload_ty| {
+                for (0..GuardedList.borrowLen(tags)) |tag_index| {
+                    const tag = GuardedList.at(tags, tag_index);
+                    const payload_tys = self.builder.program.types.span(tag.payloads);
+                    for (0..GuardedList.borrowLen(payload_tys)) |payload_index| {
+                        const payload_ty = GuardedList.at(payload_tys, payload_index);
                         if (!self.parseFieldTypeIsSupported(payload_ty, false)) break :blk false;
                     }
                 }
@@ -19458,13 +19608,17 @@ const BodyContext = struct {
             .list => |elem_ty| self.encodeFieldTypeIsSupported(elem_ty, encoding_ty),
             .box => |payload_ty| self.encodeFieldTypeIsSupported(payload_ty, encoding_ty),
             .tuple => |span| blk: {
-                for (self.builder.program.types.span(span)) |elem_ty| {
+                const elem_tys = self.builder.program.types.span(span);
+                for (0..GuardedList.borrowLen(elem_tys)) |index| {
+                    const elem_ty = GuardedList.at(elem_tys, index);
                     if (!self.encodeFieldTypeIsSupported(elem_ty, encoding_ty)) break :blk false;
                 }
                 break :blk true;
             },
             .record => |fields_span| blk: {
-                for (self.builder.program.types.fieldSpan(fields_span)) |field| {
+                const fields = self.builder.program.types.fieldSpan(fields_span);
+                for (0..GuardedList.borrowLen(fields)) |index| {
+                    const field = GuardedList.at(fields, index);
                     if (!self.encodeRecordFieldTypeIsSupported(field.ty, encoding_ty)) break :blk false;
                 }
                 break :blk true;
@@ -19538,11 +19692,11 @@ const BodyContext = struct {
         const ok_payloads = self.builder.program.types.span(ok_tag.payloads);
         const err_payloads = self.builder.program.types.span(err_tag.payloads);
         if (ok_payloads.len != 1 or err_payloads.len != 1) return null;
-        const err_info = self.jsonTryErrInfo(err_payloads[0]) orelse return null;
+        const err_info = self.jsonTryErrInfo(GuardedList.at(err_payloads, 0)) orelse return null;
         return .{
             .backing_ty = backing_ty,
-            .ok_payload_ty = ok_payloads[0],
-            .err_ty = err_payloads[0],
+            .ok_payload_ty = GuardedList.at(ok_payloads, 0),
+            .err_ty = GuardedList.at(err_payloads, 0),
             .has_missing = err_info.has_missing,
             .has_null = err_info.has_null,
         };
@@ -19557,7 +19711,8 @@ const BodyContext = struct {
 
         var has_missing = false;
         var has_null = false;
-        for (tags) |tag| {
+        for (0..GuardedList.borrowLen(tags)) |index| {
+            const tag = GuardedList.at(tags, index);
             if (self.builder.program.types.span(tag.payloads).len != 0) return null;
             const text = self.builder.program.names.tagLabelText(tag.name);
             if (Ident.textEql(text, "Missing")) {
@@ -19687,9 +19842,9 @@ const BodyContext = struct {
         const missing_fn = self.builder.functionShape(callable_mono_ty, "missing_record_field target method was not a function");
         const arg_tys = self.builder.program.types.span(missing_fn.args);
         if (arg_tys.len != 3) Common.invariant("missing_record_field target method had an unexpected arity");
-        if (!self.sameType(arg_tys[0], encoding_ty)) Common.invariant("missing_record_field encoding type differed from record encoding type");
-        if (!self.sameType(arg_tys[1], str_ty)) Common.invariant("missing_record_field name type differed from Str");
-        if (!self.sameType(arg_tys[2], state_ty)) Common.invariant("missing_record_field state type differed from record rest state type");
+        if (!self.sameType(GuardedList.at(arg_tys, 0), encoding_ty)) Common.invariant("missing_record_field encoding type differed from record encoding type");
+        if (!self.sameType(GuardedList.at(arg_tys, 1), str_ty)) Common.invariant("missing_record_field name type differed from Str");
+        if (!self.sameType(GuardedList.at(arg_tys, 2), state_ty)) Common.invariant("missing_record_field state type differed from record rest state type");
         if (!self.sameType(missing_fn.ret, err_ty)) Common.invariant("missing_record_field return type differed from parse error type");
 
         const args = [_]DraftExprId{
@@ -19735,8 +19890,8 @@ const BodyContext = struct {
         const invalid_fn = self.builder.functionShape(callable_mono_ty, "invalid_value target method was not a function");
         const arg_tys = self.builder.program.types.span(invalid_fn.args);
         if (arg_tys.len != 2) Common.invariant("invalid_value target method had an unexpected arity");
-        if (!self.sameType(arg_tys[0], encoding_ty)) Common.invariant("invalid_value encoding type differed from parser encoding type");
-        if (!self.sameType(arg_tys[1], state_ty)) Common.invariant("invalid_value state type differed from parser state type");
+        if (!self.sameType(GuardedList.at(arg_tys, 0), encoding_ty)) Common.invariant("invalid_value encoding type differed from parser encoding type");
+        if (!self.sameType(GuardedList.at(arg_tys, 1), state_ty)) Common.invariant("invalid_value state type differed from parser state type");
         if (!self.sameType(invalid_fn.ret, err_ty)) Common.invariant("invalid_value return type differed from parse error type");
 
         return try self.addExpr(.{
@@ -19764,9 +19919,9 @@ const BodyContext = struct {
         const missing_fn = self.builder.functionShape(callable_mono_ty, "missing_optional_field target method was not a function");
         const arg_tys = self.builder.program.types.span(missing_fn.args);
         if (arg_tys.len != 3) Common.invariant("missing_optional_field target method had an unexpected arity");
-        if (!self.sameType(arg_tys[0], encoding_ty)) Common.invariant("missing_optional_field encoding type differed from record encoding type");
-        if (!self.sameType(arg_tys[1], str_ty)) Common.invariant("missing_optional_field name type differed from Str");
-        if (!self.sameType(arg_tys[2], state_ty)) Common.invariant("missing_optional_field state type differed from record rest state type");
+        if (!self.sameType(GuardedList.at(arg_tys, 0), encoding_ty)) Common.invariant("missing_optional_field encoding type differed from record encoding type");
+        if (!self.sameType(GuardedList.at(arg_tys, 1), str_ty)) Common.invariant("missing_optional_field name type differed from Str");
+        if (!self.sameType(GuardedList.at(arg_tys, 2), state_ty)) Common.invariant("missing_optional_field state type differed from record rest state type");
         if (!self.sameType(missing_fn.ret, err_ty)) Common.invariant("missing_optional_field return type differed from optional field error type");
 
         const args = [_]DraftExprId{
@@ -20086,12 +20241,12 @@ const BodyContext = struct {
     fn derivationRecord(
         self: *BodyContext,
         comptime D: type,
-        fields: []const Type.Field,
+        fields: anytype,
         operand: D.Operand,
         ctx: DerivationCtx,
     ) Allocator.Error!DraftExprId {
         // Copy because recursive lowerDerivation may reallocate types.fields, invalidating the slice.
-        const fields_copy = try self.allocator.dupe(Type.Field, fields);
+        const fields_copy = try GuardedList.dupe(self.allocator, Type.Field, fields);
         defer self.allocator.free(fields_copy);
         var state = try D.combineSeed(self, operand, ctx);
         var i: usize = 0;
@@ -20107,12 +20262,12 @@ const BodyContext = struct {
     fn derivationTuple(
         self: *BodyContext,
         comptime D: type,
-        items: []const Type.TypeId,
+        items: anytype,
         operand: D.Operand,
         ctx: DerivationCtx,
     ) Allocator.Error!DraftExprId {
         // Copy because recursive lowerDerivation may reallocate types.spans, invalidating the slice.
-        const items_copy = try self.allocator.dupe(Type.TypeId, items);
+        const items_copy = try GuardedList.dupe(self.allocator, Type.TypeId, items);
         defer self.allocator.free(items_copy);
         var state = try D.combineSeed(self, operand, ctx);
         var i: usize = 0;
@@ -21235,7 +21390,8 @@ const BodyContext = struct {
         const rest_fields = self.constRecordFields(rest_ty);
         const fields = try self.allocator.alloc(DraftFieldExpr, rest_fields.len);
         defer self.allocator.free(fields);
-        for (rest_fields, 0..) |field, i| {
+        for (0..GuardedList.borrowLen(rest_fields)) |i| {
+            const field = GuardedList.at(rest_fields, i);
             fields[i] = .{
                 .name = field.name,
                 .value = try self.addExpr(.{
@@ -22470,7 +22626,7 @@ const BodyContext = struct {
 
         const callable_mono_ty = try call_ctx.instantiateIteratorPlanCallTypeFromCaller(plan.callable_ty, self, plan_args, loop_iterator, expected_ret_ty);
         const plan_fn_data = self.builder.functionShape(callable_mono_ty, "checked iterator dispatch plan had a non-function type");
-        const plan_arg_tys = try self.allocator.dupe(Type.TypeId, self.builder.program.types.span(plan_fn_data.args));
+        const plan_arg_tys = try GuardedList.dupe(self.allocator, Type.TypeId, self.builder.program.types.span(plan_fn_data.args));
         defer self.allocator.free(plan_arg_tys);
         if (expected_ret_ty) |expected| {
             if (!self.sameType(plan_fn_data.ret, expected)) {
@@ -22532,7 +22688,7 @@ const BodyContext = struct {
         defer self.allocator.free(args);
         const arg_tys = self.builder.program.types.span(fn_data.args);
         for (plan_args, 0..) |operand, i| {
-            args[i] = try self.lowerIteratorOperandAtType(operand, loop_iterator, arg_tys[i]);
+            args[i] = try self.lowerIteratorOperandAtType(operand, loop_iterator, GuardedList.at(arg_tys, i));
         }
 
         return try self.addExpr(.{
@@ -23504,12 +23660,14 @@ const BodyContext = struct {
     fn lowerPatternSpanAtTypes(
         self: *BodyContext,
         checked_patterns: []const checked.CheckedPatternId,
-        tys: []const Type.TypeId,
+        tys: anytype,
     ) Allocator.Error!DraftSpan(DraftPatId) {
-        if (checked_patterns.len != tys.len) Common.invariant("pattern arity differs from concrete checked type");
+        if (checked_patterns.len != GuardedList.borrowLen(tys)) Common.invariant("pattern arity differs from concrete checked type");
+        const stable_tys = try GuardedList.dupe(self.allocator, Type.TypeId, tys);
+        defer self.allocator.free(stable_tys);
         const lowered = try self.allocator.alloc(DraftPatId, checked_patterns.len);
         defer self.allocator.free(lowered);
-        for (checked_patterns, tys, 0..) |child, child_ty, i| {
+        for (checked_patterns, stable_tys, 0..) |child, child_ty, i| {
             lowered[i] = try self.lowerPatternAtType(child, child_ty);
         }
         return try self.addPatSpan(lowered);
@@ -23880,7 +24038,7 @@ const EqDeriver = struct {
         const rhs_local = try self.addLocal(self.builder.symbols.fresh(), ty);
 
         // Copy the tag list because recursive lowerDerivation may reallocate type spans.
-        const tags = try self.allocator.dupe(Type.Tag, self.builder.program.types.tagSpan(tags_span));
+        const tags = try GuardedList.dupe(self.allocator, Type.Tag, self.builder.program.types.tagSpan(tags_span));
         defer self.allocator.free(tags);
 
         const branches = try self.allocator.alloc(DraftBranch, tags.len);
@@ -23912,7 +24070,7 @@ const EqDeriver = struct {
     /// other right-hand variant yields `false`.
     fn tagBranch(self: *BodyContext, ty: Type.TypeId, rhs_local: DraftLocalId, tag: Type.Tag, single_variant: bool, ctx: BodyContext.DerivationCtx) Allocator.Error!DraftBranch {
         // Copy payload types because recursive lowerDerivation may reallocate type spans.
-        const payloads = try self.allocator.dupe(Type.TypeId, self.builder.program.types.span(tag.payloads));
+        const payloads = try GuardedList.dupe(self.allocator, Type.TypeId, self.builder.program.types.span(tag.payloads));
         defer self.allocator.free(payloads);
 
         const lhs_pats = try self.allocator.alloc(DraftPatId, payloads.len);
@@ -24083,7 +24241,7 @@ const HashDeriver = struct {
         const value_local = try self.addLocal(self.builder.symbols.fresh(), value_ty);
 
         // Copy the tag list because recursive lowerDerivation may reallocate type spans.
-        const tags = try self.allocator.dupe(Type.Tag, self.builder.program.types.tagSpan(tags_span));
+        const tags = try GuardedList.dupe(self.allocator, Type.Tag, self.builder.program.types.tagSpan(tags_span));
         defer self.allocator.free(tags);
 
         const branches = try self.allocator.alloc(DraftBranch, tags.len);
@@ -24106,7 +24264,7 @@ const HashDeriver = struct {
 
     fn tagBranch(self: *BodyContext, value_ty: Type.TypeId, tag: Type.Tag, variant_index: u64, hasher: DraftExprId, ctx: BodyContext.DerivationCtx) Allocator.Error!DraftBranch {
         // Copy payload types because recursive lowerDerivation may reallocate type spans.
-        const payloads = try self.allocator.dupe(Type.TypeId, self.builder.program.types.span(tag.payloads));
+        const payloads = try GuardedList.dupe(self.allocator, Type.TypeId, self.builder.program.types.span(tag.payloads));
         defer self.allocator.free(payloads);
 
         const pats = try self.allocator.alloc(DraftPatId, payloads.len);
@@ -24910,44 +25068,44 @@ test "body draft store appends draft-local ids spans and type cells" {
     const sealed_literal: Ast.StringLiteralId = @enumFromInt(@intFromEnum(literal));
     const sealed_site: Ast.ComptimeSiteId = @enumFromInt(@intFromEnum(site));
 
-    try std.testing.expectEqual(@as(usize, 1), program.locals.items.len);
-    try std.testing.expectEqual(@as(usize, 3), program.pats.items.len);
-    try std.testing.expectEqual(@as(usize, 4), program.exprs.items.len);
-    try std.testing.expectEqual(@as(usize, 1), program.stmts.items.len);
-    try std.testing.expectEqual(@as(usize, 1), program.source_files.items.len);
-    try std.testing.expectEqual(@as(usize, 1), program.string_literals.items.len);
-    try std.testing.expectEqual(@as(usize, 1), program.comptime_sites.items.len);
-    try std.testing.expectEqual(@as(usize, 1), program.field_exprs.items.len);
-    try std.testing.expectEqual(@as(usize, 1), program.record_destructs.items.len);
-    try std.testing.expectEqual(@as(usize, 1), program.str_pattern_steps.items.len);
-    try std.testing.expectEqual(@as(usize, 1), program.branches.items.len);
-    try std.testing.expectEqual(@as(usize, 1), program.if_branches.items.len);
+    try std.testing.expectEqual(@as(usize, 1), program.localCount());
+    try std.testing.expectEqual(@as(usize, 3), program.patCount());
+    try std.testing.expectEqual(@as(usize, 4), program.exprCount());
+    try std.testing.expectEqual(@as(usize, 1), program.stmtCount());
+    try std.testing.expectEqual(@as(usize, 1), program.sourceFileCount());
+    try std.testing.expectEqual(@as(usize, 1), program.stringLiteralCount());
+    try std.testing.expectEqual(@as(usize, 1), program.comptimeSiteCount());
+    try std.testing.expectEqual(@as(usize, 1), program.fieldExprCount());
+    try std.testing.expectEqual(@as(usize, 1), program.recordDestructCount());
+    try std.testing.expectEqual(@as(usize, 1), program.strPatternStepCount());
+    try std.testing.expectEqual(@as(usize, 1), program.branchCount());
+    try std.testing.expectEqual(@as(usize, 1), program.ifBranchCount());
     try std.testing.expectEqualStrings("literal", program.stringLiteralText(sealed_literal));
     try std.testing.expectEqual(Ast.ComptimeSiteKind.if_, program.comptimeSite(sealed_site).kind);
     try std.testing.expectEqual(@as(usize, 1), program.comptimeSite(sealed_site).branch_regions.len);
     try std.testing.expectEqualStrings("value", program.localName(sealed_local));
-    try std.testing.expectEqual(field_name, program.field_exprs.items[0].name);
-    try std.testing.expectEqual(sealed_expr, program.field_exprs.items[0].value);
-    try std.testing.expectEqual(field_name, program.record_destructs.items[0].name);
-    try std.testing.expectEqual(sealed_pat, program.record_destructs.items[0].pattern);
-    try std.testing.expectEqual(@as(?Ast.PatId, sealed_pat), program.str_pattern_steps.items[0].capture);
-    try std.testing.expectEqual(sealed_literal, program.str_pattern_steps.items[0].delimiter);
-    try std.testing.expectEqual(sealed_pat, program.branches.items[0].pat);
-    try std.testing.expectEqual(sealed_expr, program.branches.items[0].body);
-    try std.testing.expectEqual(sealed_expr, program.if_branches.items[0].cond);
-    try std.testing.expectEqual(sealed_expr, program.if_branches.items[0].body);
-    switch (program.pats.items[0].data) {
+    try std.testing.expectEqual(field_name, program.getFieldExprAt(0).name);
+    try std.testing.expectEqual(sealed_expr, program.getFieldExprAt(0).value);
+    try std.testing.expectEqual(field_name, program.getRecordDestructAt(0).name);
+    try std.testing.expectEqual(sealed_pat, program.getRecordDestructAt(0).pattern);
+    try std.testing.expectEqual(@as(?Ast.PatId, sealed_pat), program.getStrPatternStepAt(0).capture);
+    try std.testing.expectEqual(sealed_literal, program.getStrPatternStepAt(0).delimiter);
+    try std.testing.expectEqual(sealed_pat, program.getBranchAt(0).pat);
+    try std.testing.expectEqual(sealed_expr, program.getBranchAt(0).body);
+    try std.testing.expectEqual(sealed_expr, program.getIfBranchAt(0).cond);
+    try std.testing.expectEqual(sealed_expr, program.getIfBranchAt(0).body);
+    switch (program.getPatAt(0).data) {
         .bind => |bind_local| try std.testing.expectEqual(sealed_local, bind_local),
         else => return error.TestExpectedEqual,
     }
-    switch (program.pats.items[@intFromEnum(record_pat)].data) {
+    switch (program.getPat(record_pat).data) {
         .record => |span| {
             try std.testing.expectEqual(@as(u32, 0), span.start);
             try std.testing.expectEqual(@as(u32, 1), span.len);
         },
         else => return error.TestExpectedEqual,
     }
-    switch (program.pats.items[@intFromEnum(str_pat)].data) {
+    switch (program.getPat(str_pat).data) {
         .str_pattern => |pattern| {
             try std.testing.expectEqual(sealed_literal, pattern.prefix);
             try std.testing.expectEqual(@as(u32, 0), pattern.steps.start);
@@ -24956,18 +25114,18 @@ test "body draft store appends draft-local ids spans and type cells" {
         },
         else => return error.TestExpectedEqual,
     }
-    switch (program.exprs.items[0].data) {
+    switch (program.getExprAt(0).data) {
         .local => |expr_local| try std.testing.expectEqual(sealed_local, expr_local),
         else => return error.TestExpectedEqual,
     }
-    switch (program.exprs.items[@intFromEnum(record_expr)].data) {
+    switch (program.getExpr(record_expr).data) {
         .record => |span| {
             try std.testing.expectEqual(@as(u32, 0), span.start);
             try std.testing.expectEqual(@as(u32, 1), span.len);
         },
         else => return error.TestExpectedEqual,
     }
-    switch (program.exprs.items[@intFromEnum(match_expr)].data) {
+    switch (program.getExpr(match_expr).data) {
         .match_ => |match_| {
             try std.testing.expectEqual(sealed_expr, match_.scrutinee);
             try std.testing.expectEqual(@as(u32, 0), match_.branches.start);
@@ -24976,7 +25134,7 @@ test "body draft store appends draft-local ids spans and type cells" {
         },
         else => return error.TestExpectedEqual,
     }
-    switch (program.exprs.items[@intFromEnum(if_expr)].data) {
+    switch (program.getExpr(if_expr).data) {
         .if_ => |if_| {
             try std.testing.expectEqual(@as(u32, 0), if_.branches.start);
             try std.testing.expectEqual(@as(u32, 1), if_.branches.len);
@@ -24984,7 +25142,7 @@ test "body draft store appends draft-local ids spans and type cells" {
         },
         else => return error.TestExpectedEqual,
     }
-    switch (program.stmts.items[0]) {
+    switch (program.getStmtAt(0)) {
         .let_ => |let_| {
             try std.testing.expectEqual(sealed_pat, let_.pat);
             try std.testing.expectEqual(sealed_expr, let_.value);

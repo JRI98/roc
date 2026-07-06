@@ -15,6 +15,7 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
+const collections = @import("collections");
 const Allocator = std.mem.Allocator;
 const core = @import("lir_core");
 const layout_mod = @import("layout");
@@ -24,6 +25,7 @@ const arc_certify = @import("arc_certify.zig");
 
 const LIR = core.LIR;
 const LirStore = core.LirStore;
+const GuardedList = collections.GuardedList;
 
 pub const ResourceError = std.mem.Allocator.Error;
 
@@ -44,9 +46,10 @@ pub fn insert(store: *LirStore, layouts: *const layout_mod.Store, options: Inser
         .store = store,
         .layouts = layouts,
     };
-    var local_contains_refcounted = try store.allocator.alloc(bool, store.locals.items.len);
+    var local_contains_refcounted = try store.allocator.alloc(bool, store.localCount());
     defer store.allocator.free(local_contains_refcounted);
-    for (store.locals.items, 0..) |local, index| {
+    for (0..store.localCount()) |index| {
+        const local = store.getLocal(@enumFromInt(@as(u32, @intCast(index))));
         local_contains_refcounted[index] = layouts.layoutContainsRefcounted(layouts.getLayout(local.layout_idx));
     }
     inserter.local_contains_refcounted = local_contains_refcounted;
@@ -55,7 +58,7 @@ pub fn insert(store: *LirStore, layouts: *const layout_mod.Store, options: Inser
     defer solution.deinit();
     inserter.solution = &solution;
 
-    var scan_needles = try OwnedSet.init(store.allocator, store.locals.items.len);
+    var scan_needles = try OwnedSet.init(store.allocator, store.localCount());
     defer scan_needles.deinit();
     inserter.scan_needles = &scan_needles;
     var scan_visited = std.AutoHashMap(LIR.CFStmtId, void).init(store.allocator);
@@ -78,10 +81,11 @@ pub fn insert(store: *LirStore, layouts: *const layout_mod.Store, options: Inser
     // Original (ownership-neutral) bodies stay valid after each proc's base
     // emission because rewriting clones statements; specialized variants
     // re-emit from these.
-    const base_proc_count = store.proc_specs.items.len;
+    const base_proc_count = store.procSpecCount();
     var original_bodies = try store.allocator.alloc(?LIR.CFStmtId, base_proc_count);
     defer store.allocator.free(original_bodies);
-    for (store.proc_specs.items, 0..) |proc, proc_index| {
+    for (0..base_proc_count) |proc_index| {
+        const proc = store.getProcSpec(@enumFromInt(@as(u32, @intCast(proc_index))));
         original_bodies[proc_index] = proc.body;
     }
 
@@ -102,11 +106,11 @@ pub fn insert(store: *LirStore, layouts: *const layout_mod.Store, options: Inser
     }
     inserter.variants = &variants;
 
-    var owned_param_override = try OwnedSet.init(store.allocator, store.locals.items.len);
+    var owned_param_override = try OwnedSet.init(store.allocator, store.localCount());
     defer owned_param_override.deinit();
     inserter.owned_param_override = &owned_param_override;
 
-    var unique_param_override = try OwnedSet.init(store.allocator, store.locals.items.len);
+    var unique_param_override = try OwnedSet.init(store.allocator, store.localCount());
     defer unique_param_override.deinit();
     inserter.unique_param_override = &unique_param_override;
 
@@ -143,7 +147,9 @@ pub fn insert(store: *LirStore, layouts: *const layout_mod.Store, options: Inser
         var override_count: usize = 0;
         var unique_locals_buffer: [64]LIR.LocalId = undefined;
         var unique_count: usize = 0;
-        for (store.getLocalSpan(emit_args), 0..) |param, position| {
+        const emit_params_for_overrides = store.getLocalSpan(emit_args);
+        for (0..GuardedList.borrowLen(emit_params_for_overrides)) |position| {
+            const param = GuardedList.at(emit_params_for_overrides, position);
             if (position >= 64) break;
             if (solved_sig.paramMode(position) == .borrowed and emit_sig.paramMode(position) == .owned) {
                 owned_param_override.set(param);
@@ -182,26 +188,22 @@ pub fn insert(store: *LirStore, layouts: *const layout_mod.Store, options: Inser
         defer inserter.deinitJoinBodyMemo(&join_body_memo);
         inserter.join_body_memo = &join_body_memo;
         defer inserter.join_body_memo = null;
-        var owned = try OwnedSet.init(store.allocator, store.locals.items.len);
+        var owned = try OwnedSet.init(store.allocator, store.localCount());
         defer owned.deinit();
-        for (store.getLocalSpan(emit_args), 0..) |param, position| {
+        const emit_params_for_owned = store.getLocalSpan(emit_args);
+        for (0..GuardedList.borrowLen(emit_params_for_owned)) |position| {
+            const param = GuardedList.at(emit_params_for_owned, position);
             if (emit_sig.paramMode(position) == .owned) {
                 if (inserter.localContainsRefcounted(param)) owned.set(param);
             }
         }
         const rewritten_body = try inserter.rewritePath(body, &owned, .{});
-        // `rewritePath` may append mode-specialized proc variants via
-        // `addProcSpec`, which can reallocate `store.proc_specs` and invalidate
-        // the `proc` pointer captured above. Re-fetch the slot before writing
-        // the rewritten body and join points so they land in the live backing
-        // storage rather than a freed buffer.
-        const proc_after = store.getProcSpecPtr(emit_proc);
-        proc_after.body = rewritten_body;
-        try inserter.writeProcJoinPoints(proc_after);
+        const join_points = try inserter.procJoinPoints(rewritten_body);
+        store.setProcSpecBodyAndJoinPoints(emit_proc, rewritten_body, join_points);
     }
 
     if (builtin.mode == .Debug) {
-        const all_sigs = try store.allocator.alloc(arc_sig.RcSig, store.proc_specs.items.len);
+        const all_sigs = try store.allocator.alloc(arc_sig.RcSig, store.procSpecCount());
         defer store.allocator.free(all_sigs);
         for (all_sigs, 0..) |*sig, proc_index| {
             sig.* = if (proc_index < solution.sigs.len)
@@ -1451,7 +1453,9 @@ const Inserter = struct {
                 exit_states.deinit(self.store.allocator);
             }
 
-            for (self.store.getCFSwitchBranches(switch_stmt.branches)) |branch| {
+            const branches = self.store.getCFSwitchBranches(switch_stmt.branches);
+            for (0..GuardedList.borrowLen(branches)) |branch_index| {
+                const branch = GuardedList.at(branches, branch_index);
                 try self.analyzeUntil(branch.body, &path.owned, continuation, &exit_states, path.options.loop_keep);
             }
             try self.analyzeUntil(switch_stmt.default_branch, &path.owned, continuation, &exit_states, path.options.loop_keep);
@@ -1537,7 +1541,8 @@ const Inserter = struct {
         try tasks.append(self.store.allocator, .{ .switch_no_continuation = state });
         queued = true;
         try self.pushRewritePath(tasks, default_branch, &path.owned, path.options, &state.default_branch);
-        for (branches, 0..) |branch, index| {
+        for (0..GuardedList.borrowLen(branches)) |index| {
+            const branch = GuardedList.at(branches, index);
             try self.pushRewritePath(tasks, branch.body, &path.owned, path.options, &state.branch_results[index]);
         }
     }
@@ -1548,7 +1553,9 @@ const Inserter = struct {
         if (branches.len != state.branch_results.len) arcInvariant("ARC switch branch result count changed during rewrite");
         const rewritten_branches = try self.store.allocator.alloc(LIR.CFSwitchBranch, branches.len);
         defer self.store.allocator.free(rewritten_branches);
-        for (branches, state.branch_results, 0..) |branch, rewritten, i| {
+        for (0..GuardedList.borrowLen(branches)) |i| {
+            const branch = GuardedList.at(branches, i);
+            const rewritten = state.branch_results[i];
             rewritten_branches[i] = .{
                 .value = branch.value,
                 .body = rewritten,
@@ -1644,7 +1651,8 @@ const Inserter = struct {
         try self.pushRewritePath(tasks, switch_stmt.default_branch, &state.entry_owned, nested_options, &state.default_branch);
         const branches = self.store.getCFSwitchBranches(switch_stmt.branches);
         if (branches.len != state.branch_results.len) arcInvariant("ARC switch branch result count changed during continuation rewrite");
-        for (branches, 0..) |branch, index| {
+        for (0..GuardedList.borrowLen(branches)) |index| {
+            const branch = GuardedList.at(branches, index);
             try self.pushRewritePath(tasks, branch.body, &state.entry_owned, nested_options, &state.branch_results[index]);
         }
     }
@@ -1655,7 +1663,9 @@ const Inserter = struct {
         if (branches.len != state.branch_results.len) arcInvariant("ARC switch branch result count changed during rewrite");
         const rewritten_branches = try self.store.allocator.alloc(LIR.CFSwitchBranch, branches.len);
         defer self.store.allocator.free(rewritten_branches);
-        for (branches, state.branch_results, 0..) |branch, rewritten, i| {
+        for (0..GuardedList.borrowLen(branches)) |i| {
+            const branch = GuardedList.at(branches, i);
+            const rewritten = state.branch_results[i];
             rewritten_branches[i] = .{
                 .value = branch.value,
                 .body = rewritten,
@@ -1698,7 +1708,9 @@ const Inserter = struct {
 
         var match_owned = try path.owned.clone();
         defer match_owned.deinit();
-        for (self.store.getStrMatchSteps(str_match.steps)) |step| {
+        const steps = self.store.getStrMatchSteps(str_match.steps);
+        for (0..GuardedList.borrowLen(steps)) |step_index| {
+            const step = GuardedList.at(steps, step_index);
             switch (step.capture) {
                 .discard => {},
                 .view => |local| self.addOwnedIfRc(&match_owned, local),
@@ -1752,10 +1764,13 @@ const Inserter = struct {
         queued = true;
 
         try self.pushRewritePath(tasks, str_match_set.on_miss, &path.owned, path.options, &state.on_miss);
-        for (arms, 0..) |arm, arm_index| {
+        for (0..GuardedList.borrowLen(arms)) |arm_index| {
+            const arm = GuardedList.at(arms, arm_index);
             var match_owned = try path.owned.clone();
             defer match_owned.deinit();
-            for (self.store.getStrMatchSteps(arm.steps)) |step| {
+            const steps = self.store.getStrMatchSteps(arm.steps);
+            for (0..GuardedList.borrowLen(steps)) |step_index| {
+                const step = GuardedList.at(steps, step_index);
                 switch (step.capture) {
                     .discard => {},
                     .view => |local| self.addOwnedIfRc(&match_owned, local),
@@ -1772,7 +1787,9 @@ const Inserter = struct {
 
         const rewritten_arms = try self.store.allocator.alloc(LIR.StrMatchArm, arms.len);
         defer self.store.allocator.free(rewritten_arms);
-        for (arms, state.on_matches, 0..) |arm, rewritten_on_match, index| {
+        for (0..GuardedList.borrowLen(arms)) |index| {
+            const arm = GuardedList.at(arms, index);
+            const rewritten_on_match = state.on_matches[index];
             rewritten_arms[index] = .{
                 .prefix = arm.prefix,
                 .steps = arm.steps,
@@ -2043,7 +2060,9 @@ const Inserter = struct {
                         try tasks.append(self.store.allocator, .{ .resume_switch_continuation = resume_task });
                         queued = true;
 
-                        for (self.store.getCFSwitchBranches(switch_stmt.branches)) |branch| {
+                        const branches = self.store.getCFSwitchBranches(switch_stmt.branches);
+                        for (0..GuardedList.borrowLen(branches)) |branch_index| {
+                            const branch = GuardedList.at(branches, branch_index);
                             try self.pushAnalysisPath(tasks, branch.body, .{ .stmt = continuation }, &path.owned, &resume_task.switch_exits, path.loop_keep, path.scoped_joins, path.seen);
                         }
                         try self.pushAnalysisPath(tasks, switch_stmt.default_branch, .{ .stmt = continuation }, &path.owned, &resume_task.switch_exits, path.loop_keep, path.scoped_joins, path.seen);
@@ -2051,7 +2070,9 @@ const Inserter = struct {
                         return;
                     }
 
-                    for (self.store.getCFSwitchBranches(switch_stmt.branches)) |branch| {
+                    const branches = self.store.getCFSwitchBranches(switch_stmt.branches);
+                    for (0..GuardedList.borrowLen(branches)) |branch_index| {
+                        const branch = GuardedList.at(branches, branch_index);
                         try self.pushAnalysisPath(tasks, branch.body, path.stop, &path.owned, path.exits, path.loop_keep, path.scoped_joins, path.seen);
                     }
                     try self.pushAnalysisPath(tasks, switch_stmt.default_branch, path.stop, &path.owned, path.exits, path.loop_keep, path.scoped_joins, path.seen);
@@ -2075,7 +2096,9 @@ const Inserter = struct {
                 .str_match => |str_match| {
                     var match_owned = try path.owned.clone();
                     defer match_owned.deinit();
-                    for (self.store.getStrMatchSteps(str_match.steps)) |step| {
+                    const steps = self.store.getStrMatchSteps(str_match.steps);
+                    for (0..GuardedList.borrowLen(steps)) |step_index| {
+                        const step = GuardedList.at(steps, step_index);
                         switch (step.capture) {
                             .discard => {},
                             .view => |local| self.addOwnedIfRc(&match_owned, local),
@@ -2087,10 +2110,14 @@ const Inserter = struct {
                     return;
                 },
                 .str_match_set => |str_match_set| {
-                    for (self.store.getStrMatchArms(str_match_set.arms)) |arm| {
+                    const arms = self.store.getStrMatchArms(str_match_set.arms);
+                    for (0..GuardedList.borrowLen(arms)) |arm_index| {
+                        const arm = GuardedList.at(arms, arm_index);
                         var match_owned = try path.owned.clone();
                         defer match_owned.deinit();
-                        for (self.store.getStrMatchSteps(arm.steps)) |step| {
+                        const steps = self.store.getStrMatchSteps(arm.steps);
+                        for (0..GuardedList.borrowLen(steps)) |step_index| {
+                            const step = GuardedList.at(steps, step_index);
                             switch (step.capture) {
                                 .discard => {},
                                 .view => |local| self.addOwnedIfRc(&match_owned, local),
@@ -2538,10 +2565,14 @@ const Inserter = struct {
             }
         }
 
-        for (self.store.getLocalSpan(params)) |param| {
+        const params_borrow = self.store.getLocalSpan(params);
+        for (0..GuardedList.borrowLen(params_borrow)) |index| {
+            const param = GuardedList.at(params_borrow, index);
             self.addOwnedIfRc(&owned, param);
         }
-        for (self.store.getLocalSpan(maybe_uninitialized_params)) |param| {
+        const maybe_uninitialized_params_borrow = self.store.getLocalSpan(maybe_uninitialized_params);
+        for (0..GuardedList.borrowLen(maybe_uninitialized_params_borrow)) |index| {
+            const param = GuardedList.at(maybe_uninitialized_params_borrow, index);
             // A maybe-initialized join payload may be overwritten before it is
             // read. That overwrite is still the lifetime end of the previous
             // payload, so the loop body must enter with conditional ownership
@@ -2587,7 +2618,8 @@ const Inserter = struct {
         var transfer: u64 = 0;
         if (!self.localContainsRefcounted(target)) return 0;
         const locals = self.store.getLocalSpan(span);
-        for (locals, 0..) |local, i| {
+        for (0..GuardedList.borrowLen(locals)) |i| {
+            const local = GuardedList.at(locals, i);
             if (i >= 64) break;
             const bit = argMaskBit(i);
             if ((position_mask & bit) == 0) continue;
@@ -2637,7 +2669,9 @@ const Inserter = struct {
             try self.noteDeathIfUnused(owned, local, next, loop_keep, collected);
         }
         if (span) |operand_span| {
-            for (self.store.getLocalSpan(operand_span)) |local| {
+            const locals = self.store.getLocalSpan(operand_span);
+            for (0..GuardedList.borrowLen(locals)) |index| {
+                const local = GuardedList.at(locals, index);
                 try self.noteDeathIfUnused(owned, local, next, loop_keep, collected);
             }
         }
@@ -2732,7 +2766,7 @@ const Inserter = struct {
             i -= 1;
             if (i >= 64) continue;
             if ((mask & argMaskBit(i)) != 0) {
-                current = try self.retainLocalIfRc(locals[i], current);
+                current = try self.retainLocalIfRc(GuardedList.at(locals, i), current);
             }
         }
         return current;
@@ -2759,7 +2793,8 @@ const Inserter = struct {
         if (mask == 0) return 0;
         var preserve: u64 = 0;
         const locals = self.store.getLocalSpan(span);
-        for (locals, 0..) |local, i| {
+        for (0..GuardedList.borrowLen(locals)) |i| {
+            const local = GuardedList.at(locals, i);
             if (i >= 64) break;
             const bit = argMaskBit(i);
             if ((mask & bit) == 0) continue;
@@ -2792,7 +2827,8 @@ const Inserter = struct {
         if (check_mask == 0) return 0;
         var unique: u64 = 0;
         const locals = self.store.getLocalSpan(span);
-        for (locals, 0..) |local, i| {
+        for (0..GuardedList.borrowLen(locals)) |i| {
+            const local = GuardedList.at(locals, i);
             if (i >= 64) break;
             const bit = argMaskBit(i);
             if ((check_mask & bit) == 0) continue;
@@ -2825,13 +2861,14 @@ const Inserter = struct {
     /// even though no later statement uses it.
     fn groupSharesOtherOperand(
         self: *const Inserter,
-        locals: []const LIR.LocalId,
+        locals: anytype,
         position: usize,
         local: LIR.LocalId,
     ) bool {
         const leader = self.solution.leaderOf(local);
-        for (locals, 0..) |other, j| {
+        for (0..GuardedList.borrowLen(locals)) |j| {
             if (j == position) continue;
+            const other = GuardedList.at(locals, j);
             if (other == local) return true;
             if (self.solution.leaderOf(other) == leader) return true;
         }
@@ -2861,7 +2898,7 @@ const Inserter = struct {
         if (params.len == 0) return 0;
 
         var mask: u64 = 0;
-        var visited = try self.store.allocator.alloc(bool, self.store.cf_stmts.items.len);
+        var visited = try self.store.allocator.alloc(bool, self.store.cfStmtCount());
         defer self.store.allocator.free(visited);
         @memset(visited, false);
 
@@ -2871,7 +2908,9 @@ const Inserter = struct {
         if (self.variants.original_bodies[@intFromEnum(proc_id)]) |body| {
             try stack.append(self.store.allocator, body);
         }
-        for (self.store.getJoinPointSpan(proc.join_points)) |join_point| {
+        const join_points = self.store.getJoinPointSpan(proc.join_points);
+        for (0..GuardedList.borrowLen(join_points)) |join_index| {
+            const join_point = GuardedList.at(join_points, join_index);
             try stack.append(self.store.allocator, join_point.body);
         }
 
@@ -2888,7 +2927,9 @@ const Inserter = struct {
                     try stack.append(self.store.allocator, assign.next);
                 },
                 .switch_stmt => |switch_stmt| {
-                    for (self.store.getCFSwitchBranches(switch_stmt.branches)) |branch| {
+                    const branches = self.store.getCFSwitchBranches(switch_stmt.branches);
+                    for (0..GuardedList.borrowLen(branches)) |branch_index| {
+                        const branch = GuardedList.at(branches, branch_index);
                         try stack.append(self.store.allocator, branch.body);
                     }
                     try stack.append(self.store.allocator, switch_stmt.default_branch);
@@ -2905,7 +2946,9 @@ const Inserter = struct {
                     try stack.append(self.store.allocator, str_match.on_miss);
                 },
                 .str_match_set => |str_match_set| {
-                    for (self.store.getStrMatchArms(str_match_set.arms)) |arm| {
+                    const arms = self.store.getStrMatchArms(str_match_set.arms);
+                    for (0..GuardedList.borrowLen(arms)) |arm_index| {
+                        const arm = GuardedList.at(arms, arm_index);
                         try stack.append(self.store.allocator, arm.on_match);
                     }
                     try stack.append(self.store.allocator, str_match_set.on_miss);
@@ -2949,7 +2992,7 @@ const Inserter = struct {
 
     fn uniqueSeedMaskForLowLevel(
         self: *const Inserter,
-        params: []const LIR.LocalId,
+        params: anytype,
         args: LIR.LocalSpan,
         rc_effect: LIR.LowLevel.RcEffect,
     ) u64 {
@@ -2958,10 +3001,12 @@ const Inserter = struct {
 
         var mask: u64 = 0;
         const locals = self.store.getLocalSpan(args);
-        for (locals, 0..) |arg, arg_position| {
+        for (0..GuardedList.borrowLen(locals)) |arg_position| {
+            const arg = GuardedList.at(locals, arg_position);
             if (arg_position >= 64) break;
             if ((check_mask & argMaskBit(arg_position)) == 0) continue;
-            for (params[0..@min(params.len, 64)], 0..) |param, param_position| {
+            for (0..@min(params.len, 64)) |param_position| {
+                const param = GuardedList.at(params, param_position);
                 if (arg == param) {
                     mask |= argMaskBit(param_position);
                     break;
@@ -2989,7 +3034,8 @@ const Inserter = struct {
 
         result.demanded = callee_sig;
         const locals = self.store.getLocalSpan(span);
-        for (locals, 0..) |local, position| {
+        for (0..GuardedList.borrowLen(locals)) |position| {
+            const local = GuardedList.at(locals, position);
             if (!self.localContainsRefcounted(local)) continue;
             if (callee_sig.paramMode(position) == .borrowed) {
                 // Borrowed positions keep the caller's ownership untouched.
@@ -3101,7 +3147,8 @@ const Inserter = struct {
     fn maskedArgsContainLocal(self: *Inserter, span: LIR.LocalSpan, mask: u64, needle: LIR.LocalId) bool {
         if (mask == 0) return false;
         const locals = self.store.getLocalSpan(span);
-        for (locals, 0..) |local, i| {
+        for (0..GuardedList.borrowLen(locals)) |i| {
+            const local = GuardedList.at(locals, i);
             if (i >= 64) break;
             if ((mask & argMaskBit(i)) != 0 and local == needle) return true;
         }
@@ -3123,7 +3170,8 @@ const Inserter = struct {
     ) void {
         if (mask == 0) return;
         const locals = self.store.getLocalSpan(span);
-        for (locals, 0..) |local, i| {
+        for (0..GuardedList.borrowLen(locals)) |i| {
+            const local = GuardedList.at(locals, i);
             if (i >= 64) break;
             if ((mask & argMaskBit(i)) != 0 and local != except) {
                 self.unsetOwnedUnit(owned, local);
@@ -3167,7 +3215,9 @@ const Inserter = struct {
                         try stack.append(self.store.allocator, continuation);
                     }
                     try stack.append(self.store.allocator, switch_stmt.default_branch);
-                    for (self.store.getCFSwitchBranches(switch_stmt.branches)) |branch| {
+                    const branches = self.store.getCFSwitchBranches(switch_stmt.branches);
+                    for (0..GuardedList.borrowLen(branches)) |branch_index| {
+                        const branch = GuardedList.at(branches, branch_index);
                         try stack.append(self.store.allocator, branch.body);
                     }
                 },
@@ -3180,7 +3230,9 @@ const Inserter = struct {
                     try stack.append(self.store.allocator, str_match.on_miss);
                 },
                 .str_match_set => |str_match_set| {
-                    for (self.store.getStrMatchArms(str_match_set.arms)) |arm| {
+                    const arms = self.store.getStrMatchArms(str_match_set.arms);
+                    for (0..GuardedList.borrowLen(arms)) |arm_index| {
+                        const arm = GuardedList.at(arms, arm_index);
                         try stack.append(self.store.allocator, arm.on_match);
                     }
                     try stack.append(self.store.allocator, str_match_set.on_miss);
@@ -3208,17 +3260,14 @@ const Inserter = struct {
         }
     }
 
-    fn writeProcJoinPoints(self: *Inserter, proc: *LIR.LirProcSpec) ResourceError!void {
-        const body = proc.body orelse {
-            proc.join_points = LIR.JoinPointSpan.empty();
-            return;
-        };
+    fn procJoinPoints(self: *Inserter, body: ?LIR.CFStmtId) ResourceError!LIR.JoinPointSpan {
+        const start = body orelse return LIR.JoinPointSpan.empty();
 
         var joins: FinalJoinMap = .empty;
         defer joins.deinit(self.store.allocator);
         var visited = std.AutoHashMap(LIR.CFStmtId, void).init(self.store.allocator);
         defer visited.deinit();
-        try self.collectFinalJoinPoints(body, &joins, &visited);
+        try self.collectFinalJoinPoints(start, &joins, &visited);
 
         const sorted = try self.store.allocator.alloc(LIR.JoinPoint, joins.count());
         defer self.store.allocator.free(sorted);
@@ -3226,7 +3275,7 @@ const Inserter = struct {
             sorted[index] = join;
         }
         std.mem.sort(LIR.JoinPoint, sorted, {}, joinPointLessThan);
-        proc.join_points = try self.store.addJoinPointSpan(sorted);
+        return try self.store.addJoinPointSpan(sorted);
     }
 
     fn collectFinalJoinPoints(
@@ -3268,7 +3317,9 @@ const Inserter = struct {
                         try stack.append(self.store.allocator, continuation);
                     }
                     try stack.append(self.store.allocator, switch_stmt.default_branch);
-                    for (self.store.getCFSwitchBranches(switch_stmt.branches)) |branch| {
+                    const branches = self.store.getCFSwitchBranches(switch_stmt.branches);
+                    for (0..GuardedList.borrowLen(branches)) |branch_index| {
+                        const branch = GuardedList.at(branches, branch_index);
                         try stack.append(self.store.allocator, branch.body);
                     }
                 },
@@ -3281,7 +3332,9 @@ const Inserter = struct {
                     try stack.append(self.store.allocator, str_match.on_miss);
                 },
                 .str_match_set => |str_match_set| {
-                    for (self.store.getStrMatchArms(str_match_set.arms)) |arm| {
+                    const arms = self.store.getStrMatchArms(str_match_set.arms);
+                    for (0..GuardedList.borrowLen(arms)) |arm_index| {
+                        const arm = GuardedList.at(arms, arm_index);
                         try stack.append(self.store.allocator, arm.on_match);
                     }
                     try stack.append(self.store.allocator, str_match_set.on_miss);
@@ -3351,9 +3404,9 @@ const Inserter = struct {
     ) ResourceError!void {
         if (graph.indices.contains(stmt)) return;
 
-        var reads = try std.bit_set.DynamicBitSetUnmanaged.initEmpty(graph.allocator, self.store.locals.items.len);
+        var reads = try std.bit_set.DynamicBitSetUnmanaged.initEmpty(graph.allocator, self.store.localCount());
         errdefer reads.deinit(graph.allocator);
-        var exposed = try std.bit_set.DynamicBitSetUnmanaged.initEmpty(graph.allocator, self.store.locals.items.len);
+        var exposed = try std.bit_set.DynamicBitSetUnmanaged.initEmpty(graph.allocator, self.store.localCount());
         errdefer exposed.deinit(graph.allocator);
 
         const index = graph.nodes.items.len;
@@ -3392,7 +3445,9 @@ const Inserter = struct {
     }
 
     fn noteReadBeforeRebindSpan(self: *Inserter, reads: *std.bit_set.DynamicBitSetUnmanaged, span: LIR.LocalSpan) void {
-        for (self.store.getLocalSpan(span)) |local| {
+        const locals = self.store.getLocalSpan(span);
+        for (0..GuardedList.borrowLen(locals)) |index| {
+            const local = GuardedList.at(locals, index);
             noteReadBeforeRebindLocal(reads, local);
         }
     }
@@ -3530,7 +3585,9 @@ const Inserter = struct {
                         try self.appendReadBeforeRebindSuccessor(&graph, &work, node_index, continuation);
                     }
                     try self.appendReadBeforeRebindSuccessor(&graph, &work, node_index, switch_stmt.default_branch);
-                    for (self.store.getCFSwitchBranches(switch_stmt.branches)) |branch| {
+                    const branches = self.store.getCFSwitchBranches(switch_stmt.branches);
+                    for (0..GuardedList.borrowLen(branches)) |branch_index| {
+                        const branch = GuardedList.at(branches, branch_index);
                         try self.appendReadBeforeRebindSuccessor(&graph, &work, node_index, branch.body);
                     }
                 },
@@ -3547,7 +3604,9 @@ const Inserter = struct {
                 },
                 .str_match_set => |str_match_set| {
                     noteReadBeforeRebindLocal(&graph.nodes.items[node_index].reads, str_match_set.source);
-                    for (self.store.getStrMatchArms(str_match_set.arms)) |arm| {
+                    const arms = self.store.getStrMatchArms(str_match_set.arms);
+                    for (0..GuardedList.borrowLen(arms)) |arm_index| {
+                        const arm = GuardedList.at(arms, arm_index);
                         try self.appendReadBeforeRebindSuccessor(&graph, &work, node_index, arm.on_match);
                     }
                     try self.appendReadBeforeRebindSuccessor(&graph, &work, node_index, str_match_set.on_miss);
@@ -3615,7 +3674,7 @@ const Inserter = struct {
             }
         }
 
-        var scratch = try std.bit_set.DynamicBitSetUnmanaged.initEmpty(graph_allocator, self.store.locals.items.len);
+        var scratch = try std.bit_set.DynamicBitSetUnmanaged.initEmpty(graph_allocator, self.store.localCount());
         var in_work = try std.bit_set.DynamicBitSetUnmanaged.initEmpty(graph_allocator, node_count);
         var node_work = std.ArrayList(usize).empty;
         try node_work.ensureTotalCapacity(graph_allocator, node_count);
@@ -3756,7 +3815,9 @@ const Inserter = struct {
                         try stack.append(self.store.allocator, continuation);
                     }
                     try stack.append(self.store.allocator, switch_stmt.default_branch);
-                    for (self.store.getCFSwitchBranches(switch_stmt.branches)) |branch| {
+                    const branches = self.store.getCFSwitchBranches(switch_stmt.branches);
+                    for (0..GuardedList.borrowLen(branches)) |branch_index| {
+                        const branch = GuardedList.at(branches, branch_index);
                         try stack.append(self.store.allocator, branch.body);
                     }
                 },
@@ -3768,7 +3829,9 @@ const Inserter = struct {
                 .str_match => |str_match| {
                     if (str_match.source == needle) return true;
                     var defines_needle_on_match = false;
-                    for (self.store.getStrMatchSteps(str_match.steps)) |step| {
+                    const steps = self.store.getStrMatchSteps(str_match.steps);
+                    for (0..GuardedList.borrowLen(steps)) |step_index| {
+                        const step = GuardedList.at(steps, step_index);
                         switch (step.capture) {
                             .discard => {},
                             .view => |local| {
@@ -3781,9 +3844,13 @@ const Inserter = struct {
                 },
                 .str_match_set => |str_match_set| {
                     if (str_match_set.source == needle) return true;
-                    for (self.store.getStrMatchArms(str_match_set.arms)) |arm| {
+                    const arms = self.store.getStrMatchArms(str_match_set.arms);
+                    for (0..GuardedList.borrowLen(arms)) |arm_index| {
+                        const arm = GuardedList.at(arms, arm_index);
                         var defines_needle_on_match = false;
-                        for (self.store.getStrMatchSteps(arm.steps)) |step| {
+                        const steps = self.store.getStrMatchSteps(arm.steps);
+                        for (0..GuardedList.borrowLen(steps)) |step_index| {
+                            const step = GuardedList.at(steps, step_index);
                             switch (step.capture) {
                                 .discard => {},
                                 .view => |local| {
@@ -3833,7 +3900,9 @@ const Inserter = struct {
     }
 
     fn spanUsesLocal(self: *Inserter, span: LIR.LocalSpan, needle: LIR.LocalId) bool {
-        for (self.store.getLocalSpan(span)) |local| {
+        const locals = self.store.getLocalSpan(span);
+        for (0..GuardedList.borrowLen(locals)) |index| {
+            const local = GuardedList.at(locals, index);
             if (local == needle) return true;
         }
         return false;
@@ -3951,7 +4020,9 @@ const Inserter = struct {
                         try stack.append(self.store.allocator, continuation);
                     }
                     try stack.append(self.store.allocator, switch_stmt.default_branch);
-                    for (self.store.getCFSwitchBranches(switch_stmt.branches)) |branch| {
+                    const branches = self.store.getCFSwitchBranches(switch_stmt.branches);
+                    for (0..GuardedList.borrowLen(branches)) |branch_index| {
+                        const branch = GuardedList.at(branches, branch_index);
                         try stack.append(self.store.allocator, branch.body);
                     }
                 },
@@ -3967,7 +4038,9 @@ const Inserter = struct {
                 },
                 .str_match_set => |str_match_set| {
                     if (needles.contains(str_match_set.source)) return true;
-                    for (self.store.getStrMatchArms(str_match_set.arms)) |arm| {
+                    const arms = self.store.getStrMatchArms(str_match_set.arms);
+                    for (0..GuardedList.borrowLen(arms)) |arm_index| {
+                        const arm = GuardedList.at(arms, arm_index);
                         try stack.append(self.store.allocator, arm.on_match);
                     }
                     try stack.append(self.store.allocator, str_match_set.on_miss);
@@ -4010,7 +4083,9 @@ const Inserter = struct {
     }
 
     fn spanUsesAny(self: *Inserter, span: LIR.LocalSpan, needles: *const OwnedSet) bool {
-        for (self.store.getLocalSpan(span)) |local| {
+        const locals = self.store.getLocalSpan(span);
+        for (0..GuardedList.borrowLen(locals)) |index| {
+            const local = GuardedList.at(locals, index);
             if (needles.contains(local)) return true;
         }
         return false;
@@ -4023,7 +4098,7 @@ const Inserter = struct {
         while (i > 0) {
             i -= 1;
             if (i < 64 and (skip_mask & argMaskBit(i)) != 0) continue;
-            current = try self.retainLocalIfRc(locals[i], current);
+            current = try self.retainLocalIfRc(GuardedList.at(locals, i), current);
         }
         return current;
     }
@@ -4068,7 +4143,9 @@ const Inserter = struct {
 
     fn retainStrMatchSourceForCaptures(self: *Inserter, source: LIR.LocalId, steps: LIR.StrMatchStepSpan, next: LIR.CFStmtId) ResourceError!LIR.CFStmtId {
         var count: u16 = 0;
-        for (self.store.getStrMatchSteps(steps)) |step| {
+        const step_borrow = self.store.getStrMatchSteps(steps);
+        for (0..GuardedList.borrowLen(step_borrow)) |step_index| {
+            const step = GuardedList.at(step_borrow, step_index);
             switch (step.capture) {
                 .discard => {},
                 .view => |local| {
@@ -4558,7 +4635,8 @@ const ArcTest = struct {
     }
 
     fn procBody(self: *const ArcTest) LIR.CFStmtId {
-        for (self.store.proc_specs.items) |proc| {
+        for (0..self.store.procSpecCount()) |proc_index| {
+            const proc = self.store.getProcSpec(@enumFromInt(@as(u32, @intCast(proc_index))));
             if (proc.body) |body| return body;
         }
         arcInvariant("ARC test fixture has no procedure body");
@@ -4566,7 +4644,8 @@ const ArcTest = struct {
 
     fn joinBody(self: *const ArcTest, join_id: LIR.JoinPointId) LIR.CFStmtId {
         var found: ?LIR.CFStmtId = null;
-        for (self.store.cf_stmts.items) |stmt| {
+        for (0..self.store.cfStmtCount()) |stmt_index| {
+            const stmt = self.store.getCFStmt(@enumFromInt(@as(u32, @intCast(stmt_index))));
             switch (stmt) {
                 .join => |join_stmt| {
                     if (join_stmt.id == join_id) found = join_stmt.body;
@@ -4579,7 +4658,8 @@ const ArcTest = struct {
 
     fn countRc(self: *const ArcTest, local_id: LIR.LocalId, kind: RcKind) usize {
         var count: usize = 0;
-        for (self.store.cf_stmts.items) |stmt| {
+        for (0..self.store.cfStmtCount()) |stmt_index| {
+            const stmt = self.store.getCFStmt(@enumFromInt(@as(u32, @intCast(stmt_index))));
             switch (stmt) {
                 .incref => |rc| {
                     if (kind == .incref and rc.value == local_id) count += 1;
@@ -4603,7 +4683,8 @@ const ArcTest = struct {
 
     fn expectRcAtomicity(self: *const ArcTest, local_id: LIR.LocalId, expected: LIR.RcAtomicity) ExpectError!void {
         var seen: usize = 0;
-        for (self.store.cf_stmts.items) |stmt| {
+        for (0..self.store.cfStmtCount()) |stmt_index| {
+            const stmt = self.store.getCFStmt(@enumFromInt(@as(u32, @intCast(stmt_index))));
             const found: LIR.RcAtomicity = switch (stmt) {
                 .incref => |rc| if (rc.value == local_id) rc.atomicity else continue,
                 .decref => |rc| if (rc.value == local_id) rc.atomicity else continue,
@@ -4619,7 +4700,8 @@ const ArcTest = struct {
 
     fn uniqueArgsFor(self: *const ArcTest, target: LIR.LocalId) u64 {
         var mask: u64 = 0;
-        for (self.store.cf_stmts.items) |stmt| {
+        for (0..self.store.cfStmtCount()) |stmt_index| {
+            const stmt = self.store.getCFStmt(@enumFromInt(@as(u32, @intCast(stmt_index))));
             switch (stmt) {
                 .assign_low_level => |assign| {
                     if (assign.target == target) mask |= assign.unique_args;
@@ -4650,7 +4732,9 @@ const ArcTest = struct {
                     try stack.append(self.allocator, assign.next);
                 },
                 .switch_stmt => |s| {
-                    for (self.store.getCFSwitchBranches(s.branches)) |branch| {
+                    const branches = self.store.getCFSwitchBranches(s.branches);
+                    for (0..GuardedList.borrowLen(branches)) |branch_index| {
+                        const branch = GuardedList.at(branches, branch_index);
                         try stack.append(self.allocator, branch.body);
                     }
                     try stack.append(self.allocator, s.default_branch);
@@ -4667,7 +4751,9 @@ const ArcTest = struct {
                     try stack.append(self.allocator, s.on_miss);
                 },
                 .str_match_set => |s| {
-                    for (self.store.getStrMatchArms(s.arms)) |arm| {
+                    const arms = self.store.getStrMatchArms(s.arms);
+                    for (0..GuardedList.borrowLen(arms)) |arm_index| {
+                        const arm = GuardedList.at(arms, arm_index);
                         try stack.append(self.allocator, arm.on_match);
                     }
                     try stack.append(self.allocator, s.on_miss);
@@ -4687,7 +4773,8 @@ const ArcTest = struct {
 
     fn countAllRc(self: *const ArcTest) usize {
         var count: usize = 0;
-        for (self.store.cf_stmts.items) |stmt| {
+        for (0..self.store.cfStmtCount()) |stmt_index| {
+            const stmt = self.store.getCFStmt(@enumFromInt(@as(u32, @intCast(stmt_index))));
             switch (stmt) {
                 .incref, .decref, .decref_if_initialized, .free => count += 1,
                 else => {},
@@ -4704,7 +4791,7 @@ const ArcTest = struct {
 
     fn expectReachableRcBefore(self: *const ArcTest, start: LIR.CFStmtId, kind: RcKind, local_id: LIR.LocalId, before: RcStopKind) error{ ExpectedRcBeforeStop, NonLinearPath, CyclicPath }!void {
         var cursor = start;
-        var remaining: usize = self.store.cf_stmts.items.len + 1;
+        var remaining: usize = self.store.cfStmtCount() + 1;
         while (remaining > 0) : (remaining -= 1) {
             const stmt = self.store.getCFStmt(cursor);
             switch (stmt) {
@@ -4761,7 +4848,7 @@ const ArcTest = struct {
         set_target: LIR.LocalId,
     ) error{ ExpectedConditionalDecref, SetBeforeConditionalDecref, NonLinearPath, CyclicPath }!void {
         var cursor = start;
-        var remaining: usize = self.store.cf_stmts.items.len + 1;
+        var remaining: usize = self.store.cfStmtCount() + 1;
         while (remaining > 0) : (remaining -= 1) {
             const stmt = self.store.getCFStmt(cursor);
             switch (stmt) {
@@ -6136,12 +6223,12 @@ test "uniqueness: specialized variant elides the check on a unique dying argumen
     const caller_body = try f.assignList(list, &.{}, call);
     _ = try f.addProc(&.{}, caller_body, f.list_i64);
 
-    const base_proc_count = f.store.proc_specs.items.len;
+    const base_proc_count = f.store.procSpecCount();
     try insert(&f.store, &f.layouts, .{ .specialize = true });
 
     // One unique-seeded variant exists; its op runs check-free while the
     // base proc keeps the runtime check.
-    try testing.expectEqual(base_proc_count + 1, f.store.proc_specs.items.len);
+    try testing.expectEqual(base_proc_count + 1, f.store.procSpecCount());
     try testing.expectEqual(@as(u64, 0), try f.uniqueArgsInProc(callee, appended));
     const variant: LIR.LirProcSpecId = @enumFromInt(@as(u32, @intCast(base_proc_count)));
     try testing.expectEqual(@as(u64, 1), try f.uniqueArgsInProc(variant, appended));
@@ -6171,12 +6258,12 @@ test "uniqueness: without specialization the dying unique argument keeps the cal
     const caller_body = try f.assignList(list, &.{}, call);
     _ = try f.addProc(&.{}, caller_body, f.list_i64);
 
-    const base_proc_count = f.store.proc_specs.items.len;
+    const base_proc_count = f.store.procSpecCount();
     try f.run();
 
     // Single-variant emission never sees unique parameters: no variant is
     // cloned and the callee keeps its runtime check.
-    try testing.expectEqual(base_proc_count, f.store.proc_specs.items.len);
+    try testing.expectEqual(base_proc_count, f.store.procSpecCount());
     try testing.expectEqual(@as(u64, 0), f.uniqueArgsFor(appended));
 }
 
@@ -6380,7 +6467,7 @@ test "dev lowering: mutable list reassignment releases only the replaced value" 
 
 fn expectDecrefBeforeStmt(f: *const ArcTest, start: LIR.CFStmtId, local: LIR.LocalId, comptime stop_tag: std.meta.Tag(LIR.CFStmt)) error{ DecrefNotBeforeStop, NonLinearPath, CyclicPath }!void {
     var cursor = start;
-    var remaining: usize = f.store.cf_stmts.items.len + 1;
+    var remaining: usize = f.store.cfStmtCount() + 1;
     while (remaining > 0) : (remaining -= 1) {
         const stmt = f.store.getCFStmt(cursor);
         if (stmt == stop_tag) return error.DecrefNotBeforeStop;
@@ -6676,13 +6763,13 @@ test "RC specialization: borrowed final argument does not clone for release-only
     const body = try f.assignStr(value, "arg", call);
     _ = try f.addProc(&.{}, body, .i64);
 
-    const base_proc_count = f.store.proc_specs.items.len;
+    const base_proc_count = f.store.procSpecCount();
     try insert(&f.store, &f.layouts, .{ .specialize = true });
 
     // Moving this argument into a variant would only relocate the release
     // from caller to callee. Keep the borrowed signature and avoid cloning
     // live code for no runtime RC reduction.
-    try testing.expectEqual(base_proc_count, f.store.proc_specs.items.len);
+    try testing.expectEqual(base_proc_count, f.store.procSpecCount());
     try f.expectRc(value, 0, 1, 0);
     try f.expectRc(param, 0, 0, 0);
 }
@@ -6718,15 +6805,15 @@ test "RC specialization: caller body survives variant proc append" {
     const caller_body = try f.assignStr(source, "arg", flag_assign);
     const caller = try f.addProc(&.{}, caller_body, .i64);
 
-    const base_proc_count = f.store.proc_specs.items.len;
-    f.store.proc_specs.shrinkAndFree(f.allocator, f.store.proc_specs.items.len);
+    const base_proc_count = f.store.procSpecCount();
+    f.store.proc_specs.shrinkAndFree(f.allocator, f.store.procSpecCount());
     try insert(&f.store, &f.layouts, .{ .specialize = true });
 
-    try testing.expectEqual(base_proc_count + 1, f.store.proc_specs.items.len);
+    try testing.expectEqual(base_proc_count + 1, f.store.procSpecCount());
     const variant: LIR.LirProcSpecId = @enumFromInt(@as(u32, @intCast(base_proc_count)));
 
     var cursor = f.store.getProcSpec(caller).body orelse return error.MissingCallerBody;
-    var remaining = f.store.cf_stmts.items.len + 1;
+    var remaining = f.store.cfStmtCount() + 1;
     while (remaining > 0) : (remaining -= 1) {
         switch (f.store.getCFStmt(cursor)) {
             .assign_call => |assign| {
@@ -6768,12 +6855,12 @@ test "RC without specialization: owned final argument drops after the call" {
     const body = try f.assignStr(value, "arg", call);
     _ = try f.addProc(&.{}, body, .i64);
 
-    const base_proc_count = f.store.proc_specs.items.len;
+    const base_proc_count = f.store.procSpecCount();
     try f.run();
 
     // The single-variant build keeps the borrowed signature: the caller
     // retains ownership across the call and releases right after it.
-    try testing.expectEqual(base_proc_count, f.store.proc_specs.items.len);
+    try testing.expectEqual(base_proc_count, f.store.procSpecCount());
     try f.expectRc(value, 0, 1, 0);
     try f.expectRc(param, 0, 0, 0);
 }
@@ -6810,10 +6897,10 @@ test "RC specialization: identical demand vectors share one variant" {
     const body = try f.assignStr(value_a, "a", call_a);
     _ = try f.addProc(&.{}, body, .i64);
 
-    const base_proc_count = f.store.proc_specs.items.len;
+    const base_proc_count = f.store.procSpecCount();
     try insert(&f.store, &f.layouts, .{ .specialize = true });
 
-    try testing.expectEqual(base_proc_count + 1, f.store.proc_specs.items.len);
+    try testing.expectEqual(base_proc_count + 1, f.store.procSpecCount());
     try f.expectRc(value_a, 0, 0, 0);
     try f.expectRc(value_b, 0, 0, 0);
 }

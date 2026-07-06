@@ -2057,8 +2057,7 @@ test "monotype specialization cache maps fresh single-shard program view equival
     const pat = try program.addPat(.{ .ty = unit_ty, .data = .{ .bind = local } });
     const stmt = try program.addStmt(.{ .expr = call_expr });
 
-    const def_id: Ast.DefId = @enumFromInt(@as(u32, @intCast(program.defs.items.len)));
-    try program.defs.append(allocator, .{
+    const def_id = try program.addDef(.{
         .symbol = @enumFromInt(2),
         .fn_def = fn_template,
         .fn_id = fn_id,
@@ -2066,7 +2065,7 @@ test "monotype specialization cache maps fresh single-shard program view equival
         .body = .{ .roc = call_expr },
         .ret = unit_ty,
     });
-    try program.nested_defs.append(allocator, .{
+    _ = try program.addNestedDef(.{
         .symbol = @enumFromInt(3),
         .fn_def = fn_template,
         .fn_id = fn_id,

@@ -14,7 +14,7 @@ match ... {
 }
 ~~~
 # EXPECTED
-UNCONDITIONAL CONDITION - nested_record_patterns.md:1:1:1:1
+UNCONDITIONAL CONDITION - nested_record_patterns.md:1:7:1:10
 # PROBLEMS
 
 ┌─────────────────────────┐
@@ -22,8 +22,8 @@ UNCONDITIONAL CONDITION - nested_record_patterns.md:1:1:1:1
 └┬────────────────────────┘  this match will always inspect the same value.   │
  │                                                                            │
  │  match ... {                                                               │
- │  ‾                                                                         │
- └───────────────────────────────────────────── nested_record_patterns.md:1:1 ┘
+ │        ‾‾‾                                                                 │
+ └───────────────────────────────────────────── nested_record_patterns.md:1:7 ┘
 
 
 # TOKENS
