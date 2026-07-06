@@ -54,33 +54,27 @@ pub const ModuleKind = union(enum) {
         malformed,
     };
 
-    /// Extern-compatible payload union for serialization
-    pub const Payload = extern union {
-        type_module_ident: Ident.Idx,
-        none: u32,
-    };
-
     /// Extern-compatible serialized form
     pub const Serialized = extern struct {
         tag: Tag,
-        payload: Payload,
+        payload: u32,
 
         pub fn encode(kind: ModuleKind) @This() {
             return switch (kind) {
-                .type_module => |idx| .{ .tag = .type_module, .payload = .{ .type_module_ident = idx } },
-                .default_app => .{ .tag = .default_app, .payload = .{ .none = 0 } },
-                .app => .{ .tag = .app, .payload = .{ .none = 0 } },
-                .package => .{ .tag = .package, .payload = .{ .none = 0 } },
-                .platform => .{ .tag = .platform, .payload = .{ .none = 0 } },
-                .hosted => .{ .tag = .hosted, .payload = .{ .none = 0 } },
-                .module => .{ .tag = .module, .payload = .{ .none = 0 } },
-                .malformed => .{ .tag = .malformed, .payload = .{ .none = 0 } },
+                .type_module => |idx| .{ .tag = .type_module, .payload = @as(u32, @bitCast(idx)) },
+                .default_app => .{ .tag = .default_app, .payload = 0 },
+                .app => .{ .tag = .app, .payload = 0 },
+                .package => .{ .tag = .package, .payload = 0 },
+                .platform => .{ .tag = .platform, .payload = 0 },
+                .hosted => .{ .tag = .hosted, .payload = 0 },
+                .module => .{ .tag = .module, .payload = 0 },
+                .malformed => .{ .tag = .malformed, .payload = 0 },
             };
         }
 
         pub fn decode(self: @This()) ModuleKind {
             return switch (self.tag) {
-                .type_module => .{ .type_module = self.payload.type_module_ident },
+                .type_module => .{ .type_module = @as(Ident.Idx, @bitCast(self.payload)) },
                 .default_app => .default_app,
                 .app => .app,
                 .package => .package,
@@ -121,7 +115,7 @@ pub const CommonIdents = extern struct {
     is_eq: Ident.Idx,
     to_hash: Ident.Idx,
     parser_for: Ident.Idx,
-    encode_to: Ident.Idx,
+    encoder_for: Ident.Idx,
 
     // Type/module names
     @"try": Ident.Idx,
@@ -242,7 +236,7 @@ pub const CommonIdents = extern struct {
             .is_eq = try common.insertIdent(gpa, Ident.for_text("is_eq")),
             .to_hash = try common.insertIdent(gpa, Ident.for_text("to_hash")),
             .parser_for = try common.insertIdent(gpa, Ident.for_text("parser_for")),
-            .encode_to = try common.insertIdent(gpa, Ident.for_text("encode_to")),
+            .encoder_for = try common.insertIdent(gpa, Ident.for_text("encoder_for")),
             .@"try" = try common.insertIdent(gpa, Ident.for_text("Try")),
             .out_of_range = try common.insertIdent(gpa, Ident.for_text("OutOfRange")),
             .builtin_module = try common.insertIdent(gpa, Ident.for_text("Builtin")),
@@ -359,7 +353,7 @@ pub const CommonIdents = extern struct {
             .is_eq = common.findIdent("is_eq") orelse unreachable,
             .to_hash = common.findIdent("to_hash") orelse unreachable,
             .parser_for = common.findIdent("parser_for") orelse unreachable,
-            .encode_to = common.findIdent("encode_to") orelse unreachable,
+            .encoder_for = common.findIdent("encoder_for") orelse unreachable,
             .@"try" = common.findIdent("Try") orelse unreachable,
             .out_of_range = common.findIdent("OutOfRange") orelse unreachable,
             .builtin_module = common.findIdent("Builtin") orelse unreachable,
@@ -455,16 +449,50 @@ pub const CommonIdents = extern struct {
     }
 };
 
-/// Key for method lookup: (owner type declaration, method_ident) pair.
+/// Owner identity for static-dispatch method lookup.
+pub const MethodOwner = extern struct {
+    owner_module_ident_bits: u32,
+    owner: CIR.Statement.Idx,
+
+    pub fn init(owner_module_ident: Ident.Idx, owner: CIR.Statement.Idx) MethodOwner {
+        return .{
+            .owner_module_ident_bits = @bitCast(owner_module_ident),
+            .owner = owner,
+        };
+    }
+
+    pub fn moduleIdent(self: MethodOwner) Ident.Idx {
+        return @bitCast(self.owner_module_ident_bits);
+    }
+
+    pub fn eql(a: MethodOwner, b: MethodOwner) bool {
+        return a.owner_module_ident_bits == b.owner_module_ident_bits and a.owner == b.owner;
+    }
+};
+
+/// Key for method lookup: (receiver owner declaration, method_ident) pair.
 pub const MethodKey = extern struct {
+    owner_module_ident_bits: u32,
     owner: CIR.Statement.Idx,
     method_ident_bits: u32,
 
-    pub fn init(owner: CIR.Statement.Idx, method_ident: Ident.Idx) MethodKey {
+    pub fn init(owner: MethodOwner, method_ident: Ident.Idx) MethodKey {
         return .{
-            .owner = owner,
+            .owner_module_ident_bits = owner.owner_module_ident_bits,
+            .owner = owner.owner,
             .method_ident_bits = @bitCast(method_ident),
         };
+    }
+
+    pub fn ownerIdent(self: MethodKey) MethodOwner {
+        return .{
+            .owner_module_ident_bits = self.owner_module_ident_bits,
+            .owner = self.owner,
+        };
+    }
+
+    pub fn ownerModuleIdent(self: MethodKey) Ident.Idx {
+        return @bitCast(self.owner_module_ident_bits);
     }
 
     pub fn methodIdent(self: MethodKey) Ident.Idx {
@@ -472,6 +500,12 @@ pub const MethodKey = extern struct {
     }
 
     pub fn order(a: MethodKey, b: MethodKey) std.math.Order {
+        const a_module = a.owner_module_ident_bits;
+        const b_module = b.owner_module_ident_bits;
+        if (a_module != b_module) {
+            return if (a_module < b_module) .lt else .gt;
+        }
+
         const a_owner = @intFromEnum(a.owner);
         const b_owner = @intFromEnum(b.owner);
         if (a_owner != b_owner) {
@@ -485,7 +519,7 @@ pub const MethodKey = extern struct {
     }
 };
 
-/// Mapping from (owner declaration, method_ident) pairs to their qualified
+/// Mapping from (receiver owner declaration, method_ident) pairs to their qualified
 /// method ident.
 ///
 /// This is populated during canonicalization when methods are defined in associated blocks.
@@ -498,7 +532,7 @@ pub const MethodBinding = extern struct {
     def_idx: CIR.Def.Idx,
 };
 
-/// Mapping from (owner declaration, method_ident) pairs to the method binding.
+/// Mapping from (receiver owner declaration, method_ident) pairs to the method binding.
 /// This keeps method implementation lookup explicit without requiring local
 /// associated methods to be published through the module exposure table.
 pub const MethodDefs = SortedArrayBuilder(MethodKey, MethodBinding);
@@ -555,6 +589,53 @@ pub const NumeralDispatchPlan = extern struct {
     node_idx: u32,
     target_var: u32,
     fn_var: u32,
+
+    pub const SafeList = collections.SafeList(@This());
+};
+
+/// One constrained-scheme instantiation recorded by checking for static-dispatch
+/// evidence. It names the source node whose checking instantiated the scheme, the
+/// pristine (never-unified) scheme root that was copied, and — via
+/// `scheme_instantiation_pairs` — the fresh var each constrained scheme var was
+/// copied to. Publication resolves the fresh vars after checking settles to
+/// decide how each of the callee's dispatch constraints was satisfied at this
+/// site.
+pub const SchemeInstantiationRecord = extern struct {
+    node_idx: u32,
+    /// `Slot` — distinguishes several schemes instantiated at one node (a value
+    /// use vs. the target of a dispatch constraint).
+    slot_kind: u32,
+    /// For `dispatch_target` slots, the raw fn `Var` of the constraint whose
+    /// discharge instantiated this scheme — unique per constraint
+    /// instantiation, so nested evidence chains resolve without ambiguity.
+    /// 0 for `value_use` slots (keyed by `node_idx` instead).
+    slot_data: u32,
+    /// The pristine scheme root `Var` that was instantiated. For imported
+    /// schemes this is the local copy, which stays structurally intact.
+    scheme_root: u32,
+    /// Range into `scheme_instantiation_pairs`.
+    pairs_start: u32,
+    pairs_len: u32,
+
+    pub const SafeList = collections.SafeList(@This());
+
+    pub const Slot = enum(u32) {
+        /// The scheme of a value that was referenced (e.g. an `e_lookup` of a
+        /// generalized definition).
+        value_use,
+        /// The scheme of the method target chosen while discharging a static
+        /// dispatch constraint originating at this node.
+        dispatch_target,
+    };
+};
+
+/// One (constrained scheme var → fresh instantiated var) pair of a
+/// `SchemeInstantiationRecord`.
+pub const SchemeInstantiationPair = extern struct {
+    /// Constrained var in the pristine scheme (`Var`).
+    old_var: u32,
+    /// The fresh copy created for this instantiation (`Var`).
+    fresh_var: u32,
 
     pub const SafeList = collections.SafeList(@This());
 };
@@ -662,7 +743,8 @@ qualified_module_ident: Ident.Idx,
 /// copies rebasing imported origins into this table.
 module_identities: base.SerialStringInterner,
 /// Display ident (into this env's ident store) for each `module_identities`
-/// entry, parallel by index. Display-only — never used for identity.
+/// entry, parallel by index. Display-only by itself; identity decisions must
+/// read the paired content hash from `module_identities`.
 module_identity_displays: collections.SafeList(Ident.Idx),
 /// This module's own entry in `module_identities`; `NONE` until the deep
 /// content identity has been computed (after import resolution, before
@@ -714,6 +796,11 @@ numeral_dispatch_plans: NumeralDispatchPlan.SafeList,
 quote_dispatch_plans: NumeralDispatchPlan.SafeList,
 /// Scope-resolved explicit numeric suffix targets attached by canonicalization.
 numeric_suffix_targets: NumericSuffixTarget.SafeList,
+/// Constrained-scheme instantiations recorded by checking for static-dispatch
+/// evidence; consumed at checked-module publication.
+scheme_instantiations: SchemeInstantiationRecord.SafeList,
+/// Flat pool of (scheme var → fresh var) pairs backing `scheme_instantiations`.
+scheme_instantiation_pairs: SchemeInstantiationPair.SafeList,
 
 /// A type alias mapping from a for-clause: [Model : model]
 /// Maps an alias name (Model) to a rigid variable name (model)
@@ -903,6 +990,8 @@ pub fn init(gpa: std.mem.Allocator, source: []const u8) std.mem.Allocator.Error!
         .numeral_dispatch_plans = try NumeralDispatchPlan.SafeList.initCapacity(gpa, 8),
         .quote_dispatch_plans = try NumeralDispatchPlan.SafeList.initCapacity(gpa, 8),
         .numeric_suffix_targets = try NumericSuffixTarget.SafeList.initCapacity(gpa, 8),
+        .scheme_instantiations = try SchemeInstantiationRecord.SafeList.initCapacity(gpa, 8),
+        .scheme_instantiation_pairs = try SchemeInstantiationPair.SafeList.initCapacity(gpa, 8),
     };
 }
 
@@ -928,6 +1017,8 @@ pub fn deinit(self: *Self) void {
     self.numeral_dispatch_plans.deinit(self.gpa);
     self.quote_dispatch_plans.deinit(self.gpa);
     self.numeric_suffix_targets.deinit(self.gpa);
+    self.scheme_instantiations.deinit(self.gpa);
+    self.scheme_instantiation_pairs.deinit(self.gpa);
     // diagnostics are stored in the NodeStore, no need to free separately
     self.store.deinit();
 
@@ -969,6 +1060,8 @@ pub fn deinitCachedModule(self: *Self) void {
     self.numeral_dispatch_plans.deinit(self.gpa);
     self.quote_dispatch_plans.deinit(self.gpa);
     self.numeric_suffix_targets.deinit(self.gpa);
+    self.scheme_instantiations.deinit(self.gpa);
+    self.scheme_instantiation_pairs.deinit(self.gpa);
 
     // If enableRuntimeInserts was called on the interner, it allocated new memory
     // that needs to be freed. The interner.deinit checks supports_inserts internally
@@ -3136,6 +3229,8 @@ pub const Serialized = extern struct {
     numeral_dispatch_plans: NumeralDispatchPlan.SafeList.Serialized,
     quote_dispatch_plans: NumeralDispatchPlan.SafeList.Serialized,
     numeric_suffix_targets: NumericSuffixTarget.SafeList.Serialized,
+    scheme_instantiations: SchemeInstantiationRecord.SafeList.Serialized,
+    scheme_instantiation_pairs: SchemeInstantiationPair.SafeList.Serialized,
     // Reserved space (was is_lambda_lifted and is_defunctionalized, now unused)
     _reserved_flags: [2]u8 = .{ 0, 0 },
     _padding: [6]u8 = .{ 0, 0, 0, 0, 0, 0 },
@@ -3206,6 +3301,8 @@ pub const Serialized = extern struct {
         try self.numeral_dispatch_plans.serialize(&env.numeral_dispatch_plans, allocator, writer);
         try self.quote_dispatch_plans.serialize(&env.quote_dispatch_plans, allocator, writer);
         try self.numeric_suffix_targets.serialize(&env.numeric_suffix_targets, allocator, writer);
+        try self.scheme_instantiations.serialize(&env.scheme_instantiations, allocator, writer);
+        try self.scheme_instantiation_pairs.serialize(&env.scheme_instantiation_pairs, allocator, writer);
 
         self._reserved_flags = .{ 0, 0 };
     }
@@ -3265,6 +3362,8 @@ pub const Serialized = extern struct {
             .numeral_dispatch_plans = self.numeral_dispatch_plans.deserializeInto(base_addr),
             .quote_dispatch_plans = self.quote_dispatch_plans.deserializeInto(base_addr),
             .numeric_suffix_targets = self.numeric_suffix_targets.deserializeInto(base_addr),
+            .scheme_instantiations = self.scheme_instantiations.deserializeInto(base_addr),
+            .scheme_instantiation_pairs = self.scheme_instantiation_pairs.deserializeInto(base_addr),
         };
 
         return env;
@@ -3324,6 +3423,8 @@ pub const Serialized = extern struct {
             .numeral_dispatch_plans = self.numeral_dispatch_plans.deserializeInto(base_addr),
             .quote_dispatch_plans = self.quote_dispatch_plans.deserializeInto(base_addr),
             .numeric_suffix_targets = self.numeric_suffix_targets.deserializeInto(base_addr),
+            .scheme_instantiations = self.scheme_instantiations.deserializeInto(base_addr),
+            .scheme_instantiation_pairs = self.scheme_instantiation_pairs.deserializeInto(base_addr),
         };
     }
 
@@ -3385,6 +3486,8 @@ pub const Serialized = extern struct {
             .numeral_dispatch_plans = try self.numeral_dispatch_plans.deserializeWithCopy(base_addr, gpa),
             .quote_dispatch_plans = try self.quote_dispatch_plans.deserializeWithCopy(base_addr, gpa),
             .numeric_suffix_targets = try self.numeric_suffix_targets.deserializeWithCopy(base_addr, gpa),
+            .scheme_instantiations = try self.scheme_instantiations.deserializeWithCopy(base_addr, gpa),
+            .scheme_instantiation_pairs = try self.scheme_instantiation_pairs.deserializeWithCopy(base_addr, gpa),
         };
 
         return env;
@@ -3551,6 +3654,31 @@ pub fn recordQuoteDispatchPlan(
         .node_idx = raw_node,
         .target_var = @intFromEnum(target_var),
         .fn_var = @intFromEnum(fn_var),
+    });
+}
+
+/// Record a constrained-scheme instantiation for static-dispatch evidence.
+/// `slot_data` is the raw fn `Var` of the discharged constraint for
+/// `dispatch_target` slots and 0 for `value_use` slots.
+pub fn recordSchemeInstantiation(
+    self: *Self,
+    node_idx: u32,
+    slot: SchemeInstantiationRecord.Slot,
+    slot_data: u32,
+    scheme_root: TypeVar,
+    pairs: []const SchemeInstantiationPair,
+) std.mem.Allocator.Error!void {
+    const pairs_start: u32 = @intCast(self.scheme_instantiation_pairs.items.items.len);
+    for (pairs) |pair| {
+        _ = try self.scheme_instantiation_pairs.append(self.gpa, pair);
+    }
+    _ = try self.scheme_instantiations.append(self.gpa, .{
+        .node_idx = node_idx,
+        .slot_kind = @intFromEnum(slot),
+        .slot_data = slot_data,
+        .scheme_root = @intFromEnum(scheme_root),
+        .pairs_start = pairs_start,
+        .pairs_len = @intCast(pairs.len),
     });
 }
 
@@ -4267,6 +4395,15 @@ pub fn moduleIdentityDisplayIdent(self: *const Self, idx: base.ModuleIdentity.Id
     return self.module_identity_displays.items.items[@intFromEnum(idx)];
 }
 
+/// Look up an env-local module identity entry by its env-local display ident.
+/// Callers must use the returned identity's content hash for identity decisions.
+pub fn moduleIdentityForDisplayIdent(self: *const Self, display: Ident.Idx) ?base.ModuleIdentity.Idx {
+    for (self.module_identity_displays.items.items, 0..) |candidate, i| {
+        if (candidate.eql(display)) return @enumFromInt(i);
+    }
+    return null;
+}
+
 /// Display text for an env-local identity index. Diagnostics only.
 pub fn moduleIdentityDisplayText(self: *const Self, idx: base.ModuleIdentity.Idx) []const u8 {
     const display = self.moduleIdentityDisplayIdent(idx);
@@ -4345,30 +4482,50 @@ pub fn ensureContentIdentity(
 
 /// Registers a method identifier mapping for an explicit owner declaration.
 pub fn registerMethodIdentForOwner(self: *Self, owner: CIR.Statement.Idx, method_ident: Ident.Idx, qualified_ident: Ident.Idx) Allocator.Error!void {
+    try self.registerMethodIdentForMethodOwner(MethodOwner.init(self.qualified_module_ident, owner), method_ident, qualified_ident);
+}
+
+/// Registers a method identifier mapping for an explicit receiver owner declaration.
+pub fn registerMethodIdentForMethodOwner(self: *Self, owner: MethodOwner, method_ident: Ident.Idx, qualified_ident: Ident.Idx) Allocator.Error!void {
     const key = MethodKey.init(owner, method_ident);
     try self.method_idents.put(self.gpa, key, qualified_ident);
 }
 
 /// Registers a method definition mapping for an explicit owner declaration.
 pub fn registerMethodDefForOwner(self: *Self, owner: CIR.Statement.Idx, method_ident: Ident.Idx, binding: MethodBinding) Allocator.Error!void {
+    try self.registerMethodDefForMethodOwner(MethodOwner.init(self.qualified_module_ident, owner), method_ident, binding);
+}
+
+/// Registers a method definition mapping for an explicit receiver owner declaration.
+pub fn registerMethodDefForMethodOwner(self: *Self, owner: MethodOwner, method_ident: Ident.Idx, binding: MethodBinding) Allocator.Error!void {
     const key = MethodKey.init(owner, method_ident);
     try self.method_defs.put(self.gpa, key, binding);
 }
 
 /// Looks up a qualified method ident for an explicit owner declaration.
 pub fn lookupMethodIdentForOwner(self: *Self, owner: CIR.Statement.Idx, method_ident: Ident.Idx) ?Ident.Idx {
-    const key = MethodKey.init(owner, method_ident);
+    const key = MethodKey.init(MethodOwner.init(self.qualified_module_ident, owner), method_ident);
     return self.method_idents.get(self.gpa, key);
 }
 
 /// Looks up a qualified method ident in finalized tables for an explicit owner declaration.
 pub fn lookupMethodIdentForOwnerConst(self: *const Self, owner: CIR.Statement.Idx, method_ident: Ident.Idx) ?Ident.Idx {
+    return self.lookupMethodIdentForMethodOwnerConst(MethodOwner.init(self.qualified_module_ident, owner), method_ident);
+}
+
+/// Looks up a qualified method ident in finalized tables for an explicit receiver owner declaration.
+pub fn lookupMethodIdentForMethodOwnerConst(self: *const Self, owner: MethodOwner, method_ident: Ident.Idx) ?Ident.Idx {
     const key = MethodKey.init(owner, method_ident);
     return self.method_idents.getFinalized(key);
 }
 
 /// Looks up method type/check metadata in finalized tables for an explicit owner declaration.
 pub fn lookupMethodBindingForOwnerConst(self: *const Self, owner: CIR.Statement.Idx, method_ident: Ident.Idx) ?MethodBinding {
+    return self.lookupMethodBindingForMethodOwnerConst(MethodOwner.init(self.qualified_module_ident, owner), method_ident);
+}
+
+/// Looks up method type/check metadata in finalized tables for an explicit receiver owner declaration.
+pub fn lookupMethodBindingForMethodOwnerConst(self: *const Self, owner: MethodOwner, method_ident: Ident.Idx) ?MethodBinding {
     const key = MethodKey.init(owner, method_ident);
     return self.method_defs.getFinalized(key);
 }
@@ -4382,12 +4539,7 @@ pub fn finalizeMethodTables(self: *Self) void {
 /// Looks up method metadata using a type declaration owner from one environment
 /// and a method ident from the same source environment.
 pub fn lookupMethodBindingFromEnvAndDeclConst(self: *const Self, source_env: *const Self, source_decl: ?u32, method_ident: Ident.Idx) ?MethodBinding {
-    const method_name = source_env.getIdent(method_ident);
-
-    const local_method_ident = self.common.findIdent(method_name) orelse return null;
-    const owner: CIR.Statement.Idx = @enumFromInt(source_decl orelse return null);
-
-    return self.lookupMethodBindingForOwnerConst(owner, local_method_ident);
+    return self.lookupMethodBindingFromOwnerAndMethodEnvsConst(source_env, source_decl, source_env, method_ident);
 }
 
 /// Looks up method metadata using a type declaration owner and a method ident
@@ -4398,12 +4550,26 @@ pub fn lookupMethodBindingFromTwoEnvsAndDeclConst(
     method_source_env: *const Self,
     method_ident: Ident.Idx,
 ) ?MethodBinding {
+    return self.lookupMethodBindingFromOwnerAndMethodEnvsConst(self, source_decl, method_source_env, method_ident);
+}
+
+/// Looks up method metadata using an owner declaration and method ident that may
+/// both come from different source environments.
+pub fn lookupMethodBindingFromOwnerAndMethodEnvsConst(
+    self: *const Self,
+    owner_source_env: *const Self,
+    source_decl: ?u32,
+    method_source_env: *const Self,
+    method_ident: Ident.Idx,
+) ?MethodBinding {
     const method_name = method_source_env.getIdent(method_ident);
+    const owner_module_name = owner_source_env.getIdent(owner_source_env.qualified_module_ident);
 
     const local_method_ident = self.common.findIdent(method_name) orelse return null;
+    const local_owner_module_ident = self.common.findIdent(owner_module_name) orelse return null;
     const owner: CIR.Statement.Idx = @enumFromInt(source_decl orelse return null);
 
-    return self.lookupMethodBindingForOwnerConst(owner, local_method_ident);
+    return self.lookupMethodBindingForMethodOwnerConst(MethodOwner.init(local_owner_module_ident, owner), local_method_ident);
 }
 
 /// Returns the line start positions for source code position mapping.

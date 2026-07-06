@@ -321,14 +321,15 @@ fn specRecordMatches(
 ) Allocator.Error!bool {
     if (!std.meta.eql(candidate.identity.callable, expected.identity.callable)) return false;
     if (!digestBytesEqual(candidate.identity.source_fn_ty_digest, expected.identity.source_fn_ty_digest)) return false;
-    if (!digestBytesEqual(candidate.identity.mono_fn_ty_digest, expected.identity.mono_fn_ty_digest)) return false;
+    if (!digestBytesEqual(candidate.identity.request_fn_ty_digest, expected.identity.request_fn_ty_digest)) return false;
+    if (!digestBytesEqual(candidate.solved_fn_ty_digest, expected.solved_fn_ty_digest)) return false;
     return try MonoType.typeEqlAcrossStores(
         allocator,
         name_store,
         candidate_types,
-        candidate.identity.mono_fn_ty,
+        candidate.solved_fn_ty,
         expected_types,
-        expected.identity.mono_fn_ty,
+        expected.solved_fn_ty,
     );
 }
 
@@ -364,7 +365,7 @@ fn expectSpecsCoveredByCachedOrLoaded(
 }
 
 fn isUnaryPrimitiveFnSpec(view: MonoAst.ProgramView, record: MonoAst.SpecRecord, primitive: MonoType.Primitive) bool {
-    const func = switch (view.types.get(record.identity.mono_fn_ty)) {
+    const func = switch (view.types.get(record.solved_fn_ty)) {
         .func => |func| func,
         else => return false,
     };
@@ -1337,8 +1338,8 @@ test "issue 9802 same-type map2 specialization counters are bounded" {
         .nested_misses = 8,
         .template_lookup_candidates = 22,
         .nested_lookup_candidates = 0,
-        .specialization_type_digest_requests = 75,
-        .specialization_type_digest_cache_hits = 140,
+        .specialization_type_digest_requests = 74,
+        .specialization_type_digest_cache_hits = 139,
         .specialization_type_digest_cache_misses = 128,
         .specialization_type_digest_nodes_visited = 128,
         .exact_type_checks = 22,
@@ -1385,8 +1386,8 @@ test "issue 9802 growing-structural map2 specialization counters are bounded" {
         .nested_misses = 6,
         .template_lookup_candidates = 5,
         .nested_lookup_candidates = 0,
-        .specialization_type_digest_requests = 52,
-        .specialization_type_digest_cache_hits = 245,
+        .specialization_type_digest_requests = 51,
+        .specialization_type_digest_cache_hits = 244,
         .specialization_type_digest_cache_misses = 290,
         .specialization_type_digest_nodes_visited = 290,
         .exact_type_checks = 5,

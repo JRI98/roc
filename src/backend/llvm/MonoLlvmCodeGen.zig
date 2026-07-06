@@ -17,6 +17,7 @@ const SourceLoc = lir.SourceLoc;
 const builtins = @import("builtins");
 const layout = @import("layout");
 const lir = @import("lir");
+const CheckedArithmetic = lir.CheckedArithmetic;
 const roc_target = @import("roc_target");
 
 const CoreCtx = @import("ctx").CoreCtx;
@@ -2635,10 +2636,30 @@ pub const MonoLlvmCodeGen = struct {
             .num_is_eq => try self.storeBool(self.slot(target).ptr, try self.emitValueEqual(self.slot(arg_locals[0]).ptr, self.slot(arg_locals[1]).ptr, self.localLayout(arg_locals[0]))),
             .num_is_gt, .num_is_gte, .num_is_lt, .num_is_lte => try self.emitNumericCompare(target, op, arg_locals),
             .compare => try self.emitNumericOrderCompare(target, arg_locals),
-            .num_plus, .num_minus, .num_times, .num_div_by, .num_div_trunc_by, .num_rem_by, .num_mod_by, .num_shift_left_by, .num_shift_right_by, .num_shift_right_zf_by, .num_bitwise_and, .num_bitwise_or, .num_bitwise_xor => try self.emitNumericBinary(target, op, arg_locals),
+            .num_plus,
+            .num_plus_checked,
+            .num_minus,
+            .num_minus_checked,
+            .num_times,
+            .num_times_checked,
+            .num_div_by,
+            .num_div_by_checked,
+            .num_div_trunc_by,
+            .num_div_trunc_by_checked,
+            .num_rem_by,
+            .num_rem_by_checked,
+            .num_mod_by,
+            .num_mod_by_checked,
+            .num_shift_left_by,
+            .num_shift_right_by,
+            .num_shift_right_zf_by,
+            .num_bitwise_and,
+            .num_bitwise_or,
+            .num_bitwise_xor,
+            => try self.emitNumericBinary(target, op, arg_locals),
             .num_bitwise_not => try self.emitNumericBitwiseNot(target, arg_locals[0]),
-            .num_negate => try self.emitNumericNegate(target, arg_locals[0]),
-            .num_abs => try self.emitNumericAbs(target, arg_locals[0]),
+            .num_negate, .num_negate_checked => try self.emitNumericNegate(target, op, arg_locals[0]),
+            .num_abs, .num_abs_checked => try self.emitNumericAbs(target, op, arg_locals[0]),
             .num_abs_diff => try self.emitNumericAbsDiff(target, arg_locals),
             .num_pow => if (self.localLayout(target) == .dec)
                 try self.emitDecPow(target, arg_locals)
@@ -3027,8 +3048,10 @@ pub const MonoLlvmCodeGen = struct {
         const builder = self.builder orelse return error.CompilationFailed;
         const wip = self.wip orelse return error.CompilationFailed;
         const target_layout = self.localLayout(target);
+        const checked_op: ?lir.LowLevel = if (CheckedArithmetic.uncheckedOp(op) != null) op else null;
+        const plain_op = CheckedArithmetic.uncheckedOp(op) orelse op;
         if (target_layout == .dec) {
-            try self.emitDecBinary(target, op, args);
+            try self.emitDecBinary(target, plain_op, args);
             return;
         }
         const lhs_layout = self.localLayout(args[0]);
@@ -3038,7 +3061,8 @@ pub const MonoLlvmCodeGen = struct {
         lhs = try self.coerceScalar(lhs, result_ty, lhs_layout.isSigned());
         rhs = try self.coerceScalar(rhs, result_ty, self.localLayout(args[1]).isSigned());
         const result = if (isFloatLayout(target_layout)) blk: {
-            const tag: LlvmBuilder.Function.Instruction.Tag = switch (op) {
+            if (checked_op != null) return error.UnsupportedLowLevel;
+            const tag: LlvmBuilder.Function.Instruction.Tag = switch (plain_op) {
                 .num_plus => .fadd,
                 .num_minus => .fsub,
                 .num_times => .fmul,
@@ -3048,14 +3072,24 @@ pub const MonoLlvmCodeGen = struct {
             };
             break :blk wip.bin(tag, lhs, rhs, "") catch return error.OutOfMemory;
         } else blk: {
-            if (op == .num_shift_left_by or op == .num_shift_right_by or op == .num_shift_right_zf_by) {
-                const result = try self.emitIntegerShift(op, lhs, rhs, target_layout);
+            if (plain_op == .num_shift_left_by or plain_op == .num_shift_right_by or plain_op == .num_shift_right_zf_by) {
+                const result = try self.emitIntegerShift(plain_op, lhs, rhs, target_layout);
                 try self.storeScalar(self.slot(target).ptr, target_layout, result);
                 return;
             }
 
             const signed = target_layout.isSigned();
-            const tag: LlvmBuilder.Function.Instruction.Tag = switch (op) {
+            if (checked_op) |checked| {
+                switch (plain_op) {
+                    .num_plus, .num_minus, .num_times => break :blk try self.emitCheckedIntegerOverflowBinary(checked, plain_op, lhs, rhs, target_layout),
+                    .num_div_by, .num_div_trunc_by, .num_rem_by, .num_mod_by => {
+                        rhs = try self.emitCheckedIntegerDenominator(checked, plain_op, lhs, rhs, target_layout);
+                    },
+                    else => {},
+                }
+            }
+
+            const tag: LlvmBuilder.Function.Instruction.Tag = switch (plain_op) {
                 .num_plus => .add,
                 .num_minus => .sub,
                 .num_times => .mul,
@@ -3067,7 +3101,7 @@ pub const MonoLlvmCodeGen = struct {
                 else => return error.UnsupportedLowLevel,
             };
             const raw = wip.bin(tag, lhs, rhs, "") catch return error.OutOfMemory;
-            if (op != .num_mod_by or !signed) break :blk raw;
+            if (plain_op != .num_mod_by or !signed) break :blk raw;
 
             const zero = builder.zeroInitValue(result_ty) catch return error.OutOfMemory;
             const rem_is_zero = wip.icmp(.eq, raw, zero, "") catch return error.OutOfMemory;
@@ -3079,6 +3113,101 @@ pub const MonoLlvmCodeGen = struct {
             break :blk wip.select(.normal, rem_is_zero, zero, adjusted_or_raw, "") catch return error.OutOfMemory;
         };
         try self.storeScalar(self.slot(target).ptr, target_layout, result);
+    }
+
+    fn emitCheckedIntegerOverflowBinary(
+        self: *MonoLlvmCodeGen,
+        checked_op: lir.LowLevel,
+        plain_op: lir.LowLevel,
+        lhs: LlvmBuilder.Value,
+        rhs: LlvmBuilder.Value,
+        target_layout: layout.Idx,
+    ) Error!LlvmBuilder.Value {
+        const wip = self.wip orelse return error.CompilationFailed;
+        const result_ty = self.scalarType(target_layout);
+        if (plain_op == .num_times and (target_layout == .i128 or target_layout == .u128)) {
+            return try self.callCheckedI128MulBuiltin(checked_op, lhs, rhs, target_layout == .u128);
+        }
+
+        const intrinsic: LlvmBuilder.Intrinsic = switch (plain_op) {
+            .num_plus => if (target_layout.isSigned()) .@"sadd.with.overflow" else .@"uadd.with.overflow",
+            .num_minus => if (target_layout.isSigned()) .@"ssub.with.overflow" else .@"usub.with.overflow",
+            .num_times => if (target_layout.isSigned()) .@"smul.with.overflow" else .@"umul.with.overflow",
+            else => unreachable,
+        };
+        const overflow_result = wip.callIntrinsic(
+            .normal,
+            .none,
+            intrinsic,
+            &.{result_ty},
+            &.{ lhs, rhs },
+            "",
+        ) catch return error.OutOfMemory;
+        const result = wip.extractValue(overflow_result, &.{0}, "") catch return error.OutOfMemory;
+        const overflowed = wip.extractValue(overflow_result, &.{1}, "") catch return error.OutOfMemory;
+        try self.emitCrashIf(overflowed, checkedOverflowMessage(checked_op));
+        return result;
+    }
+
+    fn emitCheckedIntegerDenominator(
+        self: *MonoLlvmCodeGen,
+        checked_op: lir.LowLevel,
+        plain_op: lir.LowLevel,
+        lhs: LlvmBuilder.Value,
+        rhs: LlvmBuilder.Value,
+        target_layout: layout.Idx,
+    ) Error!LlvmBuilder.Value {
+        const builder = self.builder orelse return error.CompilationFailed;
+        const wip = self.wip orelse return error.CompilationFailed;
+        const result_ty = self.scalarType(target_layout);
+        const zero = builder.zeroInitValue(result_ty) catch return error.OutOfMemory;
+        const one = builder.intValue(result_ty, 1) catch return error.OutOfMemory;
+
+        const rhs_is_zero = wip.icmp(.eq, rhs, zero, "") catch return error.OutOfMemory;
+        try self.emitCrashIf(rhs_is_zero, checkedZeroDenominatorMessage(checked_op, target_layout));
+        var safe_rhs = wip.select(.normal, rhs_is_zero, one, rhs, "") catch return error.OutOfMemory;
+
+        if (target_layout.isSigned()) {
+            const lowest = builder.intValue(result_ty, CheckedArithmetic.signedLowestValue(target_layout) orelse unreachable) catch return error.OutOfMemory;
+            const neg_one = builder.intValue(result_ty, -1) catch return error.OutOfMemory;
+            const lhs_is_lowest = wip.icmp(.eq, lhs, lowest, "") catch return error.OutOfMemory;
+            const rhs_is_neg_one = wip.icmp(.eq, rhs, neg_one, "") catch return error.OutOfMemory;
+            const min_div_neg_one = wip.bin(.@"and", lhs_is_lowest, rhs_is_neg_one, "") catch return error.OutOfMemory;
+            switch (plain_op) {
+                .num_div_by, .num_div_trunc_by => try self.emitCrashIf(min_div_neg_one, checkedOverflowMessage(checked_op)),
+                .num_rem_by, .num_mod_by => {},
+                else => unreachable,
+            }
+            safe_rhs = wip.select(.normal, min_div_neg_one, one, safe_rhs, "") catch return error.OutOfMemory;
+        }
+
+        return safe_rhs;
+    }
+
+    fn callCheckedI128MulBuiltin(
+        self: *MonoLlvmCodeGen,
+        checked_op: lir.LowLevel,
+        lhs: LlvmBuilder.Value,
+        rhs: LlvmBuilder.Value,
+        unsigned: bool,
+    ) Error!LlvmBuilder.Value {
+        const builder = self.builder orelse return error.CompilationFailed;
+        const wip = self.wip orelse return error.CompilationFailed;
+        const out_low = wip.alloca(.normal, .i64, .@"1", LlvmBuilder.Alignment.fromByteUnits(8), .default, "mul_low") catch return error.OutOfMemory;
+        const out_high = wip.alloca(.normal, .i64, .@"1", LlvmBuilder.Alignment.fromByteUnits(8), .default, "mul_high") catch return error.OutOfMemory;
+        const lhs_parts = try self.splitI128Value(lhs);
+        const rhs_parts = try self.splitI128Value(rhs);
+        const overflowed_i32 = try self.callBuiltin(
+            if (unsigned) "roc_builtins_num_mul_with_overflow_u128" else "roc_builtins_num_mul_with_overflow_i128",
+            .i32,
+            &.{ try self.ptrType(), try self.ptrType(), .i64, .i64, .i64, .i64 },
+            &.{ out_low, out_high, lhs_parts.low, lhs_parts.high, rhs_parts.low, rhs_parts.high },
+        );
+        const overflowed = wip.icmp(.ne, overflowed_i32, builder.intValue(.i32, 0) catch return error.OutOfMemory, "") catch return error.OutOfMemory;
+        try self.emitCrashIf(overflowed, checkedOverflowMessage(checked_op));
+        const low = wip.load(.normal, .i64, out_low, LlvmBuilder.Alignment.fromByteUnits(8), "") catch return error.OutOfMemory;
+        const high = wip.load(.normal, .i64, out_high, LlvmBuilder.Alignment.fromByteUnits(8), "") catch return error.OutOfMemory;
+        return self.combineI128Parts(low, high);
     }
 
     fn emitIntegerShift(self: *MonoLlvmCodeGen, op: lir.LowLevel, lhs: LlvmBuilder.Value, rhs: LlvmBuilder.Value, target_layout: layout.Idx) Error!LlvmBuilder.Value {
@@ -3198,14 +3327,33 @@ pub const MonoLlvmCodeGen = struct {
         return wip.bin(.@"or", shifted_high, low128, "") catch return error.OutOfMemory;
     }
 
-    fn emitNumericNegate(self: *MonoLlvmCodeGen, target: LocalId, arg: LocalId) Error!void {
+    fn emitNumericNegate(self: *MonoLlvmCodeGen, target: LocalId, op: lir.LowLevel, arg: LocalId) Error!void {
+        const builder = self.builder orelse return error.CompilationFailed;
         const wip = self.wip orelse return error.CompilationFailed;
         const target_layout = self.localLayout(target);
+        const checked_op: ?lir.LowLevel = if (CheckedArithmetic.uncheckedOp(op) != null) op else null;
         const value = try self.loadScalar(self.slot(arg).ptr, self.localLayout(arg));
-        const result = if (isFloatLayout(target_layout))
-            wip.un(.fneg, value, "") catch return error.OutOfMemory
-        else
-            wip.neg(value, "") catch return error.OutOfMemory;
+        const result = if (isFloatLayout(target_layout)) blk: {
+            if (checked_op != null) return error.UnsupportedLowLevel;
+            break :blk wip.un(.fneg, value, "") catch return error.OutOfMemory;
+        } else blk: {
+            if (checked_op) |checked| {
+                const zero = builder.zeroInitValue(value.typeOfWip(wip)) catch return error.OutOfMemory;
+                const overflow_result = wip.callIntrinsic(
+                    .normal,
+                    .none,
+                    .@"ssub.with.overflow",
+                    &.{value.typeOfWip(wip)},
+                    &.{ zero, value },
+                    "",
+                ) catch return error.OutOfMemory;
+                const negated = wip.extractValue(overflow_result, &.{0}, "") catch return error.OutOfMemory;
+                const overflowed = wip.extractValue(overflow_result, &.{1}, "") catch return error.OutOfMemory;
+                try self.emitCrashIf(overflowed, checkedOverflowMessage(checked));
+                break :blk negated;
+            }
+            break :blk wip.neg(value, "") catch return error.OutOfMemory;
+        };
         try self.storeScalar(self.slot(target).ptr, target_layout, result);
     }
 
@@ -3217,14 +3365,21 @@ pub const MonoLlvmCodeGen = struct {
         try self.storeScalar(self.slot(target).ptr, target_layout, result);
     }
 
-    fn emitNumericAbs(self: *MonoLlvmCodeGen, target: LocalId, arg: LocalId) Error!void {
+    fn emitNumericAbs(self: *MonoLlvmCodeGen, target: LocalId, op: lir.LowLevel, arg: LocalId) Error!void {
         const builder = self.builder orelse return error.CompilationFailed;
         const wip = self.wip orelse return error.CompilationFailed;
         const target_layout = self.localLayout(target);
+        const checked_op: ?lir.LowLevel = if (CheckedArithmetic.uncheckedOp(op) != null) op else null;
         const value = try self.loadScalar(self.slot(arg).ptr, self.localLayout(arg));
         if (!target_layout.isSigned() and !isFloatLayout(target_layout)) {
             try self.storeScalar(self.slot(target).ptr, target_layout, value);
             return;
+        }
+        if (checked_op) |checked| {
+            if (isFloatLayout(target_layout)) return error.UnsupportedLowLevel;
+            const lowest = builder.intValue(value.typeOfWip(wip), CheckedArithmetic.signedLowestValue(target_layout) orelse unreachable) catch return error.OutOfMemory;
+            const is_lowest = wip.icmp(.eq, value, lowest, "") catch return error.OutOfMemory;
+            try self.emitCrashIf(is_lowest, checkedOverflowMessage(checked));
         }
         const zero = builder.zeroInitValue(value.typeOfWip(wip)) catch return error.OutOfMemory;
         const is_neg = if (isFloatLayout(target_layout))
@@ -4620,6 +4775,16 @@ pub const MonoLlvmCodeGen = struct {
         wip.cursor = .{ .block = fail_block };
         try self.emitStaticRocOpsMessageCall(.expect_failed, "expect failed");
         _ = wip.br(ok_block) catch return error.OutOfMemory;
+        wip.cursor = .{ .block = ok_block };
+    }
+
+    fn emitCrashIf(self: *MonoLlvmCodeGen, condition: LlvmBuilder.Value, msg: []const u8) Error!void {
+        const wip = self.wip orelse return error.CompilationFailed;
+        const ok_block = wip.block(0, "checked_ok") catch return error.OutOfMemory;
+        const crash_block = wip.block(0, "checked_crash") catch return error.OutOfMemory;
+        _ = wip.brCond(condition, crash_block, ok_block, .else_likely) catch return error.OutOfMemory;
+        wip.cursor = .{ .block = crash_block };
+        try self.emitCrashBytes(msg);
         wip.cursor = .{ .block = ok_block };
     }
 
@@ -8409,6 +8574,14 @@ fn isIntegerLayout(layout_idx: layout.Idx) bool {
         .bool, .u8, .i8, .u16, .i16, .u32, .i32, .u64, .i64, .u128, .i128 => true,
         else => false,
     };
+}
+
+fn checkedOverflowMessage(op: lir.LowLevel) []const u8 {
+    return CheckedArithmetic.overflowMessage(op) orelse unreachable;
+}
+
+fn checkedZeroDenominatorMessage(op: lir.LowLevel, layout_idx: layout.Idx) []const u8 {
+    return CheckedArithmetic.zeroDenominatorMessage(op, layout_idx) orelse unreachable;
 }
 
 fn intTypeForBytes(size: u8) LlvmBuilder.Type {

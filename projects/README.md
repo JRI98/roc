@@ -51,6 +51,10 @@ dispatch targets) and the glue project, but does not block them.
    — removes the remaining certifier skip path and centralizes
    ownership-transfer keying. The current code already warns on skips and
    fails CI when skips occur; this project closes the hole for real.
+2. [big/arc-inserter-join-summaries.md](big/arc-inserter-join-summaries.md)
+   — applies the same finite-summary/dataflow discipline to production ARC
+   insertion, replacing join and liveness re-walks that make generated
+   structural encoders compile in minutes.
 
 **Chain D — numerics:**
 1. [big/exact-numeral-pipeline.md](big/exact-numeral-pipeline.md)
@@ -93,9 +97,10 @@ leverage and keeps prerequisites satisfied:
 7. `small/shared-checked-type-traversal.md`
 8. `small/cache-hardening.md`
 9. `big/arc-certifier-lattice-join.md`
-10. `big/exact-numeral-pipeline.md`
-11. `big/generalization-time-ambiguity.md`
-12. `big/unify-build-pipelines.md`
-13. `big/decision-tree-match-compiler.md`
-14. `small/glue-consumes-committed-layouts.md`
-15. `small/structural-hoist-contexts.md`
+10. `big/arc-inserter-join-summaries.md`
+11. `big/exact-numeral-pipeline.md`
+12. `big/generalization-time-ambiguity.md`
+13. `big/unify-build-pipelines.md`
+14. `big/decision-tree-match-compiler.md`
+15. `small/glue-consumes-committed-layouts.md`
+16. `small/structural-hoist-contexts.md`

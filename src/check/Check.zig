@@ -17,12 +17,14 @@ const occurs = @import("occurs.zig");
 const problem = @import("problem.zig");
 const snapshot_mod = @import("snapshot.zig");
 const exhaustive = @import("exhaustive.zig");
+const ExhaustivenessContext = @import("exhaustiveness_context.zig");
 const hoist_roots = @import("hoist_roots.zig");
 
 const MkSafeList = collections.SafeList;
 
 const CIR = can.CIR;
 const ModuleEnv = can.ModuleEnv;
+const PatternRefutability = can.PatternRefutability;
 const Allocator = std.mem.Allocator;
 const Ident = base.Ident;
 const Region = base.Region;
@@ -140,6 +142,8 @@ import_cache: ImportCache,
 bool_var: Var,
 /// Copied Str type from Builtin module (for use in string literals, etc.)
 str_var: Var,
+/// Copied U64 type from Builtin module (for generated structural metadata counts, etc.)
+u64_var: Var,
 /// Builtin type vars are initialized during Check.init and may be reused by later entrypoints.
 builtin_types_copied: bool,
 /// Map representation of Ident -> Var, used in checking static dispatch constraints
@@ -242,11 +246,8 @@ checking_binding_rhs_pattern: ?CIR.Pattern.Idx = null,
 /// the value is explicitly discarded, so no caller can later pin return-only
 /// where-clause obligations created by the RHS.
 discarded_binding_rhs_expr: ?CIR.Expr.Idx = null,
-/// Nonzero while checking source that constructs a compile-time value. Static
-/// exhaustiveness diagnostics under this depth are empirical candidates: the
-/// compile-time finalizer either observes them executing, reports their generated
-/// miss path, or discards them if the source was not reached.
-empirical_exhaustiveness_depth: u32 = 0,
+/// Tracks whether static exhaustiveness diagnostics are compile-time candidates.
+exhaustiveness_context: ExhaustivenessContext.Context = .{},
 /// Deferred def-level unifications (def_var = ptrn_var = expr_var).
 /// These must happen AFTER generalization to avoid lowering expr_var's rank
 /// before generalization can process it, but BEFORE eql constraint resolution
@@ -342,6 +343,13 @@ has_can_diagnostics: bool,
 /// non-literal/non-`is_eq` dispatch constraint, and does not resolve into the
 /// pinnable set can never be pinned, so its dispatch is reported as ambiguous.
 instantiation_dispatchers: std.ArrayListUnmanaged(InstantiationDispatcher),
+/// How many `instantiation_dispatchers` the end-of-check sweep has already
+/// enqueued for validation. Discharging one instantiated constraint can
+/// instantiate further constrained schemes (a generic method target with its
+/// own where clauses); the sweep loops from this cursor until no new
+/// dispatchers appear, so nested obligations are validated to a fixpoint
+/// (issue 9892's inner `a.decode` on a concrete type).
+instantiation_dispatchers_checked: usize = 0,
 /// The expression currently being checked (`checkExpr` sets this on entry and
 /// restores it on exit). When `instantiateVarHelp` records an
 /// `InstantiationDispatcher`, it stamps this expression onto it, so the
@@ -349,6 +357,14 @@ instantiation_dispatchers: std.ArrayListUnmanaged(InstantiationDispatcher),
 /// the exact expression whose instantiation created the unsatisfiable
 /// obligation — without scanning the module to rediscover it.
 instantiation_source_expr: ?CIR.Expr.Idx = null,
+/// While discharging a static-dispatch constraint, the site that constraint
+/// originated at. Scheme instantiations that copy constrained vars are then
+/// recorded against that node's `dispatch_target` evidence slot (see
+/// `recordSchemeInstantiationEvidence`).
+evidence_target_site: ?EvidenceTargetSite = null,
+/// Scratch buffer for the (scheme var → fresh var) pairs of one constrained
+/// scheme instantiation, flushed into `cir.scheme_instantiations`.
+scratch_evidence_pairs: std.ArrayListUnmanaged(ModuleEnv.SchemeInstantiationPair) = .empty,
 /// Worklist of flex vars created by literal conversions (`from_numeral`,
 /// `from_quote`, or `from_interpolation`) — open literals that may still need
 /// defaulting. Checker bookkeeping, not type data:
@@ -466,6 +482,18 @@ const InstantiationDispatcher = struct {
     /// there is not an exposed polymorphic obligation; the value has been thrown
     /// away, so the obligation must be reported and poisoned.
     discarded_binding_rhs: bool,
+};
+
+/// The evidence-record key for scheme instantiations performed while
+/// discharging a static-dispatch constraint: the source node the constraint
+/// originated at plus the raw fn var of the constraint being discharged
+/// (unique per constraint instantiation). While set, a constrained scheme
+/// instantiated (the chosen method target's scheme) is recorded against that
+/// constraint's `dispatch_target` evidence slot instead of the ambient
+/// expression's `value_use` slot.
+const EvidenceTargetSite = struct {
+    node_idx: u32,
+    constraint_fn_var: Var,
 };
 
 fn isLiteralStaticDispatchOrigin(origin: StaticDispatchConstraint.Origin) bool {
@@ -1203,6 +1231,7 @@ fn initAssumePrepared(
         .import_cache = ImportCache{},
         .bool_var = undefined,
         .str_var = undefined,
+        .u64_var = undefined,
         .builtin_types_copied = false,
         .ident_to_var_map = std.AutoHashMap(Ident.Idx, Var).init(gpa),
         .constraint_expr_by_fn_var = std.AutoHashMap(Var, CIR.Expr.Idx).init(gpa),
@@ -1354,6 +1383,7 @@ pub fn deinit(self: *Self) void {
     self.deferred_def_unifications.deinit(self.gpa);
     self.deferred_platform_required_unifications.deinit(self.gpa);
     self.instantiation_dispatchers.deinit(self.gpa);
+    self.scratch_evidence_pairs.deinit(self.gpa);
     self.open_literal_vars.deinit(self.gpa);
     self.open_numeral_literals.deinit(self.gpa);
     self.pending_tuple_accesses.deinit(self.gpa);
@@ -3509,6 +3539,7 @@ fn instantiateVarHelp(
     // If we had to insert any new type variables, ensure that we have
     // corresponding regions for them. This is essential for error reporting.
     const root_instantiated_region = self.regions.get(@enumFromInt(@intFromEnum(var_to_instantiate))).*;
+    self.scratch_evidence_pairs.clearRetainingCapacity();
     if (instantiator.var_map.count() > 0) {
         var iterator = instantiator.var_map.iterator();
         while (iterator.next()) |x| {
@@ -3516,6 +3547,41 @@ fn instantiateVarHelp(
             const fresh_var = x.value_ptr.*;
 
             const fresh_resolved = self.types.resolveVar(fresh_var);
+
+            // A constrained scheme var was copied: remember (scheme var → fresh
+            // var) so the whole instantiation can be recorded as static-dispatch
+            // evidence below. Rigid copies (annotation-kept rigidity) are
+            // included alongside flex copies. The scheme-side constraints' fn
+            // vars are paired too: nested evidence (a chosen method target that
+            // is itself constrained) is keyed by the instantiated constraint fn
+            // var at discharge time, and publication reaches that key through
+            // these pairs.
+            const fresh_constraints_len = switch (fresh_resolved.desc.content) {
+                .flex => |flex| flex.constraints.len(),
+                .rigid => |rigid| rigid.constraints.len(),
+                else => 0,
+            };
+            if (fresh_constraints_len > 0) {
+                try self.scratch_evidence_pairs.append(self.gpa, .{
+                    .old_var = @intFromEnum(x.key_ptr.*),
+                    .fresh_var = @intFromEnum(fresh_var),
+                });
+                const old_resolved = self.types.resolveVar(x.key_ptr.*);
+                const old_constraints_range = switch (old_resolved.desc.content) {
+                    .flex => |flex| flex.constraints,
+                    .rigid => |rigid| rigid.constraints,
+                    else => types_mod.StaticDispatchConstraint.SafeList.Range.empty(),
+                };
+                for (self.types.sliceStaticDispatchConstraints(old_constraints_range)) |old_constraint| {
+                    // `var_map` keys are resolved roots (see `Instantiator`).
+                    const old_fn_root = self.types.resolveVar(old_constraint.fn_var).var_;
+                    const fresh_fn_var = instantiator.var_map.get(old_fn_root) orelse continue;
+                    try self.scratch_evidence_pairs.append(self.gpa, .{
+                        .old_var = @intFromEnum(old_fn_root),
+                        .fresh_var = @intFromEnum(fresh_fn_var),
+                    });
+                }
+            }
 
             // Register newly instantiated open-literal flex vars on the worklist
             // so the defaulting passes see them. Separately, a fresh flex
@@ -3573,6 +3639,41 @@ fn instantiateVarHelp(
                 },
             }
         }
+    }
+
+    // Persist this constrained-scheme instantiation as static-dispatch
+    // evidence: publication resolves the fresh vars once checking settles to
+    // decide how each of the scheme's dispatch constraints was satisfied here.
+    if (self.scratch_evidence_pairs.items.len > 0) {
+        if (self.evidence_target_site) |target| {
+            try self.cir.recordSchemeInstantiation(
+                target.node_idx,
+                .dispatch_target,
+                @intFromEnum(target.constraint_fn_var),
+                var_to_instantiate,
+                self.scratch_evidence_pairs.items,
+            );
+        } else if (self.instantiation_source_expr) |source_expr| {
+            // Only value uses of definitions instantiate schemes whose
+            // constraints later need per-site evidence; other in-expression
+            // instantiations (nominal constructors, Try copies, iterator
+            // declarations, …) never become specialization edges.
+            switch (self.cir.store.nodes.get(@enumFromInt(@intFromEnum(source_expr))).tag) {
+                .expr_var,
+                .expr_external_lookup,
+                .expr_required_lookup,
+                .expr_field_access,
+                => try self.cir.recordSchemeInstantiation(
+                    @intFromEnum(source_expr),
+                    .value_use,
+                    0,
+                    var_to_instantiate,
+                    self.scratch_evidence_pairs.items,
+                ),
+                else => {},
+            }
+        }
+        self.scratch_evidence_pairs.clearRetainingCapacity();
     }
 
     // Add the var to the right rank
@@ -3653,6 +3754,12 @@ fn freshBool(self: *Self, env: *Env, new_region: Region) Allocator.Error!Var {
 fn freshStr(self: *Self, env: *Env, new_region: Region) Allocator.Error!Var {
     // Use the copied Str type from the type store (set by copyBuiltinTypes)
     return try self.instantiateVar(self.str_var, env, .{ .explicit = new_region });
+}
+
+/// Create a U64 var
+fn freshU64(self: *Self, env: *Env, new_region: Region) Allocator.Error!Var {
+    // Use the copied U64 type from the type store (set by copyBuiltinTypes)
+    return try self.instantiateVar(self.u64_var, env, .{ .explicit = new_region });
 }
 
 const BuiltinNominalDecl = union(enum) {
@@ -4816,6 +4923,22 @@ fn copyBuiltinTypes(self: *Self) Allocator.Error!void {
         }
     else
         self.builtin_ctx.str_stmt;
+    const u64_stmt_idx = if (checking_builtin_directly)
+        self.findLocalTypeDeclByName(self.cir.idents.u64_type) orelse {
+            if (builtin.mode == .Debug) {
+                std.debug.panic("type checker invariant violated: local Builtin.U64 declaration not found while checking Builtin", .{});
+            }
+            unreachable;
+        }
+    else blk: {
+        const indices = self.builtin_ctx.builtin_indices orelse {
+            if (builtin.mode == .Debug) {
+                std.debug.panic("type checker invariant violated: builtin indices missing while copying Builtin.U64", .{});
+            }
+            unreachable;
+        };
+        break :blk indices.u64_type;
+    };
 
     if (!checking_builtin_directly and self.builtin_ctx.builtin_module != null) {
         const builtin_env = self.builtin_ctx.builtin_module.?;
@@ -4826,11 +4949,16 @@ fn copyBuiltinTypes(self: *Self) Allocator.Error!void {
         // Copy Str type from Builtin module using the direct reference
         const str_type_var = ModuleEnv.varFrom(str_stmt_idx);
         self.str_var = try self.copyVar(str_type_var, builtin_env, Region.zero());
+
+        // Copy U64 type from Builtin module using the direct reference
+        const u64_type_var = ModuleEnv.varFrom(u64_stmt_idx);
+        self.u64_var = try self.copyVar(u64_type_var, builtin_env, Region.zero());
     } else {
         // If Builtin module reference is null, use the statement from the current module
         // This happens when compiling the Builtin module itself
         self.bool_var = ModuleEnv.varFrom(bool_stmt_idx);
         self.str_var = ModuleEnv.varFrom(str_stmt_idx);
+        self.u64_var = ModuleEnv.varFrom(u64_stmt_idx);
     }
 
     // Try type is accessed via external references, no need to copy it here
@@ -6744,29 +6872,41 @@ fn checkInstantiatedStaticDispatchConstraints(
     env: *Env,
     is_numeric_default_pass: bool,
 ) std.mem.Allocator.Error!void {
-    if (self.instantiation_dispatchers.items.len == 0) return;
+    // Discharging an instantiated constraint can instantiate the chosen
+    // method target's own scheme, appending new dispatchers; loop to a
+    // fixpoint so nested obligations are validated too. The per-round cursor
+    // keeps each dispatcher enqueued exactly once, and the round cap bounds
+    // adversarial chains (each round performs real unification work, so real
+    // programs converge in a handful of rounds).
+    var rounds: u32 = 64;
+    while (rounds > 0) : (rounds -= 1) {
+        const start = self.instantiation_dispatchers_checked;
+        const end = self.instantiation_dispatchers.items.len;
+        if (start >= end) return;
+        self.instantiation_dispatchers_checked = end;
 
-    const deferred_top = env.deferred_static_dispatch_constraints.items.items.len;
-    for (self.instantiation_dispatchers.items) |dispatcher| {
-        if (dispatcher.constraints.len() == 0) continue;
-        var has_where_constraint = false;
-        for (self.types.sliceStaticDispatchConstraints(dispatcher.constraints)) |constraint| {
-            if (constraint.origin == .where_clause) {
-                has_where_constraint = true;
-                break;
+        const deferred_top = env.deferred_static_dispatch_constraints.items.items.len;
+        for (self.instantiation_dispatchers.items[start..end]) |dispatcher| {
+            if (dispatcher.constraints.len() == 0) continue;
+            var has_where_constraint = false;
+            for (self.types.sliceStaticDispatchConstraints(dispatcher.constraints)) |constraint| {
+                if (constraint.origin == .where_clause) {
+                    has_where_constraint = true;
+                    break;
+                }
             }
+            if (!has_where_constraint) continue;
+
+            _ = try env.deferred_static_dispatch_constraints.append(self.gpa, .{
+                .var_ = dispatcher.dispatcher_var,
+                .constraints = dispatcher.constraints,
+            });
         }
-        if (!has_where_constraint) continue;
+        if (env.deferred_static_dispatch_constraints.items.items.len == deferred_top) continue;
 
-        _ = try env.deferred_static_dispatch_constraints.append(self.gpa, .{
-            .var_ = dispatcher.dispatcher_var,
-            .constraints = dispatcher.constraints,
-        });
+        try self.checkStaticDispatchConstraints(env, is_numeric_default_pass);
+        try self.checkAllConstraints(env);
     }
-    if (env.deferred_static_dispatch_constraints.items.items.len == deferred_top) return;
-
-    try self.checkStaticDispatchConstraints(env, is_numeric_default_pass);
-    try self.checkAllConstraints(env);
 }
 
 /// Detect ambiguous static dispatch: a static-dispatch-constrained type variable
@@ -8082,8 +8222,8 @@ fn checkDef(self: *Self, def_idx: CIR.Def.Idx, env: *Env) std.mem.Allocator.Erro
         }
     };
 
-    self.empirical_exhaustiveness_depth += 1;
-    defer self.empirical_exhaustiveness_depth -= 1;
+    const exhaustiveness_scope = self.exhaustiveness_context.enterCompileTimeRoot();
+    defer exhaustiveness_scope.leave();
 
     // Infer types for the body, checking against the instantiated annotation.
     // Ordinary top-level constants are already compile-time roots, so nested
@@ -9549,11 +9689,6 @@ const Expected = struct {
     }
 };
 
-const TryArgs = struct {
-    ok: Var,
-    err: Var,
-};
-
 // pattern //
 
 /// The "polarity" of a tag union or record
@@ -9984,42 +10119,236 @@ fn getPatternIdent(self: *const Self, ptrn_idx: CIR.Pattern.Idx) ?Ident.Idx {
     }
 }
 
+const CirPatternRefutabilityAdapter = struct {
+    pub const PatternId = CIR.Pattern.Idx;
+
+    checker: *const Self,
+
+    pub fn patternClass(self: @This(), pattern_idx: PatternId) PatternRefutability.PatternClass {
+        const pattern = self.checker.cir.store.getPattern(pattern_idx);
+        return switch (pattern) {
+            .assign,
+            .underscore,
+            .runtime_error,
+            => .cannot_miss,
+            .as,
+            .nominal,
+            .nominal_external,
+            => .child,
+            .tuple => .sequence,
+            .record_destructure => .record,
+            .list => .list,
+            .applied_tag,
+            .num_literal,
+            .small_dec_literal,
+            .dec_literal,
+            .frac_f32_literal,
+            .frac_f64_literal,
+            .str_literal,
+            .str_interpolation,
+            => .can_miss,
+        };
+    }
+
+    pub fn child(self: @This(), pattern_idx: PatternId) PatternId {
+        const pattern = self.checker.cir.store.getPattern(pattern_idx);
+        return switch (pattern) {
+            .as => |as_pattern| as_pattern.pattern,
+            .nominal => |nominal| nominal.backing_pattern,
+            .nominal_external => |nominal| nominal.backing_pattern,
+            .assign,
+            .applied_tag,
+            .record_destructure,
+            .list,
+            .tuple,
+            .num_literal,
+            .small_dec_literal,
+            .dec_literal,
+            .frac_f32_literal,
+            .frac_f64_literal,
+            .str_literal,
+            .str_interpolation,
+            .underscore,
+            .runtime_error,
+            => unreachable,
+        };
+    }
+
+    pub fn sequenceLen(self: @This(), pattern_idx: PatternId) usize {
+        const pattern = self.checker.cir.store.getPattern(pattern_idx);
+        return switch (pattern) {
+            .tuple => |tuple| self.checker.cir.store.slicePatterns(tuple.patterns).len,
+            .assign,
+            .as,
+            .applied_tag,
+            .nominal,
+            .nominal_external,
+            .record_destructure,
+            .list,
+            .num_literal,
+            .small_dec_literal,
+            .dec_literal,
+            .frac_f32_literal,
+            .frac_f64_literal,
+            .str_literal,
+            .str_interpolation,
+            .underscore,
+            .runtime_error,
+            => unreachable,
+        };
+    }
+
+    pub fn sequenceChild(self: @This(), pattern_idx: PatternId, index: usize) PatternId {
+        const pattern = self.checker.cir.store.getPattern(pattern_idx);
+        return switch (pattern) {
+            .tuple => |tuple| self.checker.cir.store.slicePatterns(tuple.patterns)[index],
+            .assign,
+            .as,
+            .applied_tag,
+            .nominal,
+            .nominal_external,
+            .record_destructure,
+            .list,
+            .num_literal,
+            .small_dec_literal,
+            .dec_literal,
+            .frac_f32_literal,
+            .frac_f64_literal,
+            .str_literal,
+            .str_interpolation,
+            .underscore,
+            .runtime_error,
+            => unreachable,
+        };
+    }
+
+    pub fn recordLen(self: @This(), pattern_idx: PatternId) usize {
+        const pattern = self.checker.cir.store.getPattern(pattern_idx);
+        return switch (pattern) {
+            .record_destructure => |destructure| self.checker.cir.store.sliceRecordDestructs(destructure.destructs).len,
+            .assign,
+            .as,
+            .applied_tag,
+            .nominal,
+            .nominal_external,
+            .list,
+            .tuple,
+            .num_literal,
+            .small_dec_literal,
+            .dec_literal,
+            .frac_f32_literal,
+            .frac_f64_literal,
+            .str_literal,
+            .str_interpolation,
+            .underscore,
+            .runtime_error,
+            => unreachable,
+        };
+    }
+
+    pub fn recordChild(self: @This(), pattern_idx: PatternId, index: usize) PatternId {
+        const pattern = self.checker.cir.store.getPattern(pattern_idx);
+        return switch (pattern) {
+            .record_destructure => |destructure| blk: {
+                const destruct_idx = self.checker.cir.store.sliceRecordDestructs(destructure.destructs)[index];
+                const destruct = self.checker.cir.store.getRecordDestruct(destruct_idx);
+                break :blk destruct.kind.toPatternIdx();
+            },
+            .assign,
+            .as,
+            .applied_tag,
+            .nominal,
+            .nominal_external,
+            .list,
+            .tuple,
+            .num_literal,
+            .small_dec_literal,
+            .dec_literal,
+            .frac_f32_literal,
+            .frac_f64_literal,
+            .str_literal,
+            .str_interpolation,
+            .underscore,
+            .runtime_error,
+            => unreachable,
+        };
+    }
+
+    pub fn listFixedLen(self: @This(), pattern_idx: PatternId) usize {
+        const pattern = self.checker.cir.store.getPattern(pattern_idx);
+        return switch (pattern) {
+            .list => |list| self.checker.cir.store.slicePatterns(list.patterns).len,
+            .assign,
+            .as,
+            .applied_tag,
+            .nominal,
+            .nominal_external,
+            .record_destructure,
+            .tuple,
+            .num_literal,
+            .small_dec_literal,
+            .dec_literal,
+            .frac_f32_literal,
+            .frac_f64_literal,
+            .str_literal,
+            .str_interpolation,
+            .underscore,
+            .runtime_error,
+            => unreachable,
+        };
+    }
+
+    pub fn listHasRest(self: @This(), pattern_idx: PatternId) bool {
+        const pattern = self.checker.cir.store.getPattern(pattern_idx);
+        return switch (pattern) {
+            .list => |list| list.rest_info != null,
+            .assign,
+            .as,
+            .applied_tag,
+            .nominal,
+            .nominal_external,
+            .record_destructure,
+            .tuple,
+            .num_literal,
+            .small_dec_literal,
+            .dec_literal,
+            .frac_f32_literal,
+            .frac_f64_literal,
+            .str_literal,
+            .str_interpolation,
+            .underscore,
+            .runtime_error,
+            => unreachable,
+        };
+    }
+
+    pub fn listRestPattern(self: @This(), pattern_idx: PatternId) ?PatternId {
+        const pattern = self.checker.cir.store.getPattern(pattern_idx);
+        return switch (pattern) {
+            .list => |list| list.rest_info.?.pattern,
+            .assign,
+            .as,
+            .applied_tag,
+            .nominal,
+            .nominal_external,
+            .record_destructure,
+            .tuple,
+            .num_literal,
+            .small_dec_literal,
+            .dec_literal,
+            .frac_f32_literal,
+            .frac_f64_literal,
+            .str_literal,
+            .str_interpolation,
+            .underscore,
+            .runtime_error,
+            => unreachable,
+        };
+    }
+};
+
 fn patternNeedsExhaustiveness(self: *const Self, pattern_idx: CIR.Pattern.Idx) bool {
-    const pattern = self.cir.store.getPattern(pattern_idx);
-    return switch (pattern) {
-        .assign, .underscore, .runtime_error => false,
-        .as => |as_pattern| self.patternNeedsExhaustiveness(as_pattern.pattern),
-        .applied_tag,
-        .list,
-        .num_literal,
-        .small_dec_literal,
-        .dec_literal,
-        .frac_f32_literal,
-        .frac_f64_literal,
-        .str_literal,
-        .str_interpolation,
-        => true,
-        .tuple => |tuple| {
-            for (self.cir.store.slicePatterns(tuple.patterns)) |elem_pattern_idx| {
-                if (self.patternNeedsExhaustiveness(elem_pattern_idx)) return true;
-            }
-            return false;
-        },
-        .record_destructure => |destructure| {
-            for (self.cir.store.sliceRecordDestructs(destructure.destructs)) |destruct_idx| {
-                const destruct = self.cir.store.getRecordDestruct(destruct_idx);
-                const sub_pattern_idx = switch (destruct.kind) {
-                    .Required => |sub_pattern| sub_pattern,
-                    .SubPattern => |sub_pattern| sub_pattern,
-                    .Rest => |sub_pattern| sub_pattern,
-                };
-                if (self.patternNeedsExhaustiveness(sub_pattern_idx)) return true;
-            }
-            return false;
-        },
-        .nominal => |nominal| self.patternNeedsExhaustiveness(nominal.backing_pattern),
-        .nominal_external => |nominal| self.patternNeedsExhaustiveness(nominal.backing_pattern),
-    };
+    return PatternRefutability.canMiss(CirPatternRefutabilityAdapter, .{ .checker = self }, pattern_idx);
 }
 
 const PatternBinding = struct {
@@ -11238,9 +11567,8 @@ fn checkExpr(self: *Self, expr_idx: CIR.Expr.Idx, env: *Env, expected: Expected)
 
             // Check the the body of the expr
             // If we have an expected function, use that as the expr's expected type
-            const saved_empirical_exhaustiveness_depth = self.empirical_exhaustiveness_depth;
-            self.empirical_exhaustiveness_depth = 0;
-            defer self.empirical_exhaustiveness_depth = saved_empirical_exhaustiveness_depth;
+            const exhaustiveness_scope = self.exhaustiveness_context.resetForRuntimeFunction();
+            defer exhaustiveness_scope.leave();
 
             const body_is_delayed_dependency = !is_immediate_callee;
             if (body_is_delayed_dependency) self.delayed_dependency_depth += 1;
@@ -11914,7 +12242,7 @@ fn checkExpr(self: *Self, expr_idx: CIR.Expr.Idx, env: *Env, expected: Expected)
             {
                 // Builtin.roc has a small explicit set of compiler-owned intrinsic
                 // wrappers that post-check lowering handles from checked data.
-                // Nominal parser_for/encode_to annotations are opt-in markers
+                // Nominal parser_for/encoder_for annotations are opt-in markers
                 // whose generated targets are published in the static dispatch
                 // registry; every other annotation-only value remains an error.
             } else {
@@ -12313,6 +12641,61 @@ const OwnerEnvCandidate = struct {
     env: *const ModuleEnv,
     is_this_module: bool,
 };
+
+const StaticDispatchMethodBinding = struct {
+    env: *const ModuleEnv,
+    is_this_module: bool,
+    binding: ModuleEnv.MethodBinding,
+};
+
+fn lookupStaticDispatchMethodBinding(
+    self: *const Self,
+    owner_env: *const ModuleEnv,
+    owner_source_decl: ?u32,
+    method_source_env: *const ModuleEnv,
+    method_ident: Ident.Idx,
+) ?StaticDispatchMethodBinding {
+    if (self.lookupStaticDispatchMethodBindingInEnv(owner_env, owner_env, owner_source_decl, method_source_env, method_ident)) |found| {
+        return found;
+    }
+
+    if (owner_env != self.cir) {
+        if (self.lookupStaticDispatchMethodBindingInEnv(self.cir, owner_env, owner_source_decl, method_source_env, method_ident)) |found| {
+            return found;
+        }
+    }
+
+    for (self.imported_modules) |candidate_env| {
+        if (candidate_env == owner_env or candidate_env == self.cir) continue;
+        if (self.lookupStaticDispatchMethodBindingInEnv(candidate_env, owner_env, owner_source_decl, method_source_env, method_ident)) |found| {
+            return found;
+        }
+    }
+
+    return null;
+}
+
+fn lookupStaticDispatchMethodBindingInEnv(
+    self: *const Self,
+    candidate_env: *const ModuleEnv,
+    owner_env: *const ModuleEnv,
+    owner_source_decl: ?u32,
+    method_source_env: *const ModuleEnv,
+    method_ident: Ident.Idx,
+) ?StaticDispatchMethodBinding {
+    const binding = candidate_env.lookupMethodBindingFromOwnerAndMethodEnvsConst(
+        owner_env,
+        owner_source_decl,
+        method_source_env,
+        method_ident,
+    ) orelse return null;
+
+    return .{
+        .env = candidate_env,
+        .is_this_module = candidate_env == self.cir,
+        .binding = binding,
+    };
+}
 
 /// Resolve the module env that declares a type from the type's content-based
 /// origin identity: an exact 32-byte hash comparison against each candidate
@@ -12761,7 +13144,7 @@ fn closeAbsentConstructedPayloadVars(
 }
 
 fn pendingExhaustivenessMode(self: *const Self) ProblemStore.PendingStaticExhaustivenessMode {
-    return if (self.empirical_exhaustiveness_depth == 0) .static else .empirical;
+    return self.exhaustiveness_context.pendingStaticMode();
 }
 
 fn checkDestructureExhaustiveness(
@@ -13341,170 +13724,6 @@ fn functionTypeFromVar(self: *Self, fn_var: Var) ?Func {
     }
 }
 
-fn tryArgsFromVar(self: *Self, try_var: Var) ?TryArgs {
-    var current = try_var;
-    var guard = types_mod.debug.IterationGuard.init("tryArgsFromVar");
-    while (true) {
-        guard.tick();
-        const resolved = self.types.resolveVar(current);
-        switch (resolved.desc.content) {
-            .structure => |flat| switch (flat) {
-                .nominal_type => |nominal| {
-                    if (!self.nominalIsBuiltinTryType(nominal)) return null;
-                    const args = self.types.sliceNominalArgs(nominal);
-                    if (args.len != 2) return null;
-                    return .{ .ok = args[0], .err = args[1] };
-                },
-                else => return null,
-            },
-            .alias => |alias| current = self.types.getAliasBackingVar(alias),
-            else => return null,
-        }
-    }
-}
-
-fn widenTryConditionForExpectedReturn(
-    self: *Self,
-    cond_var: Var,
-    expected_return: Var,
-    env: *Env,
-    region: Region,
-) std.mem.Allocator.Error!void {
-    const actual_try = self.tryArgsFromVar(cond_var) orelse return;
-    const expected_try = self.tryArgsFromVar(expected_return) orelse return;
-
-    if (!try self.tryErrorRowNeedsUseSiteWidening(actual_try.err, expected_try.err)) {
-        return;
-    }
-
-    // `?` injects the callee's error row into the enclosing return row. Ordinary
-    // tag-union unification still rejects closed-vs-open rigid rows; this use-site
-    // redirect runs only after proving the callee's visible errors are included.
-    const widened_try_var = try self.freshFromContent(
-        try self.mkTryContent(actual_try.ok, expected_try.err, env),
-        env,
-        region,
-    );
-    const cond_root = self.types.resolveVar(cond_var).var_;
-    if (cond_root != widened_try_var) {
-        try self.types.dangerousSetVarRedirect(cond_root, widened_try_var);
-    }
-}
-
-fn tryErrorRowNeedsUseSiteWidening(self: *Self, actual_err: Var, expected_err: Var) std.mem.Allocator.Error!bool {
-    if (try self.probeCanUseAs(expected_err, actual_err)) {
-        return false;
-    }
-
-    var visited_actual = std.AutoHashMap(Var, void).init(self.gpa);
-    defer visited_actual.deinit();
-    return try self.actualTagRowIsIncludedInExpected(actual_err, expected_err, &visited_actual);
-}
-
-fn probeCanUseAs(self: *Self, expected_var: Var, actual_var: Var) std.mem.Allocator.Error!bool {
-    var probe = try self.beginProbe();
-    defer probe.rollback();
-    return try self.probeUnifyWithoutRecordingProblems(expected_var, actual_var);
-}
-
-fn actualTagRowIsIncludedInExpected(
-    self: *Self,
-    actual_var: Var,
-    expected_var: Var,
-    visited_actual: *std.AutoHashMap(Var, void),
-) std.mem.Allocator.Error!bool {
-    const actual_resolved = self.types.resolveVar(actual_var);
-    if (visited_actual.contains(actual_resolved.var_)) return true;
-    try visited_actual.put(actual_resolved.var_, {});
-
-    switch (actual_resolved.desc.content) {
-        .alias => |alias| return try self.actualTagRowIsIncludedInExpected(
-            self.types.getAliasBackingVar(alias),
-            expected_var,
-            visited_actual,
-        ),
-        .structure => |flat| switch (flat) {
-            .empty_tag_union => return true,
-            .tag_union => |tag_union| {
-                const tags = self.types.getTagsSlice(tag_union.tags);
-                const names = tags.items(.name);
-                const args_ranges = tags.items(.args);
-                for (names, args_ranges) |name, args| {
-                    const actual_tag = types_mod.Tag{ .name = name, .args = args };
-                    if (!try self.expectedTagRowContainsTag(expected_var, actual_tag)) {
-                        return false;
-                    }
-                }
-                return try self.actualTagRowIsIncludedInExpected(tag_union.ext, expected_var, visited_actual);
-            },
-            else => return false,
-        },
-        .err => return true,
-        .flex, .rigid => return false,
-    }
-}
-
-fn expectedTagRowContainsTag(
-    self: *Self,
-    expected_var: Var,
-    actual_tag: types_mod.Tag,
-) std.mem.Allocator.Error!bool {
-    var visited_expected = std.AutoHashMap(Var, void).init(self.gpa);
-    defer visited_expected.deinit();
-
-    const expected_tag = try self.findVisibleTagInRow(expected_var, actual_tag.name, &visited_expected) orelse return false;
-    return try self.tagsCanUseSamePayloads(expected_tag, actual_tag);
-}
-
-fn findVisibleTagInRow(
-    self: *Self,
-    row_var: Var,
-    tag_name: Ident.Idx,
-    visited: *std.AutoHashMap(Var, void),
-) std.mem.Allocator.Error!?types_mod.Tag {
-    const row_resolved = self.types.resolveVar(row_var);
-    if (visited.contains(row_resolved.var_)) return null;
-    try visited.put(row_resolved.var_, {});
-
-    switch (row_resolved.desc.content) {
-        .alias => |alias| return try self.findVisibleTagInRow(
-            self.types.getAliasBackingVar(alias),
-            tag_name,
-            visited,
-        ),
-        .structure => |flat| switch (flat) {
-            .tag_union => |tag_union| {
-                const tags = self.types.getTagsSlice(tag_union.tags);
-                const names = tags.items(.name);
-                const args_ranges = tags.items(.args);
-                for (names, args_ranges) |name, args| {
-                    if (name.eql(tag_name)) {
-                        return types_mod.Tag{ .name = name, .args = args };
-                    }
-                }
-                return try self.findVisibleTagInRow(tag_union.ext, tag_name, visited);
-            },
-            .empty_tag_union => return null,
-            else => return null,
-        },
-        .err, .flex, .rigid => return null,
-    }
-}
-
-fn tagsCanUseSamePayloads(self: *Self, expected_tag: types_mod.Tag, actual_tag: types_mod.Tag) std.mem.Allocator.Error!bool {
-    if (expected_tag.args.len() != actual_tag.args.len()) return false;
-
-    var expected_args = self.types.iterVars(expected_tag.args);
-    var actual_args = self.types.iterVars(actual_tag.args);
-    while (expected_args.next()) |expected_arg| {
-        const actual_arg = actual_args.next().?;
-        if (!try self.probeCanUseAs(expected_arg, actual_arg)) {
-            return false;
-        }
-    }
-    return true;
-}
-
 // if-else //
 
 /// Check the types for an if-else expr
@@ -13725,8 +13944,6 @@ fn checkMatchExpr(
         } });
         if (!try_result.isOk()) {
             has_invalid_try = true;
-        } else if (expected.returnResult()) |expected_return| {
-            try self.widenTryConditionForExpectedReturn(cond_var, expected_return, env, expr_region);
         }
     }
     if (!match.is_try_suffix and !match.skip_exhaustiveness) {
@@ -14399,7 +14616,7 @@ fn reportMissingNominalMethodForBinop(
         return false;
     }
     const original_env = self.getNominalOriginEnv(nominal_type);
-    if (original_env.lookupMethodBindingFromEnvAndDeclConst(self.cir, nominal_type.sourceDeclOptional(), method_name) == null) {
+    if (self.lookupStaticDispatchMethodBinding(original_env, nominal_type.sourceDeclOptional(), self.cir, method_name) == null) {
         try self.reportMissingNominalMethodForBinopConstraint(lhs_var, rhs_var, expr_var, method_name, env, region);
         return true;
     }
@@ -15286,6 +15503,8 @@ const Probe = struct {
     open_literal_vars_len: usize,
     open_numeral_literals_len: usize,
     pending_tuple_accesses_len: usize,
+    scheme_instantiations_len: usize,
+    scheme_instantiation_pairs_len: usize,
 
     fn rollback(self: *Probe) void {
         self.check.types.rollbackToSavepoint(&self.savepoint);
@@ -15298,6 +15517,10 @@ const Probe = struct {
         self.check.open_literal_vars.shrinkRetainingCapacity(self.open_literal_vars_len);
         self.check.open_numeral_literals.shrinkRetainingCapacity(self.open_numeral_literals_len);
         self.check.pending_tuple_accesses.shrinkRetainingCapacity(self.pending_tuple_accesses_len);
+        // Scheme-instantiation evidence recorded during the probe references
+        // fresh vars the savepoint rollback just discarded.
+        self.check.cir.scheme_instantiations.items.shrinkRetainingCapacity(self.scheme_instantiations_len);
+        self.check.cir.scheme_instantiation_pairs.items.shrinkRetainingCapacity(self.scheme_instantiation_pairs_len);
     }
 
     /// Close the probe scope KEEPING everything it did: the type-store
@@ -15315,6 +15538,8 @@ fn beginProbe(self: *Self) std.mem.Allocator.Error!Probe {
     const open_literal_vars_len = self.open_literal_vars.items.len;
     const open_numeral_literals_len = self.open_numeral_literals.items.len;
     const pending_tuple_accesses_len = self.pending_tuple_accesses.items.len;
+    const scheme_instantiations_len = self.cir.scheme_instantiations.items.items.len;
+    const scheme_instantiation_pairs_len = self.cir.scheme_instantiation_pairs.items.items.len;
     return .{
         .check = self,
         .regions_len = regions_len,
@@ -15322,6 +15547,8 @@ fn beginProbe(self: *Self) std.mem.Allocator.Error!Probe {
         .open_literal_vars_len = open_literal_vars_len,
         .open_numeral_literals_len = open_numeral_literals_len,
         .pending_tuple_accesses_len = pending_tuple_accesses_len,
+        .scheme_instantiations_len = scheme_instantiations_len,
+        .scheme_instantiation_pairs_len = scheme_instantiation_pairs_len,
         .savepoint = try self.types.createSavepoint(),
     };
 }
@@ -15696,7 +15923,7 @@ fn runLiteralDefaultingRounds(self: *Self, env: *Env, universe: LiteralDefaultUn
         }
 
         // --- 4. Cascade the dispatches the commits unblocked. ---
-        while (self.anyDeferredDispatchReceiverResolved(env)) {
+        while (try self.anyDeferredDispatchReceiverResolved(env)) {
             try self.checkStaticDispatchConstraints(env, true);
         }
     }
@@ -16162,9 +16389,150 @@ fn defaultLiteralsAtGeneralizationBoundary(self: *Self, def_root_var: Var, env: 
 /// something other than a flex var — i.e. whether another
 /// `checkStaticDispatchConstraints` pass can make progress (it re-defers only
 /// still-flex receivers; every other receiver is consumed: fired or errored).
-fn anyDeferredDispatchReceiverResolved(self: *Self, env: *Env) bool {
+fn anyDeferredDispatchReceiverResolved(self: *Self, env: *Env) Allocator.Error!bool {
     for (env.deferred_static_dispatch_constraints.items.items) |deferred| {
-        if (self.types.resolveVar(deferred.var_).desc.content != .flex) return true;
+        if (self.types.resolveVar(deferred.var_).desc.content == .flex) continue;
+        if (try self.deferredConstraintWaitsOnDerivedEncode(deferred, env)) continue;
+        return true;
+    }
+    return false;
+}
+
+fn deferredConstraintWaitsOnDerivedEncode(self: *Self, deferred: DeferredConstraintCheck, env: *Env) Allocator.Error!bool {
+    var maybe_encoding_var: ?Var = null;
+    for (self.types.sliceStaticDispatchConstraints(deferred.constraints)) |constraint| {
+        if (constraint.fn_name.eql(self.cir.idents.encoder_for)) {
+            maybe_encoding_var = self.encoderForConstraintEncodingVar(constraint);
+            break;
+        }
+    }
+    const encoding_var = maybe_encoding_var orelse return false;
+
+    const region = self.getRegionAt(deferred.var_);
+    return (try self.varSupportsDerivedEncodeShape(deferred.var_, encoding_var, env, region)) == .unresolved;
+}
+
+fn encoderForConstraintEncodingVar(self: *Self, constraint: StaticDispatchConstraint) ?Var {
+    const resolved_constraint = self.types.resolveVar(constraint.fn_var);
+    const resolved_func = resolved_constraint.desc.content.unwrapFunc() orelse return null;
+    const args = self.types.sliceVars(resolved_func.args);
+    if (args.len != 1) return null;
+    return args[0];
+}
+
+fn deferredEncodeHasPendingOpenLiteral(self: *Self, deferred: DeferredConstraintCheck, env: *Env) Allocator.Error!bool {
+    self.var_set.clearRetainingCapacity();
+    return try self.varHasPendingOpenLiteralForDerivedEncode(deferred.var_, env, &self.var_set);
+}
+
+fn varHasPendingOpenLiteralForDerivedEncode(
+    self: *Self,
+    var_: Var,
+    env: *Env,
+    visited: *std.AutoHashMap(Var, void),
+) Allocator.Error!bool {
+    const resolved = self.types.resolveVar(var_);
+    if (visited.contains(resolved.var_)) return false;
+    try visited.put(resolved.var_, {});
+
+    return switch (resolved.desc.content) {
+        .structure => |structure| try self.structureHasPendingOpenLiteralForDerivedEncode(structure, env, visited),
+        .alias => |alias| try self.varHasPendingOpenLiteralForDerivedEncode(self.types.getAliasBackingVar(alias), env, visited),
+        .err, .rigid => false,
+        .flex => resolved.desc.rank != .generalized and self.varLiteralKind(resolved.var_) != null,
+    };
+}
+
+fn structureHasPendingOpenLiteralForDerivedEncode(
+    self: *Self,
+    structure: types_mod.FlatType,
+    env: *Env,
+    visited: *std.AutoHashMap(Var, void),
+) Allocator.Error!bool {
+    return switch (structure) {
+        .nominal_type => |nominal| try self.nominalHasPendingOpenLiteralForDerivedEncode(nominal, env, visited),
+        .record => |record| try self.recordHasPendingOpenLiteralForDerivedEncode(record.fields, env, visited),
+        .record_unbound => |fields| try self.recordHasPendingOpenLiteralForDerivedEncode(fields, env, visited),
+        .tag_union => |tag_union| try self.tagUnionHasPendingOpenLiteralForDerivedEncode(tag_union, env, visited),
+        .tuple => |tuple| blk: {
+            const elems = self.types.sliceVars(tuple.elems);
+            for (elems) |elem_var| {
+                if (try self.varHasPendingOpenLiteralForDerivedEncode(elem_var, env, visited)) break :blk true;
+            }
+            break :blk false;
+        },
+        else => false,
+    };
+}
+
+fn recordHasPendingOpenLiteralForDerivedEncode(
+    self: *Self,
+    fields_range: types_mod.RecordField.SafeMultiList.Range,
+    env: *Env,
+    visited: *std.AutoHashMap(Var, void),
+) Allocator.Error!bool {
+    const fields = self.types.getRecordFieldsSlice(fields_range);
+    for (fields.items(.var_)) |field_var| {
+        const child_var = (try self.optionalEncodePayloadVar(field_var)) orelse field_var;
+        if (try self.varHasPendingOpenLiteralForDerivedEncode(child_var, env, visited)) return true;
+    }
+    return false;
+}
+
+fn tagUnionHasPendingOpenLiteralForDerivedEncode(
+    self: *Self,
+    tag_union: types_mod.TagUnion,
+    env: *Env,
+    visited: *std.AutoHashMap(Var, void),
+) Allocator.Error!bool {
+    const tags = self.types.getTagsSlice(tag_union.tags);
+    for (tags.items(.args)) |tag_args_range| {
+        for (self.types.sliceVars(tag_args_range)) |tag_arg| {
+            if (try self.varHasPendingOpenLiteralForDerivedEncode(tag_arg, env, visited)) return true;
+        }
+    }
+    return try self.tagExtHasPendingOpenLiteralForDerivedEncode(tag_union.ext, env, visited);
+}
+
+fn tagExtHasPendingOpenLiteralForDerivedEncode(
+    self: *Self,
+    ext_var: Var,
+    env: *Env,
+    visited: *std.AutoHashMap(Var, void),
+) Allocator.Error!bool {
+    return switch (self.types.resolveVar(ext_var).desc.content) {
+        .structure => |structure| switch (structure) {
+            .tag_union => |tag_union| try self.tagUnionHasPendingOpenLiteralForDerivedEncode(tag_union, env, visited),
+            else => false,
+        },
+        .alias => |alias| try self.tagExtHasPendingOpenLiteralForDerivedEncode(self.types.getAliasBackingVar(alias), env, visited),
+        else => false,
+    };
+}
+
+fn nominalHasPendingOpenLiteralForDerivedEncode(
+    self: *Self,
+    nominal: types_mod.NominalType,
+    env: *Env,
+    visited: *std.AutoHashMap(Var, void),
+) Allocator.Error!bool {
+    if (self.nominalListPayloadVar(nominal)) |payload_var| {
+        return try self.varHasPendingOpenLiteralForDerivedEncode(payload_var, env, visited);
+    }
+    if (self.nominalBoxPayloadVar(nominal)) |payload_var| {
+        return try self.varHasPendingOpenLiteralForDerivedEncode(payload_var, env, visited);
+    }
+    if (self.nominalSetPayloadVar(nominal)) |payload_var| {
+        return try self.varHasPendingOpenLiteralForDerivedEncode(payload_var, env, visited);
+    }
+    if (self.nominalDictKeyValueVars(nominal)) |args| {
+        return try self.varHasPendingOpenLiteralForDerivedEncode(args.key, env, visited) or
+            try self.varHasPendingOpenLiteralForDerivedEncode(args.value, env, visited);
+    }
+    if (self.nominalIsBuiltinTryType(nominal)) {
+        if (try self.jsonTryInfoFromNominal(nominal)) |info| {
+            return try self.varHasPendingOpenLiteralForDerivedEncode(info.ok_var, env, visited);
+        }
     }
     return false;
 }
@@ -16376,13 +16744,12 @@ fn numeralCandidateStructurallyRefuted(
     // would mint.
     const candidate_source_decl = self.sourceDeclForBuiltinNominal(.{ .num = candidate_kind });
     const candidate_origin_module = self.builtinOriginModule();
-    const original_env, const is_this_module = self.ownerEnvForOriginModule(
+    const owner_env, _ = self.ownerEnvForOriginModule(
         candidate_origin_module,
         candidate_source_decl,
         true,
         "static dispatch candidate",
     );
-    const method_types: *const types_mod.Store = if (is_this_module) self.types else &original_env.types;
 
     var found_refuting_pair = false;
     for (self.types.sliceStaticDispatchConstraints(constraint_range)) |constraint| {
@@ -16390,12 +16757,14 @@ fn numeralCandidateStructurallyRefuted(
 
         // Method lookup short of instantiation — same env, owner decl, and method
         // ident the probe's lookup uses, via the same const lookup.
-        const method_binding = original_env.lookupMethodBindingFromEnvAndDeclConst(
-            self.cir,
+        const method_lookup = self.lookupStaticDispatchMethodBinding(
+            owner_env,
             candidate_source_decl,
+            self.cir,
             constraint.fn_name,
         ) orelse return true;
-        const def_var: Var = ModuleEnv.varFrom(method_binding.type_node_idx);
+        const method_types: *const types_mod.Store = if (method_lookup.is_this_module) self.types else &method_lookup.env.types;
+        const def_var: Var = ModuleEnv.varFrom(method_lookup.binding.type_node_idx);
 
         // From here on, refutation needs the closed-world structural walk;
         // any uncertainty falls through to the probe (return false).
@@ -16499,27 +16868,29 @@ fn staticDispatchConstraintAcceptsCandidate(
     // Scope-proof token only; not otherwise consulted.
     const candidate_resolved = self.types.resolveVar(candidate_var);
     const nominal_type = candidate_resolved.desc.content.unwrapNominalType() orelse return false;
-    const original_env, const is_this_module = self.ownerEnvForOriginModule(
+    const owner_env, _ = self.ownerEnvForOriginModule(
         nominal_type.origin_module,
         nominal_type.sourceDeclOptional(),
         nominal_type.originIsBuiltin(),
         "static dispatch candidate",
     );
 
-    const method_binding = original_env.lookupMethodBindingFromEnvAndDeclConst(
-        self.cir,
+    const method_lookup = self.lookupStaticDispatchMethodBinding(
+        owner_env,
         nominal_type.sourceDeclOptional(),
+        self.cir,
         constraint.fn_name,
     ) orelse return false;
-    const def_var: Var = ModuleEnv.varFrom(method_binding.type_node_idx);
+    const method_env = method_lookup.env;
+    const def_var: Var = ModuleEnv.varFrom(method_lookup.binding.type_node_idx);
 
-    const method_var = if (is_this_module) blk: {
+    const method_var = if (method_lookup.is_this_module) blk: {
         if (self.types.resolveVar(def_var).desc.rank == .generalized) {
             break :blk try self.instantiateVar(def_var, env, .use_last_var);
         }
         break :blk def_var;
     } else blk: {
-        const copied_var = try self.copyVar(def_var, original_env, self.getRegionAt(candidate_var));
+        const copied_var = try self.copyVar(def_var, method_env, self.getRegionAt(candidate_var));
         break :blk try self.instantiateVar(copied_var, env, .{ .explicit = self.getRegionAt(candidate_var) });
     };
 
@@ -16864,7 +17235,7 @@ fn checkStaticDispatchConstraints(self: *Self, env: *Env, is_numeric_default_pas
                 const original_module_ident = nominal_type.origin_module;
 
                 // Check if the nominal type in question is defined in this module
-                const original_env, const is_this_module = self.ownerEnvForOriginModule(
+                const original_env, _ = self.ownerEnvForOriginModule(
                     original_module_ident,
                     nominal_type.sourceDeclOptional(),
                     nominal_type.originIsBuiltin(),
@@ -16960,58 +17331,79 @@ fn checkStaticDispatchConstraints(self: *Self, env: *Env, is_numeric_default_pas
                             continue;
                         }
                     }
-                    if (constraint.fn_name.eql(self.cir.idents.encode_to)) {
-                        var supports_implicit_encode =
-                            self.nominalIsBuiltinBoolType(nominal_type) or
-                            self.nominalIsBuiltinStrType(nominal_type) or
-                            self.nominalIsBuiltinNumberType(nominal_type);
-                        if (!supports_implicit_encode and self.nominalIsBuiltinTryType(nominal_type)) {
-                            if (try self.jsonTryInfoFromNominal(nominal_type)) |info| {
-                                supports_implicit_encode = info.has_null and !info.has_missing;
-                            }
-                        }
-                        if (!supports_implicit_encode) {
-                            if (self.nominalListPayloadVar(nominal_type)) |payload_var| {
-                                supports_implicit_encode = try self.varSupportsDerivedEncodeShape(payload_var, env, region);
-                            }
-                        }
-                        if (!supports_implicit_encode) {
-                            if (self.nominalBoxPayloadVar(nominal_type)) |payload_var| {
-                                supports_implicit_encode = try self.varSupportsDerivedEncodeShape(payload_var, env, region);
-                            }
-                        }
-                        if (!supports_implicit_encode) {
-                            if (self.nominalSetPayloadVar(nominal_type)) |payload_var| {
-                                supports_implicit_encode = try self.varSupportsDerivedEncodeShape(payload_var, env, region);
-                            }
-                        }
-                        if (!supports_implicit_encode) {
-                            if (self.nominalDictKeyValueVars(nominal_type)) |args| {
-                                supports_implicit_encode =
-                                    try self.varSupportsJsonObjectKey(args.key) and
-                                    try self.varSupportsDerivedEncodeShape(args.value, env, region);
-                            }
-                        }
-                        if (supports_implicit_encode) {
-                            try self.satisfyImplicitEncodeToConstraint(
+                    if (constraint.fn_name.eql(self.cir.idents.encoder_for)) {
+                        const encoding_var = self.encoderForConstraintEncodingVar(constraint) orelse {
+                            try self.reportConstraintError(
                                 deferred_constraint.var_,
                                 constraint,
-                                constraint.fn_var,
+                                .not_nominal,
                                 env,
-                                region,
+                                is_numeric_default_pass,
                             );
                             continue;
+                        };
+                        var supports_implicit_encode: DerivedSupport = if (self.nominalIsBuiltinBoolType(nominal_type) or
+                            self.nominalIsBuiltinStrType(nominal_type) or
+                            self.nominalIsBuiltinNumberType(nominal_type))
+                            .supported
+                        else
+                            .unsupported;
+                        if (supports_implicit_encode == .unsupported and self.nominalIsBuiltinTryType(nominal_type)) {
+                            if (try self.jsonTryInfoFromNominal(nominal_type)) |info| {
+                                supports_implicit_encode = derivedSupportFromBool(info.has_null and !info.has_missing);
+                            }
+                        }
+                        if (supports_implicit_encode == .unsupported) {
+                            if (self.nominalListPayloadVar(nominal_type)) |payload_var| {
+                                supports_implicit_encode = try self.varSupportsDerivedEncodeShape(payload_var, encoding_var, env, region);
+                            }
+                        }
+                        if (supports_implicit_encode == .unsupported) {
+                            if (self.nominalBoxPayloadVar(nominal_type)) |payload_var| {
+                                supports_implicit_encode = try self.varSupportsDerivedEncodeShape(payload_var, encoding_var, env, region);
+                            }
+                        }
+                        if (supports_implicit_encode == .unsupported) {
+                            if (self.nominalSetPayloadVar(nominal_type)) |payload_var| {
+                                supports_implicit_encode = try self.varSupportsDerivedEncodeShape(payload_var, encoding_var, env, region);
+                            }
+                        }
+                        if (supports_implicit_encode == .unsupported) {
+                            if (self.nominalDictKeyValueVars(nominal_type)) |args| {
+                                supports_implicit_encode = combineDerivedSupport(
+                                    try self.varSupportsJsonObjectKeyForDerivedEncode(args.key),
+                                    try self.varSupportsDerivedEncodeShape(args.value, encoding_var, env, region),
+                                );
+                            }
+                        }
+                        switch (supports_implicit_encode) {
+                            .supported => {
+                                try self.satisfyImplicitEncoderForConstraint(
+                                    deferred_constraint.var_,
+                                    constraint,
+                                    constraint.fn_var,
+                                    env,
+                                    region,
+                                );
+                                continue;
+                            },
+                            .unresolved => if (!is_numeric_default_pass or try self.deferredEncodeHasPendingOpenLiteral(deferred_constraint, env)) {
+                                try self.scratch_deferred_static_dispatch_constraints.append(deferred_constraint);
+                                break :dispatch_resolution;
+                            },
+                            .unsupported => {},
                         }
                     }
-                    const method_binding = if (constraint.fn_name.eql(self.cir.idents.is_eq) and
+                    const method_lookup = if (constraint.fn_name.eql(self.cir.idents.is_eq) and
                         try self.nominalSupportsStructuralDerive(nominal_type))
                     blk: {
-                        const exact_method_binding = original_env.lookupMethodBindingFromEnvAndDeclConst(
-                            self.cir,
+                        const exact_method_lookup = self.lookupStaticDispatchMethodBinding(
+                            original_env,
                             nominal_type.sourceDeclOptional(),
+                            self.cir,
                             constraint.fn_name,
                         );
-                        if (exact_method_binding == null and try self.nominalSupportsStructuralDerive(nominal_type)) {
+                        if (exact_method_lookup == null and try self.nominalSupportsStructuralDerive(nominal_type)) {
                             try self.satisfyDerivedIsEqConstraint(
                                 deferred_constraint.var_,
                                 constraint,
@@ -17021,7 +17413,7 @@ fn checkStaticDispatchConstraints(self: *Self, env: *Env, is_numeric_default_pas
                             );
                             continue;
                         }
-                        break :blk exact_method_binding orelse {
+                        break :blk exact_method_lookup orelse {
                             try self.reportConstraintError(
                                 deferred_constraint.var_,
                                 constraint,
@@ -17034,12 +17426,13 @@ fn checkStaticDispatchConstraints(self: *Self, env: *Env, is_numeric_default_pas
                     } else if (constraint.fn_name.eql(self.cir.idents.to_hash) and
                         try self.nominalSupportsStructuralDerive(nominal_type))
                     blk: {
-                        const exact_method_binding = original_env.lookupMethodBindingFromEnvAndDeclConst(
-                            self.cir,
+                        const exact_method_lookup = self.lookupStaticDispatchMethodBinding(
+                            original_env,
                             nominal_type.sourceDeclOptional(),
+                            self.cir,
                             constraint.fn_name,
                         );
-                        if (exact_method_binding == null) {
+                        if (exact_method_lookup == null) {
                             try self.satisfyDerivedToHashConstraint(
                                 deferred_constraint.var_,
                                 constraint,
@@ -17049,8 +17442,8 @@ fn checkStaticDispatchConstraints(self: *Self, env: *Env, is_numeric_default_pas
                             );
                             continue;
                         }
-                        break :blk exact_method_binding.?;
-                    } else original_env.lookupMethodBindingFromEnvAndDeclConst(self.cir, nominal_type.sourceDeclOptional(), constraint.fn_name) orelse {
+                        break :blk exact_method_lookup.?;
+                    } else self.lookupStaticDispatchMethodBinding(original_env, nominal_type.sourceDeclOptional(), self.cir, constraint.fn_name) orelse {
                         // Method name doesn't exist in target module
                         try self.reportConstraintError(
                             deferred_constraint.var_,
@@ -17065,13 +17458,16 @@ fn checkStaticDispatchConstraints(self: *Self, env: *Env, is_numeric_default_pas
                         self.rewriteEqBinopAsMethodEq(constraint);
                     }
 
+                    const method_env = method_lookup.env;
+                    const method_is_this_module = method_lookup.is_this_module;
+                    const method_binding = method_lookup.binding;
                     const def_idx = method_binding.def_idx;
                     const method_type_var: Var = ModuleEnv.varFrom(method_binding.type_node_idx);
-                    const def = original_env.store.getDef(def_idx);
+                    const def = method_env.store.getDef(def_idx);
                     // Track whether we just processed or referenced a cycle participant.
                     var cycle_method_expr_var: ?Var = null;
 
-                    if (is_this_module) {
+                    if (method_is_this_module) {
                         // Check if we've processed this def already.
                         const mb_processing_def = self.top_level_ptrns.get(def.pattern);
                         if (mb_processing_def) |processing_def| {
@@ -17143,21 +17539,29 @@ fn checkStaticDispatchConstraints(self: *Self, env: *Env, is_numeric_default_pas
                         }
                     }
 
-                    // Copy the actual method from the dest module env to this module env
+                    // Copy the actual method from the dest module env to this module env.
+                    // Instantiating the chosen method target's scheme while this
+                    // key is set records the instantiation as `dispatch_target`
+                    // evidence for the constraint being discharged.
+                    self.evidence_target_site = .{
+                        .node_idx = if (self.constraintExprForFnVar(constraint.fn_var)) |expr| @intFromEnum(expr) else 0,
+                        .constraint_fn_var = constraint.fn_var,
+                    };
                     const method_var = if (cycle_method_expr_var) |expr_var_for_method| blk: {
                         // Cycle participant or recursive self-dispatch: use the
                         // fresh flex var instead of def_var to avoid rank lowering.
                         break :blk expr_var_for_method;
-                    } else if (is_this_module) blk: {
+                    } else if (method_is_this_module) blk: {
                         if (self.types.resolveVar(method_type_var).desc.rank == .generalized) {
                             break :blk try self.instantiateVar(method_type_var, env, .use_last_var);
                         }
                         break :blk method_type_var;
                     } else blk: {
                         // Copy the method from the other module's type store
-                        const copied_var = try self.copyVar(method_type_var, original_env, region);
+                        const copied_var = try self.copyVar(method_type_var, method_env, region);
                         break :blk try self.instantiateVar(copied_var, env, .{ .explicit = region });
                     };
+                    self.evidence_target_site = null;
 
                     // Unwrap the constraint type
                     const constraint_fn = constraint_fn_resolved.unwrapFunc() orelse {
@@ -17210,7 +17614,7 @@ fn checkStaticDispatchConstraints(self: *Self, env: *Env, is_numeric_default_pas
 
                 // Get the module ident that this alias type was defined in
                 const original_module_ident = alias.origin_module;
-                const original_env, const is_this_module = self.ownerEnvForOriginModule(
+                const original_env, _ = self.ownerEnvForOriginModule(
                     original_module_ident,
                     alias.source_decl.toOptional(),
                     alias.source_decl.originIsBuiltin(),
@@ -17240,12 +17644,13 @@ fn checkStaticDispatchConstraints(self: *Self, env: *Env, is_numeric_default_pas
                         try self.ensureCustomInterpolationPartsChecked(constraint, env);
                     }
                     if (constraint.fn_name.eql(self.cir.idents.is_eq)) {
-                        const method_binding = original_env.lookupMethodBindingFromTwoEnvsAndDeclConst(
+                        const method_lookup = self.lookupStaticDispatchMethodBinding(
+                            original_env,
                             alias.source_decl.toOptional(),
                             self.cir,
                             constraint.fn_name,
                         );
-                        if (method_binding == null) {
+                        if (method_lookup == null) {
                             const backing_var = self.types.getAliasBackingVar(alias);
                             if (try self.varSupportsIsEq(backing_var)) {
                                 try self.satisfyDerivedIsEqConstraint(
@@ -17266,12 +17671,13 @@ fn checkStaticDispatchConstraints(self: *Self, env: *Env, is_numeric_default_pas
                         }
                     }
                     if (constraint.fn_name.eql(self.cir.idents.to_hash)) {
-                        const method_binding = original_env.lookupMethodBindingFromTwoEnvsAndDeclConst(
+                        const method_lookup = self.lookupStaticDispatchMethodBinding(
+                            original_env,
                             alias.source_decl.toOptional(),
                             self.cir,
                             constraint.fn_name,
                         );
-                        if (method_binding == null) {
+                        if (method_lookup == null) {
                             const backing_var = self.types.getAliasBackingVar(alias);
                             if (try self.varSupportsToHash(backing_var)) {
                                 try self.satisfyDerivedToHashConstraint(
@@ -17306,21 +17712,39 @@ fn checkStaticDispatchConstraints(self: *Self, env: *Env, is_numeric_default_pas
                             continue;
                         }
                     }
-                    if (constraint.fn_name.eql(self.cir.idents.encode_to)) {
+                    if (constraint.fn_name.eql(self.cir.idents.encoder_for)) {
                         const backing_var = self.types.getAliasBackingVar(alias);
-                        if (try self.varSupportsDerivedEncodeShape(backing_var, env, region)) {
-                            try self.satisfyImplicitEncodeToConstraint(
+                        const encoding_var = self.encoderForConstraintEncodingVar(constraint) orelse {
+                            try self.reportConstraintError(
                                 deferred_constraint.var_,
                                 constraint,
-                                constraint.fn_var,
+                                .not_nominal,
                                 env,
-                                region,
+                                is_numeric_default_pass,
                             );
                             continue;
+                        };
+                        switch (try self.varSupportsDerivedEncodeShape(backing_var, encoding_var, env, region)) {
+                            .supported => {
+                                try self.satisfyImplicitEncoderForConstraint(
+                                    deferred_constraint.var_,
+                                    constraint,
+                                    constraint.fn_var,
+                                    env,
+                                    region,
+                                );
+                                continue;
+                            },
+                            .unresolved => if (!is_numeric_default_pass or try self.deferredEncodeHasPendingOpenLiteral(deferred_constraint, env)) {
+                                try self.scratch_deferred_static_dispatch_constraints.append(deferred_constraint);
+                                break :dispatch_resolution;
+                            },
+                            .unsupported => {},
                         }
                     }
 
-                    const method_binding = original_env.lookupMethodBindingFromTwoEnvsAndDeclConst(
+                    const method_lookup = self.lookupStaticDispatchMethodBinding(
+                        original_env,
                         alias.source_decl.toOptional(),
                         self.cir,
                         constraint.fn_name,
@@ -17334,15 +17758,18 @@ fn checkStaticDispatchConstraints(self: *Self, env: *Env, is_numeric_default_pas
                         );
                         continue;
                     };
+                    const method_env = method_lookup.env;
+                    const method_is_this_module = method_lookup.is_this_module;
+                    const method_binding = method_lookup.binding;
                     const def_idx = method_binding.def_idx;
                     if (constraint.fn_name.eql(self.cir.idents.is_eq)) {
                         self.rewriteEqBinopAsMethodEq(constraint);
                     }
 
                     const method_type_var: Var = ModuleEnv.varFrom(method_binding.type_node_idx);
-                    const def = original_env.store.getDef(def_idx);
+                    const def = method_env.store.getDef(def_idx);
                     var cycle_method_expr_var: ?Var = null;
-                    if (is_this_module) {
+                    if (method_is_this_module) {
                         const mb_processing_def = self.top_level_ptrns.get(def.pattern);
                         if (mb_processing_def) |processing_def| {
                             std.debug.assert(processing_def.def_idx == def_idx);
@@ -17401,17 +17828,25 @@ fn checkStaticDispatchConstraints(self: *Self, env: *Env, is_numeric_default_pas
                         }
                     }
 
+                    // See the nominal branch above: while this key is set, the
+                    // chosen method target's scheme instantiation is recorded as
+                    // `dispatch_target` evidence for this constraint.
+                    self.evidence_target_site = .{
+                        .node_idx = if (self.constraintExprForFnVar(constraint.fn_var)) |expr| @intFromEnum(expr) else 0,
+                        .constraint_fn_var = constraint.fn_var,
+                    };
                     const method_var = if (cycle_method_expr_var) |expr_var_for_method| blk: {
                         break :blk expr_var_for_method;
-                    } else if (is_this_module) blk: {
+                    } else if (method_is_this_module) blk: {
                         if (self.types.resolveVar(method_type_var).desc.rank == .generalized) {
                             break :blk try self.instantiateVar(method_type_var, env, .use_last_var);
                         }
                         break :blk method_type_var;
                     } else blk: {
-                        const copied_var = try self.copyVar(method_type_var, original_env, region);
+                        const copied_var = try self.copyVar(method_type_var, method_env, region);
                         break :blk try self.instantiateVar(copied_var, env, .{ .explicit = region });
                     };
+                    self.evidence_target_site = null;
 
                     const constraint_fn = constraint_fn_resolved.unwrapFunc() orelse {
                         _ = try self.unifyInContext(method_var, constraint.fn_var, env, .{
@@ -17526,17 +17961,9 @@ fn checkStaticDispatchConstraints(self: *Self, env: *Env, is_numeric_default_pas
                                 is_numeric_default_pass,
                             );
                         }
-                    } else if (constraint.fn_name.eql(self.cir.idents.encode_to)) {
+                    } else if (constraint.fn_name.eql(self.cir.idents.encoder_for)) {
                         const region = self.getRegionAt(deferred_constraint.var_);
-                        if (try self.typeSupportsDerivedEncode(dispatcher_content.structure, env, region)) {
-                            try self.satisfyImplicitEncodeToConstraint(
-                                deferred_constraint.var_,
-                                constraint,
-                                constraint.fn_var,
-                                env,
-                                region,
-                            );
-                        } else {
+                        const encoding_var = self.encoderForConstraintEncodingVar(constraint) orelse {
                             try self.reportConstraintError(
                                 deferred_constraint.var_,
                                 constraint,
@@ -17544,6 +17971,40 @@ fn checkStaticDispatchConstraints(self: *Self, env: *Env, is_numeric_default_pas
                                 env,
                                 is_numeric_default_pass,
                             );
+                            continue;
+                        };
+                        switch (try self.typeSupportsDerivedEncode(dispatcher_content.structure, encoding_var, env, region)) {
+                            .supported => {
+                                try self.satisfyImplicitEncoderForConstraint(
+                                    deferred_constraint.var_,
+                                    constraint,
+                                    constraint.fn_var,
+                                    env,
+                                    region,
+                                );
+                            },
+                            .unresolved => {
+                                if (!is_numeric_default_pass or try self.deferredEncodeHasPendingOpenLiteral(deferred_constraint, env)) {
+                                    try self.scratch_deferred_static_dispatch_constraints.append(deferred_constraint);
+                                    break :dispatch_resolution;
+                                }
+                                try self.reportConstraintError(
+                                    deferred_constraint.var_,
+                                    constraint,
+                                    .not_nominal,
+                                    env,
+                                    is_numeric_default_pass,
+                                );
+                            },
+                            .unsupported => {
+                                try self.reportConstraintError(
+                                    deferred_constraint.var_,
+                                    constraint,
+                                    .not_nominal,
+                                    env,
+                                    is_numeric_default_pass,
+                                );
+                            },
                         }
                     } else {
                         if (try self.tryResolveStructuralRecordFieldDispatch(
@@ -17555,7 +18016,7 @@ fn checkStaticDispatchConstraints(self: *Self, env: *Env, is_numeric_default_pas
                         }
 
                         // Structural types (other than is_eq, to_hash, parser_for, and
-                        // encode_to) cannot have methods called on them. The user must
+                        // encoder_for) cannot have methods called on them. The user must
                         // explicitly wrap the value in a nominal type.
                         try self.reportConstraintError(
                             deferred_constraint.var_,
@@ -18201,6 +18662,16 @@ fn typeSupportsJsonObjectKey(self: *Self, flat_type: types_mod.FlatType) std.mem
     };
 }
 
+fn varSupportsJsonObjectKeyForDerivedEncode(self: *Self, var_: Var) std.mem.Allocator.Error!DerivedSupport {
+    return switch (self.types.resolveVar(var_).desc.content) {
+        .structure => |structure| derivedSupportFromBool(try self.typeSupportsJsonObjectKey(structure)),
+        .alias => |alias| try self.varSupportsJsonObjectKeyForDerivedEncode(self.types.getAliasBackingVar(alias)),
+        .err => .supported,
+        .flex => .unresolved,
+        .rigid => .unsupported,
+    };
+}
+
 fn tagUnionIsClosedAndUnit(self: *Self, tag_union: types_mod.TagUnion) std.mem.Allocator.Error!bool {
     const tags = self.types.getTagsSlice(tag_union.tags);
     if (tags.items(.name).len == 0) return false;
@@ -18435,132 +18906,167 @@ fn nominalSupportsDerivedParseField(
     return (try self.builtinTryInfoFromNominal(nominal)) != null;
 }
 
+const DerivedSupport = enum {
+    supported,
+    unsupported,
+    unresolved,
+};
+
+fn derivedSupportFromBool(value: bool) DerivedSupport {
+    return if (value) .supported else .unsupported;
+}
+
+fn combineDerivedSupport(a: DerivedSupport, b: DerivedSupport) DerivedSupport {
+    if (a == .unsupported or b == .unsupported) return .unsupported;
+    if (a == .unresolved or b == .unresolved) return .unresolved;
+    return .supported;
+}
+
 fn typeSupportsDerivedEncode(
     self: *Self,
     flat_type: types_mod.FlatType,
+    encoding_var: Var,
     env: *Env,
     region: Region,
-) Allocator.Error!bool {
+) Allocator.Error!DerivedSupport {
     return switch (flat_type) {
         .record => |record| blk: {
             const fields_slice = self.types.getRecordFieldsSlice(record.fields);
+            var support: DerivedSupport = .supported;
             for (fields_slice.items(.var_)) |field_var| {
-                if (!try self.varSupportsDerivedEncodeRecordField(field_var, env, region)) break :blk false;
+                support = combineDerivedSupport(support, try self.varSupportsDerivedEncodeRecordField(field_var, encoding_var, env, region));
+                if (support == .unsupported) break;
             }
-            break :blk true;
+            break :blk support;
         },
         .record_unbound => |fields| blk: {
             const fields_slice = self.types.getRecordFieldsSlice(fields);
+            var support: DerivedSupport = .supported;
             for (fields_slice.items(.var_)) |field_var| {
-                if (!try self.varSupportsDerivedEncodeRecordField(field_var, env, region)) break :blk false;
+                support = combineDerivedSupport(support, try self.varSupportsDerivedEncodeRecordField(field_var, encoding_var, env, region));
+                if (support == .unsupported) break;
             }
-            break :blk true;
+            break :blk support;
         },
         .tag_union => |tag_union| blk: {
-            if (!try self.derivedParseTagUnionHasAnyTag(tag_union)) break :blk false;
+            if (!try self.derivedParseTagUnionHasAnyTag(tag_union)) break :blk .unsupported;
             const tags_slice = self.types.getTagsSlice(tag_union.tags);
+            var support: DerivedSupport = .supported;
             for (tags_slice.items(.args)) |tag_args_range| {
                 const tag_args = self.types.sliceVars(tag_args_range);
                 for (tag_args) |tag_arg| {
-                    if (!try self.varSupportsDerivedEncodeShape(tag_arg, env, region)) break :blk false;
+                    support = combineDerivedSupport(support, try self.varSupportsDerivedEncodeShape(tag_arg, encoding_var, env, region));
+                    if (support == .unsupported) break :blk .unsupported;
                 }
             }
-            break :blk try self.varSupportsDerivedEncodeTagExt(tag_union.ext, env, region);
+            break :blk combineDerivedSupport(support, try self.varSupportsDerivedEncodeTagExt(tag_union.ext, encoding_var, env, region));
         },
         .tuple => |tuple| blk: {
             const elems = try self.gpa.dupe(Var, self.types.sliceVars(tuple.elems));
             defer self.gpa.free(elems);
+            var support: DerivedSupport = .supported;
             for (elems) |elem_var| {
-                if (!try self.varSupportsDerivedEncodeShape(elem_var, env, region)) break :blk false;
+                support = combineDerivedSupport(support, try self.varSupportsDerivedEncodeShape(elem_var, encoding_var, env, region));
+                if (support == .unsupported) break;
             }
-            break :blk true;
+            break :blk support;
         },
-        .empty_record => true,
-        else => false,
+        .empty_record => .supported,
+        else => .unsupported,
     };
 }
 
 fn varSupportsDerivedEncodeRecordField(
     self: *Self,
     var_: Var,
+    encoding_var: Var,
     env: *Env,
     region: Region,
-) Allocator.Error!bool {
-    if (try self.optionalEncodePayloadVar(var_)) |payload_var| {
-        return try self.varSupportsDerivedEncodeShape(payload_var, env, region);
+) Allocator.Error!DerivedSupport {
+    if (try self.varIsBuiltinJsonEncoding(encoding_var)) {
+        if (try self.optionalEncodePayloadVar(var_)) |payload_var| {
+            return try self.varSupportsDerivedEncodeShape(payload_var, encoding_var, env, region);
+        }
     }
-    return try self.varSupportsDerivedEncodeShape(var_, env, region);
+    return try self.varSupportsDerivedEncodeShape(var_, encoding_var, env, region);
 }
 
 fn varSupportsDerivedEncodeShape(
     self: *Self,
     var_: Var,
+    encoding_var: Var,
     env: *Env,
     region: Region,
-) Allocator.Error!bool {
+) Allocator.Error!DerivedSupport {
     return switch (self.types.resolveVar(var_).desc.content) {
         .structure => |structure| switch (structure) {
-            .nominal_type => |nominal| try self.nominalSupportsDerivedEncodeShape(nominal, env, region),
-            .record => |record| try self.typeSupportsDerivedEncode(.{ .record = record }, env, region),
-            .record_unbound => |fields| try self.typeSupportsDerivedEncode(.{ .record_unbound = fields }, env, region),
-            .tag_union => |tag_union| try self.typeSupportsDerivedEncode(.{ .tag_union = tag_union }, env, region),
-            .tuple => |tuple| try self.typeSupportsDerivedEncode(.{ .tuple = tuple }, env, region),
-            .empty_record => true,
-            .empty_tag_union => false,
-            else => false,
+            .nominal_type => |nominal| try self.nominalSupportsDerivedEncodeShape(nominal, encoding_var, env, region),
+            .record => |record| try self.typeSupportsDerivedEncode(.{ .record = record }, encoding_var, env, region),
+            .record_unbound => |fields| try self.typeSupportsDerivedEncode(.{ .record_unbound = fields }, encoding_var, env, region),
+            .tag_union => |tag_union| try self.typeSupportsDerivedEncode(.{ .tag_union = tag_union }, encoding_var, env, region),
+            .tuple => |tuple| try self.typeSupportsDerivedEncode(.{ .tuple = tuple }, encoding_var, env, region),
+            .empty_record => .supported,
+            .empty_tag_union => .unsupported,
+            else => .unsupported,
         },
-        .alias => |alias| try self.varSupportsDerivedEncodeShape(self.types.getAliasBackingVar(alias), env, region),
-        .err => true,
-        .flex, .rigid => false,
+        .alias => |alias| try self.varSupportsDerivedEncodeShape(self.types.getAliasBackingVar(alias), encoding_var, env, region),
+        .err => .supported,
+        .flex => .unresolved,
+        .rigid => .unsupported,
     };
 }
 
 fn varSupportsDerivedEncodeTagExt(
     self: *Self,
     var_: Var,
+    encoding_var: Var,
     env: *Env,
     region: Region,
-) Allocator.Error!bool {
+) Allocator.Error!DerivedSupport {
     return switch (self.types.resolveVar(var_).desc.content) {
         .structure => |structure| switch (structure) {
-            .empty_tag_union => true,
-            .tag_union => |tag_union| try self.typeSupportsDerivedEncode(.{ .tag_union = tag_union }, env, region),
-            else => false,
+            .empty_tag_union => .supported,
+            .tag_union => |tag_union| try self.typeSupportsDerivedEncode(.{ .tag_union = tag_union }, encoding_var, env, region),
+            else => .unsupported,
         },
-        .alias => |alias| try self.varSupportsDerivedEncodeTagExt(self.types.getAliasBackingVar(alias), env, region),
-        .err => true,
-        .flex, .rigid => false,
+        .alias => |alias| try self.varSupportsDerivedEncodeTagExt(self.types.getAliasBackingVar(alias), encoding_var, env, region),
+        .err => .supported,
+        .flex => .supported,
+        .rigid => .unsupported,
     };
 }
 
 fn nominalSupportsDerivedEncodeShape(
     self: *Self,
     nominal: types_mod.NominalType,
+    encoding_var: Var,
     env: *Env,
     region: Region,
-) Allocator.Error!bool {
-    if (self.nominalIsBuiltinBoolType(nominal)) return true;
-    if (self.nominalIsBuiltinStrType(nominal)) return true;
-    if (self.nominalIsBuiltinNumberType(nominal)) return true;
+) Allocator.Error!DerivedSupport {
+    if (self.nominalIsBuiltinBoolType(nominal)) return .supported;
+    if (self.nominalIsBuiltinStrType(nominal)) return .supported;
+    if (self.nominalIsBuiltinNumberType(nominal)) return .supported;
     if (self.nominalListPayloadVar(nominal)) |payload_var| {
-        return try self.varSupportsDerivedEncodeShape(payload_var, env, region);
+        return try self.varSupportsDerivedEncodeShape(payload_var, encoding_var, env, region);
     }
     if (self.nominalBoxPayloadVar(nominal)) |payload_var| {
-        return try self.varSupportsDerivedEncodeShape(payload_var, env, region);
+        return try self.varSupportsDerivedEncodeShape(payload_var, encoding_var, env, region);
     }
     if (self.nominalSetPayloadVar(nominal)) |payload_var| {
-        return try self.varSupportsDerivedEncodeShape(payload_var, env, region);
+        return try self.varSupportsDerivedEncodeShape(payload_var, encoding_var, env, region);
     }
     if (self.nominalDictKeyValueVars(nominal)) |args| {
-        return try self.varSupportsJsonObjectKey(args.key) and
-            try self.varSupportsDerivedEncodeShape(args.value, env, region);
+        return combineDerivedSupport(
+            try self.varSupportsJsonObjectKeyForDerivedEncode(args.key),
+            try self.varSupportsDerivedEncodeShape(args.value, encoding_var, env, region),
+        );
     }
     if (self.nominalIsBuiltinTryType(nominal)) {
-        const info = try self.jsonTryInfoFromNominal(nominal) orelse return false;
-        return !info.has_missing;
+        const info = try self.jsonTryInfoFromNominal(nominal) orelse return .unsupported;
+        return derivedSupportFromBool(!info.has_missing);
     }
-    if (nominal.originIsBuiltin()) return false;
-    return true;
+    if (nominal.originIsBuiltin()) return .unsupported;
+    return .supported;
 }
 
 fn optionalEncodePayloadVar(
@@ -18611,6 +19117,30 @@ fn jsonTryInfoFromNominal(
         .has_missing = err_info.has_missing,
         .has_null = err_info.has_null,
     };
+}
+
+fn varIsBuiltinJsonEncoding(self: *Self, var_: Var) Allocator.Error!bool {
+    return switch (self.types.resolveVar(var_).desc.content) {
+        .structure => |structure| switch (structure) {
+            .nominal_type => |nominal| self.nominalIsBuiltinJsonEncodingType(nominal),
+            else => false,
+        },
+        .alias => |alias| try self.varIsBuiltinJsonEncoding(self.types.getAliasBackingVar(alias)),
+        .err => true,
+        .flex, .rigid => false,
+    };
+}
+
+fn nominalIsBuiltinJsonEncodingType(self: *const Self, nominal_type: types_mod.NominalType) bool {
+    if (!nominal_type.originIsBuiltin()) return false;
+    if (nominal_type.sourceDeclOptional()) |source_decl| {
+        if (self.builtin_ctx.builtin_indices) |indices| {
+            if (source_decl == @intFromEnum(indices.json_encoding_type)) return true;
+        }
+    }
+
+    const ident_text = self.cir.getIdentStoreConst().getText(nominal_type.ident.ident_idx);
+    return Ident.textEql(ident_text, "JsonEncoding") or Ident.textEql(ident_text, "Builtin.Encoding.JsonEncoding");
 }
 
 fn jsonTryErrInfo(
@@ -19023,7 +19553,7 @@ fn satisfyImplicitParserConstraint(
     }
 }
 
-fn satisfyImplicitEncodeToConstraint(
+fn satisfyImplicitEncoderForConstraint(
     self: *Self,
     dispatcher_var: Var,
     constraint: StaticDispatchConstraint,
@@ -19038,18 +19568,12 @@ fn satisfyImplicitEncodeToConstraint(
     };
 
     const args = self.types.sliceVars(resolved_func.args);
-    if (args.len != 2) {
+    if (args.len != 1) {
         try self.reportConstraintError(dispatcher_var, constraint, .not_nominal, env, false);
         return;
     }
 
-    const value_var = args[0];
-    const encoding_var = args[1];
-    const value_result = try self.unifyInContext(dispatcher_var, value_var, env, .none);
-    if (value_result.isProblem()) {
-        try self.markConstraintFunctionAsError(constraint, env);
-        return;
-    }
+    const encoding_var = args[0];
 
     const resolved_runtime_fn = self.types.resolveVar(resolved_func.ret);
     const runtime_func = resolved_runtime_fn.desc.content.unwrapFunc() orelse {
@@ -19057,12 +19581,19 @@ fn satisfyImplicitEncodeToConstraint(
         return;
     };
     const runtime_args = self.types.sliceVars(runtime_func.args);
-    if (runtime_args.len != 1) {
+    if (runtime_args.len != 2) {
         try self.reportConstraintError(dispatcher_var, constraint, .not_nominal, env, false);
         return;
     }
 
-    const state_var = runtime_args[0];
+    const value_var = runtime_args[0];
+    const state_var = runtime_args[1];
+    const value_result = try self.unifyInContext(dispatcher_var, value_var, env, .none);
+    if (value_result.isProblem()) {
+        try self.markConstraintFunctionAsError(constraint, env);
+        return;
+    }
+
     const err_var = try self.fresh(env, region);
     const encode_result_var = try self.freshFromContent(try self.mkTryContent(state_var, err_var, env), env, region);
     const ret_result = try self.unifyInContext(encode_result_var, runtime_func.ret, env, .none);
@@ -19084,7 +19615,7 @@ fn satisfyImplicitEncodeToConstraint(
 
 fn isGeneratedStructuralCodecAnnotation(self: *const Self, ident: Ident.Idx, annotation_idx: CIR.Annotation.Idx) bool {
     const text = self.cir.getIdent(ident);
-    if (!Ident.textEndsWith(text, ".parser_for") and !Ident.textEndsWith(text, ".encode_to")) return false;
+    if (!Ident.textEndsWith(text, ".parser_for") and !Ident.textEndsWith(text, ".encoder_for")) return false;
     return self.cir.store.getTypeAnno(self.cir.store.getAnnotation(annotation_idx).anno) == .underscore;
 }
 
@@ -19322,12 +19853,9 @@ const BuiltinEncodeSpecDecl = enum {
     dec,
     f32,
     f64,
-    begin_record,
-    record_field,
-    end_record,
-    begin_array,
-    array_element,
-    end_array,
+    record,
+    tuple,
+    list,
 };
 
 fn parseFormatMethodName(self: *Self, decl: BuiltinParseSpecDecl) Allocator.Error!Ident.Idx {
@@ -19486,12 +20014,9 @@ fn encodeFormatMethodName(self: *Self, decl: BuiltinEncodeSpecDecl) Allocator.Er
         .dec => "encode_dec",
         .f32 => "encode_f32",
         .f64 => "encode_f64",
-        .begin_record => "begin_record",
-        .record_field => "encode_record_field",
-        .end_record => "end_record",
-        .begin_array => "begin_array",
-        .array_element => "encode_array_element",
-        .end_array => "end_array",
+        .record => "encode_record",
+        .tuple => "encode_tuple",
+        .list => "encode_list",
     };
     return try @constCast(self.cir).insertIdent(base.Ident.for_text(text));
 }
@@ -19526,22 +20051,23 @@ fn parseFormatMethodVarForEncoding(
     return switch (resolved.desc.content) {
         .structure => |structure| switch (structure) {
             .nominal_type => |nominal| blk: {
-                const original_env, const is_this_module = self.ownerEnvForOriginModule(
+                const original_env, _ = self.ownerEnvForOriginModule(
                     nominal.origin_module,
                     nominal.sourceDeclOptional(),
                     nominal.originIsBuiltin(),
                     "parser format method",
                 );
-                const binding = original_env.lookupMethodBindingFromEnvAndDeclConst(
-                    self.cir,
+                const method_lookup = self.lookupStaticDispatchMethodBinding(
+                    original_env,
                     nominal.sourceDeclOptional(),
+                    self.cir,
                     method_name,
                 ) orelse break :blk null;
                 break :blk .{
                     .var_ = (try self.methodVarFromOriginalEnv(
-                        original_env,
-                        is_this_module,
-                        binding.type_node_idx,
+                        method_lookup.env,
+                        method_lookup.is_this_module,
+                        method_lookup.binding.type_node_idx,
                         nominal.ident.ident_idx,
                         env,
                         region,
@@ -19552,22 +20078,23 @@ fn parseFormatMethodVarForEncoding(
             else => null,
         },
         .alias => |alias| blk: {
-            const original_env, const is_this_module = self.ownerEnvForOriginModule(
+            const original_env, _ = self.ownerEnvForOriginModule(
                 alias.origin_module,
                 alias.source_decl.toOptional(),
                 alias.source_decl.originIsBuiltin(),
                 "parser format method",
             );
-            const binding = original_env.lookupMethodBindingFromTwoEnvsAndDeclConst(
+            const method_lookup = self.lookupStaticDispatchMethodBinding(
+                original_env,
                 alias.source_decl.toOptional(),
                 self.cir,
                 method_name,
             ) orelse break :blk null;
             break :blk .{
                 .var_ = (try self.methodVarFromOriginalEnv(
-                    original_env,
-                    is_this_module,
-                    binding.type_node_idx,
+                    method_lookup.env,
+                    method_lookup.is_this_module,
+                    method_lookup.binding.type_node_idx,
                     alias.ident.ident_idx,
                     env,
                     region,
@@ -19664,10 +20191,21 @@ fn validateEncodeFormatMethod(
     const expected_ret = try self.freshFromContent(try self.mkTryContent(state_var, err_var, env), env, region);
     const expected_fn = switch (spec_decl) {
         .bool, .str, .u8, .i8, .u16, .i16, .u32, .i32, .u64, .i64, .u128, .i128, .dec, .f32, .f64 => try self.freshFromContent(try self.types.mkFuncUnbound(&.{ value_var, state_var }, expected_ret), env, region),
-        .null, .begin_record, .end_record, .begin_array, .array_element, .end_array => try self.freshFromContent(try self.types.mkFuncUnbound(&.{state_var}, expected_ret), env, region),
-        .record_field => blk: {
+        .null => try self.freshFromContent(try self.types.mkFuncUnbound(&.{state_var}, expected_ret), env, region),
+        .record => blk: {
             const str_var = try self.freshStr(env, region);
-            break :blk try self.freshFromContent(try self.types.mkFuncUnbound(&.{ str_var, state_var }, expected_ret), env, region);
+            const count_var = try self.freshU64(env, region);
+            const value_writer_var = try self.freshFromContent(try self.types.mkFuncUnbound(&.{state_var}, expected_ret), env, region);
+            const field_writer_var = try self.freshFromContent(try self.types.mkFuncUnbound(&.{ state_var, str_var, value_writer_var }, expected_ret), env, region);
+            const write_fields_var = try self.freshFromContent(try self.types.mkFuncUnbound(&.{ state_var, field_writer_var }, expected_ret), env, region);
+            break :blk try self.freshFromContent(try self.types.mkFuncUnbound(&.{ state_var, count_var, write_fields_var }, expected_ret), env, region);
+        },
+        .tuple, .list => blk: {
+            const count_var = try self.freshU64(env, region);
+            const value_writer_var = try self.freshFromContent(try self.types.mkFuncUnbound(&.{state_var}, expected_ret), env, region);
+            const element_writer_var = try self.freshFromContent(try self.types.mkFuncUnbound(&.{ state_var, value_writer_var }, expected_ret), env, region);
+            const write_elements_var = try self.freshFromContent(try self.types.mkFuncUnbound(&.{ state_var, element_writer_var }, expected_ret), env, region);
+            break :blk try self.freshFromContent(try self.types.mkFuncUnbound(&.{ state_var, count_var, write_elements_var }, expected_ret), env, region);
         },
     };
     const result = try self.unifyInContext(method.var_, expected_fn, env, .{
@@ -20200,28 +20738,29 @@ fn validateDerivedParseNominal(
         return try self.validateDerivedParseVar(try_info.ok_var, encoding_var, state_var, err_var, constraint, env, region, visited, .shape);
     }
 
-    const original_env, const is_this_module = self.ownerEnvForOriginModule(
+    const original_env, _ = self.ownerEnvForOriginModule(
         nominal.origin_module,
         nominal.sourceDeclOptional(),
         nominal.originIsBuiltin(),
         "parser nominal field",
     );
-    const method_binding = original_env.lookupMethodBindingFromEnvAndDeclConst(
-        self.cir,
+    const method_lookup = self.lookupStaticDispatchMethodBinding(
+        original_env,
         nominal.sourceDeclOptional(),
+        self.cir,
         self.cir.idents.parser_for,
     ) orelse {
         return try self.reportDerivedParseMissingMethod(nominal_var, self.cir.idents.parser_for, constraint, env);
     };
 
-    const method_type_var: Var = ModuleEnv.varFrom(method_binding.type_node_idx);
-    const method_var = if (is_this_module) blk: {
+    const method_type_var: Var = ModuleEnv.varFrom(method_lookup.binding.type_node_idx);
+    const method_var = if (method_lookup.is_this_module) blk: {
         if (self.types.resolveVar(method_type_var).desc.rank == .generalized) {
             break :blk try self.instantiateVar(method_type_var, env, .use_last_var);
         }
         break :blk method_type_var;
     } else blk: {
-        const copied_var = try self.copyVar(method_type_var, original_env, region);
+        const copied_var = try self.copyVar(method_type_var, method_lookup.env, region);
         break :blk try self.instantiateVar(copied_var, env, .{ .explicit = region });
     };
 
@@ -20304,23 +20843,27 @@ fn validateDerivedEncodeRecord(
     const field_vars = try self.gpa.dupe(Var, fields.items(.var_));
     defer self.gpa.free(field_vars);
 
+    const json_object_optional_fields = try self.varIsBuiltinJsonEncoding(encoding_var);
     for (field_vars) |field_var| {
-        if (try self.jsonTryInfoForVar(field_var)) |info| {
-            if (info.has_null) {
-                switch (try self.validateEncodeFormatMethod(encoding_var, state_var, state_var, .null, err_var, constraint, env, region)) {
+        if (json_object_optional_fields) {
+            if (try self.jsonTryInfoForVar(field_var)) |info| {
+                if (info.has_null) {
+                    switch (try self.validateEncodeFormatMethod(encoding_var, state_var, state_var, .null, err_var, constraint, env, region)) {
+                        .ok => {},
+                        .unsupported, .reported_error => |result| return result,
+                    }
+                }
+                switch (try self.validateDerivedEncodeVar(info.ok_var, encoding_var, state_var, err_var, constraint, env, region, visited)) {
                     .ok => {},
                     .unsupported, .reported_error => |result| return result,
                 }
+                continue;
             }
-            switch (try self.validateDerivedEncodeVar(info.ok_var, encoding_var, state_var, err_var, constraint, env, region, visited)) {
-                .ok => {},
-                .unsupported, .reported_error => |result| return result,
-            }
-        } else {
-            switch (try self.validateDerivedEncodeVar(field_var, encoding_var, state_var, err_var, constraint, env, region, visited)) {
-                .ok => {},
-                .unsupported, .reported_error => |result| return result,
-            }
+        }
+
+        switch (try self.validateDerivedEncodeVar(field_var, encoding_var, state_var, err_var, constraint, env, region, visited)) {
+            .ok => {},
+            .unsupported, .reported_error => |result| return result,
         }
     }
     return .ok;
@@ -20337,7 +20880,7 @@ fn validateDerivedEncodeTuple(
     region: Region,
     visited: *std.AutoHashMap(Var, void),
 ) Allocator.Error!DerivedParseValidation {
-    switch (try self.validateDerivedEncodeArrayMethods(encoding_var, state_var, err_var, constraint, env, region)) {
+    switch (try self.validateDerivedEncodeTupleMethods(encoding_var, state_var, err_var, constraint, env, region)) {
         .ok => {},
         .unsupported, .reported_error => |result| return result,
     }
@@ -20417,7 +20960,12 @@ fn validateDerivedEncodeTagExt(
         },
         .alias => |alias| try self.validateDerivedEncodeTagExt(self.types.getAliasBackingVar(alias), encoding_var, state_var, err_var, constraint, env, region, visited),
         .err => .ok,
-        .flex, .rigid => .unsupported,
+        .flex => blk: {
+            const empty_tu_var = try self.freshFromContent(.{ .structure = .empty_tag_union }, env, region);
+            const result = try self.unify(ext_var, empty_tu_var, env);
+            break :blk if (result.isOk()) .ok else .reported_error;
+        },
+        .rigid => .unsupported,
     };
 }
 
@@ -20445,21 +20993,13 @@ fn validateDerivedEncodeTagUnionMethods(
         }
     }
     if (needs.has_payload_tag) {
-        switch (try self.validateEncodeFormatMethod(encoding_var, state_var, state_var, .begin_record, err_var, constraint, env, region)) {
-            .ok => {},
-            .unsupported, .reported_error => |result| return result,
-        }
-        switch (try self.validateEncodeFormatMethod(encoding_var, state_var, state_var, .record_field, err_var, constraint, env, region)) {
-            .ok => {},
-            .unsupported, .reported_error => |result| return result,
-        }
-        switch (try self.validateEncodeFormatMethod(encoding_var, state_var, state_var, .end_record, err_var, constraint, env, region)) {
+        switch (try self.validateEncodeFormatMethod(encoding_var, state_var, state_var, .record, err_var, constraint, env, region)) {
             .ok => {},
             .unsupported, .reported_error => |result| return result,
         }
     }
     if (needs.has_multi_payload_tag) {
-        switch (try self.validateDerivedEncodeArrayMethods(encoding_var, state_var, err_var, constraint, env, region)) {
+        switch (try self.validateDerivedEncodeTupleMethods(encoding_var, state_var, err_var, constraint, env, region)) {
             .ok => {},
             .unsupported, .reported_error => |result| return result,
         }
@@ -20502,7 +21042,7 @@ fn validateDerivedEncodeRecordMethods(
     region: Region,
     has_fields: bool,
 ) Allocator.Error!DerivedParseValidation {
-    switch (try self.validateEncodeFormatMethod(encoding_var, state_var, state_var, .begin_record, err_var, constraint, env, region)) {
+    switch (try self.validateEncodeFormatMethod(encoding_var, state_var, state_var, .record, err_var, constraint, env, region)) {
         .ok => {},
         .unsupported, .reported_error => |result| return result,
     }
@@ -20511,14 +21051,6 @@ fn validateDerivedEncodeRecordMethods(
             .ok => {},
             .unsupported, .reported_error => |result| return result,
         }
-        switch (try self.validateEncodeFormatMethod(encoding_var, state_var, state_var, .record_field, err_var, constraint, env, region)) {
-            .ok => {},
-            .unsupported, .reported_error => |result| return result,
-        }
-    }
-    switch (try self.validateEncodeFormatMethod(encoding_var, state_var, state_var, .end_record, err_var, constraint, env, region)) {
-        .ok => {},
-        .unsupported, .reported_error => |result| return result,
     }
     return .ok;
 }
@@ -20532,22 +21064,14 @@ fn validateDerivedEncodeDictMethods(
     env: *Env,
     region: Region,
 ) Allocator.Error!DerivedParseValidation {
-    switch (try self.validateEncodeFormatMethod(encoding_var, state_var, state_var, .begin_record, err_var, constraint, env, region)) {
-        .ok => {},
-        .unsupported, .reported_error => |result| return result,
-    }
-    switch (try self.validateEncodeFormatMethod(encoding_var, state_var, state_var, .record_field, err_var, constraint, env, region)) {
-        .ok => {},
-        .unsupported, .reported_error => |result| return result,
-    }
-    switch (try self.validateEncodeFormatMethod(encoding_var, state_var, state_var, .end_record, err_var, constraint, env, region)) {
+    switch (try self.validateEncodeFormatMethod(encoding_var, state_var, state_var, .record, err_var, constraint, env, region)) {
         .ok => {},
         .unsupported, .reported_error => |result| return result,
     }
     return .ok;
 }
 
-fn validateDerivedEncodeArrayMethods(
+fn validateDerivedEncodeTupleMethods(
     self: *Self,
     encoding_var: Var,
     state_var: Var,
@@ -20556,15 +21080,23 @@ fn validateDerivedEncodeArrayMethods(
     env: *Env,
     region: Region,
 ) Allocator.Error!DerivedParseValidation {
-    switch (try self.validateEncodeFormatMethod(encoding_var, state_var, state_var, .begin_array, err_var, constraint, env, region)) {
+    switch (try self.validateEncodeFormatMethod(encoding_var, state_var, state_var, .tuple, err_var, constraint, env, region)) {
         .ok => {},
         .unsupported, .reported_error => |result| return result,
     }
-    switch (try self.validateEncodeFormatMethod(encoding_var, state_var, state_var, .array_element, err_var, constraint, env, region)) {
-        .ok => {},
-        .unsupported, .reported_error => |result| return result,
-    }
-    switch (try self.validateEncodeFormatMethod(encoding_var, state_var, state_var, .end_array, err_var, constraint, env, region)) {
+    return .ok;
+}
+
+fn validateDerivedEncodeListMethods(
+    self: *Self,
+    encoding_var: Var,
+    state_var: Var,
+    err_var: Var,
+    constraint: StaticDispatchConstraint,
+    env: *Env,
+    region: Region,
+) Allocator.Error!DerivedParseValidation {
+    switch (try self.validateEncodeFormatMethod(encoding_var, state_var, state_var, .list, err_var, constraint, env, region)) {
         .ok => {},
         .unsupported, .reported_error => |result| return result,
     }
@@ -20593,7 +21125,7 @@ fn validateDerivedEncodeNominal(
         return try self.validateEncodeFormatMethod(encoding_var, state_var, nominal_var, encodeSpecDeclForNumKind(num_kind), err_var, constraint, env, region);
     }
     if (self.nominalListPayloadVar(nominal)) |payload_var| {
-        switch (try self.validateDerivedEncodeArrayMethods(encoding_var, state_var, err_var, constraint, env, region)) {
+        switch (try self.validateDerivedEncodeListMethods(encoding_var, state_var, err_var, constraint, env, region)) {
             .ok => {},
             .unsupported, .reported_error => |result| return result,
         }
@@ -20603,7 +21135,7 @@ fn validateDerivedEncodeNominal(
         return try self.validateDerivedEncodeVar(payload_var, encoding_var, state_var, err_var, constraint, env, region, visited);
     }
     if (self.nominalSetPayloadVar(nominal)) |payload_var| {
-        switch (try self.validateDerivedEncodeArrayMethods(encoding_var, state_var, err_var, constraint, env, region)) {
+        switch (try self.validateDerivedEncodeListMethods(encoding_var, state_var, err_var, constraint, env, region)) {
             .ok => {},
             .unsupported, .reported_error => |result| return result,
         }
@@ -20633,34 +21165,35 @@ fn validateDerivedEncodeNominal(
         return try self.validateDerivedEncodeVar(info.ok_var, encoding_var, state_var, err_var, constraint, env, region, visited);
     }
 
-    const original_env, const is_this_module = self.ownerEnvForOriginModule(
+    const original_env, _ = self.ownerEnvForOriginModule(
         nominal.origin_module,
         nominal.sourceDeclOptional(),
         nominal.originIsBuiltin(),
-        "encode_to nominal field",
+        "encoder_for nominal field",
     );
-    const method_binding = original_env.lookupMethodBindingFromEnvAndDeclConst(
-        self.cir,
+    const method_lookup = self.lookupStaticDispatchMethodBinding(
+        original_env,
         nominal.sourceDeclOptional(),
-        self.cir.idents.encode_to,
+        self.cir,
+        self.cir.idents.encoder_for,
     ) orelse {
-        return try self.reportDerivedParseMissingMethod(nominal_var, self.cir.idents.encode_to, constraint, env);
+        return try self.reportDerivedParseMissingMethod(nominal_var, self.cir.idents.encoder_for, constraint, env);
     };
 
-    const method_type_var: Var = ModuleEnv.varFrom(method_binding.type_node_idx);
-    const method_var = if (is_this_module) blk: {
+    const method_type_var: Var = ModuleEnv.varFrom(method_lookup.binding.type_node_idx);
+    const method_var = if (method_lookup.is_this_module) blk: {
         if (self.types.resolveVar(method_type_var).desc.rank == .generalized) {
             break :blk try self.instantiateVar(method_type_var, env, .use_last_var);
         }
         break :blk method_type_var;
     } else blk: {
-        const copied_var = try self.copyVar(method_type_var, original_env, region);
+        const copied_var = try self.copyVar(method_type_var, method_lookup.env, region);
         break :blk try self.instantiateVar(copied_var, env, .{ .explicit = region });
     };
 
     const expected_ret = try self.freshFromContent(try self.mkTryContent(state_var, err_var, env), env, region);
-    const expected_runtime_fn = try self.freshFromContent(try self.types.mkFuncUnbound(&.{state_var}, expected_ret), env, region);
-    const expected_fn = try self.freshFromContent(try self.types.mkFuncUnbound(&.{ nominal_var, encoding_var }, expected_runtime_fn), env, region);
+    const expected_runtime_fn = try self.freshFromContent(try self.types.mkFuncUnbound(&.{ nominal_var, state_var }, expected_ret), env, region);
+    const expected_fn = try self.freshFromContent(try self.types.mkFuncUnbound(&.{encoding_var}, expected_runtime_fn), env, region);
     const result = try self.unifyInContext(method_var, expected_fn, env, .{
         .method_type = .{
             .constraint_var = nominal_var,

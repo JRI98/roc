@@ -15,11 +15,14 @@ const layout_mod = @import("layout");
 const lir = @import("lir");
 const LIR = lir.LIR;
 const LirStore = lir.LirStore;
+const CheckedArithmetic = lir.CheckedArithmetic;
 const lir_value = @import("value.zig");
+const backend = @import("backend");
 const host_trampoline = @import("host_trampoline.zig");
 const builtins = @import("builtins");
 const sljmp = @import("sljmp");
 const build_options = @import("build_options");
+const RocTarget = @import("roc_target").RocTarget;
 const is_freestanding = builtin.target.os.tag == .freestanding;
 
 /// Comptime-gated tracing for the interpreter eval loop.
@@ -295,6 +298,7 @@ pub const Interpreter = struct {
     /// RocOps environment for builtin dispatch.
     roc_env: *InterpreterRocEnv,
     roc_ops: RocOps,
+    static_strings: backend.StaticStringData.Table,
     frame_plans: []FramePlan,
     rc_presence: []RcPresence,
     rc_plans: std.AutoHashMapUnmanaged(u64, layout_mod.RcHelperPlan) = .{},
@@ -507,6 +511,13 @@ pub const Interpreter = struct {
 
         const roc_env = try allocator.create(InterpreterRocEnv);
         roc_env.* = InterpreterRocEnv.init(allocator, caller_roc_ops);
+        errdefer {
+            roc_env.deinit();
+            allocator.destroy(roc_env);
+        }
+
+        var static_strings = try backend.StaticStringData.build(allocator, store, RocTarget.detectNative());
+        errdefer static_strings.deinit();
 
         return .{
             .allocator = allocator,
@@ -525,6 +536,7 @@ pub const Interpreter = struct {
                 .roc_crashed = &InterpreterRocEnv.rocCrashedFn,
                 .hosted_fns = caller_roc_ops.hosted_fns,
             },
+            .static_strings = static_strings,
             .frame_plans = frame_plans,
             .rc_presence = rc_presence,
             .rc_plans = rc_plans,
@@ -542,6 +554,7 @@ pub const Interpreter = struct {
         self.call_stack.deinit(self.evalAllocator());
         self.roc_env.deinit();
         self.allocator.destroy(self.roc_env);
+        self.static_strings.deinit();
         self.arena.deinit();
         self.tag_variant_plans.deinit(self.allocator);
         self.struct_field_plans.deinit(self.allocator);
@@ -734,30 +747,6 @@ pub const Interpreter = struct {
     fn comptimeExhaustivenessFailed(self: *LirInterpreter, site: LIR.ComptimeSiteId) Error {
         self.comptime_failed_site = site;
         return error.ComptimeExhaustiveness;
-    }
-
-    fn divisionByZeroMessageForLayout(self: *const LirInterpreter, layout_idx: layout_mod.Idx) []const u8 {
-        return switch (layout_idx) {
-            .u8 => "U8 division by zero",
-            .i8 => "I8 division by zero",
-            .u16 => "U16 division by zero",
-            .i16 => "I16 division by zero",
-            .u32 => "U32 division by zero",
-            .i32 => "I32 division by zero",
-            .u64 => "U64 division by zero",
-            .i64 => "I64 division by zero",
-            .u128 => "U128 division by zero",
-            .i128 => "I128 division by zero",
-            .dec => "Dec division by zero",
-            else => self.invariantFailed(
-                "LIR/interpreter invariant violated: division by zero reported for non-crashing numeric layout {d}",
-                .{@intFromEnum(layout_idx)},
-            ),
-        };
-    }
-
-    fn divisionByZero(self: *LirInterpreter, layout_idx: layout_mod.Idx) Error {
-        return self.triggerCrash(self.divisionByZeroMessageForLayout(layout_idx));
     }
 
     fn triggerCrash(self: *LirInterpreter, message: []const u8) Error {
@@ -3481,7 +3470,7 @@ pub const Interpreter = struct {
 
     fn evalStrLiteral(self: *LirInterpreter, literal: LIR.StrLiteral) Error!Value {
         return self.makeStaticRocStrLiteralView(
-            self.store.getStringLiteralBacking(literal),
+            self.staticStringBacking(literal.backing),
             literal.offset,
             literal.len,
         );
@@ -3489,7 +3478,7 @@ pub const Interpreter = struct {
 
     fn evalBytesLiteral(self: *LirInterpreter, literal: LIR.StrLiteral, target_layout: layout_mod.Idx) Error!Value {
         return self.makeStaticRocListLiteralView(
-            self.store.getStringLiteralBacking(literal),
+            self.staticStringBacking(literal.backing),
             literal.offset,
             literal.len,
             target_layout,
@@ -3497,6 +3486,14 @@ pub const Interpreter = struct {
     }
 
     // String helpers (RocStr construction)
+
+    fn staticStringBacking(self: *const LirInterpreter, backing: base.StringLiteral.Idx) []const u8 {
+        if (self.static_strings.find(backing)) |entry| return entry.bytes;
+        self.invariantFailed(
+            "LIR/interpreter invariant violated: string literal {d} has no runtime static backing",
+            .{@intFromEnum(backing)},
+        );
+    }
 
     fn makeStaticRocStrLiteralView(self: *LirInterpreter, backing: []const u8, offset: u32, len: u32) Error!Value {
         const offset_usize: usize = offset;
@@ -5378,16 +5375,25 @@ pub const Interpreter = struct {
             .list_split_last => self.evalListSplitLast(args[0], arg_layout, ll.ret_layout, updateModeForArg0(ll.unique_args)),
 
             // ── Arithmetic ──
-            .num_plus => self.numBinOp(args[0], args[1], ll.ret_layout, arg_layout, .add),
-            .num_minus => self.numBinOp(args[0], args[1], ll.ret_layout, arg_layout, .sub),
-            .num_times => self.numBinOp(args[0], args[1], ll.ret_layout, arg_layout, .mul),
-            .num_div_by => self.numBinOp(args[0], args[1], ll.ret_layout, arg_layout, .div),
-            .num_div_trunc_by => self.numBinOp(args[0], args[1], ll.ret_layout, arg_layout, .div_trunc),
-            .num_rem_by => self.numBinOp(args[0], args[1], ll.ret_layout, arg_layout, .rem),
-            .num_mod_by => self.numBinOp(args[0], args[1], ll.ret_layout, arg_layout, .mod),
-            .num_negate => self.numUnaryOp(args[0], ll.ret_layout, arg_layout, .negate),
-            .num_abs => self.numUnaryOp(args[0], ll.ret_layout, arg_layout, .abs),
-            .num_abs_diff => self.numBinOp(args[0], args[1], ll.ret_layout, arg_layout, .abs_diff),
+            .num_plus => self.numBinOp(args[0], args[1], ll.ret_layout, arg_layout, .add, null),
+            .num_plus_checked => self.numBinOp(args[0], args[1], ll.ret_layout, arg_layout, .add, .num_plus_checked),
+            .num_minus => self.numBinOp(args[0], args[1], ll.ret_layout, arg_layout, .sub, null),
+            .num_minus_checked => self.numBinOp(args[0], args[1], ll.ret_layout, arg_layout, .sub, .num_minus_checked),
+            .num_times => self.numBinOp(args[0], args[1], ll.ret_layout, arg_layout, .mul, null),
+            .num_times_checked => self.numBinOp(args[0], args[1], ll.ret_layout, arg_layout, .mul, .num_times_checked),
+            .num_div_by => self.numBinOp(args[0], args[1], ll.ret_layout, arg_layout, .div, null),
+            .num_div_by_checked => self.numBinOp(args[0], args[1], ll.ret_layout, arg_layout, .div, .num_div_by_checked),
+            .num_div_trunc_by => self.numBinOp(args[0], args[1], ll.ret_layout, arg_layout, .div_trunc, null),
+            .num_div_trunc_by_checked => self.numBinOp(args[0], args[1], ll.ret_layout, arg_layout, .div_trunc, .num_div_trunc_by_checked),
+            .num_rem_by => self.numBinOp(args[0], args[1], ll.ret_layout, arg_layout, .rem, null),
+            .num_rem_by_checked => self.numBinOp(args[0], args[1], ll.ret_layout, arg_layout, .rem, .num_rem_by_checked),
+            .num_mod_by => self.numBinOp(args[0], args[1], ll.ret_layout, arg_layout, .mod, null),
+            .num_mod_by_checked => self.numBinOp(args[0], args[1], ll.ret_layout, arg_layout, .mod, .num_mod_by_checked),
+            .num_negate => self.numUnaryOp(args[0], ll.ret_layout, arg_layout, .negate, null),
+            .num_negate_checked => self.numUnaryOp(args[0], ll.ret_layout, arg_layout, .negate, .num_negate_checked),
+            .num_abs => self.numUnaryOp(args[0], ll.ret_layout, arg_layout, .abs, null),
+            .num_abs_checked => self.numUnaryOp(args[0], ll.ret_layout, arg_layout, .abs, .num_abs_checked),
+            .num_abs_diff => self.numBinOp(args[0], args[1], ll.ret_layout, arg_layout, .abs_diff, null),
             .num_pow => self.evalNumPow(args[0], args[1], ll.ret_layout, arg_layout),
             .num_sqrt => self.evalNumSqrt(args[0], ll.ret_layout, arg_layout),
             .num_sin => self.evalNumFloatUnaryMath(args[0], ll.ret_layout, arg_layout, .sin),
@@ -6029,7 +6035,7 @@ pub const Interpreter = struct {
         };
     }
 
-    fn numBinOp(self: *LirInterpreter, a: Value, b: Value, ret_layout: layout_mod.Idx, arg_layout: layout_mod.Idx, op: NumOp) Error!Value {
+    fn numBinOp(self: *LirInterpreter, a: Value, b: Value, ret_layout: layout_mod.Idx, arg_layout: layout_mod.Idx, op: NumOp, checked_op: ?LIR.LowLevel) Error!Value {
         const val = try self.alloc(ret_layout);
         const kind = try self.numericOperandKind(arg_layout);
         const is_division_like = op == .div or op == .div_trunc or op == .rem or op == .mod;
@@ -6040,44 +6046,46 @@ pub const Interpreter = struct {
             ret_layout,
         });
 
-        if (is_division_like) {
+        if (checked_op != null and is_division_like) {
             switch (kind) {
                 .unsigned_int => |bits| switch (bits) {
-                    8 => if (b.read(u8) == 0) return self.divisionByZero(arg_layout),
-                    16 => if (b.read(u16) == 0) return self.divisionByZero(arg_layout),
-                    32 => if (b.read(u32) == 0) return self.divisionByZero(arg_layout),
-                    64 => if (b.read(u64) == 0) return self.divisionByZero(arg_layout),
-                    128 => if (b.read(u128) == 0) return self.divisionByZero(arg_layout),
+                    8 => if (b.read(u8) == 0) return self.checkedZeroDenominator(checked_op.?, arg_layout),
+                    16 => if (b.read(u16) == 0) return self.checkedZeroDenominator(checked_op.?, arg_layout),
+                    32 => if (b.read(u32) == 0) return self.checkedZeroDenominator(checked_op.?, arg_layout),
+                    64 => if (b.read(u64) == 0) return self.checkedZeroDenominator(checked_op.?, arg_layout),
+                    128 => if (b.read(u128) == 0) return self.checkedZeroDenominator(checked_op.?, arg_layout),
                     else => return self.invariantFailedError("LIR/interpreter invariant violated: unsupported unsigned integer width {d}", .{bits}),
                 },
                 .signed_int => |bits| switch (bits) {
-                    8 => if (b.read(i8) == 0) return self.divisionByZero(arg_layout),
-                    16 => if (b.read(i16) == 0) return self.divisionByZero(arg_layout),
-                    32 => if (b.read(i32) == 0) return self.divisionByZero(arg_layout),
-                    64 => if (b.read(i64) == 0) return self.divisionByZero(arg_layout),
-                    128 => if (b.read(i128) == 0) return self.divisionByZero(arg_layout),
+                    8 => if (b.read(i8) == 0) return self.checkedZeroDenominator(checked_op.?, arg_layout),
+                    16 => if (b.read(i16) == 0) return self.checkedZeroDenominator(checked_op.?, arg_layout),
+                    32 => if (b.read(i32) == 0) return self.checkedZeroDenominator(checked_op.?, arg_layout),
+                    64 => if (b.read(i64) == 0) return self.checkedZeroDenominator(checked_op.?, arg_layout),
+                    128 => if (b.read(i128) == 0) return self.checkedZeroDenominator(checked_op.?, arg_layout),
                     else => return self.invariantFailedError("LIR/interpreter invariant violated: unsupported signed integer width {d}", .{bits}),
                 },
-                .dec => if (b.read(i128) == 0) return self.divisionByZero(arg_layout),
-                .float => {},
+                .dec, .float => return self.invariantFailedError(
+                    "LIR/interpreter invariant violated: checked integer op used non-integer layout {d}",
+                    .{@intFromEnum(arg_layout)},
+                ),
             }
         }
 
         switch (kind) {
             .unsigned_int => |bits| switch (bits) {
-                8 => val.write(u8, try self.intBinOp(u8, a.read(u8), b.read(u8), op)),
-                16 => val.write(u16, try self.intBinOp(u16, a.read(u16), b.read(u16), op)),
-                32 => val.write(u32, try self.intBinOp(u32, a.read(u32), b.read(u32), op)),
-                64 => val.write(u64, try self.intBinOp(u64, a.read(u64), b.read(u64), op)),
-                128 => val.write(u128, try self.intBinOp(u128, a.read(u128), b.read(u128), op)),
+                8 => val.write(u8, try self.intBinOp(u8, a.read(u8), b.read(u8), op, checked_op)),
+                16 => val.write(u16, try self.intBinOp(u16, a.read(u16), b.read(u16), op, checked_op)),
+                32 => val.write(u32, try self.intBinOp(u32, a.read(u32), b.read(u32), op, checked_op)),
+                64 => val.write(u64, try self.intBinOp(u64, a.read(u64), b.read(u64), op, checked_op)),
+                128 => val.write(u128, try self.intBinOp(u128, a.read(u128), b.read(u128), op, checked_op)),
                 else => return self.invariantFailedError("LIR/interpreter invariant violated: unsupported unsigned integer width {d}", .{bits}),
             },
             .signed_int => |bits| switch (bits) {
-                8 => val.write(i8, try self.intBinOp(i8, a.read(i8), b.read(i8), op)),
-                16 => val.write(i16, try self.intBinOp(i16, a.read(i16), b.read(i16), op)),
-                32 => val.write(i32, try self.intBinOp(i32, a.read(i32), b.read(i32), op)),
-                64 => val.write(i64, try self.intBinOp(i64, a.read(i64), b.read(i64), op)),
-                128 => val.write(i128, try self.intBinOp(i128, a.read(i128), b.read(i128), op)),
+                8 => val.write(i8, try self.intBinOp(i8, a.read(i8), b.read(i8), op, checked_op)),
+                16 => val.write(i16, try self.intBinOp(i16, a.read(i16), b.read(i16), op, checked_op)),
+                32 => val.write(i32, try self.intBinOp(i32, a.read(i32), b.read(i32), op, checked_op)),
+                64 => val.write(i64, try self.intBinOp(i64, a.read(i64), b.read(i64), op, checked_op)),
+                128 => val.write(i128, try self.intBinOp(i128, a.read(i128), b.read(i128), op, checked_op)),
                 else => return self.invariantFailedError("LIR/interpreter invariant violated: unsupported signed integer width {d}", .{bits}),
             },
             .float => |bits| switch (bits) {
@@ -6090,8 +6098,8 @@ pub const Interpreter = struct {
         return val;
     }
 
-    fn numUnaryOp(self: *LirInterpreter, a: Value, ret_layout: layout_mod.Idx, arg_layout: layout_mod.Idx, op: NumOp) Error!Value {
-        return self.numBinOp(a, a, ret_layout, arg_layout, op);
+    fn numUnaryOp(self: *LirInterpreter, a: Value, ret_layout: layout_mod.Idx, arg_layout: layout_mod.Idx, op: NumOp, checked_op: ?LIR.LowLevel) Error!Value {
+        return self.numBinOp(a, a, ret_layout, arg_layout, op, checked_op);
     }
 
     fn numCmpOp(self: *LirInterpreter, a: Value, b: Value, arg_layout: layout_mod.Idx, op: CmpOp) Error!Value {
@@ -7412,21 +7420,39 @@ pub const Interpreter = struct {
     }
 
     /// Generic integer binary operation.
-    fn intBinOp(self: *LirInterpreter, comptime T: type, av: T, bv: T, op: NumOp) Error!T {
+    fn intBinOp(self: *LirInterpreter, comptime T: type, av: T, bv: T, op: NumOp, checked_op: ?LIR.LowLevel) Error!T {
         return switch (op) {
-            .add => checkedIntAdd(T, av, bv) orelse return self.triggerCrash("Integer addition overflowed!"),
-            .sub => checkedIntSub(T, av, bv) orelse return self.triggerCrash("Integer subtraction overflowed!"),
-            .mul => av *% bv,
-            .negate => if (@typeInfo(T).int.signedness == .signed) -%av else -%av,
+            .add => if (checked_op) |op_tag|
+                checkedIntAdd(T, av, bv) orelse return self.checkedOverflow(op_tag)
+            else
+                av +% bv,
+            .sub => if (checked_op) |op_tag|
+                checkedIntSub(T, av, bv) orelse return self.checkedOverflow(op_tag)
+            else
+                av -% bv,
+            .mul => if (checked_op) |op_tag|
+                checkedIntMul(T, av, bv) orelse return self.checkedOverflow(op_tag)
+            else
+                av *% bv,
+            .negate => if (checked_op) |op_tag|
+                checkedIntNegate(T, av) orelse return self.checkedOverflow(op_tag)
+            else
+                -%av,
             .abs => if (@typeInfo(T).int.signedness == .signed)
-                (if (av < 0) -%av else av)
+                if (av < 0) (if (checked_op) |op_tag|
+                    checkedIntNegate(T, av) orelse return self.checkedOverflow(op_tag)
+                else
+                    -%av) else av
             else
                 av,
             .abs_diff => if (@typeInfo(T).int.signedness == .signed)
                 (if (av > bv) av -% bv else bv -% av)
             else
                 (if (av > bv) av - bv else bv - av),
-            .div, .div_trunc => if (bv != 0) (if (signedMinDivOverflow(T, av, bv)) av else @divTrunc(av, bv)) else 0,
+            .div, .div_trunc => if (bv != 0) (if (signedMinDivOverflow(T, av, bv)) blk: {
+                if (checked_op) |op_tag| return self.checkedOverflow(op_tag);
+                break :blk av;
+            } else @divTrunc(av, bv)) else 0,
             .rem => if (bv != 0) (if (signedMinDivOverflow(T, av, bv)) 0 else @rem(av, bv)) else 0,
             .mod => if (bv != 0) (if (signedMinDivOverflow(T, av, bv)) 0 else @mod(av, bv)) else 0,
         };
@@ -7444,9 +7470,33 @@ pub const Interpreter = struct {
         return result[0];
     }
 
+    fn checkedIntMul(comptime T: type, av: T, bv: T) ?T {
+        const result = @mulWithOverflow(av, bv);
+        if (result[1] != 0) return null;
+        return result[0];
+    }
+
+    fn checkedIntNegate(comptime T: type, av: T) ?T {
+        const result = @subWithOverflow(@as(T, 0), av);
+        if (result[1] != 0) return null;
+        return result[0];
+    }
+
     fn signedMinDivOverflow(comptime T: type, av: T, bv: T) bool {
         if (@typeInfo(T).int.signedness != .signed) return false;
         return av == std.math.minInt(T) and bv == -1;
+    }
+
+    fn checkedOverflow(self: *LirInterpreter, op: LIR.LowLevel) Error {
+        const message = CheckedArithmetic.overflowMessage(op) orelse
+            return self.invariantFailedError("LIR/interpreter invariant violated: checked op has no overflow message {s}", .{@tagName(op)});
+        return self.triggerCrash(message);
+    }
+
+    fn checkedZeroDenominator(self: *LirInterpreter, op: LIR.LowLevel, layout_idx: layout_mod.Idx) Error {
+        const message = CheckedArithmetic.zeroDenominatorMessage(op, layout_idx) orelse
+            return self.invariantFailedError("LIR/interpreter invariant violated: checked op has no zero denominator message {s}", .{@tagName(op)});
+        return self.triggerCrash(message);
     }
 
     /// Generic float binary operation.

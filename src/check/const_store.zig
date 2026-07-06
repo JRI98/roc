@@ -174,7 +174,7 @@ pub const FnDef = union(enum) {
         owner: names.ProcTemplate,
         expr: checked_ids.CheckedExprId,
     },
-    encode_to_runtime: struct {
+    encoder_for_runtime: struct {
         owner: names.ProcTemplate,
         expr: checked_ids.CheckedExprId,
     },

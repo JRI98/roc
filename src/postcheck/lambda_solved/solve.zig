@@ -514,7 +514,8 @@ const Solver = struct {
             },
             .field_access => |field| {
                 const receiver_ty = try self.inferExpr(field.receiver);
-                try self.unify(expected, try self.recordField(receiver_ty, field.field));
+                const field_ty = try self.recordField(receiver_ty, field.field);
+                try self.unify(expected, field_ty);
             },
             .tuple_access => |access| {
                 const receiver_ty = try self.inferExpr(access.tuple);

@@ -16,6 +16,7 @@ pub const problem = @import("problem.zig");
 pub const report = @import("report.zig");
 /// **Exhaustiveness Checking**
 pub const exhaustive = @import("exhaustive.zig");
+pub const ExhaustivenessContext = @import("exhaustiveness_context.zig");
 pub const TypedCIR = @import("typed_cir.zig");
 pub const CheckedIds = @import("checked_ids.zig");
 pub const CanonicalNames = @import("canonical_names.zig");
@@ -41,6 +42,7 @@ pub const ReportBuilder = report.ReportBuilder;
 test "check tests" {
     std.testing.refAllDecls(@import("Check.zig"));
     std.testing.refAllDecls(@import("exhaustive.zig"));
+    std.testing.refAllDecls(@import("exhaustiveness_context.zig"));
     std.testing.refAllDecls(@import("occurs.zig"));
     std.testing.refAllDecls(@import("problem.zig"));
     std.testing.refAllDecls(@import("problem/context.zig"));
@@ -71,6 +73,9 @@ test "check tests" {
     std.testing.refAllDecls(@import("test/unify_test.zig"));
     std.testing.refAllDecls(@import("test/instantiate_tag_union_test.zig"));
     std.testing.refAllDecls(@import("test/where_clause_test.zig"));
+    std.testing.refAllDecls(@import("test/scheme_instantiation_evidence_test.zig"));
+    std.testing.refAllDecls(@import("test/dispatch_evidence_test.zig"));
+    std.testing.refAllDecls(@import("dispatch_evidence.zig"));
     std.testing.refAllDecls(@import("test/range_test.zig"));
     std.testing.refAllDecls(@import("test/recursive_alias_test.zig"));
     std.testing.refAllDecls(@import("test/generalize_redirect_test.zig"));

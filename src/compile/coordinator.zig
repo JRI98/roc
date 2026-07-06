@@ -51,6 +51,7 @@ const compile_package = @import("compile_package.zig");
 const compile_build = @import("compile_build.zig");
 const module_discovery = @import("module_discovery.zig");
 const cache_manager_mod = @import("cache_manager.zig");
+const cache_module = @import("cache_module.zig");
 const package_source = @import("package_source.zig");
 const package_identity = @import("package_identity.zig");
 const watch_inputs = @import("watch_inputs.zig");
@@ -176,14 +177,15 @@ fn readStageTimer(io: std.Io, timer: *?StageTimer) u64 {
     return 0;
 }
 
-const checked_module_cache_magic = "roc-mod-cache-v4";
-const checked_module_cache_format_version: u64 = 4;
-// Header: magic, format version (u64), artifact-layout version hash (32), artifact
-// key (32), env-blob length (u64), artifact-blob length (u64). The two length-prefixed
-// bodies (env blob then artifact blob) follow the header. The layout hash guards
-// against relocating a cached artifact whose `Serialized` layout differs from the
-// running compiler's — important in development, where `compiler_version` is a fixed
-// release string that does not move between rebuilds.
+const checked_module_cache_magic = "roc-mod-cache-v5";
+const checked_module_entry_version: u32 = 5;
+const checked_module_entry_version_hash: [32]u8 = computeCheckedModuleEntryVersionHash();
+// Header: magic, composite entry-version hash (32), artifact key (32), env-blob
+// length (u64), artifact-blob length (u64). The two length-prefixed bodies (env
+// blob then artifact blob) follow the header. The entry-version hash folds the
+// manual entry-envelope version, the artifact `Serialized` layout hash, and the
+// ModuleEnv `Serialized` layout hash, so a stale env or artifact body is rejected
+// by the same single admission check.
 //
 // There is no body checksum: cache entries are written to a temp file and atomically
 // renamed into place (so a torn write never replaces a valid entry), the length fields
@@ -191,7 +193,44 @@ const checked_module_cache_format_version: u64 = 4;
 // stale or wrong entries, and relocation bounds-checks every marker against the blob.
 // A corrupt-but-right-length body is the only residue, which for a recomputable local
 // cache does not justify hashing the whole blob on every read and write.
-const checked_module_cache_header_len: usize = checked_module_cache_magic.len + 8 + 32 + 32 + 8 + 8;
+const checked_module_cache_header_len: usize = checked_module_cache_magic.len + 32 + 32 + 8 + 8;
+
+fn checkedModuleEntryHashUpdate(state: *u64, bytes: []const u8) void {
+    for (bytes) |byte| {
+        state.* = (state.* ^ byte) *% 0x100000001b3;
+    }
+}
+
+fn checkedModuleEntryHashUpdateU32(state: *u64, value: u32) void {
+    inline for (0..4) |i| {
+        state.* = (state.* ^ @as(u8, @truncate(value >> (i * 8)))) *% 0x100000001b3;
+    }
+}
+
+fn checkedModuleEntrySplitmix64(x: u64) u64 {
+    var z = x +% 0x9E3779B97F4A7C15;
+    z = (z ^ (z >> 30)) *% 0xBF58476D1CE4E5B9;
+    z = (z ^ (z >> 27)) *% 0x94D049BB133111EB;
+    return z ^ (z >> 31);
+}
+
+fn computeCheckedModuleEntryVersionHash() [32]u8 {
+    var state: u64 = 0xcbf29ce484222325;
+    checkedModuleEntryHashUpdate(&state, "roc-checked-module-entry-v1");
+    checkedModuleEntryHashUpdateU32(&state, checked_module_entry_version);
+    checkedModuleEntryHashUpdate(&state, &check.CheckedArtifact.CheckedModuleArtifact.SERIALIZED_VERSION_HASH);
+    checkedModuleEntryHashUpdate(&state, &cache_module.MODULE_ENV_VERSION_HASH);
+
+    var result: [32]u8 = undefined;
+    var split_state = state;
+    inline for (0..4) |lane| {
+        split_state = checkedModuleEntrySplitmix64(split_state);
+        inline for (0..8) |byte_i| {
+            result[lane * 8 + byte_i] = @truncate(split_state >> (byte_i * 8));
+        }
+    }
+    return result;
+}
 
 /// Two length-prefixed cache bodies decoded from a checked-module cache entry:
 /// the relocatable `ModuleEnv` blob and the relocatable
@@ -213,9 +252,7 @@ fn writeCheckedModuleCacheHeader(
     var offset: usize = 0;
     @memcpy(dest[offset..][0..checked_module_cache_magic.len], checked_module_cache_magic);
     offset += checked_module_cache_magic.len;
-    std.mem.writeInt(u64, dest[offset..][0..8], checked_module_cache_format_version, .little);
-    offset += 8;
-    @memcpy(dest[offset..][0..32], &check.CheckedArtifact.CheckedModuleArtifact.SERIALIZED_VERSION_HASH);
+    @memcpy(dest[offset..][0..32], &checked_module_entry_version_hash);
     offset += 32;
     @memcpy(dest[offset..][0..32], &key.bytes);
     offset += 32;
@@ -232,11 +269,9 @@ fn decodeCheckedModuleCacheEntry(
     var offset: usize = 0;
     if (!std.mem.eql(u8, bytes[offset..][0..checked_module_cache_magic.len], checked_module_cache_magic)) return null;
     offset += checked_module_cache_magic.len;
-    if (std.mem.readInt(u64, bytes[offset..][0..8], .little) != checked_module_cache_format_version) return null;
-    offset += 8;
-    // Reject (as a cache miss) an entry whose artifact `Serialized` layout differs
-    // from this compiler's, so we never relocate into a mismatched struct.
-    if (!check.CheckedArtifact.CheckedModuleArtifact.expectSerializedVersion(bytes[offset..][0..32])) return null;
+    // Reject (as a cache miss) an entry whose envelope, ModuleEnv `Serialized`,
+    // or artifact `Serialized` layout differs from this compiler's.
+    if (!std.mem.eql(u8, bytes[offset..][0..32], &checked_module_entry_version_hash)) return null;
     offset += 32;
     if (!std.mem.eql(u8, bytes[offset..][0..32], &key.bytes)) return null;
     offset += 32;
@@ -261,6 +296,57 @@ fn decodeCheckedModuleCacheEntry(
     if (env_body.len < @sizeOf(ModuleEnv.Serialized)) return null;
     if (artifact_body.len < @sizeOf(check.CheckedArtifact.CheckedModuleArtifact.Serialized)) return null;
     return .{ .env_body = env_body, .artifact_body = artifact_body };
+}
+
+fn checkedModuleCacheTestKey(byte: u8) check.CheckedArtifact.CheckedModuleArtifactKey {
+    var key = check.CheckedArtifact.CheckedModuleArtifactKey{};
+    @memset(&key.bytes, byte);
+    return key;
+}
+
+test "checked module cache header decodes bodies and rejects corrupt envelope" {
+    const key = checkedModuleCacheTestKey(0xAB);
+    const env_len = @sizeOf(ModuleEnv.Serialized);
+    const artifact_len = @sizeOf(check.CheckedArtifact.CheckedModuleArtifact.Serialized);
+    const total_len = checked_module_cache_header_len + env_len + artifact_len;
+    const env_len_offset = checked_module_cache_magic.len + 32 + 32;
+    const artifact_len_offset = env_len_offset + 8;
+
+    var entry: [total_len]u8 = undefined;
+    @memset(&entry, 0);
+    writeCheckedModuleCacheHeader(entry[0..checked_module_cache_header_len], key, env_len, artifact_len);
+
+    const bodies = decodeCheckedModuleCacheEntry(key, &entry) orelse return error.TestExpectedEqual;
+    try std.testing.expectEqual(@as(usize, env_len), bodies.env_body.len);
+    try std.testing.expectEqual(@as(usize, artifact_len), bodies.artifact_body.len);
+
+    var bad_magic = entry;
+    bad_magic[0] ^= 0xFF;
+    try std.testing.expect(decodeCheckedModuleCacheEntry(key, &bad_magic) == null);
+
+    var bad_entry_version = entry;
+    bad_entry_version[checked_module_cache_magic.len] ^= 0xFF;
+    try std.testing.expect(decodeCheckedModuleCacheEntry(key, &bad_entry_version) == null);
+
+    var bad_key = entry;
+    bad_key[checked_module_cache_magic.len + 32] ^= 0xFF;
+    try std.testing.expect(decodeCheckedModuleCacheEntry(key, &bad_key) == null);
+
+    try std.testing.expect(decodeCheckedModuleCacheEntry(key, entry[0 .. checked_module_cache_header_len - 1]) == null);
+    try std.testing.expect(decodeCheckedModuleCacheEntry(key, entry[0 .. total_len - 1]) == null);
+
+    var oversize_env = entry;
+    std.mem.writeInt(u64, oversize_env[env_len_offset..][0..8], env_len + artifact_len + 1, .little);
+    try std.testing.expect(decodeCheckedModuleCacheEntry(key, &oversize_env) == null);
+
+    var oversize_artifact = entry;
+    std.mem.writeInt(u64, oversize_artifact[artifact_len_offset..][0..8], artifact_len + 1, .little);
+    try std.testing.expect(decodeCheckedModuleCacheEntry(key, &oversize_artifact) == null);
+
+    var extra_byte: [total_len + 1]u8 = undefined;
+    @memcpy(extra_byte[0..total_len], &entry);
+    extra_byte[total_len] = 0;
+    try std.testing.expect(decodeCheckedModuleCacheEntry(key, &extra_byte) == null);
 }
 
 /// Maximum scratch arena capacity retained by a worker after each task.
@@ -1590,6 +1676,16 @@ pub const Coordinator = struct {
             entry.value_ptr.* = {};
 
             try views.append(allocator, view);
+
+            for (view.direct_import_artifact_keys) |dependency_key| {
+                const artifact = self.checkedArtifactByKey(dependency_key) orelse {
+                    if (builtin.mode == .Debug) {
+                        std.debug.panic("compile.coordinator missing direct dependency checked artifact", .{});
+                    }
+                    unreachable;
+                };
+                try pending.append(allocator, check.CheckedArtifact.importedView(artifact));
+            }
 
             for (view.public_api_dependencies.type_owner_artifacts) |dependency_key| {
                 const artifact = self.checkedArtifactByKey(dependency_key) orelse {
@@ -4809,9 +4905,15 @@ const CheckedModuleCacheRunStats = struct {
     cache: CacheStats,
     hoisted_constants: usize,
     pattern_extraction_regions: PatternExtractionRegionStats,
+    exhaustiveness_sites: ExhaustivenessSiteStats,
 };
 
 const PatternExtractionRegionStats = struct {
+    count: usize,
+    digest: [32]u8,
+};
+
+const ExhaustivenessSiteStats = struct {
     count: usize,
     digest: [32]u8,
 };
@@ -4884,12 +4986,14 @@ fn compileAppWithCheckedModuleCache(
     const relations = try coord.collectRelationArtifactViews(arena, root);
     const hoisted_constants = countHoistedConstants(root, imports, relations);
     const pattern_extraction_regions = try collectPatternExtractionRegionStats(root, imports, relations);
+    const exhaustiveness_sites = collectExhaustivenessSiteStats(root, imports, relations);
 
     return .{
         .build = coord.getBuildStats(),
         .cache = cache_manager.stats,
         .hoisted_constants = hoisted_constants,
         .pattern_extraction_regions = pattern_extraction_regions,
+        .exhaustiveness_sites = exhaustiveness_sites,
     };
 }
 
@@ -5306,6 +5410,88 @@ fn hashU32IntoSha256(hasher: *std.crypto.hash.sha2.Sha256, value: u32) void {
     hasher.update(&bytes);
 }
 
+fn collectExhaustivenessSiteStats(
+    root: *const check.CheckedArtifact.CheckedModuleArtifact,
+    imports: []const check.CheckedArtifact.ImportedModuleView,
+    relations: []const check.CheckedArtifact.ImportedModuleView,
+) ExhaustivenessSiteStats {
+    var hasher = std.crypto.hash.sha2.Sha256.init(.{});
+    var count: usize = 0;
+
+    hashExhaustivenessSitesForView(&hasher, &count, check.CheckedArtifact.importedView(root));
+    for (imports) |view| hashExhaustivenessSitesForView(&hasher, &count, view);
+    for (relations) |view| hashExhaustivenessSitesForView(&hasher, &count, view);
+
+    var digest: [32]u8 = undefined;
+    hasher.final(&digest);
+    return .{ .count = count, .digest = digest };
+}
+
+fn hashExhaustivenessSitesForView(
+    hasher: *std.crypto.hash.sha2.Sha256,
+    count: *usize,
+    view: check.CheckedArtifact.ImportedModuleView,
+) void {
+    for (view.exhaustiveness_sites.sites) |site| {
+        count.* += 1;
+        hasher.update(&view.key.bytes);
+        hashU32IntoSha256(hasher, @intFromEnum(site.id));
+        hashU32IntoSha256(hasher, switch (site.kind) {
+            .match => 0,
+            .destructure => 1,
+        });
+        hashRegionIntoSha256(hasher, site.region);
+        hashOptionalU32IntoSha256(hasher, if (site.checked_expr) |expr| @intFromEnum(expr) else null);
+        hashOptionalU32IntoSha256(hasher, if (site.checked_pattern) |pattern| @intFromEnum(pattern) else null);
+        hashExhaustivenessOwnerIntoSha256(hasher, site.owner);
+        hashExhaustivenessPolicyIntoSha256(hasher, site.policy);
+    }
+}
+
+fn hashOptionalU32IntoSha256(hasher: *std.crypto.hash.sha2.Sha256, value: ?u32) void {
+    if (value) |payload| {
+        hashU32IntoSha256(hasher, 1);
+        hashU32IntoSha256(hasher, payload);
+    } else {
+        hashU32IntoSha256(hasher, 0);
+    }
+}
+
+fn hashExhaustivenessOwnerIntoSha256(
+    hasher: *std.crypto.hash.sha2.Sha256,
+    owner: ?check.CheckedArtifact.CheckedExhaustivenessSiteOwner,
+) void {
+    if (owner) |payload| switch (payload) {
+        .procedure_template => |template| {
+            hashU32IntoSha256(hasher, 1);
+            hasher.update(&template.artifact.bytes);
+            hashU32IntoSha256(hasher, @intFromEnum(template.proc_base));
+            hashU32IntoSha256(hasher, @intFromEnum(template.template));
+        },
+        .root => |root| {
+            hashU32IntoSha256(hasher, 2);
+            hashU32IntoSha256(hasher, @intFromEnum(root));
+        },
+    } else {
+        hashU32IntoSha256(hasher, 0);
+    }
+}
+
+fn hashExhaustivenessPolicyIntoSha256(
+    hasher: *std.crypto.hash.sha2.Sha256,
+    policy: check.CheckedArtifact.ExhaustivenessResolutionPolicy,
+) void {
+    switch (policy) {
+        .compile_time_replaced_by_root => |root| {
+            hashU32IntoSha256(hasher, 0);
+            hashU32IntoSha256(hasher, @intFromEnum(root));
+        },
+        .compile_time_only => hashU32IntoSha256(hasher, 1),
+        .runtime_reachable => hashU32IntoSha256(hasher, 2),
+        .not_pending => hashU32IntoSha256(hasher, 3),
+    }
+}
+
 fn countHoistedConstants(
     root: *const check.CheckedArtifact.CheckedModuleArtifact,
     imports: []const check.CheckedArtifact.ImportedModuleView,
@@ -5396,12 +5582,19 @@ test "Coordinator checked module cache preserves hoisted roots on hit" {
         \\
         \\top = 40.I64
         \\
+        \\message_result : Try(Str, Str)
+        \\message_result = Ok("done")
+        \\
+        \\message = match message_result {
+        \\    Ok(value) => value
+        \\}
+        \\
         \\main! = |args| {
         \\    pair = (top, 2.I64)
         \\    (left, right) = pair
         \\    Ok(tag_value) = Ok(45.I64)
         \\    _ = left + right + tag_value + List.len(args).to_i64_wrap()
-        \\    Echo.line!("done")
+        \\    Echo.line!(message)
         \\    Ok({})
         \\}
         ,
@@ -5444,6 +5637,7 @@ test "Coordinator checked module cache preserves hoisted roots on hit" {
     const first = try compileAppWithCheckedModuleCache(allocator, cache_dir, app_path);
     try std.testing.expect(first.hoisted_constants >= 2);
     try std.testing.expect(first.pattern_extraction_regions.count >= 3);
+    try std.testing.expect(first.exhaustiveness_sites.count > 0);
 
     const second = try compileAppWithCheckedModuleCache(allocator, cache_dir, app_path);
     try std.testing.expect(second.cache.hits > 0);
@@ -5453,6 +5647,12 @@ test "Coordinator checked module cache preserves hoisted roots on hit" {
         u8,
         &first.pattern_extraction_regions.digest,
         &second.pattern_extraction_regions.digest,
+    );
+    try std.testing.expectEqual(first.exhaustiveness_sites.count, second.exhaustiveness_sites.count);
+    try std.testing.expectEqualSlices(
+        u8,
+        &first.exhaustiveness_sites.digest,
+        &second.exhaustiveness_sites.digest,
     );
 }
 
