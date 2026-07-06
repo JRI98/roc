@@ -2723,8 +2723,9 @@ fn collectLirResultProcShape(
                 shape.switch_count += 1;
                 if (stmt.continuation) |continuation| try work.append(allocator, continuation);
                 try work.append(allocator, stmt.default_branch);
-                for (result.store.getCFSwitchBranches(stmt.branches)) |branch| {
-                    try work.append(allocator, branch.body);
+                const branches = result.store.getCFSwitchBranches(stmt.branches);
+                for (0..branches.len) |index| {
+                    try work.append(allocator, GuardedList.at(branches, index).body);
                 }
             },
             .switch_initialized_payload => |stmt| {
@@ -2738,8 +2739,9 @@ fn collectLirResultProcShape(
             },
             .str_match_set => |stmt| {
                 shape.str_match_set_count += 1;
-                for (result.store.getStrMatchArms(stmt.arms)) |arm| {
-                    try work.append(allocator, arm.on_match);
+                const arms = result.store.getStrMatchArms(stmt.arms);
+                for (0..arms.len) |index| {
+                    try work.append(allocator, GuardedList.at(arms, index).on_match);
                 }
                 try work.append(allocator, stmt.on_miss);
             },
