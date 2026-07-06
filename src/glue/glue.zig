@@ -31,6 +31,8 @@ const RocTarget = roc_target.RocTarget;
 const CheckedArtifact = check.CheckedArtifact;
 const CanonicalNameStore = check.CanonicalNames.CanonicalNameStore;
 const CIR = can.CIR;
+const checked_artifact_layout_resolver = @import("checked_artifact_layout_resolver.zig");
+const CheckedArtifactLayoutResolver = checked_artifact_layout_resolver.Resolver;
 
 const builtins = @import("builtins");
 const RocStr = builtins.str.RocStr;
@@ -229,7 +231,15 @@ fn rocGlueInner(gpa: Allocator, stderr: *std.Io.Writer, stdout: *std.Io.Writer, 
         try artifacts_by_key.put(artifact.key, artifact);
     }
 
-    var type_table = TypeTable.init(gpa, target_usize, &artifacts_by_key);
+    var glue_layouts = layout.Store.init(gpa, .u64) catch {
+        return error.OutOfMemory;
+    };
+    defer glue_layouts.deinit();
+
+    var layout_resolver = CheckedArtifactLayoutResolver.init(&glue_layouts, &artifacts_by_key);
+    defer layout_resolver.deinit();
+
+    var type_table = TypeTable.init(gpa, target_usize, &artifacts_by_key, &glue_layouts, &layout_resolver);
     defer type_table.deinit();
 
     for (modules) |mod| {
@@ -964,29 +974,44 @@ const CollectedModuleTypeInfo = struct {
 };
 
 /// Internal representation of a collected type for the type table.
+const CollectedLayoutFacts = struct {
+    layout_idx: layout.Idx,
+    size_32: u64,
+    alignment_32: u64,
+    size_64: u64,
+    alignment_64: u64,
+
+    fn native(self: CollectedLayoutFacts, target_usize: base.target.TargetUsize) struct { size: u64, alignment: u64 } {
+        return switch (target_usize) {
+            .u32 => .{ .size = self.size_32, .alignment = self.alignment_32 },
+            .u64 => .{ .size = self.size_64, .alignment = self.alignment_64 },
+        };
+    }
+};
+
 const CollectedTypeRepr = union(enum) {
-    bool_,
-    box: u64,
-    dec,
-    f32_,
-    f64_,
-    i8_,
-    i16_,
-    i32_,
-    i64_,
-    i128_,
-    u8_,
-    u16_,
-    u32_,
-    u64_,
-    u128_,
-    str_,
-    unit,
-    list: u64,
-    function: struct { arg_ids: []const u64, ret_id: u64 },
-    record: struct { name: []const u8, anonymous: bool, fields: []const CollectedRecordField, size: u64, alignment: u64 },
-    tag_union: struct { name: []const u8, tags: []const CollectedTagInfo, size: u64, alignment: u64 },
-    unknown: []const u8,
+    bool_: CollectedLayoutFacts,
+    box: struct { inner_id: u64, layout: CollectedLayoutFacts },
+    dec: CollectedLayoutFacts,
+    f32_: CollectedLayoutFacts,
+    f64_: CollectedLayoutFacts,
+    i8_: CollectedLayoutFacts,
+    i16_: CollectedLayoutFacts,
+    i32_: CollectedLayoutFacts,
+    i64_: CollectedLayoutFacts,
+    i128_: CollectedLayoutFacts,
+    u8_: CollectedLayoutFacts,
+    u16_: CollectedLayoutFacts,
+    u32_: CollectedLayoutFacts,
+    u64_: CollectedLayoutFacts,
+    u128_: CollectedLayoutFacts,
+    str_: CollectedLayoutFacts,
+    unit: CollectedLayoutFacts,
+    list: struct { elem_id: u64, layout: CollectedLayoutFacts },
+    function: struct { arg_ids: []const u64, ret_id: u64, layout: CollectedLayoutFacts },
+    record: struct { name: []const u8, anonymous: bool, fields: []const CollectedRecordField, size: u64, alignment: u64, layout: CollectedLayoutFacts },
+    tag_union: struct { name: []const u8, tags: []const CollectedTagInfo, size: u64, alignment: u64, discriminant_size: u64, discriminant_offset_32: u64, discriminant_offset_64: u64, layout: CollectedLayoutFacts },
+    unknown: struct { name: []const u8, layout: CollectedLayoutFacts },
 };
 
 const CollectedRecordField = struct {
@@ -994,11 +1019,15 @@ const CollectedRecordField = struct {
     type_id: u64,
     size: u64,
     alignment: u64,
+    size_32: u64,
+    alignment_32: u64,
+    offset_32: u64,
+    size_64: u64,
+    alignment_64: u64,
+    offset_64: u64,
     /// True for an unnamed nominal-record padding field (`_` / `_name`). The
-    /// emitters render it as a fixed-size `size`-byte array (`[size]u8` in Zig,
-    /// `uint8_t name[size]` in C) and skip it for refcount helpers. Zero-sized
-    /// unnamed fields are layout markers only and are not collected. `type_id`
-    /// is unused for padding fields.
+    /// emitters render it as a fixed-size byte array and skip it for refcount
+    /// helpers. `type_id` is unused for padding fields.
     is_padding: bool = false,
 };
 
@@ -1007,12 +1036,17 @@ const CollectedTagInfo = struct {
     payload_ids: []const u64,
     payload_size: u64,
     payload_alignment: u64,
+    payload_size_32: u64,
+    payload_alignment_32: u64,
+    payload_size_64: u64,
+    payload_alignment_64: u64,
+    payload_layout_idx: layout.Idx,
 };
 
 /// Maps checked artifact keys to artifacts. Populated once from the compiled
 /// module list before collection so nominal representation refs can resolve
 /// their declaration owners directly.
-const ArtifactKeyMap = std.AutoHashMap(CheckedArtifact.CheckedModuleArtifactKey, *const CheckedArtifact.CheckedModuleArtifact);
+const ArtifactKeyMap = checked_artifact_layout_resolver.ArtifactMap;
 
 const TypeTableKey = struct {
     artifact_key: CheckedArtifact.CheckedModuleArtifactKey,
@@ -1025,6 +1059,8 @@ const TypeTable = struct {
     var_map: std.AutoHashMap(TypeTableKey, u64),
     target_usize: base.target.TargetUsize,
     gpa: std.mem.Allocator,
+    layouts: *const layout.Store,
+    layout_resolver: *CheckedArtifactLayoutResolver,
     /// Lookup from checked artifact key to artifact. Borrowed; not owned by the
     /// type table.
     artifacts_by_key: *const ArtifactKeyMap,
@@ -1033,12 +1069,16 @@ const TypeTable = struct {
         gpa: std.mem.Allocator,
         target_usize: base.target.TargetUsize,
         artifacts_by_key: *const ArtifactKeyMap,
+        layouts: *const layout.Store,
+        layout_resolver: *CheckedArtifactLayoutResolver,
     ) TypeTable {
         return .{
             .entries = std.ArrayList(CollectedTypeRepr).empty,
             .var_map = std.AutoHashMap(TypeTableKey, u64).init(gpa),
             .target_usize = target_usize,
             .gpa = gpa,
+            .layouts = layouts,
+            .layout_resolver = layout_resolver,
             .artifacts_by_key = artifacts_by_key,
         };
     }
@@ -1071,8 +1111,8 @@ const TypeTable = struct {
             .function => |func| {
                 self.gpa.free(func.arg_ids);
             },
-            .unknown => |text| {
-                self.freeDuped(text);
+            .unknown => |unknown| {
+                self.freeDuped(unknown.name);
             },
             .box,
             .list,
@@ -1117,6 +1157,31 @@ const TypeTable = struct {
         self.var_map.clearRetainingCapacity();
     }
 
+    fn layoutFactsForIdx(self: *const TypeTable, layout_idx: layout.Idx) CollectedLayoutFacts {
+        const layout_value = self.layouts.getLayout(layout_idx);
+        const sa32 = self.layouts.layoutSizeAlignAt(layout_value, .u32);
+        const sa64 = self.layouts.layoutSizeAlignAt(layout_value, .u64);
+        return .{
+            .layout_idx = layout_idx,
+            .size_32 = sa32.size,
+            .alignment_32 = sa32.alignment.toByteUnits(),
+            .size_64 = sa64.size,
+            .alignment_64 = sa64.alignment.toByteUnits(),
+        };
+    }
+
+    fn layoutFactsForCheckedType(
+        self: *TypeTable,
+        artifact: *const CheckedArtifact.CheckedModuleArtifact,
+        checked_type: CheckedArtifact.CheckedTypeId,
+    ) Allocator.Error!CollectedLayoutFacts {
+        const layout_idx = self.layout_resolver.resolve(artifact, checked_type) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.UnresolvedByValue => glueInvariant("type with no committed layout reached glue type table", .{}),
+        };
+        return self.layoutFactsForIdx(layout_idx);
+    }
+
     /// Get an existing type table index for a checked type, or insert a new entry.
     /// Pre-registers a placeholder before conversion to prevent infinite recursion
     /// on cyclic types (the placeholder is updated in-place after conversion).
@@ -1131,7 +1196,7 @@ const TypeTable = struct {
         }
 
         const idx: u64 = @intCast(self.entries.items.len);
-        try self.entries.append(self.gpa, .{ .unknown = "" });
+        try self.entries.append(self.gpa, .{ .unknown = .{ .name = "", .layout = self.layoutFactsForIdx(.opaque_ptr) } });
         try self.var_map.put(key, idx);
 
         const repr = try self.convertCheckedType(artifact, checked_type);
@@ -1147,6 +1212,7 @@ const TypeTable = struct {
                         .fields = rec.fields,
                         .size = rec.size,
                         .alignment = rec.alignment,
+                        .layout = rec.layout,
                     } };
                 }
             },
@@ -1159,7 +1225,7 @@ const TypeTable = struct {
     /// Insert a Unit type and return its index.
     fn insertUnit(self: *TypeTable) Allocator.Error!u64 {
         const idx: u64 = @intCast(self.entries.items.len);
-        try self.entries.append(self.gpa, .unit);
+        try self.entries.append(self.gpa, .{ .unit = self.layoutFactsForIdx(.zst) });
         return idx;
     }
 
@@ -1167,68 +1233,38 @@ const TypeTable = struct {
 
     /// Get the size and alignment for a type table entry by index.
     fn getSizeAlign(self: *const TypeTable, type_id: u64) SizeAlign {
-        if (type_id >= self.entries.items.len) return .{ .size = 0, .alignment = 1 };
+        if (type_id >= self.entries.items.len) glueInvariant("missing type table entry {d}", .{type_id});
         return self.getSizeAlignForRepr(self.entries.items[@intCast(type_id)]);
     }
 
-    /// Get the size and alignment for a CollectedTypeRepr.
+    /// Get the size and alignment for a CollectedTypeRepr from committed layout facts.
     fn getSizeAlignForRepr(self: *const TypeTable, repr: CollectedTypeRepr) SizeAlign {
-        const ptr_size = self.target_usize.size();
-        const ptr_alignment = self.target_usize.alignment().toByteUnits();
-        return switch (repr) {
-            .bool_ => .{ .size = 1, .alignment = 1 },
-            .box => .{ .size = ptr_size, .alignment = ptr_alignment },
-            .u8_, .i8_ => .{ .size = 1, .alignment = 1 },
-            .u16_, .i16_ => .{ .size = 2, .alignment = 2 },
-            .u32_, .i32_, .f32_ => .{ .size = 4, .alignment = 4 },
-            .u64_, .i64_, .f64_, .dec => .{ .size = 8, .alignment = 8 },
-            .u128_, .i128_ => .{ .size = 16, .alignment = 16 },
-            .str_ => .{ .size = ptr_size * 3, .alignment = ptr_alignment },
-            .list => .{ .size = ptr_size * 3, .alignment = ptr_alignment },
-            .unit => .{ .size = 0, .alignment = 0 },
-            .record => |rec| .{ .size = rec.size, .alignment = rec.alignment },
-            .function => .{ .size = ptr_size, .alignment = ptr_alignment },
-            .tag_union => |tu| .{ .size = tu.size, .alignment = tu.alignment },
-            .unknown => .{ .size = 0, .alignment = 1 },
+        const facts = switch (repr) {
+            .bool_,
+            .dec,
+            .f32_,
+            .f64_,
+            .i8_,
+            .i16_,
+            .i32_,
+            .i64_,
+            .i128_,
+            .u8_,
+            .u16_,
+            .u32_,
+            .u64_,
+            .u128_,
+            .str_,
+            .unit,
+            => |facts| facts,
+            .box => |box| box.layout,
+            .list => |list| list.layout,
+            .function => |func| func.layout,
+            .record => |rec| rec.layout,
+            .tag_union => |tu| tu.layout,
+            .unknown => |unknown| unknown.layout,
         };
-    }
-
-    /// Target-independent `SortKey` for a type table entry (see `layout.SortKey`).
-    /// Mirrors `layout.Store.layoutSortKey` over glue's own type representation so
-    /// `roc glue` orders structural records/tuples identically to the layout store
-    /// on both 32-bit and 64-bit targets.
-    fn getSortKey(self: *const TypeTable, type_id: u64) layout.SortKey {
-        if (type_id >= self.entries.items.len) return .align_1;
-        return self.getSortKeyForRepr(self.entries.items[@intCast(type_id)]);
-    }
-
-    fn getSortKeyForRepr(self: *const TypeTable, repr: CollectedTypeRepr) layout.SortKey {
-        return switch (repr) {
-            .bool_, .u8_, .i8_, .unit, .unknown => .align_1,
-            .u16_, .i16_ => .align_2,
-            .u32_, .i32_, .f32_ => .align_4,
-            .u64_, .i64_, .f64_, .dec => .align_8,
-            .u128_, .i128_ => .align_16,
-            .box, .str_, .list, .function => .pointer,
-            .record => |rec| blk: {
-                var key: layout.SortKey = .align_1;
-                for (rec.fields) |field| {
-                    if (field.is_padding) continue;
-                    key = key.max(self.getSortKey(field.type_id));
-                }
-                break :blk key;
-            },
-            .tag_union => |tu| blk: {
-                const disc_size = layout.TagUnionData.discriminantSize(tu.tags.len);
-                var key = layout.SortKey.fromAlignBytes(
-                    layout.TagUnionData.alignmentForDiscriminantSize(disc_size).toByteUnits(),
-                );
-                for (tu.tags) |tag| {
-                    for (tag.payload_ids) |pid| key = key.max(self.getSortKey(pid));
-                }
-                break :blk key;
-            },
-        };
+        return facts.native(self.target_usize);
     }
 
     fn convertCheckedType(
@@ -1239,16 +1275,16 @@ const TypeTable = struct {
         const payload = checkedTypePayload(artifact, checked_type);
         return switch (payload) {
             .pending => glueInvariant("pending checked type reached glue type table", .{}),
-            .flex => .{ .unknown = try self.gpa.dupe(u8, "flex") },
-            .rigid => .{ .unknown = try self.gpa.dupe(u8, "rigid") },
+            .flex => .{ .unknown = .{ .name = try self.gpa.dupe(u8, "flex"), .layout = self.layoutFactsForIdx(.opaque_ptr) } },
+            .rigid => .{ .unknown = .{ .name = try self.gpa.dupe(u8, "rigid"), .layout = self.layoutFactsForIdx(.opaque_ptr) } },
             .alias => |alias| try self.getAliasBackingRepr(artifact, alias.backing),
-            .record => |record| try self.convertRecord(artifact, record.fields, record.ext),
-            .record_unbound => |fields| try self.convertRecord(artifact, fields, null),
-            .tuple => |items| try self.convertTuple(artifact, items),
-            .nominal => |nominal| try self.convertNominal(artifact, nominal),
-            .function => |func| try self.convertFunc(artifact, func),
-            .empty_record, .empty_tag_union => .unit,
-            .tag_union => |tag_union| try self.convertTagUnion(artifact, tag_union.tags, tag_union.ext),
+            .record => |record| try self.convertRecord(artifact, checked_type, record.fields, record.ext),
+            .record_unbound => |fields| try self.convertRecord(artifact, checked_type, fields, null),
+            .tuple => |items| try self.convertTuple(artifact, checked_type, items),
+            .nominal => |nominal| try self.convertNominal(artifact, checked_type, nominal),
+            .function => |func| try self.convertFunc(artifact, checked_type, func),
+            .empty_record, .empty_tag_union => .{ .unit = self.layoutFactsForIdx(.zst) },
+            .tag_union => |tag_union| try self.convertTagUnion(artifact, checked_type, tag_union.tags, tag_union.ext),
         };
     }
 
@@ -1263,24 +1299,32 @@ const TypeTable = struct {
     fn convertNominal(
         self: *TypeTable,
         artifact: *const CheckedArtifact.CheckedModuleArtifact,
+        checked_type: CheckedArtifact.CheckedTypeId,
         nominal: CheckedArtifact.CheckedNominalType,
     ) Allocator.Error!CollectedTypeRepr {
         const display_name = TypeTable.getTypeDisplayName(artifact.canonical_names.typeNameText(nominal.name));
+        const nominal_layout = try self.layoutFactsForCheckedType(artifact, checked_type);
 
         if (nominal.builtin) |builtin_nominal| {
             switch (builtin_nominal) {
                 .list => {
-                    if (nominal.args.len >= 1) return .{ .list = try self.getOrInsert(artifact, nominal.args[0]) };
-                    return .{ .unknown = try self.gpa.dupe(u8, "List") };
+                    if (nominal.args.len >= 1) return .{ .list = .{
+                        .elem_id = try self.getOrInsert(artifact, nominal.args[0]),
+                        .layout = nominal_layout,
+                    } };
+                    return .{ .unknown = .{ .name = try self.gpa.dupe(u8, "List"), .layout = self.layoutFactsForIdx(.opaque_ptr) } };
                 },
                 .box => {
-                    if (nominal.args.len >= 1) return .{ .box = try self.getOrInsert(artifact, nominal.args[0]) };
-                    return .{ .unknown = try self.gpa.dupe(u8, "Box") };
+                    if (nominal.args.len >= 1) return .{ .box = .{
+                        .inner_id = try self.getOrInsert(artifact, nominal.args[0]),
+                        .layout = nominal_layout,
+                    } };
+                    return .{ .unknown = .{ .name = try self.gpa.dupe(u8, "Box"), .layout = self.layoutFactsForIdx(.opaque_ptr) } };
                 },
                 .parse_tag_union_spec,
                 .fields,
                 .field,
-                => return .unit,
+                => return .{ .unit = self.layoutFactsForIdx(.zst) },
                 .dict,
                 .set,
                 .crypto_sha256_digest,
@@ -1288,21 +1332,21 @@ const TypeTable = struct {
                 .crypto_blake3_digest,
                 .crypto_blake3_hasher,
                 => {},
-                .str => return .str_,
-                .bool => return .bool_,
-                .dec => return .dec,
-                .u8 => return .u8_,
-                .u16 => return .u16_,
-                .u32 => return .u32_,
-                .u64 => return .u64_,
-                .u128 => return .u128_,
-                .i8 => return .i8_,
-                .i16 => return .i16_,
-                .i32 => return .i32_,
-                .i64 => return .i64_,
-                .i128 => return .i128_,
-                .f32 => return .f32_,
-                .f64 => return .f64_,
+                .str => return .{ .str_ = self.layoutFactsForIdx(.str) },
+                .bool => return .{ .bool_ = self.layoutFactsForIdx(.bool) },
+                .dec => return .{ .dec = self.layoutFactsForIdx(.dec) },
+                .u8 => return .{ .u8_ = self.layoutFactsForIdx(.u8) },
+                .u16 => return .{ .u16_ = self.layoutFactsForIdx(.u16) },
+                .u32 => return .{ .u32_ = self.layoutFactsForIdx(.u32) },
+                .u64 => return .{ .u64_ = self.layoutFactsForIdx(.u64) },
+                .u128 => return .{ .u128_ = self.layoutFactsForIdx(.u128) },
+                .i8 => return .{ .i8_ = self.layoutFactsForIdx(.i8) },
+                .i16 => return .{ .i16_ = self.layoutFactsForIdx(.i16) },
+                .i32 => return .{ .i32_ = self.layoutFactsForIdx(.i32) },
+                .i64 => return .{ .i64_ = self.layoutFactsForIdx(.i64) },
+                .i128 => return .{ .i128_ = self.layoutFactsForIdx(.i128) },
+                .f32 => return .{ .f32_ = self.layoutFactsForIdx(.f32) },
+                .f64 => return .{ .f64_ = self.layoutFactsForIdx(.f64) },
             }
         }
 
@@ -1312,13 +1356,14 @@ const TypeTable = struct {
                 // The backing record `rec.fields` is in the structural (sorted)
                 // order. A nominal record must instead lay out in DECLARED source
                 // order, with unnamed `_` fields reinstated as padding spacers.
-                const declared = try self.nominalRecordInDeclaredOrder(artifact, nominal, rec) orelse
+                const declared = try self.nominalRecordInDeclaredOrder(artifact, nominal, rec, nominal_layout) orelse
                     break :blk .{ .record = .{
                         .name = try self.gpa.dupe(u8, display_name),
                         .anonymous = false,
                         .fields = rec.fields,
                         .size = rec.size,
                         .alignment = rec.alignment,
+                        .layout = nominal_layout,
                     } };
                 // `declared.fields` replaces `rec.fields`, which we now own and free.
                 for (rec.fields) |field| self.freeDuped(field.name);
@@ -1329,6 +1374,7 @@ const TypeTable = struct {
                     .fields = declared.fields,
                     .size = declared.size,
                     .alignment = declared.alignment,
+                    .layout = nominal_layout,
                 } };
             },
             .tag_union => |tu| blk: {
@@ -1338,6 +1384,10 @@ const TypeTable = struct {
                     .tags = tu.tags,
                     .size = tu.size,
                     .alignment = tu.alignment,
+                    .discriminant_size = tu.discriminant_size,
+                    .discriminant_offset_32 = tu.discriminant_offset_32,
+                    .discriminant_offset_64 = tu.discriminant_offset_64,
+                    .layout = nominal_layout,
                 } };
             },
             else => backing_repr,
@@ -1376,7 +1426,7 @@ const TypeTable = struct {
                 .padding_field_types = artifact.checked_types.nominalDeclarationById(declaration_id).paddingFieldTypes(&artifact.checked_types),
             },
             .imported_declaration => |imported| blk: {
-                const owner = self.artifactByKey(CheckedArtifact.importedNominalDeclarationModuleId(imported));
+                const owner = self.artifacts_by_key.get(CheckedArtifact.importedNominalDeclarationModuleId(imported)) orelse return null;
                 const declaration = owner.checked_types.nominalDeclarationById(imported.declaration);
                 break :blk .{
                     .artifact = owner,
@@ -1395,7 +1445,7 @@ const TypeTable = struct {
                 };
             },
             .imported_box_payload_capability => |capability_ref| blk: {
-                const owner = self.artifactByKey(CheckedArtifact.importedBoxPayloadCapabilityModuleId(capability_ref));
+                const owner = self.artifacts_by_key.get(CheckedArtifact.importedBoxPayloadCapabilityModuleId(capability_ref)) orelse return null;
                 const capability = owner.interface_capabilities.boxPayloadCapability(capability_ref.capability);
                 const declaration = owner.checked_types.nominalDeclaration(capability.nominal) orelse
                     glueInvariant("imported boxed payload capability referenced a nominal declaration that is not in the owner artifact", .{});
@@ -1423,15 +1473,21 @@ const TypeTable = struct {
         artifact: *const CheckedArtifact.CheckedModuleArtifact,
         nominal: CheckedArtifact.CheckedNominalType,
         backing: anytype,
+        nominal_layout: CollectedLayoutFacts,
     ) Allocator.Error!?NominalRecordLayout {
         const lookup = self.nominalDeclarationFor(artifact, nominal) orelse return null;
         const declared_fields = lookup.declaration.declaredRecordFields(&lookup.artifact.checked_types);
         if (declared_fields.len == 0) return null;
         const padding_types = lookup.padding_field_types;
+        const layout_value = self.layouts.getLayout(nominal_layout.layout_idx);
+        if (layout_value.tag != .struct_) return null;
+        const struct_idx = layout_value.getStruct().idx;
+
+        const committed_fields = self.layouts.getStructInfo(layout_value).fields;
 
         // Each named declared field reads its converted shape from the backing
-        // record (matched by name); each nonzero unnamed field becomes a padding
-        // spacer whose size is its declared type's size and whose alignment is 1.
+        // record (matched by name); each unnamed field reads its committed
+        // padding size, alignment, and offsets from the store.
         const collected = try self.gpa.alloc(CollectedRecordField, declared_fields.len);
         var populated: usize = 0;
         errdefer self.freeCollectedRecordFields(collected, populated);
@@ -1446,19 +1502,37 @@ const TypeTable = struct {
                     if (padding_cursor >= padding_types.len) {
                         glueInvariant("nominal declaration had more padding fields than padding types", .{});
                     }
-                    const padding_ty = padding_types[padding_cursor];
+                    _ = padding_types[padding_cursor];
                     padding_cursor += 1;
-                    const padding_type_id = try self.getOrInsert(lookup.artifact, padding_ty);
-                    const sa = self.getSizeAlign(padding_type_id);
-                    if (sa.size == 0) continue;
+                    if (populated >= committed_fields.len) {
+                        glueInvariant("nominal declaration had more padding fields than committed layout fields", .{});
+                    }
+                    const committed_field = committed_fields.get(@intCast(populated));
+                    if (!committed_field.is_padding) {
+                        glueInvariant("nominal padding field did not line up with committed padding field", .{});
+                    }
+                    const size_32 = self.layouts.getStructFieldSizeAt(struct_idx, @intCast(populated), .u32);
+                    const alignment_32 = self.layouts.getStructFieldAlignmentAt(struct_idx, @intCast(populated), .u32);
+                    const size_64 = self.layouts.getStructFieldSizeAt(struct_idx, @intCast(populated), .u64);
+                    const alignment_64 = self.layouts.getStructFieldAlignmentAt(struct_idx, @intCast(populated), .u64);
+                    const native: SizeAlign = switch (self.target_usize) {
+                        .u32 => .{ .size = size_32, .alignment = alignment_32 },
+                        .u64 => .{ .size = size_64, .alignment = alignment_64 },
+                    };
 
                     const name = try std.fmt.allocPrint(self.gpa, "_pad{d}", .{pad_index});
                     pad_index += 1;
                     collected[populated] = .{
                         .name = name,
                         .type_id = 0,
-                        .size = sa.size,
-                        .alignment = 1,
+                        .size = native.size,
+                        .alignment = native.alignment,
+                        .size_32 = size_32,
+                        .alignment_32 = alignment_32,
+                        .offset_32 = self.layouts.getStructFieldOffsetAt(struct_idx, @intCast(populated), .u32),
+                        .size_64 = size_64,
+                        .alignment_64 = alignment_64,
+                        .offset_64 = self.layouts.getStructFieldOffsetAt(struct_idx, @intCast(populated), .u64),
                         .is_padding = true,
                     };
                     populated += 1;
@@ -1467,12 +1541,33 @@ const TypeTable = struct {
                     const field_name = lookup.artifact.canonical_names.recordFieldLabelText(field_name_id);
                     const match = backingFieldByName(backing, field_name) orelse
                         glueInvariant("nominal declaration field '{s}' missing from backing record", .{field_name});
+                    if (populated >= committed_fields.len) {
+                        glueInvariant("nominal declaration had more named fields than committed layout fields", .{});
+                    }
+                    const committed_field = committed_fields.get(@intCast(populated));
+                    if (committed_field.is_padding) {
+                        glueInvariant("nominal named field lined up with committed padding field", .{});
+                    }
+                    const size_32 = self.layouts.getStructFieldSizeAt(struct_idx, @intCast(populated), .u32);
+                    const alignment_32 = self.layouts.getStructFieldAlignmentAt(struct_idx, @intCast(populated), .u32);
+                    const size_64 = self.layouts.getStructFieldSizeAt(struct_idx, @intCast(populated), .u64);
+                    const alignment_64 = self.layouts.getStructFieldAlignmentAt(struct_idx, @intCast(populated), .u64);
+                    const native: SizeAlign = switch (self.target_usize) {
+                        .u32 => .{ .size = size_32, .alignment = alignment_32 },
+                        .u64 => .{ .size = size_64, .alignment = alignment_64 },
+                    };
                     const name = try self.gpa.dupe(u8, field_name);
                     collected[populated] = .{
                         .name = name,
                         .type_id = match.type_id,
-                        .size = match.size,
-                        .alignment = match.alignment,
+                        .size = native.size,
+                        .alignment = native.alignment,
+                        .size_32 = size_32,
+                        .alignment_32 = alignment_32,
+                        .offset_32 = self.layouts.getStructFieldOffsetAt(struct_idx, @intCast(populated), .u32),
+                        .size_64 = size_64,
+                        .alignment_64 = alignment_64,
+                        .offset_64 = self.layouts.getStructFieldOffsetAt(struct_idx, @intCast(populated), .u64),
                         .is_padding = false,
                     };
                     populated += 1;
@@ -1489,30 +1584,16 @@ const TypeTable = struct {
         if (padding_cursor != padding_types.len) {
             glueInvariant("nominal declaration had more padding types than padding fields", .{});
         }
+        if (populated != committed_fields.len) {
+            glueInvariant("nominal declaration field count {d} did not match committed field count {d}", .{ populated, committed_fields.len });
+        }
         const collected_fields = if (populated == collected.len)
             collected
         else
             try self.gpa.realloc(collected, populated);
 
-        // Declared order, verbatim, with C-style padding inserted between fields as
-        // alignment requires (the padding amount can differ on 32- vs 64-bit).
-        var max_alignment: u64 = 1;
-        var offset: u64 = 0;
-        for (collected_fields) |field| {
-            if (field.alignment > max_alignment) max_alignment = field.alignment;
-            if (field.alignment > 0) {
-                const rem = offset % field.alignment;
-                if (rem != 0) offset += field.alignment - rem;
-            }
-            offset += field.size;
-        }
-        var record_size = offset;
-        if (max_alignment > 0) {
-            const rem = record_size % max_alignment;
-            if (rem != 0) record_size += max_alignment - rem;
-        }
-
-        return .{ .fields = collected_fields, .size = record_size, .alignment = max_alignment };
+        const native = nominal_layout.native(self.target_usize);
+        return .{ .fields = collected_fields, .size = native.size, .alignment = native.alignment };
     }
 
     /// Finds a backing record field by its name text, returning its converted
@@ -1530,21 +1611,24 @@ const TypeTable = struct {
     fn convertRecord(
         self: *TypeTable,
         artifact: *const CheckedArtifact.CheckedModuleArtifact,
+        checked_type: CheckedArtifact.CheckedTypeId,
         fields: []const CheckedArtifact.CheckedRecordField,
         ext: ?CheckedArtifact.CheckedTypeId,
     ) Allocator.Error!CollectedTypeRepr {
         var all_fields = std.ArrayList(CheckedArtifact.CheckedRecordField).empty;
         defer all_fields.deinit(self.gpa);
         try appendRecordRowFields(self.gpa, artifact, fields, ext, &all_fields);
-        return self.convertRecordFields(artifact, all_fields.items);
+        return self.convertRecordFields(artifact, checked_type, all_fields.items);
     }
 
     fn convertRecordFields(
         self: *TypeTable,
         artifact: *const CheckedArtifact.CheckedModuleArtifact,
+        checked_type: CheckedArtifact.CheckedTypeId,
         fields: []const CheckedArtifact.CheckedRecordField,
     ) Allocator.Error!CollectedTypeRepr {
-        if (fields.len == 0) return .unit;
+        if (fields.len == 0) return .{ .unit = self.layoutFactsForIdx(.zst) };
+        const record_layout = try self.layoutFactsForCheckedType(artifact, checked_type);
 
         const field_type_ids = try self.gpa.alloc(u64, fields.len);
         defer self.gpa.free(field_type_ids);
@@ -1552,68 +1636,67 @@ const TypeTable = struct {
             field_type_ids[i] = try self.getOrInsert(artifact, field.ty);
         }
 
-        const field_sizes = try self.gpa.alloc(SizeAlign, fields.len);
-        defer self.gpa.free(field_sizes);
-        for (0..fields.len) |i| {
-            field_sizes[i] = self.getSizeAlign(field_type_ids[i]);
+        const record_layout_value = self.layouts.getLayout(record_layout.layout_idx);
+        if (record_layout_value.tag != .struct_) glueInvariant("record type committed to non-struct layout", .{});
+        const record_struct_idx = record_layout_value.getStruct().idx;
+        const record_info = self.layouts.getStructInfo(record_layout_value);
+        if (record_info.fields.len != fields.len) {
+            glueInvariant("record committed field count mismatch: expected {d}, found {d}", .{ fields.len, record_info.fields.len });
         }
 
-        // Structural records order by descending sort key then ascending field
-        // name, computed by the shared field-order module the layout store uses.
-        const structural = try self.gpa.alloc(layout.field_order.StructuralField, fields.len);
-        defer self.gpa.free(structural);
-        for (fields, 0..) |field, i| {
-            structural[i] = .{
-                .sort_key = self.getSortKey(field_type_ids[i]),
-                .name = artifact.canonical_names.recordFieldLabelText(field.name),
-            };
-        }
-        const order = try self.gpa.alloc(u16, fields.len);
-        defer self.gpa.free(order);
-        layout.field_order.computeStructuralFieldOrder(structural, order);
-
-        const collected_fields = try self.gpa.alloc(CollectedRecordField, fields.len);
-        var max_alignment: u64 = 0;
-        var current_offset: u64 = 0;
-        for (order, 0..) |src_idx, dst_idx| {
-            const f_size = field_sizes[src_idx].size;
-            const f_align = field_sizes[src_idx].alignment;
-            if (f_align > max_alignment) max_alignment = f_align;
-            if (f_align > 0) {
-                const rem = current_offset % f_align;
-                if (rem != 0) current_offset += f_align - rem;
+        const collected_fields = try self.gpa.alloc(CollectedRecordField, record_info.fields.len);
+        var populated: usize = 0;
+        errdefer self.freeCollectedRecordFields(collected_fields, populated);
+        for (0..record_info.fields.len) |dst_idx| {
+            const committed_field = record_info.fields.get(@intCast(dst_idx));
+            if (committed_field.is_padding) {
+                glueInvariant("structural record committed an unexpected padding field", .{});
             }
-            current_offset += f_size;
-
+            const src_idx: usize = committed_field.index;
+            if (src_idx >= fields.len) {
+                glueInvariant("record committed field index {d} out of bounds for {d} fields", .{ src_idx, fields.len });
+            }
+            const size_32 = self.layouts.getStructFieldSizeAt(record_struct_idx, @intCast(dst_idx), .u32);
+            const alignment_32 = self.layouts.getStructFieldAlignmentAt(record_struct_idx, @intCast(dst_idx), .u32);
+            const size_64 = self.layouts.getStructFieldSizeAt(record_struct_idx, @intCast(dst_idx), .u64);
+            const alignment_64 = self.layouts.getStructFieldAlignmentAt(record_struct_idx, @intCast(dst_idx), .u64);
+            const native: SizeAlign = switch (self.target_usize) {
+                .u32 => .{ .size = size_32, .alignment = alignment_32 },
+                .u64 => .{ .size = size_64, .alignment = alignment_64 },
+            };
             collected_fields[dst_idx] = .{
                 .name = try self.gpa.dupe(u8, artifact.canonical_names.recordFieldLabelText(fields[src_idx].name)),
                 .type_id = field_type_ids[src_idx],
-                .size = f_size,
-                .alignment = f_align,
+                .size = native.size,
+                .alignment = native.alignment,
+                .size_32 = size_32,
+                .alignment_32 = alignment_32,
+                .offset_32 = self.layouts.getStructFieldOffsetAt(record_struct_idx, @intCast(dst_idx), .u32),
+                .size_64 = size_64,
+                .alignment_64 = alignment_64,
+                .offset_64 = self.layouts.getStructFieldOffsetAt(record_struct_idx, @intCast(dst_idx), .u64),
             };
-        }
-
-        var record_size = current_offset;
-        if (max_alignment > 0) {
-            const rem = record_size % max_alignment;
-            if (rem != 0) record_size += max_alignment - rem;
+            populated += 1;
         }
 
         return .{ .record = .{
             .name = "",
             .anonymous = true,
             .fields = collected_fields,
-            .size = record_size,
-            .alignment = max_alignment,
+            .size = record_layout.native(self.target_usize).size,
+            .alignment = record_layout.native(self.target_usize).alignment,
+            .layout = record_layout,
         } };
     }
 
     fn convertTuple(
         self: *TypeTable,
         artifact: *const CheckedArtifact.CheckedModuleArtifact,
+        checked_type: CheckedArtifact.CheckedTypeId,
         elems: []const CheckedArtifact.CheckedTypeId,
     ) Allocator.Error!CollectedTypeRepr {
-        if (elems.len == 0) return .unit;
+        if (elems.len == 0) return .{ .unit = self.layoutFactsForIdx(.zst) };
+        const tuple_layout = try self.layoutFactsForCheckedType(artifact, checked_type);
 
         // Convert tuple elements as record fields with positional names (_0, _1, ...)
         const field_type_ids = try self.gpa.alloc(u64, elems.len);
@@ -1622,88 +1705,63 @@ const TypeTable = struct {
             field_type_ids[i] = try self.getOrInsert(artifact, elem);
         }
 
-        const field_sizes = try self.gpa.alloc(SizeAlign, elems.len);
-        defer self.gpa.free(field_sizes);
-        for (0..elems.len) |i| {
-            field_sizes[i] = self.getSizeAlign(field_type_ids[i]);
+        const tuple_layout_value = self.layouts.getLayout(tuple_layout.layout_idx);
+        if (tuple_layout_value.tag != .struct_) glueInvariant("tuple type committed to non-struct layout", .{});
+        const tuple_struct_idx = tuple_layout_value.getStruct().idx;
+        const tuple_info = self.layouts.getStructInfo(tuple_layout_value);
+        if (tuple_info.fields.len != elems.len) {
+            glueInvariant("tuple committed field count mismatch: expected {d}, found {d}", .{ elems.len, tuple_info.fields.len });
         }
 
-        // Generate positional field names (_0, _1, ...) before sorting
-        const field_names = try self.gpa.alloc([]const u8, elems.len);
-        defer self.gpa.free(field_names);
-        for (0..elems.len) |i| {
-            field_names[i] = try std.fmt.allocPrint(self.gpa, "_{d}", .{i});
-        }
-
-        // Sort by sort key descending, then name ascending (matching Roc ABI). The
-        // sort key is target-independent (a pointer sorts between 4- and 8-byte
-        // alignment), so the element order matches the layout store on both targets.
-        const field_sort_keys = try self.gpa.alloc(layout.SortKey, elems.len);
-        defer self.gpa.free(field_sort_keys);
-        for (0..elems.len) |i| {
-            field_sort_keys[i] = self.getSortKey(field_type_ids[i]);
-        }
-
-        var field_indices = try self.gpa.alloc(usize, elems.len);
-        defer self.gpa.free(field_indices);
-        for (0..elems.len) |i| {
-            field_indices[i] = i;
-        }
-
-        const SortCtx = struct {
-            sort_keys: []const layout.SortKey,
-            names: []const []const u8,
-
-            pub fn lessThan(ctx: @This(), a: usize, b: usize) bool {
-                if (ctx.sort_keys[a] != ctx.sort_keys[b]) {
-                    return ctx.sort_keys[a].sortsBefore(ctx.sort_keys[b]);
-                }
-                return std.mem.order(u8, ctx.names[a], ctx.names[b]) == .lt;
+        const collected_fields = try self.gpa.alloc(CollectedRecordField, tuple_info.fields.len);
+        var populated: usize = 0;
+        errdefer self.freeCollectedRecordFields(collected_fields, populated);
+        for (0..tuple_info.fields.len) |dst_idx| {
+            const committed_field = tuple_info.fields.get(@intCast(dst_idx));
+            if (committed_field.is_padding) {
+                glueInvariant("tuple committed an unexpected padding field", .{});
             }
-        };
-        std.mem.sort(usize, field_indices, SortCtx{ .sort_keys = field_sort_keys, .names = field_names }, SortCtx.lessThan);
-
-        const collected_fields = try self.gpa.alloc(CollectedRecordField, elems.len);
-        var max_alignment: u64 = 0;
-        var current_offset: u64 = 0;
-        for (field_indices, 0..) |src_idx, dst_idx| {
-            const f_size = field_sizes[src_idx].size;
-            const f_align = field_sizes[src_idx].alignment;
-
-            if (f_align > max_alignment) max_alignment = f_align;
-
-            if (f_align > 0) {
-                const rem = current_offset % f_align;
-                if (rem != 0) current_offset += f_align - rem;
+            const src_idx: usize = committed_field.index;
+            if (src_idx >= elems.len) {
+                glueInvariant("tuple committed field index {d} out of bounds for {d} fields", .{ src_idx, elems.len });
             }
-            current_offset += f_size;
-
-            collected_fields[dst_idx] = .{
-                .name = field_names[src_idx],
-                .type_id = field_type_ids[src_idx],
-                .size = f_size,
-                .alignment = f_align,
+            const size_32 = self.layouts.getStructFieldSizeAt(tuple_struct_idx, @intCast(dst_idx), .u32);
+            const alignment_32 = self.layouts.getStructFieldAlignmentAt(tuple_struct_idx, @intCast(dst_idx), .u32);
+            const size_64 = self.layouts.getStructFieldSizeAt(tuple_struct_idx, @intCast(dst_idx), .u64);
+            const alignment_64 = self.layouts.getStructFieldAlignmentAt(tuple_struct_idx, @intCast(dst_idx), .u64);
+            const native: SizeAlign = switch (self.target_usize) {
+                .u32 => .{ .size = size_32, .alignment = alignment_32 },
+                .u64 => .{ .size = size_64, .alignment = alignment_64 },
             };
-        }
-
-        var record_size = current_offset;
-        if (max_alignment > 0) {
-            const rem = record_size % max_alignment;
-            if (rem != 0) record_size += max_alignment - rem;
+            collected_fields[dst_idx] = .{
+                .name = try std.fmt.allocPrint(self.gpa, "_{d}", .{src_idx}),
+                .type_id = field_type_ids[src_idx],
+                .size = native.size,
+                .alignment = native.alignment,
+                .size_32 = size_32,
+                .alignment_32 = alignment_32,
+                .offset_32 = self.layouts.getStructFieldOffsetAt(tuple_struct_idx, @intCast(dst_idx), .u32),
+                .size_64 = size_64,
+                .alignment_64 = alignment_64,
+                .offset_64 = self.layouts.getStructFieldOffsetAt(tuple_struct_idx, @intCast(dst_idx), .u64),
+            };
+            populated += 1;
         }
 
         return .{ .record = .{
             .name = "",
             .anonymous = true,
             .fields = collected_fields,
-            .size = record_size,
-            .alignment = max_alignment,
+            .size = tuple_layout.native(self.target_usize).size,
+            .alignment = tuple_layout.native(self.target_usize).alignment,
+            .layout = tuple_layout,
         } };
     }
 
     fn convertTagUnion(
         self: *TypeTable,
         artifact: *const CheckedArtifact.CheckedModuleArtifact,
+        checked_type: CheckedArtifact.CheckedTypeId,
         tags: []const CheckedArtifact.CheckedTag,
         ext: CheckedArtifact.CheckedTypeId,
     ) Allocator.Error!CollectedTypeRepr {
@@ -1711,7 +1769,15 @@ const TypeTable = struct {
         defer all_tags.deinit(self.gpa);
         try appendTagRowTags(self.gpa, artifact, tags, ext, &all_tags);
 
-        if (all_tags.items.len == 0) return .unit;
+        if (all_tags.items.len == 0) return .{ .unit = self.layoutFactsForIdx(.zst) };
+        const union_layout = try self.layoutFactsForCheckedType(artifact, checked_type);
+        const union_layout_value = self.layouts.getLayout(union_layout.layout_idx);
+        const union_is_tag = union_layout_value.tag == .tag_union;
+        const union_tag_idx = if (union_is_tag) union_layout_value.getTagUnion().idx else undefined;
+        const union_variants = if (union_is_tag)
+            self.layouts.getTagUnionVariants(self.layouts.getTagUnionData(union_tag_idx))
+        else
+            undefined;
 
         // Build sortable array of tag indices
         var tag_indices = try self.gpa.alloc(usize, all_tags.items.len);
@@ -1733,10 +1799,8 @@ const TypeTable = struct {
         };
         std.mem.sort(usize, tag_indices, SortCtx{ .tags = all_tags.items, .names = &artifact.canonical_names }, SortCtx.lessThan);
 
-        // Collect tags and compute per-variant payload layout
+        // Collect tags and read each committed variant payload layout.
         const collected_tags = try self.gpa.alloc(CollectedTagInfo, all_tags.items.len);
-        var max_payload_size: u64 = 0;
-        var max_payload_alignment: u64 = 0;
 
         // Also build auto-generated name from variant names joined with "Or"
         var name_len: usize = 0;
@@ -1759,33 +1823,23 @@ const TypeTable = struct {
                 payload_ids[i] = try self.getOrInsert(artifact, arg);
             }
 
-            // Compute payload as a tuple: sequential fields with alignment padding
-            var payload_size: u64 = 0;
-            var payload_alignment: u64 = 0;
-            for (payload_ids) |pid| {
-                const sa = self.getSizeAlign(pid);
-                if (sa.alignment > payload_alignment) payload_alignment = sa.alignment;
-                // Align current offset
-                if (sa.alignment > 0) {
-                    const rem = payload_size % sa.alignment;
-                    if (rem != 0) payload_size += sa.alignment - rem;
-                }
-                payload_size += sa.size;
-            }
-            // Round up to payload alignment
-            if (payload_alignment > 0) {
-                const rem = payload_size % payload_alignment;
-                if (rem != 0) payload_size += payload_alignment - rem;
-            }
-
-            if (payload_size > max_payload_size) max_payload_size = payload_size;
-            if (payload_alignment > max_payload_alignment) max_payload_alignment = payload_alignment;
+            const payload_layout_idx = if (union_is_tag)
+                union_variants.get(@intCast(dst_idx)).payload_layout
+            else
+                layout.Idx.zst;
+            const payload_layout = self.layoutFactsForIdx(payload_layout_idx);
+            const payload_native = payload_layout.native(self.target_usize);
 
             collected_tags[dst_idx] = .{
                 .name = try self.gpa.dupe(u8, name_text),
                 .payload_ids = payload_ids,
-                .payload_size = payload_size,
-                .payload_alignment = payload_alignment,
+                .payload_size = payload_native.size,
+                .payload_alignment = payload_native.alignment,
+                .payload_size_32 = payload_layout.size_32,
+                .payload_alignment_32 = payload_layout.alignment_32,
+                .payload_size_64 = payload_layout.size_64,
+                .payload_alignment_64 = payload_layout.alignment_64,
+                .payload_layout_idx = payload_layout_idx,
             };
 
             // Build auto-name
@@ -1804,40 +1858,25 @@ const TypeTable = struct {
             }
         }
 
-        // Compute discriminant size/alignment from tag count.
-        // Single-variant tag unions have no discriminant (ZigGlue unwraps them to payload).
-        const disc_size: u64 = if (all_tags.items.len <= 1) 0 else layout.TagUnionData.discriminantSize(all_tags.items.len);
-        const disc_align: u64 = disc_size;
-
-        // Compute overall tag union layout: payload at offset 0, discriminant at end
-        // disc_offset = alignForward(max_payload_size, disc_align)
-        var disc_offset = max_payload_size;
-        if (disc_align > 0) {
-            const rem = disc_offset % disc_align;
-            if (rem != 0) disc_offset += disc_align - rem;
-        }
-
-        const total_align = @max(max_payload_alignment, disc_align);
-        // total_size = alignForward(disc_offset + disc_size, total_align)
-        var total_size = disc_offset + disc_size;
-        if (total_align > 0) {
-            const rem = total_size % total_align;
-            if (rem != 0) total_size += total_align - rem;
-        }
-
         const auto_name: []const u8 = auto_name_buf[0..name_pos];
+        const native = union_layout.native(self.target_usize);
 
         return .{ .tag_union = .{
             .name = auto_name,
             .tags = collected_tags,
-            .size = total_size,
-            .alignment = total_align,
+            .size = native.size,
+            .alignment = native.alignment,
+            .discriminant_size = if (union_is_tag) self.layouts.getTagUnionDiscriminantSize(union_tag_idx) else 0,
+            .discriminant_offset_32 = if (union_is_tag) self.layouts.getTagUnionDiscriminantOffsetAt(union_tag_idx, .u32) else 0,
+            .discriminant_offset_64 = if (union_is_tag) self.layouts.getTagUnionDiscriminantOffsetAt(union_tag_idx, .u64) else 0,
+            .layout = union_layout,
         } };
     }
 
     fn convertFunc(
         self: *TypeTable,
         artifact: *const CheckedArtifact.CheckedModuleArtifact,
+        checked_type: CheckedArtifact.CheckedTypeId,
         func: CheckedArtifact.CheckedFunctionType,
     ) Allocator.Error!CollectedTypeRepr {
         const arg_ids = try self.gpa.alloc(u64, func.args.len);
@@ -1849,6 +1888,7 @@ const TypeTable = struct {
         return .{ .function = .{
             .arg_ids = arg_ids,
             .ret_id = ret_id,
+            .layout = try self.layoutFactsForCheckedType(artifact, checked_type),
         } };
     }
 
@@ -2103,9 +2143,15 @@ fn writeRecordFieldTypeRepr(
 ) void {
     writer.zeroValue(value_base, record_field_layout);
     writer.writeField(value_base, record_field_layout, "RecordField", "alignment", u64, field.alignment);
+    writer.writeField(value_base, record_field_layout, "RecordField", "alignment_32", u64, field.alignment_32);
+    writer.writeField(value_base, record_field_layout, "RecordField", "alignment_64", u64, field.alignment_64);
     writer.writeField(value_base, record_field_layout, "RecordField", "is_padding", bool, field.is_padding);
     writer.writeField(value_base, record_field_layout, "RecordField", "name", RocStr, createBigRocStr(field.name, writer.roc_ops));
+    writer.writeField(value_base, record_field_layout, "RecordField", "offset_32", u64, field.offset_32);
+    writer.writeField(value_base, record_field_layout, "RecordField", "offset_64", u64, field.offset_64);
     writer.writeField(value_base, record_field_layout, "RecordField", "size", u64, field.size);
+    writer.writeField(value_base, record_field_layout, "RecordField", "size_32", u64, field.size_32);
+    writer.writeField(value_base, record_field_layout, "RecordField", "size_64", u64, field.size_64);
     writer.writeField(value_base, record_field_layout, "RecordField", "type_id", u64, field.type_id);
 }
 
@@ -2133,7 +2179,11 @@ fn writeTagVariant(
     writer.writeField(value_base, tag_variant_layout, "TagVariant", "name", RocStr, createBigRocStr(tag.name, writer.roc_ops));
     writer.writeField(value_base, tag_variant_layout, "TagVariant", "payload", RocList, buildU64RocList(writer, tag.payload_ids, payload_slot.layout_idx));
     writer.writeField(value_base, tag_variant_layout, "TagVariant", "payload_alignment", u64, tag.payload_alignment);
+    writer.writeField(value_base, tag_variant_layout, "TagVariant", "payload_alignment_32", u64, tag.payload_alignment_32);
+    writer.writeField(value_base, tag_variant_layout, "TagVariant", "payload_alignment_64", u64, tag.payload_alignment_64);
     writer.writeField(value_base, tag_variant_layout, "TagVariant", "payload_size", u64, tag.payload_size);
+    writer.writeField(value_base, tag_variant_layout, "TagVariant", "payload_size_32", u64, tag.payload_size_32);
+    writer.writeField(value_base, tag_variant_layout, "TagVariant", "payload_size_64", u64, tag.payload_size_64);
 }
 
 fn buildTagVariantList(
@@ -2160,9 +2210,9 @@ fn writeTypeRepr(
 
     const tag_name: []const u8 = switch (entry) {
         .bool_ => "RocBool",
-        .box => |inner_id| {
+        .box => |box| {
             const tag_index = writer.tagIndex("TypeRepr", "RocBox");
-            writer.writeValue(value_base, u64, inner_id);
+            writer.writeValue(value_base, u64, box.inner_id);
             writer.writeTagDiscriminant(value_base, type_repr_layout, tag_index);
             return;
         },
@@ -2181,10 +2231,10 @@ fn writeTypeRepr(
         .u128_ => "RocU128",
         .str_ => "RocStr",
         .unit => "RocUnit",
-        .list => |elem_id| {
+        .list => |list| {
             const tag_index = writer.tagIndex("TypeRepr", "RocList");
             _ = writer.variantPayloadLayout(type_repr_layout, tag_index);
-            writer.writeValue(value_base, u64, elem_id);
+            writer.writeValue(value_base, u64, list.elem_id);
             writer.writeTagDiscriminant(value_base, type_repr_layout, tag_index);
             return;
         },
@@ -2204,10 +2254,14 @@ fn writeTypeRepr(
             writer.zeroValue(value_base, payload_layout);
             const fields_slot = writer.recordField(value_base, payload_layout, "RecordRepr", "fields");
             writer.writeField(value_base, payload_layout, "RecordRepr", "alignment", u64, rec.alignment);
+            writer.writeField(value_base, payload_layout, "RecordRepr", "alignment_32", u64, rec.layout.alignment_32);
+            writer.writeField(value_base, payload_layout, "RecordRepr", "alignment_64", u64, rec.layout.alignment_64);
             writer.writeField(value_base, payload_layout, "RecordRepr", "anonymous", bool, rec.anonymous);
             writer.writeField(value_base, payload_layout, "RecordRepr", "fields", RocList, buildRecordFieldTypeReprList(writer, rec.fields, fields_slot.layout_idx));
             writer.writeField(value_base, payload_layout, "RecordRepr", "name", RocStr, createBigRocStr(rec.name, writer.roc_ops));
             writer.writeField(value_base, payload_layout, "RecordRepr", "size", u64, rec.size);
+            writer.writeField(value_base, payload_layout, "RecordRepr", "size_32", u64, rec.layout.size_32);
+            writer.writeField(value_base, payload_layout, "RecordRepr", "size_64", u64, rec.layout.size_64);
             writer.writeTagDiscriminant(value_base, type_repr_layout, tag_index);
             return;
         },
@@ -2217,16 +2271,23 @@ fn writeTypeRepr(
             writer.zeroValue(value_base, payload_layout);
             const tags_slot = writer.recordField(value_base, payload_layout, "TagUnionRepr", "tags");
             writer.writeField(value_base, payload_layout, "TagUnionRepr", "alignment", u64, tu.alignment);
+            writer.writeField(value_base, payload_layout, "TagUnionRepr", "alignment_32", u64, tu.layout.alignment_32);
+            writer.writeField(value_base, payload_layout, "TagUnionRepr", "alignment_64", u64, tu.layout.alignment_64);
+            writer.writeField(value_base, payload_layout, "TagUnionRepr", "discriminant_offset_32", u64, tu.discriminant_offset_32);
+            writer.writeField(value_base, payload_layout, "TagUnionRepr", "discriminant_offset_64", u64, tu.discriminant_offset_64);
+            writer.writeField(value_base, payload_layout, "TagUnionRepr", "discriminant_size", u64, tu.discriminant_size);
             writer.writeField(value_base, payload_layout, "TagUnionRepr", "name", RocStr, createBigRocStr(tu.name, writer.roc_ops));
             writer.writeField(value_base, payload_layout, "TagUnionRepr", "size", u64, tu.size);
+            writer.writeField(value_base, payload_layout, "TagUnionRepr", "size_32", u64, tu.layout.size_32);
+            writer.writeField(value_base, payload_layout, "TagUnionRepr", "size_64", u64, tu.layout.size_64);
             writer.writeField(value_base, payload_layout, "TagUnionRepr", "tags", RocList, buildTagVariantList(writer, tu.tags, tags_slot.layout_idx));
             writer.writeTagDiscriminant(value_base, type_repr_layout, tag_index);
             return;
         },
-        .unknown => |text| {
+        .unknown => |unknown| {
             const tag_index = writer.tagIndex("TypeRepr", "RocUnknown");
             _ = writer.variantPayloadLayout(type_repr_layout, tag_index);
-            writer.writeValue(value_base, RocStr, createBigRocStr(text, writer.roc_ops));
+            writer.writeValue(value_base, RocStr, createBigRocStr(unknown.name, writer.roc_ops));
             writer.writeTagDiscriminant(value_base, type_repr_layout, tag_index);
             return;
         },
