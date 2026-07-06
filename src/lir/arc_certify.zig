@@ -22,12 +22,71 @@
 //! consumption tolerates a transiently negative balance and relies on the
 //! per-path terminal balance check to flag a missing restore.
 //!
+//! ## Join points: dataflow fixpoint over a finite-height lattice
+//!
+//! Every jump into a join is summarized over the locals the join body reads
+//! before rebinding (`summarizeForJoin`): per name, an ownership mode drawn
+//! from `unbound`, `owned(units)`, `conditional_owned(cond, mask)`, or
+//! `borrowed(anchor)`, plus the must-alias partition of the names (`repr`).
+//! Rather than walking the body once per distinct summary — for a loop
+//! carrying K refcounted mutable locals whose body merges and re-splits
+//! their alias groups, the number of distinct partitions grows like the
+//! Bell number of K (B(6) = 203, B(12) = 4.2 million; issue 9658 was a
+//! valid program that outgrew the old per-summary enumeration cap) —
+//! summaries are *joined* and the body is walked once per joined state
+//! (`JoinGroup`, `absorbJoinSummary`):
+//!
+//! - Summaries agreeing on every name's mode (same class, same presence
+//!   condition, same borrow anchor) share one group. The group's partition
+//!   is the meet (common refinement) of the members' partitions, and each
+//!   fine class's balance is attributed from the members' class balances by
+//!   constraint propagation (`meetGroupSummary`).
+//! - Summaries whose modes disagree go to separate groups. This is the
+//!   refinement rule: the abstraction splits exactly on facts real in-edges
+//!   disagree about, so every group is witnessed by at least one real jump
+//!   and a group-walk finding always corresponds to a real entry state. In
+//!   the worst case this degenerates to one group per distinct summary —
+//!   the pre-fixpoint exact behavior — but with no cap and no skip path.
+//!
+//! Why one walk under the group's meet partition covers every member
+//! (soundness of the join): a member's entry state is the group state with
+//! some fine classes merged, each merged class's balance the sum of its
+//! parts (that is exactly the attribution constraint). Every certifier
+//! check is monotone under that merge: a release through name x needs a
+//! unit on x's fine class, and the merged class holds the sum of the fine
+//! remainders, which stays >= any single part on every walk prefix; the
+//! per-path terminal check demands all fine balances hit exactly zero, so
+//! their sums do too; and a fine value that is live (a unit remaining, a
+//! live borrow anchor, or a live holder chain) only gains liveness sources
+//! when merged with more names' units. So a passing walk under the finer
+//! partition implies a passing walk under any member's coarser one; the
+//! transfer functions are monotone in the entry state, and the walked state
+//! only moves down the refinement order as members arrive.
+//!
+//! Termination and re-walk bound: a group's partition strictly refines at
+//! most (relevant locals - 1) times, and a group is only re-walked when its
+//! partition refined, so each group walks at most n times — the lattice
+//! height replaces summary enumeration. Group *creation* is bounded by
+//! Dickson's lemma: mode vectors and partitions are finite, and among
+//! groups sharing both, balance vectors that keep growing pointwise are
+//! reported as a per-iteration accumulation finding after
+//! `balance_growth_finding_threshold` strictly-increasing witnesses (two
+//! mode- and partition-identical entries with different balances cannot
+//! both certify against the one shared body: every terminal path consumes a
+//! fixed unit count, so divergent balances either fail a walk or are
+//! shunted through jumps forever, which is unbounded refcount growth — a
+//! leak either way).
+//!
+//! The guaranteed property on a clean return: for every procedure — with no
+//! unverified residue and no capacity escape — every emitted schedule
+//! balances ownership on all paths: each unit is released or transferred
+//! exactly once, nothing is used after its value dies, and no borrowed
+//! value is released.
+//!
 //! A certification failure is a compiler bug in ARC insertion. The production
 //! entry point panics in debug builds; release builds never run the certifier.
 
 const std = @import("std");
-const builtin = @import("builtin");
-const build_options = @import("build_options");
 const collections = @import("collections");
 const core = @import("lir_core");
 const layout_mod = @import("layout");
@@ -39,21 +98,14 @@ const LirStore = core.LirStore;
 const GuardedList = collections.GuardedList;
 const Allocator = std.mem.Allocator;
 
-/// Join-state budget for full-store certification. The production bound is
-/// written here in exactly one place; tests override it via `CertifyOptions`.
-pub const production_join_state_capacity: usize = 4096;
-const skipped_proc_record_limit = 16;
-const forbid_skips = builtin.mode == .Debug and build_options.forbid_arc_certifier_skips;
-
 /// Errors produced while certifying: allocation failure or a violation of
 /// the ownership rules (a compiler bug in ARC insertion).
 /// `Certification` is a positive finding: ARC insertion produced refcount-incorrect code
 /// (a leak, a use-after-free, or a balance mismatch) — a real bug, so it aborts the build.
-/// `CertifierCapacityExceeded` is an incompleteness signal, NOT a finding: the certifier could
-/// not finish proving a procedure within its budget (its join-state enumeration grew too large).
-/// It must never abort a valid build — `certifyStore` catches it and leaves that one procedure
-/// unverified, continuing with the rest.
-pub const CertifyError = error{ OutOfMemory, Certification, CertifierCapacityExceeded };
+/// The certifier has no incompleteness escape hatch: every procedure is
+/// verified to a fixpoint (see the join handling in `runSegment`), so a
+/// clean return means every emitted RC schedule was checked.
+pub const CertifyError = error{ OutOfMemory, Certification };
 
 /// Holds the first violation message for test inspection.
 pub const Diagnostic = struct {
@@ -68,15 +120,6 @@ pub const Diagnostic = struct {
     /// Lender/holder chain of the dead value at the violation.
     chain: [8]ChainLink = undefined,
     chain_len: usize = 0,
-    /// Number of procedures left unverified because their join-state enumeration
-    /// exceeded the certifier's budget (incompleteness, not a finding). Exposed for
-    /// tests/debugging; a nonzero value means certification was not exhaustive.
-    skipped_proc_count: usize = 0,
-    /// Storage for the first skipped procedures. Read it only through
-    /// `skippedSample`, which bounds the slice; entries past the sample are
-    /// undefined.
-    skipped_procs: [skipped_proc_record_limit]LIR.LirProcSpecId = undefined,
-
     pub const ChainLink = struct {
         value: u32,
         origin: LIR.LocalId,
@@ -96,23 +139,6 @@ pub const Diagnostic = struct {
             return;
         }).len;
     }
-
-    fn recordSkippedProc(self: *Diagnostic, proc_id: LIR.LirProcSpecId) void {
-        if (self.skipped_proc_count < self.skipped_procs.len) {
-            self.skipped_procs[self.skipped_proc_count] = proc_id;
-        }
-        self.skipped_proc_count += 1;
-    }
-
-    /// The bounded sample of skipped procedures: the first
-    /// `skipped_proc_record_limit` of the `skipped_proc_count` total.
-    pub fn skippedSample(self: *const Diagnostic) []const LIR.LirProcSpecId {
-        return self.skipped_procs[0..@min(self.skipped_proc_count, self.skipped_procs.len)];
-    }
-};
-
-const CertifyOptions = struct {
-    join_state_capacity: usize = production_join_state_capacity,
 };
 
 /// Certifies every proc body in the store. Returns `error.Certification`
@@ -124,18 +150,6 @@ pub fn certifyStore(
     sigs: arc_sig.SigTable,
     roots: []const LIR.LirProcSpecId,
     diag: *Diagnostic,
-) CertifyError!void {
-    return certifyStoreWithOptions(allocator, store, layouts, sigs, roots, diag, .{});
-}
-
-fn certifyStoreWithOptions(
-    allocator: Allocator,
-    store: *const LirStore,
-    layouts: *const layout_mod.Store,
-    sigs: arc_sig.SigTable,
-    roots: []const LIR.LirProcSpecId,
-    diag: *Diagnostic,
-    options: CertifyOptions,
 ) CertifyError!void {
     var rc_local = try allocator.alloc(bool, store.localCount());
     defer allocator.free(rc_local);
@@ -159,7 +173,6 @@ fn certifyStoreWithOptions(
         .join_bodies = std.AutoHashMap(LIR.JoinPointId, LIR.CFStmtId).init(allocator),
         .reads_before_rebind_cache = std.AutoHashMap(LIR.CFStmtId, std.bit_set.DynamicBitSetUnmanaged).init(allocator),
         .diag = diag,
-        .join_state_capacity = options.join_state_capacity,
     };
     defer certifier.deinit();
 
@@ -167,18 +180,7 @@ fn certifyStoreWithOptions(
         const proc_id: LIR.LirProcSpecId = @enumFromInt(@as(u32, @intCast(index)));
         const proc = store.getProcSpec(proc_id);
         const body = proc.body orelse continue;
-        certifier.certifyProc(proc_id, proc, body) catch |err| switch (err) {
-            // Incompleteness, not a finding: this procedure's join-state space exceeded the
-            // certifier's budget. Leave it unverified and keep certifying the rest, rather than
-            // failing a valid build. `certifyProc` resets all per-proc state on the next call, and
-            // its work stack is cleaned up on unwind, so skipping is safe. Real findings surface as
-            // `error.Certification` and still propagate.
-            error.CertifierCapacityExceeded => {
-                diag.recordSkippedProc(proc_id);
-                continue;
-            },
-            else => |e| return e,
-        };
+        try certifier.certifyProc(proc_id, proc, body);
     }
 }
 
@@ -340,9 +342,6 @@ pub fn certifyStoreOrPanic(
     var diag = Diagnostic{};
     certifyStore(allocator, store, layouts, sigs, roots, &diag) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
-        // `certifyStore` already catches this per-procedure (skips the proc), so it cannot reach
-        // here; handle it defensively as "nothing to report" rather than panicking.
-        error.CertifierCapacityExceeded => {},
         error.Certification => {
             var context = FailureContext{};
             for (diag.chain[0..diag.chain_len]) |link| {
@@ -362,33 +361,9 @@ pub fn certifyStoreOrPanic(
                 }
                 writeFailureContext(&context, store, sigs, proc_id, diag.context_stmt, diag.context_local, extra_locals[0..diag.chain_len]);
             }
-            if (diag.skipped_proc_count != 0) {
-                context.append("\n", .{});
-                writeSkippedProcReport(&context, store, &diag);
-            }
             std.debug.panic("ARC borrow certifier: {s}{s}", .{ diag.message(), context.text() });
         },
     };
-    const outcome = skipOutcome(diag.skipped_proc_count, forbid_skips);
-    if (outcome != .none) {
-        var context = FailureContext{};
-        writeSkippedProcReport(&context, store, &diag);
-        // When the debug stats compiler from #9787/#9789 lands, route this count there too.
-        switch (outcome) {
-            .none => unreachable,
-            .fail => std.debug.panic("{s}", .{context.text()}),
-            .warn => std.log.warn("{s}", .{context.text()}),
-        }
-    }
-}
-
-/// What `certifyStoreOrPanic` does about capacity skips. Split out from the
-/// wrapper so the escalation decision is unit-testable.
-const SkipOutcome = enum { none, warn, fail };
-
-fn skipOutcome(skipped_proc_count: usize, forbid: bool) SkipOutcome {
-    if (skipped_proc_count == 0) return .none;
-    return if (forbid) .fail else .warn;
 }
 
 /// Bounded, allocation-free text buffer for panic context. Output past the
@@ -407,27 +382,6 @@ const FailureContext = struct {
         self.len += written.len;
     }
 };
-
-fn writeSkippedProcReport(
-    context: *FailureContext,
-    store: *const LirStore,
-    diag: *const Diagnostic,
-) void {
-    context.append(
-        "ARC certifier skipped {d} procedure(s) whose join-state enumeration exceeded capacity; their RC schedules are UNVERIFIED.",
-        .{diag.skipped_proc_count},
-    );
-    const sample = diag.skippedSample();
-    for (sample) |proc_id| {
-        context.append("\n  proc={d}", .{@intFromEnum(proc_id)});
-        if (store.procDebugName(proc_id)) |name| {
-            context.append(" name={s}", .{name});
-        }
-    }
-    if (diag.skipped_proc_count > sample.len) {
-        context.append("\n  ... and {d} more", .{diag.skipped_proc_count - sample.len});
-    }
-}
 
 /// Writes every statement of the failing proc that mentions the implicated
 /// local, plus all join/jump structure, into the panic context buffer.
@@ -877,12 +831,38 @@ const JoinRecord = struct {
     maybe_uninitialized_params: LIR.LocalSpan,
     maybe_uninitialized_conditions: LIR.LocalSpan,
     maybe_uninitialized_condition_masks: LIR.U64Span,
-    /// Digests of entry states the body has been scheduled under. The body
-    /// is certified once per distinct jump state, exactly as shared switch
-    /// suffixes are re-walked per distinct inflowing state.
-    scheduled: std.AutoHashMap(u64, void),
-    /// Entry summaries pending a body walk.
-    pending: std.ArrayList([]LocalSummary),
+    /// Joined entry-state abstractions. Every jump summary is absorbed into
+    /// exactly one group (see `absorbJoinSummary`); the body is certified
+    /// once per group state, re-walked only when absorbing a summary
+    /// strictly refines the group's must-alias partition.
+    groups: std.ArrayList(JoinGroup),
+};
+
+/// One joined entry-state abstraction at a join point, covering every
+/// mode-compatible jump summary absorbed into it.
+///
+/// The group state is itself a summary vector: per dense proc-local, the
+/// per-name ownership mode (`class`, `condition`/`condition_mask`,
+/// `lender_repr`) is identical across all absorbed summaries, `repr` encodes
+/// the *meet* (common refinement) of their must-alias partitions, and
+/// `balance` carries the per-fine-class attributed units. Walking the body
+/// under this state certifies every absorbed summary at once — see the
+/// module doc comment for why a walk under the finer partition covers the
+/// coarser member states.
+const JoinGroup = struct {
+    summary: []LocalSummary,
+    /// A body walk with the group's current state is queued on the work
+    /// stack; refinements while queued are picked up when the walk starts.
+    queued: bool,
+};
+
+/// Result of absorbing one jump summary into a join's groups.
+const AbsorbOutcome = union(enum) {
+    /// The summary is covered by an already-walked group state.
+    covered,
+    /// This group must be (re)walked: it was created for the summary, or
+    /// absorbing the summary refined its partition.
+    walk: usize,
 };
 
 const MemoEntry = struct {
@@ -892,7 +872,12 @@ const MemoEntry = struct {
 
 const WorkItem = union(enum) {
     segment: Segment,
-    join_body: LIR.JoinPointId,
+    join_body: JoinWalk,
+};
+
+const JoinWalk = struct {
+    join: LIR.JoinPointId,
+    group: usize,
 };
 
 const Segment = struct {
@@ -926,7 +911,6 @@ const Certifier = struct {
     /// Scratch bitset over store locals, reused by join-relevance extension.
     relevant_scratch: std.bit_set.DynamicBitSetUnmanaged = .{},
     diag: *Diagnostic,
-    join_state_capacity: usize,
     /// Proc and statement being certified; written by `certifyProc` and
     /// `runSegment` before any read.
     current_proc: LIR.LirProcSpecId = undefined,
@@ -956,9 +940,8 @@ const Certifier = struct {
         var iter = self.records.valueIterator();
         while (iter.next()) |record| {
             record.relevant.deinit(self.allocator);
-            record.scheduled.deinit();
-            for (record.pending.items) |entry| self.allocator.free(entry);
-            record.pending.deinit(self.allocator);
+            for (record.groups.items) |group| self.allocator.free(group.summary);
+            record.groups.deinit(self.allocator);
         }
         self.records.clearRetainingCapacity();
     }
@@ -1286,6 +1269,247 @@ const Certifier = struct {
             state.bindValue(local, state.valueOf(self.proc_locals.items[entry.repr]));
         }
         return state;
+    }
+
+    /// Groups whose balance vectors sit pointwise strictly below a new
+    /// mode-identical, partition-identical summary are per-iteration
+    /// accumulation evidence: two such entries can never both certify
+    /// against the one shared body (every terminal path consumes a fixed
+    /// unit count), so distinct balances either fail a walk or are shunted
+    /// through jumps forever — unbounded refcount growth, a leak. Valid
+    /// inserter output keeps balances at 0 or 1 outside transient aggregate
+    /// windows, so a strictly-growing set this deep is reported as a
+    /// finding. Any infinite set of distinct balance vectors contains an
+    /// ascending subsequence (Dickson's lemma), so this bound also makes
+    /// group creation — and with it the whole fixpoint — structurally
+    /// terminating.
+    const balance_growth_finding_threshold = 8;
+
+    /// Absorbs one jump-entry summary into the join's groups.
+    ///
+    /// A group accepts the summary when every name's ownership mode matches
+    /// (`modesCompatible`); the group's must-alias partition then becomes
+    /// the meet of the two partitions and per-fine-class balances are
+    /// re-attributed (`meetGroupSummary`). A summary no group accepts
+    /// starts a new group, so refinement splits exactly along facts on
+    /// which real in-edges disagree — every group is witnessed by at least
+    /// one real jump, and a group walk can never manufacture a false
+    /// positive that no refinement traces back to a real entry state.
+    fn absorbJoinSummary(
+        self: *Certifier,
+        record: *JoinRecord,
+        summary: []const LocalSummary,
+        join_id: LIR.JoinPointId,
+    ) CertifyError!AbsorbOutcome {
+        var growth_witnesses: usize = 0;
+        for (record.groups.items, 0..) |*group, group_index| {
+            if (!modesCompatible(group.summary, summary)) continue;
+            switch (try self.meetGroupSummary(group, summary)) {
+                .unchanged => return .covered,
+                .refined => return .{ .walk = group_index },
+                .conflict => {
+                    if (summaryBalanceAbove(summary, group.summary)) {
+                        growth_witnesses += 1;
+                        if (growth_witnesses >= balance_growth_finding_threshold) {
+                            self.diag.context_proc = self.current_proc;
+                            return self.fail(
+                                "ownership balance grows without bound across jumps to join {d}: per-iteration accumulation",
+                                .{@intFromEnum(join_id)},
+                            );
+                        }
+                    }
+                },
+            }
+        }
+        const copy = try self.allocator.dupe(LocalSummary, summary);
+        errdefer self.allocator.free(copy);
+        try record.groups.append(self.allocator, .{ .summary = copy, .queued = false });
+        return .{ .walk = record.groups.items.len - 1 };
+    }
+
+    /// True when the two summaries assign every name the same ownership
+    /// mode: same class, same presence condition for conditional ownership,
+    /// and the same borrow anchor. Partition (`repr`) and balances are the
+    /// joinable components and are deliberately not compared here.
+    fn modesCompatible(a: []const LocalSummary, b: []const LocalSummary) bool {
+        for (a, b) |ga, sb| {
+            if (ga.class != sb.class) return false;
+            switch (ga.class) {
+                .unbound, .owned => {},
+                .conditional_owned => if (ga.condition != sb.condition or ga.condition_mask != sb.condition_mask) return false,
+                .borrowed => if (ga.lender_repr != sb.lender_repr) return false,
+            }
+        }
+        return true;
+    }
+
+    /// True when `b` and `a` have identical partitions and `a`'s balances
+    /// are pointwise >= `b`'s with at least one strictly greater.
+    fn summaryBalanceAbove(a: []const LocalSummary, b: []const LocalSummary) bool {
+        var strict = false;
+        for (a, b) |ea, eb| {
+            if (ea.repr != eb.repr) return false;
+            if (ea.class != .owned and ea.class != .conditional_owned) continue;
+            if (ea.balance < eb.balance) return false;
+            if (ea.balance > eb.balance) strict = true;
+        }
+        return strict;
+    }
+
+    const MeetOutcome = enum {
+        /// The summary is subsumed: same partition, same balances.
+        unchanged,
+        /// The group's partition was refined (and balances re-attributed);
+        /// the group state strictly decreased and the body must be
+        /// re-walked. This happens at most once per name, so a group is
+        /// re-walked at most `proc_locals.len` times.
+        refined,
+        /// Balance attribution failed: the summary's units cannot be
+        /// reconciled with the group's (divergent entry balances, or an
+        /// attribution the constraints leave ambiguous). The summary starts
+        /// its own group.
+        conflict,
+    };
+
+    /// Meets the group's must-alias partition with the summary's and
+    /// re-attributes per-fine-class balances by constraint propagation.
+    ///
+    /// Two names share a meet class iff they share a class in the group AND
+    /// in the summary. Each group class and each summary class then
+    /// constrains the sum of its member meet-class balances to its own
+    /// balance; propagation solves constraints with a single unknown until
+    /// nothing changes. A full, consistent solution updates the group in
+    /// place; anything else is a conflict.
+    fn meetGroupSummary(self: *Certifier, group: *JoinGroup, summary: []const LocalSummary) CertifyError!MeetOutcome {
+        const g = group.summary;
+        const n = g.len;
+
+        // Meet partition: representative per dense position, keyed by the
+        // (group repr, summary repr) pair; the representative is the first
+        // member, so `repr[dense] <= dense` with equality exactly at class
+        // leaders — the shape `stateFromSummary` expects.
+        var meet_repr = try self.allocator.alloc(u32, n);
+        defer self.allocator.free(meet_repr);
+        var pair_repr = std.AutoHashMap(u64, u32).init(self.allocator);
+        defer pair_repr.deinit();
+        for (g, summary, 0..) |ge, se, dense| {
+            if (ge.class == .unbound) {
+                meet_repr[dense] = no_dense;
+                continue;
+            }
+            const key = (@as(u64, ge.repr) << 32) | @as(u64, se.repr);
+            const entry = try pair_repr.getOrPut(key);
+            if (!entry.found_existing) entry.value_ptr.* = @intCast(dense);
+            meet_repr[dense] = entry.value_ptr.*;
+        }
+
+        // Balance attribution over owned/conditional meet classes. Unknowns
+        // are indexed by meet-class representative; each group class and
+        // each summary class contributes one sum constraint.
+        var solved = try self.allocator.alloc(?u64, n);
+        defer self.allocator.free(solved);
+        @memset(solved, null);
+
+        const Constraint = struct {
+            total: u64,
+            /// Meet-class representatives (deduplicated, this constraint's
+            /// members).
+            members: []u32,
+        };
+        var arena = std.heap.ArenaAllocator.init(self.allocator);
+        defer arena.deinit();
+        const scratch = arena.allocator();
+
+        var constraints = std.ArrayList(Constraint).empty;
+        // Group classes and summary classes, keyed by their own repr.
+        for (0..2) |side| {
+            const source = if (side == 0) g else summary;
+            var class_members = std.AutoHashMap(u32, std.ArrayList(u32)).init(scratch);
+            var class_total = std.AutoHashMap(u32, u64).init(scratch);
+            for (source, 0..) |entry, dense| {
+                if (entry.class != .owned and entry.class != .conditional_owned) continue;
+                const members = try class_members.getOrPut(entry.repr);
+                if (!members.found_existing) {
+                    members.value_ptr.* = .empty;
+                    try class_total.put(entry.repr, entry.balance);
+                }
+                const meet_class = meet_repr[dense];
+                var already = false;
+                for (members.value_ptr.items) |existing| {
+                    if (existing == meet_class) {
+                        already = true;
+                        break;
+                    }
+                }
+                if (!already) try members.value_ptr.append(scratch, meet_class);
+            }
+            var iter = class_members.iterator();
+            while (iter.next()) |entry| {
+                try constraints.append(scratch, .{
+                    .total = class_total.get(entry.key_ptr.*).?,
+                    .members = entry.value_ptr.items,
+                });
+            }
+        }
+
+        // Propagate: solve any constraint with exactly one unknown member;
+        // verify fully-solved constraints. Each round solves at least one
+        // unknown or stops, so this terminates in at most n rounds.
+        var progress = true;
+        while (progress) {
+            progress = false;
+            for (constraints.items) |constraint| {
+                var assigned_sum: u64 = 0;
+                var unsolved: usize = 0;
+                var unsolved_class: u32 = 0;
+                for (constraint.members) |meet_class| {
+                    if (solved[meet_class]) |units| {
+                        assigned_sum += units;
+                    } else {
+                        unsolved += 1;
+                        unsolved_class = meet_class;
+                    }
+                }
+                if (unsolved == 0) {
+                    if (assigned_sum != constraint.total) return .conflict;
+                } else if (unsolved == 1) {
+                    if (assigned_sum >= constraint.total) return .conflict;
+                    const remaining = constraint.total - assigned_sum;
+                    // A class carrying names summarized as owned always has
+                    // at least one unit on every real edge.
+                    if (remaining == 0) return .conflict;
+                    solved[unsolved_class] = remaining;
+                    progress = true;
+                }
+            }
+        }
+        for (constraints.items) |constraint| {
+            for (constraint.members) |meet_class| {
+                // Under-determined attribution (proper overlaps in both
+                // partitions with no forcing constraint): fall back to an
+                // exact per-summary group rather than guessing.
+                if (solved[meet_class] == null) return .conflict;
+            }
+        }
+
+        // Commit: rewrite the group's partition and balances in place.
+        var changed = false;
+        for (g, 0..) |*entry, dense| {
+            if (entry.class == .unbound) continue;
+            const new_repr = meet_repr[dense];
+            if (entry.repr != new_repr) {
+                entry.repr = new_repr;
+                changed = true;
+            }
+            if (entry.class == .owned or entry.class == .conditional_owned) {
+                const units: u32 = @intCast(solved[new_repr].?);
+                if (entry.balance != units) {
+                    entry.balance = units;
+                    changed = true;
+                }
+            }
+        }
+        return if (changed) .refined else .unchanged;
     }
 
     fn collectProcLocals(self: *Certifier, proc: LIR.LirProcSpec, body: LIR.CFStmtId) Allocator.Error!void {
@@ -2093,21 +2317,25 @@ const Certifier = struct {
         while (work.pop()) |item| {
             switch (item) {
                 .segment => |segment| try self.runSegment(&work, segment),
-                .join_body => |join_id| try self.scheduleJoinBody(&work, join_id),
+                .join_body => |walk| try self.scheduleJoinBody(&work, walk),
             }
         }
     }
 
-    fn scheduleJoinBody(self: *Certifier, work: *std.ArrayList(WorkItem), join_id: LIR.JoinPointId) CertifyError!void {
-        const record = self.records.getPtr(join_id) orelse return;
-        const entry = record.pending.pop() orelse return;
-        defer self.allocator.free(entry);
-        var body_state = try self.stateFromSummary(entry);
+    fn scheduleJoinBody(self: *Certifier, work: *std.ArrayList(WorkItem), walk: JoinWalk) CertifyError!void {
+        const record = self.records.getPtr(walk.join) orelse return;
+        const group = &record.groups.items[walk.group];
+        // A refinement while this item sat on the stack re-queued the group;
+        // the earlier of the two items walks the refined state, the later
+        // one is a no-op.
+        if (!group.queued) return;
+        group.queued = false;
+        var body_state = try self.stateFromSummary(group.summary);
         errdefer body_state.deinit();
         try work.append(self.allocator, .{ .segment = .{
             .cursor = record.body,
             .state = body_state,
-            .origin_join = join_id,
+            .origin_join = walk.join,
         } });
     }
 
@@ -2369,8 +2597,7 @@ const Certifier = struct {
                             .maybe_uninitialized_params = join_stmt.maybe_uninitialized_params,
                             .maybe_uninitialized_conditions = join_stmt.maybe_uninitialized_conditions,
                             .maybe_uninitialized_condition_masks = join_stmt.maybe_uninitialized_condition_masks,
-                            .scheduled = std.AutoHashMap(u64, void).init(self.allocator),
-                            .pending = .empty,
+                            .groups = .empty,
                         };
                     }
                     cursor = join_stmt.remainder;
@@ -2380,45 +2607,18 @@ const Certifier = struct {
                         return self.fail("jump to join {d} before its definition", .{@intFromEnum(jump_stmt.target)});
                     };
                     const jump_summary = try self.summarizeForJoin(&state, record, jump_stmt.target);
-                    const digest = summaryDigest(record.body, jump_summary);
-                    const seen_entry = try record.scheduled.getOrPut(digest);
-                    if (!seen_entry.found_existing) {
-                        // The join body is certified once per distinct inflowing entry-state
-                        // summary. For a loop carrying K refcounted mutable locals whose body
-                        // merges and re-splits their alias groups, the number of distinct
-                        // (alias-partition x balance) summaries is finite but grows like the Bell
-                        // number of K (B(6) = 203). This bound is purely a *capacity* limit on how
-                        // many states we will enumerate for one procedure before giving up — it is
-                        // NOT a refcount finding. Exceeding it means "I cannot finish proving this
-                        // procedure within budget," so the certifier abandons this procedure
-                        // (leaving it unverified) rather than aborting the build or claiming a bug:
-                        // a verification tool must only block on a positive finding, never on its
-                        // own incompleteness (issue 9658 was a valid 203-state scanner). Findings
-                        // (leak / use-after-free / balance mismatch) on the first ≤4096 distinct
-                        // entry-states still `fail` → `error.Certification` → abort. The cap can
-                        // mask only a finding whose sole manifesting path is reached past the
-                        // 4096th distinct entry-state — most plausibly a real leak whose owned
-                        // balance grows every iteration (balance is part of the per-join summary
-                        // digest), so the state count climbs without converging; that proc is then
-                        // skipped rather than reported. The algorithmically-ideal fix is a
-                        // converging dataflow fixpoint that joins entry states over a finite-height
-                        // semilattice (bounding re-walks by lattice height rather than enumerating
-                        // summaries); it remains future work because a correct join must preserve
-                        // exact per-path ownership-unit accounting — naively merging owned states
-                        // that carry different balances (e.g. `if c then x = dup(y) else x = y`)
-                        // would be unsound. Until then the bound is generous enough to fully
-                        // certify realistic procedures and only skips genuinely pathological ones.
-                        if (record.scheduled.count() > self.join_state_capacity) {
-                            return error.CertifierCapacityExceeded;
-                        }
-                        const copy = try self.allocator.dupe(LocalSummary, jump_summary);
-                        errdefer self.allocator.free(copy);
-                        // Append to `work` first, while `errdefer` is the sole owner of
-                        // `copy`; `pending` takes ownership last, so neither append's
-                        // OOM path can double-free (the errdefer only fires before
-                        // `pending` owns it).
-                        try work.append(self.allocator, .{ .join_body = jump_stmt.target });
-                        try record.pending.append(self.allocator, copy);
+                    switch (try self.absorbJoinSummary(record, jump_summary, jump_stmt.target)) {
+                        .covered => {},
+                        .walk => |group_index| {
+                            const group = &record.groups.items[group_index];
+                            if (!group.queued) {
+                                group.queued = true;
+                                try work.append(self.allocator, .{ .join_body = .{
+                                    .join = jump_stmt.target,
+                                    .group = group_index,
+                                } });
+                            }
+                        },
                     }
                     return;
                 },
@@ -2767,18 +2967,7 @@ const CertifyTest = struct {
     fn certifyWith(self: *CertifyTest, sigs: arc_sig.SigTable) CertifyError!void {
         return certifyStore(self.allocator, &self.store, &self.layouts, sigs, &.{}, &self.diag);
     }
-
-    fn certifyWithOptions(self: *CertifyTest, options: CertifyOptions) CertifyError!void {
-        return certifyStoreWithOptions(self.allocator, &self.store, &self.layouts, arc_sig.SigTable.all_owned, &.{}, &self.diag, options);
-    }
 };
-
-test "skip outcome escalates to fail only in forbid mode" {
-    try testing.expectEqual(SkipOutcome.none, skipOutcome(0, false));
-    try testing.expectEqual(SkipOutcome.none, skipOutcome(0, true));
-    try testing.expectEqual(SkipOutcome.warn, skipOutcome(3, false));
-    try testing.expectEqual(SkipOutcome.fail, skipOutcome(3, true));
-}
 
 test "certify accepts owned binding released once" {
     var f = try CertifyTest.init(testing.allocator);
@@ -2791,73 +2980,6 @@ test "certify accepts owned binding released once" {
     const body = try f.assignStr(value, result_assign);
     _ = try f.addProc(&.{}, body, .i64);
     try f.certify();
-    try testing.expectEqual(@as(usize, 0), f.diag.skipped_proc_count);
-}
-
-test "certify records skipped proc when join-state capacity is exceeded" {
-    var f = try CertifyTest.init(testing.allocator);
-    defer f.deinit();
-    const result = try f.local(.i64);
-
-    const join_id = f.freshJoinPointId();
-    const ret = try f.ret(result);
-    const result_assign = try f.assignI64(result, ret);
-    const jump = try f.store.addCFStmt(.{ .jump = .{ .target = join_id } });
-    const join_stmt = try f.store.addCFStmt(.{ .join = .{
-        .id = join_id,
-        .params = LIR.LocalSpan.empty(),
-        .body = result_assign,
-        .remainder = jump,
-    } });
-    const proc = try f.addProc(&.{}, join_stmt, .i64);
-    try f.store.setProcDebugName(proc, "capacitySkip");
-
-    try f.certifyWithOptions(.{ .join_state_capacity = 0 });
-
-    try testing.expectEqual(@as(usize, 1), f.diag.skipped_proc_count);
-    try testing.expectEqual(@as(usize, 1), f.diag.skippedSample().len);
-    try testing.expectEqual(proc, f.diag.skippedSample()[0]);
-
-    var report = FailureContext{};
-    writeSkippedProcReport(&report, &f.store, &f.diag);
-    try testing.expect(std.mem.find(u8, report.text(), "ARC certifier skipped 1 procedure(s)") != null);
-    try testing.expect(std.mem.find(u8, report.text(), "UNVERIFIED") != null);
-    try testing.expect(std.mem.find(u8, report.text(), "capacitySkip") != null);
-}
-
-test "skipped proc report caps listed names and preserves total count" {
-    var f = try CertifyTest.init(testing.allocator);
-    defer f.deinit();
-
-    var diag = Diagnostic{};
-    for (0..skipped_proc_record_limit + 1) |index| {
-        const proc = try f.store.addProcSpec(.{
-            .name = f.store.freshSyntheticSymbol(),
-            .args = LIR.LocalSpan.empty(),
-            .ret_layout = .i64,
-        });
-        var name_buf: [32]u8 = undefined;
-        const name = try std.fmt.bufPrint(&name_buf, "proc-{d}", .{index});
-        try f.store.setProcDebugName(proc, name);
-        diag.recordSkippedProc(proc);
-    }
-
-    var report = FailureContext{};
-    writeSkippedProcReport(&report, &f.store, &diag);
-
-    try testing.expectEqual(@as(usize, skipped_proc_record_limit + 1), diag.skipped_proc_count);
-    try testing.expectEqual(@as(usize, skipped_proc_record_limit), diag.skippedSample().len);
-    var header_buf: [64]u8 = undefined;
-    const header = try std.fmt.bufPrint(&header_buf, "ARC certifier skipped {d} procedure(s)", .{skipped_proc_record_limit + 1});
-    try testing.expect(std.mem.find(u8, report.text(), header) != null);
-    try testing.expect(std.mem.find(u8, report.text(), "proc-0") != null);
-    var included_buf: [32]u8 = undefined;
-    const last_included = try std.fmt.bufPrint(&included_buf, "proc-{d}", .{skipped_proc_record_limit - 1});
-    try testing.expect(std.mem.find(u8, report.text(), last_included) != null);
-    var excluded_buf: [32]u8 = undefined;
-    const first_excluded = try std.fmt.bufPrint(&excluded_buf, "proc-{d}", .{skipped_proc_record_limit});
-    try testing.expect(std.mem.find(u8, report.text(), first_excluded) == null);
-    try testing.expect(std.mem.find(u8, report.text(), "... and 1 more") != null);
 }
 
 test "certify flags a leaked binding" {
