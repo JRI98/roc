@@ -6,14 +6,9 @@ Format := [Default].{
 	rename_field : Format, Str -> Str
 	rename_field = |_, name| name
 
-	begin_record : U64 -> Try(U64, [])
-	begin_record = |state| Ok(state)
-
-	encode_record_field : Str, U64 -> Try(U64, [])
-	encode_record_field = |_, state| Ok(state)
-
-	end_record : U64 -> Try(U64, [])
-	end_record = |state| Ok(state)
+	encode_record : U64, U64, (U64, (U64, Str, (U64 -> Try(U64, [])) -> Try(U64, [])) -> Try(U64, [])) -> Try(U64, [])
+	encode_record = |state, _, write_fields|
+		write_fields(state, |field_state, _, write_value| write_value(field_state))
 
 	encode_str : Str, U64 -> Try(U64, [])
 	encode_str = |value, state| Ok(state + Str.count_utf8_bytes(value))

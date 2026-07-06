@@ -4024,6 +4024,18 @@ const Builder = struct {
         precomputed_plan.next_capture_id = encoderForFirstFieldCaptureId();
         try fn_ctx.buildEncodeRestoredPrecomputedPlan(&precomputed_plan, fn_value, store_view, fn_view, shape_ty, arg_tys[0], str_ty);
 
+        const saved_encoder_source_fn_ty = fn_ctx.generated_encoder_source_fn_ty;
+        const saved_encoder_source_expr = fn_ctx.generated_encoder_source_expr;
+        const saved_encoder_lambda_index = fn_ctx.generated_encoder_lambda_index;
+        fn_ctx.generated_encoder_source_fn_ty = fn_value.source_fn_ty;
+        fn_ctx.generated_encoder_source_expr = runtime.expr;
+        fn_ctx.generated_encoder_lambda_index = 0;
+        defer {
+            fn_ctx.generated_encoder_source_fn_ty = saved_encoder_source_fn_ty;
+            fn_ctx.generated_encoder_source_expr = saved_encoder_source_expr;
+            fn_ctx.generated_encoder_lambda_index = saved_encoder_lambda_index;
+        }
+
         const encoded = try fn_ctx.lowerEncodeShapeToState(
             shape_ty,
             value_expr,
@@ -6135,6 +6147,9 @@ const BodyContext = struct {
     owner_template: names.ProcTemplate,
     owner_context_fn_key: names.TypeDigest,
     current_fn_key: names.TypeDigest,
+    generated_encoder_source_fn_ty: ?checked.CheckedTypeId,
+    generated_encoder_source_expr: ?checked.CheckedExprId,
+    generated_encoder_lambda_index: u64,
     comptime_exhaustiveness_depth: u32,
     binders: BinderMap,
     typed_binders: TypedBinders,
@@ -6360,6 +6375,9 @@ const BodyContext = struct {
             .owner_template = owner_template,
             .owner_context_fn_key = .{},
             .current_fn_key = .{},
+            .generated_encoder_source_fn_ty = null,
+            .generated_encoder_source_expr = null,
+            .generated_encoder_lambda_index = 0,
             .comptime_exhaustiveness_depth = 0,
             .binders = BinderMap.init(allocator),
             .typed_binders = TypedBinders.init(allocator),
@@ -6935,6 +6953,9 @@ const BodyContext = struct {
         errdefer child.deinit();
         child.owner_context_fn_key = self.owner_context_fn_key;
         child.current_fn_key = current_fn_key;
+        child.generated_encoder_source_fn_ty = self.generated_encoder_source_fn_ty;
+        child.generated_encoder_source_expr = self.generated_encoder_source_expr;
+        child.generated_encoder_lambda_index = self.generated_encoder_lambda_index;
         child.comptime_exhaustiveness_depth = self.comptime_exhaustiveness_depth;
         child.source_region_override = self.source_region_override;
         child.current_entry_root = self.current_entry_root;
@@ -15212,6 +15233,18 @@ const BodyContext = struct {
         precomputed_plan.next_capture_id = encoderForFirstFieldCaptureId();
         try fn_ctx.buildEncodeRestoredPrecomputedPlan(&precomputed_plan, fn_value, store_view, fn_view, shape_ty, arg_tys[0], str_ty);
 
+        const saved_encoder_source_fn_ty = fn_ctx.generated_encoder_source_fn_ty;
+        const saved_encoder_source_expr = fn_ctx.generated_encoder_source_expr;
+        const saved_encoder_lambda_index = fn_ctx.generated_encoder_lambda_index;
+        fn_ctx.generated_encoder_source_fn_ty = fn_value.source_fn_ty;
+        fn_ctx.generated_encoder_source_expr = runtime.expr;
+        fn_ctx.generated_encoder_lambda_index = 0;
+        defer {
+            fn_ctx.generated_encoder_source_fn_ty = saved_encoder_source_fn_ty;
+            fn_ctx.generated_encoder_source_expr = saved_encoder_source_expr;
+            fn_ctx.generated_encoder_lambda_index = saved_encoder_lambda_index;
+        }
+
         const encoded = try fn_ctx.lowerEncodeShapeToState(
             shape_ty,
             value_expr,
@@ -17273,6 +17306,18 @@ const BodyContext = struct {
             str_ty,
         );
 
+        const saved_encoder_source_fn_ty = self.generated_encoder_source_fn_ty;
+        const saved_encoder_source_expr = self.generated_encoder_source_expr;
+        const saved_encoder_lambda_index = self.generated_encoder_lambda_index;
+        self.generated_encoder_source_fn_ty = plan.callable_ty;
+        self.generated_encoder_source_expr = plan.expr;
+        self.generated_encoder_lambda_index = 0;
+        defer {
+            self.generated_encoder_source_fn_ty = saved_encoder_source_fn_ty;
+            self.generated_encoder_source_expr = saved_encoder_source_expr;
+            self.generated_encoder_lambda_index = saved_encoder_lambda_index;
+        }
+
         const encoded = try self.lowerEncodeShapeToState(
             shape_ty,
             try self.localExpr(value_local, runtime_arg_tys[0]),
@@ -17356,6 +17401,87 @@ const BodyContext = struct {
         };
     }
 
+    fn functionType(self: *BodyContext, arg_tys: []const Type.TypeId, ret_ty: Type.TypeId) Allocator.Error!Type.TypeId {
+        return try self.builder.program.types.add(.{ .func = .{
+            .args = try self.builder.program.types.addSpan(arg_tys),
+            .ret = ret_ty,
+        } });
+    }
+
+    fn encodeValueThunkType(self: *BodyContext, state_ty: Type.TypeId, ret_ty: Type.TypeId) Allocator.Error!Type.TypeId {
+        return try self.functionType(&.{state_ty}, ret_ty);
+    }
+
+    fn encodeElementWriterType(self: *BodyContext, state_ty: Type.TypeId, ret_ty: Type.TypeId) Allocator.Error!Type.TypeId {
+        return try self.functionType(&.{ state_ty, try self.encodeValueThunkType(state_ty, ret_ty) }, ret_ty);
+    }
+
+    fn encodeFieldWriterType(self: *BodyContext, state_ty: Type.TypeId, ret_ty: Type.TypeId) Allocator.Error!Type.TypeId {
+        const str_ty = try self.builder.primitiveType(.str);
+        return try self.functionType(&.{ state_ty, str_ty, try self.encodeValueThunkType(state_ty, ret_ty) }, ret_ty);
+    }
+
+    fn encodeContainerBodyType(self: *BodyContext, state_ty: Type.TypeId, writer_ty: Type.TypeId, ret_ty: Type.TypeId) Allocator.Error!Type.TypeId {
+        return try self.functionType(&.{ state_ty, writer_ty }, ret_ty);
+    }
+
+    fn lowerGeneratedEncoderCallbackLambda(
+        self: *BodyContext,
+        lambda_ty: Type.TypeId,
+        args: []const BodyTypedLocal,
+        body: DraftExprId,
+    ) Allocator.Error!DraftExprId {
+        const source_fn_ty = self.generated_encoder_source_fn_ty orelse
+            Common.invariant("generated encoder callback requested outside generated encoder lowering");
+        const source_expr = self.generated_encoder_source_expr orelse
+            Common.invariant("generated encoder callback source expression was missing");
+        const lambda_index = self.generated_encoder_lambda_index;
+        self.generated_encoder_lambda_index += 1;
+        const fn_id = try self.addFn(.{
+            .fn_def = .{ .encoder_for_runtime = .{
+                .owner = self.owner_template,
+                .expr = source_expr,
+            } },
+            .source_fn_ty = source_fn_ty,
+            .source_fn_key = generatedEncoderCallbackKey(self.current_fn_key, source_expr, lambda_index),
+            .mono_fn_ty = lambda_ty,
+        });
+        return try self.addExpr(.{ .ty = lambda_ty, .data = .{ .lambda = .{
+            .fn_id = .{ .draft = fn_id },
+            .args = try self.addTypedLocalSpan(args),
+            .body = body,
+        } } });
+    }
+
+    fn lowerEncodeValueThunk(
+        self: *BodyContext,
+        value_ty: Type.TypeId,
+        value_expr: DraftExprId,
+        encoding_expr: DraftExprId,
+        encoding_ty: Type.TypeId,
+        state_ty: Type.TypeId,
+        ret_ty: Type.TypeId,
+        precomputed_plan: ?*const ParserPrecomputedPlan,
+    ) Allocator.Error!DraftExprId {
+        const thunk_ty = try self.encodeValueThunkType(state_ty, ret_ty);
+        const state_local = try self.addLocal(self.builder.symbols.fresh(), state_ty);
+        const body = try self.lowerEncodeShapeToState(
+            value_ty,
+            value_expr,
+            encoding_expr,
+            encoding_ty,
+            try self.localExpr(state_local, state_ty),
+            state_ty,
+            ret_ty,
+            precomputed_plan,
+        );
+        return try self.lowerGeneratedEncoderCallbackLambda(
+            thunk_ty,
+            &.{.{ .local = state_local, .ty = state_ty }},
+            body,
+        );
+    }
+
     fn lowerEncodeTupleToState(
         self: *BodyContext,
         item_tys: []const Type.TypeId,
@@ -17367,20 +17493,38 @@ const BodyContext = struct {
         ret_ty: Type.TypeId,
         precomputed_plan: ?*const ParserPrecomputedPlan,
     ) Allocator.Error!DraftExprId {
-        const begin_try = try self.lowerEncodeFormatMethod("begin_array", &.{state_expr}, &.{state_ty}, encoding_ty, ret_ty);
-        const begin_state_local = try self.addLocal(self.builder.symbols.fresh(), state_ty);
+        const u64_ty = try self.builder.primitiveType(.u64);
+        const element_writer_ty = try self.encodeElementWriterType(state_ty, ret_ty);
+        const body_ty = try self.encodeContainerBodyType(state_ty, element_writer_ty, ret_ty);
+        const body_state_local = try self.addLocal(self.builder.symbols.fresh(), state_ty);
+        const element_writer_local = try self.addLocal(self.builder.symbols.fresh(), element_writer_ty);
         const body = try self.lowerEncodeTupleItemsFromState(
             item_tys,
             value_expr,
             encoding_expr,
             encoding_ty,
-            try self.localExpr(begin_state_local, state_ty),
+            try self.localExpr(body_state_local, state_ty),
             state_ty,
             ret_ty,
+            try self.localExpr(element_writer_local, element_writer_ty),
             0,
             precomputed_plan,
         );
-        return try self.sequenceEncodeTry(begin_try, ret_ty, begin_state_local, body, ret_ty);
+        const body_lambda = try self.lowerGeneratedEncoderCallbackLambda(
+            body_ty,
+            &.{
+                .{ .local = body_state_local, .ty = state_ty },
+                .{ .local = element_writer_local, .ty = element_writer_ty },
+            },
+            body,
+        );
+        return try self.lowerEncodeFormatMethod(
+            "encode_tuple",
+            &.{ state_expr, try self.intLiteralExpr(@intCast(item_tys.len), u64_ty), body_lambda },
+            &.{ state_ty, u64_ty, body_ty },
+            encoding_ty,
+            ret_ty,
+        );
     }
 
     fn lowerEncodeTupleItemsFromState(
@@ -17392,30 +17536,35 @@ const BodyContext = struct {
         state_expr: DraftExprId,
         state_ty: Type.TypeId,
         ret_ty: Type.TypeId,
+        element_writer_expr: DraftExprId,
         item_index: usize,
         precomputed_plan: ?*const ParserPrecomputedPlan,
     ) Allocator.Error!DraftExprId {
         if (item_index == item_tys.len) {
-            return try self.lowerEncodeFormatMethod("end_array", &.{state_expr}, &.{state_ty}, encoding_ty, ret_ty);
+            return try self.tryOk(ret_ty, state_expr);
         }
 
-        const element_start_try = try self.lowerEncodeFormatMethod("encode_array_element", &.{state_expr}, &.{state_ty}, encoding_ty, ret_ty);
-        const element_start_local = try self.addLocal(self.builder.symbols.fresh(), state_ty);
         const item_ty = item_tys[item_index];
         const item_expr = try self.addExpr(.{ .ty = item_ty, .data = .{ .tuple_access = .{
             .tuple = value_expr,
             .elem_index = @intCast(item_index),
         } } });
-        const item_try = try self.lowerEncodeShapeToState(
+        const item_writer = try self.lowerEncodeValueThunk(
             item_ty,
             item_expr,
             encoding_expr,
             encoding_ty,
-            try self.localExpr(element_start_local, state_ty),
             state_ty,
             ret_ty,
             precomputed_plan,
         );
+        const item_try = try self.addExpr(.{
+            .ty = ret_ty,
+            .data = .{ .call_value = .{
+                .callee = element_writer_expr,
+                .args = try self.addExprSpan(&[_]DraftExprId{ state_expr, item_writer }),
+            } },
+        });
         const item_done_local = try self.addLocal(self.builder.symbols.fresh(), state_ty);
         const rest = try self.lowerEncodeTupleItemsFromState(
             item_tys,
@@ -17425,11 +17574,11 @@ const BodyContext = struct {
             try self.localExpr(item_done_local, state_ty),
             state_ty,
             ret_ty,
+            element_writer_expr,
             item_index + 1,
             precomputed_plan,
         );
-        const after_item = try self.sequenceEncodeTry(item_try, ret_ty, item_done_local, rest, ret_ty);
-        return try self.sequenceEncodeTry(element_start_try, ret_ty, element_start_local, after_item, ret_ty);
+        return try self.sequenceEncodeTry(item_try, ret_ty, item_done_local, rest, ret_ty);
     }
 
     fn lowerEncodeListToState(
@@ -17443,9 +17592,11 @@ const BodyContext = struct {
         ret_ty: Type.TypeId,
         precomputed_plan: ?*const ParserPrecomputedPlan,
     ) Allocator.Error!DraftExprId {
-        const begin_try = try self.lowerEncodeFormatMethod("begin_array", &.{state_expr}, &.{state_ty}, encoding_ty, ret_ty);
-        const begin_state_local = try self.addLocal(self.builder.symbols.fresh(), state_ty);
         const u64_ty = try self.builder.primitiveType(.u64);
+        const element_writer_ty = try self.encodeElementWriterType(state_ty, ret_ty);
+        const body_ty = try self.encodeContainerBodyType(state_ty, element_writer_ty, ret_ty);
+        const body_state_local = try self.addLocal(self.builder.symbols.fresh(), state_ty);
+        const element_writer_local = try self.addLocal(self.builder.symbols.fresh(), element_writer_ty);
         const len_local = try self.addLocal(self.builder.symbols.fresh(), u64_ty);
         const index_local = try self.addLocal(self.builder.symbols.fresh(), u64_ty);
         const loop_state_local = try self.addLocal(self.builder.symbols.fresh(), state_ty);
@@ -17460,6 +17611,7 @@ const BodyContext = struct {
             index_local,
             loop_state_local,
             ret_ty,
+            try self.localExpr(element_writer_local, element_writer_ty),
             precomputed_plan,
         );
         const params = [_]BodyTypedLocal{
@@ -17468,15 +17620,29 @@ const BodyContext = struct {
         };
         const initial_values = [_]DraftExprId{
             try self.intLiteralExpr(0, u64_ty),
-            try self.localExpr(begin_state_local, state_ty),
+            try self.localExpr(body_state_local, state_ty),
         };
         const loop_expr = try self.addExpr(.{ .ty = ret_ty, .data = .{ .loop_ = .{
             .params = try self.addTypedLocalSpan(&params),
             .initial_values = try self.addExprSpan(&initial_values),
             .body = loop_body,
         } } });
-        const with_len = try self.wrapLet(len_local, u64_ty, len_value, loop_expr, ret_ty);
-        return try self.sequenceEncodeTry(begin_try, ret_ty, begin_state_local, with_len, ret_ty);
+        const body_lambda = try self.lowerGeneratedEncoderCallbackLambda(
+            body_ty,
+            &.{
+                .{ .local = body_state_local, .ty = state_ty },
+                .{ .local = element_writer_local, .ty = element_writer_ty },
+            },
+            loop_expr,
+        );
+        const encode_list = try self.lowerEncodeFormatMethod(
+            "encode_list",
+            &.{ state_expr, try self.localExpr(len_local, u64_ty), body_lambda },
+            &.{ state_ty, u64_ty, body_ty },
+            encoding_ty,
+            ret_ty,
+        );
+        return try self.wrapLet(len_local, u64_ty, len_value, encode_list, ret_ty);
     }
 
     fn lowerEncodeSetToState(
@@ -17509,13 +17675,15 @@ const BodyContext = struct {
         ret_ty: Type.TypeId,
         precomputed_plan: ?*const ParserPrecomputedPlan,
     ) Allocator.Error!DraftExprId {
-        const begin_try = try self.lowerEncodeFormatMethod("begin_record", &.{state_expr}, &.{state_ty}, encoding_ty, ret_ty);
-        const begin_state_local = try self.addLocal(self.builder.symbols.fresh(), state_ty);
         const entry_ty = try self.tupleType(&.{ key_ty, value_ty });
         const entries_ty = try self.listType(entry_ty);
         const entries_expr = try self.lowerDictToList(dict_ty, entries_ty, value_expr);
         const entries_local = try self.addLocal(self.builder.symbols.fresh(), entries_ty);
         const u64_ty = try self.builder.primitiveType(.u64);
+        const field_writer_ty = try self.encodeFieldWriterType(state_ty, ret_ty);
+        const body_ty = try self.encodeContainerBodyType(state_ty, field_writer_ty, ret_ty);
+        const body_state_local = try self.addLocal(self.builder.symbols.fresh(), state_ty);
+        const field_writer_local = try self.addLocal(self.builder.symbols.fresh(), field_writer_ty);
         const len_local = try self.addLocal(self.builder.symbols.fresh(), u64_ty);
         const index_local = try self.addLocal(self.builder.symbols.fresh(), u64_ty);
         const loop_state_local = try self.addLocal(self.builder.symbols.fresh(), state_ty);
@@ -17532,6 +17700,7 @@ const BodyContext = struct {
             index_local,
             loop_state_local,
             ret_ty,
+            try self.localExpr(field_writer_local, field_writer_ty),
             precomputed_plan,
         );
         const params = [_]BodyTypedLocal{
@@ -17540,16 +17709,30 @@ const BodyContext = struct {
         };
         const initial_values = [_]DraftExprId{
             try self.intLiteralExpr(0, u64_ty),
-            try self.localExpr(begin_state_local, state_ty),
+            try self.localExpr(body_state_local, state_ty),
         };
         const loop_expr = try self.addExpr(.{ .ty = ret_ty, .data = .{ .loop_ = .{
             .params = try self.addTypedLocalSpan(&params),
             .initial_values = try self.addExprSpan(&initial_values),
             .body = loop_body,
         } } });
-        const with_len = try self.wrapLet(len_local, u64_ty, len_value, loop_expr, ret_ty);
-        const with_entries = try self.wrapLet(entries_local, entries_ty, entries_expr, with_len, ret_ty);
-        return try self.sequenceEncodeTry(begin_try, ret_ty, begin_state_local, with_entries, ret_ty);
+        const body_lambda = try self.lowerGeneratedEncoderCallbackLambda(
+            body_ty,
+            &.{
+                .{ .local = body_state_local, .ty = state_ty },
+                .{ .local = field_writer_local, .ty = field_writer_ty },
+            },
+            loop_expr,
+        );
+        const encode_record = try self.lowerEncodeFormatMethod(
+            "encode_record",
+            &.{ state_expr, try self.localExpr(len_local, u64_ty), body_lambda },
+            &.{ state_ty, u64_ty, body_ty },
+            encoding_ty,
+            ret_ty,
+        );
+        const with_len = try self.wrapLet(len_local, u64_ty, len_value, encode_record, ret_ty);
+        return try self.wrapLet(entries_local, entries_ty, entries_expr, with_len, ret_ty);
     }
 
     fn lowerEncodeDictLoopBody(
@@ -17565,6 +17748,7 @@ const BodyContext = struct {
         index_local: DraftLocalId,
         loop_state_local: DraftLocalId,
         ret_ty: Type.TypeId,
+        field_writer_expr: DraftExprId,
         precomputed_plan: ?*const ParserPrecomputedPlan,
     ) Allocator.Error!DraftExprId {
         const u64_ty = try self.builder.primitiveType(.u64);
@@ -17572,19 +17756,10 @@ const BodyContext = struct {
         const index_expr = try self.localExpr(index_local, u64_ty);
         const len_expr = try self.localExpr(len_local, u64_ty);
         const done_cond = try self.lowLevelExpr(.num_is_eq, &.{ index_expr, len_expr }, bool_ty);
-        const finish_try = try self.lowerEncodeFormatMethod(
-            "end_record",
-            &.{try self.localExpr(loop_state_local, state_ty)},
-            &.{state_ty},
-            encoding_ty,
-            ret_ty,
-        );
-        const finish_local = try self.addLocal(self.builder.symbols.fresh(), state_ty);
         const finish_body = try self.addExpr(.{
             .ty = ret_ty,
-            .data = .{ .break_ = try self.tryOk(ret_ty, try self.localExpr(finish_local, state_ty)) },
+            .data = .{ .break_ = try self.tryOk(ret_ty, try self.localExpr(loop_state_local, state_ty)) },
         });
-        const finish = try self.sequenceEncodeTry(finish_try, ret_ty, finish_local, finish_body, ret_ty);
 
         const step = try self.lowerEncodeDictEntry(
             key_ty,
@@ -17597,9 +17772,10 @@ const BodyContext = struct {
             index_local,
             loop_state_local,
             ret_ty,
+            field_writer_expr,
             precomputed_plan,
         );
-        return try self.ifExpr(done_cond, finish, step, ret_ty);
+        return try self.ifExpr(done_cond, finish_body, step, ret_ty);
     }
 
     fn lowerEncodeDictEntry(
@@ -17614,6 +17790,7 @@ const BodyContext = struct {
         index_local: DraftLocalId,
         loop_state_local: DraftLocalId,
         ret_ty: Type.TypeId,
+        field_writer_expr: DraftExprId,
         precomputed_plan: ?*const ParserPrecomputedPlan,
     ) Allocator.Error!DraftExprId {
         const u64_ty = try self.builder.primitiveType(.u64);
@@ -17634,24 +17811,26 @@ const BodyContext = struct {
         const key_try_ty = try self.tryTypeLike(ret_ty, str_ty, ret_info.err_ty);
         const key_try = try self.lowerEncodeDictKeyToString(key_ty, key_expr, encoding_expr, encoding_ty, key_try_ty);
         const key_local = try self.addLocal(self.builder.symbols.fresh(), str_ty);
-        const field_start_try = try self.lowerEncodeFormatMethod(
-            "encode_record_field",
-            &.{ try self.localExpr(key_local, str_ty), try self.localExpr(loop_state_local, state_ty) },
-            &.{ str_ty, state_ty },
-            encoding_ty,
-            ret_ty,
-        );
-        const field_start_local = try self.addLocal(self.builder.symbols.fresh(), state_ty);
-        const value_try = try self.lowerEncodeShapeToState(
+        const value_writer = try self.lowerEncodeValueThunk(
             value_ty,
             item_value_expr,
             encoding_expr,
             encoding_ty,
-            try self.localExpr(field_start_local, state_ty),
             state_ty,
             ret_ty,
             precomputed_plan,
         );
+        const value_try = try self.addExpr(.{
+            .ty = ret_ty,
+            .data = .{ .call_value = .{
+                .callee = field_writer_expr,
+                .args = try self.addExprSpan(&[_]DraftExprId{
+                    try self.localExpr(loop_state_local, state_ty),
+                    try self.localExpr(key_local, str_ty),
+                    value_writer,
+                }),
+            } },
+        });
         const value_done_local = try self.addLocal(self.builder.symbols.fresh(), state_ty);
         const next_index = try self.lowLevelExpr(.num_plus, &.{ index_expr, try self.intLiteralExpr(1, u64_ty) }, u64_ty);
         const continue_expr = try self.addExpr(.{ .ty = ret_ty, .data = .{ .continue_ = .{
@@ -17661,8 +17840,7 @@ const BodyContext = struct {
             }),
         } } });
         const after_value = try self.sequenceEncodeTry(value_try, ret_ty, value_done_local, continue_expr, ret_ty);
-        const after_field = try self.sequenceEncodeTry(field_start_try, ret_ty, field_start_local, after_value, ret_ty);
-        return try self.sequenceEncodeTry(key_try, key_try_ty, key_local, after_field, ret_ty);
+        return try self.sequenceEncodeTry(key_try, key_try_ty, key_local, after_value, ret_ty);
     }
 
     fn lowerEncodeDictKeyToString(
@@ -17728,6 +17906,7 @@ const BodyContext = struct {
         index_local: DraftLocalId,
         loop_state_local: DraftLocalId,
         ret_ty: Type.TypeId,
+        element_writer_expr: DraftExprId,
         precomputed_plan: ?*const ParserPrecomputedPlan,
     ) Allocator.Error!DraftExprId {
         const u64_ty = try self.builder.primitiveType(.u64);
@@ -17735,19 +17914,10 @@ const BodyContext = struct {
         const index_expr = try self.localExpr(index_local, u64_ty);
         const len_expr = try self.localExpr(len_local, u64_ty);
         const done_cond = try self.lowLevelExpr(.num_is_eq, &.{ index_expr, len_expr }, bool_ty);
-        const finish_try = try self.lowerEncodeFormatMethod(
-            "end_array",
-            &.{try self.localExpr(loop_state_local, state_ty)},
-            &.{state_ty},
-            encoding_ty,
-            ret_ty,
-        );
-        const finish_local = try self.addLocal(self.builder.symbols.fresh(), state_ty);
         const finish_body = try self.addExpr(.{
             .ty = ret_ty,
-            .data = .{ .break_ = try self.tryOk(ret_ty, try self.localExpr(finish_local, state_ty)) },
+            .data = .{ .break_ = try self.tryOk(ret_ty, try self.localExpr(loop_state_local, state_ty)) },
         });
-        const finish = try self.sequenceEncodeTry(finish_try, ret_ty, finish_local, finish_body, ret_ty);
 
         const step = try self.lowerEncodeListElement(
             elem_ty,
@@ -17758,9 +17928,10 @@ const BodyContext = struct {
             index_local,
             loop_state_local,
             ret_ty,
+            element_writer_expr,
             precomputed_plan,
         );
-        return try self.ifExpr(done_cond, finish, step, ret_ty);
+        return try self.ifExpr(done_cond, finish_body, step, ret_ty);
     }
 
     fn lowerEncodeListElement(
@@ -17773,30 +17944,32 @@ const BodyContext = struct {
         index_local: DraftLocalId,
         loop_state_local: DraftLocalId,
         ret_ty: Type.TypeId,
+        element_writer_expr: DraftExprId,
         precomputed_plan: ?*const ParserPrecomputedPlan,
     ) Allocator.Error!DraftExprId {
         const u64_ty = try self.builder.primitiveType(.u64);
         const index_expr = try self.localExpr(index_local, u64_ty);
         const element_expr = try self.lowLevelExpr(.list_get_unsafe, &.{ value_expr, index_expr }, elem_ty);
         const element_local = try self.addLocal(self.builder.symbols.fresh(), elem_ty);
-        const element_start_try = try self.lowerEncodeFormatMethod(
-            "encode_array_element",
-            &.{try self.localExpr(loop_state_local, state_ty)},
-            &.{state_ty},
-            encoding_ty,
-            ret_ty,
-        );
-        const element_start_local = try self.addLocal(self.builder.symbols.fresh(), state_ty);
-        const element_try = try self.lowerEncodeShapeToState(
+        const element_writer = try self.lowerEncodeValueThunk(
             elem_ty,
             try self.localExpr(element_local, elem_ty),
             encoding_expr,
             encoding_ty,
-            try self.localExpr(element_start_local, state_ty),
             state_ty,
             ret_ty,
             precomputed_plan,
         );
+        const element_try = try self.addExpr(.{
+            .ty = ret_ty,
+            .data = .{ .call_value = .{
+                .callee = element_writer_expr,
+                .args = try self.addExprSpan(&[_]DraftExprId{
+                    try self.localExpr(loop_state_local, state_ty),
+                    element_writer,
+                }),
+            } },
+        });
         const element_done_local = try self.addLocal(self.builder.symbols.fresh(), state_ty);
         const next_index = try self.lowLevelExpr(.num_plus, &.{ index_expr, try self.intLiteralExpr(1, u64_ty) }, u64_ty);
         const continue_expr = try self.addExpr(.{ .ty = ret_ty, .data = .{ .continue_ = .{
@@ -17806,8 +17979,7 @@ const BodyContext = struct {
             }),
         } } });
         const after_element = try self.sequenceEncodeTry(element_try, ret_ty, element_done_local, continue_expr, ret_ty);
-        const body = try self.sequenceEncodeTry(element_start_try, ret_ty, element_start_local, after_element, ret_ty);
-        return try self.wrapLet(element_local, elem_ty, element_expr, body, ret_ty);
+        return try self.wrapLet(element_local, elem_ty, element_expr, after_element, ret_ty);
     }
 
     fn lowerEncodeJsonTryToState(
@@ -17908,22 +18080,40 @@ const BodyContext = struct {
             break :blk locals;
         };
 
-        const begin_try = try self.lowerEncodeFormatMethod("begin_record", &.{state_expr}, &.{state_ty}, encoding_ty, ret_ty);
-        const begin_state_local = try self.addLocal(self.builder.symbols.fresh(), state_ty);
+        const u64_ty = try self.builder.primitiveType(.u64);
+        const field_writer_ty = try self.encodeFieldWriterType(state_ty, ret_ty);
+        const body_ty = try self.encodeContainerBodyType(state_ty, field_writer_ty, ret_ty);
+        const body_state_local = try self.addLocal(self.builder.symbols.fresh(), state_ty);
+        const field_writer_local = try self.addLocal(self.builder.symbols.fresh(), field_writer_ty);
         const fields_body = try self.lowerEncodeRecordFieldNamesFrom(
             shape_ty,
             value_expr,
             encoding_expr,
             encoding_ty,
-            try self.localExpr(begin_state_local, state_ty),
+            try self.localExpr(body_state_local, state_ty),
             state_ty,
             ret_ty,
             precomputed_plan,
             record_fields,
             renamed_field_locals,
+            try self.localExpr(field_writer_local, field_writer_ty),
             0,
         );
-        var body = try self.sequenceEncodeTry(begin_try, ret_ty, begin_state_local, fields_body, ret_ty);
+        const fields_lambda = try self.lowerGeneratedEncoderCallbackLambda(
+            body_ty,
+            &.{
+                .{ .local = body_state_local, .ty = state_ty },
+                .{ .local = field_writer_local, .ty = field_writer_ty },
+            },
+            fields_body,
+        );
+        var body = try self.lowerEncodeFormatMethod(
+            "encode_record",
+            &.{ state_expr, try self.intLiteralExpr(@intCast(record_fields.len), u64_ty), fields_lambda },
+            &.{ state_ty, u64_ty, body_ty },
+            encoding_ty,
+            ret_ty,
+        );
         if (owned_renamed_field_values) |renamed_field_values| {
             var index = renamed_field_locals.len;
             while (index > 0) {
@@ -17946,10 +18136,11 @@ const BodyContext = struct {
         precomputed_plan: ?*const ParserPrecomputedPlan,
         record_fields: []const Type.Field,
         renamed_field_locals: []const DraftLocalId,
+        field_writer_expr: DraftExprId,
         field_index: usize,
     ) Allocator.Error!DraftExprId {
         if (field_index >= record_fields.len) {
-            return try self.lowerEncodeFormatMethod("end_record", &.{state_expr}, &.{state_ty}, encoding_ty, ret_ty);
+            return try self.tryOk(ret_ty, state_expr);
         }
 
         const field = record_fields[field_index];
@@ -17975,6 +18166,7 @@ const BodyContext = struct {
                         precomputed_plan,
                         record_fields,
                         renamed_field_locals,
+                        field_writer_expr,
                         field_index,
                         field.ty,
                         field_value_expr,
@@ -17991,6 +18183,7 @@ const BodyContext = struct {
                     precomputed_plan,
                     record_fields,
                     renamed_field_locals,
+                    field_writer_expr,
                     field_index,
                     field_value_expr,
                     optional_info,
@@ -18009,6 +18202,7 @@ const BodyContext = struct {
             precomputed_plan,
             record_fields,
             renamed_field_locals,
+            field_writer_expr,
             field_index,
             field.ty,
             field_value_expr,
@@ -18027,25 +18221,29 @@ const BodyContext = struct {
         precomputed_plan: ?*const ParserPrecomputedPlan,
         record_fields: []const Type.Field,
         renamed_field_locals: []const DraftLocalId,
+        field_writer_expr: DraftExprId,
         field_index: usize,
         field_value_ty: Type.TypeId,
         field_value_expr: DraftExprId,
     ) Allocator.Error!DraftExprId {
         const str_ty = try self.builder.primitiveType(.str);
         const renamed_field_expr = try self.localExpr(renamed_field_locals[field_index], str_ty);
-        const field_name_try = try self.lowerEncodeFormatMethod("encode_record_field", &.{ renamed_field_expr, state_expr }, &.{ str_ty, state_ty }, encoding_ty, ret_ty);
-        const after_name_local = try self.addLocal(self.builder.symbols.fresh(), state_ty);
-
-        const value_try = try self.lowerEncodeShapeToState(
+        const value_writer = try self.lowerEncodeValueThunk(
             field_value_ty,
             field_value_expr,
             encoding_expr,
             encoding_ty,
-            try self.localExpr(after_name_local, state_ty),
             state_ty,
             ret_ty,
             precomputed_plan,
         );
+        const value_try = try self.addExpr(.{
+            .ty = ret_ty,
+            .data = .{ .call_value = .{
+                .callee = field_writer_expr,
+                .args = try self.addExprSpan(&[_]DraftExprId{ state_expr, renamed_field_expr, value_writer }),
+            } },
+        });
         const after_value_local = try self.addLocal(self.builder.symbols.fresh(), state_ty);
         const rest_body = try self.lowerEncodeRecordFieldNamesFrom(
             shape_ty,
@@ -18058,10 +18256,10 @@ const BodyContext = struct {
             precomputed_plan,
             record_fields,
             renamed_field_locals,
+            field_writer_expr,
             field_index + 1,
         );
-        const value_body = try self.sequenceEncodeTry(value_try, ret_ty, after_value_local, rest_body, ret_ty);
-        return try self.sequenceEncodeTry(field_name_try, ret_ty, after_name_local, value_body, ret_ty);
+        return try self.sequenceEncodeTry(value_try, ret_ty, after_value_local, rest_body, ret_ty);
     }
 
     fn lowerEncodeNullRecordFieldFrom(
@@ -18076,13 +18274,25 @@ const BodyContext = struct {
         precomputed_plan: ?*const ParserPrecomputedPlan,
         record_fields: []const Type.Field,
         renamed_field_locals: []const DraftLocalId,
+        field_writer_expr: DraftExprId,
         field_index: usize,
     ) Allocator.Error!DraftExprId {
         const str_ty = try self.builder.primitiveType(.str);
         const renamed_field_expr = try self.localExpr(renamed_field_locals[field_index], str_ty);
-        const field_name_try = try self.lowerEncodeFormatMethod("encode_record_field", &.{ renamed_field_expr, state_expr }, &.{ str_ty, state_ty }, encoding_ty, ret_ty);
-        const after_name_local = try self.addLocal(self.builder.symbols.fresh(), state_ty);
-        const null_try = try self.lowerEncodeFormatMethod("encode_null", &.{try self.localExpr(after_name_local, state_ty)}, &.{state_ty}, encoding_ty, ret_ty);
+        const null_state_local = try self.addLocal(self.builder.symbols.fresh(), state_ty);
+        const null_body = try self.lowerEncodeFormatMethod("encode_null", &.{try self.localExpr(null_state_local, state_ty)}, &.{state_ty}, encoding_ty, ret_ty);
+        const null_value_writer = try self.lowerGeneratedEncoderCallbackLambda(
+            try self.encodeValueThunkType(state_ty, ret_ty),
+            &.{.{ .local = null_state_local, .ty = state_ty }},
+            null_body,
+        );
+        const null_try = try self.addExpr(.{
+            .ty = ret_ty,
+            .data = .{ .call_value = .{
+                .callee = field_writer_expr,
+                .args = try self.addExprSpan(&[_]DraftExprId{ state_expr, renamed_field_expr, null_value_writer }),
+            } },
+        });
         const after_null_local = try self.addLocal(self.builder.symbols.fresh(), state_ty);
         const rest_body = try self.lowerEncodeRecordFieldNamesFrom(
             shape_ty,
@@ -18095,10 +18305,10 @@ const BodyContext = struct {
             precomputed_plan,
             record_fields,
             renamed_field_locals,
+            field_writer_expr,
             field_index + 1,
         );
-        const null_body = try self.sequenceEncodeTry(null_try, ret_ty, after_null_local, rest_body, ret_ty);
-        return try self.sequenceEncodeTry(field_name_try, ret_ty, after_name_local, null_body, ret_ty);
+        return try self.sequenceEncodeTry(null_try, ret_ty, after_null_local, rest_body, ret_ty);
     }
 
     fn lowerEncodeOptionalRecordFieldFrom(
@@ -18113,6 +18323,7 @@ const BodyContext = struct {
         precomputed_plan: ?*const ParserPrecomputedPlan,
         record_fields: []const Type.Field,
         renamed_field_locals: []const DraftLocalId,
+        field_writer_expr: DraftExprId,
         field_index: usize,
         field_value_expr: DraftExprId,
         optional_info: TryJsonInfo,
@@ -18143,6 +18354,7 @@ const BodyContext = struct {
             precomputed_plan,
             record_fields,
             renamed_field_locals,
+            field_writer_expr,
             field_index,
             optional_info.ok_payload_ty,
             try self.localExpr(ok_payload_local, optional_info.ok_payload_ty),
@@ -18173,6 +18385,7 @@ const BodyContext = struct {
             precomputed_plan,
             record_fields,
             renamed_field_locals,
+            field_writer_expr,
             field_index + 1,
         );
 
@@ -18207,6 +18420,7 @@ const BodyContext = struct {
                 precomputed_plan,
                 record_fields,
                 renamed_field_locals,
+                field_writer_expr,
                 field_index,
             );
             try branches.append(self.allocator, .{ .pat = null_pat, .body = null_body });
@@ -18303,24 +18517,19 @@ const BodyContext = struct {
             );
         }
 
-        const begin_outer_try = try self.lowerEncodeFormatMethod("begin_record", &.{state_expr}, &.{state_ty}, encoding_ty, ret_ty);
-        const outer_state_local = try self.addLocal(self.builder.symbols.fresh(), state_ty);
-        const tag_name_try = try self.lowerEncodeFormatMethod(
-            "encode_record_field",
-            &.{ tag_name_expr, try self.localExpr(outer_state_local, state_ty) },
-            &.{ try self.builder.primitiveType(.str), state_ty },
-            encoding_ty,
-            ret_ty,
-        );
-        const after_name_local = try self.addLocal(self.builder.symbols.fresh(), state_ty);
-
-        const payload_try = if (payload_tys.len == 1)
+        const u64_ty = try self.builder.primitiveType(.u64);
+        const field_writer_ty = try self.encodeFieldWriterType(state_ty, ret_ty);
+        const body_ty = try self.encodeContainerBodyType(state_ty, field_writer_ty, ret_ty);
+        const body_state_local = try self.addLocal(self.builder.symbols.fresh(), state_ty);
+        const field_writer_local = try self.addLocal(self.builder.symbols.fresh(), field_writer_ty);
+        const payload_state_local = try self.addLocal(self.builder.symbols.fresh(), state_ty);
+        const payload_body = if (payload_tys.len == 1)
             try self.lowerEncodeShapeToState(
                 payload_tys[0],
                 payload_exprs[0],
                 encoding_expr,
                 encoding_ty,
-                try self.localExpr(after_name_local, state_ty),
+                try self.localExpr(payload_state_local, state_ty),
                 state_ty,
                 ret_ty,
                 precomputed_plan,
@@ -18331,22 +18540,42 @@ const BodyContext = struct {
                 payload_tys,
                 encoding_expr,
                 encoding_ty,
-                try self.localExpr(after_name_local, state_ty),
+                try self.localExpr(payload_state_local, state_ty),
                 state_ty,
                 ret_ty,
                 precomputed_plan,
             );
-        const after_payload_local = try self.addLocal(self.builder.symbols.fresh(), state_ty);
-        const end_outer_try = try self.lowerEncodeFormatMethod(
-            "end_record",
-            &.{try self.localExpr(after_payload_local, state_ty)},
-            &.{state_ty},
+        const payload_writer = try self.lowerGeneratedEncoderCallbackLambda(
+            try self.encodeValueThunkType(state_ty, ret_ty),
+            &.{.{ .local = payload_state_local, .ty = state_ty }},
+            payload_body,
+        );
+        const field_body = try self.addExpr(.{
+            .ty = ret_ty,
+            .data = .{ .call_value = .{
+                .callee = try self.localExpr(field_writer_local, field_writer_ty),
+                .args = try self.addExprSpan(&[_]DraftExprId{
+                    try self.localExpr(body_state_local, state_ty),
+                    tag_name_expr,
+                    payload_writer,
+                }),
+            } },
+        });
+        const fields_lambda = try self.lowerGeneratedEncoderCallbackLambda(
+            body_ty,
+            &.{
+                .{ .local = body_state_local, .ty = state_ty },
+                .{ .local = field_writer_local, .ty = field_writer_ty },
+            },
+            field_body,
+        );
+        return try self.lowerEncodeFormatMethod(
+            "encode_record",
+            &.{ state_expr, try self.intLiteralExpr(1, u64_ty), fields_lambda },
+            &.{ state_ty, u64_ty, body_ty },
             encoding_ty,
             ret_ty,
         );
-        const payload_body = try self.sequenceEncodeTry(payload_try, ret_ty, after_payload_local, end_outer_try, ret_ty);
-        const tag_body = try self.sequenceEncodeTry(tag_name_try, ret_ty, after_name_local, payload_body, ret_ty);
-        return try self.sequenceEncodeTry(begin_outer_try, ret_ty, outer_state_local, tag_body, ret_ty);
     }
 
     fn lowerEncodePayloadArrayToState(
@@ -18360,20 +18589,38 @@ const BodyContext = struct {
         ret_ty: Type.TypeId,
         precomputed_plan: ?*const ParserPrecomputedPlan,
     ) Allocator.Error!DraftExprId {
-        const begin_try = try self.lowerEncodeFormatMethod("begin_array", &.{state_expr}, &.{state_ty}, encoding_ty, ret_ty);
-        const begin_state_local = try self.addLocal(self.builder.symbols.fresh(), state_ty);
+        const u64_ty = try self.builder.primitiveType(.u64);
+        const element_writer_ty = try self.encodeElementWriterType(state_ty, ret_ty);
+        const body_ty = try self.encodeContainerBodyType(state_ty, element_writer_ty, ret_ty);
+        const body_state_local = try self.addLocal(self.builder.symbols.fresh(), state_ty);
+        const element_writer_local = try self.addLocal(self.builder.symbols.fresh(), element_writer_ty);
         const body = try self.lowerEncodePayloadArrayItemsFromState(
             payload_exprs,
             payload_tys,
             encoding_expr,
             encoding_ty,
-            try self.localExpr(begin_state_local, state_ty),
+            try self.localExpr(body_state_local, state_ty),
             state_ty,
             ret_ty,
+            try self.localExpr(element_writer_local, element_writer_ty),
             0,
             precomputed_plan,
         );
-        return try self.sequenceEncodeTry(begin_try, ret_ty, begin_state_local, body, ret_ty);
+        const body_lambda = try self.lowerGeneratedEncoderCallbackLambda(
+            body_ty,
+            &.{
+                .{ .local = body_state_local, .ty = state_ty },
+                .{ .local = element_writer_local, .ty = element_writer_ty },
+            },
+            body,
+        );
+        return try self.lowerEncodeFormatMethod(
+            "encode_tuple",
+            &.{ state_expr, try self.intLiteralExpr(@intCast(payload_tys.len), u64_ty), body_lambda },
+            &.{ state_ty, u64_ty, body_ty },
+            encoding_ty,
+            ret_ty,
+        );
     }
 
     fn lowerEncodePayloadArrayItemsFromState(
@@ -18385,25 +18632,30 @@ const BodyContext = struct {
         state_expr: DraftExprId,
         state_ty: Type.TypeId,
         ret_ty: Type.TypeId,
+        element_writer_expr: DraftExprId,
         item_index: usize,
         precomputed_plan: ?*const ParserPrecomputedPlan,
     ) Allocator.Error!DraftExprId {
         if (item_index == payload_tys.len) {
-            return try self.lowerEncodeFormatMethod("end_array", &.{state_expr}, &.{state_ty}, encoding_ty, ret_ty);
+            return try self.tryOk(ret_ty, state_expr);
         }
 
-        const element_start_try = try self.lowerEncodeFormatMethod("encode_array_element", &.{state_expr}, &.{state_ty}, encoding_ty, ret_ty);
-        const element_start_local = try self.addLocal(self.builder.symbols.fresh(), state_ty);
-        const item_try = try self.lowerEncodeShapeToState(
+        const item_writer = try self.lowerEncodeValueThunk(
             payload_tys[item_index],
             payload_exprs[item_index],
             encoding_expr,
             encoding_ty,
-            try self.localExpr(element_start_local, state_ty),
             state_ty,
             ret_ty,
             precomputed_plan,
         );
+        const item_try = try self.addExpr(.{
+            .ty = ret_ty,
+            .data = .{ .call_value = .{
+                .callee = element_writer_expr,
+                .args = try self.addExprSpan(&[_]DraftExprId{ state_expr, item_writer }),
+            } },
+        });
         const item_done_local = try self.addLocal(self.builder.symbols.fresh(), state_ty);
         const rest = try self.lowerEncodePayloadArrayItemsFromState(
             payload_exprs,
@@ -18413,11 +18665,11 @@ const BodyContext = struct {
             try self.localExpr(item_done_local, state_ty),
             state_ty,
             ret_ty,
+            element_writer_expr,
             item_index + 1,
             precomputed_plan,
         );
-        const after_item = try self.sequenceEncodeTry(item_try, ret_ty, item_done_local, rest, ret_ty);
-        return try self.sequenceEncodeTry(element_start_try, ret_ty, element_start_local, after_item, ret_ty);
+        return try self.sequenceEncodeTry(item_try, ret_ty, item_done_local, rest, ret_ty);
     }
 
     fn encodeRecordFieldPayloadType(self: *BodyContext, field_ty: Type.TypeId, encoding_ty: Type.TypeId) Type.TypeId {
@@ -23464,6 +23716,21 @@ fn generatedEncoderForRuntimeKey(
     hasher.update(&current_fn_key.bytes);
     var source_expr_bytes = std.mem.nativeToLittle(u32, @intFromEnum(source_expr_id));
     hasher.update(std.mem.asBytes(&source_expr_bytes));
+    return .{ .bytes = hasher.finalResult() };
+}
+
+fn generatedEncoderCallbackKey(
+    current_fn_key: names.TypeDigest,
+    source_expr_id: checked.CheckedExprId,
+    index: u64,
+) names.TypeDigest {
+    var hasher = std.crypto.hash.sha2.Sha256.init(.{});
+    hasher.update("roc.generated_structural_encoder_callback");
+    hasher.update(&current_fn_key.bytes);
+    var source_expr_bytes = std.mem.nativeToLittle(u32, @intFromEnum(source_expr_id));
+    hasher.update(std.mem.asBytes(&source_expr_bytes));
+    var index_bytes = std.mem.nativeToLittle(u64, index);
+    hasher.update(std.mem.asBytes(&index_bytes));
     return .{ .bytes = hasher.finalResult() };
 }
 

@@ -1916,12 +1916,47 @@ The encoding type owns the output methods required by that shape:
 ```roc
 MyEncoding :: [Out(Str)].{
 	rename_field : MyEncoding, Str -> Str
-	begin_record : MyEncoding -> Try(MyEncoding, MyErr)
-	encode_record_field : Str, MyEncoding -> Try(MyEncoding, MyErr)
-	end_record : MyEncoding -> Try(MyEncoding, MyErr)
-	encode_str : Str, MyEncoding -> Try(MyEncoding, MyErr)
-	encode_u64 : U64, MyEncoding -> Try(MyEncoding, MyErr)
+	encode_record :
+		MyState,
+		U64,
+		(MyState, (MyState, Str, (MyState -> Try(MyState, MyErr)) -> Try(MyState, MyErr)) -> Try(MyState, MyErr))
+			-> Try(MyState, MyErr)
+	encode_str : Str, MyState -> Try(MyState, MyErr)
+	encode_u64 : U64, MyState -> Try(MyState, MyErr)
 }
+```
+
+The `U64` argument is the statically-known number of record fields that will be
+encoded. The callback receives the current state and a field writer supplied by
+the format. Generated record encoders call the field writer once per present
+field:
+
+```roc
+MyEncoding.encode_record(
+	state,
+	2,
+	|state0, field| {
+		state1 = field(state0, "count", |s| encode_count(value.count, s))?
+		field(state1, "foo-bar", |s| encode_foo_bar(value.foo_bar, s))
+	},
+)
+```
+
+Tuples and lists use the same ownership pattern, except their writer has no
+field name:
+
+```roc
+encode_tuple :
+	MyState,
+	U64,
+	(MyState, (MyState, (MyState -> Try(MyState, MyErr)) -> Try(MyState, MyErr)) -> Try(MyState, MyErr))
+		-> Try(MyState, MyErr)
+
+encode_list :
+	MyState,
+	U64,
+	(MyState, (MyState, (MyState -> Try(MyState, MyErr)) -> Try(MyState, MyErr)) -> Try(MyState, MyErr))
+		-> Try(MyState, MyErr)
 ```
 
 ### Compile-Time Literal Conversions

@@ -1,11 +1,12 @@
 EncoderForEmptyRecordNoFieldMethods :: [].{}
 
 Format := [Default].{
-	begin_record : U64 -> Try(U64, [])
-	begin_record = |state| Ok(state + 1)
-
-	end_record : U64 -> Try(U64, [])
-	end_record = |state| Ok(state + 2)
+	encode_record : U64, U64, (U64, (U64, Str, (U64 -> Try(U64, [])) -> Try(U64, [])) -> Try(U64, [])) -> Try(U64, [])
+	encode_record = |state, _, write_fields| {
+		started = state + 1
+		finished = write_fields(started, |field_state, _, write_value| write_value(field_state))?
+		Ok(finished + 2)
+	}
 }
 
 encode : value -> Try(U64, [])

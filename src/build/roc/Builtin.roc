@@ -214,74 +214,22 @@ Builtin :: [].{
 					Input(value) => Json.parse_tag_union_from_json(value, encoding, spec)
 				}
 
-			begin_record : JsonEncodeState -> Try(JsonEncodeState, _never_fails)
-			begin_record = |state|
-				Ok(
-					JsonEncodeState.{
-						output: u8_append(state.output, 123),
-						container_commas: state.container_commas.append(False),
-					},
-				)
-
-			encode_record_field : Str, JsonEncodeState -> Try(JsonEncodeState, _never_fails)
-			encode_record_field = |field, state| {
-				with_comma = if Json.container_needs_comma(state) {
-					u8_append(state.output, 44)
-				} else {
-					state.output
-				}
-				output = u8_append(Json.append_json_quoted_string(with_comma, field), 58)
-
-				Ok(
-					JsonEncodeState.{
-						output,
-						container_commas: Json.mark_container_has_item(state.container_commas),
-					},
-				)
+			encode_record : JsonEncodeState, U64, (JsonEncodeState, (JsonEncodeState, Str, (JsonEncodeState -> Try(JsonEncodeState, err)) -> Try(JsonEncodeState, err)) -> Try(JsonEncodeState, err)) -> Try(JsonEncodeState, err)
+			encode_record = |state, _, write_fields| {
+				started = Json.write_record_start(state)?
+				finished = write_fields(started, Json.write_record_field)?
+				Json.write_record_end(finished)
 			}
 
-			end_record : JsonEncodeState -> Try(JsonEncodeState, _never_fails)
-			end_record = |state|
-				Ok(
-					JsonEncodeState.{
-						output: u8_append(state.output, 125),
-						container_commas: List.drop_last(state.container_commas, 1),
-					},
-				)
-
-			begin_array : JsonEncodeState -> Try(JsonEncodeState, _never_fails)
-			begin_array = |state|
-				Ok(
-					JsonEncodeState.{
-						output: u8_append(state.output, 91),
-						container_commas: state.container_commas.append(False),
-					},
-				)
-
-			encode_array_element : JsonEncodeState -> Try(JsonEncodeState, _never_fails)
-			encode_array_element = |state| {
-				output = if Json.container_needs_comma(state) {
-					u8_append(state.output, 44)
-				} else {
-					state.output
-				}
-
-				Ok(
-					JsonEncodeState.{
-						output,
-						container_commas: Json.mark_container_has_item(state.container_commas),
-					},
-				)
+			encode_tuple : JsonEncodeState, U64, (JsonEncodeState, (JsonEncodeState, (JsonEncodeState -> Try(JsonEncodeState, err)) -> Try(JsonEncodeState, err)) -> Try(JsonEncodeState, err)) -> Try(JsonEncodeState, err)
+			encode_tuple = |state, _, write_elements| {
+				started = Json.write_sequence_start(state)?
+				finished = write_elements(started, Json.write_sequence_element)?
+				Json.write_sequence_end(finished)
 			}
 
-			end_array : JsonEncodeState -> Try(JsonEncodeState, _never_fails)
-			end_array = |state|
-				Ok(
-					JsonEncodeState.{
-						output: u8_append(state.output, 93),
-						container_commas: List.drop_last(state.container_commas, 1),
-					},
-				)
+			encode_list : JsonEncodeState, U64, (JsonEncodeState, (JsonEncodeState, (JsonEncodeState -> Try(JsonEncodeState, err)) -> Try(JsonEncodeState, err)) -> Try(JsonEncodeState, err)) -> Try(JsonEncodeState, err)
+			encode_list = |state, count, write_elements| JsonEncoding.encode_tuple(state, count, write_elements)
 
 			encode_str : Str, JsonEncodeState -> Try(JsonEncodeState, _never_fails)
 			encode_str = |value, state|
@@ -657,14 +605,14 @@ Builtin :: [].{
 			encode_null : JsonEncoding, JsonEncodeState -> Try(JsonEncodeState, _never_fails)
 			encode_null = |_, state| JsonEncoding.encode_null(state)
 
-			begin_array : JsonEncoding, JsonEncodeState -> Try(JsonEncodeState, _never_fails)
-			begin_array = |_, state| JsonEncoding.begin_array(state)
+			encode_record : JsonEncoding, JsonEncodeState, U64, (JsonEncodeState, (JsonEncodeState, Str, (JsonEncodeState -> Try(JsonEncodeState, err)) -> Try(JsonEncodeState, err)) -> Try(JsonEncodeState, err)) -> Try(JsonEncodeState, err)
+			encode_record = |_, state, count, write_fields| JsonEncoding.encode_record(state, count, write_fields)
 
-			encode_array_element : JsonEncoding, JsonEncodeState -> Try(JsonEncodeState, _never_fails)
-			encode_array_element = |_, state| JsonEncoding.encode_array_element(state)
+			encode_tuple : JsonEncoding, JsonEncodeState, U64, (JsonEncodeState, (JsonEncodeState, (JsonEncodeState -> Try(JsonEncodeState, err)) -> Try(JsonEncodeState, err)) -> Try(JsonEncodeState, err)) -> Try(JsonEncodeState, err)
+			encode_tuple = |_, state, count, write_elements| JsonEncoding.encode_tuple(state, count, write_elements)
 
-			end_array : JsonEncoding, JsonEncodeState -> Try(JsonEncodeState, _never_fails)
-			end_array = |_, state| JsonEncoding.end_array(state)
+			encode_list : JsonEncoding, JsonEncodeState, U64, (JsonEncodeState, (JsonEncodeState, (JsonEncodeState -> Try(JsonEncodeState, err)) -> Try(JsonEncodeState, err)) -> Try(JsonEncodeState, err)) -> Try(JsonEncodeState, err)
+			encode_list = |_, state, count, write_elements| JsonEncoding.encode_list(state, count, write_elements)
 
 			to_str : a -> Str
 				where [
@@ -1047,6 +995,75 @@ Builtin :: [].{
 			mark_container_has_item : List(Bool) -> List(Bool)
 			mark_container_has_item = |container_commas|
 				List.drop_last(container_commas, 1).append(True)
+
+			write_record_start : JsonEncodeState -> Try(JsonEncodeState, _never_fails)
+			write_record_start = |state|
+				Ok(
+					JsonEncodeState.{
+						output: u8_append(state.output, 123),
+						container_commas: state.container_commas.append(False),
+					},
+				)
+
+			write_record_field : JsonEncodeState, Str, (JsonEncodeState -> Try(JsonEncodeState, err)) -> Try(JsonEncodeState, err)
+			write_record_field = |state, field, write_value| {
+				with_comma = if Json.container_needs_comma(state) {
+					u8_append(state.output, 44)
+				} else {
+					state.output
+				}
+				output = u8_append(Json.append_json_quoted_string(with_comma, field), 58)
+
+				write_value(
+					JsonEncodeState.{
+						output,
+						container_commas: Json.mark_container_has_item(state.container_commas),
+					},
+				)
+			}
+
+			write_record_end : JsonEncodeState -> Try(JsonEncodeState, _never_fails)
+			write_record_end = |state|
+				Ok(
+					JsonEncodeState.{
+						output: u8_append(state.output, 125),
+						container_commas: List.drop_last(state.container_commas, 1),
+					},
+				)
+
+			write_sequence_start : JsonEncodeState -> Try(JsonEncodeState, _never_fails)
+			write_sequence_start = |state|
+				Ok(
+					JsonEncodeState.{
+						output: u8_append(state.output, 91),
+						container_commas: state.container_commas.append(False),
+					},
+				)
+
+			write_sequence_element : JsonEncodeState, (JsonEncodeState -> Try(JsonEncodeState, err)) -> Try(JsonEncodeState, err)
+			write_sequence_element = |state, write_value| {
+				output = if Json.container_needs_comma(state) {
+					u8_append(state.output, 44)
+				} else {
+					state.output
+				}
+
+				write_value(
+					JsonEncodeState.{
+						output,
+						container_commas: Json.mark_container_has_item(state.container_commas),
+					},
+				)
+			}
+
+			write_sequence_end : JsonEncodeState -> Try(JsonEncodeState, _never_fails)
+			write_sequence_end = |state|
+				Ok(
+					JsonEncodeState.{
+						output: u8_append(state.output, 93),
+						container_commas: List.drop_last(state.container_commas, 1),
+					},
+				)
 
 			append_json_string_bytes : List(U8), Str -> List(U8)
 			append_json_string_bytes = |out, value| {
@@ -4153,13 +4170,11 @@ Builtin :: [].{
 					Err(ListWasEmpty)
 				}
 
-		## Build an encoder for a list using a format that provides array encoding methods.
+		## Build an encoder for a list using a format that provides a list encoding method.
 		encoder_for : encoding -> (List(item), state -> Try(state, err))
 			where [
-				encoding.begin_array : state -> Try(state, err),
-				encoding.encode_array_element : state -> Try(state, err),
-				encoding.end_array : state -> Try(state, err),
 				item.encoder_for : encoding -> (item, state -> Try(state, err)),
+				encoding.encode_list : state, U64, (state, (state, (state -> Try(state, err)) -> Try(state, err)) -> Try(state, err)) -> Try(state, err),
 			]
 		encoder_for = |encoding| {
 			Encoding : encoding
@@ -4167,24 +4182,22 @@ Builtin :: [].{
 			encode_item = Item.encoder_for(encoding)
 
 			|self, state| {
-				started = Encoding.begin_array(state)?
-				encoded_items = 
-					List.fold(
-						self,
-						Ok(started),
-						|state_result, elem|
-							match state_result {
-								Ok(current) => {
-									element_state = Encoding.encode_array_element(current)?
-									encode_item(elem, element_state)
-								}
+				Encoding.encode_list(
+					state,
+					List.len(self),
+					|current, element|
+						List.fold(
+							self,
+							Ok(current),
+							|state_result, elem|
+								match state_result {
+									Ok(element_state) =>
+										element(element_state, |value_state| encode_item(elem, value_state))
 
-								Err(err) => Err(err)
-							},
-					)
-
-				finished = encoded_items?
-				Encoding.end_array(finished)
+									Err(err) => Err(err)
+								},
+						),
+				)
 			}
 		}
 

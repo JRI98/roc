@@ -140,6 +140,8 @@ import_cache: ImportCache,
 bool_var: Var,
 /// Copied Str type from Builtin module (for use in string literals, etc.)
 str_var: Var,
+/// Copied U64 type from Builtin module (for generated structural metadata counts, etc.)
+u64_var: Var,
 /// Builtin type vars are initialized during Check.init and may be reused by later entrypoints.
 builtin_types_copied: bool,
 /// Map representation of Ident -> Var, used in checking static dispatch constraints
@@ -1203,6 +1205,7 @@ fn initAssumePrepared(
         .import_cache = ImportCache{},
         .bool_var = undefined,
         .str_var = undefined,
+        .u64_var = undefined,
         .builtin_types_copied = false,
         .ident_to_var_map = std.AutoHashMap(Ident.Idx, Var).init(gpa),
         .constraint_expr_by_fn_var = std.AutoHashMap(Var, CIR.Expr.Idx).init(gpa),
@@ -3655,6 +3658,12 @@ fn freshStr(self: *Self, env: *Env, new_region: Region) Allocator.Error!Var {
     return try self.instantiateVar(self.str_var, env, .{ .explicit = new_region });
 }
 
+/// Create a U64 var
+fn freshU64(self: *Self, env: *Env, new_region: Region) Allocator.Error!Var {
+    // Use the copied U64 type from the type store (set by copyBuiltinTypes)
+    return try self.instantiateVar(self.u64_var, env, .{ .explicit = new_region });
+}
+
 const BuiltinNominalDecl = union(enum) {
     list,
     box,
@@ -4816,6 +4825,22 @@ fn copyBuiltinTypes(self: *Self) Allocator.Error!void {
         }
     else
         self.builtin_ctx.str_stmt;
+    const u64_stmt_idx = if (checking_builtin_directly)
+        self.findLocalTypeDeclByName(self.cir.idents.u64_type) orelse {
+            if (builtin.mode == .Debug) {
+                std.debug.panic("type checker invariant violated: local Builtin.U64 declaration not found while checking Builtin", .{});
+            }
+            unreachable;
+        }
+    else blk: {
+        const indices = self.builtin_ctx.builtin_indices orelse {
+            if (builtin.mode == .Debug) {
+                std.debug.panic("type checker invariant violated: builtin indices missing while copying Builtin.U64", .{});
+            }
+            unreachable;
+        };
+        break :blk indices.u64_type;
+    };
 
     if (!checking_builtin_directly and self.builtin_ctx.builtin_module != null) {
         const builtin_env = self.builtin_ctx.builtin_module.?;
@@ -4826,11 +4851,16 @@ fn copyBuiltinTypes(self: *Self) Allocator.Error!void {
         // Copy Str type from Builtin module using the direct reference
         const str_type_var = ModuleEnv.varFrom(str_stmt_idx);
         self.str_var = try self.copyVar(str_type_var, builtin_env, Region.zero());
+
+        // Copy U64 type from Builtin module using the direct reference
+        const u64_type_var = ModuleEnv.varFrom(u64_stmt_idx);
+        self.u64_var = try self.copyVar(u64_type_var, builtin_env, Region.zero());
     } else {
         // If Builtin module reference is null, use the statement from the current module
         // This happens when compiling the Builtin module itself
         self.bool_var = ModuleEnv.varFrom(bool_stmt_idx);
         self.str_var = ModuleEnv.varFrom(str_stmt_idx);
+        self.u64_var = ModuleEnv.varFrom(u64_stmt_idx);
     }
 
     // Try type is accessed via external references, no need to copy it here
@@ -19596,12 +19626,9 @@ const BuiltinEncodeSpecDecl = enum {
     dec,
     f32,
     f64,
-    begin_record,
-    record_field,
-    end_record,
-    begin_array,
-    array_element,
-    end_array,
+    record,
+    tuple,
+    list,
 };
 
 fn parseFormatMethodName(self: *Self, decl: BuiltinParseSpecDecl) Allocator.Error!Ident.Idx {
@@ -19760,12 +19787,9 @@ fn encodeFormatMethodName(self: *Self, decl: BuiltinEncodeSpecDecl) Allocator.Er
         .dec => "encode_dec",
         .f32 => "encode_f32",
         .f64 => "encode_f64",
-        .begin_record => "begin_record",
-        .record_field => "encode_record_field",
-        .end_record => "end_record",
-        .begin_array => "begin_array",
-        .array_element => "encode_array_element",
-        .end_array => "end_array",
+        .record => "encode_record",
+        .tuple => "encode_tuple",
+        .list => "encode_list",
     };
     return try @constCast(self.cir).insertIdent(base.Ident.for_text(text));
 }
@@ -19938,10 +19962,21 @@ fn validateEncodeFormatMethod(
     const expected_ret = try self.freshFromContent(try self.mkTryContent(state_var, err_var, env), env, region);
     const expected_fn = switch (spec_decl) {
         .bool, .str, .u8, .i8, .u16, .i16, .u32, .i32, .u64, .i64, .u128, .i128, .dec, .f32, .f64 => try self.freshFromContent(try self.types.mkFuncUnbound(&.{ value_var, state_var }, expected_ret), env, region),
-        .null, .begin_record, .end_record, .begin_array, .array_element, .end_array => try self.freshFromContent(try self.types.mkFuncUnbound(&.{state_var}, expected_ret), env, region),
-        .record_field => blk: {
+        .null => try self.freshFromContent(try self.types.mkFuncUnbound(&.{state_var}, expected_ret), env, region),
+        .record => blk: {
             const str_var = try self.freshStr(env, region);
-            break :blk try self.freshFromContent(try self.types.mkFuncUnbound(&.{ str_var, state_var }, expected_ret), env, region);
+            const count_var = try self.freshU64(env, region);
+            const value_writer_var = try self.freshFromContent(try self.types.mkFuncUnbound(&.{state_var}, expected_ret), env, region);
+            const field_writer_var = try self.freshFromContent(try self.types.mkFuncUnbound(&.{ state_var, str_var, value_writer_var }, expected_ret), env, region);
+            const write_fields_var = try self.freshFromContent(try self.types.mkFuncUnbound(&.{ state_var, field_writer_var }, expected_ret), env, region);
+            break :blk try self.freshFromContent(try self.types.mkFuncUnbound(&.{ state_var, count_var, write_fields_var }, expected_ret), env, region);
+        },
+        .tuple, .list => blk: {
+            const count_var = try self.freshU64(env, region);
+            const value_writer_var = try self.freshFromContent(try self.types.mkFuncUnbound(&.{state_var}, expected_ret), env, region);
+            const element_writer_var = try self.freshFromContent(try self.types.mkFuncUnbound(&.{ state_var, value_writer_var }, expected_ret), env, region);
+            const write_elements_var = try self.freshFromContent(try self.types.mkFuncUnbound(&.{ state_var, element_writer_var }, expected_ret), env, region);
+            break :blk try self.freshFromContent(try self.types.mkFuncUnbound(&.{ state_var, count_var, write_elements_var }, expected_ret), env, region);
         },
     };
     const result = try self.unifyInContext(method.var_, expected_fn, env, .{
@@ -20615,7 +20650,7 @@ fn validateDerivedEncodeTuple(
     region: Region,
     visited: *std.AutoHashMap(Var, void),
 ) Allocator.Error!DerivedParseValidation {
-    switch (try self.validateDerivedEncodeArrayMethods(encoding_var, state_var, err_var, constraint, env, region)) {
+    switch (try self.validateDerivedEncodeTupleMethods(encoding_var, state_var, err_var, constraint, env, region)) {
         .ok => {},
         .unsupported, .reported_error => |result| return result,
     }
@@ -20728,21 +20763,13 @@ fn validateDerivedEncodeTagUnionMethods(
         }
     }
     if (needs.has_payload_tag) {
-        switch (try self.validateEncodeFormatMethod(encoding_var, state_var, state_var, .begin_record, err_var, constraint, env, region)) {
-            .ok => {},
-            .unsupported, .reported_error => |result| return result,
-        }
-        switch (try self.validateEncodeFormatMethod(encoding_var, state_var, state_var, .record_field, err_var, constraint, env, region)) {
-            .ok => {},
-            .unsupported, .reported_error => |result| return result,
-        }
-        switch (try self.validateEncodeFormatMethod(encoding_var, state_var, state_var, .end_record, err_var, constraint, env, region)) {
+        switch (try self.validateEncodeFormatMethod(encoding_var, state_var, state_var, .record, err_var, constraint, env, region)) {
             .ok => {},
             .unsupported, .reported_error => |result| return result,
         }
     }
     if (needs.has_multi_payload_tag) {
-        switch (try self.validateDerivedEncodeArrayMethods(encoding_var, state_var, err_var, constraint, env, region)) {
+        switch (try self.validateDerivedEncodeTupleMethods(encoding_var, state_var, err_var, constraint, env, region)) {
             .ok => {},
             .unsupported, .reported_error => |result| return result,
         }
@@ -20785,7 +20812,7 @@ fn validateDerivedEncodeRecordMethods(
     region: Region,
     has_fields: bool,
 ) Allocator.Error!DerivedParseValidation {
-    switch (try self.validateEncodeFormatMethod(encoding_var, state_var, state_var, .begin_record, err_var, constraint, env, region)) {
+    switch (try self.validateEncodeFormatMethod(encoding_var, state_var, state_var, .record, err_var, constraint, env, region)) {
         .ok => {},
         .unsupported, .reported_error => |result| return result,
     }
@@ -20794,14 +20821,6 @@ fn validateDerivedEncodeRecordMethods(
             .ok => {},
             .unsupported, .reported_error => |result| return result,
         }
-        switch (try self.validateEncodeFormatMethod(encoding_var, state_var, state_var, .record_field, err_var, constraint, env, region)) {
-            .ok => {},
-            .unsupported, .reported_error => |result| return result,
-        }
-    }
-    switch (try self.validateEncodeFormatMethod(encoding_var, state_var, state_var, .end_record, err_var, constraint, env, region)) {
-        .ok => {},
-        .unsupported, .reported_error => |result| return result,
     }
     return .ok;
 }
@@ -20815,22 +20834,14 @@ fn validateDerivedEncodeDictMethods(
     env: *Env,
     region: Region,
 ) Allocator.Error!DerivedParseValidation {
-    switch (try self.validateEncodeFormatMethod(encoding_var, state_var, state_var, .begin_record, err_var, constraint, env, region)) {
-        .ok => {},
-        .unsupported, .reported_error => |result| return result,
-    }
-    switch (try self.validateEncodeFormatMethod(encoding_var, state_var, state_var, .record_field, err_var, constraint, env, region)) {
-        .ok => {},
-        .unsupported, .reported_error => |result| return result,
-    }
-    switch (try self.validateEncodeFormatMethod(encoding_var, state_var, state_var, .end_record, err_var, constraint, env, region)) {
+    switch (try self.validateEncodeFormatMethod(encoding_var, state_var, state_var, .record, err_var, constraint, env, region)) {
         .ok => {},
         .unsupported, .reported_error => |result| return result,
     }
     return .ok;
 }
 
-fn validateDerivedEncodeArrayMethods(
+fn validateDerivedEncodeTupleMethods(
     self: *Self,
     encoding_var: Var,
     state_var: Var,
@@ -20839,15 +20850,23 @@ fn validateDerivedEncodeArrayMethods(
     env: *Env,
     region: Region,
 ) Allocator.Error!DerivedParseValidation {
-    switch (try self.validateEncodeFormatMethod(encoding_var, state_var, state_var, .begin_array, err_var, constraint, env, region)) {
+    switch (try self.validateEncodeFormatMethod(encoding_var, state_var, state_var, .tuple, err_var, constraint, env, region)) {
         .ok => {},
         .unsupported, .reported_error => |result| return result,
     }
-    switch (try self.validateEncodeFormatMethod(encoding_var, state_var, state_var, .array_element, err_var, constraint, env, region)) {
-        .ok => {},
-        .unsupported, .reported_error => |result| return result,
-    }
-    switch (try self.validateEncodeFormatMethod(encoding_var, state_var, state_var, .end_array, err_var, constraint, env, region)) {
+    return .ok;
+}
+
+fn validateDerivedEncodeListMethods(
+    self: *Self,
+    encoding_var: Var,
+    state_var: Var,
+    err_var: Var,
+    constraint: StaticDispatchConstraint,
+    env: *Env,
+    region: Region,
+) Allocator.Error!DerivedParseValidation {
+    switch (try self.validateEncodeFormatMethod(encoding_var, state_var, state_var, .list, err_var, constraint, env, region)) {
         .ok => {},
         .unsupported, .reported_error => |result| return result,
     }
@@ -20876,7 +20895,7 @@ fn validateDerivedEncodeNominal(
         return try self.validateEncodeFormatMethod(encoding_var, state_var, nominal_var, encodeSpecDeclForNumKind(num_kind), err_var, constraint, env, region);
     }
     if (self.nominalListPayloadVar(nominal)) |payload_var| {
-        switch (try self.validateDerivedEncodeArrayMethods(encoding_var, state_var, err_var, constraint, env, region)) {
+        switch (try self.validateDerivedEncodeListMethods(encoding_var, state_var, err_var, constraint, env, region)) {
             .ok => {},
             .unsupported, .reported_error => |result| return result,
         }
@@ -20886,7 +20905,7 @@ fn validateDerivedEncodeNominal(
         return try self.validateDerivedEncodeVar(payload_var, encoding_var, state_var, err_var, constraint, env, region, visited);
     }
     if (self.nominalSetPayloadVar(nominal)) |payload_var| {
-        switch (try self.validateDerivedEncodeArrayMethods(encoding_var, state_var, err_var, constraint, env, region)) {
+        switch (try self.validateDerivedEncodeListMethods(encoding_var, state_var, err_var, constraint, env, region)) {
             .ok => {},
             .unsupported, .reported_error => |result| return result,
         }

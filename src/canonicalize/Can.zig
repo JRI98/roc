@@ -3564,7 +3564,8 @@ fn canonicalizeAssociatedItems(
                             qualified_idx
                         else blk_tqd: {
                             const type_text = self.env.getIdent(type_name);
-                            break :blk_tqd try self.insertQualifiedIdent(type_text, decl_text);
+                            const fresh_decl_text = self.env.getIdent(decl_ident);
+                            break :blk_tqd try self.insertQualifiedIdent(type_text, fresh_decl_text);
                         };
                         const assoc_key: ?AST.DeclIndex.AssocValue = if (owner_type_path) |owner|
                             .{ .owner = owner, .item = decl_ident }

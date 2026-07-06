@@ -9,14 +9,18 @@ Format := [Default].{
 			name
 		}
 
-	begin_record : U64 -> Try(U64, [])
-	begin_record = |state| Ok(state + 1)
-
-	encode_record_field : Str, U64 -> Try(U64, [])
-	encode_record_field = |name, state| Ok(state + Str.count_utf8_bytes(name))
-
-	end_record : U64 -> Try(U64, [])
-	end_record = |state| Ok(state + 2)
+	encode_record : U64, U64, (U64, (U64, Str, (U64 -> Try(U64, [])) -> Try(U64, [])) -> Try(U64, [])) -> Try(U64, [])
+	encode_record = |state, _, write_fields| {
+		started = state + 1
+		finished = write_fields(
+			started,
+			|field_state, name, write_value| {
+				named = field_state + Str.count_utf8_bytes(name)
+				write_value(named)
+			},
+		)?
+		Ok(finished + 2)
+	}
 
 	encode_str : Str, U64 -> Try(U64, [])
 	encode_str = |value, state| Ok(state + Str.count_utf8_bytes(value))
