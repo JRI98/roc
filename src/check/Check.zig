@@ -16172,17 +16172,25 @@ fn anyDeferredDispatchReceiverResolved(self: *Self, env: *Env) Allocator.Error!b
 }
 
 fn deferredConstraintWaitsOnDerivedEncode(self: *Self, deferred: DeferredConstraintCheck, env: *Env) Allocator.Error!bool {
-    var has_encoder_for = false;
+    var maybe_encoding_var: ?Var = null;
     for (self.types.sliceStaticDispatchConstraints(deferred.constraints)) |constraint| {
         if (constraint.fn_name.eql(self.cir.idents.encoder_for)) {
-            has_encoder_for = true;
+            maybe_encoding_var = self.encoderForConstraintEncodingVar(constraint);
             break;
         }
     }
-    if (!has_encoder_for) return false;
+    const encoding_var = maybe_encoding_var orelse return false;
 
     const region = self.getRegionAt(deferred.var_);
-    return (try self.varSupportsDerivedEncodeShape(deferred.var_, env, region)) == .unresolved;
+    return (try self.varSupportsDerivedEncodeShape(deferred.var_, encoding_var, env, region)) == .unresolved;
+}
+
+fn encoderForConstraintEncodingVar(self: *Self, constraint: StaticDispatchConstraint) ?Var {
+    const resolved_constraint = self.types.resolveVar(constraint.fn_var);
+    const resolved_func = resolved_constraint.desc.content.unwrapFunc() orelse return null;
+    const args = self.types.sliceVars(resolved_func.args);
+    if (args.len != 1) return null;
+    return args[0];
 }
 
 fn deferredEncodeHasPendingOpenLiteral(self: *Self, deferred: DeferredConstraintCheck, env: *Env) Allocator.Error!bool {
@@ -17094,6 +17102,16 @@ fn checkStaticDispatchConstraints(self: *Self, env: *Env, is_numeric_default_pas
                         }
                     }
                     if (constraint.fn_name.eql(self.cir.idents.encoder_for)) {
+                        const encoding_var = self.encoderForConstraintEncodingVar(constraint) orelse {
+                            try self.reportConstraintError(
+                                deferred_constraint.var_,
+                                constraint,
+                                .not_nominal,
+                                env,
+                                is_numeric_default_pass,
+                            );
+                            continue;
+                        };
                         var supports_implicit_encode: DerivedSupport = if (self.nominalIsBuiltinBoolType(nominal_type) or
                             self.nominalIsBuiltinStrType(nominal_type) or
                             self.nominalIsBuiltinNumberType(nominal_type))
@@ -17107,24 +17125,24 @@ fn checkStaticDispatchConstraints(self: *Self, env: *Env, is_numeric_default_pas
                         }
                         if (supports_implicit_encode == .unsupported) {
                             if (self.nominalListPayloadVar(nominal_type)) |payload_var| {
-                                supports_implicit_encode = try self.varSupportsDerivedEncodeShape(payload_var, env, region);
+                                supports_implicit_encode = try self.varSupportsDerivedEncodeShape(payload_var, encoding_var, env, region);
                             }
                         }
                         if (supports_implicit_encode == .unsupported) {
                             if (self.nominalBoxPayloadVar(nominal_type)) |payload_var| {
-                                supports_implicit_encode = try self.varSupportsDerivedEncodeShape(payload_var, env, region);
+                                supports_implicit_encode = try self.varSupportsDerivedEncodeShape(payload_var, encoding_var, env, region);
                             }
                         }
                         if (supports_implicit_encode == .unsupported) {
                             if (self.nominalSetPayloadVar(nominal_type)) |payload_var| {
-                                supports_implicit_encode = try self.varSupportsDerivedEncodeShape(payload_var, env, region);
+                                supports_implicit_encode = try self.varSupportsDerivedEncodeShape(payload_var, encoding_var, env, region);
                             }
                         }
                         if (supports_implicit_encode == .unsupported) {
                             if (self.nominalDictKeyValueVars(nominal_type)) |args| {
                                 supports_implicit_encode = combineDerivedSupport(
                                     try self.varSupportsJsonObjectKeyForDerivedEncode(args.key),
-                                    try self.varSupportsDerivedEncodeShape(args.value, env, region),
+                                    try self.varSupportsDerivedEncodeShape(args.value, encoding_var, env, region),
                                 );
                             }
                         }
@@ -17451,7 +17469,17 @@ fn checkStaticDispatchConstraints(self: *Self, env: *Env, is_numeric_default_pas
                     }
                     if (constraint.fn_name.eql(self.cir.idents.encoder_for)) {
                         const backing_var = self.types.getAliasBackingVar(alias);
-                        switch (try self.varSupportsDerivedEncodeShape(backing_var, env, region)) {
+                        const encoding_var = self.encoderForConstraintEncodingVar(constraint) orelse {
+                            try self.reportConstraintError(
+                                deferred_constraint.var_,
+                                constraint,
+                                .not_nominal,
+                                env,
+                                is_numeric_default_pass,
+                            );
+                            continue;
+                        };
+                        switch (try self.varSupportsDerivedEncodeShape(backing_var, encoding_var, env, region)) {
                             .supported => {
                                 try self.satisfyImplicitEncoderForConstraint(
                                     deferred_constraint.var_,
@@ -17678,7 +17706,17 @@ fn checkStaticDispatchConstraints(self: *Self, env: *Env, is_numeric_default_pas
                         }
                     } else if (constraint.fn_name.eql(self.cir.idents.encoder_for)) {
                         const region = self.getRegionAt(deferred_constraint.var_);
-                        switch (try self.typeSupportsDerivedEncode(dispatcher_content.structure, env, region)) {
+                        const encoding_var = self.encoderForConstraintEncodingVar(constraint) orelse {
+                            try self.reportConstraintError(
+                                deferred_constraint.var_,
+                                constraint,
+                                .not_nominal,
+                                env,
+                                is_numeric_default_pass,
+                            );
+                            continue;
+                        };
+                        switch (try self.typeSupportsDerivedEncode(dispatcher_content.structure, encoding_var, env, region)) {
                             .supported => {
                                 try self.satisfyImplicitEncoderForConstraint(
                                     deferred_constraint.var_,
@@ -18630,6 +18668,7 @@ fn combineDerivedSupport(a: DerivedSupport, b: DerivedSupport) DerivedSupport {
 fn typeSupportsDerivedEncode(
     self: *Self,
     flat_type: types_mod.FlatType,
+    encoding_var: Var,
     env: *Env,
     region: Region,
 ) Allocator.Error!DerivedSupport {
@@ -18638,7 +18677,7 @@ fn typeSupportsDerivedEncode(
             const fields_slice = self.types.getRecordFieldsSlice(record.fields);
             var support: DerivedSupport = .supported;
             for (fields_slice.items(.var_)) |field_var| {
-                support = combineDerivedSupport(support, try self.varSupportsDerivedEncodeRecordField(field_var, env, region));
+                support = combineDerivedSupport(support, try self.varSupportsDerivedEncodeRecordField(field_var, encoding_var, env, region));
                 if (support == .unsupported) break;
             }
             break :blk support;
@@ -18647,7 +18686,7 @@ fn typeSupportsDerivedEncode(
             const fields_slice = self.types.getRecordFieldsSlice(fields);
             var support: DerivedSupport = .supported;
             for (fields_slice.items(.var_)) |field_var| {
-                support = combineDerivedSupport(support, try self.varSupportsDerivedEncodeRecordField(field_var, env, region));
+                support = combineDerivedSupport(support, try self.varSupportsDerivedEncodeRecordField(field_var, encoding_var, env, region));
                 if (support == .unsupported) break;
             }
             break :blk support;
@@ -18659,18 +18698,18 @@ fn typeSupportsDerivedEncode(
             for (tags_slice.items(.args)) |tag_args_range| {
                 const tag_args = self.types.sliceVars(tag_args_range);
                 for (tag_args) |tag_arg| {
-                    support = combineDerivedSupport(support, try self.varSupportsDerivedEncodeShape(tag_arg, env, region));
+                    support = combineDerivedSupport(support, try self.varSupportsDerivedEncodeShape(tag_arg, encoding_var, env, region));
                     if (support == .unsupported) break :blk .unsupported;
                 }
             }
-            break :blk combineDerivedSupport(support, try self.varSupportsDerivedEncodeTagExt(tag_union.ext, env, region));
+            break :blk combineDerivedSupport(support, try self.varSupportsDerivedEncodeTagExt(tag_union.ext, encoding_var, env, region));
         },
         .tuple => |tuple| blk: {
             const elems = try self.gpa.dupe(Var, self.types.sliceVars(tuple.elems));
             defer self.gpa.free(elems);
             var support: DerivedSupport = .supported;
             for (elems) |elem_var| {
-                support = combineDerivedSupport(support, try self.varSupportsDerivedEncodeShape(elem_var, env, region));
+                support = combineDerivedSupport(support, try self.varSupportsDerivedEncodeShape(elem_var, encoding_var, env, region));
                 if (support == .unsupported) break;
             }
             break :blk support;
@@ -18683,33 +18722,37 @@ fn typeSupportsDerivedEncode(
 fn varSupportsDerivedEncodeRecordField(
     self: *Self,
     var_: Var,
+    encoding_var: Var,
     env: *Env,
     region: Region,
 ) Allocator.Error!DerivedSupport {
-    if (try self.optionalEncodePayloadVar(var_)) |payload_var| {
-        return try self.varSupportsDerivedEncodeShape(payload_var, env, region);
+    if (try self.varIsBuiltinJsonEncoding(encoding_var)) {
+        if (try self.optionalEncodePayloadVar(var_)) |payload_var| {
+            return try self.varSupportsDerivedEncodeShape(payload_var, encoding_var, env, region);
+        }
     }
-    return try self.varSupportsDerivedEncodeShape(var_, env, region);
+    return try self.varSupportsDerivedEncodeShape(var_, encoding_var, env, region);
 }
 
 fn varSupportsDerivedEncodeShape(
     self: *Self,
     var_: Var,
+    encoding_var: Var,
     env: *Env,
     region: Region,
 ) Allocator.Error!DerivedSupport {
     return switch (self.types.resolveVar(var_).desc.content) {
         .structure => |structure| switch (structure) {
-            .nominal_type => |nominal| try self.nominalSupportsDerivedEncodeShape(nominal, env, region),
-            .record => |record| try self.typeSupportsDerivedEncode(.{ .record = record }, env, region),
-            .record_unbound => |fields| try self.typeSupportsDerivedEncode(.{ .record_unbound = fields }, env, region),
-            .tag_union => |tag_union| try self.typeSupportsDerivedEncode(.{ .tag_union = tag_union }, env, region),
-            .tuple => |tuple| try self.typeSupportsDerivedEncode(.{ .tuple = tuple }, env, region),
+            .nominal_type => |nominal| try self.nominalSupportsDerivedEncodeShape(nominal, encoding_var, env, region),
+            .record => |record| try self.typeSupportsDerivedEncode(.{ .record = record }, encoding_var, env, region),
+            .record_unbound => |fields| try self.typeSupportsDerivedEncode(.{ .record_unbound = fields }, encoding_var, env, region),
+            .tag_union => |tag_union| try self.typeSupportsDerivedEncode(.{ .tag_union = tag_union }, encoding_var, env, region),
+            .tuple => |tuple| try self.typeSupportsDerivedEncode(.{ .tuple = tuple }, encoding_var, env, region),
             .empty_record => .supported,
             .empty_tag_union => .unsupported,
             else => .unsupported,
         },
-        .alias => |alias| try self.varSupportsDerivedEncodeShape(self.types.getAliasBackingVar(alias), env, region),
+        .alias => |alias| try self.varSupportsDerivedEncodeShape(self.types.getAliasBackingVar(alias), encoding_var, env, region),
         .err => .supported,
         .flex => .unresolved,
         .rigid => .unsupported,
@@ -18719,16 +18762,17 @@ fn varSupportsDerivedEncodeShape(
 fn varSupportsDerivedEncodeTagExt(
     self: *Self,
     var_: Var,
+    encoding_var: Var,
     env: *Env,
     region: Region,
 ) Allocator.Error!DerivedSupport {
     return switch (self.types.resolveVar(var_).desc.content) {
         .structure => |structure| switch (structure) {
             .empty_tag_union => .supported,
-            .tag_union => |tag_union| try self.typeSupportsDerivedEncode(.{ .tag_union = tag_union }, env, region),
+            .tag_union => |tag_union| try self.typeSupportsDerivedEncode(.{ .tag_union = tag_union }, encoding_var, env, region),
             else => .unsupported,
         },
-        .alias => |alias| try self.varSupportsDerivedEncodeTagExt(self.types.getAliasBackingVar(alias), env, region),
+        .alias => |alias| try self.varSupportsDerivedEncodeTagExt(self.types.getAliasBackingVar(alias), encoding_var, env, region),
         .err => .supported,
         .flex => .supported,
         .rigid => .unsupported,
@@ -18738,6 +18782,7 @@ fn varSupportsDerivedEncodeTagExt(
 fn nominalSupportsDerivedEncodeShape(
     self: *Self,
     nominal: types_mod.NominalType,
+    encoding_var: Var,
     env: *Env,
     region: Region,
 ) Allocator.Error!DerivedSupport {
@@ -18745,18 +18790,18 @@ fn nominalSupportsDerivedEncodeShape(
     if (self.nominalIsBuiltinStrType(nominal)) return .supported;
     if (self.nominalIsBuiltinNumberType(nominal)) return .supported;
     if (self.nominalListPayloadVar(nominal)) |payload_var| {
-        return try self.varSupportsDerivedEncodeShape(payload_var, env, region);
+        return try self.varSupportsDerivedEncodeShape(payload_var, encoding_var, env, region);
     }
     if (self.nominalBoxPayloadVar(nominal)) |payload_var| {
-        return try self.varSupportsDerivedEncodeShape(payload_var, env, region);
+        return try self.varSupportsDerivedEncodeShape(payload_var, encoding_var, env, region);
     }
     if (self.nominalSetPayloadVar(nominal)) |payload_var| {
-        return try self.varSupportsDerivedEncodeShape(payload_var, env, region);
+        return try self.varSupportsDerivedEncodeShape(payload_var, encoding_var, env, region);
     }
     if (self.nominalDictKeyValueVars(nominal)) |args| {
         return combineDerivedSupport(
             try self.varSupportsJsonObjectKeyForDerivedEncode(args.key),
-            try self.varSupportsDerivedEncodeShape(args.value, env, region),
+            try self.varSupportsDerivedEncodeShape(args.value, encoding_var, env, region),
         );
     }
     if (self.nominalIsBuiltinTryType(nominal)) {
@@ -18815,6 +18860,30 @@ fn jsonTryInfoFromNominal(
         .has_missing = err_info.has_missing,
         .has_null = err_info.has_null,
     };
+}
+
+fn varIsBuiltinJsonEncoding(self: *Self, var_: Var) Allocator.Error!bool {
+    return switch (self.types.resolveVar(var_).desc.content) {
+        .structure => |structure| switch (structure) {
+            .nominal_type => |nominal| self.nominalIsBuiltinJsonEncodingType(nominal),
+            else => false,
+        },
+        .alias => |alias| try self.varIsBuiltinJsonEncoding(self.types.getAliasBackingVar(alias)),
+        .err => true,
+        .flex, .rigid => false,
+    };
+}
+
+fn nominalIsBuiltinJsonEncodingType(self: *const Self, nominal_type: types_mod.NominalType) bool {
+    if (!nominal_type.originIsBuiltin()) return false;
+    if (nominal_type.sourceDeclOptional()) |source_decl| {
+        if (self.builtin_ctx.builtin_indices) |indices| {
+            if (source_decl == @intFromEnum(indices.json_encoding_type)) return true;
+        }
+    }
+
+    const ident_text = self.cir.getIdentStoreConst().getText(nominal_type.ident.ident_idx);
+    return Ident.textEql(ident_text, "JsonEncoding") or Ident.textEql(ident_text, "Builtin.Encoding.JsonEncoding");
 }
 
 fn jsonTryErrInfo(
@@ -20509,23 +20578,27 @@ fn validateDerivedEncodeRecord(
     const field_vars = try self.gpa.dupe(Var, fields.items(.var_));
     defer self.gpa.free(field_vars);
 
+    const json_object_optional_fields = try self.varIsBuiltinJsonEncoding(encoding_var);
     for (field_vars) |field_var| {
-        if (try self.jsonTryInfoForVar(field_var)) |info| {
-            if (info.has_null) {
-                switch (try self.validateEncodeFormatMethod(encoding_var, state_var, state_var, .null, err_var, constraint, env, region)) {
+        if (json_object_optional_fields) {
+            if (try self.jsonTryInfoForVar(field_var)) |info| {
+                if (info.has_null) {
+                    switch (try self.validateEncodeFormatMethod(encoding_var, state_var, state_var, .null, err_var, constraint, env, region)) {
+                        .ok => {},
+                        .unsupported, .reported_error => |result| return result,
+                    }
+                }
+                switch (try self.validateDerivedEncodeVar(info.ok_var, encoding_var, state_var, err_var, constraint, env, region, visited)) {
                     .ok => {},
                     .unsupported, .reported_error => |result| return result,
                 }
+                continue;
             }
-            switch (try self.validateDerivedEncodeVar(info.ok_var, encoding_var, state_var, err_var, constraint, env, region, visited)) {
-                .ok => {},
-                .unsupported, .reported_error => |result| return result,
-            }
-        } else {
-            switch (try self.validateDerivedEncodeVar(field_var, encoding_var, state_var, err_var, constraint, env, region, visited)) {
-                .ok => {},
-                .unsupported, .reported_error => |result| return result,
-            }
+        }
+
+        switch (try self.validateDerivedEncodeVar(field_var, encoding_var, state_var, err_var, constraint, env, region, visited)) {
+            .ok => {},
+            .unsupported, .reported_error => |result| return result,
         }
     }
     return .ok;

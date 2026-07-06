@@ -1950,6 +1950,41 @@ const Builder = struct {
         };
     }
 
+    fn typeIsBuiltinJsonEncoding(self: *Builder, ty: Type.TypeId) bool {
+        return switch (self.program.types.get(ty)) {
+            .named => |named| blk: {
+                if (self.typeDefIsBuiltinJsonEncoding(named.def)) break :blk true;
+                if (named.kind == .alias) {
+                    if (named.backing) |backing| break :blk self.typeIsBuiltinJsonEncoding(backing.ty);
+                }
+                break :blk false;
+            },
+            else => false,
+        };
+    }
+
+    fn typeDefIsBuiltinJsonEncoding(self: *Builder, def: Type.TypeDef) bool {
+        const type_name = self.program.names.typeNameText(def.type_name);
+        if (!Ident.textEql(type_name, "JsonEncoding") and !Ident.textEql(type_name, "Builtin.Encoding.JsonEncoding")) return false;
+        return self.moduleIdentityIsBuiltin(def.module);
+    }
+
+    fn moduleIdentityIsBuiltin(self: *Builder, module: names.ModuleIdentityId) bool {
+        const origin_hash = self.program.names.moduleIdentityBytes(module);
+        if (self.moduleViewHasBuiltinIdentity(moduleView(self.root_view), origin_hash)) return true;
+        for (self.modules.imports) |imported| {
+            if (self.moduleViewHasBuiltinIdentity(moduleView(imported), origin_hash)) return true;
+        }
+        for (self.modules.root.relation_modules) |relation| {
+            if (self.moduleViewHasBuiltinIdentity(moduleView(relation), origin_hash)) return true;
+        }
+        return false;
+    }
+
+    fn moduleViewHasBuiltinIdentity(_: *Builder, view: ModuleView, origin_hash: *const [32]u8) bool {
+        return view.module_env.module_role == .builtin and moduleViewIdentityMatches(view, origin_hash);
+    }
+
     fn recordFieldByTextOptional(self: *Builder, ty: Type.TypeId, text: []const u8) ?Type.Field {
         const fields = switch (self.shapeContent(ty)) {
             .record => |span| self.program.types.fieldSpan(span),
@@ -3987,7 +4022,7 @@ const Builder = struct {
         var precomputed_plan = BodyContext.ParserPrecomputedPlan.init(self.allocator);
         defer precomputed_plan.deinit();
         precomputed_plan.next_capture_id = encoderForFirstFieldCaptureId();
-        try fn_ctx.buildEncodeRestoredPrecomputedPlan(&precomputed_plan, fn_value, store_view, fn_view, shape_ty, str_ty);
+        try fn_ctx.buildEncodeRestoredPrecomputedPlan(&precomputed_plan, fn_value, store_view, fn_view, shape_ty, arg_tys[0], str_ty);
 
         const encoded = try fn_ctx.lowerEncodeShapeToState(
             shape_ty,
@@ -10458,7 +10493,7 @@ const BodyContext = struct {
             .record, .zst => {
                 try self.buildEncodeConstructionRecordPrecomputedPlan(plan, shape_ty, encoding_expr, encoding_ty, str_ty);
                 for (self.recordFieldsForShape(shape_ty)) |field| {
-                    try self.buildEncodeConstructionPrecomputedPlan(plan, self.encodeRecordFieldPayloadType(field.ty), encoding_expr, encoding_ty, str_ty);
+                    try self.buildEncodeConstructionPrecomputedPlan(plan, self.encodeRecordFieldPayloadType(field.ty, encoding_ty), encoding_expr, encoding_ty, str_ty);
                 }
             },
             .tag_union => |span| {
@@ -10479,40 +10514,41 @@ const BodyContext = struct {
         store_view: ModuleView,
         fn_view: ModuleView,
         shape_ty: Type.TypeId,
+        encoding_ty: Type.TypeId,
         str_ty: Type.TypeId,
     ) Allocator.Error!void {
         if (self.tryJsonInfo(shape_ty)) |info| {
-            return try self.buildEncodeRestoredPrecomputedPlan(plan, fn_value, store_view, fn_view, info.ok_payload_ty, str_ty);
+            return try self.buildEncodeRestoredPrecomputedPlan(plan, fn_value, store_view, fn_view, info.ok_payload_ty, encoding_ty, str_ty);
         }
         if (self.customEncoderForLookup(shape_ty) != null) return;
         if (self.jsonEncodeScalarMethodName(shape_ty) != null) return;
         if (self.setPayloadType(shape_ty)) |payload_ty| {
-            return try self.buildEncodeRestoredPrecomputedPlan(plan, fn_value, store_view, fn_view, payload_ty, str_ty);
+            return try self.buildEncodeRestoredPrecomputedPlan(plan, fn_value, store_view, fn_view, payload_ty, encoding_ty, str_ty);
         }
         if (self.dictEntryShape(shape_ty)) |dict| {
-            return try self.buildEncodeRestoredPrecomputedPlan(plan, fn_value, store_view, fn_view, dict.value_ty, str_ty);
+            return try self.buildEncodeRestoredPrecomputedPlan(plan, fn_value, store_view, fn_view, dict.value_ty, encoding_ty, str_ty);
         }
 
         switch (self.builder.shapeContent(shape_ty)) {
-            .list => |elem_ty| try self.buildEncodeRestoredPrecomputedPlan(plan, fn_value, store_view, fn_view, elem_ty, str_ty),
-            .box => |payload_ty| try self.buildEncodeRestoredPrecomputedPlan(plan, fn_value, store_view, fn_view, payload_ty, str_ty),
+            .list => |elem_ty| try self.buildEncodeRestoredPrecomputedPlan(plan, fn_value, store_view, fn_view, elem_ty, encoding_ty, str_ty),
+            .box => |payload_ty| try self.buildEncodeRestoredPrecomputedPlan(plan, fn_value, store_view, fn_view, payload_ty, encoding_ty, str_ty),
             .tuple => |span| {
                 const item_tys = try self.allocator.dupe(Type.TypeId, self.builder.program.types.span(span));
                 defer self.allocator.free(item_tys);
                 for (item_tys) |elem_ty| {
-                    try self.buildEncodeRestoredPrecomputedPlan(plan, fn_value, store_view, fn_view, elem_ty, str_ty);
+                    try self.buildEncodeRestoredPrecomputedPlan(plan, fn_value, store_view, fn_view, elem_ty, encoding_ty, str_ty);
                 }
             },
             .record, .zst => {
                 try self.buildEncodeRestoredRecordPrecomputedPlan(plan, fn_value, store_view, fn_view, shape_ty, str_ty);
                 for (self.recordFieldsForShape(shape_ty)) |field| {
-                    try self.buildEncodeRestoredPrecomputedPlan(plan, fn_value, store_view, fn_view, self.encodeRecordFieldPayloadType(field.ty), str_ty);
+                    try self.buildEncodeRestoredPrecomputedPlan(plan, fn_value, store_view, fn_view, self.encodeRecordFieldPayloadType(field.ty, encoding_ty), encoding_ty, str_ty);
                 }
             },
             .tag_union => |span| {
                 for (self.builder.program.types.tagSpan(span)) |tag| {
                     for (self.builder.program.types.span(tag.payloads)) |payload_ty| {
-                        try self.buildEncodeRestoredPrecomputedPlan(plan, fn_value, store_view, fn_view, payload_ty, str_ty);
+                        try self.buildEncodeRestoredPrecomputedPlan(plan, fn_value, store_view, fn_view, payload_ty, encoding_ty, str_ty);
                     }
                 }
             },
@@ -15174,7 +15210,7 @@ const BodyContext = struct {
         var precomputed_plan = BodyContext.ParserPrecomputedPlan.init(self.allocator);
         defer precomputed_plan.deinit();
         precomputed_plan.next_capture_id = encoderForFirstFieldCaptureId();
-        try fn_ctx.buildEncodeRestoredPrecomputedPlan(&precomputed_plan, fn_value, store_view, fn_view, shape_ty, str_ty);
+        try fn_ctx.buildEncodeRestoredPrecomputedPlan(&precomputed_plan, fn_value, store_view, fn_view, shape_ty, arg_tys[0], str_ty);
 
         const encoded = try fn_ctx.lowerEncodeShapeToState(
             shape_ty,
@@ -17213,7 +17249,7 @@ const BodyContext = struct {
         if (runtime_arg_tys.len != 2) Common.invariant("structural encoder_for runtime function must have value and state arguments");
 
         const shape_ty = try self.sealCheckedType(plan.dispatcher_ty);
-        if (!self.encodeFieldTypeIsSupported(shape_ty)) Common.invariant("structural encoder_for dispatcher was not a supported structural type");
+        if (!self.encodeFieldTypeIsSupported(shape_ty, arg_tys[0])) Common.invariant("structural encoder_for dispatcher was not a supported structural type");
 
         const encoding_value = if (pre_lowered != null and pre_lowered.?.index == 0)
             pre_lowered.?.expr
@@ -17925,9 +17961,26 @@ const BodyContext = struct {
             } },
         });
 
-        if (self.tryJsonInfo(field.ty)) |optional_info| {
-            if (!optional_info.has_missing) {
-                return try self.lowerEncodePresentRecordFieldFrom(
+        if (self.builder.typeIsBuiltinJsonEncoding(encoding_ty)) {
+            if (self.tryJsonInfo(field.ty)) |optional_info| {
+                if (!optional_info.has_missing) {
+                    return try self.lowerEncodePresentRecordFieldFrom(
+                        shape_ty,
+                        value_expr,
+                        encoding_expr,
+                        encoding_ty,
+                        state_expr,
+                        state_ty,
+                        ret_ty,
+                        precomputed_plan,
+                        record_fields,
+                        renamed_field_locals,
+                        field_index,
+                        field.ty,
+                        field_value_expr,
+                    );
+                }
+                return try self.lowerEncodeOptionalRecordFieldFrom(
                     shape_ty,
                     value_expr,
                     encoding_expr,
@@ -17939,25 +17992,10 @@ const BodyContext = struct {
                     record_fields,
                     renamed_field_locals,
                     field_index,
-                    field.ty,
                     field_value_expr,
+                    optional_info,
                 );
             }
-            return try self.lowerEncodeOptionalRecordFieldFrom(
-                shape_ty,
-                value_expr,
-                encoding_expr,
-                encoding_ty,
-                state_expr,
-                state_ty,
-                ret_ty,
-                precomputed_plan,
-                record_fields,
-                renamed_field_locals,
-                field_index,
-                field_value_expr,
-                optional_info,
-            );
         }
 
         return try self.lowerEncodePresentRecordFieldFrom(
@@ -18382,25 +18420,26 @@ const BodyContext = struct {
         return try self.sequenceEncodeTry(element_start_try, ret_ty, element_start_local, after_item, ret_ty);
     }
 
-    fn encodeRecordFieldPayloadType(self: *BodyContext, field_ty: Type.TypeId) Type.TypeId {
-        if (self.tryJsonInfo(field_ty)) |optional_info| {
-            if (optional_info.has_missing) return optional_info.ok_payload_ty;
+    fn encodeRecordFieldPayloadType(self: *BodyContext, field_ty: Type.TypeId, encoding_ty: Type.TypeId) Type.TypeId {
+        if (self.builder.typeIsBuiltinJsonEncoding(encoding_ty)) {
+            if (self.tryJsonInfo(field_ty)) |optional_info| {
+                if (optional_info.has_missing) return optional_info.ok_payload_ty;
+            }
         }
         return field_ty;
     }
 
-    fn encodeRecordFieldTypeIsSupported(self: *BodyContext, field_ty: Type.TypeId) bool {
-        if (self.tryJsonInfo(field_ty)) |info| return self.encodeFieldTypeIsSupported(info.ok_payload_ty);
-        return self.encodeFieldTypeIsSupported(self.encodeRecordFieldPayloadType(field_ty));
+    fn encodeRecordFieldTypeIsSupported(self: *BodyContext, field_ty: Type.TypeId, encoding_ty: Type.TypeId) bool {
+        return self.encodeFieldTypeIsSupported(self.encodeRecordFieldPayloadType(field_ty, encoding_ty), encoding_ty);
     }
 
-    fn encodeTagUnionTypeIsSupported(self: *BodyContext, tags_span: Type.Span) bool {
+    fn encodeTagUnionTypeIsSupported(self: *BodyContext, tags_span: Type.Span, encoding_ty: Type.TypeId) bool {
         const tags = self.builder.program.types.tagSpan(tags_span);
         if (tags.len == 0) return false;
         for (tags) |tag| {
             const payloads = self.builder.program.types.span(tag.payloads);
             for (payloads) |payload_ty| {
-                if (!self.encodeFieldTypeIsSupported(payload_ty)) return false;
+                if (!self.encodeFieldTypeIsSupported(payload_ty, encoding_ty)) return false;
             }
         }
         return true;
@@ -18882,31 +18921,31 @@ const BodyContext = struct {
         };
     }
 
-    fn encodeFieldTypeIsSupported(self: *BodyContext, ty: Type.TypeId) bool {
+    fn encodeFieldTypeIsSupported(self: *BodyContext, ty: Type.TypeId, encoding_ty: Type.TypeId) bool {
         if (self.jsonEncodeScalarMethodName(ty) != null) return true;
         if (self.tryJsonInfo(ty)) |info| {
             if (info.has_missing) return false;
-            return self.encodeFieldTypeIsSupported(info.ok_payload_ty);
+            return self.encodeFieldTypeIsSupported(info.ok_payload_ty, encoding_ty);
         }
         if (self.customEncoderForLookup(ty) != null) return true;
-        if (self.setPayloadType(ty)) |payload_ty| return self.encodeFieldTypeIsSupported(payload_ty);
-        if (self.dictEntryShape(ty)) |dict| return self.jsonObjectKeyTypeIsSupported(dict.key_ty) and self.encodeFieldTypeIsSupported(dict.value_ty);
+        if (self.setPayloadType(ty)) |payload_ty| return self.encodeFieldTypeIsSupported(payload_ty, encoding_ty);
+        if (self.dictEntryShape(ty)) |dict| return self.jsonObjectKeyTypeIsSupported(dict.key_ty) and self.encodeFieldTypeIsSupported(dict.value_ty, encoding_ty);
         return switch (self.builder.shapeContent(ty)) {
-            .list => |elem_ty| self.encodeFieldTypeIsSupported(elem_ty),
-            .box => |payload_ty| self.encodeFieldTypeIsSupported(payload_ty),
+            .list => |elem_ty| self.encodeFieldTypeIsSupported(elem_ty, encoding_ty),
+            .box => |payload_ty| self.encodeFieldTypeIsSupported(payload_ty, encoding_ty),
             .tuple => |span| blk: {
                 for (self.builder.program.types.span(span)) |elem_ty| {
-                    if (!self.encodeFieldTypeIsSupported(elem_ty)) break :blk false;
+                    if (!self.encodeFieldTypeIsSupported(elem_ty, encoding_ty)) break :blk false;
                 }
                 break :blk true;
             },
             .record => |fields_span| blk: {
                 for (self.builder.program.types.fieldSpan(fields_span)) |field| {
-                    if (!self.encodeRecordFieldTypeIsSupported(field.ty)) break :blk false;
+                    if (!self.encodeRecordFieldTypeIsSupported(field.ty, encoding_ty)) break :blk false;
                 }
                 break :blk true;
             },
-            .tag_union => |tags_span| self.encodeTagUnionTypeIsSupported(tags_span),
+            .tag_union => |tags_span| self.encodeTagUnionTypeIsSupported(tags_span, encoding_ty),
             .zst => true,
             else => false,
         };

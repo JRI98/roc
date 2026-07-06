@@ -678,6 +678,22 @@ Builtin :: [].{
 				Str.from_utf8_lossy(encoded.output)
 			}
 
+			## Encode a value as JSON text, returning `Err` when the value cannot
+			## be represented in JSON. For example, `F32` and `F64` values can be
+			## finite numbers, `NaN`, positive infinity, or negative infinity, but
+			## JSON can only represent the finite number case.
+			to_str_try : a -> Try(Str, err)
+				where [
+					a.encoder_for : JsonEncoding -> (a, JsonEncodeState -> Try(JsonEncodeState, err)),
+				]
+			to_str_try = |value| {
+				Shape : a
+				encode_shape = Shape.encoder_for(JsonEncoding.Default)
+				encoded = encode_shape(value, JsonEncodeState.{ output: u8_list_with_capacity(64), container_commas: [] })?
+
+				Ok(Str.from_utf8_lossy(encoded.output))
+			}
+
 			parse : Str -> Try(a, Json)
 				where [
 					a.parser_for : JsonEncoding -> (JsonState -> Try({ value : a, rest : JsonState }, Json)),
