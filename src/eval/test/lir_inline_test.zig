@@ -2841,22 +2841,45 @@ fn expectNoReachableErasedCallableLowering(
     try std.testing.expectEqual(@as(usize, 0), try reachableProcShapeFieldTotal(allocator, lowered, "packed_erased_fn_count"));
 }
 
+fn expectLoweredIterChainAllocatesNothing(
+    allocator: Allocator,
+    lowered: *const lir.CheckedPipeline.LoweredProgram,
+) TestError!void {
+    try expectReachableProcShapeFieldEqual(allocator, lowered, "box_box_count", 0);
+    try expectReachableProcShapeFieldEqual(allocator, lowered, "erased_call_count", 0);
+    try expectReachableProcShapeFieldEqual(allocator, lowered, "packed_erased_fn_count", 0);
+    try expectReachableProcShapeFieldEqual(allocator, lowered, "list_with_capacity_count", 0);
+}
+
+fn expectLoweredIterStateHasNoBoxesOrErasedCallables(
+    allocator: Allocator,
+    lowered: *const lir.CheckedPipeline.LoweredProgram,
+) TestError!void {
+    try expectReachableProcShapeFieldEqual(allocator, lowered, "box_box_count", 0);
+    try expectReachableProcShapeFieldEqual(allocator, lowered, "erased_call_count", 0);
+    try expectReachableProcShapeFieldEqual(allocator, lowered, "packed_erased_fn_count", 0);
+}
+
 // Zero-allocation gate for iterator chains that escape their construction site
 // (returned from a function, passed to a non-inlined function, chosen by a
 // branch). Range sources carry no list, so a statically-known chain must lower
 // to no heap allocation at all: no boxed iterator state, no erased callable
 // dispatch, no list allocation. This is the static companion to the runtime
 // allocations_at_most=0 gate in eval_iter_alloc_tests.zig, which cannot express
-// module-level function definitions. RED on the recursive-nominal
-// representation (an escaping iterator boxes its state in its constructor).
+// module-level function definitions. It checks both `.none` and `.wrappers` so
+// the gate proves representation-level minting, not opt-only wrapper
+// specialization. RED on the recursive-nominal representation (an escaping
+// iterator boxes its state in its constructor).
 fn expectEscapingIterChainAllocatesNothing(source: []const u8) TestError!void {
     const allocator = std.testing.allocator;
+
+    var ordinary = try lowerModuleWithOptions(allocator, source, .none, .{ .tag_reachability = true });
+    defer ordinary.deinit(allocator);
+    try expectLoweredIterChainAllocatesNothing(allocator, &ordinary.lowered);
+
     var optimized = try lowerModuleWithOptions(allocator, source, .wrappers, .{ .tag_reachability = true });
     defer optimized.deinit(allocator);
-    try expectReachableProcShapeFieldEqual(allocator, &optimized.lowered, "box_box_count", 0);
-    try expectReachableProcShapeFieldEqual(allocator, &optimized.lowered, "erased_call_count", 0);
-    try expectReachableProcShapeFieldEqual(allocator, &optimized.lowered, "packed_erased_fn_count", 0);
-    try expectReachableProcShapeFieldEqual(allocator, &optimized.lowered, "list_with_capacity_count", 0);
+    try expectLoweredIterChainAllocatesNothing(allocator, &optimized.lowered);
 }
 
 test "iter alloc static: iterator returned from a function is zero-alloc" {
@@ -2986,6 +3009,12 @@ test "iter alloc static: runtime-count map wrapping terminates at dynamic bounda
         \\main = |count| consume(wrap(count, Iter.exclusive_range(0.U64, 5)))
     ;
 
+    var ordinary = try lowerModuleWithOptions(allocator, source, .none, .{ .tag_reachability = true });
+    defer ordinary.deinit(allocator);
+    try std.testing.expect(try reachableProcShapeFieldTotal(allocator, &ordinary.lowered, "box_box_count") > 0);
+    try expectReachableProcShapeFieldEqual(allocator, &ordinary.lowered, "erased_call_count", 0);
+    try expectReachableProcShapeFieldEqual(allocator, &ordinary.lowered, "packed_erased_fn_count", 0);
+
     var optimized = try lowerModuleWithOptions(allocator, source, .wrappers, .{ .tag_reachability = true });
     defer optimized.deinit(allocator);
     try std.testing.expect(try reachableProcShapeFieldTotal(allocator, &optimized.lowered, "box_box_count") > 0);
@@ -3000,7 +3029,7 @@ test "iter alloc static: runtime-count map wrapping terminates at dynamic bounda
 // the list's own `list_with_capacity` is expected and not asserted here.
 test "iter alloc static: base list fold is zero-alloc" {
     const allocator = std.testing.allocator;
-    var optimized = try lowerModuleWithOptions(allocator,
+    const source =
         \\module [main]
         \\
         \\main : I64
@@ -3008,11 +3037,15 @@ test "iter alloc static: base list fold is zero-alloc" {
         \\    xs = [1.I64, 2, 3, 4, 5]
         \\    Iter.fold(xs.iter(), 0, |a, b| a + b)
         \\}
-    , .wrappers, .{ .tag_reachability = true });
+    ;
+
+    var ordinary = try lowerModuleWithOptions(allocator, source, .none, .{ .tag_reachability = true });
+    defer ordinary.deinit(allocator);
+    try expectLoweredIterStateHasNoBoxesOrErasedCallables(allocator, &ordinary.lowered);
+
+    var optimized = try lowerModuleWithOptions(allocator, source, .wrappers, .{ .tag_reachability = true });
     defer optimized.deinit(allocator);
-    try expectReachableProcShapeFieldEqual(allocator, &optimized.lowered, "box_box_count", 0);
-    try expectReachableProcShapeFieldEqual(allocator, &optimized.lowered, "erased_call_count", 0);
-    try expectReachableProcShapeFieldEqual(allocator, &optimized.lowered, "packed_erased_fn_count", 0);
+    try expectLoweredIterStateHasNoBoxesOrErasedCallables(allocator, &optimized.lowered);
 }
 
 fn reachableReturnSlotProcCount(

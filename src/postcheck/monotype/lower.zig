@@ -438,6 +438,12 @@ const ParseIntrinsic = enum {
     field_name,
 };
 
+/// Internal iterator-family nominal kind.
+///
+/// These are not source-visible nominal declarations like `MapIter`. The
+/// distinct compiler-owned nominal identity is the `TypeDef.generated` digest
+/// minted from this kind plus the concrete component types. That digest is the
+/// identity; display names stay the public `Iter` provenance.
 const GeneratedIteratorKind = enum {
     custom,
     single,
@@ -10540,6 +10546,11 @@ const BodyContext = struct {
         components: []const Type.TypeId,
         callable_evidence: ?names.TypeDigest,
     ) Allocator.Error!Type.TypeId {
+        // Mint a per-chain internal `Iter` nominal. Reusing the public `Iter`
+        // definition here is only provenance for public unification and error
+        // boundaries; `def.generated` is what separates this chain's nominal
+        // identity from the public recursive `Iter` and from other adapter
+        // chains. This is representation-level minting, not SpecConstr.
         const public_named = self.publicIteratorNamed(public_iter_ty);
         const item_ty = self.iterItemType(public_iter_ty);
         const digest = self.generatedIteratorDigest(kind, item_ty, components, callable_evidence);
