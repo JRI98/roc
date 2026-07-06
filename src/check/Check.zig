@@ -342,6 +342,13 @@ has_can_diagnostics: bool,
 /// non-literal/non-`is_eq` dispatch constraint, and does not resolve into the
 /// pinnable set can never be pinned, so its dispatch is reported as ambiguous.
 instantiation_dispatchers: std.ArrayListUnmanaged(InstantiationDispatcher),
+/// How many `instantiation_dispatchers` the end-of-check sweep has already
+/// enqueued for validation. Discharging one instantiated constraint can
+/// instantiate further constrained schemes (a generic method target with its
+/// own where clauses); the sweep loops from this cursor until no new
+/// dispatchers appear, so nested obligations are validated to a fixpoint
+/// (issue 9892's inner `a.decode` on a concrete type).
+instantiation_dispatchers_checked: usize = 0,
 /// The expression currently being checked (`checkExpr` sets this on entry and
 /// restores it on exit). When `instantiateVarHelp` records an
 /// `InstantiationDispatcher`, it stamps this expression onto it, so the
@@ -349,6 +356,14 @@ instantiation_dispatchers: std.ArrayListUnmanaged(InstantiationDispatcher),
 /// the exact expression whose instantiation created the unsatisfiable
 /// obligation — without scanning the module to rediscover it.
 instantiation_source_expr: ?CIR.Expr.Idx = null,
+/// While discharging a static-dispatch constraint, the site that constraint
+/// originated at. Scheme instantiations that copy constrained vars are then
+/// recorded against that node's `dispatch_target` evidence slot (see
+/// `recordSchemeInstantiationEvidence`).
+evidence_target_site: ?EvidenceTargetSite = null,
+/// Scratch buffer for the (scheme var → fresh var) pairs of one constrained
+/// scheme instantiation, flushed into `cir.scheme_instantiations`.
+scratch_evidence_pairs: std.ArrayListUnmanaged(ModuleEnv.SchemeInstantiationPair) = .empty,
 /// Worklist of flex vars created by literal conversions (`from_numeral`,
 /// `from_quote`, or `from_interpolation`) — open literals that may still need
 /// defaulting. Checker bookkeeping, not type data:
@@ -466,6 +481,18 @@ const InstantiationDispatcher = struct {
     /// there is not an exposed polymorphic obligation; the value has been thrown
     /// away, so the obligation must be reported and poisoned.
     discarded_binding_rhs: bool,
+};
+
+/// The evidence-record key for scheme instantiations performed while
+/// discharging a static-dispatch constraint: the source node the constraint
+/// originated at plus the raw fn var of the constraint being discharged
+/// (unique per constraint instantiation). While set, a constrained scheme
+/// instantiated (the chosen method target's scheme) is recorded against that
+/// constraint's `dispatch_target` evidence slot instead of the ambient
+/// expression's `value_use` slot.
+const EvidenceTargetSite = struct {
+    node_idx: u32,
+    constraint_fn_var: Var,
 };
 
 fn isLiteralStaticDispatchOrigin(origin: StaticDispatchConstraint.Origin) bool {
@@ -1354,6 +1381,7 @@ pub fn deinit(self: *Self) void {
     self.deferred_def_unifications.deinit(self.gpa);
     self.deferred_platform_required_unifications.deinit(self.gpa);
     self.instantiation_dispatchers.deinit(self.gpa);
+    self.scratch_evidence_pairs.deinit(self.gpa);
     self.open_literal_vars.deinit(self.gpa);
     self.open_numeral_literals.deinit(self.gpa);
     self.pending_tuple_accesses.deinit(self.gpa);
@@ -3509,6 +3537,7 @@ fn instantiateVarHelp(
     // If we had to insert any new type variables, ensure that we have
     // corresponding regions for them. This is essential for error reporting.
     const root_instantiated_region = self.regions.get(@enumFromInt(@intFromEnum(var_to_instantiate))).*;
+    self.scratch_evidence_pairs.clearRetainingCapacity();
     if (instantiator.var_map.count() > 0) {
         var iterator = instantiator.var_map.iterator();
         while (iterator.next()) |x| {
@@ -3516,6 +3545,41 @@ fn instantiateVarHelp(
             const fresh_var = x.value_ptr.*;
 
             const fresh_resolved = self.types.resolveVar(fresh_var);
+
+            // A constrained scheme var was copied: remember (scheme var → fresh
+            // var) so the whole instantiation can be recorded as static-dispatch
+            // evidence below. Rigid copies (annotation-kept rigidity) are
+            // included alongside flex copies. The scheme-side constraints' fn
+            // vars are paired too: nested evidence (a chosen method target that
+            // is itself constrained) is keyed by the instantiated constraint fn
+            // var at discharge time, and publication reaches that key through
+            // these pairs.
+            const fresh_constraints_len = switch (fresh_resolved.desc.content) {
+                .flex => |flex| flex.constraints.len(),
+                .rigid => |rigid| rigid.constraints.len(),
+                else => 0,
+            };
+            if (fresh_constraints_len > 0) {
+                try self.scratch_evidence_pairs.append(self.gpa, .{
+                    .old_var = @intFromEnum(x.key_ptr.*),
+                    .fresh_var = @intFromEnum(fresh_var),
+                });
+                const old_resolved = self.types.resolveVar(x.key_ptr.*);
+                const old_constraints_range = switch (old_resolved.desc.content) {
+                    .flex => |flex| flex.constraints,
+                    .rigid => |rigid| rigid.constraints,
+                    else => types_mod.StaticDispatchConstraint.SafeList.Range.empty(),
+                };
+                for (self.types.sliceStaticDispatchConstraints(old_constraints_range)) |old_constraint| {
+                    // `var_map` keys are resolved roots (see `Instantiator`).
+                    const old_fn_root = self.types.resolveVar(old_constraint.fn_var).var_;
+                    const fresh_fn_var = instantiator.var_map.get(old_fn_root) orelse continue;
+                    try self.scratch_evidence_pairs.append(self.gpa, .{
+                        .old_var = @intFromEnum(old_fn_root),
+                        .fresh_var = @intFromEnum(fresh_fn_var),
+                    });
+                }
+            }
 
             // Register newly instantiated open-literal flex vars on the worklist
             // so the defaulting passes see them. Separately, a fresh flex
@@ -3573,6 +3637,41 @@ fn instantiateVarHelp(
                 },
             }
         }
+    }
+
+    // Persist this constrained-scheme instantiation as static-dispatch
+    // evidence: publication resolves the fresh vars once checking settles to
+    // decide how each of the scheme's dispatch constraints was satisfied here.
+    if (self.scratch_evidence_pairs.items.len > 0) {
+        if (self.evidence_target_site) |target| {
+            try self.cir.recordSchemeInstantiation(
+                target.node_idx,
+                .dispatch_target,
+                @intFromEnum(target.constraint_fn_var),
+                var_to_instantiate,
+                self.scratch_evidence_pairs.items,
+            );
+        } else if (self.instantiation_source_expr) |source_expr| {
+            // Only value uses of definitions instantiate schemes whose
+            // constraints later need per-site evidence; other in-expression
+            // instantiations (nominal constructors, Try copies, iterator
+            // declarations, …) never become specialization edges.
+            switch (self.cir.store.nodes.get(@enumFromInt(@intFromEnum(source_expr))).tag) {
+                .expr_var,
+                .expr_external_lookup,
+                .expr_required_lookup,
+                .expr_field_access,
+                => try self.cir.recordSchemeInstantiation(
+                    @intFromEnum(source_expr),
+                    .value_use,
+                    0,
+                    var_to_instantiate,
+                    self.scratch_evidence_pairs.items,
+                ),
+                else => {},
+            }
+        }
+        self.scratch_evidence_pairs.clearRetainingCapacity();
     }
 
     // Add the var to the right rank
@@ -6744,29 +6843,41 @@ fn checkInstantiatedStaticDispatchConstraints(
     env: *Env,
     is_numeric_default_pass: bool,
 ) std.mem.Allocator.Error!void {
-    if (self.instantiation_dispatchers.items.len == 0) return;
+    // Discharging an instantiated constraint can instantiate the chosen
+    // method target's own scheme, appending new dispatchers; loop to a
+    // fixpoint so nested obligations are validated too. The per-round cursor
+    // keeps each dispatcher enqueued exactly once, and the round cap bounds
+    // adversarial chains (each round performs real unification work, so real
+    // programs converge in a handful of rounds).
+    var rounds: u32 = 64;
+    while (rounds > 0) : (rounds -= 1) {
+        const start = self.instantiation_dispatchers_checked;
+        const end = self.instantiation_dispatchers.items.len;
+        if (start >= end) return;
+        self.instantiation_dispatchers_checked = end;
 
-    const deferred_top = env.deferred_static_dispatch_constraints.items.items.len;
-    for (self.instantiation_dispatchers.items) |dispatcher| {
-        if (dispatcher.constraints.len() == 0) continue;
-        var has_where_constraint = false;
-        for (self.types.sliceStaticDispatchConstraints(dispatcher.constraints)) |constraint| {
-            if (constraint.origin == .where_clause) {
-                has_where_constraint = true;
-                break;
+        const deferred_top = env.deferred_static_dispatch_constraints.items.items.len;
+        for (self.instantiation_dispatchers.items[start..end]) |dispatcher| {
+            if (dispatcher.constraints.len() == 0) continue;
+            var has_where_constraint = false;
+            for (self.types.sliceStaticDispatchConstraints(dispatcher.constraints)) |constraint| {
+                if (constraint.origin == .where_clause) {
+                    has_where_constraint = true;
+                    break;
+                }
             }
+            if (!has_where_constraint) continue;
+
+            _ = try env.deferred_static_dispatch_constraints.append(self.gpa, .{
+                .var_ = dispatcher.dispatcher_var,
+                .constraints = dispatcher.constraints,
+            });
         }
-        if (!has_where_constraint) continue;
+        if (env.deferred_static_dispatch_constraints.items.items.len == deferred_top) continue;
 
-        _ = try env.deferred_static_dispatch_constraints.append(self.gpa, .{
-            .var_ = dispatcher.dispatcher_var,
-            .constraints = dispatcher.constraints,
-        });
+        try self.checkStaticDispatchConstraints(env, is_numeric_default_pass);
+        try self.checkAllConstraints(env);
     }
-    if (env.deferred_static_dispatch_constraints.items.items.len == deferred_top) return;
-
-    try self.checkStaticDispatchConstraints(env, is_numeric_default_pass);
-    try self.checkAllConstraints(env);
 }
 
 /// Detect ambiguous static dispatch: a static-dispatch-constrained type variable
@@ -15286,6 +15397,8 @@ const Probe = struct {
     open_literal_vars_len: usize,
     open_numeral_literals_len: usize,
     pending_tuple_accesses_len: usize,
+    scheme_instantiations_len: usize,
+    scheme_instantiation_pairs_len: usize,
 
     fn rollback(self: *Probe) void {
         self.check.types.rollbackToSavepoint(&self.savepoint);
@@ -15298,6 +15411,10 @@ const Probe = struct {
         self.check.open_literal_vars.shrinkRetainingCapacity(self.open_literal_vars_len);
         self.check.open_numeral_literals.shrinkRetainingCapacity(self.open_numeral_literals_len);
         self.check.pending_tuple_accesses.shrinkRetainingCapacity(self.pending_tuple_accesses_len);
+        // Scheme-instantiation evidence recorded during the probe references
+        // fresh vars the savepoint rollback just discarded.
+        self.check.cir.scheme_instantiations.items.shrinkRetainingCapacity(self.scheme_instantiations_len);
+        self.check.cir.scheme_instantiation_pairs.items.shrinkRetainingCapacity(self.scheme_instantiation_pairs_len);
     }
 
     /// Close the probe scope KEEPING everything it did: the type-store
@@ -15315,6 +15432,8 @@ fn beginProbe(self: *Self) std.mem.Allocator.Error!Probe {
     const open_literal_vars_len = self.open_literal_vars.items.len;
     const open_numeral_literals_len = self.open_numeral_literals.items.len;
     const pending_tuple_accesses_len = self.pending_tuple_accesses.items.len;
+    const scheme_instantiations_len = self.cir.scheme_instantiations.items.items.len;
+    const scheme_instantiation_pairs_len = self.cir.scheme_instantiation_pairs.items.items.len;
     return .{
         .check = self,
         .regions_len = regions_len,
@@ -15322,6 +15441,8 @@ fn beginProbe(self: *Self) std.mem.Allocator.Error!Probe {
         .open_literal_vars_len = open_literal_vars_len,
         .open_numeral_literals_len = open_numeral_literals_len,
         .pending_tuple_accesses_len = pending_tuple_accesses_len,
+        .scheme_instantiations_len = scheme_instantiations_len,
+        .scheme_instantiation_pairs_len = scheme_instantiation_pairs_len,
         .savepoint = try self.types.createSavepoint(),
     };
 }
@@ -17143,7 +17264,14 @@ fn checkStaticDispatchConstraints(self: *Self, env: *Env, is_numeric_default_pas
                         }
                     }
 
-                    // Copy the actual method from the dest module env to this module env
+                    // Copy the actual method from the dest module env to this module env.
+                    // Instantiating the chosen method target's scheme while this
+                    // key is set records the instantiation as `dispatch_target`
+                    // evidence for the constraint being discharged.
+                    self.evidence_target_site = .{
+                        .node_idx = if (self.constraintExprForFnVar(constraint.fn_var)) |expr| @intFromEnum(expr) else 0,
+                        .constraint_fn_var = constraint.fn_var,
+                    };
                     const method_var = if (cycle_method_expr_var) |expr_var_for_method| blk: {
                         // Cycle participant or recursive self-dispatch: use the
                         // fresh flex var instead of def_var to avoid rank lowering.
@@ -17158,6 +17286,7 @@ fn checkStaticDispatchConstraints(self: *Self, env: *Env, is_numeric_default_pas
                         const copied_var = try self.copyVar(method_type_var, original_env, region);
                         break :blk try self.instantiateVar(copied_var, env, .{ .explicit = region });
                     };
+                    self.evidence_target_site = null;
 
                     // Unwrap the constraint type
                     const constraint_fn = constraint_fn_resolved.unwrapFunc() orelse {
@@ -17401,6 +17530,13 @@ fn checkStaticDispatchConstraints(self: *Self, env: *Env, is_numeric_default_pas
                         }
                     }
 
+                    // See the nominal branch above: while this key is set, the
+                    // chosen method target's scheme instantiation is recorded as
+                    // `dispatch_target` evidence for this constraint.
+                    self.evidence_target_site = .{
+                        .node_idx = if (self.constraintExprForFnVar(constraint.fn_var)) |expr| @intFromEnum(expr) else 0,
+                        .constraint_fn_var = constraint.fn_var,
+                    };
                     const method_var = if (cycle_method_expr_var) |expr_var_for_method| blk: {
                         break :blk expr_var_for_method;
                     } else if (is_this_module) blk: {
@@ -17412,6 +17548,7 @@ fn checkStaticDispatchConstraints(self: *Self, env: *Env, is_numeric_default_pas
                         const copied_var = try self.copyVar(method_type_var, original_env, region);
                         break :blk try self.instantiateVar(copied_var, env, .{ .explicit = region });
                     };
+                    self.evidence_target_site = null;
 
                     const constraint_fn = constraint_fn_resolved.unwrapFunc() orelse {
                         _ = try self.unifyInContext(method_var, constraint.fn_var, env, .{

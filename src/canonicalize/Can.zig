@@ -1418,6 +1418,27 @@ fn typePathForBinding(self: *const Self, binding: Scope.TypeBinding) ?AST.DeclIn
     return self.type_decl_paths.get(stmt_idx);
 }
 
+/// The type name a top-level alias declaration refers to, when its annotation
+/// is a plain (possibly applied) type reference — `ThingAlias : Thing` or
+/// `Wrapped(a) : Wrapper(a)`. Null for every other binding or annotation
+/// shape.
+fn aliasBindingTargetName(self: *const Self, binding: Scope.TypeBinding) ?Ident.Idx {
+    const stmt_idx = switch (binding) {
+        .local_alias => |stmt_idx| stmt_idx,
+        .local_nominal, .associated_nominal, .external_nominal => return null,
+    };
+    const alias = switch (self.env.store.getStatement(stmt_idx)) {
+        .s_alias_decl => |alias| alias,
+        else => return null,
+    };
+    if (alias.anno == .placeholder) return null;
+    return switch (self.env.store.getTypeAnno(alias.anno)) {
+        .lookup => |lookup| lookup.name,
+        .apply => |apply| apply.name,
+        else => null,
+    };
+}
+
 fn qualifierTypePath(
     self: *Self,
     qualifier_tokens: []const u32,
@@ -6943,10 +6964,23 @@ fn canonicalizeTypeDispatchFieldAccess(
 
 fn canonicalizeTypeAssociatedLookup(
     self: *Self,
-    module_alias: Ident.Idx,
+    unresolved_module_alias: Ident.Idx,
     ident: Ident.Idx,
     region: Region,
 ) std.mem.Allocator.Error!?CanonicalizedExpr {
+    // Type aliases are transparent for associated-item lookup: given
+    // `ThingAlias : Thing`, `ThingAlias.from_u64` resolves against `Thing`'s
+    // associated items (#9875). Follow the (finite, cycle-guarded) alias
+    // chain to the terminal type name before looking anything up.
+    var module_alias = unresolved_module_alias;
+    var alias_hops: u32 = 32;
+    while (alias_hops > 0) : (alias_hops -= 1) {
+        const binding_location = (try self.scopeLookupOrPrepareTypeBinding(module_alias)) orelse break;
+        const target = self.aliasBindingTargetName(binding_location.binding.*) orelse break;
+        if (target.eql(module_alias)) break;
+        module_alias = target;
+    }
+
     const local_type_binding = try self.scopeLookupOrPrepareTypeBinding(module_alias);
     const is_type_in_scope = local_type_binding != null;
     const is_auto_imported_type = self.hasAvailableModuleEnv(module_alias);

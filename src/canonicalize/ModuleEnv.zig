@@ -559,6 +559,53 @@ pub const NumeralDispatchPlan = extern struct {
     pub const SafeList = collections.SafeList(@This());
 };
 
+/// One constrained-scheme instantiation recorded by checking for static-dispatch
+/// evidence. It names the source node whose checking instantiated the scheme, the
+/// pristine (never-unified) scheme root that was copied, and — via
+/// `scheme_instantiation_pairs` — the fresh var each constrained scheme var was
+/// copied to. Publication resolves the fresh vars after checking settles to
+/// decide how each of the callee's dispatch constraints was satisfied at this
+/// site.
+pub const SchemeInstantiationRecord = extern struct {
+    node_idx: u32,
+    /// `Slot` — distinguishes several schemes instantiated at one node (a value
+    /// use vs. the target of a dispatch constraint).
+    slot_kind: u32,
+    /// For `dispatch_target` slots, the raw fn `Var` of the constraint whose
+    /// discharge instantiated this scheme — unique per constraint
+    /// instantiation, so nested evidence chains resolve without ambiguity.
+    /// 0 for `value_use` slots (keyed by `node_idx` instead).
+    slot_data: u32,
+    /// The pristine scheme root `Var` that was instantiated. For imported
+    /// schemes this is the local copy, which stays structurally intact.
+    scheme_root: u32,
+    /// Range into `scheme_instantiation_pairs`.
+    pairs_start: u32,
+    pairs_len: u32,
+
+    pub const SafeList = collections.SafeList(@This());
+
+    pub const Slot = enum(u32) {
+        /// The scheme of a value that was referenced (e.g. an `e_lookup` of a
+        /// generalized definition).
+        value_use,
+        /// The scheme of the method target chosen while discharging a static
+        /// dispatch constraint originating at this node.
+        dispatch_target,
+    };
+};
+
+/// One (constrained scheme var → fresh instantiated var) pair of a
+/// `SchemeInstantiationRecord`.
+pub const SchemeInstantiationPair = extern struct {
+    /// Constrained var in the pristine scheme (`Var`).
+    old_var: u32,
+    /// The fresh copy created for this instantiation (`Var`).
+    fresh_var: u32,
+
+    pub const SafeList = collections.SafeList(@This());
+};
+
 /// Resolved type target for an explicit numeric suffix such as `123.U64` or
 /// `123.Custom`. Canonicalization records this once from scope resolution;
 /// checking consumes it directly instead of looking up the suffix text again.
@@ -714,6 +761,11 @@ numeral_dispatch_plans: NumeralDispatchPlan.SafeList,
 quote_dispatch_plans: NumeralDispatchPlan.SafeList,
 /// Scope-resolved explicit numeric suffix targets attached by canonicalization.
 numeric_suffix_targets: NumericSuffixTarget.SafeList,
+/// Constrained-scheme instantiations recorded by checking for static-dispatch
+/// evidence; consumed at checked-module publication.
+scheme_instantiations: SchemeInstantiationRecord.SafeList,
+/// Flat pool of (scheme var → fresh var) pairs backing `scheme_instantiations`.
+scheme_instantiation_pairs: SchemeInstantiationPair.SafeList,
 
 /// A type alias mapping from a for-clause: [Model : model]
 /// Maps an alias name (Model) to a rigid variable name (model)
@@ -903,6 +955,8 @@ pub fn init(gpa: std.mem.Allocator, source: []const u8) std.mem.Allocator.Error!
         .numeral_dispatch_plans = try NumeralDispatchPlan.SafeList.initCapacity(gpa, 8),
         .quote_dispatch_plans = try NumeralDispatchPlan.SafeList.initCapacity(gpa, 8),
         .numeric_suffix_targets = try NumericSuffixTarget.SafeList.initCapacity(gpa, 8),
+        .scheme_instantiations = try SchemeInstantiationRecord.SafeList.initCapacity(gpa, 8),
+        .scheme_instantiation_pairs = try SchemeInstantiationPair.SafeList.initCapacity(gpa, 8),
     };
 }
 
@@ -928,6 +982,8 @@ pub fn deinit(self: *Self) void {
     self.numeral_dispatch_plans.deinit(self.gpa);
     self.quote_dispatch_plans.deinit(self.gpa);
     self.numeric_suffix_targets.deinit(self.gpa);
+    self.scheme_instantiations.deinit(self.gpa);
+    self.scheme_instantiation_pairs.deinit(self.gpa);
     // diagnostics are stored in the NodeStore, no need to free separately
     self.store.deinit();
 
@@ -969,6 +1025,8 @@ pub fn deinitCachedModule(self: *Self) void {
     self.numeral_dispatch_plans.deinit(self.gpa);
     self.quote_dispatch_plans.deinit(self.gpa);
     self.numeric_suffix_targets.deinit(self.gpa);
+    self.scheme_instantiations.deinit(self.gpa);
+    self.scheme_instantiation_pairs.deinit(self.gpa);
 
     // If enableRuntimeInserts was called on the interner, it allocated new memory
     // that needs to be freed. The interner.deinit checks supports_inserts internally
@@ -3136,6 +3194,8 @@ pub const Serialized = extern struct {
     numeral_dispatch_plans: NumeralDispatchPlan.SafeList.Serialized,
     quote_dispatch_plans: NumeralDispatchPlan.SafeList.Serialized,
     numeric_suffix_targets: NumericSuffixTarget.SafeList.Serialized,
+    scheme_instantiations: SchemeInstantiationRecord.SafeList.Serialized,
+    scheme_instantiation_pairs: SchemeInstantiationPair.SafeList.Serialized,
     // Reserved space (was is_lambda_lifted and is_defunctionalized, now unused)
     _reserved_flags: [2]u8 = .{ 0, 0 },
     _padding: [6]u8 = .{ 0, 0, 0, 0, 0, 0 },
@@ -3206,6 +3266,8 @@ pub const Serialized = extern struct {
         try self.numeral_dispatch_plans.serialize(&env.numeral_dispatch_plans, allocator, writer);
         try self.quote_dispatch_plans.serialize(&env.quote_dispatch_plans, allocator, writer);
         try self.numeric_suffix_targets.serialize(&env.numeric_suffix_targets, allocator, writer);
+        try self.scheme_instantiations.serialize(&env.scheme_instantiations, allocator, writer);
+        try self.scheme_instantiation_pairs.serialize(&env.scheme_instantiation_pairs, allocator, writer);
 
         self._reserved_flags = .{ 0, 0 };
     }
@@ -3265,6 +3327,8 @@ pub const Serialized = extern struct {
             .numeral_dispatch_plans = self.numeral_dispatch_plans.deserializeInto(base_addr),
             .quote_dispatch_plans = self.quote_dispatch_plans.deserializeInto(base_addr),
             .numeric_suffix_targets = self.numeric_suffix_targets.deserializeInto(base_addr),
+            .scheme_instantiations = self.scheme_instantiations.deserializeInto(base_addr),
+            .scheme_instantiation_pairs = self.scheme_instantiation_pairs.deserializeInto(base_addr),
         };
 
         return env;
@@ -3324,6 +3388,8 @@ pub const Serialized = extern struct {
             .numeral_dispatch_plans = self.numeral_dispatch_plans.deserializeInto(base_addr),
             .quote_dispatch_plans = self.quote_dispatch_plans.deserializeInto(base_addr),
             .numeric_suffix_targets = self.numeric_suffix_targets.deserializeInto(base_addr),
+            .scheme_instantiations = self.scheme_instantiations.deserializeInto(base_addr),
+            .scheme_instantiation_pairs = self.scheme_instantiation_pairs.deserializeInto(base_addr),
         };
     }
 
@@ -3385,6 +3451,8 @@ pub const Serialized = extern struct {
             .numeral_dispatch_plans = try self.numeral_dispatch_plans.deserializeWithCopy(base_addr, gpa),
             .quote_dispatch_plans = try self.quote_dispatch_plans.deserializeWithCopy(base_addr, gpa),
             .numeric_suffix_targets = try self.numeric_suffix_targets.deserializeWithCopy(base_addr, gpa),
+            .scheme_instantiations = try self.scheme_instantiations.deserializeWithCopy(base_addr, gpa),
+            .scheme_instantiation_pairs = try self.scheme_instantiation_pairs.deserializeWithCopy(base_addr, gpa),
         };
 
         return env;
@@ -3551,6 +3619,31 @@ pub fn recordQuoteDispatchPlan(
         .node_idx = raw_node,
         .target_var = @intFromEnum(target_var),
         .fn_var = @intFromEnum(fn_var),
+    });
+}
+
+/// Record a constrained-scheme instantiation for static-dispatch evidence.
+/// `slot_data` is the raw fn `Var` of the discharged constraint for
+/// `dispatch_target` slots and 0 for `value_use` slots.
+pub fn recordSchemeInstantiation(
+    self: *Self,
+    node_idx: u32,
+    slot: SchemeInstantiationRecord.Slot,
+    slot_data: u32,
+    scheme_root: TypeVar,
+    pairs: []const SchemeInstantiationPair,
+) std.mem.Allocator.Error!void {
+    const pairs_start: u32 = @intCast(self.scheme_instantiation_pairs.items.items.len);
+    for (pairs) |pair| {
+        _ = try self.scheme_instantiation_pairs.append(self.gpa, pair);
+    }
+    _ = try self.scheme_instantiations.append(self.gpa, .{
+        .node_idx = node_idx,
+        .slot_kind = @intFromEnum(slot),
+        .slot_data = slot_data,
+        .scheme_root = @intFromEnum(scheme_root),
+        .pairs_start = pairs_start,
+        .pairs_len = @intCast(pairs.len),
     });
 }
 

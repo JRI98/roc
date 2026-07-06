@@ -206,6 +206,7 @@ pub const BuildEnv = struct {
     synthetic_root_original_path: ?[]const u8 = null,
     synthetic_root_original_source: ?[]const u8 = null,
     synthetic_root_header_len: usize = 0,
+    synthetic_root_header_lines: u32 = 0,
     synthetic_root_identity: bool = false,
     synthetic_root_platform_identity: bool = false,
 
@@ -484,8 +485,20 @@ pub const BuildEnv = struct {
         self.synthetic_root_original_path = original_path;
         self.synthetic_root_original_source = original_source;
         self.synthetic_root_header_len = header_len;
+        self.synthetic_root_header_lines = 0;
         self.setSyntheticRootPackageIdentity();
         self.setSyntheticRootPlatformPackageIdentity();
+    }
+
+    pub fn setSyntheticRootSourceMappingWithLineOffset(
+        self: *BuildEnv,
+        original_path: []const u8,
+        original_source: []const u8,
+        header_len: usize,
+        header_lines: u32,
+    ) void {
+        self.setSyntheticRootSourceMapping(original_path, original_source, header_len);
+        self.synthetic_root_header_lines = header_lines;
     }
 
     pub fn setSyntheticRootPackageIdentity(self: *BuildEnv) void {
@@ -2080,6 +2093,109 @@ pub const BuildEnv = struct {
         return error.InvalidPackageName;
     }
 
+    fn syntheticRootDisplayPath(self: *BuildEnv, path: []const u8) ?[]const u8 {
+        const original_path = self.synthetic_root_original_path orelse return null;
+        const root_path = self.discovered_root_abs orelse return null;
+        if (!std.mem.eql(u8, path, root_path)) return null;
+        return original_path;
+    }
+
+    fn remapSyntheticRootSourceRegion(
+        self: *BuildEnv,
+        allocator: Allocator,
+        region: *reporting.SourceCodeDisplayRegion,
+        original_line_starts: []const u32,
+    ) Allocator.Error!void {
+        const original_path = self.synthetic_root_original_path orelse return;
+        const original_source = self.synthetic_root_original_source orelse return;
+        const filename = region.filename orelse return;
+        if (self.syntheticRootDisplayPath(filename) == null) return;
+
+        const header_lines = self.synthetic_root_header_lines;
+        if (header_lines == 0) {
+            const owned_filename = try allocator.dupe(u8, original_path);
+            if (region.filename) |old_filename| allocator.free(old_filename);
+            region.filename = owned_filename;
+            return;
+        }
+
+        if (region.start_line <= header_lines or region.end_line <= header_lines) return;
+        if (original_line_starts.len == 0) return;
+
+        const original_start_line = region.start_line - header_lines;
+        const original_end_line = region.end_line - header_lines;
+        const region_info = base.RegionInfo{
+            .start_line_idx = original_start_line - 1,
+            .start_col_idx = region.start_column - 1,
+            .end_line_idx = original_end_line - 1,
+            .end_col_idx = region.end_column - 1,
+        };
+
+        const line_text = try allocator.dupe(u8, region_info.calculateLineText(original_source, original_line_starts));
+        errdefer allocator.free(line_text);
+        const owned_filename = try allocator.dupe(u8, original_path);
+        errdefer allocator.free(owned_filename);
+
+        allocator.free(region.line_text);
+        if (region.filename) |old_filename| allocator.free(old_filename);
+
+        region.line_text = line_text;
+        region.filename = owned_filename;
+        region.start_line = original_start_line;
+        region.end_line = original_end_line;
+    }
+
+    fn remapSyntheticRootDocumentElement(
+        self: *BuildEnv,
+        allocator: Allocator,
+        element: *reporting.DocumentElement,
+        original_line_starts: []const u32,
+    ) Allocator.Error!void {
+        switch (element.*) {
+            .source_code_region => |*region| try self.remapSyntheticRootSourceRegion(allocator, region, original_line_starts),
+            .source_code_with_underlines => |*underlines| {
+                const old_start_line = underlines.display_region.start_line;
+                try self.remapSyntheticRootSourceRegion(allocator, &underlines.display_region, original_line_starts);
+                const header_lines = self.synthetic_root_header_lines;
+                if (header_lines == 0 or old_start_line <= header_lines) return;
+                for (underlines.underline_regions) |*underline| {
+                    if (underline.start_line > header_lines) {
+                        underline.start_line -= header_lines;
+                    }
+                    if (underline.end_line > header_lines) {
+                        underline.end_line -= header_lines;
+                    }
+                }
+            },
+            else => {},
+        }
+    }
+
+    fn remapSyntheticRootReport(self: *BuildEnv, report: *Report) Allocator.Error!void {
+        if (self.synthetic_root_original_path == null or self.synthetic_root_original_source == null) return;
+
+        if (self.synthetic_root_header_lines == 0) {
+            for (report.document.elements.items) |*element| {
+                try self.remapSyntheticRootDocumentElement(
+                    report.document.allocator,
+                    element,
+                    &.{},
+                );
+            }
+            return;
+        }
+
+        var original_line_starts = try base.RegionInfo.findLineStarts(self.gpa, self.synthetic_root_original_source.?);
+        defer original_line_starts.deinit(self.gpa);
+        for (report.document.elements.items) |*element| {
+            try self.remapSyntheticRootDocumentElement(
+                report.document.allocator,
+                element,
+                original_line_starts.items.items,
+            );
+        }
+    }
+
     pub const DrainedModuleReports = struct {
         abs_path: []const u8,
         reports: []Report,
@@ -2095,10 +2211,15 @@ pub const BuildEnv = struct {
         var out = try self.gpa.alloc(DrainedModuleReports, drained.len);
         var i: usize = 0;
         while (i < drained.len) : (i += 1) {
-            const path = self.moduleToPath(drained[i].pkg_name, drained[i].module_name) catch |err| switch (err) {
+            var path = self.moduleToPath(drained[i].pkg_name, drained[i].module_name) catch |err| switch (err) {
                 error.OutOfMemory => return error.OutOfMemory,
                 error.InvalidPackageName, error.PathOutsideWorkspace => try self.gpa.dupe(u8, ""),
             };
+
+            if (self.syntheticRootDisplayPath(path)) |display_path| {
+                self.gpa.free(path);
+                path = try self.gpa.dupe(u8, display_path);
+            }
 
             // When a package that was compiled against a bumped dependency
             // version has errors, attach its version note to the first error
@@ -2113,6 +2234,10 @@ pub const BuildEnv = struct {
                         break;
                     }
                 }
+            }
+
+            for (drained[i].reports) |*report| {
+                try self.remapSyntheticRootReport(report);
             }
 
             out[i] = .{
