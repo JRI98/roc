@@ -1990,16 +1990,26 @@ const PlatformRelationSubstitutionCollector = struct {
         actual: CheckedTypeId,
     ) Allocator.Error!void {
         if (formal == actual) return;
-        for (self.formals.items, self.actuals.items) |existing_formal, existing_actual| {
+        for (self.formals.items, 0..) |existing_formal, i| {
             if (existing_formal != formal) continue;
-            if (!self.rootsEquivalent(existing_actual, actual)) {
-                checkedArtifactInvariant("platform relation substitution mapped one identity to incompatible actual types", .{});
-            }
+            const existing_actual = self.actuals.items[i];
+            const refined = try self.refineBoundActual(existing_actual, actual);
+            self.actuals.items[i] = refined;
             return;
         }
         try self.formals.append(self.allocator, formal);
         errdefer _ = self.formals.pop();
         try self.actuals.append(self.allocator, actual);
+    }
+
+    fn refineBoundActual(
+        self: *PlatformRelationSubstitutionCollector,
+        existing: CheckedTypeId,
+        candidate: CheckedTypeId,
+    ) Allocator.Error!CheckedTypeId {
+        var resolver = PlatformAppRelationTypeResolver.init(self.allocator, self.names, self.store);
+        defer resolver.deinit();
+        return try resolver.refineIdentitySubstitution(existing, candidate);
     }
 
     fn collectAlias(
@@ -2208,20 +2218,6 @@ const PlatformRelationSubstitutionCollector = struct {
 
     fn emptyTagUnionRoot(self: *PlatformRelationSubstitutionCollector) Allocator.Error!CheckedTypeId {
         return try self.store.appendSyntheticPayloadRoot(self.allocator, self.names, .empty_tag_union);
-    }
-
-    fn rootsEquivalent(
-        self: *const PlatformRelationSubstitutionCollector,
-        left: CheckedTypeId,
-        right: CheckedTypeId,
-    ) bool {
-        if (left == right) return true;
-        const left_index: usize = @intFromEnum(left);
-        const right_index: usize = @intFromEnum(right);
-        if (left_index >= self.store.roots.items.len or right_index >= self.store.roots.items.len) {
-            checkedArtifactInvariant("platform relation substitution referenced a missing root", .{});
-        }
-        return canonicalTypeKeyEql(self.store.roots.items[left_index].key, self.store.roots.items[right_index].key);
     }
 
     fn payload(self: *const PlatformRelationSubstitutionCollector, root: CheckedTypeId) CheckedTypePayload {
@@ -18126,21 +18122,8 @@ const PlatformAppRelationTypeResolver = struct {
         for (self.substitution_formals.items, 0..) |existing_formal, i| {
             if (existing_formal != formal) continue;
             const existing_actual = self.substitution_actuals.items[i];
-            if (existing_actual == actual) {
-                return;
-            }
-            if (checkedTypePayloadIsIdentity(self.payload(existing_actual))) {
-                self.substitution_actuals.items[i] = actual;
-                return;
-            }
-            if (checkedTypePayloadIsIdentity(self.payload(actual))) {
-                return;
-            }
-            const existing_key = self.store.roots.items[@intFromEnum(existing_actual)].key;
-            const actual_key = self.store.roots.items[@intFromEnum(actual)].key;
-            if (!canonicalTypeKeyEql(existing_key, actual_key)) {
-                checkedArtifactInvariant("platform/app relation assigned incompatible concrete types to one requirement identity", .{});
-            }
+            const refined = try self.refineIdentitySubstitution(existing_actual, actual);
+            self.substitution_actuals.items[i] = refined;
             return;
         }
         try self.substitution_formals.append(self.allocator, formal);
@@ -29365,6 +29348,72 @@ test "platform app relation resolver substitutes required identity in provided f
         else => return error.ExpectedNominalReturn,
     };
     try std.testing.expectEqual(app_player.nominal, resolved_ret);
+}
+
+test "platform app relation resolver refines repeated identity substitution through alias backing" {
+    const allocator = std.testing.allocator;
+
+    var names = canonical.CanonicalNameStore.init(allocator);
+    defer names.deinit();
+
+    const module_identity = try names.internModuleIdentity(&([_]u8{0x90} ** 32));
+    const alias_name = try names.internTypeName("Model");
+    const pins_field = try names.internRecordFieldLabel("pins");
+
+    var store = CheckedTypeStore{};
+    defer store.deinit(allocator);
+
+    const platform_model = try store.reserveSyntheticTypeRoot(allocator, testCanonicalTypeKey(91));
+    try store.fillSyntheticTypeRoot(allocator, platform_model, .{ .flex = .{} });
+
+    const empty_record = try store.appendSyntheticPayloadRoot(allocator, &names, .empty_record);
+    const record_fields = try allocator.alloc(CheckedRecordField, 1);
+    record_fields[0] = .{ .name = pins_field, .ty = empty_record };
+    const app_record = try appendExplicitCheckedTypePayload(allocator, &names, &store, .{ .record = .{
+        .fields = record_fields,
+        .ext = empty_record,
+    } });
+    const app_alias = try appendExplicitCheckedTypePayload(allocator, &names, &store, .{ .alias = .{
+        .name = alias_name,
+        .origin_module = module_identity,
+        .backing = app_record,
+    } });
+
+    {
+        var resolver = PlatformAppRelationTypeResolver.init(allocator, &names, &store);
+        defer resolver.deinit();
+
+        try std.testing.expectEqual(app_alias, try resolver.merge(platform_model, app_alias, .value));
+        try std.testing.expectEqual(app_alias, try resolver.merge(platform_model, app_record, .value));
+    }
+
+    {
+        var resolver = PlatformAppRelationTypeResolver.init(allocator, &names, &store);
+        defer resolver.deinit();
+
+        try std.testing.expectEqual(app_record, try resolver.merge(platform_model, app_record, .value));
+        try std.testing.expectEqual(app_record, try resolver.merge(platform_model, app_alias, .value));
+    }
+
+    {
+        var collector = PlatformRelationSubstitutionCollector.init(allocator, &names, &store);
+        defer collector.deinit();
+
+        try collector.collect(platform_model, app_alias, .value);
+        try collector.collect(platform_model, app_record, .value);
+        try std.testing.expectEqual(@as(usize, 1), collector.formals.items.len);
+        try std.testing.expectEqual(app_alias, collector.actuals.items[0]);
+    }
+
+    {
+        var collector = PlatformRelationSubstitutionCollector.init(allocator, &names, &store);
+        defer collector.deinit();
+
+        try collector.collect(platform_model, app_record, .value);
+        try collector.collect(platform_model, app_alias, .value);
+        try std.testing.expectEqual(@as(usize, 1), collector.formals.items.len);
+        try std.testing.expectEqual(app_record, collector.actuals.items[0]);
+    }
 }
 
 test "platform app relation resolver merges recursive structural checked roots as fixed point" {
