@@ -577,6 +577,8 @@ const Builder = struct {
     /// requests made anywhere inside that specialization defer to its end,
     /// when its types are final and specialization keys are stable.
     active_graph: ?*InstGraph = null,
+    batched_requester_drain_graph: ?*InstGraph = null,
+    batched_requester_drain_needed: bool = false,
     final_body_output_allowance: FinalBodyOutputCounts = .{},
     /// Owns every materialized `SpecEvidence` tree; freed wholesale with the
     /// builder.
@@ -609,6 +611,8 @@ const Builder = struct {
             .inspect_defs = std.AutoHashMap(GeneratedHelperDefAddress, GeneratedHelperDefEntry).init(allocator),
             .equality_defs = std.AutoHashMap(GeneratedHelperDefAddress, GeneratedHelperDefEntry).init(allocator),
             .hash_defs = std.AutoHashMap(GeneratedHelperDefAddress, GeneratedHelperDefEntry).init(allocator),
+            .batched_requester_drain_graph = null,
+            .batched_requester_drain_needed = false,
             .evidence_arena = std.heap.ArenaAllocator.init(allocator),
         };
     }
@@ -681,8 +685,15 @@ const Builder = struct {
             self.countBy("specialization_type_digest_nodes_visited", @intCast(stats.nodes_visited));
             return digest;
         }
-
         return self.program.types.specializationDigestCached(&self.program.names, ty, null);
+    }
+
+    fn drainRequesterGraph(self: *Builder, graph: *InstGraph) Allocator.Error!void {
+        if (self.batched_requester_drain_graph == graph) {
+            self.batched_requester_drain_needed = true;
+            return;
+        }
+        try graph.drainDirty();
     }
 
     fn initHostedCatalog(self: *Builder) Allocator.Error!void {
@@ -1303,7 +1314,7 @@ const Builder = struct {
                 const existing = self.lowered_templates.get(hit.fn_id) orelse
                     Common.invariant("Monotype specialization index found a local template missing from lowering state");
                 if (requester) |graph| {
-                    try unifyRequestWithLocalHit(graph, fn_ty, hit);
+                    try self.unifyRequestWithLocalHit(graph, fn_ty, hit);
                 }
                 switch (hit.status) {
                     .ready,
@@ -1493,7 +1504,7 @@ const Builder = struct {
                 try requester_graph.importMono(fn_ty),
                 try requester_graph.importMono(solved_requester_fn_ty),
             );
-            try requester_graph.drainDirty();
+            try self.drainRequesterGraph(requester_graph);
         }
         const sealed = try self.sealActiveBodyDraft(
             graph,
@@ -1559,7 +1570,7 @@ const Builder = struct {
                             Common.invariant("specialization edges disagreed on dispatch evidence");
                         }
                     }
-                    try unifyRequestWithLocalHit(requester, fn_ty, hit);
+                    try self.unifyRequestWithLocalHit(requester, fn_ty, hit);
                     return .{
                         .target = .{ .local = hit.fn_id },
                         .needs_lowering = hit.status == .reserved,
@@ -1605,6 +1616,7 @@ const Builder = struct {
     /// the record is ready, with its solved type, so the requester adopts the
     /// specialization's evidence.
     fn unifyRequestWithLocalHit(
+        self: *Builder,
         graph: *InstGraph,
         fn_ty: Type.TypeId,
         hit: specialize.LocalHit,
@@ -1615,7 +1627,7 @@ const Builder = struct {
         if (hit.status == .ready and hit.solved_fn_ty != fn_ty) {
             try graph.unify(try graph.importMono(fn_ty), try graph.importMono(hit.solved_fn_ty));
         }
-        try graph.drainDirty();
+        try self.drainRequesterGraph(graph);
     }
 
     fn markTemplateReady(self: *Builder, fn_id: Ast.FnId, fn_ty: Type.TypeId) Allocator.Error!void {
@@ -2808,7 +2820,7 @@ const Builder = struct {
         const fn_ty_digest = self.specializationTypeDigest(fn_template.mono_fn_ty);
         if (try self.spec_store.findLocal(nestedSpecIdentity(nested, fn_template.source_fn_key, fn_template.mono_fn_ty, fn_ty_digest))) |hit| {
             self.count("nested_hits");
-            try unifyRequestWithLocalHit(request.ctx.graph, fn_template.mono_fn_ty, hit);
+            try self.unifyRequestWithLocalHit(request.ctx.graph, fn_template.mono_fn_ty, hit);
             switch (hit.status) {
                 .ready,
                 .lowering,
@@ -2924,6 +2936,14 @@ const Builder = struct {
     /// every remaining request before lowering it.
     fn drainSpecRequestsFrom(self: *Builder, graph: *InstGraph, start_len: usize) Allocator.Error!void {
         if (start_len == 0) try self.sealDeferredSpecRequestsFrom(graph, start_len);
+        const saved_batched_graph = self.batched_requester_drain_graph;
+        const saved_batched_needed = self.batched_requester_drain_needed;
+        self.batched_requester_drain_graph = graph;
+        self.batched_requester_drain_needed = false;
+        errdefer {
+            self.batched_requester_drain_graph = saved_batched_graph;
+            self.batched_requester_drain_needed = saved_batched_needed;
+        }
         while (graph.deferred_templates.items.len > start_len) {
             const request = graph.deferred_templates.pop() orelse
                 Common.invariant("deferred template queue length changed while draining");
@@ -2941,6 +2961,12 @@ const Builder = struct {
                 request.source_region_override,
                 request.current_entry_root,
             );
+        }
+        const drain_needed = self.batched_requester_drain_needed;
+        self.batched_requester_drain_graph = saved_batched_graph;
+        self.batched_requester_drain_needed = saved_batched_needed or (drain_needed and saved_batched_graph == graph);
+        if (drain_needed and saved_batched_graph != graph) {
+            try graph.drainDirty();
         }
     }
 
@@ -7782,15 +7808,26 @@ const BodyContext = struct {
         source: NominalInstantiationSource,
         args: []NodeId,
     ) Allocator.Error!NodeId {
-        if (moduleBytesEqual(source.view.key.bytes, self.view.key.bytes)) {
-            return try self.instNominalDeclarationBackingNodeInCurrentView(source.declaration, args);
+        const declaration_id: u32 = @intFromEnum(source.declaration.id);
+        if (self.graph.nominalBackingNode(source.view.key.bytes, declaration_id, args)) |cached| {
+            return cached;
         }
-        var source_ctx = try BodyContext.init(self.allocator, self.builder, source.view, self.owner_template, self.graph, self.draft);
-        source_ctx.evidence = self.evidence;
-        defer source_ctx.deinit();
-        source_ctx.owner_context_fn_key = self.owner_context_fn_key;
-        source_ctx.current_fn_key = self.current_fn_key;
-        return try source_ctx.instNominalDeclarationBackingNodeInCurrentView(source.declaration, args);
+
+        const placeholder = try self.graph.newNode(.{ .unresolved = InstVariable.placeholder() });
+        try self.graph.putNominalBackingNode(source.view.key.bytes, declaration_id, args, placeholder);
+
+        const backing = if (moduleBytesEqual(source.view.key.bytes, self.view.key.bytes)) backing: {
+            break :backing try self.instNominalDeclarationBackingNodeInCurrentView(source.declaration, args);
+        } else backing: {
+            var source_ctx = try BodyContext.init(self.allocator, self.builder, source.view, self.owner_template, self.graph, self.draft);
+            source_ctx.evidence = self.evidence;
+            defer source_ctx.deinit();
+            source_ctx.owner_context_fn_key = self.owner_context_fn_key;
+            source_ctx.current_fn_key = self.current_fn_key;
+            break :backing try source_ctx.instNominalDeclarationBackingNodeInCurrentView(source.declaration, args);
+        };
+        try self.graph.unify(placeholder, backing);
+        return placeholder;
     }
 
     fn instNominalDeclarationBackingNodeInCurrentView(
@@ -15745,8 +15782,8 @@ const BodyContext = struct {
         if (monoAliasBacking(&self.builder.program.types, actual)) |backing| {
             if (self.sameTypeInner(expected, backing, visiting)) return true;
         }
-        const expected_digest = self.builder.program.types.typeDigest(&self.builder.program.names, expected);
-        const actual_digest = self.builder.program.types.typeDigest(&self.builder.program.names, actual);
+        const expected_digest = self.builder.program.types.typeDigestCached(&self.builder.program.names, expected, null);
+        const actual_digest = self.builder.program.types.typeDigestCached(&self.builder.program.names, actual, null);
         if (std.mem.eql(u8, expected_digest.bytes[0..], actual_digest.bytes[0..])) return true;
 
         const pair = TypePair{ .expected = expected, .actual = actual };

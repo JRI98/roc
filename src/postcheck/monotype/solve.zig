@@ -166,6 +166,34 @@ const RelationStamp = struct {
     right_version: u32,
 };
 
+const NominalBackingInstanceId = struct {
+    module_bytes: [32]u8,
+    declaration_id: u32,
+    args: []const NodeId,
+};
+
+const NominalBackingCacheContext = struct {
+    pub fn hash(_: NominalBackingCacheContext, key: NominalBackingInstanceId) u64 {
+        var hasher = std.hash.Wyhash.init(0);
+        hasher.update(&key.module_bytes);
+        var declaration_id = std.mem.nativeToLittle(u32, key.declaration_id);
+        hasher.update(std.mem.asBytes(&declaration_id));
+        var arg_len = std.mem.nativeToLittle(u32, @intCast(key.args.len));
+        hasher.update(std.mem.asBytes(&arg_len));
+        for (key.args) |arg| {
+            var raw_arg = std.mem.nativeToLittle(u32, @intFromEnum(arg));
+            hasher.update(std.mem.asBytes(&raw_arg));
+        }
+        return hasher.final();
+    }
+
+    pub fn eql(_: NominalBackingCacheContext, left: NominalBackingInstanceId, right: NominalBackingInstanceId) bool {
+        return std.mem.eql(u8, left.module_bytes[0..], right.module_bytes[0..]) and
+            left.declaration_id == right.declaration_id and
+            nodeSliceEql(left.args, right.args);
+    }
+};
+
 /// Per-specialization type solver. Checked types instantiate into union-find
 /// nodes with explicit row extension links; constraints unify nodes
 /// order-independently; Monotypes are materialized views of solved nodes and
@@ -204,6 +232,11 @@ pub const InstGraph = struct {
     /// to an extension changes the flattened view of every row above it, so
     /// dirty marks propagate through these back references.
     row_parents: std.AutoHashMap(NodeId, std.ArrayList(NodeId)),
+    /// Declaration-backed nominal backings already instantiated in this graph,
+    /// keyed by the source declaration and the exact argument cells that seeded
+    /// the declaration formal scope. This preserves per-argument correctness
+    /// without rebuilding the same backing template repeatedly.
+    nominal_backings: std.HashMap(NominalBackingInstanceId, NodeId, NominalBackingCacheContext, 80),
     /// Template body requests made while lowering this specialization,
     /// processed once its body is complete and its types are final.
     deferred_templates: std.ArrayList(DeferredTemplate) = .empty,
@@ -230,6 +263,7 @@ pub const InstGraph = struct {
             .dirty_set = std.AutoHashMap(NodeId, void).init(allocator),
             .row_exts = std.AutoHashMap(NodeId, NodeId).init(allocator),
             .row_parents = std.AutoHashMap(NodeId, std.ArrayList(NodeId)).init(allocator),
+            .nominal_backings = std.HashMap(NominalBackingInstanceId, NodeId, NominalBackingCacheContext, 80).init(allocator),
         };
         return graph;
     }
@@ -246,6 +280,7 @@ pub const InstGraph = struct {
         while (parents.next()) |list| {
             list.deinit(allocator);
         }
+        self.nominal_backings.deinit();
         self.row_parents.deinit();
         self.row_exts.deinit();
         self.dirty_set.deinit();
@@ -268,6 +303,35 @@ pub const InstGraph = struct {
         try self.versions.append(self.allocator, 0);
         try self.registerRowParent(id, node_content);
         return id;
+    }
+
+    pub fn nominalBackingNode(
+        self: *InstGraph,
+        module_bytes: [32]u8,
+        declaration_id: u32,
+        args: []const NodeId,
+    ) ?NodeId {
+        return self.nominal_backings.get(.{
+            .module_bytes = module_bytes,
+            .declaration_id = declaration_id,
+            .args = args,
+        });
+    }
+
+    pub fn putNominalBackingNode(
+        self: *InstGraph,
+        module_bytes: [32]u8,
+        declaration_id: u32,
+        args: []const NodeId,
+        node: NodeId,
+    ) Allocator.Error!void {
+        const stored_args = try self.arena().alloc(NodeId, args.len);
+        @memcpy(stored_args, args);
+        try self.nominal_backings.put(.{
+            .module_bytes = module_bytes,
+            .declaration_id = declaration_id,
+            .args = stored_args,
+        }, node);
     }
 
     fn registerRowParent(self: *InstGraph, row: NodeId, node_content: InstNode) Allocator.Error!void {
@@ -1669,6 +1733,8 @@ pub const InstGraph = struct {
     /// drain. Run only when no constraint walk holds slices into the type
     /// store.
     pub fn drainDirty(self: *InstGraph) Allocator.Error!void {
+        self.types.beginDigestCacheInvalidationBatch();
+        defer self.types.endDigestCacheInvalidationBatch();
         while (self.dirty.pop()) |raw_root| {
             const root = self.find(raw_root);
             if (!self.dirty_set.remove(root)) continue;

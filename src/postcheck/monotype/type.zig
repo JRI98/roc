@@ -160,6 +160,8 @@ pub const Store = struct {
     types: StoreList(Content, "types"),
     type_digests: StoreList(?names.TypeDigest, "type_digests"),
     specialization_digests: StoreList(?names.TypeDigest, "specialization_digests"),
+    digest_cache_batch_depth: u32,
+    digest_cache_dirty: bool,
     spans: StoreList(TypeId, "spans"),
     fields: StoreList(Field, "fields"),
     tags: StoreList(Tag, "tags"),
@@ -172,6 +174,8 @@ pub const Store = struct {
             .types = .empty,
             .type_digests = .empty,
             .specialization_digests = .empty,
+            .digest_cache_batch_depth = 0,
+            .digest_cache_dirty = false,
             .spans = .empty,
             .fields = .empty,
             .tags = .empty,
@@ -625,7 +629,28 @@ pub const Store = struct {
         identity_only,
     };
 
+    pub fn beginDigestCacheInvalidationBatch(self: *Store) void {
+        self.digest_cache_batch_depth += 1;
+    }
+
+    pub fn endDigestCacheInvalidationBatch(self: *Store) void {
+        if (self.digest_cache_batch_depth == 0) Common.invariant("ended Monotype digest cache invalidation batch without a matching begin");
+        self.digest_cache_batch_depth -= 1;
+        if (self.digest_cache_batch_depth == 0 and self.digest_cache_dirty) {
+            self.clearTypeDigestCacheNow();
+            self.digest_cache_dirty = false;
+        }
+    }
+
     fn clearTypeDigestCache(self: *Store) void {
+        if (self.digest_cache_batch_depth != 0) {
+            self.digest_cache_dirty = true;
+            return;
+        }
+        self.clearTypeDigestCacheNow();
+    }
+
+    fn clearTypeDigestCacheNow(self: *Store) void {
         @memset(self.type_digests.unsafeRawItemsMutForStore(), null);
         @memset(self.specialization_digests.unsafeRawItemsMutForStore(), null);
     }
@@ -710,7 +735,9 @@ pub const Store = struct {
             }
         }
 
-        const cached = switch (named_mode) {
+        const cached = if (self.digest_cache_dirty)
+            null
+        else switch (named_mode) {
             .full => self.type_digests.unsafeRawItemsForView()[@intFromEnum(ty)],
             .identity_only => self.specialization_digests.unsafeRawItemsForView()[@intFromEnum(ty)],
         };
@@ -737,7 +764,7 @@ pub const Store = struct {
         ctx.len -= 1;
 
         const digest: names.TypeDigest = .{ .bytes = hasher.finalResult() };
-        if (ctx.saw_cycle == saw_cycle_before) {
+        if (!self.digest_cache_dirty and ctx.saw_cycle == saw_cycle_before) {
             switch (named_mode) {
                 .full => self.type_digests.set(@intFromEnum(ty), digest),
                 .identity_only => self.specialization_digests.set(@intFromEnum(ty), digest),
