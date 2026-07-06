@@ -52,6 +52,7 @@ const compile_build = @import("compile_build.zig");
 const module_discovery = @import("module_discovery.zig");
 const cache_manager_mod = @import("cache_manager.zig");
 const package_source = @import("package_source.zig");
+const package_identity = @import("package_identity.zig");
 const watch_inputs = @import("watch_inputs.zig");
 const CacheManager = cache_manager_mod.CacheManager;
 const CacheConfig = @import("cache_config.zig").CacheConfig;
@@ -77,6 +78,7 @@ const ParseTask = messages.ParseTask;
 const CanonicalizeTask = messages.CanonicalizeTask;
 const CanonicalizeImport = messages.CanonicalizeImport;
 const TypeCheckTask = messages.TypeCheckTask;
+const PlatformRequirementSurface = messages.PlatformRequirementSurface;
 const ParsedResult = messages.ParsedResult;
 const CanonicalizedResult = messages.CanonicalizedResult;
 
@@ -118,7 +120,6 @@ const Thread = threading.Thread;
 const CheckedModuleArtifact = check.CheckedArtifact.CheckedModuleArtifact;
 const CheckedArtifact = check.CheckedArtifact;
 const canonical = check.CanonicalNames;
-const CanonicalTypeKey = canonical.CanonicalTypeKey;
 
 fn destroyCheckedArtifact(artifact: *CheckedModuleArtifact, retain_module_env: bool) void {
     const allocator = artifact.canonical_names.allocator;
@@ -319,6 +320,8 @@ pub const Phase = enum {
     Canonicalize,
     /// Canonicalized, waiting for imports to complete
     WaitingOnImports,
+    /// Canonicalized app root, waiting on the platform's checked requires surface.
+    WaitingOnPlatformRequirements,
     /// Imports ready, needs type checking
     TypeCheck,
     /// Fully compiled
@@ -342,6 +345,9 @@ pub const ModuleState = struct {
     /// Owned semantic module payload. Earlier phases populate only `module_env`;
     /// type checking later fills in the checked artifact.
     semantic: ?OwnedSemanticModuleData = null,
+    /// Requirement surface exposed once a platform root's check completes
+    /// with a published artifact; borrows the platform's checked env.
+    platform_requirement_surface: ?PlatformRequirementSurface = null,
     /// Cached AST from parsing (owned, null after canonicalization)
     cached_ast: ?*AST,
     /// Current compilation phase
@@ -431,12 +437,6 @@ pub const ModuleState = struct {
                 .checked_artifact = null,
                 .user_errors_allow_lowering = false,
             };
-        }
-    }
-
-    fn markUserErrorsNotLowerable(self: *ModuleState) void {
-        if (self.semantic) |*semantic| {
-            semantic.user_errors_allow_lowering = false;
         }
     }
 
@@ -778,102 +778,6 @@ pub const ModuleRef = struct {
     module_id: ModuleId,
 };
 
-const PlatformRequiredValidationSnapshot = struct {
-    dispatch_dispatcher_keys: []CanonicalTypeKey = &.{},
-    dispatch_callable_keys: []CanonicalTypeKey = &.{},
-    iterator_iter_dispatcher_keys: []CanonicalTypeKey = &.{},
-    iterator_next_dispatcher_keys: []CanonicalTypeKey = &.{},
-    pattern_type_keys: []CanonicalTypeKey = &.{},
-
-    fn init(
-        allocator: Allocator,
-        artifact: *const check.CheckedArtifact.CheckedModuleArtifact,
-    ) Allocator.Error!PlatformRequiredValidationSnapshot {
-        var snapshot = PlatformRequiredValidationSnapshot{};
-        errdefer snapshot.deinit(allocator);
-
-        snapshot.dispatch_dispatcher_keys = try allocator.alloc(CanonicalTypeKey, artifact.static_dispatch_plans.plans.len);
-        snapshot.dispatch_callable_keys = try allocator.alloc(CanonicalTypeKey, artifact.static_dispatch_plans.plans.len);
-        for (artifact.static_dispatch_plans.plans, 0..) |plan, i| {
-            snapshot.dispatch_dispatcher_keys[i] = check.CheckedArtifact.checkedTypeRootKey(artifact, plan.dispatcher_ty);
-            snapshot.dispatch_callable_keys[i] = check.CheckedArtifact.checkedTypeRootKey(artifact, plan.callable_ty);
-        }
-
-        snapshot.iterator_iter_dispatcher_keys = try allocator.alloc(CanonicalTypeKey, artifact.static_dispatch_plans.iterator_for_plans.len);
-        snapshot.iterator_next_dispatcher_keys = try allocator.alloc(CanonicalTypeKey, artifact.static_dispatch_plans.iterator_for_plans.len);
-        for (artifact.static_dispatch_plans.iterator_for_plans, 0..) |plan, i| {
-            snapshot.iterator_iter_dispatcher_keys[i] = check.CheckedArtifact.checkedTypeRootKey(artifact, plan.iter.dispatcher_ty);
-            snapshot.iterator_next_dispatcher_keys[i] = check.CheckedArtifact.checkedTypeRootKey(artifact, plan.next.dispatcher_ty);
-        }
-
-        snapshot.pattern_type_keys = try allocator.alloc(CanonicalTypeKey, artifact.checked_bodies.patternCount());
-        for (snapshot.pattern_type_keys, 0..) |*key, i| {
-            const pattern_id: check.CheckedArtifact.CheckedPatternId = @enumFromInt(i);
-            key.* = check.CheckedArtifact.checkedTypeRootKey(artifact, artifact.checked_bodies.pattern(pattern_id).ty);
-        }
-
-        return snapshot;
-    }
-
-    fn deinit(self: *PlatformRequiredValidationSnapshot, allocator: Allocator) void {
-        allocator.free(self.dispatch_dispatcher_keys);
-        allocator.free(self.dispatch_callable_keys);
-        allocator.free(self.iterator_iter_dispatcher_keys);
-        allocator.free(self.iterator_next_dispatcher_keys);
-        allocator.free(self.pattern_type_keys);
-        self.* = .{};
-    }
-
-    fn dispatchPlanChanged(
-        self: *const PlatformRequiredValidationSnapshot,
-        artifact: *const check.CheckedArtifact.CheckedModuleArtifact,
-        plan_index: usize,
-        plan: check.StaticDispatchRegistry.StaticDispatchCallPlan,
-    ) bool {
-        if (plan_index >= self.dispatch_dispatcher_keys.len or
-            plan_index >= self.dispatch_callable_keys.len)
-        {
-            return false;
-        }
-        return !typeKeyMatchesArtifactRoot(self.dispatch_dispatcher_keys[plan_index], artifact, plan.dispatcher_ty) or
-            !typeKeyMatchesArtifactRoot(self.dispatch_callable_keys[plan_index], artifact, plan.callable_ty);
-    }
-
-    fn iteratorPlanChanged(
-        self: *const PlatformRequiredValidationSnapshot,
-        artifact: *const check.CheckedArtifact.CheckedModuleArtifact,
-        plan_index: usize,
-        plan: check.StaticDispatchRegistry.IteratorForPlan,
-    ) bool {
-        if (plan_index >= self.iterator_iter_dispatcher_keys.len or
-            plan_index >= self.iterator_next_dispatcher_keys.len)
-        {
-            return false;
-        }
-        return !typeKeyMatchesArtifactRoot(self.iterator_iter_dispatcher_keys[plan_index], artifact, plan.iter.dispatcher_ty) or
-            !typeKeyMatchesArtifactRoot(self.iterator_next_dispatcher_keys[plan_index], artifact, plan.next.dispatcher_ty);
-    }
-
-    fn patternTypeChanged(
-        self: *const PlatformRequiredValidationSnapshot,
-        artifact: *const check.CheckedArtifact.CheckedModuleArtifact,
-        pattern_index: usize,
-        pattern: check.CheckedArtifact.CheckedPattern,
-    ) bool {
-        if (pattern_index >= self.pattern_type_keys.len) return false;
-        return !typeKeyMatchesArtifactRoot(self.pattern_type_keys[pattern_index], artifact, pattern.ty);
-    }
-
-    fn typeKeyMatchesArtifactRoot(
-        key: CanonicalTypeKey,
-        artifact: *const check.CheckedArtifact.CheckedModuleArtifact,
-        root: check.CheckedArtifact.CheckedTypeId,
-    ) bool {
-        const current = check.CheckedArtifact.checkedTypeRootKey(artifact, root);
-        return std.meta.eql(key.bytes, current.bytes);
-    }
-};
-
 /// Coordinator manages all compilation state and coordinates workers
 pub const Coordinator = struct {
     gpa: Allocator,
@@ -910,6 +814,11 @@ pub const Coordinator = struct {
     /// Total modules remaining across all packages
     total_remaining: usize,
 
+    /// The package identity for the current app root, when this coordinator is
+    /// compiling an app. This is role metadata; package identity itself still
+    /// comes from package_identity.zig.
+    app_package_name: ?[]const u8,
+
     /// Shared read-only builtin modules
     builtin_modules: *const BuiltinModules,
 
@@ -939,6 +848,11 @@ pub const Coordinator = struct {
     enable_hosted_transform: bool,
     /// Whether to retain exact source byte states for watch-mode refreshes.
     track_watch_inputs: bool,
+    /// Name of the registered platform package, set via markPlatformPackage.
+    /// App-root type checks wait for this package's root module to finish
+    /// checking, so platform existence comes from explicit registration data
+    /// rather than probing names or canonicalization progress.
+    platform_root_package_name: ?[]const u8 = null,
 
     /// Package name -> note for packages compiled against a dependency
     /// version they did not declare. Rendered alongside errors from those
@@ -1010,6 +924,7 @@ pub const Coordinator = struct {
             .shutting_down = std.atomic.Value(bool).init(false),
             .worker_oom = std.atomic.Value(bool).init(false),
             .total_remaining = 0,
+            .app_package_name = null,
             .builtin_modules = builtin_modules,
             .roc_ctx = roc_ctx,
             .compiler_version = compiler_version,
@@ -1019,6 +934,7 @@ pub const Coordinator = struct {
             .retired_checked_artifacts = std.ArrayList(RetiredCheckedArtifact).empty,
             .enable_hosted_transform = false,
             .track_watch_inputs = false,
+            .platform_root_package_name = null,
             .version_notes = std.StringHashMap([]const u8).init(gpa),
             .total_parse_ns = 0,
             .total_canonicalize_ns = 0,
@@ -1104,6 +1020,17 @@ pub const Coordinator = struct {
 
     pub fn setWatchInputTracking(self: *Coordinator, enabled: bool) void {
         self.track_watch_inputs = enabled;
+    }
+
+    /// Record which registered package is the app's platform. App-root type
+    /// checks wait for this package's root module to finish checking, so the
+    /// requirement surface always comes from a completed platform check.
+    pub fn markPlatformPackage(self: *Coordinator, package_name: []const u8) void {
+        self.platform_root_package_name = package_name;
+    }
+
+    pub fn markAppPackage(self: *Coordinator, package_name: []const u8) void {
+        self.app_package_name = package_name;
     }
 
     /// Set the I/O / core context implementation. Callers must supply a fully
@@ -1195,6 +1122,10 @@ pub const Coordinator = struct {
         entry_path: []const u8,
         /// Optional override for the app module's `source_dir_override`.
         source_dir_override: ?[]const u8 = null,
+        /// Use the synthetic app identity for compiler-generated default-app roots.
+        synthetic_root_identity: bool = false,
+        /// Use the synthetic platform identity for compiler-generated default platforms.
+        synthetic_platform_identity: bool = false,
     };
 
     pub const AppDiscoveryError = error{
@@ -1202,7 +1133,7 @@ pub const Coordinator = struct {
         AbsolutePlatformPath,
         UnsupportedPlatformSpec,
         UnsupportedPackageSpec,
-    } || app_header_mod.Error || Allocator.Error;
+    } || app_header_mod.Error || package_identity.PackageIdentityError;
 
     /// Read an app `.roc` file's header, register the app + platform +
     /// non-platform packages, and enqueue the app's parse task. After this
@@ -1228,7 +1159,15 @@ pub const Coordinator = struct {
 
         const app_dir = std.fs.path.dirname(opts.entry_path) orelse ".";
 
-        const app_pkg = try self.ensurePackage("app", app_dir);
+        const app_identity = try package_identity.packageIdentityFor(
+            self.gpa,
+            self.roc_ctx,
+            if (opts.synthetic_root_identity) .synthetic_app else .{ .local_path = opts.entry_path },
+        );
+        defer self.gpa.free(@constCast(app_identity));
+
+        const app_pkg = try self.ensurePackage(app_identity, app_dir);
+        self.markAppPackage(app_pkg.name);
         const app_module_name = base.module_path.getModuleName(opts.entry_path);
         const app_module_id = try app_pkg.ensureModule(self.gpa, app_module_name, opts.entry_path);
         if (opts.source_dir_override) |source_dir| {
@@ -1249,7 +1188,9 @@ pub const Coordinator = struct {
             const platform_main_path = try std.fs.path.join(arena, &.{ app_dir, header_info.platform_spec });
             const platform_dir = std.fs.path.dirname(platform_main_path) orelse return error.InvalidPlatformPath;
 
-            try self.registerPlatformPackage(app_pkg, platform_dir, platform_main_path, header_info.platform_qualifier);
+            try self.registerPlatformPackageWithOptions(app_pkg, platform_dir, platform_main_path, header_info.platform_qualifier, null, .{
+                .synthetic_identity = opts.synthetic_platform_identity,
+            });
         }
 
         for (header_info.non_platform_packages) |entry| {
@@ -1258,22 +1199,26 @@ pub const Coordinator = struct {
             }
             const pkg_main_path = try std.fs.path.join(arena, &.{ app_dir, entry.spec });
             const pkg_dir = std.fs.path.dirname(pkg_main_path) orelse ".";
-            _ = try self.registerInlinePackage(entry.shorthand, pkg_dir, app_pkg, entry.shorthand);
+            _ = try self.registerInlinePackageWithRootFile(pkg_main_path, pkg_dir, app_pkg, entry.shorthand);
         }
 
-        try self.enqueueParseTask("app", app_module_id);
+        try self.enqueueParseTask(app_pkg.name, app_module_id);
     }
 
-    /// Register the platform package (named "pf"), wire the app's shorthand
-    /// for it, ensure the platform's main module, and enqueue its parse task.
+    const PlatformIdentityOptions = struct {
+        synthetic_identity: bool = false,
+    };
+
+    /// Register the platform package, wire the app's shorthand for it, ensure
+    /// the platform's main module, and enqueue its parse task.
     pub fn registerPlatformPackage(
         self: *Coordinator,
         app_pkg: *PackageState,
         platform_dir: []const u8,
         platform_main_path: []const u8,
         qualifier: ?[]const u8,
-    ) Allocator.Error!void {
-        return self.registerPlatformPackageWithUrl(app_pkg, platform_dir, platform_main_path, qualifier, null);
+    ) package_identity.PackageIdentityError!void {
+        return self.registerPlatformPackageWithOptions(app_pkg, platform_dir, platform_main_path, qualifier, null, .{});
     }
 
     pub fn registerPlatformPackageWithUrl(
@@ -1283,13 +1228,38 @@ pub const Coordinator = struct {
         platform_main_path: []const u8,
         qualifier: ?[]const u8,
         url: ?package_source.UrlSourceView,
-    ) Allocator.Error!void {
-        const pf_pkg = try self.ensurePackageWithUrl("pf", platform_dir, url);
+    ) package_identity.PackageIdentityError!void {
+        return self.registerPlatformPackageWithOptions(app_pkg, platform_dir, platform_main_path, qualifier, url, .{});
+    }
+
+    fn registerPlatformPackageWithOptions(
+        self: *Coordinator,
+        app_pkg: *PackageState,
+        platform_dir: []const u8,
+        platform_main_path: []const u8,
+        qualifier: ?[]const u8,
+        url: ?package_source.UrlSourceView,
+        options: PlatformIdentityOptions,
+    ) package_identity.PackageIdentityError!void {
+        const platform_identity = try package_identity.packageIdentityFor(
+            self.gpa,
+            self.roc_ctx,
+            if (options.synthetic_identity)
+                .synthetic_platform
+            else if (url) |url_view|
+                .{ .url = url_view.url }
+            else
+                .{ .local_path = platform_main_path },
+        );
+        defer self.gpa.free(@constCast(platform_identity));
+
+        const pf_pkg = try self.ensurePackageWithUrl(platform_identity, platform_dir, url);
+        self.markPlatformPackage(pf_pkg.name);
 
         if (qualifier) |qual| {
             try app_pkg.shorthands.put(
                 try self.gpa.dupe(u8, qual),
-                try self.gpa.dupe(u8, "pf"),
+                try self.gpa.dupe(u8, pf_pkg.name),
             );
         }
 
@@ -1298,7 +1268,7 @@ pub const Coordinator = struct {
         pf_pkg.modules.items[pf_module_id].depth = 1;
         pf_pkg.remaining_modules += 1;
         self.total_remaining += 1;
-        try self.enqueueParseTask("pf", pf_module_id);
+        try self.enqueueParseTask(pf_pkg.name, pf_module_id);
     }
 
     /// Register a non-platform package and (optionally) wire a shorthand on
@@ -1308,32 +1278,50 @@ pub const Coordinator = struct {
     /// Returns the new (or existing) package state.
     pub fn registerInlinePackage(
         self: *Coordinator,
-        package_name: []const u8,
+        package_identity_value: []const u8,
         package_root_dir: []const u8,
         app_pkg: ?*PackageState,
         shorthand_on_app: ?[]const u8,
-    ) Allocator.Error!*PackageState {
-        return self.registerInlinePackageWithUrl(package_name, package_root_dir, app_pkg, shorthand_on_app, null);
+    ) package_identity.PackageIdentityError!*PackageState {
+        return self.registerInlinePackageWithUrl(package_identity_value, package_root_dir, app_pkg, shorthand_on_app, null);
     }
 
     pub fn registerInlinePackageWithUrl(
         self: *Coordinator,
-        package_name: []const u8,
+        package_identity_value: []const u8,
         package_root_dir: []const u8,
         app_pkg: ?*PackageState,
         shorthand_on_app: ?[]const u8,
         url: ?package_source.UrlSourceView,
-    ) Allocator.Error!*PackageState {
-        const pkg = try self.ensurePackageWithUrl(package_name, package_root_dir, url);
+    ) package_identity.PackageIdentityError!*PackageState {
+        const identity = if (url) |url_view|
+            try package_identity.packageIdentityFor(self.gpa, self.roc_ctx, .{ .url = url_view.url })
+        else
+            try self.gpa.dupe(u8, package_identity_value);
+        defer self.gpa.free(@constCast(identity));
+
+        const pkg = try self.ensurePackageWithUrl(identity, package_root_dir, url);
         if (app_pkg) |a| {
             if (shorthand_on_app) |sh| {
                 try a.shorthands.put(
                     try self.gpa.dupe(u8, sh),
-                    try self.gpa.dupe(u8, package_name),
+                    try self.gpa.dupe(u8, pkg.name),
                 );
             }
         }
         return pkg;
+    }
+
+    pub fn registerInlinePackageWithRootFile(
+        self: *Coordinator,
+        package_root_file: []const u8,
+        package_root_dir: []const u8,
+        app_pkg: ?*PackageState,
+        shorthand_on_app: ?[]const u8,
+    ) package_identity.PackageIdentityError!*PackageState {
+        const identity = try package_identity.packageIdentityFor(self.gpa, self.roc_ctx, .{ .local_path = package_root_file });
+        defer self.gpa.free(@constCast(identity));
+        return self.registerInlinePackage(identity, package_root_dir, app_pkg, shorthand_on_app);
     }
 
     fn isRelativeSpec(spec: []const u8) bool {
@@ -1570,6 +1558,15 @@ pub const Coordinator = struct {
         allocator: Allocator,
         imported_artifacts: []const check.CheckedArtifact.PublishImportArtifact,
     ) Allocator.Error![]check.CheckedArtifact.ImportedModuleView {
+        return self.collectTypecheckAvailableArtifactViewsSeeded(allocator, imported_artifacts, &.{});
+    }
+
+    fn collectTypecheckAvailableArtifactViewsSeeded(
+        self: *Coordinator,
+        allocator: Allocator,
+        imported_artifacts: []const check.CheckedArtifact.PublishImportArtifact,
+        extra_seed_views: []const check.CheckedArtifact.ImportedModuleView,
+    ) Allocator.Error![]check.CheckedArtifact.ImportedModuleView {
         var views = std.ArrayList(check.CheckedArtifact.ImportedModuleView).empty;
         errdefer views.deinit(allocator);
 
@@ -1581,6 +1578,10 @@ pub const Coordinator = struct {
 
         for (imported_artifacts) |imported| {
             try pending.append(allocator, imported.view);
+        }
+
+        for (extra_seed_views) |seed_view| {
+            try pending.append(allocator, seed_view);
         }
 
         while (pending.pop()) |view| {
@@ -1602,60 +1603,6 @@ pub const Coordinator = struct {
         }
 
         return try views.toOwnedSlice(allocator);
-    }
-
-    fn appendTypecheckAvailablePublicApiClosure(
-        self: *Coordinator,
-        views: *std.ArrayList(check.CheckedArtifact.ImportedModuleView),
-        allocator: Allocator,
-        root_view: check.CheckedArtifact.ImportedModuleView,
-    ) Allocator.Error!void {
-        var pending = std.ArrayList(check.CheckedArtifact.ImportedModuleView).empty;
-        defer pending.deinit(allocator);
-
-        var seen = std.AutoHashMap(check.CheckedArtifact.CheckedModuleArtifactKey, void).init(allocator);
-        defer seen.deinit();
-
-        for (views.items) |view| {
-            try seen.put(view.key, {});
-        }
-        try pending.append(allocator, root_view);
-
-        while (pending.pop()) |view| {
-            const entry = try seen.getOrPut(view.key);
-            if (entry.found_existing) continue;
-            entry.value_ptr.* = {};
-
-            try views.append(allocator, view);
-
-            for (view.direct_import_artifact_keys) |dependency_key| {
-                const artifact = self.checkedArtifactByKey(dependency_key) orelse {
-                    if (builtin.mode == .Debug) {
-                        std.debug.panic("compile.coordinator missing direct dependency checked artifact", .{});
-                    }
-                    unreachable;
-                };
-                try pending.append(allocator, check.CheckedArtifact.importedView(artifact));
-            }
-            for (view.public_api_dependencies.artifacts) |dependency_key| {
-                const artifact = self.checkedArtifactByKey(dependency_key) orelse {
-                    if (builtin.mode == .Debug) {
-                        std.debug.panic("compile.coordinator missing public API dependency checked artifact", .{});
-                    }
-                    unreachable;
-                };
-                try pending.append(allocator, check.CheckedArtifact.importedView(artifact));
-            }
-            for (view.public_api_dependencies.type_owner_artifacts) |dependency_key| {
-                const artifact = self.checkedArtifactByKey(dependency_key) orelse {
-                    if (builtin.mode == .Debug) {
-                        std.debug.panic("compile.coordinator missing type-owner dependency checked artifact", .{});
-                    }
-                    unreachable;
-                };
-                try pending.append(allocator, check.CheckedArtifact.importedView(artifact));
-            }
-        }
     }
 
     fn rootRelationContainsArtifact(
@@ -2188,6 +2135,36 @@ pub const Coordinator = struct {
         return false;
     }
 
+    fn appendTypeOwnerAvailableArtifactClosure(
+        self: *Coordinator,
+        views: *std.ArrayList(check.CheckedArtifact.ImportedModuleView),
+        allocator: Allocator,
+        seed: *const check.CheckedArtifact.CheckedModuleArtifact,
+    ) Allocator.Error!void {
+        var pending = std.ArrayList(*const check.CheckedArtifact.CheckedModuleArtifact).empty;
+        defer pending.deinit(allocator);
+        var seen = std.AutoHashMap(check.CheckedArtifact.CheckedModuleArtifactKey, void).init(allocator);
+        defer seen.deinit();
+
+        try pending.append(allocator, seed);
+        while (pending.pop()) |artifact| {
+            const entry = try seen.getOrPut(artifact.key);
+            if (entry.found_existing) continue;
+            entry.value_ptr.* = {};
+
+            if (!importedArtifactViewExists(views.items, artifact.key)) {
+                try views.append(allocator, check.CheckedArtifact.importedView(artifact));
+            }
+
+            for (artifact.public_api_dependencies.type_owner_artifacts) |dependency_key| {
+                const dependency = self.checkedArtifactByKey(dependency_key) orelse {
+                    coordinatorInvariant("compile.coordinator missing type-owner dependency checked artifact", .{});
+                };
+                try pending.append(allocator, dependency);
+            }
+        }
+    }
+
     /// Finalize the build's executable artifacts (link app + platform, build
     /// the platform-app relation, republish the root artifact).
     ///
@@ -2221,32 +2198,7 @@ pub const Coordinator = struct {
         // Artifact presence is the single authority here, applied uniformly to the platform and
         // app roots (see the app-artifact guard below).
         const platform_declaration_artifact = platform_root.mod.checkedArtifact() orelse return;
-        const requirement_context = check.CheckedArtifact.platformRequirementContextKey(platform_declaration_artifact);
-
-        const original_app_artifact = app_root.mod.checkedArtifact() orelse return;
-        var validation_snapshot = try PlatformRequiredValidationSnapshot.init(self.gpa, original_app_artifact);
-        defer validation_snapshot.deinit(self.gpa);
-
-        try self.appendPlatformRequiredInvalidNumericExpressionReports(app_root.mod, original_app_artifact, platform_declaration_artifact);
-        if (self.hasUserErrors() and !allow_user_errors) return;
-
-        try self.republishCheckedArtifact(app_root.pkg, app_root.mod, .{
-            .platform_requirement_artifact = check.CheckedArtifact.importedView(platform_declaration_artifact),
-            .platform_requirement_context = requirement_context,
-        });
-
-        const app_artifact = app_root.mod.checkedArtifact() orelse {
-            if (builtin.mode == .Debug) {
-                std.debug.panic("compile.coordinator.finalizeExecutableArtifacts missing app artifact after co-finalization", .{});
-            }
-            unreachable;
-        };
-        const app_imported_artifacts = try self.buildTypecheckImportedArtifacts(app_root.pkg, app_root.mod, self.gpa);
-        defer self.gpa.free(app_imported_artifacts);
-
-        try self.appendPlatformRequiredUnresolvedDispatchReports(app_root.mod, app_artifact, app_imported_artifacts, &validation_snapshot);
-        try self.appendPlatformRequiredInvalidNumericPatternReports(app_root.mod, app_artifact, &validation_snapshot);
-        if (self.hasUserErrors() and !allow_user_errors) return;
+        const app_artifact = app_root.mod.checkedArtifact() orelse return;
 
         var relation_result = try check.CheckedArtifact.buildPlatformAppRelation(
             self.gpa,
@@ -2258,22 +2210,18 @@ pub const Coordinator = struct {
 
         const relation = switch (relation_result) {
             .relation => |relation| relation,
-            .type_mismatch => |mismatch| {
-                try self.appendPlatformRequirementTypeMismatchReport(
-                    app_root.mod,
-                    platform_declaration_artifact,
-                    app_artifact,
-                    mismatch,
-                );
-                return;
-            },
-            .missing_value => |missing| {
-                try self.appendPlatformRequirementMissingValueReport(
-                    app_root.mod,
-                    platform_declaration_artifact,
-                    missing,
-                );
-                return;
+            .type_mismatch, .missing_value => {
+                // With user errors permitted (the `roc run` lowering path from
+                // the error-recovery contract), an app that failed checking can
+                // publish an artifact whose required values never materialized
+                // as exports; the user already has the diagnostics, so skip the
+                // relation instead of asserting. Without user errors, checking
+                // proved the requirements, so these outcomes are compiler bugs.
+                if (allow_user_errors and self.hasUserErrors()) return;
+                switch (relation_result) {
+                    .type_mismatch => coordinatorInvariant("platform/app relation type mismatch reached executable finalization after checking", .{}),
+                    else => coordinatorInvariant("platform/app relation missing required app value reached executable finalization after checking", .{}),
+                }
             },
         };
         const relation_artifacts = [_]check.CheckedArtifact.ImportedModuleView{
@@ -2286,6 +2234,10 @@ pub const Coordinator = struct {
     }
 
     pub fn validatePlatformAppRelationsForCheck(self: *Coordinator) compile_package.PublishError!void {
+        // Checking owns all user-facing requirement diagnostics; this pass only
+        // asserts that the published artifacts agree with what checking proved,
+        // so it has no reason to spend time in release builds.
+        if (comptime builtin.mode != .Debug) return;
         if (self.hasUserErrors()) {
             if (builtin.mode == .Debug) {
                 std.debug.panic("compile.coordinator.validatePlatformAppRelationsForCheck called after user-facing errors", .{});
@@ -2301,32 +2253,7 @@ pub const Coordinator = struct {
         // Artifact presence is the single authority here, applied uniformly to the platform and
         // app roots (see the app-artifact guard below).
         const platform_declaration_artifact = platform_root.mod.checkedArtifact() orelse return;
-        const requirement_context = check.CheckedArtifact.platformRequirementContextKey(platform_declaration_artifact);
-
-        const original_app_artifact = app_root.mod.checkedArtifact() orelse return;
-        var validation_snapshot = try PlatformRequiredValidationSnapshot.init(self.gpa, original_app_artifact);
-        defer validation_snapshot.deinit(self.gpa);
-
-        try self.appendPlatformRequiredInvalidNumericExpressionReports(app_root.mod, original_app_artifact, platform_declaration_artifact);
-        if (self.hasUserErrors()) return;
-
-        try self.republishCheckedArtifact(app_root.pkg, app_root.mod, .{
-            .platform_requirement_artifact = check.CheckedArtifact.importedView(platform_declaration_artifact),
-            .platform_requirement_context = requirement_context,
-        });
-
-        const app_artifact = app_root.mod.checkedArtifact() orelse {
-            if (builtin.mode == .Debug) {
-                std.debug.panic("compile.coordinator.validatePlatformAppRelationsForCheck missing app artifact after co-finalization", .{});
-            }
-            unreachable;
-        };
-        const app_imported_artifacts = try self.buildTypecheckImportedArtifacts(app_root.pkg, app_root.mod, self.gpa);
-        defer self.gpa.free(app_imported_artifacts);
-
-        try self.appendPlatformRequiredUnresolvedDispatchReports(app_root.mod, app_artifact, app_imported_artifacts, &validation_snapshot);
-        try self.appendPlatformRequiredInvalidNumericPatternReports(app_root.mod, app_artifact, &validation_snapshot);
-        if (self.hasUserErrors()) return;
+        const app_artifact = app_root.mod.checkedArtifact() orelse return;
 
         var relation_result = try check.CheckedArtifact.buildPlatformAppRelation(
             self.gpa,
@@ -2338,659 +2265,9 @@ pub const Coordinator = struct {
 
         switch (relation_result) {
             .relation => {},
-            .type_mismatch => |mismatch| try self.appendPlatformRequirementTypeMismatchReport(
-                app_root.mod,
-                platform_declaration_artifact,
-                app_artifact,
-                mismatch,
-            ),
-            .missing_value => |missing| try self.appendPlatformRequirementMissingValueReport(
-                app_root.mod,
-                platform_declaration_artifact,
-                missing,
-            ),
+            .type_mismatch => coordinatorInvariant("platform/app relation type mismatch reached check validation after checking", .{}),
+            .missing_value => coordinatorInvariant("platform/app relation missing required app value reached check validation after checking", .{}),
         }
-    }
-
-    fn appendPlatformRequirementMissingValueReport(
-        self: *Coordinator,
-        app_mod: *ModuleState,
-        platform_artifact: *const check.CheckedArtifact.CheckedModuleArtifact,
-        missing: check.CheckedArtifact.PlatformRequirementMissingValue,
-    ) compile_package.PublishError!void {
-        const required_name = platform_artifact.canonical_names.exportNameText(missing.declaration.platform_name);
-        const headline = try std.fmt.allocPrint(self.gpa, "The app does not provide {s}, but the platform requires it.", .{required_name});
-        defer self.gpa.free(headline);
-        var report = try Report.init(self.gpa, "Missing Required Value", headline, .runtime_error);
-        errdefer report.deinit();
-
-        try self.appendNonLowerableReport(app_mod, report);
-    }
-
-    fn appendPlatformRequirementTypeMismatchReport(
-        self: *Coordinator,
-        app_mod: *ModuleState,
-        platform_artifact: *const check.CheckedArtifact.CheckedModuleArtifact,
-        app_artifact: *const check.CheckedArtifact.CheckedModuleArtifact,
-        mismatch: check.CheckedArtifact.PlatformRequirementTypeMismatch,
-    ) Allocator.Error!void {
-        const required_name = platform_artifact.canonical_names.exportNameText(mismatch.declaration.platform_name);
-        const headline = try std.fmt.allocPrint(self.gpa, "The app provides {s} with a type that does not match the platform's requires entry.", .{required_name});
-        defer self.gpa.free(headline);
-        var report = try Report.init(self.gpa, "Type Mismatch", headline, .runtime_error);
-        errdefer report.deinit();
-
-        const actual = try check.CheckedArtifact.formatCheckedTypeAlloc(self.gpa, app_artifact, mismatch.actual);
-        defer self.gpa.free(actual);
-        try report.document.addText("The app provides:");
-        try report.document.addLineBreak();
-        try report.document.addLineBreak();
-        try report.document.addCodeBlock(actual);
-        try report.document.addLineBreak();
-        try report.document.addLineBreak();
-
-        const expected = try check.CheckedArtifact.formatCheckedTypeAlloc(self.gpa, platform_artifact, mismatch.expected);
-        defer self.gpa.free(expected);
-        try report.document.addText("But the platform requires:");
-        try report.document.addLineBreak();
-        try report.document.addLineBreak();
-        try report.document.addCodeBlock(expected);
-
-        try self.appendNonLowerableReport(app_mod, report);
-    }
-
-    fn appendPlatformRequiredUnresolvedDispatchReports(
-        self: *Coordinator,
-        app_mod: *ModuleState,
-        app_artifact: *const check.CheckedArtifact.CheckedModuleArtifact,
-        app_imported_artifacts: []const check.CheckedArtifact.PublishImportArtifact,
-        validation_snapshot: *const PlatformRequiredValidationSnapshot,
-    ) Allocator.Error!void {
-        for (app_artifact.static_dispatch_plans.plans, 0..) |plan, plan_index| {
-            if (plan.result_mode != .value) continue;
-
-            if (try self.appendPlatformRequiredInvalidNumeralDispatchReportIfNeeded(
-                app_mod,
-                app_artifact,
-                plan,
-            )) continue;
-
-            const plan_changed = validation_snapshot.dispatchPlanChanged(app_artifact, plan_index, plan);
-            switch (plan.resolution) {
-                .resolved_target => |target| {
-                    if (!plan_changed) continue;
-                    switch (target.kind) {
-                        .generated_structural_parser,
-                        .generated_structural_encoder,
-                        => continue,
-                        .procedure, .local_proc => {},
-                    }
-
-                    const target_artifact = switch (target.kind) {
-                        .procedure => |procedure| blk: {
-                            const target_key = checkedArtifactKeyFromArtifactRef(procedure.template.artifact);
-                            break :blk self.checkedArtifactByKey(target_key) orelse {
-                                if (builtin.mode == .Debug) {
-                                    std.debug.panic("compile.coordinator missing checked artifact for resolved dispatch target", .{});
-                                }
-                                unreachable;
-                            };
-                        },
-                        .local_proc => app_artifact,
-                        .generated_structural_parser,
-                        .generated_structural_encoder,
-                        => unreachable,
-                    };
-                    if (!try check.CheckedArtifact.checkedTypesCompatible(
-                        self.gpa,
-                        target_artifact,
-                        target.callable_ty,
-                        app_artifact,
-                        plan.callable_ty,
-                    )) {
-                        try self.appendPlatformRequiredDispatchTargetMismatchReport(
-                            app_mod,
-                            app_artifact,
-                            target_artifact,
-                            plan.method,
-                            target.callable_ty,
-                            plan.callable_ty,
-                        );
-                    }
-                    continue;
-                },
-                .unresolved_checked_plan => {},
-            }
-            if (!plan_changed) continue;
-            const dispatcher = self.platformRequiredDispatchReportDispatcherType(app_artifact, app_imported_artifacts, plan) orelse continue;
-            try self.appendPlatformRequiredUnresolvedDispatchReport(
-                app_mod,
-                app_artifact,
-                plan.method,
-                dispatcher.artifact,
-                dispatcher.ty,
-            );
-        }
-        for (app_artifact.static_dispatch_plans.iterator_for_plans, 0..) |plan, plan_index| {
-            if (!validation_snapshot.iteratorPlanChanged(app_artifact, plan_index, plan)) continue;
-            const dispatcher = self.platformRequiredIteratorReportDispatcherType(app_artifact, app_imported_artifacts, plan.iter) orelse continue;
-
-            try self.appendPlatformRequiredUnresolvedDispatchReport(
-                app_mod,
-                app_artifact,
-                plan.iter.method,
-                dispatcher.artifact,
-                dispatcher.ty,
-            );
-        }
-    }
-
-    const PlatformRequiredDispatchReportType = struct {
-        artifact: *const check.CheckedArtifact.CheckedModuleArtifact,
-        ty: check.CheckedIds.CheckedTypeId,
-    };
-
-    fn platformRequiredDispatchReportDispatcherType(
-        self: *Coordinator,
-        app_artifact: *const check.CheckedArtifact.CheckedModuleArtifact,
-        app_imported_artifacts: []const check.CheckedArtifact.PublishImportArtifact,
-        plan: check.StaticDispatchRegistry.StaticDispatchCallPlan,
-    ) ?PlatformRequiredDispatchReportType {
-        if (!check.CheckedArtifact.checkedTypeRootIsIdentity(app_artifact, plan.dispatcher_ty)) {
-            return .{ .artifact = app_artifact, .ty = plan.dispatcher_ty };
-        }
-        const dispatcher_expr = staticDispatchPlanDispatcherExpr(app_artifact, plan) orelse return null;
-        return self.platformRequiredConcreteExprType(app_artifact, app_imported_artifacts, dispatcher_expr);
-    }
-
-    fn platformRequiredIteratorReportDispatcherType(
-        self: *Coordinator,
-        app_artifact: *const check.CheckedArtifact.CheckedModuleArtifact,
-        app_imported_artifacts: []const check.CheckedArtifact.PublishImportArtifact,
-        plan: check.StaticDispatchRegistry.IteratorDispatchCall,
-    ) ?PlatformRequiredDispatchReportType {
-        if (!check.CheckedArtifact.checkedTypeRootIsIdentity(app_artifact, plan.dispatcher_ty)) {
-            return .{ .artifact = app_artifact, .ty = plan.dispatcher_ty };
-        }
-        const dispatcher_expr = iteratorDispatchPlanDispatcherExpr(app_artifact, plan) orelse return null;
-        return self.platformRequiredConcreteExprType(app_artifact, app_imported_artifacts, dispatcher_expr);
-    }
-
-    fn staticDispatchPlanDispatcherExpr(
-        app_artifact: *const check.CheckedArtifact.CheckedModuleArtifact,
-        plan: check.StaticDispatchRegistry.StaticDispatchCallPlan,
-    ) ?check.CheckedArtifact.CheckedExprId {
-        const index = switch (plan.dispatcher) {
-            .arg => |arg| arg,
-            .type_only => return null,
-        };
-        const args = plan.argsSlice(&app_artifact.static_dispatch_plans);
-        if (index >= args.len) return null;
-        return switch (args[index]) {
-            .checked_expr => |expr| expr,
-            .generated_interpolation_iter,
-            .generated_numeral,
-            .generated_quote,
-            => null,
-        };
-    }
-
-    fn iteratorDispatchPlanDispatcherExpr(
-        app_artifact: *const check.CheckedArtifact.CheckedModuleArtifact,
-        plan: check.StaticDispatchRegistry.IteratorDispatchCall,
-    ) ?check.CheckedArtifact.CheckedExprId {
-        const args = plan.argsSlice(&app_artifact.static_dispatch_plans);
-        if (plan.dispatcher_arg_index >= args.len) return null;
-        return switch (args[plan.dispatcher_arg_index]) {
-            .checked_expr => |expr| expr,
-            .loop_iterator_state => null,
-        };
-    }
-
-    fn platformRequiredConcreteExprType(
-        self: *Coordinator,
-        app_artifact: *const check.CheckedArtifact.CheckedModuleArtifact,
-        app_imported_artifacts: []const check.CheckedArtifact.PublishImportArtifact,
-        expr_id: check.CheckedArtifact.CheckedExprId,
-    ) ?PlatformRequiredDispatchReportType {
-        const expr = app_artifact.checked_bodies.expr(expr_id);
-        const expr_ty: ?PlatformRequiredDispatchReportType = if (check.CheckedArtifact.checkedTypeRootIsIdentity(app_artifact, expr.ty))
-            null
-        else
-            .{ .artifact = app_artifact, .ty = expr.ty };
-        return switch (expr.data) {
-            .dispatch_call => |plan_id| if (plan_id) |id| self.platformRequiredResolvedDispatchReturnType(app_artifact, app_imported_artifacts, id) orelse expr_ty else expr_ty,
-            .method_eq => |plan_id| if (plan_id) |id| self.platformRequiredResolvedDispatchReturnType(app_artifact, app_imported_artifacts, id) orelse expr_ty else expr_ty,
-            .num_from_numeral,
-            .typed_num_from_numeral,
-            => |plan_id| if (plan_id) |id| self.platformRequiredResolvedDispatchReturnType(app_artifact, app_imported_artifacts, id) orelse expr_ty else expr_ty,
-            .str_from_quote => |quote| if (quote.plan) |id| self.platformRequiredResolvedDispatchReturnType(app_artifact, app_imported_artifacts, id) orelse expr_ty else expr_ty,
-            .match_ => |match| blk: {
-                if (!match.is_try_suffix) break :blk expr_ty;
-                const cond = self.platformRequiredConcreteExprType(app_artifact, app_imported_artifacts, match.cond) orelse {
-                    const cond_expr = app_artifact.checked_bodies.expr(match.cond);
-                    if (check.CheckedArtifact.checkedTypeRootIsIdentity(app_artifact, cond_expr.ty)) break :blk expr_ty;
-                    break :blk platformRequiredTryOkType(app_artifact, cond_expr.ty);
-                };
-                break :blk if (platformRequiredTryOkType(cond.artifact, cond.ty)) |ok| ok else expr_ty;
-            },
-            else => expr_ty,
-        };
-    }
-
-    fn platformRequiredTryOkType(
-        artifact: *const check.CheckedArtifact.CheckedModuleArtifact,
-        root: check.CheckedArtifact.CheckedTypeId,
-    ) ?PlatformRequiredDispatchReportType {
-        var current = root;
-        var remaining = artifact.checked_types.payloads.items.len;
-        while (true) {
-            const payload = artifact.checked_types.payload(current);
-            switch (payload) {
-                .alias => |alias| current = alias.backing,
-                .nominal => |nominal| current = nominal.backing,
-                .tag_union => |tag_union| {
-                    if (platformRequiredOkTagPayload(artifact, tag_union.tags)) |ok| return .{ .artifact = artifact, .ty = ok };
-                    current = tag_union.ext;
-                },
-                .empty_tag_union => return null,
-                else => return null,
-            }
-            if (remaining == 0) {
-                coordinatorInvariant("platform-required Try success type lookup reached a cyclic checked type", .{});
-            }
-            remaining -= 1;
-        }
-    }
-
-    fn platformRequiredOkTagPayload(
-        artifact: *const check.CheckedArtifact.CheckedModuleArtifact,
-        tags: []const check.CheckedArtifact.CheckedTag,
-    ) ?check.CheckedArtifact.CheckedTypeId {
-        for (tags) |tag| {
-            if (!std.mem.eql(u8, artifact.canonical_names.tagLabelText(tag.name), "Ok")) continue;
-            const args = tag.argsSlice(&artifact.checked_types);
-            if (args.len != 1) return null;
-            return args[0];
-        }
-        return null;
-    }
-
-    fn platformRequiredResolvedDispatchReturnType(
-        self: *Coordinator,
-        app_artifact: *const check.CheckedArtifact.CheckedModuleArtifact,
-        app_imported_artifacts: []const check.CheckedArtifact.PublishImportArtifact,
-        plan_id: check.StaticDispatchRegistry.StaticDispatchPlanId,
-    ) ?PlatformRequiredDispatchReportType {
-        const raw = @intFromEnum(plan_id);
-        if (raw >= app_artifact.static_dispatch_plans.plans.len) return null;
-        const plan = app_artifact.static_dispatch_plans.plans[raw];
-        const target = switch (plan.resolution) {
-            .resolved_target => |target| target,
-            .unresolved_checked_plan => return null,
-        };
-        const plan_ret = checkedFunctionReturnType(app_artifact, plan.callable_ty) orelse return null;
-        if (!check.CheckedArtifact.checkedTypeRootIsIdentity(app_artifact, plan_ret)) {
-            return .{ .artifact = app_artifact, .ty = plan_ret };
-        }
-        switch (target.kind) {
-            .generated_structural_parser,
-            .generated_structural_encoder,
-            => {},
-            .procedure, .local_proc => {
-                const target_artifact = self.platformRequiredDispatchTargetArtifact(app_artifact, app_imported_artifacts, target);
-                if (checkedFunctionReturnType(target_artifact, target.callable_ty)) |target_ret| {
-                    if (!check.CheckedArtifact.checkedTypeRootIsIdentity(target_artifact, target_ret)) {
-                        return .{ .artifact = target_artifact, .ty = target_ret };
-                    }
-                }
-            },
-        }
-        return null;
-    }
-
-    fn platformRequiredDispatchTargetArtifact(
-        self: *Coordinator,
-        app_artifact: *const check.CheckedArtifact.CheckedModuleArtifact,
-        app_imported_artifacts: []const check.CheckedArtifact.PublishImportArtifact,
-        target: check.StaticDispatchRegistry.MethodTarget,
-    ) *const check.CheckedArtifact.CheckedModuleArtifact {
-        return switch (target.kind) {
-            .local_proc => app_artifact,
-            .generated_structural_parser,
-            .generated_structural_encoder,
-            => self.platformRequiredArtifactForModuleIndex(app_artifact, app_imported_artifacts, target.module_idx),
-            .procedure => |procedure| blk: {
-                const target_key = checkedArtifactKeyFromArtifactRef(procedure.template.artifact);
-                break :blk self.checkedArtifactByKey(target_key) orelse {
-                    coordinatorInvariant("platform-required dispatch target artifact was not available", .{});
-                };
-            },
-        };
-    }
-
-    fn platformRequiredArtifactForModuleIndex(
-        self: *Coordinator,
-        app_artifact: *const check.CheckedArtifact.CheckedModuleArtifact,
-        app_imported_artifacts: []const check.CheckedArtifact.PublishImportArtifact,
-        module_idx: u32,
-    ) *const check.CheckedArtifact.CheckedModuleArtifact {
-        if (module_idx == app_artifact.module_identity.module_idx) return app_artifact;
-        for (app_imported_artifacts) |imported_artifact| {
-            if (imported_artifact.module_idx == module_idx) {
-                return self.checkedArtifactByKey(imported_artifact.key) orelse {
-                    coordinatorInvariant("platform-required dispatch target artifact was not available", .{});
-                };
-            }
-        }
-        coordinatorInvariant("platform-required dispatch target module was not available to the app root", .{});
-    }
-
-    fn checkedFunctionReturnType(
-        app_artifact: *const check.CheckedArtifact.CheckedModuleArtifact,
-        callable_ty: check.CheckedIds.CheckedTypeId,
-    ) ?check.CheckedIds.CheckedTypeId {
-        return switch (app_artifact.checked_types.payload(callable_ty)) {
-            .function => |function| function.ret,
-            else => null,
-        };
-    }
-
-    fn appendPlatformRequiredInvalidNumeralDispatchReportIfNeeded(
-        self: *Coordinator,
-        app_mod: *ModuleState,
-        app_artifact: *const check.CheckedArtifact.CheckedModuleArtifact,
-        plan: check.StaticDispatchRegistry.StaticDispatchCallPlan,
-    ) Allocator.Error!bool {
-        const method_name = app_artifact.canonical_names.methodNameText(plan.method);
-        if (!std.mem.eql(u8, method_name, "from_numeral")) return false;
-
-        const builtin_nominal = check.CheckedArtifact.checkedTypeBuiltinNominal(
-            app_artifact,
-            plan.dispatcher_ty,
-        ) orelse return false;
-        if (!check.CheckedArtifact.builtinNominalAcceptsNumeralLiteral(builtin_nominal)) return false;
-
-        const args = plan.argsSlice(&app_artifact.static_dispatch_plans);
-        if (args.len != 1) return false;
-        const literal = switch (args[0]) {
-            .generated_numeral => |literal| literal,
-            else => return false,
-        };
-
-        const expr = app_artifact.checked_bodies.expr(plan.expr);
-        const has_suffix = switch (expr.data) {
-            .typed_num_from_numeral => true,
-            else => false,
-        };
-
-        const module_env = app_mod.moduleEnv() orelse {
-            if (builtin.mode == .Debug) {
-                std.debug.panic("compile.coordinator missing module env for platform-required numeral validation", .{});
-            }
-            unreachable;
-        };
-        if (try check.CheckedArtifact.numeralLiteralFitsBuiltin(
-            self.gpa,
-            module_env,
-            literal,
-            builtin_nominal,
-            has_suffix,
-        )) return false;
-
-        try self.appendPlatformRequiredInvalidNumericExpressionReport(
-            app_mod,
-            expr,
-            builtin_nominal,
-        );
-        return true;
-    }
-
-    fn appendPlatformRequiredInvalidNumericExpressionReports(
-        self: *Coordinator,
-        app_mod: *ModuleState,
-        app_artifact: *const check.CheckedArtifact.CheckedModuleArtifact,
-        platform_artifact: *const check.CheckedArtifact.CheckedModuleArtifact,
-    ) Allocator.Error!void {
-        const expectations = try check.CheckedArtifact.collectPlatformRequiredNumericExpectations(
-            self.gpa,
-            platform_artifact,
-            app_artifact,
-        );
-        defer self.gpa.free(expectations);
-        if (expectations.len == 0) return;
-
-        var raw_expr: usize = 0;
-        while (raw_expr < app_artifact.checked_bodies.exprCount()) : (raw_expr += 1) {
-            const expr_id: check.CheckedArtifact.CheckedExprId = @enumFromInt(raw_expr);
-            const expr = app_artifact.checked_bodies.expr(expr_id);
-
-            const int_value = switch (expr.data) {
-                .num => |num| num.value,
-                .typed_int => |typed| typed.value,
-                else => continue,
-            };
-            const expr_key = check.CheckedArtifact.checkedTypeRootKey(app_artifact, expr.ty);
-            for (expectations) |expectation| {
-                if (!std.meta.eql(expectation.app_type.bytes, expr_key.bytes)) continue;
-                if (check.CheckedArtifact.intLiteralFitsBuiltin(int_value, expectation.expected_builtin)) continue;
-
-                try self.appendPlatformRequiredInvalidNumericExpressionReport(
-                    app_mod,
-                    expr,
-                    expectation.expected_builtin,
-                );
-                break;
-            }
-        }
-    }
-
-    fn appendPlatformRequiredDispatchTargetMismatchReport(
-        self: *Coordinator,
-        app_mod: *ModuleState,
-        app_artifact: *const check.CheckedArtifact.CheckedModuleArtifact,
-        target_artifact: *const check.CheckedArtifact.CheckedModuleArtifact,
-        method: check.CanonicalNames.MethodNameId,
-        expected_ty: check.CheckedIds.CheckedTypeId,
-        actual_ty: check.CheckedIds.CheckedTypeId,
-    ) Allocator.Error!void {
-        const method_name = app_artifact.canonical_names.methodNameText(method);
-        const expected = try check.CheckedArtifact.formatCheckedTypeAlloc(self.gpa, target_artifact, expected_ty);
-        defer self.gpa.free(expected);
-        const actual = try check.CheckedArtifact.formatCheckedTypeAlloc(self.gpa, app_artifact, actual_ty);
-        defer self.gpa.free(actual);
-
-        var report = try Report.init(self.gpa, "Type Mismatch", "", .runtime_error);
-        errdefer report.deinit();
-
-        try report.document.addText("This ");
-        try report.document.addAnnotated(method_name, .emphasized);
-        try report.document.addText(" method call does not match the method it resolves to after applying the platform-required signature.");
-        try report.document.addLineBreak();
-        try report.document.addLineBreak();
-        try report.document.addText("The resolved method has type:");
-        try report.document.addLineBreak();
-        try report.document.addLineBreak();
-        try report.document.addCodeBlock(expected);
-        try report.document.addLineBreak();
-        try report.document.addLineBreak();
-        try report.document.addText("But this call was inferred as:");
-        try report.document.addLineBreak();
-        try report.document.addLineBreak();
-        try report.document.addCodeBlock(actual);
-
-        try self.appendNonLowerableReport(app_mod, report);
-    }
-
-    fn appendPlatformRequiredInvalidNumericPatternReports(
-        self: *Coordinator,
-        app_mod: *ModuleState,
-        app_artifact: *const check.CheckedArtifact.CheckedModuleArtifact,
-        validation_snapshot: *const PlatformRequiredValidationSnapshot,
-    ) Allocator.Error!void {
-        var raw_pattern: usize = 0;
-        while (raw_pattern < app_artifact.checked_bodies.patternCount()) : (raw_pattern += 1) {
-            const pattern_id: check.CheckedArtifact.CheckedPatternId = @enumFromInt(raw_pattern);
-            const pattern = app_artifact.checked_bodies.pattern(pattern_id);
-            if (!validation_snapshot.patternTypeChanged(app_artifact, raw_pattern, pattern)) continue;
-            if (!checkedPatternIsNumericLiteral(pattern.data)) continue;
-
-            const builtin_nominal = check.CheckedArtifact.checkedTypeBuiltinNominal(
-                app_artifact,
-                pattern.ty,
-            ) orelse continue;
-            if (check.CheckedArtifact.builtinNominalAcceptsNumeralLiteral(builtin_nominal)) continue;
-
-            try self.appendPlatformRequiredNumericPatternTypeMismatchReport(
-                app_mod,
-                app_artifact,
-                pattern.ty,
-            );
-        }
-    }
-
-    fn appendPlatformRequiredInvalidNumericExpressionReport(
-        self: *Coordinator,
-        app_mod: *ModuleState,
-        expr: check.CheckedArtifact.CheckedExpr,
-        expected_builtin: check.CheckedArtifact.CheckedBuiltinNominal,
-    ) Allocator.Error!void {
-        const module_env = app_mod.moduleEnv() orelse {
-            coordinatorInvariant("platform-required invalid numeric report missing module env", .{});
-        };
-        var report = try Report.init(self.gpa, "Invalid Number", "", .runtime_error);
-        errdefer report.deinit();
-
-        try report.document.addText("This numeric literal does not fit in the type required by the platform.");
-        try report.document.addLineBreak();
-        const region_info = module_env.calcRegionInfo(expr.source_region);
-        try report.document.addSourceRegion(
-            region_info,
-            .error_highlight,
-            app_mod.path,
-            module_env.common.source,
-            module_env.getLineStarts(),
-        );
-        try report.document.addLineBreak();
-        try report.document.addLineBreak();
-        try report.document.addText("The platform-required signature expects:");
-        try report.document.addLineBreak();
-        try report.document.addLineBreak();
-        try report.document.addCodeBlock(platformRequiredBuiltinNominalText(expected_builtin));
-
-        try self.appendNonLowerableReport(app_mod, report);
-    }
-
-    fn platformRequiredBuiltinNominalText(builtin_nominal: check.CheckedArtifact.CheckedBuiltinNominal) []const u8 {
-        return switch (builtin_nominal) {
-            .u8 => "Builtin.Num.U8",
-            .i8 => "Builtin.Num.I8",
-            .u16 => "Builtin.Num.U16",
-            .i16 => "Builtin.Num.I16",
-            .u32 => "Builtin.Num.U32",
-            .i32 => "Builtin.Num.I32",
-            .u64 => "Builtin.Num.U64",
-            .i64 => "Builtin.Num.I64",
-            .u128 => "Builtin.Num.U128",
-            .i128 => "Builtin.Num.I128",
-            .f32 => "Builtin.Num.F32",
-            .f64 => "Builtin.Num.F64",
-            .dec => "Builtin.Num.Dec",
-            .str => "Builtin.Str",
-            .bool => "Builtin.Bool",
-            .list => "Builtin.List",
-            .box => "Builtin.Box",
-            .dict => "Builtin.Dict",
-            .set => "Builtin.Set",
-            .parse_tag_union_spec => "Builtin.Encoding.ParseTagUnionSpec",
-            .fields => "Builtin.Encoding.FieldName.FieldNames",
-            .field => "Builtin.Encoding.FieldName",
-            .crypto_sha256_digest => "Builtin.Crypto.SHA256.Digest",
-            .crypto_sha256_hasher => "Builtin.Crypto.SHA256.Hasher",
-            .crypto_blake3_digest => "Builtin.Crypto.BLAKE3.Digest",
-            .crypto_blake3_hasher => "Builtin.Crypto.BLAKE3.Hasher",
-        };
-    }
-
-    fn appendPlatformRequiredNumericPatternTypeMismatchReport(
-        self: *Coordinator,
-        app_mod: *ModuleState,
-        app_artifact: *const check.CheckedArtifact.CheckedModuleArtifact,
-        pattern_ty: check.CheckedArtifact.CheckedTypeId,
-    ) Allocator.Error!void {
-        const actual = try check.CheckedArtifact.formatCheckedTypeAlloc(self.gpa, app_artifact, pattern_ty);
-        defer self.gpa.free(actual);
-
-        var report = try Report.init(self.gpa, "Type Mismatch", "", .runtime_error);
-        errdefer report.deinit();
-
-        try report.document.addText("This numeric pattern cannot match the type required by the platform.");
-        try report.document.addLineBreak();
-        try report.document.addLineBreak();
-        try report.document.addText("The platform-required signature expects:");
-        try report.document.addLineBreak();
-        try report.document.addLineBreak();
-        try report.document.addCodeBlock(actual);
-
-        try self.appendNonLowerableReport(app_mod, report);
-    }
-
-    fn checkedPatternIsNumericLiteral(data: check.CheckedArtifact.CheckedPatternData) bool {
-        return switch (data) {
-            .num_literal,
-            .small_dec_literal,
-            .dec_literal,
-            .frac_f32_literal,
-            .frac_f64_literal,
-            => true,
-            else => false,
-        };
-    }
-
-    fn appendPlatformRequiredUnresolvedDispatchReport(
-        self: *Coordinator,
-        app_mod: *ModuleState,
-        method_artifact: *const check.CheckedArtifact.CheckedModuleArtifact,
-        method: check.CanonicalNames.MethodNameId,
-        dispatcher_artifact: *const check.CheckedArtifact.CheckedModuleArtifact,
-        dispatcher_ty: check.CheckedIds.CheckedTypeId,
-    ) Allocator.Error!void {
-        if (check.CheckedArtifact.checkedTypeRootIsIdentity(dispatcher_artifact, dispatcher_ty)) return;
-
-        const method_name = method_artifact.canonical_names.methodNameText(method);
-        const dispatcher_type = try check.CheckedArtifact.formatCheckedTypeAlloc(self.gpa, dispatcher_artifact, dispatcher_ty);
-        defer self.gpa.free(dispatcher_type);
-
-        if (std.mem.eql(u8, method_name, "from_numeral")) {
-            var report = try Report.init(self.gpa, "Type Mismatch", "", .runtime_error);
-            errdefer report.deinit();
-
-            try report.document.addText("This number is being used where a non-number type is needed.");
-            try report.document.addLineBreak();
-            try report.document.addLineBreak();
-            try report.document.addText("The platform-required signature expects:");
-            try report.document.addLineBreak();
-            try report.document.addLineBreak();
-            try report.document.addCodeBlock(dispatcher_type);
-
-            try self.appendNonLowerableReport(app_mod, report);
-            return;
-        }
-
-        var report = try Report.init(self.gpa, "Missing Method", "", .runtime_error);
-        errdefer report.deinit();
-
-        try report.document.addText("This ");
-        try report.document.addAnnotated(method_name, .emphasized);
-        try report.document.addText(" method is being called on a value whose type doesn't have that method.");
-        try report.document.addLineBreak();
-        try report.document.addLineBreak();
-        try report.document.addText("The value's type is:");
-        try report.document.addLineBreak();
-        try report.document.addLineBreak();
-        try report.document.addCodeBlock(dispatcher_type);
-
-        try self.appendNonLowerableReport(app_mod, report);
     }
 
     pub fn hasUserErrors(self: *const Coordinator) bool {
@@ -3095,7 +2372,12 @@ pub const Coordinator = struct {
                 }
             }
         }
-        return self.rootCheckedArtifact("app");
+        return self.appRootCheckedArtifact();
+    }
+
+    pub fn appRootCheckedArtifact(self: *Coordinator) *const check.CheckedArtifact.CheckedModuleArtifact {
+        const app_package_name = self.app_package_name orelse package_identity.synthetic_app_identity;
+        return self.rootCheckedArtifact(app_package_name);
     }
 
     pub fn collectRelationArtifactViews(
@@ -3175,24 +2457,7 @@ pub const Coordinator = struct {
             publication_with_availability.hoisted_roots = republish_hoisted_roots;
         }
 
-        var platform_requirement_available_artifacts: []CheckedArtifact.ImportedModuleView = &.{};
-        var platform_requirement_available_artifacts_owned = false;
-        defer if (platform_requirement_available_artifacts_owned) self.gpa.free(platform_requirement_available_artifacts);
-
-        var base_available_artifacts = available_artifacts;
-        if (publication.platform_requirement_artifact) |platform_requirement_artifact| {
-            var extended_available = std.ArrayList(CheckedArtifact.ImportedModuleView).empty;
-            errdefer extended_available.deinit(self.gpa);
-            try extended_available.appendSlice(self.gpa, available_artifacts);
-            try self.appendTypecheckAvailablePublicApiClosure(
-                &extended_available,
-                self.gpa,
-                platform_requirement_artifact,
-            );
-            platform_requirement_available_artifacts = try extended_available.toOwnedSlice(self.gpa);
-            platform_requirement_available_artifacts_owned = true;
-            base_available_artifacts = platform_requirement_available_artifacts;
-        }
+        const base_available_artifacts = available_artifacts;
 
         var relation_available_artifacts: []CheckedArtifact.ImportedModuleView = &.{};
         var relation_available_artifacts_owned = false;
@@ -3206,8 +2471,10 @@ pub const Coordinator = struct {
             const root_key = if (mod.checkedArtifact()) |current| current.key else CheckedArtifact.CheckedModuleArtifactKey{};
             for (publication.relation_artifacts) |relation_artifact| {
                 if (checkedArtifactKeyEql(relation_artifact.key, root_key)) continue;
-                if (importedArtifactViewExists(extended_available.items, relation_artifact.key)) continue;
-                try extended_available.append(self.gpa, relation_artifact);
+                const relation_checked_artifact = self.checkedArtifactByKey(relation_artifact.key) orelse {
+                    coordinatorInvariant("platform/app relation publication references unavailable checked module", .{});
+                };
+                try self.appendTypeOwnerAvailableArtifactClosure(&extended_available, self.gpa, relation_checked_artifact);
             }
 
             var dependency_collector = RelationLoweringDependencyCollector.init(
@@ -3483,6 +2750,7 @@ pub const Coordinator = struct {
             switch (task) {
                 .parse => |t| std.debug.print("[COORD] ENQUEUE parse: pkg={s} module={s}\n", .{ t.package_name, t.module_name }),
                 .canonicalize => |t| std.debug.print("[COORD] ENQUEUE canonicalize: pkg={s} module={s}\n", .{ t.package_name, t.module_name }),
+                .platform_requirements_check => |t| std.debug.print("[COORD] ENQUEUE platform_requirements_check: pkg={s} module={s}\n", .{ t.package_name, t.module_name }),
                 .type_check => |t| std.debug.print("[COORD] ENQUEUE type_check: pkg={s} module={s}\n", .{ t.package_name, t.module_name }),
             }
         }
@@ -3697,11 +2965,6 @@ pub const Coordinator = struct {
         return semantic;
     }
 
-    fn appendNonLowerableReport(self: *Coordinator, app_mod: *ModuleState, report: Report) Allocator.Error!void {
-        app_mod.markUserErrorsNotLowerable();
-        try app_mod.reports.append(self.gpa, report);
-    }
-
     fn appendReportOwned(allocator: Allocator, reports: *std.ArrayList(Report), report: Report) Allocator.Error!void {
         var owned = report;
         errdefer owned.deinit();
@@ -3780,6 +3043,7 @@ pub const Coordinator = struct {
         env: *ModuleEnv,
         imported_envs: []const *ModuleEnv,
         imported_artifacts: []const check.CheckedArtifact.PublishImportArtifact,
+        platform_requirement_context: ?check.CheckedArtifact.PlatformRequirementContextKey,
         explicit_roots: []const check.CheckedArtifact.ExplicitRootRequestInput,
     ) Allocator.Error!check.CheckedArtifact.CheckedModuleArtifactKey {
         var typed = try CheckedModules.initForRootModule(self.gpa, env, imported_envs);
@@ -3791,6 +3055,7 @@ pub const Coordinator = struct {
             typed.module_idx,
             .{
                 .imports = imported_artifacts,
+                .platform_requirement_context = platform_requirement_context,
                 .explicit_roots = explicit_roots,
             },
         );
@@ -3872,6 +3137,7 @@ pub const Coordinator = struct {
         mod: *ModuleState,
         imported_envs: []const *ModuleEnv,
         imported_artifacts: []const check.CheckedArtifact.PublishImportArtifact,
+        platform_requirement_context: ?check.CheckedArtifact.PlatformRequirementContextKey,
         explicit_roots: []const check.CheckedArtifact.ExplicitRootRequestInput,
     ) bool {
         const manager = self.cache_manager orelse return false;
@@ -3879,7 +3145,7 @@ pub const Coordinator = struct {
 
         const current_env = mod.moduleEnv() orelse return false;
         if (!resolvedDirectImportsHaveCheckedOutput(current_env, imported_artifacts)) return false;
-        const cache_key = self.checkedModuleCacheKey(current_env, imported_envs, imported_artifacts, explicit_roots) catch return false;
+        const cache_key = self.checkedModuleCacheKey(current_env, imported_envs, imported_artifacts, platform_requirement_context, explicit_roots) catch return false;
 
         return self.installCachedCheckedArtifact(pkg, mod, cache_key, current_env);
     }
@@ -4091,6 +3357,8 @@ pub const Coordinator = struct {
         mod.phase = .Done;
         mod.visit_color = .black;
 
+        installPlatformRequirementSurface(mod);
+
         self.cache_hits += 1;
 
         if (pkg.remaining_modules > 0) pkg.remaining_modules -= 1;
@@ -4102,6 +3370,26 @@ pub const Coordinator = struct {
 
         const module_id = pkg.getModuleId(mod.name) orelse return;
         try self.wakeCrossPackageDependents(pkg.name, module_id);
+        try self.wakeAppsWaitingOnPlatformRequirements();
+    }
+
+    /// When a platform root finishes checking with a published artifact and a
+    /// requires clause, expose its requirement surface for app-root checks.
+    /// The surface borrows the platform's checked env — stable once the module
+    /// is Done — and derives its cache-identity context from the published
+    /// artifact, so the checker input and the cache key can never disagree.
+    /// A platform whose check failed publishes no artifact and installs no
+    /// surface; its own diagnostics gate the build instead.
+    fn installPlatformRequirementSurface(mod: *ModuleState) void {
+        const env = mod.moduleEnv() orelse return;
+        if (moduleKindTag(env.module_kind) != .platform) return;
+        if (env.requires_types.items.items.len == 0) return;
+        const artifact = mod.checkedArtifact() orelse return;
+        mod.platform_requirement_surface = .{
+            .env = env,
+            .context = artifact.platformRequirementContextKey(),
+            .path = mod.path,
+        };
     }
 
     /// Write a BUG diagnostic to stderr via the injected Io. No-op in release builds.
@@ -4267,9 +3555,8 @@ pub const Coordinator = struct {
             if (can.BuiltinLowLevel.isBuiltinModule(env)) {
                 try can.BuiltinLowLevel.apply(env);
             } else if (self.enable_hosted_transform) {
-                // Only run for platform modules (packages other than "app")
-                // The app package doesn't need hosted lambdas
-                if (!std.mem.eql(u8, result.package_name, "app")) {
+                // The app package doesn't need hosted lambdas.
+                if (self.app_package_name == null or !std.mem.eql(u8, result.package_name, self.app_package_name.?)) {
                     if (can.HostedCompiler.replaceAnnoOnlyWithHosted(env)) |modified_defs| {
                         var defs = modified_defs;
                         defs.deinit(env.gpa);
@@ -4307,18 +3594,105 @@ pub const Coordinator = struct {
         self.total_canonicalize_diag_ns += result.canonicalize_diagnostics_ns;
         mod.compile_time_ns += result.canonicalize_ns + result.canonicalize_diagnostics_ns;
 
+        if (self.appShouldWaitForPlatformRequirements(mod)) {
+            mod.phase = .WaitingOnPlatformRequirements;
+            mod.visit_color = .black;
+            return;
+        }
+
+        try self.scheduleTypeCheckForCanonicalizedModule(pkg, result.module_id, mod);
+    }
+
+    fn platformRootCandidate(self: *Coordinator) ?RootModuleRef {
+        const package_name = self.platform_root_package_name orelse return null;
+        const pkg = self.packages.get(package_name) orelse return null;
+        const root_id = pkg.root_module_id orelse return null;
+        const mod = pkg.getModule(root_id) orelse return null;
+        return .{ .pkg = pkg, .mod = mod };
+    }
+
+    fn platformRequirementSurfaceForApp(self: *Coordinator, mod: *ModuleState) ?*PlatformRequirementSurface {
+        const env = mod.moduleEnv() orelse return null;
+        switch (moduleKindTag(env.module_kind)) {
+            .app, .default_app => {},
+            else => return null,
+        }
+        const platform_root = self.platformRootCandidate() orelse return null;
+        if (platform_root.mod.platform_requirement_surface) |*surface| return surface;
+        return null;
+    }
+
+    /// App roots wait for the registered platform's root module to finish
+    /// checking, so the requirement surface (or the platform's own failure
+    /// diagnostics) always exists before the app is checked. Registration is
+    /// the authority for whether a platform exists; canonicalization progress
+    /// and package names are never consulted.
+    fn appShouldWaitForPlatformRequirements(self: *Coordinator, mod: *ModuleState) bool {
+        const env = mod.moduleEnv() orelse return false;
+        switch (moduleKindTag(env.module_kind)) {
+            .app, .default_app => {},
+            else => return false,
+        }
+        const platform_root = self.platformRootCandidate() orelse return false;
+        return platform_root.mod.phase != .Done;
+    }
+
+    fn wakeAppsWaitingOnPlatformRequirements(self: *Coordinator) Allocator.Error!void {
+        var pkg_iter = self.packages.iterator();
+        while (pkg_iter.next()) |entry| {
+            const pkg = entry.value_ptr.*;
+            for (pkg.modules.items, 0..) |*mod, module_id| {
+                if (mod.phase != .WaitingOnPlatformRequirements) continue;
+                if (self.appShouldWaitForPlatformRequirements(mod)) continue;
+                try self.scheduleTypeCheckForCanonicalizedModule(pkg, @intCast(module_id), mod);
+            }
+        }
+    }
+
+    fn scheduleTypeCheckForCanonicalizedModule(
+        self: *Coordinator,
+        pkg: *PackageState,
+        module_id: ModuleId,
+        mod: *ModuleState,
+    ) Allocator.Error!void {
+        const platform_surface: ?messages.PlatformRequirementSurface = if (self.platformRequirementSurfaceForApp(mod)) |surface| surface.* else null;
+        const platform_requirement_context: ?check.CheckedArtifact.PlatformRequirementContextKey = if (platform_surface) |surface| surface.context else null;
+
         const task_payload_alloc = self.getWorkerAllocator();
         const imported_envs = try self.buildTypecheckImportedEnvs(pkg, mod, task_payload_alloc);
         errdefer task_payload_alloc.free(imported_envs);
+
+        // All direct imports are Done, so their deep content identities are
+        // final; compute this module's identity before the cache-key probe and
+        // before type-checking (the unifier consumes precomputed identities).
+        try mod.moduleEnv().?.ensureContentIdentity(imported_envs);
         const imported_artifacts = try self.buildTypecheckImportedArtifacts(pkg, mod, task_payload_alloc);
         errdefer task_payload_alloc.free(imported_artifacts);
-        const available_artifacts = try self.collectTypecheckAvailableArtifactViews(task_payload_alloc, imported_artifacts);
+        // Requirement unification copies platform-owned types into the app's
+        // store, so the app's published API can reference the platform's nominal
+        // types — including types that only appear in the platform's `requires`
+        // signatures (like `Host`), whose declaring modules are not part of the
+        // platform root's public-API type owners. Seed the availability walk with
+        // every checked module of the platform package so each such declaration
+        // is resolvable when the app publishes checked types.
+        var platform_seed_list = std.ArrayList(check.CheckedArtifact.ImportedModuleView).empty;
+        defer platform_seed_list.deinit(task_payload_alloc);
+        if (platform_surface != null) {
+            if (self.platformRootCandidate()) |platform_root| {
+                for (platform_root.pkg.modules.items) |*platform_mod| {
+                    if (platform_mod.checkedArtifact()) |platform_artifact| {
+                        try platform_seed_list.append(task_payload_alloc, check.CheckedArtifact.importedView(platform_artifact));
+                    }
+                }
+            }
+        }
+        const available_artifacts = try self.collectTypecheckAvailableArtifactViewsSeeded(task_payload_alloc, imported_artifacts, platform_seed_list.items);
         errdefer task_payload_alloc.free(available_artifacts);
         const explicit_roots = try buildExplicitRootRequests(mod, task_payload_alloc);
         errdefer task_payload_alloc.free(explicit_roots);
 
         if (mod.reports.items.len == 0 and
-            self.tryLoadCachedCheckedModule(pkg, mod, imported_envs, imported_artifacts, explicit_roots))
+            self.tryLoadCachedCheckedModule(pkg, mod, imported_envs, imported_artifacts, platform_requirement_context, explicit_roots))
         {
             task_payload_alloc.free(imported_envs);
             task_payload_alloc.free(imported_artifacts);
@@ -4333,13 +3707,14 @@ pub const Coordinator = struct {
         try self.enqueueTask(.{
             .type_check = .{
                 .package_name = pkg.name,
-                .module_id = result.module_id,
+                .module_id = module_id,
                 .module_name = mod.name,
                 .path = mod.path,
                 .module_env = mod.moduleEnv().?,
                 .imported_envs = imported_envs,
                 .imported_artifacts = imported_artifacts,
                 .available_artifacts = available_artifacts,
+                .platform_requirements = platform_surface,
                 .explicit_roots = explicit_roots,
             },
         });
@@ -4472,6 +3847,8 @@ pub const Coordinator = struct {
         mod.phase = .Done;
         mod.visit_color = .black;
 
+        installPlatformRequirementSurface(mod);
+
         // Update compile stats
         self.cache_misses += 1;
         self.modules_compiled += 1;
@@ -4487,6 +3864,7 @@ pub const Coordinator = struct {
 
         // Wake cross-package dependents (other packages that import this module)
         try self.wakeCrossPackageDependents(result.package_name, result.module_id);
+        try self.wakeAppsWaitingOnPlatformRequirements();
     }
 
     /// Handle a parse failure
@@ -4535,6 +3913,7 @@ pub const Coordinator = struct {
 
         // Wake cross-package dependents
         try self.wakeCrossPackageDependents(result.package_name, result.module_id);
+        try self.wakeAppsWaitingOnPlatformRequirements();
     }
 
     /// Handle a non-parsing compilation failure.
@@ -4575,6 +3954,7 @@ pub const Coordinator = struct {
         }
 
         try self.wakeCrossPackageDependents(result.package_name, result.module_id);
+        try self.wakeAppsWaitingOnPlatformRequirements();
     }
 
     /// Handle cycle detection
@@ -4608,6 +3988,7 @@ pub const Coordinator = struct {
         // Decrement counters
         if (pkg.remaining_modules > 0) pkg.remaining_modules -= 1;
         if (self.total_remaining > 0) self.total_remaining -= 1;
+        try self.wakeAppsWaitingOnPlatformRequirements();
     }
 
     /// Handle cycle detection inline during canonicalization result processing
@@ -4676,20 +4057,30 @@ pub const Coordinator = struct {
         mod: *ModuleState,
         allocator: Allocator,
     ) Allocator.Error![]const *ModuleEnv {
+        return self.buildTypecheckImportedEnvsForEnv(pkg, mod, mod.moduleEnv().?, allocator);
+    }
+
+    fn buildTypecheckImportedEnvsForEnv(
+        self: *Coordinator,
+        pkg: *PackageState,
+        mod: *ModuleState,
+        module_env: *ModuleEnv,
+        allocator: Allocator,
+    ) Allocator.Error![]const *ModuleEnv {
         const expected_capacity = 1 + mod.imports.items.len + mod.external_imports.items.len;
         var imported_envs = try std.ArrayList(*ModuleEnv).initCapacity(allocator, expected_capacity);
         errdefer imported_envs.deinit(allocator);
 
         try imported_envs.append(allocator, self.builtin_modules.builtin_module.env);
-        mod.moduleEnv().?.imports.clearResolvedModules();
+        module_env.imports.clearResolvedModules();
 
-        const direct_imports = mod.moduleEnv().?.imports.imports.items.items;
+        const direct_imports = module_env.imports.imports.items.items;
         for (direct_imports, 0..) |str_idx, i| {
             const import_idx: can.CIR.Import.Idx = @enumFromInt(i);
-            const import_name = mod.moduleEnv().?.getString(str_idx);
+            const import_name = module_env.getString(str_idx);
 
             if (can.CIR.Import.isCompilerBuiltinImportName(import_name)) {
-                mod.moduleEnv().?.imports.setResolvedModule(import_idx, 0);
+                module_env.imports.setResolvedModule(import_idx, 0);
                 continue;
             }
 
@@ -4698,7 +4089,7 @@ pub const Coordinator = struct {
                 if (imp.moduleEnv()) |env| {
                     const resolved_module_idx: u32 = @intCast(imported_envs.items.len);
                     try imported_envs.append(allocator, env);
-                    mod.moduleEnv().?.imports.setResolvedModule(import_idx, resolved_module_idx);
+                    module_env.imports.setResolvedModule(import_idx, resolved_module_idx);
                 }
                 continue;
             }
@@ -4706,12 +4097,12 @@ pub const Coordinator = struct {
             if (self.getExternalEnv(pkg.name, import_name)) |ext_env| {
                 const resolved_module_idx: u32 = @intCast(imported_envs.items.len);
                 try imported_envs.append(allocator, ext_env);
-                mod.moduleEnv().?.imports.setResolvedModule(import_idx, resolved_module_idx);
+                module_env.imports.setResolvedModule(import_idx, resolved_module_idx);
                 continue;
             }
         }
 
-        mod.moduleEnv().?.imports.markUnresolvedImportsFailedBeforeChecking();
+        module_env.imports.markUnresolvedImportsFailedBeforeChecking();
 
         if (builtin.mode == .Debug) {
             for (mod.imports.items) |imp_id| {
@@ -5232,7 +4623,6 @@ pub const Coordinator = struct {
         };
     }
 
-    /// Execute a type-check task (pure function)
     fn executeTypeCheck(self: *Coordinator, task: TypeCheckTask, allocators: WorkerTaskAllocators) WorkerResult {
         return self.executeTypeCheckFallible(task, allocators) catch |err| switch (err) {
             error.OutOfMemory => WorkerResult{ .worker_oom = .{
@@ -5273,6 +4663,8 @@ pub const Coordinator = struct {
             task.imported_envs,
             task.imported_artifacts,
             task.available_artifacts,
+            if (task.platform_requirements) |surface| surface.checkerInput() else null,
+            if (task.platform_requirements) |surface| surface.context else null,
             task.explicit_roots,
             compile_package.compileTimeFinalizationOptions(self.max_threads, &self.roc_ctx),
         );
@@ -5295,6 +4687,7 @@ pub const Coordinator = struct {
             task.imported_envs,
             &typecheck_output.checker.import_mapping,
             &typecheck_output.checker.regions,
+            if (task.platform_requirements) |requirements| .{ .env = requirements.env, .filename = requirements.path } else null,
         );
         defer rb.deinit();
 
@@ -5498,6 +4891,299 @@ fn compileAppWithCheckedModuleCache(
         .hoisted_constants = hoisted_constants,
         .pattern_extraction_regions = pattern_extraction_regions,
     };
+}
+
+const AppRootIdentity = struct {
+    artifact_key: [32]u8,
+    module_identity_hash: [32]u8,
+    cache_hits: u32,
+};
+
+/// Compile an app workspace and return the executable root artifact's
+/// content-addressed key and module identity hash, plus checked-cache hits.
+fn compileAppRootIdentity(
+    allocator: Allocator,
+    cache_dir: []const u8,
+    app_path: []const u8,
+) CheckedModuleCacheRunError!AppRootIdentity {
+    const roc_ctx = CoreCtx.os(allocator, allocator, std.testing.io);
+    var cache_manager = CacheManager.init(allocator, .{
+        .enabled = true,
+        .cache_dir = cache_dir,
+    }, roc_ctx);
+
+    var builtin_modules = try eval.BuiltinModules.init(allocator);
+    defer builtin_modules.deinit();
+
+    var coord = try Coordinator.init(
+        allocator,
+        .single_threaded,
+        1,
+        roc_target.RocTarget.detectNative(),
+        &builtin_modules,
+        build_options.compiler_version,
+        &cache_manager,
+        roc_ctx,
+    );
+    defer coord.deinit();
+    coord.enable_hosted_transform = true;
+
+    var arena_impl = base.SingleThreadArena.init(allocator);
+    defer arena_impl.deinit();
+    const arena = arena_impl.allocator();
+
+    try coord.start();
+    try coord.discoverAppFromPath(arena, .{ .entry_path = app_path });
+    try coord.coordinatorLoop();
+    try std.testing.expect(!coord.hasUserErrors());
+    try coord.finalizeExecutableArtifacts();
+    try std.testing.expect(!coord.hasUserErrors());
+
+    const root = coord.executableRootCheckedArtifact();
+    return .{
+        .artifact_key = root.key.bytes,
+        .module_identity_hash = root.module_identity.stable_hash,
+        .cache_hits = coord.getBuildStats().cache_hits,
+    };
+}
+
+fn writeCacheKeyPurityFixture(tmp_dir: *std.testing.TmpDir, sub_dir: []const u8) (std.Io.Dir.CreateDirPathError || std.Io.Dir.WriteFileError || std.Io.Writer.Error)!void {
+    var path_buf: [256]u8 = undefined;
+    var writer = std.Io.Writer.fixed(&path_buf);
+    try writer.print("{s}/app/.roc_echo_platform", .{sub_dir});
+    try tmp_dir.dir.createDirPath(std.testing.io, writer.buffered());
+
+    const files = [_]struct { rel: []const u8, data: []const u8 }{
+        .{ .rel = "app/main.roc", .data =
+        \\app [main!] { pf: platform "./.roc_echo_platform/main.roc" }
+        \\
+        \\import pf.Echo
+        \\
+        \\main! = |_args| {
+        \\    Echo.line!("done")
+        \\    Ok({})
+        \\}
+        },
+        .{ .rel = "app/.roc_echo_platform/main.roc", .data =
+        \\platform ""
+        \\    requires {} { main! : List(Str) => Try({}, [Exit(I8), ..]) }
+        \\    exposes [Echo]
+        \\    packages {}
+        \\    provides { "roc_main": main_for_host! }
+        \\    hosted { "roc_echo_line": Echo.line! }
+        \\
+        \\import Echo
+        \\
+        \\main_for_host! : List(Str) => I8
+        \\main_for_host! = |args|
+        \\    match main!(args) {
+        \\        Ok({}) => 0
+        \\        Err(Exit(code)) => code
+        \\        Err(other) => {
+        \\            Echo.line!("Program exited with error: ${Str.inspect(other)}")
+        \\            1
+        \\        }
+        \\    }
+        },
+        .{ .rel = "app/.roc_echo_platform/Echo.roc", .data =
+        \\Echo := [].{
+        \\    line! : Str => {}
+        \\}
+        },
+    };
+    for (files) |file| {
+        var rel_buf: [256]u8 = undefined;
+        var rel_writer = std.Io.Writer.fixed(&rel_buf);
+        try rel_writer.print("{s}/{s}", .{ sub_dir, file.rel });
+        try tmp_dir.dir.writeFile(std.testing.io, .{ .sub_path = rel_writer.buffered(), .data = file.data });
+    }
+}
+
+test "cache-key purity: identical workspaces in different directories produce bit-identical identities, keys, and cache hits" {
+    const allocator = std.testing.allocator;
+
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    try tmp_dir.dir.createDirPath(std.testing.io, "cache");
+    const cache_dir = try tmp_dir.dir.realPathFileAlloc(std.testing.io, "cache", allocator);
+    defer allocator.free(cache_dir);
+
+    // The same workspace content in two different temp directories.
+    try writeCacheKeyPurityFixture(&tmp_dir, "first");
+    try writeCacheKeyPurityFixture(&tmp_dir, "second");
+
+    const first_app = try tmp_dir.dir.realPathFileAlloc(std.testing.io, "first/app/main.roc", allocator);
+    defer allocator.free(first_app);
+    const second_app = try tmp_dir.dir.realPathFileAlloc(std.testing.io, "second/app/main.roc", allocator);
+    defer allocator.free(second_app);
+
+    const first = try compileAppRootIdentity(allocator, cache_dir, first_app);
+    const second = try compileAppRootIdentity(allocator, cache_dir, second_app);
+
+    // Identity bytes and content-addressed cache keys are pure functions of
+    // module content: no coordinator-assigned display strings and no paths
+    // participate, so both builds agree bit-for-bit.
+    try std.testing.expectEqualSlices(u8, &first.module_identity_hash, &second.module_identity_hash);
+    try std.testing.expectEqualSlices(u8, &first.artifact_key, &second.artifact_key);
+    // ...and the second build gets checked-cache hits from the first build's
+    // entries even though it ran in a different directory.
+    try std.testing.expect(second.cache_hits > 0);
+}
+
+fn writeHostedDistinctnessFixture(tmp_dir: *std.testing.TmpDir) (std.Io.Dir.CreateDirPathError || std.Io.Dir.WriteFileError)!void {
+    try tmp_dir.dir.createDirPath(std.testing.io, "app/.roc_hosted_platform");
+    try tmp_dir.dir.writeFile(std.testing.io, .{
+        .sub_path = "app/main.roc",
+        .data =
+        \\app [main!] { pf: platform "./.roc_hosted_platform/main.roc" }
+        \\
+        \\import pf.EchoA
+        \\import pf.EchoB
+        \\
+        \\main! = |_args| {
+        \\    EchoA.line!("a")
+        \\    EchoB.line!("b")
+        \\    Ok({})
+        \\}
+        ,
+    });
+    try tmp_dir.dir.writeFile(std.testing.io, .{
+        .sub_path = "app/.roc_hosted_platform/main.roc",
+        .data =
+        \\platform ""
+        \\    requires {} { main! : List(Str) => Try({}, [Exit(I8), ..]) }
+        \\    exposes [EchoA, EchoB]
+        \\    packages {}
+        \\    provides { "roc_main": main_for_host! }
+        \\    hosted { "roc_echo_a_line": EchoA.line!, "roc_echo_b_line": EchoB.line! }
+        \\
+        \\import EchoA
+        \\import EchoB
+        \\
+        \\main_for_host! : List(Str) => I8
+        \\main_for_host! = |args|
+        \\    match main!(args) {
+        \\        Ok({}) => 0
+        \\        Err(Exit(code)) => code
+        \\        Err(_) => 1
+        \\    }
+        ,
+    });
+    // Two hosted modules whose declarations are identical up to the mandated
+    // module/type name, bound to different platform-header symbols.
+    try tmp_dir.dir.writeFile(std.testing.io, .{
+        .sub_path = "app/.roc_hosted_platform/EchoA.roc",
+        .data =
+        \\EchoA := [].{
+        \\    line! : Str => {}
+        \\}
+        ,
+    });
+    try tmp_dir.dir.writeFile(std.testing.io, .{
+        .sub_path = "app/.roc_hosted_platform/EchoB.roc",
+        .data =
+        \\EchoB := [].{
+        \\    line! : Str => {}
+        \\}
+        ,
+    });
+}
+
+test "hosted distinctness: identical hosted declarations bound to different platform symbols stay distinct" {
+    const allocator = std.testing.allocator;
+
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    try tmp_dir.dir.createDirPath(std.testing.io, "cache");
+    const cache_dir = try tmp_dir.dir.realPathFileAlloc(std.testing.io, "cache", allocator);
+    defer allocator.free(cache_dir);
+    try writeHostedDistinctnessFixture(&tmp_dir);
+    const app_path = try tmp_dir.dir.realPathFileAlloc(std.testing.io, "app/main.roc", allocator);
+    defer allocator.free(app_path);
+
+    const roc_ctx = CoreCtx.os(allocator, allocator, std.testing.io);
+    var cache_manager = CacheManager.init(allocator, .{
+        .enabled = true,
+        .cache_dir = cache_dir,
+    }, roc_ctx);
+
+    var builtin_modules = try eval.BuiltinModules.init(allocator);
+    defer builtin_modules.deinit();
+
+    var coord = try Coordinator.init(
+        allocator,
+        .single_threaded,
+        1,
+        roc_target.RocTarget.detectNative(),
+        &builtin_modules,
+        build_options.compiler_version,
+        &cache_manager,
+        roc_ctx,
+    );
+    defer coord.deinit();
+    coord.enable_hosted_transform = true;
+
+    var arena_impl = base.SingleThreadArena.init(allocator);
+    defer arena_impl.deinit();
+    const arena = arena_impl.allocator();
+
+    try coord.start();
+    try coord.discoverAppFromPath(arena, .{ .entry_path = app_path });
+    try coord.coordinatorLoop();
+    try std.testing.expect(!coord.hasUserErrors());
+    try coord.finalizeExecutableArtifacts();
+    try std.testing.expect(!coord.hasUserErrors());
+
+    // Per design.md, hosted identities are the platform-header symbol strings
+    // and declaration slots — never content hashes — so no deduplication or
+    // merging step may collapse the two entries even though their declaring
+    // modules are as content-identical as the language allows.
+    const root = coord.executableRootCheckedArtifact();
+    const imports = try coord.collectImportedArtifactViews(arena, root);
+    const relations = try coord.collectRelationArtifactViews(arena, root);
+
+    var symbols = std.ArrayList([]const u8).empty;
+    defer symbols.deinit(allocator);
+    var proc_refs = std.ArrayList(canonical.ProcedureValueRef).empty;
+    defer proc_refs.deinit(allocator);
+
+    var seen_keys = std.ArrayList([32]u8).empty;
+    defer seen_keys.deinit(allocator);
+
+    const root_view = check.CheckedArtifact.importedView(root);
+    const view_groups = [_][]const check.CheckedArtifact.ImportedModuleView{ &.{root_view}, imports, relations };
+    for (view_groups) |views| {
+        views: for (views) |view| {
+            for (seen_keys.items) |seen| {
+                if (std.mem.eql(u8, &seen, &view.key.bytes)) continue :views;
+            }
+            try seen_keys.append(allocator, view.key.bytes);
+            for (view.hosted_procs.procs) |proc| {
+                try symbols.append(allocator, view.canonical_names.externalSymbolNameText(proc.external_symbol_name));
+                try proc_refs.append(allocator, proc.proc);
+            }
+        }
+    }
+
+    // Both hosted procedures survive every merging pass as distinct
+    // identities even though their declaring modules' member declarations
+    // are identical.
+    try std.testing.expectEqual(@as(usize, 2), symbols.items.len);
+    try std.testing.expect(!canonical.procedureValueRefEql(proc_refs.items[0], proc_refs.items[1]));
+
+    // And the platform header binds them to two distinct linker symbols.
+    var linker_symbols = std.ArrayList([]const u8).empty;
+    defer linker_symbols.deinit(allocator);
+    for (view_groups) |views| {
+        for (views) |view| {
+            const env = view.module_env;
+            for (env.hosted_entries.items.items) |entry| {
+                try linker_symbols.append(allocator, env.getString(entry.symbol));
+            }
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 2), linker_symbols.items.len);
+    try std.testing.expect(!std.mem.eql(u8, linker_symbols.items[0], linker_symbols.items[1]));
 }
 
 fn collectPatternExtractionRegionStats(
@@ -5816,6 +5502,7 @@ test "Coordinator basic initialization" {
 
 test "Coordinator package creation" {
     const allocator = std.testing.allocator;
+    const app_identity = package_identity.synthetic_app_identity;
 
     var coord = try Coordinator.init(
         allocator,
@@ -5830,14 +5517,14 @@ test "Coordinator package creation" {
     defer coord.deinit();
 
     // Create a package
-    const pkg = try coord.ensurePackage("app", "/test/app");
-    try std.testing.expectEqualStrings("app", pkg.name);
+    const pkg = try coord.ensurePackage(app_identity, "/test/app");
+    try std.testing.expectEqualStrings(app_identity, pkg.name);
     try std.testing.expectEqualStrings("/test/app", pkg.root_dir);
 
     // Verify package is stored
-    const retrieved = coord.packages.get("app");
+    const retrieved = coord.packages.get(app_identity);
     try std.testing.expect(retrieved != null);
-    try std.testing.expectEqualStrings("app", retrieved.?.name);
+    try std.testing.expectEqualStrings(app_identity, retrieved.?.name);
 }
 
 test "Coordinator collectWatchInputStates includes package root state" {
@@ -5954,6 +5641,7 @@ test "Coordinator collectWatchInputStates includes module source file state" {
 
 test "Coordinator module creation" {
     const allocator = std.testing.allocator;
+    const app_identity = package_identity.synthetic_app_identity;
 
     var coord = try Coordinator.init(
         allocator,
@@ -5968,7 +5656,7 @@ test "Coordinator module creation" {
     defer coord.deinit();
 
     // Create package and module
-    const pkg = try coord.ensurePackage("app", "/test/app");
+    const pkg = try coord.ensurePackage(app_identity, "/test/app");
     const module_id = try pkg.ensureModule(allocator, "Main", "/test/app/Main.roc");
 
     try std.testing.expectEqual(@as(ModuleId, 0), module_id);
@@ -5982,6 +5670,7 @@ test "Coordinator module creation" {
 
 test "Coordinator task queue" {
     const allocator = std.testing.allocator;
+    const app_identity = package_identity.synthetic_app_identity;
 
     var coord = try Coordinator.init(
         allocator,
@@ -5996,13 +5685,13 @@ test "Coordinator task queue" {
     defer coord.deinit();
 
     // Create package and module
-    const pkg = try coord.ensurePackage("app", "/test/app");
+    const pkg = try coord.ensurePackage(app_identity, "/test/app");
     _ = try pkg.ensureModule(allocator, "Main", "/test/app/Main.roc");
 
     // Enqueue a task directly
     try coord.enqueueTask(.{
         .parse = .{
-            .package_name = "app",
+            .package_name = app_identity,
             .module_id = 0,
             .module_name = "Main",
             .path = "/test/app/Main.roc",
@@ -6018,7 +5707,7 @@ test "Coordinator task queue" {
     const task = coord.task_channel.tryRecv();
     try std.testing.expect(task != null);
     try std.testing.expect(task.? == .parse);
-    try std.testing.expectEqualStrings("app", task.?.parse.package_name);
+    try std.testing.expectEqualStrings(app_identity, task.?.parse.package_name);
 }
 
 test "Coordinator isComplete logic" {
@@ -6249,6 +5938,7 @@ test "Channel in coordinator context" {
 
 test "Coordinator enqueueParseTask flow" {
     const allocator = std.testing.allocator;
+    const app_identity = package_identity.synthetic_app_identity;
 
     var coord = try Coordinator.init(
         allocator,
@@ -6263,7 +5953,7 @@ test "Coordinator enqueueParseTask flow" {
     defer coord.deinit();
 
     // Create package
-    const pkg = try coord.ensurePackage("app", "/test/app");
+    const pkg = try coord.ensurePackage(app_identity, "/test/app");
 
     // Create module
     const module_id = try pkg.ensureModule(allocator, "Main", "/test/app/Main.roc");
@@ -6273,7 +5963,7 @@ test "Coordinator enqueueParseTask flow" {
     coord.total_remaining = 1;
 
     // Enqueue parse task
-    try coord.enqueueParseTask("app", module_id);
+    try coord.enqueueParseTask(app_identity, module_id);
 
     // Verify task was queued
     try std.testing.expectEqual(@as(usize, 1), coord.task_channel.len());
@@ -6281,12 +5971,12 @@ test "Coordinator enqueueParseTask flow" {
     // Verify it's a parse task for the right module
     const task = coord.task_channel.tryRecv().?;
     try std.testing.expect(task == .parse);
-    try std.testing.expectEqualStrings("app", task.parse.package_name);
+    try std.testing.expectEqualStrings(app_identity, task.parse.package_name);
     try std.testing.expectEqual(@as(ModuleId, 0), task.parse.module_id);
     try std.testing.expectEqualStrings("Main", task.parse.module_name);
 }
 
-test "Coordinator single-threaded loop with mock result" {
+test "platform root candidate comes from registration, not name probing" {
     const allocator = std.testing.allocator;
 
     var coord = try Coordinator.init(
@@ -6301,8 +5991,40 @@ test "Coordinator single-threaded loop with mock result" {
     );
     defer coord.deinit();
 
+    // No platform registered: no candidate, so apps never wait.
+    try std.testing.expect(coord.platformRootCandidate() == null);
+
+    const pf_pkg = try coord.ensurePackage("/abs/path/to/platform/main.roc", "/abs/path/to/platform");
+    const pf_root_id = try pf_pkg.ensureModule(allocator, "main", "/abs/path/to/platform/main.roc");
+    pf_pkg.root_module_id = pf_root_id;
+
+    // Registered but unmarked: still no candidate (registration is the authority).
+    try std.testing.expect(coord.platformRootCandidate() == null);
+
+    coord.markPlatformPackage(pf_pkg.name);
+    const candidate = coord.platformRootCandidate() orelse return error.TestExpectedCandidate;
+    try std.testing.expect(candidate.mod == pf_pkg.getModule(pf_root_id).?);
+    try std.testing.expect(candidate.mod.phase != .Done);
+}
+
+test "Coordinator single-threaded loop with mock result" {
+    const allocator = std.testing.allocator;
+    const app_identity = package_identity.synthetic_app_identity;
+
+    var coord = try Coordinator.init(
+        allocator,
+        .single_threaded,
+        1,
+        roc_target.RocTarget.detectNative(),
+        undefined,
+        "test",
+        null, // cache_manager
+        CoreCtx.os(std.testing.allocator, std.testing.allocator, std.testing.io),
+    );
+    defer coord.deinit();
+
     // Create package and module
-    const pkg = try coord.ensurePackage("app", "/test/app");
+    const pkg = try coord.ensurePackage(app_identity, "/test/app");
     const module_id = try pkg.ensureModule(allocator, "Main", "/test/app/Main.roc");
 
     // Set up remaining count
@@ -6334,6 +6056,8 @@ test "Coordinator CI failure scenario - app with platform cross-package imports"
     // for this exact structure.
 
     const allocator = std.testing.allocator;
+    const app_identity = package_identity.synthetic_app_identity;
+    const platform_identity = package_identity.synthetic_platform_identity;
 
     var coord = try Coordinator.init(
         allocator,
@@ -6347,20 +6071,20 @@ test "Coordinator CI failure scenario - app with platform cross-package imports"
     );
     defer coord.deinit();
 
-    // Set up "app" package
-    const app_pkg = try coord.ensurePackage("app", "/test/app");
+    // Set up synthetic app package
+    const app_pkg = try coord.ensurePackage(app_identity, "/test/app");
 
-    // Set up shorthand: app's "pf" -> package "pf"
+    // Set up shorthand: app's "pf" alias -> synthetic platform package
     const sh_key = try allocator.dupe(u8, "pf");
-    const sh_val = try allocator.dupe(u8, "pf");
+    const sh_val = try allocator.dupe(u8, platform_identity);
     try app_pkg.shorthands.put(sh_key, sh_val);
 
     const app_mod_id = try app_pkg.ensureModule(allocator, "expect_with_main", "/test/app/expect_with_main.roc");
     app_pkg.remaining_modules = 1;
     coord.total_remaining = 1;
 
-    // Set up "pf" package
-    const pf_pkg = try coord.ensurePackage("pf", "/test/pf");
+    // Set up synthetic platform package
+    const pf_pkg = try coord.ensurePackage(platform_identity, "/test/pf");
     const pf_main_id = try pf_pkg.ensureModule(allocator, "main", "/test/pf/main.roc");
     const pf_stdout_id = try pf_pkg.ensureModule(allocator, "Stdout", "/test/pf/Stdout.roc");
     const pf_stderr_id = try pf_pkg.ensureModule(allocator, "Stderr", "/test/pf/Stderr.roc");
@@ -6417,8 +6141,8 @@ test "Coordinator CI failure scenario - app with platform cross-package imports"
 
     // Verify external import readiness via the public isExternalReady API
     // pf.Stdout and pf.Stderr should be ready (they're Done)
-    try std.testing.expect(coord.isExternalReady("app", "pf.Stdout"));
-    try std.testing.expect(coord.isExternalReady("app", "pf.Stderr"));
+    try std.testing.expect(coord.isExternalReady(app_identity, "pf.Stdout"));
+    try std.testing.expect(coord.isExternalReady(app_identity, "pf.Stderr"));
 
     // Now simulate completing pf.main
     pf_pkg.getModule(pf_main_id).?.phase = .Done;
@@ -6455,6 +6179,7 @@ test "Coordinator handleParseFailed advances module to Done" {
     // If the package/module lookup silently returned, the module would
     // stay in Parsing forever — exactly the bug from CI.
     const allocator = std.testing.allocator;
+    const app_identity = package_identity.synthetic_app_identity;
 
     var coord = try Coordinator.init(
         allocator,
@@ -6469,7 +6194,7 @@ test "Coordinator handleParseFailed advances module to Done" {
     defer coord.deinit();
 
     // Create package and module
-    const pkg = try coord.ensurePackage("app", "/test/app");
+    const pkg = try coord.ensurePackage(app_identity, "/test/app");
     const module_id = try pkg.ensureModule(allocator, "Builder", "/test/app/Builder.roc");
     pkg.remaining_modules = 1;
     coord.total_remaining = 1;
@@ -6482,7 +6207,7 @@ test "Coordinator handleParseFailed advances module to Done" {
     // This exercises the package/module lookup that previously used orelse return.
     const result: WorkerResult = .{
         .parse_failed = .{
-            .package_name = "app",
+            .package_name = app_identity,
             .module_id = module_id,
             .module_name = "Builder",
             .path = "/test/app/Builder.roc",

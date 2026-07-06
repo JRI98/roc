@@ -92,6 +92,7 @@ const Printer = struct {
                         .dec_literal => |d| try writer.print("literal dec {d}", .{d}),
                         .str_literal => try writer.writeAll("literal str"),
                         .static_data => |id| try writer.print("literal static_data s{d}", .{@intFromEnum(id)}),
+                        .bytes_literal => try writer.writeAll("literal bytes"),
                         .null_ptr => try writer.writeAll("literal null_ptr"),
                         .proc_ref => |p| try writer.print("literal proc_ref p{d}", .{@intFromEnum(p)}),
                     }

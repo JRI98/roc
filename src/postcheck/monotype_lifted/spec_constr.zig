@@ -300,10 +300,15 @@ const NominalValue = struct {
     backing: *const Value,
 };
 
+const CaptureValue = struct {
+    id: check.CheckedModule.CaptureId,
+    value: Value,
+};
+
 const CallableValue = struct {
     ty: Type.TypeId,
     fn_id: Ast.FnId,
-    captures: []const Value,
+    captures: []const CaptureValue,
 };
 
 const CallPattern = struct {
@@ -600,13 +605,14 @@ const Pass = struct {
             .frac_f64_lit,
             .dec_lit,
             .str_lit,
+            .bytes_lit,
             .crash,
             .comptime_exhaustiveness_failed,
             .uninitialized,
             .uninitialized_payload,
             => {},
             .fn_ref => |fn_ref| {
-                for (self.program.exprSpan(fn_ref.captures)) |capture| try self.markArgUsesInExpr(fn_id, capture, changed);
+                for (self.program.captureOperandSpan(fn_ref.captures)) |operand| try self.markArgUsesInExpr(fn_id, operand.value, changed);
             },
             .list,
             .tuple,
@@ -635,7 +641,7 @@ const Pass = struct {
             .call_proc => |call| {
                 const args = self.program.exprSpan(call.args);
                 for (args) |arg| try self.markArgUsesInExpr(fn_id, arg, changed);
-                for (self.program.exprSpan(call.captures)) |capture| try self.markArgUsesInExpr(fn_id, capture, changed);
+                for (self.program.captureOperandSpan(call.captures)) |operand| try self.markArgUsesInExpr(fn_id, operand.value, changed);
                 const callee = Ast.localDirectCallee(call) orelse return;
                 const callee_raw = @intFromEnum(callee);
                 if (callee_raw < self.plans.len) {
@@ -743,12 +749,13 @@ const Pass = struct {
             .frac_f64_lit,
             .dec_lit,
             .str_lit,
+            .bytes_lit,
             .crash,
             .comptime_exhaustiveness_failed,
             .uninitialized,
             .uninitialized_payload,
             => {},
-            .fn_ref => |fn_ref| try self.collectCallPatternsInExprSpan(owner, fn_ref.captures),
+            .fn_ref => |fn_ref| try self.collectCallPatternsInCaptureOperandSpan(owner, fn_ref.captures),
             .list,
             .tuple,
             => |items| try self.collectCallPatternsInExprSpan(owner, items),
@@ -775,7 +782,7 @@ const Pass = struct {
             },
             .call_proc => |call| {
                 try self.collectCallPatternsInExprSpan(owner, call.args);
-                try self.collectCallPatternsInExprSpan(owner, call.captures);
+                try self.collectCallPatternsInCaptureOperandSpan(owner, call.captures);
                 const callee = Ast.localDirectCallee(call) orelse return;
                 if (@intFromEnum(callee) < self.plans.len) try self.recordCallPattern(callee, call.args);
             },
@@ -830,6 +837,12 @@ const Pass = struct {
         const source = try self.allocator.dupe(Ast.ExprId, self.program.exprSpan(span));
         defer self.allocator.free(source);
         for (source) |expr| try self.collectCallPatternsInExpr(owner, expr);
+    }
+
+    fn collectCallPatternsInCaptureOperandSpan(self: *Pass, owner: Ast.FnId, span: Ast.Span(Ast.CaptureOperand)) Allocator.Error!void {
+        const source = try self.allocator.dupe(Ast.CaptureOperand, self.program.captureOperandSpan(span));
+        defer self.allocator.free(source);
+        for (source) |operand| try self.collectCallPatternsInExpr(owner, operand.value);
     }
 
     fn collectCallPatternsInFieldExprSpan(self: *Pass, owner: Ast.FnId, span: Ast.Span(Ast.FieldExpr)) Allocator.Error!void {
@@ -2009,6 +2022,7 @@ const Pass = struct {
             .frac_f64_lit => |v| .{ .frac_f64_lit = v },
             .dec_lit => |v| .{ .dec_lit = v },
             .str_lit => |v| .{ .str_lit = v },
+            .bytes_lit => |v| .{ .bytes_lit = v },
             .crash => |v| .{ .crash = v },
             .list => |items| .{ .list = (try self.cloneExprSpanFresh(items, renames)) orelse return null },
             .tuple => |items| .{ .tuple = (try self.cloneExprSpanFresh(items, renames)) orelse return null },
@@ -2020,7 +2034,7 @@ const Pass = struct {
             .nominal => |backing| .{ .nominal = (try self.cloneExprFresh(backing, renames)) orelse return null },
             .fn_ref => |fn_ref| .{ .fn_ref = .{
                 .fn_id = fn_ref.fn_id,
-                .captures = (try self.cloneExprSpanFresh(fn_ref.captures, renames)) orelse return null,
+                .captures = (try self.cloneCaptureOperandSpanFresh(fn_ref.captures, renames)) orelse return null,
             } },
             .field_access => |field| .{ .field_access = .{
                 .receiver = (try self.cloneExprFresh(field.receiver, renames)) orelse return null,
@@ -2046,7 +2060,7 @@ const Pass = struct {
             .call_proc => |call| .{ .call_proc = .{
                 .callee = call.callee,
                 .args = (try self.cloneExprSpanFresh(call.args, renames)) orelse return null,
-                .captures = (try self.cloneExprSpanFresh(call.captures, renames)) orelse return null,
+                .captures = (try self.cloneCaptureOperandSpanFresh(call.captures, renames)) orelse return null,
                 .is_cold = call.is_cold,
             } },
             .call_value => |call| .{ .call_value = .{
@@ -2135,6 +2149,20 @@ const Pass = struct {
             out[index] = (try self.cloneExprFresh(item, renames)) orelse return null;
         }
         return try self.program.addExprSpan(out);
+    }
+
+    fn cloneCaptureOperandSpanFresh(self: *Pass, span: Ast.Span(Ast.CaptureOperand), renames: *std.AutoHashMap(Ast.LocalId, Ast.LocalId)) Common.LowerError!?Ast.Span(Ast.CaptureOperand) {
+        const source = try self.allocator.dupe(Ast.CaptureOperand, self.program.captureOperandSpan(span));
+        defer self.allocator.free(source);
+        var out = try self.allocator.alloc(Ast.CaptureOperand, source.len);
+        defer self.allocator.free(out);
+        for (source, 0..) |operand, index| {
+            out[index] = .{
+                .id = operand.id,
+                .value = (try self.cloneExprFresh(operand.value, renames)) orelse return null,
+            };
+        }
+        return try self.program.addCaptureOperandSpan(out);
     }
 
     fn cloneFieldSpanFresh(self: *Pass, span: Ast.Span(Ast.FieldExpr), renames: *std.AutoHashMap(Ast.LocalId, Ast.LocalId)) Common.LowerError!?Ast.Span(Ast.FieldExpr) {
@@ -2327,12 +2355,13 @@ const Pass = struct {
             .frac_f64_lit,
             .dec_lit,
             .str_lit,
+            .bytes_lit,
             .crash,
             .comptime_exhaustiveness_failed,
             .uninitialized,
             .uninitialized_payload,
             => {},
-            .fn_ref => |fn_ref| try self.rewriteCallsInExprSpan(fn_ref.captures, done),
+            .fn_ref => |fn_ref| try self.rewriteCallsInCaptureOperandSpan(fn_ref.captures, done),
             .list,
             .tuple,
             => |items| try self.rewriteCallsInExprSpan(items, done),
@@ -2359,7 +2388,7 @@ const Pass = struct {
             },
             .call_proc => |call| {
                 try self.rewriteCallsInExprSpan(call.args, done);
-                try self.rewriteCallsInExprSpan(call.captures, done);
+                try self.rewriteCallsInCaptureOperandSpan(call.captures, done);
                 try self.rewriteCallProc(expr_id, call);
             },
             .low_level => |call| try self.rewriteCallsInExprSpan(call.args, done),
@@ -2411,6 +2440,12 @@ const Pass = struct {
         const source = try self.allocator.dupe(Ast.ExprId, self.program.exprSpan(span));
         defer self.allocator.free(source);
         for (source) |expr| try self.rewriteCallsInExpr(expr, done);
+    }
+
+    fn rewriteCallsInCaptureOperandSpan(self: *Pass, span: Ast.Span(Ast.CaptureOperand), done: []bool) Allocator.Error!void {
+        const source = try self.allocator.dupe(Ast.CaptureOperand, self.program.captureOperandSpan(span));
+        defer self.allocator.free(source);
+        for (source) |operand| try self.rewriteCallsInExpr(operand.value, done);
     }
 
     fn rewriteCallsInFieldExprSpan(self: *Pass, span: Ast.Span(Ast.FieldExpr), done: []bool) Allocator.Error!void {
@@ -2625,11 +2660,11 @@ const Pass = struct {
                 } };
             },
             .fn_ref => |fn_ref| blk: {
-                const capture_exprs = self.program.exprSpan(fn_ref.captures);
-                const capture_shapes = try self.arena.allocator().alloc(Shape, capture_exprs.len);
-                for (capture_exprs, 0..) |capture, index| {
-                    capture_shapes[index] = (try self.constructorShape(capture)) orelse
-                        .{ .any = self.program.exprs.items[@intFromEnum(capture)].ty };
+                const capture_operands = self.program.captureOperandSpan(fn_ref.captures);
+                const capture_shapes = try self.arena.allocator().alloc(Shape, capture_operands.len);
+                for (capture_operands, 0..) |operand, index| {
+                    capture_shapes[index] = (try self.constructorShape(operand.value)) orelse
+                        .{ .any = self.program.exprs.items[@intFromEnum(operand.value)].ty };
                 }
                 break :blk Shape{ .callable = .{
                     .ty = expr.ty,
@@ -2693,8 +2728,8 @@ const Pass = struct {
             .callable => |callable| blk: {
                 const captures = try self.arena.allocator().alloc(Shape, callable.captures.len);
                 for (callable.captures, 0..) |capture, index| {
-                    captures[index] = (try self.shapeFromValue(capture)) orelse
-                        .{ .any = valueType(self.program, capture) };
+                    captures[index] = (try self.shapeFromValue(capture.value)) orelse
+                        .{ .any = valueType(self.program, capture.value) };
                 }
                 break :blk Shape{ .callable = .{
                     .ty = callable.ty,
@@ -2879,9 +2914,16 @@ const Cloner = struct {
                 } };
             },
             .callable => |callable| {
-                const captures = try self.pass.arena.allocator().alloc(Value, callable.captures.len);
-                for (callable.captures, 0..) |capture, index| {
-                    captures[index] = try self.valueFromShapeArgs(capture, args);
+                const slots = self.pass.program.typedLocalSpan(self.pass.program.fns.items[@intFromEnum(callable.fn_id)].captures);
+                if (slots.len != callable.captures.len) {
+                    Common.invariant("callable shape capture count differed from its function capture slots");
+                }
+                const captures = try self.pass.arena.allocator().alloc(CaptureValue, callable.captures.len);
+                for (callable.captures, slots, 0..) |capture, slot, index| {
+                    captures[index] = .{
+                        .id = self.pass.program.captureIdOfLocal(slot.local),
+                        .value = try self.valueFromShapeArgs(capture, args),
+                    };
                 }
                 return .{ .callable = .{
                     .ty = callable.ty,
@@ -3058,9 +3100,9 @@ const Cloner = struct {
     /// Whether any capture operand of a direct call would clone to something
     /// other than the callee's own capture local — i.e. the call sits in a
     /// context where the captured bindings have been substituted.
-    fn callCapturesAreForeign(self: *Cloner, captures_span: Ast.Span(Ast.ExprId)) bool {
-        for (self.pass.program.exprSpan(captures_span)) |capture_expr| {
-            const local = localExpr(self.pass.program, capture_expr) orelse return true;
+    fn callCapturesAreForeign(self: *Cloner, captures_span: Ast.Span(Ast.CaptureOperand)) bool {
+        for (self.pass.program.captureOperandSpan(captures_span)) |operand| {
+            const local = localExpr(self.pass.program, operand.value) orelse return true;
             if (self.subst.contains(local)) return true;
             if (self.binderIdentityOf(local)) |identity| {
                 if (self.binder_subst.contains(identity)) return true;
@@ -3082,7 +3124,7 @@ const Cloner = struct {
             .nominal,
             .fn_ref,
             => (try self.pass.constructorShape(expr_id)) != null,
-            .list, .str_lit => self.inline_list_source_construction,
+            .list, .str_lit, .bytes_lit => self.inline_list_source_construction,
             .field_access => |field| blk: {
                 const receiver_local = localExpr(self.pass.program, field.receiver) orelse break :blk false;
                 const receiver = self.subst.get(receiver_local) orelse break :blk false;
@@ -3125,7 +3167,7 @@ const Cloner = struct {
             .nominal => |nominal| self.valueCanSubstitute(nominal.backing.*),
             .callable => |callable| blk: {
                 for (callable.captures) |capture| {
-                    if (!self.valueCanSubstitute(capture)) break :blk false;
+                    if (!self.valueCanSubstitute(capture.value)) break :blk false;
                 }
                 break :blk true;
             },
@@ -3141,8 +3183,9 @@ const Cloner = struct {
             .frac_f64_lit,
             .dec_lit,
             .str_lit,
+            .bytes_lit,
             => true,
-            .fn_ref => |fn_ref| self.exprSpanCanSubstitute(fn_ref.captures),
+            .fn_ref => |fn_ref| self.captureOperandSpanCanSubstitute(fn_ref.captures),
             .field_access => |field| self.exprCanSubstitute(field.receiver),
             .tuple_access => |access| self.exprCanSubstitute(access.tuple),
             else => false,
@@ -3156,11 +3199,21 @@ const Cloner = struct {
         return true;
     }
 
+    fn captureOperandSpanCanSubstitute(self: *Cloner, span: Ast.Span(Ast.CaptureOperand)) bool {
+        for (self.pass.program.captureOperandSpan(span)) |operand| {
+            if (!self.exprCanSubstitute(operand.value)) return false;
+        }
+        return true;
+    }
+
     fn callableValueFromRef(self: *Cloner, ty: Type.TypeId, fn_ref: @import("../monotype/ast.zig").LiftedFunctionValue) Common.LowerError!Value {
-        const source_exprs = self.pass.program.exprSpan(fn_ref.captures);
-        const captures = try self.pass.arena.allocator().alloc(Value, source_exprs.len);
-        for (source_exprs, 0..) |capture, index| {
-            captures[index] = try self.cloneExprValue(capture);
+        const source_operands = self.pass.program.captureOperandSpan(fn_ref.captures);
+        const captures = try self.pass.arena.allocator().alloc(CaptureValue, source_operands.len);
+        for (source_operands, 0..) |operand, index| {
+            captures[index] = .{
+                .id = operand.id,
+                .value = try self.cloneExprValue(operand.value),
+            };
         }
         return .{ .callable = .{
             .ty = ty,
@@ -3190,6 +3243,7 @@ const Cloner = struct {
             .frac_f64_lit => |value| .{ .frac_f64_lit = value },
             .dec_lit => |value| .{ .dec_lit = value },
             .str_lit => |value| .{ .str_lit = value },
+            .bytes_lit => |value| .{ .bytes_lit = value },
             .list => |items| .{ .list = try self.cloneExprSpan(items) },
             .tuple => |items| .{ .tuple = try self.cloneExprSpan(items) },
             .record => |fields| .{ .record = try self.cloneFieldExprSpan(fields) },
@@ -3205,7 +3259,7 @@ const Cloner = struct {
             => Common.invariant("pre-lift function expression reached call-pattern specialization"),
             .fn_ref => |fn_ref| .{ .fn_ref = .{
                 .fn_id = fn_ref.fn_id,
-                .captures = try self.cloneExprSpan(fn_ref.captures),
+                .captures = try self.cloneCaptureOperandSpan(fn_ref.captures),
             } },
             .call_value => |call| .{ .call_value = .{
                 .callee = try self.cloneExpr(call.callee),
@@ -3706,7 +3760,6 @@ const Cloner = struct {
         _ = self.binder_subst.remove(identity);
     }
 
-
     /// A block whose statements all dissolve — each binds a substitutable
     /// value, or names an effect-free computation that becomes a pending
     /// binding — is transparent to value flow: its result keeps the final
@@ -3844,7 +3897,7 @@ const Cloner = struct {
             return .{ .call_proc = .{
                 .callee = call.callee,
                 .args = try self.cloneExprSpan(call.args),
-                .captures = try self.cloneExprSpan(call.captures),
+                .captures = try self.cloneCaptureOperandSpan(call.captures),
                 .is_cold = true,
             } };
         }
@@ -3852,6 +3905,7 @@ const Cloner = struct {
         const callee = Ast.localDirectCallee(call) orelse return .{ .call_proc = .{
             .callee = call.callee,
             .args = try self.cloneExprSpan(call.args),
+            .captures = try self.cloneCaptureOperandSpan(call.captures),
             .is_cold = call.is_cold,
         } };
         const raw = @intFromEnum(callee);
@@ -3875,7 +3929,7 @@ const Cloner = struct {
                     return .{ .call_proc = .{
                         .callee = .{ .lifted = spec.fn_id orelse Common.invariant("call-pattern specialization id was not assigned before cloning calls") },
                         .args = try self.pass.program.addExprSpan(rewritten_args.items),
-                        .captures = try self.cloneExprSpan(call.captures),
+                        .captures = try self.cloneCaptureOperandSpan(call.captures),
                         .is_cold = call.is_cold,
                     } };
                 }
@@ -3884,7 +3938,7 @@ const Cloner = struct {
         return .{ .call_proc = .{
             .callee = call.callee,
             .args = try self.cloneExprSpan(call.args),
-            .captures = try self.cloneExprSpan(call.captures),
+            .captures = try self.cloneCaptureOperandSpan(call.captures),
             .is_cold = call.is_cold,
         } };
     }
@@ -3975,7 +4029,7 @@ const Cloner = struct {
                     else => Common.invariant("callable call pattern matched a non-callable value"),
                 };
                 for (callable.captures, callable_value.captures) |capture_shape, capture_value| {
-                    try self.appendExprsFromValue(capture_shape, capture_value, out);
+                    try self.appendExprsFromValue(capture_shape, capture_value.value, out);
                 }
             },
         }
@@ -4128,7 +4182,7 @@ const Cloner = struct {
                 const captures = try self.pass.arena.allocator().alloc(Shape, callable.captures.len);
                 var demoted = false;
                 for (callable.captures, value_callable.captures, 0..) |capture_shape, capture_value, index| {
-                    const supplied = try self.supplyLoopSlotLeaves(capture_shape, capture_value, out);
+                    const supplied = try self.supplyLoopSlotLeaves(capture_shape, capture_value.value, out);
                     captures[index] = supplied.shape;
                     demoted = demoted or supplied.demoted;
                 }
@@ -4384,7 +4438,7 @@ const Cloner = struct {
             .nominal => |nominal| 1 + self.knownConstructorSize(nominal.backing.*),
             .callable => |callable| blk: {
                 var count: usize = 1;
-                for (callable.captures) |capture| count += self.knownConstructorSize(capture);
+                for (callable.captures) |capture| count += self.knownConstructorSize(capture.value);
                 break :blk count;
             },
         };
@@ -4424,6 +4478,14 @@ const Cloner = struct {
         return total;
     }
 
+    fn captureOperandsKnownConstructorSize(self: *Cloner, span: Ast.Span(Ast.CaptureOperand)) usize {
+        var total: usize = 0;
+        for (self.pass.program.captureOperandSpan(span)) |operand| {
+            if (self.peekKnownValue(operand.value)) |value| total += self.knownConstructorSize(value);
+        }
+        return total;
+    }
+
     fn unsafeLeafCount(self: *Cloner, value: Value) usize {
         return switch (value) {
             .expr => |expr| if (self.exprCanSubstitute(expr)) 0 else 1,
@@ -4445,7 +4507,7 @@ const Cloner = struct {
             .nominal => |nominal| self.unsafeLeafCount(nominal.backing.*),
             .callable => |callable| blk: {
                 var count: usize = 0;
-                for (callable.captures) |capture| count += self.unsafeLeafCount(capture);
+                for (callable.captures) |capture| count += self.unsafeLeafCount(capture.value);
                 break :blk count;
             },
         };
@@ -4511,9 +4573,12 @@ const Cloner = struct {
                 } };
             },
             .callable => |callable| blk: {
-                const captures = try self.pass.arena.allocator().alloc(Value, callable.captures.len);
+                const captures = try self.pass.arena.allocator().alloc(CaptureValue, callable.captures.len);
                 for (callable.captures, 0..) |capture, index| {
-                    captures[index] = try self.makeReusableForMatch(capture);
+                    captures[index] = .{
+                        .id = capture.id,
+                        .value = try self.makeReusableForMatch(capture.value),
+                    };
                 }
                 break :blk Value{ .callable = .{
                     .ty = callable.ty,
@@ -4712,7 +4777,7 @@ const Cloner = struct {
         args_span: Ast.Span(Ast.ExprId),
     ) Common.LowerError!Value {
         var callable_call_size: usize = 0;
-        for (callable.captures) |capture| callable_call_size += self.knownConstructorSize(capture);
+        for (callable.captures) |capture| callable_call_size += self.knownConstructorSize(capture.value);
         callable_call_size += self.argsKnownConstructorSize(args_span);
         for (self.inline_stack.items) |active| {
             if (active.fn_id != callable.fn_id) continue;
@@ -4757,7 +4822,10 @@ const Cloner = struct {
 
         const prepared_captures = try self.pass.allocator.alloc(Value, callable.captures.len);
         defer self.pass.allocator.free(prepared_captures);
-        for (source_captures, callable.captures, 0..) |source_capture, capture_value, index| {
+        for (source_captures, 0..) |source_capture, index| {
+            const id = self.pass.program.captureIdOfLocal(source_capture.local);
+            const capture_value = callableCaptureValueForId(callable.captures, id) orelse
+                Common.invariant("callable value had no value for a source capture slot");
             prepared_captures[index] = try self.makeReusableForMatch(capture_value);
             try self.putSubst(source_capture.local, prepared_captures[index]);
         }
@@ -4795,10 +4863,10 @@ const Cloner = struct {
         self: *Cloner,
         callee: Ast.FnId,
         args_span: Ast.Span(Ast.ExprId),
-        captures_span: Ast.Span(Ast.ExprId),
+        captures_span: Ast.Span(Ast.CaptureOperand),
         original_expr: Ast.ExprId,
     ) Common.LowerError!Value {
-        const direct_call_size = self.argsKnownConstructorSize(args_span) + self.argsKnownConstructorSize(captures_span);
+        const direct_call_size = self.argsKnownConstructorSize(args_span) + self.captureOperandsKnownConstructorSize(captures_span);
         for (self.inline_stack.items) |active| {
             if (active.fn_id != callee) continue;
             if (direct_call_size == 0 or direct_call_size >= active.known_size) {
@@ -4826,16 +4894,19 @@ const Cloner = struct {
 
         const captures = try self.pass.allocator.dupe(Ast.TypedLocal, self.pass.program.typedLocalSpan(source_fn.captures));
         defer self.pass.allocator.free(captures);
-        const capture_exprs = try self.pass.allocator.dupe(Ast.ExprId, self.pass.program.exprSpan(captures_span));
-        defer self.pass.allocator.free(capture_exprs);
-        if (captures.len != capture_exprs.len) {
+        const operands = try self.pass.allocator.dupe(Ast.CaptureOperand, self.pass.program.captureOperandSpan(captures_span));
+        defer self.pass.allocator.free(operands);
+        if (captures.len != operands.len) {
             Common.invariant("direct call capture count differed from lifted function capture count");
         }
 
-        const capture_values = try self.pass.allocator.alloc(Value, capture_exprs.len);
+        const capture_values = try self.pass.allocator.alloc(CaptureValue, operands.len);
         defer self.pass.allocator.free(capture_values);
-        for (capture_exprs, 0..) |capture_expr, index| {
-            capture_values[index] = try self.cloneExprValue(capture_expr);
+        for (operands, 0..) |operand, index| {
+            capture_values[index] = .{
+                .id = operand.id,
+                .value = try self.cloneExprValue(operand.value),
+            };
         }
 
         const arg_values = try self.pass.allocator.alloc(Value, args.len);
@@ -4845,12 +4916,15 @@ const Cloner = struct {
         }
 
         var unsafe_count: usize = 0;
-        for (capture_values) |capture_value| unsafe_count += self.unsafeLeafCount(capture_value);
+        for (capture_values) |capture_value| unsafe_count += self.unsafeLeafCount(capture_value.value);
         for (arg_values) |arg_value| unsafe_count += self.unsafeLeafCount(arg_value);
 
-        const prepared_captures = try self.pass.allocator.alloc(Value, capture_values.len);
+        const prepared_captures = try self.pass.allocator.alloc(Value, captures.len);
         defer self.pass.allocator.free(prepared_captures);
-        for (captures, capture_values, 0..) |capture, capture_value, index| {
+        for (captures, 0..) |capture, index| {
+            const id = self.pass.program.captureIdOfLocal(capture.local);
+            const capture_value = callableCaptureValueForId(capture_values, id) orelse
+                Common.invariant("direct call had no value for a source capture slot");
             prepared_captures[index] = try self.valueForInlineLocal(capture.local, capture_value, body, unsafe_count);
         }
 
@@ -5115,6 +5189,21 @@ const Cloner = struct {
         return try self.pass.program.addExprSpan(values);
     }
 
+    fn cloneCaptureOperandSpan(self: *Cloner, span: Ast.Span(Ast.CaptureOperand)) Common.LowerError!Ast.Span(Ast.CaptureOperand) {
+        const source = try self.pass.allocator.dupe(Ast.CaptureOperand, self.pass.program.captureOperandSpan(span));
+        defer self.pass.allocator.free(source);
+
+        const operands = try self.pass.allocator.alloc(Ast.CaptureOperand, source.len);
+        defer self.pass.allocator.free(operands);
+        for (source, 0..) |operand, index| {
+            operands[index] = .{
+                .id = operand.id,
+                .value = try self.cloneExpr(operand.value),
+            };
+        }
+        return try self.pass.program.addCaptureOperandSpan(operands);
+    }
+
     fn clonePatSpan(self: *Cloner, span: Ast.Span(Ast.PatId)) Allocator.Error!Ast.Span(Ast.PatId) {
         const source = try self.pass.allocator.dupe(Ast.PatId, self.pass.program.patSpan(span));
         defer self.pass.allocator.free(source);
@@ -5241,7 +5330,11 @@ const Cloner = struct {
         }
 
         var all_original = true;
-        for (captures, callable.captures) |capture, value| {
+        for (captures) |capture| {
+            const value = callableCaptureValueForId(callable.captures, self.pass.program.captureIdOfLocal(capture.local)) orelse {
+                all_original = false;
+                break;
+            };
             const expr = switch (value) {
                 .expr => |expr| expr,
                 else => {
@@ -5384,7 +5477,7 @@ const Cloner = struct {
         ty: Type.TypeId,
         fn_id: Ast.FnId,
         captures_span: Ast.Span(Ast.TypedLocal),
-        values: []const Value,
+        values: []const CaptureValue,
     ) Common.LowerError!Ast.ExprId {
         const captures = try self.pass.allocator.dupe(Ast.TypedLocal, self.pass.program.typedLocalSpan(captures_span));
         defer self.pass.allocator.free(captures);
@@ -5392,21 +5485,32 @@ const Cloner = struct {
             Common.invariant("callable value capture count differed from specialized function capture count");
         }
 
-        const value_exprs = try self.pass.allocator.alloc(Ast.ExprId, values.len);
-        defer self.pass.allocator.free(value_exprs);
-        for (captures, values, 0..) |capture, value, index| {
+        const operands = try self.pass.allocator.alloc(Ast.CaptureOperand, captures.len);
+        defer self.pass.allocator.free(operands);
+        for (captures, 0..) |capture, index| {
+            const id = self.pass.program.captureIdOfLocal(capture.local);
+            const value = callableCaptureValueForId(values, id) orelse
+                Common.invariant("specialized callable had no value for a capture slot");
             const value_expr = try self.materialize(value);
             const value_local = localExpr(self.pass.program, value_expr);
-            value_exprs[index] = if (value_local != null and value_local.? == capture.local)
+            const operand_value = if (value_local != null and value_local.? == capture.local)
                 try self.addExpr(.{ .ty = capture.ty, .data = .{ .local = capture.local } })
             else
                 value_expr;
+            operands[index] = .{ .id = id, .value = operand_value };
         }
 
         return try self.addExpr(.{ .ty = ty, .data = .{ .fn_ref = .{
             .fn_id = fn_id,
-            .captures = try self.pass.program.addExprSpan(value_exprs),
+            .captures = try self.pass.program.addCaptureOperandSpan(operands),
         } } });
+    }
+
+    fn callableCaptureValueForId(values: []const CaptureValue, id: check.CheckedModule.CaptureId) ?Value {
+        for (values) |capture_value| {
+            if (capture_value.id == id) return capture_value.value;
+        }
+        return null;
     }
 
     fn copyValue(self: *Cloner, value: Value) Allocator.Error!*const Value {
@@ -5546,6 +5650,7 @@ fn exprContainsReturn(program: *const Ast.Program, expr_id: Ast.ExprId) bool {
         .frac_f64_lit,
         .dec_lit,
         .str_lit,
+        .bytes_lit,
         .crash,
         .comptime_exhaustiveness_failed,
         .uninitialized,
@@ -5554,7 +5659,7 @@ fn exprContainsReturn(program: *const Ast.Program, expr_id: Ast.ExprId) bool {
         .def_ref,
         .fn_def,
         => false,
-        .fn_ref => |fn_ref| exprSpanContainsReturn(program, fn_ref.captures),
+        .fn_ref => |fn_ref| captureOperandSpanContainsReturn(program, fn_ref.captures),
         .return_ => true,
         .list,
         .tuple,
@@ -5574,7 +5679,7 @@ fn exprContainsReturn(program: *const Ast.Program, expr_id: Ast.ExprId) bool {
         .comptime_branch_taken => |taken| exprContainsReturn(program, taken.body),
         .let_ => |let_| exprContainsReturn(program, let_.value) or exprContainsReturn(program, let_.rest),
         .call_value => |call| exprContainsReturn(program, call.callee) or exprSpanContainsReturn(program, call.args),
-        .call_proc => |call| exprSpanContainsReturn(program, call.args) or exprSpanContainsReturn(program, call.captures),
+        .call_proc => |call| exprSpanContainsReturn(program, call.args) or captureOperandSpanContainsReturn(program, call.captures),
         .low_level => |call| exprSpanContainsReturn(program, call.args),
         .field_access => |field| exprContainsReturn(program, field.receiver),
         .tuple_access => |access| exprContainsReturn(program, access.tuple),
@@ -5621,6 +5726,13 @@ fn exprSpanContainsReturn(program: *const Ast.Program, span: Ast.Span(Ast.ExprId
     return false;
 }
 
+fn captureOperandSpanContainsReturn(program: *const Ast.Program, span: Ast.Span(Ast.CaptureOperand)) bool {
+    for (program.captureOperandSpan(span)) |operand| {
+        if (exprContainsReturn(program, operand.value)) return true;
+    }
+    return false;
+}
+
 fn stmtContainsReturn(program: *const Ast.Program, stmt_id: Ast.StmtId) bool {
     return switch (program.stmts.items[@intFromEnum(stmt_id)]) {
         .return_ => true,
@@ -5644,12 +5756,13 @@ fn localUseCountInExpr(program: *const Ast.Program, local: Ast.LocalId, expr_id:
         .frac_f64_lit,
         .dec_lit,
         .str_lit,
+        .bytes_lit,
         .crash,
         .comptime_exhaustiveness_failed,
         .uninitialized,
         .uninitialized_payload,
         => 0,
-        .fn_ref => |fn_ref| localUseCountInExprSpan(program, local, fn_ref.captures),
+        .fn_ref => |fn_ref| localUseCountInCaptureOperandSpan(program, local, fn_ref.captures),
         .list,
         .tuple,
         => |items| localUseCountInExprSpan(program, local, items),
@@ -5672,7 +5785,7 @@ fn localUseCountInExpr(program: *const Ast.Program, local: Ast.LocalId, expr_id:
         .fn_def,
         => 0,
         .call_value => |call| localUseCountInExpr(program, local, call.callee) + localUseCountInExprSpan(program, local, call.args),
-        .call_proc => |call| localUseCountInExprSpan(program, local, call.args) + localUseCountInExprSpan(program, local, call.captures),
+        .call_proc => |call| localUseCountInExprSpan(program, local, call.args) + localUseCountInCaptureOperandSpan(program, local, call.captures),
         .low_level => |call| localUseCountInExprSpan(program, local, call.args),
         .field_access => |field| localUseCountInExpr(program, local, field.receiver),
         .tuple_access => |access| localUseCountInExpr(program, local, access.tuple),
@@ -5721,6 +5834,12 @@ fn localUseCountInExprSpan(program: *const Ast.Program, local: Ast.LocalId, span
     return count;
 }
 
+fn localUseCountInCaptureOperandSpan(program: *const Ast.Program, local: Ast.LocalId, span: Ast.Span(Ast.CaptureOperand)) usize {
+    var count: usize = 0;
+    for (program.captureOperandSpan(span)) |operand| count += localUseCountInExpr(program, local, operand.value);
+    return count;
+}
+
 fn localUseCountInStmt(program: *const Ast.Program, local: Ast.LocalId, stmt_id: Ast.StmtId) usize {
     return switch (program.stmts.items[@intFromEnum(stmt_id)]) {
         .uninitialized => 0,
@@ -5759,12 +5878,13 @@ fn exprHasNoObservableEffect(program: *const Ast.Program, fn_effect_free: []cons
         .frac_f64_lit,
         .dec_lit,
         .str_lit,
+        .bytes_lit,
         .uninitialized,
         .uninitialized_payload,
         .def_ref,
         .fn_def,
         => true,
-        .fn_ref => |fn_ref| exprSpanHasNoObservableEffect(program, fn_effect_free, fn_ref.captures, allow_control),
+        .fn_ref => |fn_ref| captureOperandSpanHasNoObservableEffect(program, fn_effect_free, fn_ref.captures, allow_control),
         .list,
         .tuple,
         => |items| exprSpanHasNoObservableEffect(program, fn_effect_free, items, allow_control),
@@ -5794,7 +5914,7 @@ fn exprHasNoObservableEffect(program: *const Ast.Program, fn_effect_free: []cons
             const raw = @intFromEnum(callee);
             if (raw >= fn_effect_free.len or !fn_effect_free[raw]) break :blk false;
             break :blk exprSpanHasNoObservableEffect(program, fn_effect_free, call.args, allow_control) and
-                exprSpanHasNoObservableEffect(program, fn_effect_free, call.captures, allow_control);
+                captureOperandSpanHasNoObservableEffect(program, fn_effect_free, call.captures, allow_control);
         },
         .let_ => |let_| exprHasNoObservableEffect(program, fn_effect_free, let_.value, allow_control) and
             exprHasNoObservableEffect(program, fn_effect_free, let_.rest, allow_control),
@@ -5860,6 +5980,13 @@ fn exprSpanHasNoObservableEffect(program: *const Ast.Program, fn_effect_free: []
     return true;
 }
 
+fn captureOperandSpanHasNoObservableEffect(program: *const Ast.Program, fn_effect_free: []const bool, span: Ast.Span(Ast.CaptureOperand), allow_control: bool) bool {
+    for (program.captureOperandSpan(span)) |operand| {
+        if (!exprHasNoObservableEffect(program, fn_effect_free, operand.value, allow_control)) return false;
+    }
+    return true;
+}
+
 fn localUseBeforeEffect(program: *const Ast.Program, local: Ast.LocalId, expr_id: Ast.ExprId) bool {
     var scan: LocalUseScan = .{};
     scanLocalUseInExpr(program, local, expr_id, &scan);
@@ -5884,10 +6011,11 @@ fn scanLocalUseInExpr(program: *const Ast.Program, local: Ast.LocalId, expr_id: 
         .frac_f64_lit,
         .dec_lit,
         .str_lit,
+        .bytes_lit,
         .uninitialized,
         .uninitialized_payload,
         => {},
-        .fn_ref => |fn_ref| scanLocalUseInExprSpan(program, local, fn_ref.captures, scan),
+        .fn_ref => |fn_ref| scanLocalUseInCaptureOperandSpan(program, local, fn_ref.captures, scan),
         .crash, .comptime_exhaustiveness_failed => scan.seen_effect = true,
         .list,
         .tuple,
@@ -5927,7 +6055,7 @@ fn scanLocalUseInExpr(program: *const Ast.Program, local: Ast.LocalId, expr_id: 
         },
         .call_proc => |call| {
             scanLocalUseInExprSpan(program, local, call.args, scan);
-            scanLocalUseInExprSpan(program, local, call.captures, scan);
+            scanLocalUseInCaptureOperandSpan(program, local, call.captures, scan);
             scan.seen_effect = true;
         },
         .low_level => |call| {
@@ -6028,6 +6156,15 @@ fn scanLocalUseInExprSpan(
     scan: *LocalUseScan,
 ) void {
     for (program.exprSpan(span)) |expr| scanLocalUseInExpr(program, local, expr, scan);
+}
+
+fn scanLocalUseInCaptureOperandSpan(
+    program: *const Ast.Program,
+    local: Ast.LocalId,
+    span: Ast.Span(Ast.CaptureOperand),
+    scan: *LocalUseScan,
+) void {
+    for (program.captureOperandSpan(span)) |operand| scanLocalUseInExpr(program, local, operand.value, scan);
 }
 
 fn scanLocalUseInStmt(program: *const Ast.Program, local: Ast.LocalId, stmt_id: Ast.StmtId, scan: *LocalUseScan) void {
@@ -6203,7 +6340,7 @@ fn shapeMatchesValue(program: *const Ast.Program, shape: Shape, value: Value) bo
                 break :blk false;
             }
             for (callable.captures, value_callable.captures) |capture_shape, capture_value| {
-                if (!shapeMatchesValue(program, capture_shape, capture_value)) break :blk false;
+                if (!shapeMatchesValue(program, capture_shape, capture_value.value)) break :blk false;
             }
             break :blk true;
         },

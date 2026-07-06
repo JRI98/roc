@@ -19,7 +19,7 @@ const iter_alloc_tests = @import("eval_iter_alloc_tests.zig");
 /// Every value-producing test is observed solely through `Str.inspect(...)`.
 const core_tests = [_]TestCase{
     // Frontend problems
-    .{ .name = "problem: undefined variable", .source = "undefinedVar", .expected = .{ .problem = {} } },
+    .{ .name = "problem: name not in scope", .source = "undefinedVar", .expected = .{ .problem = {} } },
     .{ .name = "problem: dec plus int type mismatch", .source = "1.0.Dec + 2.I64", .expected = .{ .problem = {} } },
     .{ .name = "problem: dec minus int type mismatch", .source = "1.0.Dec - 2.I64", .expected = .{ .problem = {} } },
     .{ .name = "problem: dec times int type mismatch", .source = "1.0.Dec * 2.I64", .expected = .{ .problem = {} } },
@@ -1518,6 +1518,76 @@ const core_tests = [_]TestCase{
         .expected = .{ .inspect_str = "223" },
     },
     .{ .name = "inspect: typed identity closure on string", .source = "(|s| s)(\"Test\")", .expected = .{ .inspect_str = "\"Test\"" } },
+
+    // CaptureId regression suite: exercises the canonical-CaptureId join through
+    // nested/curried closures, closures held before application, capture-set
+    // reshaping, and captures that also appear inside call arguments.
+    // Repro for issue 9897 ("function reference capture count differs from its
+    // target"): nested callbacks capture an outer destructured binding while
+    // forwarding through another function reference.
+    .{
+        .name = "capture-id: issue 9897 nested callback captures destructured binding",
+        .source =
+        \\{
+        \\    c = |x, f| f(x)
+        \\    (a, _) = ({}, 0)
+        \\    c(0, |x| c(x, |_| a))
+        \\}
+        ,
+        .expected = .{ .inspect_str = "{}" },
+    },
+    // The middle closure is bound and applied separately, so each fn_ref must
+    // carry exactly its target's capture slots.
+    .{
+        .name = "capture-id: nested closure held before application",
+        .source =
+        \\{
+        \\    make = |x| |y| |z| x + y + z
+        \\    partial = make(1.I64)(2.I64)
+        \\    partial(3.I64)
+        \\}
+        ,
+        .expected = .{ .inspect_str = "6" },
+    },
+    // Repro for PR 9874's order-sensitivity: a 5-deep curried chain, each level
+    // adding a capture, so the capture spans must stay canonically ordered.
+    .{
+        .name = "capture-id: five-deep curried capture chain",
+        .source = "(|a| |b| |c| |d| |e| a + b + c + d + e)(1.I64)(2.I64)(3.I64)(4.I64)(5.I64)",
+        .expected = .{ .inspect_str = "15" },
+    },
+    // A captured variable that also appears inside a record argument to the
+    // closure it is passed to, reshaped by specialization.
+    .{
+        .name = "capture-id: captured var also used in a record argument",
+        .source =
+        \\{
+        \\    outer = |seed| {
+        \\        inner = |next, arg| seed + next.n + arg
+        \\        inner({ n: seed }, seed * 10.I64)
+        \\    }
+        \\    outer(2.I64)
+        \\}
+        ,
+        .expected = .{ .inspect_str = "24" },
+    },
+    // Two sibling closures capture the same outer binding via a shared helper,
+    // so the capture-set fixpoint must give both the same canonical CaptureId.
+    .{
+        .name = "capture-id: sibling closures share one captured binding",
+        .source =
+        \\{
+        \\    base = 10.I64
+        \\    pick = |flag| {
+        \\        add = |n| base + n
+        \\        sub = |n| base - n
+        \\        if flag add(3.I64) else sub(3.I64)
+        \\    }
+        \\    pick(True) + pick(False)
+        \\}
+        ,
+        .expected = .{ .inspect_str = "20" },
+    },
 
     // Untyped closures, HOFs, and recursion
     .{
@@ -4615,6 +4685,80 @@ const core_tests = [_]TestCase{
         \\main = (read(Crate.Crate(5)), read(Count.Count(8)))
         ,
         .expected = .{ .inspect_str = "(5, 108)" },
+    },
+    .{
+        // Issue 9875 repro: static dispatch must survive an alias re-export
+        // (ThingAlias : Thing) declared in an intermediate module. The alias
+        // walk plus content-based owner identity resolve the method on the
+        // declaring module.
+        .name = "inspect: static dispatch through alias re-export resolves declaring module (issue 9875)",
+        .source_kind = .module,
+        .source =
+        \\import ThingMod
+        \\import ApiMod
+        \\
+        \\main = {
+        \\    v : ApiMod.ThingAlias
+        \\    v = ThingMod.Thing.Make(7)
+        \\    v.get()
+        \\}
+        ,
+        .imports = &.{
+            .{
+                .name = "ThingMod",
+                .source =
+                \\Thing := [Make(U64)].{
+                \\  get : Thing -> U64
+                \\  get = |Thing.Make(n)| n
+                \\}
+                ,
+            },
+            .{
+                .name = "ApiMod",
+                .source =
+                \\import ThingMod
+                \\
+                \\ThingAlias : ThingMod.Thing
+                ,
+            },
+        },
+        .expected = .{ .inspect_str = "7" },
+    },
+    .{
+        // Issue 9864 shape: a module dispatches a method on a nominal owned
+        // by a module it imports (the cross-artifact method-owner rebase
+        // path), and the result flows through a second consuming module.
+        .name = "inspect: cross-module dispatch on nominal owned by transitive import (issue 9864 shape)",
+        .source_kind = .module,
+        .source =
+        \\import ThingMod
+        \\import WrapMod
+        \\
+        \\main = WrapMod.wrap(ThingMod.Thing(9))
+        ,
+        .imports = &.{
+            .{
+                .name = "ThingMod",
+                .source =
+                \\Thing := [Thing(U64)].{
+                \\  get : Thing -> U64
+                \\  get = |Thing.Thing(n)| n
+                \\}
+                ,
+            },
+            .{
+                .name = "WrapMod",
+                .source =
+                \\import ThingMod
+                \\
+                \\WrapMod := [].{
+                \\  wrap : ThingMod.Thing -> U64
+                \\  wrap = |t| t.get() + 100
+                \\}
+                ,
+            },
+        },
+        .expected = .{ .inspect_str = "109" },
     },
     .{
         .name = "inspect: cross-module attached method specialization on imported nominal",

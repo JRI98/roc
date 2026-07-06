@@ -6521,7 +6521,7 @@ test "addStaticDataExports defines forward data symbols used by code relocations
     try std.testing.expectEqual(@as(u32, 0), sym.data_offset);
     try std.testing.expectEqual(@as(u32, 4), sym.data_size);
 
-    module.resolveCodeRelocations();
+    try module.resolveCodeRelocations();
     const expected_addr: i32 = @intCast(module.data_segments.items[sym.index].offset + 2);
     try std.testing.expectEqual(expected_addr, decodePaddedI32(module.code_bytes.items[1..6]));
 }

@@ -1640,10 +1640,10 @@ pub fn computeUniqueness(
             .assign_literal => |assign| {
                 marks.trackDef(&has_def, &multi_def, assign.target);
                 switch (assign.value) {
-                    // Static-backed literals have the static count sentinel,
-                    // never a fresh count-1 outer allocation, so they must not
-                    // erase runtime uniqueness checks or take in-place paths.
-                    .str_literal, .static_data => marks.destroy(&foreign_def, assign.target),
+                    // Static-backed literals view backing whose count is the
+                    // static sentinel, never 1, so they are not unique births
+                    // and must never take in-place paths.
+                    .str_literal, .static_data, .bytes_literal => marks.destroy(&foreign_def, assign.target),
                     else => marks.noteBirth(&born, assign.target),
                 }
             },

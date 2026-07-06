@@ -397,6 +397,7 @@ const Solver = struct {
             .frac_f64_lit,
             .dec_lit,
             .str_lit,
+            .bytes_lit,
             .uninitialized,
             .uninitialized_payload,
             .crash,
@@ -454,12 +455,15 @@ const Solver = struct {
             .fn_ref => |fn_ref| {
                 try self.unify(expected, self.program.fn_tys.items[@intFromEnum(fn_ref.fn_id)]);
                 const captures = self.liftedCapturesForFn(fn_ref.fn_id);
-                const capture_exprs = self.lifted.exprSpan(fn_ref.captures);
-                if (captures.len != capture_exprs.len) {
+                const capture_operands = self.lifted.captureOperandSpan(fn_ref.captures);
+                if (captures.len != capture_operands.len) {
                     Common.invariant("function reference capture count differs from its target");
                 }
-                for (captures, capture_exprs) |capture, capture_expr| {
-                    _ = try self.expectExpr(capture_expr, self.localTy(capture.local));
+                for (captures, capture_operands) |capture, operand| {
+                    if (operand.id != self.lifted.captureIdOfLocal(capture.local)) {
+                        Common.invariant("function reference capture operand CaptureId did not match its slot");
+                    }
+                    _ = try self.expectExpr(operand.value, self.localTy(capture.local));
                 }
             },
             .call_value => |call| {
@@ -482,10 +486,13 @@ const Solver = struct {
                             _ = try self.expectExpr(arg, self.program.types.spanItem(func.args, i));
                         }
                         const captures = self.liftedCapturesForFn(callee);
-                        const capture_exprs = self.lifted.exprSpan(call.captures);
-                        if (captures.len != capture_exprs.len) Common.invariant("procedure call capture count differs from its callee");
-                        for (captures, capture_exprs) |capture, capture_expr| {
-                            _ = try self.expectExpr(capture_expr, self.localTy(capture.local));
+                        const capture_operands = self.lifted.captureOperandSpan(call.captures);
+                        if (captures.len != capture_operands.len) Common.invariant("procedure call capture count differs from its callee");
+                        for (captures, capture_operands) |capture, operand| {
+                            if (operand.id != self.lifted.captureIdOfLocal(capture.local)) {
+                                Common.invariant("procedure call capture operand CaptureId did not match its slot");
+                            }
+                            _ = try self.expectExpr(operand.value, self.localTy(capture.local));
                         }
                     },
                     .imported => {
@@ -1247,6 +1254,27 @@ const Solver = struct {
             return;
         }
 
+        // An empty tag union is the seal for a slot that no value reached: a
+        // variable that was defaulted at Monotype materialization rather than
+        // constrained by evidence (see Monotype import, which re-enters it as an
+        // unresolved node instead of a closed row). Two representations of the
+        // same runtime type can therefore disagree here — most visibly in the
+        // phantom argument types of a function value that is inspected but never
+        // called (`|x, y| x + y` rendered as `<function>`), where the callee's
+        // own body solves an argument to a concrete number while the referencing
+        // site left the shared variable to seal as `[]`. Such a slot fixes no
+        // layout, so it yields to a concrete peer instead of tripping the
+        // exact-match invariant, matching how the Monotype layer lets local
+        // evidence supersede an empty tag union.
+        if (isEmptyTagUnion(left) and !isEmptyTagUnion(right)) {
+            self.program.types.set(a, .{ .link = b });
+            return;
+        }
+        if (isEmptyTagUnion(right) and !isEmptyTagUnion(left)) {
+            self.program.types.set(b, .{ .link = a });
+            return;
+        }
+
         switch (left) {
             .primitive => |left_primitive| switch (right) {
                 .primitive => |right_primitive| {
@@ -1388,6 +1416,15 @@ const Solver = struct {
         };
     }
 
+    /// A tag union with no tags is the materialized seal for an unconstrained
+    /// slot; it is uninhabited and fixes no layout.
+    fn isEmptyTagUnion(content: Type.Content) bool {
+        return switch (content) {
+            .tag_union => |tags| tags.count() == 0,
+            else => false,
+        };
+    }
+
     fn unifySpans(self: *Solver, lhs: Type.Span, rhs: Type.Span, comptime message: []const u8) Allocator.Error!void {
         if (lhs.count() != rhs.count()) Common.invariant(message);
         for (0..lhs.count()) |i| {
@@ -1443,11 +1480,7 @@ const Solver = struct {
         for (0..lhs.count()) |i| {
             const left_capture = self.program.types.captureItem(lhs, i);
             const right_capture = self.program.types.captureItem(rhs, i);
-            if (left_capture.local != right_capture.local or
-                left_capture.symbol != right_capture.symbol or
-                left_capture.binder != right_capture.binder or
-                left_capture.capture_id != right_capture.capture_id)
-            {
+            if (left_capture.capture_id != right_capture.capture_id) {
                 Common.invariant("capture identity failed Lambda Solved unification");
             }
             try self.unify(left_capture.ty, right_capture.ty);
@@ -1527,7 +1560,8 @@ const Solver = struct {
             .named => |named| {
                 writeBytes(hasher, "named");
                 hasher.update(&named.named_type.module.bytes);
-                writeBytes(hasher, self.lifted.names.moduleNameText(named.def.module_name));
+                writeBytes(hasher, self.lifted.names.moduleIdentityBytes(named.def.module));
+                writeOptionalU32(hasher, named.def.source_decl);
                 writeBytes(hasher, self.lifted.names.typeNameText(named.def.type_name));
                 writeBytes(hasher, @tagName(named.kind));
                 if (named.builtin_owner) |owner| {
@@ -1572,6 +1606,15 @@ const Solver = struct {
 fn writeBytes(hasher: *std.crypto.hash.sha2.Sha256, bytes: []const u8) void {
     writeU32(hasher, @intCast(bytes.len));
     hasher.update(bytes);
+}
+
+fn writeOptionalU32(hasher: *std.crypto.hash.sha2.Sha256, value: ?u32) void {
+    if (value) |v| {
+        hasher.update(&[_]u8{1});
+        writeU32(hasher, v);
+    } else {
+        hasher.update(&[_]u8{0});
+    }
 }
 
 fn writeU32(hasher: *std.crypto.hash.sha2.Sha256, value: u32) void {
@@ -1740,7 +1783,7 @@ fn isGeneratedOpaqueEvidenceOwner(owner: ?static_dispatch.BuiltinOwner) bool {
 }
 
 fn sameMonoTypeDef(left: MonoType.TypeDef, right: MonoType.TypeDef) bool {
-    return left.module_name == right.module_name and
+    return left.module == right.module and
         left.type_name == right.type_name and
         left.source_decl == right.source_decl;
 }

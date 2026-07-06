@@ -506,6 +506,7 @@ pub const MappedProgramView = struct {
             .frac_f64_lit,
             .dec_lit,
             .str_lit,
+            .bytes_lit,
             .uninitialized,
             .crash,
             .comptime_exhaustiveness_failed,
@@ -524,7 +525,7 @@ pub const MappedProgramView = struct {
             .fn_def => |fn_def| self.fnRefInBounds(fn_def.fn_id) and self.fnDefCaptureSpanInBounds(fn_def.captures),
             .fn_ref => true,
             .call_value => |call| self.exprRefInBounds(call.callee) and self.exprIdSpanInBounds(call.args),
-            .call_proc => |call| self.exprIdSpanInBounds(call.args) and self.exprIdSpanInBounds(call.captures),
+            .call_proc => |call| self.exprIdSpanInBounds(call.args) and captureOperandSpanInBounds(call.captures),
             .low_level => |call| self.exprIdSpanInBounds(call.args),
             .field_access => |field| self.exprRefInBounds(field.receiver),
             .tuple_access => |tuple| self.exprRefInBounds(tuple.tuple),
@@ -653,6 +654,12 @@ pub const MappedProgramView = struct {
 
     fn fnDefCaptureSpanInBounds(self: MappedProgramView, span: Ast.Span(Ast.FnDefCapture)) bool {
         return spanInBounds(self.fn_def_captures.len, span.start, span.len);
+    }
+
+    fn captureOperandSpanInBounds(span: Ast.Span(Ast.CaptureOperand)) bool {
+        // The pre-lift Monotype program never carries capture operands; closure
+        // lifting resolves them, so the serialized program has none.
+        return span.len == 0;
     }
 
     fn recordDestructSpanInBounds(self: MappedProgramView, span: Ast.Span(Ast.RecordDestruct)) bool {
@@ -1865,7 +1872,7 @@ test "monotype specialization cache round trips empty program functions imports 
     defer name_store.deinit();
     const field_a = try name_store.internRecordFieldLabel("a");
     const tag_ok = try name_store.internTagLabel("Ok");
-    const module_name = try name_store.internModuleName("M");
+    const module_identity = try name_store.internModuleIdentity(&([_]u8{0x77} ** 32));
     const type_name = try name_store.internTypeName("Boxed");
 
     const first_type_index: u32 = std.math.minInt(u32);
@@ -1901,7 +1908,7 @@ test "monotype specialization cache round trips empty program functions imports 
         .{ .named = .{
             .named_type = .{ .module = testModuleDigest(9), .ty = @enumFromInt(11) },
             .def = .{
-                .module_name = module_name,
+                .module = module_identity,
                 .type_name = type_name,
             },
             .kind = .nominal,
@@ -1995,7 +2002,7 @@ test "monotype specialization cache maps fresh single-shard program view equival
 
     const field_name = try program.names.internRecordFieldLabel("field");
     const tag_name = try program.names.internTagLabel("Ok");
-    const module_name = try program.names.internModuleName("M");
+    const module_identity = try program.names.internModuleIdentity(&([_]u8{0x77} ** 32));
     const type_name = try program.names.internTypeName("Boxed");
 
     const unit_ty = try program.types.add(.zst);
@@ -2012,7 +2019,7 @@ test "monotype specialization cache maps fresh single-shard program view equival
     const declared_order = try program.types.addDeclaredFields(&.{.{ .named = field_name }});
     const named_ty = try program.types.add(.{ .named = .{
         .named_type = .{ .module = testModuleDigest(4), .ty = @enumFromInt(8) },
-        .def = .{ .module_name = module_name, .type_name = type_name },
+        .def = .{ .module = module_identity, .type_name = type_name },
         .kind = .nominal,
         .args = Type.Span.empty(),
         .backing = .{ .ty = record_ty, .use = .inspectable },
@@ -2099,7 +2106,7 @@ test "monotype specialization cache maps fresh single-shard program view equival
         .def = def_id,
     });
     try program.runtime_schema_requests.append(allocator, .{
-        .def = .{ .module_name = module_name, .type_name = type_name },
+        .def = .{ .module = module_identity, .type_name = type_name },
         .ty = named_ty,
     });
 

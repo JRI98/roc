@@ -100,7 +100,7 @@ pub const Local = struct {
 /// Span into flat local-id storage.
 pub const LocalSpan = extern struct {
     start: u32,
-    len: u16,
+    len: u32,
 
     /// Returns an empty local-id span.
     pub fn empty() LocalSpan {
@@ -273,6 +273,7 @@ pub const LiteralValue = union(enum) {
     dec_literal: i128,
     str_literal: StrLiteral,
     static_data: StaticDataId,
+    bytes_literal: StrLiteral,
     null_ptr,
     proc_ref: LirProcSpecId,
 };

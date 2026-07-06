@@ -352,11 +352,19 @@ pub const TypeCheckOutput = struct {
     }
 };
 
+/// Owned output from checking a platform's requires surface.
+pub const PlatformRequirementsCheckOutput = struct {
+    checker: Check,
+
+    pub fn deinit(self: *PlatformRequirementsCheckOutput) void {
+        self.checker.deinit();
+    }
+};
+
 /// Public `ArtifactPublicationInputs` declaration.
 pub const ArtifactPublicationInputs = struct {
     available_artifacts: []const CheckedArtifact.ImportedModuleView = &.{},
     relation_artifacts: []const CheckedArtifact.ImportedModuleView = &.{},
-    platform_requirement_artifact: ?CheckedArtifact.ImportedModuleView = null,
     platform_requirement_context: ?CheckedArtifact.PlatformRequirementContextKey = null,
     platform_app_relation: ?CheckedArtifact.PlatformAppRelation = null,
     explicit_roots: []const CheckedArtifact.ExplicitRootRequestInput = &.{},
@@ -529,23 +537,19 @@ fn appendCheckOwnerEnvIfMissing(
     module_env: *const ModuleEnv,
 ) Allocator.Error!void {
     for (owner_envs.items) |existing| {
-        if (moduleEnvNamesMatch(existing, module_env)) return;
+        if (moduleEnvIdentitiesMatch(existing, module_env)) return;
     }
     try owner_envs.append(allocator, module_env);
 }
 
-fn moduleEnvNamesMatch(a: *const ModuleEnv, b: *const ModuleEnv) bool {
+/// Two owner envs are duplicates exactly when their deep content identities
+/// match: byte-identical transitive module content is interchangeable as a
+/// type owner. No name text participates.
+fn moduleEnvIdentitiesMatch(a: *const ModuleEnv, b: *const ModuleEnv) bool {
     if (@intFromPtr(a) == @intFromPtr(b)) return true;
-    if (!a.qualified_module_ident.isNone() and !b.qualified_module_ident.isNone()) {
-        return std.mem.eql(u8, a.getIdent(a.qualified_module_ident), b.getIdent(b.qualified_module_ident));
-    }
-    if (!a.display_module_name_idx.isNone() and !b.display_module_name_idx.isNone()) {
-        return std.mem.eql(u8, a.getIdent(a.display_module_name_idx), b.getIdent(b.display_module_name_idx));
-    }
-    if (a.qualified_module_ident.isNone() or b.qualified_module_ident.isNone()) {
-        if (std.mem.eql(u8, a.module_name, b.module_name)) return true;
-    }
-    return false;
+    const a_hash = a.contentIdentityHash() orelse return false;
+    const b_hash = b.contentIdentityHash() orelse return false;
+    return base.ModuleIdentity.eql(a_hash, b_hash);
 }
 
 fn availableArtifactByKey(
@@ -1553,7 +1557,6 @@ pub const PackageEnv = struct {
 
         // Type check using the SAME module_envs_map
         const module_builtin_ctx: Check.BuiltinContext = .{
-            .module_name = env.qualified_module_ident,
             .bool_stmt = builtin_indices.bool_type,
             .try_stmt = builtin_indices.try_type,
             .str_stmt = builtin_indices.str_type,
@@ -1764,13 +1767,14 @@ pub const PackageEnv = struct {
         imported_envs: []const *ModuleEnv,
         imported_artifacts: []const CheckedArtifact.PublishImportArtifact,
         available_artifacts: []const CheckedArtifact.ImportedModuleView,
+        platform_requirements: ?Check.PlatformRequirementInput,
+        platform_requirement_context: ?CheckedArtifact.PlatformRequirementContextKey,
         explicit_roots: []const CheckedArtifact.ExplicitRootRequestInput,
         ctfe_options: eval.CompileTimeFinalization.Options,
     ) TypeCheckModuleError!TypeCheckOutput {
         const builtin_indices = compiled_builtins.builtinIndices(can.CIR);
 
         const module_builtin_ctx: Check.BuiltinContext = .{
-            .module_name = env.qualified_module_ident,
             .bool_stmt = builtin_indices.bool_type,
             .try_stmt = builtin_indices.try_type,
             .str_stmt = builtin_indices.str_type,
@@ -1795,6 +1799,7 @@ pub const PackageEnv = struct {
             &env.store.regions,
             module_builtin_ctx,
         );
+        checker.platform_requirements = platform_requirements;
         checker.fixupTypeWriter();
         errdefer checker.deinit();
 
@@ -1836,7 +1841,7 @@ pub const PackageEnv = struct {
             imported_envs,
             imported_artifacts,
             .{
-                .platform_requirement_context = null,
+                .platform_requirement_context = platform_requirement_context,
                 .platform_app_relation = null,
                 .explicit_roots = explicit_roots,
                 .hoisted_roots = checker.selectedHoistedRoots(),
@@ -1916,7 +1921,6 @@ pub const PackageEnv = struct {
                 .imports = imported_artifacts,
                 .available_artifacts = publication.available_artifacts,
                 .relation_artifacts = publication.relation_artifacts,
-                .platform_requirement_artifact = publication.platform_requirement_artifact,
                 .platform_requirement_context = publication.platform_requirement_context,
                 .platform_app_relation = publication.platform_app_relation,
                 .explicit_roots = publication.explicit_roots,
@@ -2003,6 +2007,8 @@ pub const PackageEnv = struct {
             imported_envs.items,
             imported_artifacts.items,
             available_artifacts,
+            null,
+            null,
             &.{},
             compileTimeFinalizationOptions(self.max_threads, &self.roc_ctx),
         );
@@ -2024,6 +2030,7 @@ pub const PackageEnv = struct {
             imported_envs.items,
             &typecheck_output.checker.import_mapping,
             &typecheck_output.checker.regions,
+            null,
         );
         defer rb.deinit();
         for (typecheck_output.checker.problems.problems.items) |prob| {

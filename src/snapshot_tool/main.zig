@@ -295,6 +295,7 @@ fn generateAllReports(
             empty_modules,
             &solver.import_mapping,
             &solver.regions,
+            null,
         );
         defer report_builder.deinit();
 
@@ -911,7 +912,6 @@ fn processSnapshotContent(
     defer parse_ast.deinit();
 
     const builtin_ctx: Check.BuiltinContext = .{
-        .module_name = try can_ir.insertIdent(base.Ident.for_text(module_name)),
         .bool_stmt = config.builtin_indices.bool_type,
         .try_stmt = config.builtin_indices.try_type,
         .str_stmt = config.builtin_indices.str_type,
@@ -2833,13 +2833,7 @@ fn validateMonoOutput(allocator: Allocator, mono_source: []const u8, source_path
 
     // Type-check the canonicalized MONO output
     // Create a BuiltinContext using the config's builtin information
-    const module_name = validation_env.insertIdent(base.Ident.for_text("mono_validation")) catch |err| {
-        std.log.err("MONO VALIDATION ERROR in {s}: Failed to insert module name: {}", .{ source_path, err });
-        return false;
-    };
-
     const builtin_ctx: Check.BuiltinContext = .{
-        .module_name = module_name,
         .bool_stmt = config.builtin_indices.bool_type,
         .try_stmt = config.builtin_indices.try_type,
         .str_stmt = config.builtin_indices.str_type,
@@ -3464,6 +3458,8 @@ fn processDocsSnapshot(
     };
     defer build_env.deinit();
     build_env.setFinalizeExecutableArtifacts(false);
+    build_env.setSyntheticRootPackageIdentity();
+    build_env.setSyntheticRootPlatformPackageIdentity();
 
     build_env.build(app_path) catch |err| {
         std.log.err("BuildEnv.build failed for {s}: {}", .{ app_path, err });
@@ -3907,6 +3903,8 @@ fn processDevObjectSnapshot(
         return false;
     };
     defer build_env.deinit();
+    build_env.setSyntheticRootPackageIdentity();
+    build_env.setSyntheticRootPlatformPackageIdentity();
 
     build_env.build(app_path) catch |err| {
         std.log.err("BuildEnv.build failed for {s}: {}", .{ app_path, err });
@@ -4454,7 +4452,6 @@ fn renderSnapshotReplTypeProblems(
     defer parse_ast.deinit();
 
     const builtin_ctx: Check.BuiltinContext = .{
-        .module_name = try can_ir.insertIdent(base.Ident.for_text("repl")),
         .bool_stmt = config.builtin_indices.bool_type,
         .try_stmt = config.builtin_indices.try_type,
         .str_stmt = config.builtin_indices.str_type,
