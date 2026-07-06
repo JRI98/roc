@@ -16106,8 +16106,9 @@ pub fn LirCodeGen(comptime target: RocTarget) type {
 
                 switch (self.generation_mode) {
                     .native_execution => {
-                        verifyStaticStringBytes(backing_bytes);
-                        try self.codegen.emitLoadImm(ptr_reg, @bitCast(@as(u64, @intFromPtr(str_bytes.ptr))));
+                        const static_backing_bytes = self.staticStringEntry(literal.backing).bytes;
+                        verifyStaticStringBytes(static_backing_bytes);
+                        try self.codegen.emitLoadImm(ptr_reg, @bitCast(@as(u64, @intFromPtr(static_backing_bytes.ptr + literal.offset))));
                     },
                     .shim_execution, .object_file => {
                         const symbol_name = self.staticStringSymbol(literal.backing);
@@ -16118,10 +16119,11 @@ pub fn LirCodeGen(comptime target: RocTarget) type {
                 try self.codegen.emitStoreStack(.w64, base_offset, ptr_reg);
                 switch (self.generation_mode) {
                     .native_execution => {
+                        const static_backing_bytes = self.staticStringEntry(literal.backing).bytes;
                         const cap_or_alloc = if (whole_backing)
                             str_bytes.len << 1
                         else
-                            @intFromPtr(backing_bytes.ptr) | 1;
+                            @intFromPtr(static_backing_bytes.ptr) | 1;
                         try self.codegen.emitLoadImm(ptr_reg, @intCast(cap_or_alloc));
                     },
                     .shim_execution, .object_file => {
@@ -16160,8 +16162,9 @@ pub fn LirCodeGen(comptime target: RocTarget) type {
             } else {
                 switch (self.generation_mode) {
                     .native_execution => {
-                        verifyStaticStringBytes(backing_bytes);
-                        try self.codegen.emitLoadImm(ptr_reg, @bitCast(@as(u64, @intFromPtr(bytes.ptr))));
+                        const static_backing_bytes = self.staticStringEntry(literal.backing).bytes;
+                        verifyStaticStringBytes(static_backing_bytes);
+                        try self.codegen.emitLoadImm(ptr_reg, @bitCast(@as(u64, @intFromPtr(static_backing_bytes.ptr + literal.offset))));
                     },
                     .shim_execution, .object_file => {
                         const symbol_name = self.staticStringSymbol(literal.backing);
@@ -16176,10 +16179,11 @@ pub fn LirCodeGen(comptime target: RocTarget) type {
 
                 switch (self.generation_mode) {
                     .native_execution => {
+                        const static_backing_bytes = self.staticStringEntry(literal.backing).bytes;
                         const cap_or_alloc = if (whole_backing)
                             bytes.len << 1
                         else
-                            @intFromPtr(backing_bytes.ptr) | 1;
+                            @intFromPtr(static_backing_bytes.ptr) | 1;
                         try self.codegen.emitLoadImm(ptr_reg, @intCast(cap_or_alloc));
                     },
                     .shim_execution, .object_file => {
@@ -16218,9 +16222,9 @@ pub fn LirCodeGen(comptime target: RocTarget) type {
             try self.emitAddRegs(.w64, dst, src, scratch);
         }
 
-        fn staticStringSymbol(self: *Self, str_idx: base.StringLiteral.Idx) []const u8 {
+        fn staticStringEntry(self: *Self, str_idx: base.StringLiteral.Idx) StaticStringData.Entry {
             for (self.static_strings) |entry| {
-                if (entry.id == str_idx) return entry.symbol_name;
+                if (entry.id == str_idx) return entry;
             }
             if (builtin.mode == .Debug) {
                 std.debug.panic(
@@ -16231,8 +16235,12 @@ pub fn LirCodeGen(comptime target: RocTarget) type {
             unreachable;
         }
 
+        fn staticStringSymbol(self: *Self, str_idx: base.StringLiteral.Idx) []const u8 {
+            return self.staticStringEntry(str_idx).symbol_name;
+        }
+
         fn verifyStaticStringBytes(str_bytes: []const u8) void {
-            if (builtin.mode != .Debug) return;
+            if (comptime builtin.mode != .Debug) return;
 
             const data_addr = @intFromPtr(str_bytes.ptr);
             if (data_addr % @alignOf(isize) != 0) {
@@ -17335,7 +17343,8 @@ pub const X64LinuxLirCodeGen = LirCodeGen(.x64linux);
 /// x86_64 ELF (generic)
 pub const X64ElfLirCodeGen = LirCodeGen(.x64elf);
 
-const host_lir_codegen_target = RocTarget.detectNative();
+/// Native target used by host dev codegen and its runtime static-data tables.
+pub const host_lir_codegen_target = RocTarget.detectNative();
 
 /// Whether this compiler build has a fast native dev backend for the target it
 /// is being compiled to run on.

@@ -891,11 +891,14 @@ fn lowerDevEvalAndFinishRoots(
     if (lowered.lir_result.const_roots.items.len != requests.len) {
         finalizationInvariant("LIR lowering returned a different number of compile-time roots than requested");
     }
+    var static_strings = try backend.StaticStringData.build(allocator, &lowered.lir_result.store, backend.dev.LirCodeGenMod.host_lir_codegen_target);
+    defer static_strings.deinit();
+
     var codegen = try backend.HostLirCodeGen.init(
         allocator,
         &lowered.lir_result.store,
         &lowered.lir_result.layouts,
-        &.{},
+        static_strings.entries,
     );
     defer codegen.deinit();
     codegen.setComptimeHooks(.{

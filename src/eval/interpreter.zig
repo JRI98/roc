@@ -16,10 +16,12 @@ const lir = @import("lir");
 const LIR = lir.LIR;
 const LirStore = lir.LirStore;
 const lir_value = @import("value.zig");
+const backend = @import("backend");
 const host_trampoline = @import("host_trampoline.zig");
 const builtins = @import("builtins");
 const sljmp = @import("sljmp");
 const build_options = @import("build_options");
+const RocTarget = @import("roc_target").RocTarget;
 const is_freestanding = builtin.target.os.tag == .freestanding;
 
 /// Comptime-gated tracing for the interpreter eval loop.
@@ -295,6 +297,7 @@ pub const Interpreter = struct {
     /// RocOps environment for builtin dispatch.
     roc_env: *InterpreterRocEnv,
     roc_ops: RocOps,
+    static_strings: backend.StaticStringData.Table,
     frame_plans: []FramePlan,
     rc_presence: []RcPresence,
     rc_plans: std.AutoHashMapUnmanaged(u64, layout_mod.RcHelperPlan) = .{},
@@ -507,6 +510,13 @@ pub const Interpreter = struct {
 
         const roc_env = try allocator.create(InterpreterRocEnv);
         roc_env.* = InterpreterRocEnv.init(allocator, caller_roc_ops);
+        errdefer {
+            roc_env.deinit();
+            allocator.destroy(roc_env);
+        }
+
+        var static_strings = try backend.StaticStringData.build(allocator, store, RocTarget.detectNative());
+        errdefer static_strings.deinit();
 
         return .{
             .allocator = allocator,
@@ -525,6 +535,7 @@ pub const Interpreter = struct {
                 .roc_crashed = &InterpreterRocEnv.rocCrashedFn,
                 .hosted_fns = caller_roc_ops.hosted_fns,
             },
+            .static_strings = static_strings,
             .frame_plans = frame_plans,
             .rc_presence = rc_presence,
             .rc_plans = rc_plans,
@@ -542,6 +553,7 @@ pub const Interpreter = struct {
         self.call_stack.deinit(self.evalAllocator());
         self.roc_env.deinit();
         self.allocator.destroy(self.roc_env);
+        self.static_strings.deinit();
         self.arena.deinit();
         self.tag_variant_plans.deinit(self.allocator);
         self.struct_field_plans.deinit(self.allocator);
@@ -3396,7 +3408,7 @@ pub const Interpreter = struct {
 
     fn evalStrLiteral(self: *LirInterpreter, literal: LIR.StrLiteral) Error!Value {
         return self.makeStaticRocStrLiteralView(
-            self.store.getStringLiteralBacking(literal),
+            self.staticStringBacking(literal.backing),
             literal.offset,
             literal.len,
         );
@@ -3404,7 +3416,7 @@ pub const Interpreter = struct {
 
     fn evalBytesLiteral(self: *LirInterpreter, literal: LIR.StrLiteral, target_layout: layout_mod.Idx) Error!Value {
         return self.makeStaticRocListLiteralView(
-            self.store.getStringLiteralBacking(literal),
+            self.staticStringBacking(literal.backing),
             literal.offset,
             literal.len,
             target_layout,
@@ -3412,6 +3424,14 @@ pub const Interpreter = struct {
     }
 
     // String helpers (RocStr construction)
+
+    fn staticStringBacking(self: *const LirInterpreter, backing: base.StringLiteral.Idx) []const u8 {
+        if (self.static_strings.find(backing)) |entry| return entry.bytes;
+        self.invariantFailed(
+            "LIR/interpreter invariant violated: string literal {d} has no runtime static backing",
+            .{@intFromEnum(backing)},
+        );
+    }
 
     fn makeStaticRocStrLiteralView(self: *LirInterpreter, backing: []const u8, offset: u32, len: u32) Error!Value {
         const offset_usize: usize = offset;

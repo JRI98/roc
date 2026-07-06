@@ -466,11 +466,18 @@ fn runGlueSpecDev(
     if (comptime !backend.host_lir_codegen_available) {
         return error.DevBackendUnavailable;
     } else {
+        var static_strings = backend.StaticStringData.build(
+            gpa,
+            &lowered.lir_result.store,
+            backend.dev.LirCodeGenMod.host_lir_codegen_target,
+        ) catch return error.OutOfMemory;
+        defer static_strings.deinit();
+
         var codegen = backend.HostLirCodeGen.init(
             gpa,
             &lowered.lir_result.store,
             &lowered.lir_result.layouts,
-            &.{},
+            static_strings.entries,
         ) catch return error.OutOfMemory;
         defer codegen.deinit();
 
