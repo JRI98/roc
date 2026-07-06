@@ -42,8 +42,8 @@
 //!   fine class's balance is attributed from the members' class balances by
 //!   constraint propagation (`meetGroupSummary`).
 //! - Summaries whose modes disagree go to separate groups. This is the
-//!   refinement rule: the abstraction splits exactly on facts real in-edges
-//!   disagree about, so every group is witnessed by at least one real jump
+//!   refinement rule: the abstraction splits exactly on entry-state modes
+//!   real in-edges disagree about, so every group is witnessed by at least one real jump
 //!   and a group-walk finding always corresponds to a real entry state. In
 //!   the worst case this degenerates to one group per distinct summary —
 //!   the pre-fixpoint exact behavior — but with no cap and no skip path.
@@ -1291,8 +1291,8 @@ const Certifier = struct {
     /// (`modesCompatible`); the group's must-alias partition then becomes
     /// the meet of the two partitions and per-fine-class balances are
     /// re-attributed (`meetGroupSummary`). A summary no group accepts
-    /// starts a new group, so refinement splits exactly along facts on
-    /// which real in-edges disagree — every group is witnessed by at least
+    /// starts a new group, so refinement splits exactly along the entry-state
+    /// modes real in-edges disagree about — every group is witnessed by at least
     /// one real jump, and a group walk can never manufacture a false
     /// positive that no refinement traces back to a real entry state.
     fn absorbJoinSummary(

@@ -4040,7 +4040,7 @@ against the borrow typing rules:
   theirs (with per-fine-class balances re-attributed by constraint
   propagation), and the body is re-certified only when a jump strictly
   refines that abstraction. Mode disagreements split the abstraction along
-  exactly the facts real in-edges disagree about, so refinement never
+  exactly the entry-state modes real in-edges disagree about, so refinement never
   manufactures entry states no jump produced; in the worst case it
   degenerates to one walk per distinct summary, with no capacity cap and no
   skip path. The join is monotone over a finite-height lattice (partition
