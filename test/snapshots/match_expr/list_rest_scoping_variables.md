@@ -157,7 +157,7 @@ match data {
 							(rest-at (index 1)
 								(p-assign (ident "items"))))))
 				(value
-					(e-dispatch-call (method "plus") (constraint-fn-var 81)
+					(e-dispatch-call (method "plus") (constraint-fn-var 84)
 						(receiver
 							(e-lookup-local
 								(p-assign (ident "first"))))

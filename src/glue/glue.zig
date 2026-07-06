@@ -466,11 +466,18 @@ fn runGlueSpecDev(
     if (comptime !backend.host_lir_codegen_available) {
         return error.DevBackendUnavailable;
     } else {
+        var static_strings = backend.StaticStringData.build(
+            gpa,
+            &lowered.lir_result.store,
+            backend.dev.LirCodeGenMod.host_lir_codegen_target,
+        ) catch return error.OutOfMemory;
+        defer static_strings.deinit();
+
         var codegen = backend.HostLirCodeGen.init(
             gpa,
             &lowered.lir_result.store,
             &lowered.lir_result.layouts,
-            &.{},
+            static_strings.entries,
         ) catch return error.OutOfMemory;
         defer codegen.deinit();
 
@@ -2847,16 +2854,9 @@ fn collectModuleTypeInfo(
     for (artifact.top_level_values.entries) |entry| {
         const def_idx = entry.def;
 
-        const member_key = member_by_def.get(def_idx) orelse continue;
-        const owner_relative = ownerDeclRelativeName(module_env, member_key.owner) orelse continue;
-        const bare_name = module_env.getIdent(member_key.methodIdent());
-        // A type module's main type takes the module's name (language rule),
-        // so members of the main type display bare; members of nested types
-        // display relative to the module.
-        const local_name = if (std.mem.eql(u8, owner_relative, module_name))
-            try gpa.dupe(u8, bare_name)
-        else
-            try std.fmt.allocPrint(gpa, "{s}.{s}", .{ owner_relative, bare_name });
+        _ = member_by_def.get(def_idx) orelse continue;
+        const source_name = artifact.canonical_names.exportNameText(entry.source_name);
+        const local_name = try moduleLocalMemberName(gpa, module_name, source_name);
         defer gpa.free(local_name);
 
         const checked_type = checkedTypeRootForScheme(artifact, entry.source_scheme);
@@ -2941,22 +2941,16 @@ fn collectModuleTypeInfo(
     };
 }
 
-/// The module-relative declared name of a type declaration statement, or
-/// null when the statement is not an alias/nominal declaration.
-fn ownerDeclRelativeName(module_env: *const ModuleEnv, owner_stmt: can.CIR.Statement.Idx) ?[]const u8 {
-    if (@intFromEnum(owner_stmt) >= module_env.store.nodes.len()) return null;
-    const node: can.CIR.Node.Idx = @enumFromInt(@intFromEnum(owner_stmt));
-    switch (module_env.store.nodes.get(node).tag) {
-        .statement_alias_decl, .statement_nominal_decl => {},
-        else => return null,
-    }
-    const header_idx = switch (module_env.store.getStatement(owner_stmt)) {
-        .s_nominal_decl => |nominal| nominal.header,
-        .s_alias_decl => |alias| alias.header,
-        else => return null,
-    };
-    const header = module_env.store.getTypeHeader(header_idx);
-    return module_env.getIdent(header.relative_name);
+fn moduleLocalMemberName(
+    allocator: Allocator,
+    module_name: []const u8,
+    source_name: []const u8,
+) Allocator.Error![]const u8 {
+    if (module_name.len == 0) return try allocator.dupe(u8, source_name);
+    if (!std.mem.startsWith(u8, source_name, module_name)) return try allocator.dupe(u8, source_name);
+    if (source_name.len == module_name.len) return try allocator.dupe(u8, source_name);
+    if (source_name[module_name.len] != '.') return try allocator.dupe(u8, source_name);
+    return try allocator.dupe(u8, source_name[module_name.len + 1 ..]);
 }
 
 /// Print a type annotation to a buffer (for requires entries which use AST types)
