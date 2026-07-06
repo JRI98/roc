@@ -19,6 +19,7 @@ const builtins = @import("builtins");
 const layout = @import("layout");
 
 const lir = @import("lir");
+const CheckedArithmetic = lir.CheckedArithmetic;
 const LIR = lir.LIR;
 const LirStore = lir.LirStore;
 const GuardedList = LirStore.GuardedList;
@@ -326,6 +327,10 @@ list_eq_import: ?u32 = null,
 i128_div_s_import: ?u32 = null,
 /// Wasm function index for imported roc_i128_mod_s host function.
 i128_mod_s_import: ?u32 = null,
+/// Wasm function index for imported roc_builtins_num_mul_with_overflow_i128 host function.
+num_mul_with_overflow_i128_import: ?u32 = null,
+/// Wasm function index for imported roc_builtins_num_mul_with_overflow_u128 host function.
+num_mul_with_overflow_u128_import: ?u32 = null,
 /// Wasm function index for imported roc_i32_mod_by host function.
 i32_mod_by_import: ?u32 = null,
 /// Wasm function index for imported roc_i64_mod_by host function.
@@ -631,6 +636,11 @@ fn emitBuiltinCall(self: *Self, kind: BuiltinKind, host_import: ?u32) Allocator.
 fn emitI32Const(self: *Self, value: i32) Allocator.Error!void {
     self.currentCode().append(self.allocator, Op.i32_const) catch return error.OutOfMemory;
     WasmModule.leb128WriteI32(self.allocator, self.currentCode(), value) catch return error.OutOfMemory;
+}
+
+fn emitI64Const(self: *Self, value: i64) Allocator.Error!void {
+    self.currentCode().append(self.allocator, Op.i64_const) catch return error.OutOfMemory;
+    WasmModule.leb128WriteI64(self.allocator, self.currentCode(), value) catch return error.OutOfMemory;
 }
 
 /// Select a builtin wrapper's update-mode immediate from the statement's
@@ -1445,6 +1455,13 @@ fn registerHostImports(self: *Self) Allocator.Error!void {
     self.dec_div_import = try self.module.addImport("env", "roc_dec_div", i128_binop_type);
     self.dec_div_trunc_import = try self.module.addImport("env", "roc_dec_div_trunc", i128_binop_type);
     self.dec_pow_import = try self.module.addImport("env", "roc_dec_pow", i128_binop_type);
+
+    const i128_mul_overflow_type = try self.module.addFuncType(
+        &.{ .i32, .i32, .i64, .i64, .i64, .i64 },
+        &.{.i32},
+    );
+    self.num_mul_with_overflow_i128_import = try self.module.addImport("env", "roc_builtins_num_mul_with_overflow_i128", i128_mul_overflow_type);
+    self.num_mul_with_overflow_u128_import = try self.module.addImport("env", "roc_builtins_num_mul_with_overflow_u128", i128_mul_overflow_type);
 
     const dec_unary_type = try self.module.addFuncType(
         &.{ .i32, .i32 },
@@ -4569,8 +4586,709 @@ fn emitI128HostBinOp(self: *Self, lhs_local: u32, rhs_local: u32, import_idx: u3
     try self.emitLocalGet(result_local);
 }
 
+fn emitZeroI128ResultPtr(self: *Self) Allocator.Error!void {
+    const result_offset = try self.allocStackMemory(16, 8);
+    const result_local = self.storage.allocAnonymousLocal(.i32) catch return error.OutOfMemory;
+    try self.emitFpOffset(result_offset);
+    try self.emitLocalSet(result_local);
+
+    try self.emitLocalGet(result_local);
+    try self.emitI64Const(0);
+    try self.emitStoreOp(.i64, 0);
+    try self.emitLocalGet(result_local);
+    try self.emitI64Const(0);
+    try self.emitStoreOp(.i64, 8);
+    try self.emitLocalGet(result_local);
+}
+
+fn emitI32PtrOffset(self: *Self, base_local: u32, offset: i32) Allocator.Error!void {
+    try self.emitLocalGet(base_local);
+    try self.emitI32Const(offset);
+    self.currentCode().append(self.allocator, Op.i32_add) catch return error.OutOfMemory;
+}
+
+fn emitCrashMessage(self: *Self, msg: []const u8) Allocator.Error!void {
+    try self.emitRocStaticStringCall(wasm_roc_ops_crashed_offset, msg);
+    self.currentCode().append(self.allocator, Op.@"unreachable") catch return error.OutOfMemory;
+}
+
+fn emitCrashIfStackBool(self: *Self, msg: []const u8) Allocator.Error!void {
+    self.currentCode().append(self.allocator, Op.@"if") catch return error.OutOfMemory;
+    self.currentCode().append(self.allocator, @intFromEnum(BlockType.void)) catch return error.OutOfMemory;
+    try self.emitCrashMessage(msg);
+    self.currentCode().append(self.allocator, Op.end) catch return error.OutOfMemory;
+}
+
+fn emitCompositeIsZero(self: *Self, value_local: u32) Allocator.Error!void {
+    try self.emitLocalGet(value_local);
+    try self.emitLoadOp(.i64, 0);
+    self.currentCode().append(self.allocator, Op.i64_eqz) catch return error.OutOfMemory;
+    try self.emitLocalGet(value_local);
+    try self.emitLoadOp(.i64, 8);
+    self.currentCode().append(self.allocator, Op.i64_eqz) catch return error.OutOfMemory;
+    self.currentCode().append(self.allocator, Op.i32_and) catch return error.OutOfMemory;
+}
+
+fn emitCompositeIsSignedMinNegOne(self: *Self, lhs_local: u32, rhs_local: u32) Allocator.Error!void {
+    try self.emitLocalGet(lhs_local);
+    try self.emitLoadOp(.i64, 0);
+    try self.emitI64Const(0);
+    self.currentCode().append(self.allocator, Op.i64_eq) catch return error.OutOfMemory;
+    try self.emitLocalGet(lhs_local);
+    try self.emitLoadOp(.i64, 8);
+    try self.emitI64Const(std.math.minInt(i64));
+    self.currentCode().append(self.allocator, Op.i64_eq) catch return error.OutOfMemory;
+    self.currentCode().append(self.allocator, Op.i32_and) catch return error.OutOfMemory;
+    try self.emitLocalGet(rhs_local);
+    try self.emitLoadOp(.i64, 0);
+    try self.emitI64Const(-1);
+    self.currentCode().append(self.allocator, Op.i64_eq) catch return error.OutOfMemory;
+    self.currentCode().append(self.allocator, Op.i32_and) catch return error.OutOfMemory;
+    try self.emitLocalGet(rhs_local);
+    try self.emitLoadOp(.i64, 8);
+    try self.emitI64Const(-1);
+    self.currentCode().append(self.allocator, Op.i64_eq) catch return error.OutOfMemory;
+    self.currentCode().append(self.allocator, Op.i32_and) catch return error.OutOfMemory;
+}
+
+fn emitCheckedCompositeSignedLowestValue(self: *Self, value_local: u32, checked_op: LIR.LowLevel) Allocator.Error!void {
+    try self.emitLocalGet(value_local);
+    try self.emitLoadOp(.i64, 0);
+    try self.emitI64Const(0);
+    self.currentCode().append(self.allocator, Op.i64_eq) catch return error.OutOfMemory;
+    try self.emitLocalGet(value_local);
+    try self.emitLoadOp(.i64, 8);
+    try self.emitI64Const(std.math.minInt(i64));
+    self.currentCode().append(self.allocator, Op.i64_eq) catch return error.OutOfMemory;
+    self.currentCode().append(self.allocator, Op.i32_and) catch return error.OutOfMemory;
+    try self.emitCrashIfStackBool(checkedOverflowMessage(checked_op));
+}
+
+fn emitI128SignedAddSubOverflowCondition(self: *Self, plain_op: LIR.LowLevel, lhs_local: u32, rhs_local: u32, result_local: u32) Allocator.Error!void {
+    try self.emitLocalGet(lhs_local);
+    try self.emitLoadOp(.i64, 8);
+    try self.emitLocalGet(if (plain_op == .num_plus) result_local else rhs_local);
+    try self.emitLoadOp(.i64, 8);
+    self.currentCode().append(self.allocator, Op.i64_xor) catch return error.OutOfMemory;
+
+    try self.emitLocalGet(if (plain_op == .num_plus) rhs_local else lhs_local);
+    try self.emitLoadOp(.i64, 8);
+    try self.emitLocalGet(result_local);
+    try self.emitLoadOp(.i64, 8);
+    self.currentCode().append(self.allocator, Op.i64_xor) catch return error.OutOfMemory;
+
+    self.currentCode().append(self.allocator, Op.i64_and) catch return error.OutOfMemory;
+    try self.emitI64Const(0);
+    self.currentCode().append(self.allocator, Op.i64_lt_s) catch return error.OutOfMemory;
+}
+
+fn emitCheckedI128AddSub(self: *Self, checked_op: LIR.LowLevel, plain_op: LIR.LowLevel, lhs_local: u32, rhs_local: u32, operand_layout: layout.Idx) Allocator.Error!void {
+    switch (plain_op) {
+        .num_plus => try self.emitI128Add(lhs_local, rhs_local),
+        .num_minus => try self.emitI128Sub(lhs_local, rhs_local),
+        else => unreachable,
+    }
+    const result_local = try self.stabilizeCompositeResult(16);
+    if (operand_layout == .u128) {
+        switch (plain_op) {
+            .num_plus => try self.emitI128CompareWithSignedness(result_local, lhs_local, .lt, false),
+            .num_minus => try self.emitI128CompareWithSignedness(lhs_local, rhs_local, .lt, false),
+            else => unreachable,
+        }
+    } else {
+        try self.emitI128SignedAddSubOverflowCondition(plain_op, lhs_local, rhs_local, result_local);
+    }
+    try self.emitCrashIfStackBool(checkedOverflowMessage(checked_op));
+    try self.emitLocalGet(result_local);
+}
+
+fn emitCheckedI128Mul(self: *Self, checked_op: LIR.LowLevel, lhs_local: u32, rhs_local: u32, operand_layout: layout.Idx) Allocator.Error!void {
+    const result_offset = try self.allocStackMemory(16, 8);
+    const result_local = self.storage.allocAnonymousLocal(.i32) catch return error.OutOfMemory;
+    try self.emitFpOffset(result_offset);
+    try self.emitLocalSet(result_local);
+
+    try self.emitLocalGet(result_local);
+    try self.emitI32PtrOffset(result_local, 8);
+    try self.emitLocalGet(lhs_local);
+    try self.emitLoadOp(.i64, 0);
+    try self.emitLocalGet(lhs_local);
+    try self.emitLoadOp(.i64, 8);
+    try self.emitLocalGet(rhs_local);
+    try self.emitLoadOp(.i64, 0);
+    try self.emitLocalGet(rhs_local);
+    try self.emitLoadOp(.i64, 8);
+    if (operand_layout == .u128) {
+        try self.emitBuiltinCall(.num_mul_with_overflow_u128, self.num_mul_with_overflow_u128_import);
+    } else {
+        try self.emitBuiltinCall(.num_mul_with_overflow_i128, self.num_mul_with_overflow_i128_import);
+    }
+    try self.emitCrashIfStackBool(checkedOverflowMessage(checked_op));
+    try self.emitLocalGet(result_local);
+}
+
+fn emitCheckedCompositeNumericOp(self: *Self, checked_op: LIR.LowLevel, plain_op: LIR.LowLevel, args: anytype, operand_layout: layout.Idx) Allocator.Error!void {
+    try self.emitProcLocal(GuardedList.at(args, 0));
+    const lhs_local = try self.stabilizeCompositeResult(16);
+
+    if (args.len == 1) {
+        switch (plain_op) {
+            .num_negate => {
+                try self.emitCheckedCompositeSignedLowestValue(lhs_local, checked_op);
+                try self.emitCompositeI128NegateFromLocal(lhs_local);
+            },
+            .num_abs => {
+                try self.emitCheckedCompositeSignedLowestValue(lhs_local, checked_op);
+                if (operand_layout == .u128) {
+                    try self.emitLocalGet(lhs_local);
+                } else {
+                    try self.emitCompositeI128Abs(GuardedList.at(args, 0));
+                }
+            },
+            else => unreachable,
+        }
+        return;
+    }
+
+    try self.emitProcLocal(GuardedList.at(args, 1));
+    const rhs_local = try self.stabilizeCompositeResult(16);
+
+    switch (plain_op) {
+        .num_plus, .num_minus => try self.emitCheckedI128AddSub(checked_op, plain_op, lhs_local, rhs_local, operand_layout),
+        .num_times => try self.emitCheckedI128Mul(checked_op, lhs_local, rhs_local, operand_layout),
+        .num_div_by, .num_div_trunc_by => {
+            try self.emitCompositeIsZero(rhs_local);
+            try self.emitCrashIfStackBool(checkedZeroDenominatorMessage(checked_op, operand_layout));
+            if (operand_layout == .i128) {
+                try self.emitCompositeIsSignedMinNegOne(lhs_local, rhs_local);
+                try self.emitCrashIfStackBool(checkedOverflowMessage(checked_op));
+            }
+            const import_idx = if (operand_layout == .i128) self.i128_div_s_import else self.u128_div_import;
+            try self.emitI128HostBinOp(lhs_local, rhs_local, import_idx orelse unreachable);
+        },
+        .num_rem_by, .num_mod_by => {
+            try self.emitCompositeIsZero(rhs_local);
+            try self.emitCrashIfStackBool(checkedZeroDenominatorMessage(checked_op, operand_layout));
+            if (operand_layout == .i128) {
+                try self.emitCompositeIsSignedMinNegOne(lhs_local, rhs_local);
+                self.currentCode().append(self.allocator, Op.@"if") catch return error.OutOfMemory;
+                self.currentCode().append(self.allocator, @intFromEnum(BlockType.i32)) catch return error.OutOfMemory;
+                try self.emitZeroI128ResultPtr();
+                self.currentCode().append(self.allocator, Op.@"else") catch return error.OutOfMemory;
+                try self.emitI128HostBinOp(lhs_local, rhs_local, self.i128_mod_s_import orelse unreachable);
+                self.currentCode().append(self.allocator, Op.end) catch return error.OutOfMemory;
+            } else {
+                try self.emitI128HostBinOp(lhs_local, rhs_local, self.u128_mod_import orelse unreachable);
+            }
+        },
+        else => unreachable,
+    }
+}
+
+fn emitScalarArgLocal(self: *Self, arg: ProcLocalId, vt: ValType) Allocator.Error!u32 {
+    try self.emitProcLocal(arg);
+    const local = self.storage.allocAnonymousLocal(vt) catch return error.OutOfMemory;
+    try self.emitLocalSet(local);
+    return local;
+}
+
+fn emitScalarZero(self: *Self, vt: ValType) Allocator.Error!void {
+    switch (vt) {
+        .i32 => try self.emitI32Const(0),
+        .i64 => try self.emitI64Const(0),
+        .f32, .f64 => unreachable,
+    }
+}
+
+fn scalarBlockType(vt: ValType) BlockType {
+    return switch (vt) {
+        .i32 => .i32,
+        .i64 => .i64,
+        .f32, .f64 => unreachable,
+    };
+}
+
+fn checkedScalarBinaryWasmOp(plain_op: LIR.LowLevel, vt: ValType) u8 {
+    return switch (plain_op) {
+        .num_plus => switch (vt) {
+            .i32 => Op.i32_add,
+            .i64 => Op.i64_add,
+            .f32, .f64 => unreachable,
+        },
+        .num_minus => switch (vt) {
+            .i32 => Op.i32_sub,
+            .i64 => Op.i64_sub,
+            .f32, .f64 => unreachable,
+        },
+        else => unreachable,
+    };
+}
+
+fn signedMinForScalar(layout_idx: layout.Idx) i64 {
+    return switch (layout_idx) {
+        .i8 => std.math.minInt(i8),
+        .i16 => std.math.minInt(i16),
+        .i32 => std.math.minInt(i32),
+        .i64 => std.math.minInt(i64),
+        else => unreachable,
+    };
+}
+
+fn signedMaxForScalar(layout_idx: layout.Idx) i64 {
+    return switch (layout_idx) {
+        .i8 => std.math.maxInt(i8),
+        .i16 => std.math.maxInt(i16),
+        .i32 => std.math.maxInt(i32),
+        .i64 => std.math.maxInt(i64),
+        else => unreachable,
+    };
+}
+
+fn unsignedMaxForI32Scalar(layout_idx: layout.Idx) i64 {
+    return switch (layout_idx) {
+        .u8 => std.math.maxInt(u8),
+        .u16 => std.math.maxInt(u16),
+        .u32 => std.math.maxInt(u32),
+        else => unreachable,
+    };
+}
+
+fn emitCheckedI32SignedAddSubOverflowCondition(self: *Self, plain_op: LIR.LowLevel, lhs: u32, rhs: u32, result: u32) Allocator.Error!void {
+    switch (plain_op) {
+        .num_plus => {
+            try self.emitLocalGet(lhs);
+            try self.emitLocalGet(result);
+            self.currentCode().append(self.allocator, Op.i32_xor) catch return error.OutOfMemory;
+
+            try self.emitLocalGet(rhs);
+            try self.emitLocalGet(result);
+            self.currentCode().append(self.allocator, Op.i32_xor) catch return error.OutOfMemory;
+        },
+        .num_minus => {
+            try self.emitLocalGet(lhs);
+            try self.emitLocalGet(rhs);
+            self.currentCode().append(self.allocator, Op.i32_xor) catch return error.OutOfMemory;
+
+            try self.emitLocalGet(lhs);
+            try self.emitLocalGet(result);
+            self.currentCode().append(self.allocator, Op.i32_xor) catch return error.OutOfMemory;
+        },
+        else => unreachable,
+    }
+    self.currentCode().append(self.allocator, Op.i32_and) catch return error.OutOfMemory;
+    try self.emitI32Const(0);
+    self.currentCode().append(self.allocator, Op.i32_lt_s) catch return error.OutOfMemory;
+}
+
+fn emitCheckedI64SignedAddSubOverflowCondition(self: *Self, plain_op: LIR.LowLevel, lhs: u32, rhs: u32, result: u32) Allocator.Error!void {
+    switch (plain_op) {
+        .num_plus => {
+            try self.emitLocalGet(lhs);
+            try self.emitLocalGet(result);
+            self.currentCode().append(self.allocator, Op.i64_xor) catch return error.OutOfMemory;
+
+            try self.emitLocalGet(rhs);
+            try self.emitLocalGet(result);
+            self.currentCode().append(self.allocator, Op.i64_xor) catch return error.OutOfMemory;
+        },
+        .num_minus => {
+            try self.emitLocalGet(lhs);
+            try self.emitLocalGet(rhs);
+            self.currentCode().append(self.allocator, Op.i64_xor) catch return error.OutOfMemory;
+
+            try self.emitLocalGet(lhs);
+            try self.emitLocalGet(result);
+            self.currentCode().append(self.allocator, Op.i64_xor) catch return error.OutOfMemory;
+        },
+        else => unreachable,
+    }
+    self.currentCode().append(self.allocator, Op.i64_and) catch return error.OutOfMemory;
+    try self.emitI64Const(0);
+    self.currentCode().append(self.allocator, Op.i64_lt_s) catch return error.OutOfMemory;
+}
+
+fn emitCheckedI32AddSubOverflowCondition(self: *Self, plain_op: LIR.LowLevel, lhs: u32, rhs: u32, result: u32, layout_idx: layout.Idx) Allocator.Error!void {
+    switch (layout_idx) {
+        .u8, .u16 => {
+            try self.emitLocalGet(result);
+            try self.emitI32Const(0);
+            self.currentCode().append(self.allocator, Op.i32_lt_s) catch return error.OutOfMemory;
+
+            try self.emitLocalGet(result);
+            try self.emitI32Const(@intCast(unsignedMaxForI32Scalar(layout_idx)));
+            self.currentCode().append(self.allocator, Op.i32_gt_s) catch return error.OutOfMemory;
+
+            self.currentCode().append(self.allocator, Op.i32_or) catch return error.OutOfMemory;
+        },
+        .i8, .i16 => {
+            try self.emitLocalGet(result);
+            try self.emitI32Const(@intCast(signedMinForScalar(layout_idx)));
+            self.currentCode().append(self.allocator, Op.i32_lt_s) catch return error.OutOfMemory;
+
+            try self.emitLocalGet(result);
+            try self.emitI32Const(@intCast(signedMaxForScalar(layout_idx)));
+            self.currentCode().append(self.allocator, Op.i32_gt_s) catch return error.OutOfMemory;
+
+            self.currentCode().append(self.allocator, Op.i32_or) catch return error.OutOfMemory;
+        },
+        .u32 => switch (plain_op) {
+            .num_plus => {
+                try self.emitLocalGet(result);
+                try self.emitLocalGet(lhs);
+                self.currentCode().append(self.allocator, Op.i32_lt_u) catch return error.OutOfMemory;
+            },
+            .num_minus => {
+                try self.emitLocalGet(lhs);
+                try self.emitLocalGet(rhs);
+                self.currentCode().append(self.allocator, Op.i32_lt_u) catch return error.OutOfMemory;
+            },
+            else => unreachable,
+        },
+        .i32 => try self.emitCheckedI32SignedAddSubOverflowCondition(plain_op, lhs, rhs, result),
+        else => unreachable,
+    }
+}
+
+fn emitCheckedI64AddSubOverflowCondition(self: *Self, plain_op: LIR.LowLevel, lhs: u32, rhs: u32, result: u32, layout_idx: layout.Idx) Allocator.Error!void {
+    switch (layout_idx) {
+        .u64 => switch (plain_op) {
+            .num_plus => {
+                try self.emitLocalGet(result);
+                try self.emitLocalGet(lhs);
+                self.currentCode().append(self.allocator, Op.i64_lt_u) catch return error.OutOfMemory;
+            },
+            .num_minus => {
+                try self.emitLocalGet(lhs);
+                try self.emitLocalGet(rhs);
+                self.currentCode().append(self.allocator, Op.i64_lt_u) catch return error.OutOfMemory;
+            },
+            else => unreachable,
+        },
+        .i64 => try self.emitCheckedI64SignedAddSubOverflowCondition(plain_op, lhs, rhs, result),
+        else => unreachable,
+    }
+}
+
+fn emitCheckedScalarAddSub(self: *Self, checked_op: LIR.LowLevel, plain_op: LIR.LowLevel, args: anytype, layout_idx: layout.Idx, vt: ValType) Allocator.Error!void {
+    const lhs = try self.emitScalarArgLocal(GuardedList.at(args, 0), vt);
+    const rhs = try self.emitScalarArgLocal(GuardedList.at(args, 1), vt);
+    const result = self.storage.allocAnonymousLocal(vt) catch return error.OutOfMemory;
+
+    try self.emitLocalGet(lhs);
+    try self.emitLocalGet(rhs);
+    self.currentCode().append(self.allocator, checkedScalarBinaryWasmOp(plain_op, vt)) catch return error.OutOfMemory;
+    try self.emitLocalSet(result);
+
+    switch (vt) {
+        .i32 => try self.emitCheckedI32AddSubOverflowCondition(plain_op, lhs, rhs, result, layout_idx),
+        .i64 => try self.emitCheckedI64AddSubOverflowCondition(plain_op, lhs, rhs, result, layout_idx),
+        .f32, .f64 => unreachable,
+    }
+    try self.emitCrashIfStackBool(checkedOverflowMessage(checked_op));
+    try self.emitLocalGet(result);
+}
+
+fn emitCheckedI32Mul(self: *Self, checked_op: LIR.LowLevel, args: anytype, layout_idx: layout.Idx) Allocator.Error!void {
+    const signed = CheckedArithmetic.isSignedIntegerLayout(layout_idx);
+    const lhs = try self.emitScalarArgLocal(GuardedList.at(args, 0), .i32);
+    const rhs = try self.emitScalarArgLocal(GuardedList.at(args, 1), .i32);
+    const lhs64 = self.storage.allocAnonymousLocal(.i64) catch return error.OutOfMemory;
+    const rhs64 = self.storage.allocAnonymousLocal(.i64) catch return error.OutOfMemory;
+    const product = self.storage.allocAnonymousLocal(.i64) catch return error.OutOfMemory;
+
+    try self.emitLocalGet(lhs);
+    self.currentCode().append(self.allocator, if (signed) Op.i64_extend_i32_s else Op.i64_extend_i32_u) catch return error.OutOfMemory;
+    try self.emitLocalSet(lhs64);
+
+    try self.emitLocalGet(rhs);
+    self.currentCode().append(self.allocator, if (signed) Op.i64_extend_i32_s else Op.i64_extend_i32_u) catch return error.OutOfMemory;
+    try self.emitLocalSet(rhs64);
+
+    try self.emitLocalGet(lhs64);
+    try self.emitLocalGet(rhs64);
+    self.currentCode().append(self.allocator, Op.i64_mul) catch return error.OutOfMemory;
+    try self.emitLocalSet(product);
+
+    if (signed) {
+        try self.emitLocalGet(product);
+        try self.emitI64Const(signedMinForScalar(layout_idx));
+        self.currentCode().append(self.allocator, Op.i64_lt_s) catch return error.OutOfMemory;
+
+        try self.emitLocalGet(product);
+        try self.emitI64Const(signedMaxForScalar(layout_idx));
+        self.currentCode().append(self.allocator, Op.i64_gt_s) catch return error.OutOfMemory;
+
+        self.currentCode().append(self.allocator, Op.i32_or) catch return error.OutOfMemory;
+    } else {
+        try self.emitLocalGet(product);
+        try self.emitI64Const(unsignedMaxForI32Scalar(layout_idx));
+        self.currentCode().append(self.allocator, Op.i64_gt_u) catch return error.OutOfMemory;
+    }
+    try self.emitCrashIfStackBool(checkedOverflowMessage(checked_op));
+
+    try self.emitLocalGet(product);
+    self.currentCode().append(self.allocator, Op.i32_wrap_i64) catch return error.OutOfMemory;
+}
+
+fn emitCheckedU64Mul(self: *Self, checked_op: LIR.LowLevel, args: anytype) Allocator.Error!void {
+    const lhs = try self.emitScalarArgLocal(GuardedList.at(args, 0), .i64);
+    const rhs = try self.emitScalarArgLocal(GuardedList.at(args, 1), .i64);
+
+    try self.emitI64MulToI128(lhs, rhs);
+    const result_ptr = self.storage.allocAnonymousLocal(.i32) catch return error.OutOfMemory;
+    try self.emitLocalSet(result_ptr);
+
+    try self.emitLocalGet(result_ptr);
+    try self.emitLoadOp(.i64, 8);
+    try self.emitI64Const(0);
+    self.currentCode().append(self.allocator, Op.i64_ne) catch return error.OutOfMemory;
+    try self.emitCrashIfStackBool(checkedOverflowMessage(checked_op));
+
+    try self.emitLocalGet(result_ptr);
+    try self.emitLoadOp(.i64, 0);
+}
+
+fn emitI64CorrectionIfNegative(self: *Self, value_local: u32, condition_local: u32) Allocator.Error!void {
+    try self.emitLocalGet(value_local);
+    try self.emitI64Const(0);
+    try self.emitLocalGet(condition_local);
+    try self.emitI64Const(0);
+    self.currentCode().append(self.allocator, Op.i64_lt_s) catch return error.OutOfMemory;
+    self.currentCode().append(self.allocator, Op.select) catch return error.OutOfMemory;
+}
+
+fn emitCheckedI64Mul(self: *Self, checked_op: LIR.LowLevel, args: anytype) Allocator.Error!void {
+    const lhs = try self.emitScalarArgLocal(GuardedList.at(args, 0), .i64);
+    const rhs = try self.emitScalarArgLocal(GuardedList.at(args, 1), .i64);
+
+    try self.emitI64MulToI128(lhs, rhs);
+    const result_ptr = self.storage.allocAnonymousLocal(.i32) catch return error.OutOfMemory;
+    try self.emitLocalSet(result_ptr);
+
+    const low = self.storage.allocAnonymousLocal(.i64) catch return error.OutOfMemory;
+    try self.emitLocalGet(result_ptr);
+    try self.emitLoadOp(.i64, 0);
+    try self.emitLocalSet(low);
+
+    const high = self.storage.allocAnonymousLocal(.i64) catch return error.OutOfMemory;
+    try self.emitLocalGet(result_ptr);
+    try self.emitLoadOp(.i64, 8);
+    try self.emitLocalSet(high);
+
+    const signed_high = self.storage.allocAnonymousLocal(.i64) catch return error.OutOfMemory;
+    try self.emitLocalGet(high);
+    try self.emitI64CorrectionIfNegative(rhs, lhs);
+    self.currentCode().append(self.allocator, Op.i64_sub) catch return error.OutOfMemory;
+    try self.emitI64CorrectionIfNegative(lhs, rhs);
+    self.currentCode().append(self.allocator, Op.i64_sub) catch return error.OutOfMemory;
+    try self.emitLocalSet(signed_high);
+
+    try self.emitLocalGet(signed_high);
+    try self.emitLocalGet(low);
+    try self.emitI64Const(63);
+    self.currentCode().append(self.allocator, Op.i64_shr_s) catch return error.OutOfMemory;
+    self.currentCode().append(self.allocator, Op.i64_ne) catch return error.OutOfMemory;
+    try self.emitCrashIfStackBool(checkedOverflowMessage(checked_op));
+
+    try self.emitLocalGet(low);
+}
+
+fn emitCheckedScalarMul(self: *Self, checked_op: LIR.LowLevel, args: anytype, layout_idx: layout.Idx, vt: ValType) Allocator.Error!void {
+    switch (vt) {
+        .i32 => try self.emitCheckedI32Mul(checked_op, args, layout_idx),
+        .i64 => switch (layout_idx) {
+            .u64 => try self.emitCheckedU64Mul(checked_op, args),
+            .i64 => try self.emitCheckedI64Mul(checked_op, args),
+            else => unreachable,
+        },
+        .f32, .f64 => unreachable,
+    }
+}
+
+fn emitScalarEqZero(self: *Self, value_local: u32, vt: ValType) Allocator.Error!void {
+    try self.emitLocalGet(value_local);
+    switch (vt) {
+        .i32 => {
+            try self.emitI32Const(0);
+            self.currentCode().append(self.allocator, Op.i32_eq) catch return error.OutOfMemory;
+        },
+        .i64 => {
+            try self.emitI64Const(0);
+            self.currentCode().append(self.allocator, Op.i64_eq) catch return error.OutOfMemory;
+        },
+        .f32, .f64 => unreachable,
+    }
+}
+
+fn emitScalarSignedLowestEq(self: *Self, value_local: u32, layout_idx: layout.Idx, vt: ValType) Allocator.Error!void {
+    try self.emitLocalGet(value_local);
+    switch (vt) {
+        .i32 => {
+            try self.emitI32Const(@intCast(signedMinForScalar(layout_idx)));
+            self.currentCode().append(self.allocator, Op.i32_eq) catch return error.OutOfMemory;
+        },
+        .i64 => {
+            try self.emitI64Const(signedMinForScalar(layout_idx));
+            self.currentCode().append(self.allocator, Op.i64_eq) catch return error.OutOfMemory;
+        },
+        .f32, .f64 => unreachable,
+    }
+}
+
+fn emitScalarSignedMinNegOneCondition(self: *Self, lhs: u32, rhs: u32, layout_idx: layout.Idx, vt: ValType) Allocator.Error!void {
+    try self.emitScalarSignedLowestEq(lhs, layout_idx, vt);
+    try self.emitLocalGet(rhs);
+    switch (vt) {
+        .i32 => {
+            try self.emitI32Const(-1);
+            self.currentCode().append(self.allocator, Op.i32_eq) catch return error.OutOfMemory;
+        },
+        .i64 => {
+            try self.emitI64Const(-1);
+            self.currentCode().append(self.allocator, Op.i64_eq) catch return error.OutOfMemory;
+        },
+        .f32, .f64 => unreachable,
+    }
+    self.currentCode().append(self.allocator, Op.i32_and) catch return error.OutOfMemory;
+}
+
+fn emitCheckedScalarModuloBuiltin(self: *Self, lhs: u32, rhs: u32, layout_idx: layout.Idx) Allocator.Error!void {
+    try self.emitLocalGet(lhs);
+    try self.emitLocalGet(rhs);
+
+    switch (layout_idx) {
+        .i8 => try self.emitBuiltinCall(.i8_mod_by, self.i8_mod_by_import),
+        .u8 => try self.emitBuiltinCall(.u8_mod_by, self.u8_mod_by_import),
+        .i16 => try self.emitBuiltinCall(.i16_mod_by, self.i16_mod_by_import),
+        .u16 => try self.emitBuiltinCall(.u16_mod_by, self.u16_mod_by_import),
+        .i32 => try self.emitBuiltinCall(.i32_mod_by, self.i32_mod_by_import),
+        .u32 => try self.emitBuiltinCall(.u32_mod_by, self.u32_mod_by_import),
+        .i64 => try self.emitBuiltinCall(.i64_mod_by, self.i64_mod_by_import),
+        .u64 => try self.emitBuiltinCall(.u64_mod_by, self.u64_mod_by_import),
+        else => unreachable,
+    }
+}
+
+fn emitCheckedScalarDivRemModPlain(self: *Self, plain_op: LIR.LowLevel, lhs: u32, rhs: u32, layout_idx: layout.Idx, vt: ValType) Allocator.Error!void {
+    switch (plain_op) {
+        .num_div_by, .num_div_trunc_by => {
+            try self.emitLocalGet(lhs);
+            try self.emitLocalGet(rhs);
+            const is_unsigned = isUnsignedLayout(layout_idx);
+            const wasm_op: u8 = switch (vt) {
+                .i32 => if (is_unsigned) Op.i32_div_u else Op.i32_div_s,
+                .i64 => if (is_unsigned) Op.i64_div_u else Op.i64_div_s,
+                .f32, .f64 => unreachable,
+            };
+            self.currentCode().append(self.allocator, wasm_op) catch return error.OutOfMemory;
+        },
+        .num_rem_by => {
+            try self.emitLocalGet(lhs);
+            try self.emitLocalGet(rhs);
+            const is_unsigned = isUnsignedLayout(layout_idx);
+            const wasm_op: u8 = switch (vt) {
+                .i32 => if (is_unsigned) Op.i32_rem_u else Op.i32_rem_s,
+                .i64 => if (is_unsigned) Op.i64_rem_u else Op.i64_rem_s,
+                .f32, .f64 => unreachable,
+            };
+            self.currentCode().append(self.allocator, wasm_op) catch return error.OutOfMemory;
+        },
+        .num_mod_by => try self.emitCheckedScalarModuloBuiltin(lhs, rhs, layout_idx),
+        else => unreachable,
+    }
+}
+
+fn emitCheckedScalarDivRemMod(self: *Self, checked_op: LIR.LowLevel, plain_op: LIR.LowLevel, args: anytype, layout_idx: layout.Idx, vt: ValType) Allocator.Error!void {
+    const lhs = try self.emitScalarArgLocal(GuardedList.at(args, 0), vt);
+    const rhs = try self.emitScalarArgLocal(GuardedList.at(args, 1), vt);
+
+    try self.emitScalarEqZero(rhs, vt);
+    try self.emitCrashIfStackBool(checkedZeroDenominatorMessage(checked_op, layout_idx));
+
+    if (CheckedArithmetic.isSignedIntegerLayout(layout_idx)) {
+        switch (plain_op) {
+            .num_div_by, .num_div_trunc_by => {
+                try self.emitScalarSignedMinNegOneCondition(lhs, rhs, layout_idx, vt);
+                try self.emitCrashIfStackBool(checkedOverflowMessage(checked_op));
+                return self.emitCheckedScalarDivRemModPlain(plain_op, lhs, rhs, layout_idx, vt);
+            },
+            .num_rem_by, .num_mod_by => {
+                try self.emitScalarSignedMinNegOneCondition(lhs, rhs, layout_idx, vt);
+                self.currentCode().append(self.allocator, Op.@"if") catch return error.OutOfMemory;
+                self.currentCode().append(self.allocator, @intFromEnum(scalarBlockType(vt))) catch return error.OutOfMemory;
+                try self.emitScalarZero(vt);
+                self.currentCode().append(self.allocator, Op.@"else") catch return error.OutOfMemory;
+                try self.emitCheckedScalarDivRemModPlain(plain_op, lhs, rhs, layout_idx, vt);
+                self.currentCode().append(self.allocator, Op.end) catch return error.OutOfMemory;
+                return;
+            },
+            else => unreachable,
+        }
+    }
+
+    try self.emitCheckedScalarDivRemModPlain(plain_op, lhs, rhs, layout_idx, vt);
+}
+
+fn emitCheckedScalarUnary(self: *Self, checked_op: LIR.LowLevel, plain_op: LIR.LowLevel, args: anytype, layout_idx: layout.Idx, vt: ValType) Allocator.Error!void {
+    if (!CheckedArithmetic.isSignedIntegerLayout(layout_idx)) unreachable;
+
+    const value = try self.emitScalarArgLocal(GuardedList.at(args, 0), vt);
+    try self.emitScalarSignedLowestEq(value, layout_idx, vt);
+    try self.emitCrashIfStackBool(checkedOverflowMessage(checked_op));
+
+    switch (plain_op) {
+        .num_negate => {
+            try self.emitScalarZero(vt);
+            try self.emitLocalGet(value);
+            self.currentCode().append(self.allocator, switch (vt) {
+                .i32 => Op.i32_sub,
+                .i64 => Op.i64_sub,
+                .f32, .f64 => unreachable,
+            }) catch return error.OutOfMemory;
+        },
+        .num_abs => {
+            try self.emitLocalGet(value);
+            switch (vt) {
+                .i32 => {
+                    try self.emitI32Const(0);
+                    self.currentCode().append(self.allocator, Op.i32_lt_s) catch return error.OutOfMemory;
+                },
+                .i64 => {
+                    try self.emitI64Const(0);
+                    self.currentCode().append(self.allocator, Op.i64_lt_s) catch return error.OutOfMemory;
+                },
+                .f32, .f64 => unreachable,
+            }
+            self.currentCode().append(self.allocator, Op.@"if") catch return error.OutOfMemory;
+            self.currentCode().append(self.allocator, @intFromEnum(scalarBlockType(vt))) catch return error.OutOfMemory;
+            try self.emitScalarZero(vt);
+            try self.emitLocalGet(value);
+            self.currentCode().append(self.allocator, switch (vt) {
+                .i32 => Op.i32_sub,
+                .i64 => Op.i64_sub,
+                .f32, .f64 => unreachable,
+            }) catch return error.OutOfMemory;
+            self.currentCode().append(self.allocator, Op.@"else") catch return error.OutOfMemory;
+            try self.emitLocalGet(value);
+            self.currentCode().append(self.allocator, Op.end) catch return error.OutOfMemory;
+        },
+        else => unreachable,
+    }
+}
+
+fn emitCheckedScalarNumericOp(self: *Self, checked_op: LIR.LowLevel, plain_op: LIR.LowLevel, args: anytype, layout_idx: layout.Idx, vt: ValType) Allocator.Error!void {
+    switch (plain_op) {
+        .num_plus, .num_minus => try self.emitCheckedScalarAddSub(checked_op, plain_op, args, layout_idx, vt),
+        .num_times => try self.emitCheckedScalarMul(checked_op, args, layout_idx, vt),
+        .num_div_by, .num_div_trunc_by, .num_rem_by, .num_mod_by => try self.emitCheckedScalarDivRemMod(checked_op, plain_op, args, layout_idx, vt),
+        .num_negate, .num_abs => try self.emitCheckedScalarUnary(checked_op, plain_op, args, layout_idx, vt),
+        else => unreachable,
+    }
+}
+
 fn emitDecBinaryMath(self: *Self, args: anytype, import_idx: u32) Allocator.Error!void {
     try self.emitProcLocal(GuardedList.at(args, 0));
+
     const lhs_local = try self.stabilizeCompositeResult(16);
 
     try self.emitProcLocal(GuardedList.at(args, 1));
@@ -9279,13 +9997,23 @@ fn generateLowLevel(self: *Self, ll: anytype) Allocator.Error!void {
     switch (ll.op) {
         // Numeric operations (arithmetic, comparisons, shifts)
         .num_plus,
+        .num_plus_checked,
         .num_minus,
+        .num_minus_checked,
         .num_times,
+        .num_times_checked,
         .num_div_by,
+        .num_div_by_checked,
         .num_div_trunc_by,
+        .num_div_trunc_by_checked,
         .num_rem_by,
+        .num_rem_by_checked,
+        .num_mod_by,
+        .num_mod_by_checked,
         .num_negate,
+        .num_negate_checked,
         .num_abs,
+        .num_abs_checked,
         .num_bitwise_and,
         .num_bitwise_or,
         .num_bitwise_xor,
@@ -9750,11 +10478,6 @@ fn generateLowLevel(self: *Self, ll: anytype) Allocator.Error!void {
                 .i32, .i64 => unreachable,
             };
             self.currentCode().append(self.allocator, wasm_op) catch return error.OutOfMemory;
-        },
-
-        // Modulo (integer only — float mod not yet supported)
-        .num_mod_by => {
-            return self.emitNumericLowLevel(ll.op, args, ll.ret_layout);
         },
 
         // List operations
@@ -12833,7 +13556,9 @@ fn generateLowLevel(self: *Self, ll: anytype) Allocator.Error!void {
 /// Handles both scalar and composite (i128/Dec) types.
 fn emitNumericLowLevel(self: *Self, op: anytype, args: anytype, ret_layout: layout.Idx) Allocator.Error!void {
     const operand_layout = self.procLocalLayoutIdx(GuardedList.at(args, 0));
-    const requires_matching_operands = switch (op) {
+    const checked_op: ?LIR.LowLevel = if (CheckedArithmetic.uncheckedOp(op) != null) op else null;
+    const plain_op = CheckedArithmetic.uncheckedOp(op) orelse op;
+    const requires_matching_operands = switch (plain_op) {
         .num_plus,
         .num_minus,
         .num_times,
@@ -12863,7 +13588,7 @@ fn emitNumericLowLevel(self: *Self, op: anytype, args: anytype, ret_layout: layo
             if (builtin.mode == .Debug) {
                 std.debug.panic(
                     "wasm numeric lowering invariant violated: operand layouts differ for {s}: lhs={s} rhs={s}",
-                    .{ @tagName(op), @tagName(operand_layout), @tagName(rhs_layout) },
+                    .{ @tagName(plain_op), @tagName(operand_layout), @tagName(rhs_layout) },
                 );
             }
             unreachable;
@@ -12871,23 +13596,29 @@ fn emitNumericLowLevel(self: *Self, op: anytype, args: anytype, ret_layout: layo
     }
 
     // Check for composite types (i128/Dec)
-    const is_shift = op == .num_shift_left_by or op == .num_shift_right_by or op == .num_shift_right_zf_by;
+    const is_shift = plain_op == .num_shift_left_by or plain_op == .num_shift_right_by or plain_op == .num_shift_right_zf_by;
     if (!is_shift and (try self.isCompositeLocal(GuardedList.at(args, 0)) or try self.isCompositeLayout(operand_layout))) {
-        return self.emitCompositeNumericOp(op, args, ret_layout, operand_layout);
+        if (checked_op) |checked| {
+            return self.emitCheckedCompositeNumericOp(checked, plain_op, args, operand_layout);
+        }
+        return self.emitCompositeNumericOp(plain_op, args, ret_layout, operand_layout);
     }
     // I128/U128 shifts: LHS is composite but RHS is U8 — needs dedicated handling.
     if (is_shift and (try self.isCompositeLocal(GuardedList.at(args, 0)) or try self.isCompositeLayout(operand_layout))) {
-        return self.emitI128Shift(op, args);
+        return self.emitI128Shift(plain_op, args);
     }
 
-    if (op == .num_negate and try self.isCompositeLayout(operand_layout)) {
+    if (plain_op == .num_negate and try self.isCompositeLayout(operand_layout)) {
         return self.emitCompositeI128Negate(GuardedList.at(args, 0), ret_layout);
     }
 
     const vt = try self.procLocalValType(GuardedList.at(args, 0));
     const layout_idx = operand_layout;
+    if (checked_op) |checked| {
+        return self.emitCheckedScalarNumericOp(checked, plain_op, args, layout_idx, vt);
+    }
 
-    switch (op) {
+    switch (plain_op) {
         .num_plus => {
             try self.emitProcLocal(GuardedList.at(args, 0));
             try self.emitProcLocal(GuardedList.at(args, 1));
@@ -16291,6 +17022,14 @@ fn generateLLListSplitLast(self: *Self, args: anytype, _ret_layout: layout.Idx) 
 
     // Push result pointer
     try self.emitLocalGet(result_ptr);
+}
+
+fn checkedOverflowMessage(op: LIR.LowLevel) []const u8 {
+    return CheckedArithmetic.overflowMessage(op) orelse unreachable;
+}
+
+fn checkedZeroDenominatorMessage(op: LIR.LowLevel, layout_idx: layout.Idx) []const u8 {
+    return CheckedArithmetic.zeroDenominatorMessage(op, layout_idx) orelse unreachable;
 }
 
 test "rcAllocationLayout matches wasm32 builtin refcount allocation layout" {

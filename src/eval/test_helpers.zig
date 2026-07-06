@@ -1973,7 +1973,14 @@ pub fn devEvalBoolRoots(
     if (comptime !backend.host_lir_codegen_available) {
         return error.DevBackendUnavailable;
     } else {
-        var codegen = try HostLirCodeGen.init(allocator, store, layouts, &.{});
+        var static_strings = try backend.StaticStringData.build(
+            allocator,
+            store,
+            backend.dev.LirCodeGenMod.host_lir_codegen_target,
+        );
+        defer static_strings.deinit();
+
+        var codegen = try HostLirCodeGen.init(allocator, store, layouts, static_strings.entries);
         defer codegen.deinit();
         try codegen.compileAllProcSpecs(store.getProcSpecs());
 
@@ -2199,11 +2206,18 @@ pub fn devEvaluatorStrWithStats(allocator: Allocator, lowered: *const LoweredPro
     if (comptime !backend.host_lir_codegen_available) {
         return error.DevBackendUnavailable;
     } else {
+        var static_strings = try backend.StaticStringData.build(
+            allocator,
+            &lowered.view.store,
+            backend.dev.LirCodeGenMod.host_lir_codegen_target,
+        );
+        defer static_strings.deinit();
+
         var codegen = try HostLirCodeGen.init(
             allocator,
             &lowered.view.store,
             &lowered.view.layouts,
-            &.{},
+            static_strings.entries,
         );
         defer codegen.deinit();
         try codegen.compileAllProcSpecs(lowered.view.store.getProcSpecs());
