@@ -5405,7 +5405,7 @@ Builtin :: [].{
 				match U8.pow_try(base, exponent) {
 					Ok(result) => result
 					Err(Overflow) => {
-						crash "integer exponentiation overflowed"
+						crash "Integer exponentiation overflowed"
 					}
 				}
 
@@ -6040,10 +6040,10 @@ Builtin :: [].{
 				match I8.pow_try(base, exponent) {
 					Ok(result) => result
 					Err(Overflow) => {
-						crash "integer exponentiation overflowed"
+						crash "Integer exponentiation overflowed"
 					}
 					Err(Underflow) => {
-						crash "integer exponentiation underflowed"
+						crash "Integer exponentiation underflowed"
 					}
 				}
 
@@ -6718,7 +6718,7 @@ Builtin :: [].{
 				match U16.pow_try(base, exponent) {
 					Ok(result) => result
 					Err(Overflow) => {
-						crash "integer exponentiation overflowed"
+						crash "Integer exponentiation overflowed"
 					}
 				}
 
@@ -7386,10 +7386,10 @@ Builtin :: [].{
 				match I16.pow_try(base, exponent) {
 					Ok(result) => result
 					Err(Overflow) => {
-						crash "integer exponentiation overflowed"
+						crash "Integer exponentiation overflowed"
 					}
 					Err(Underflow) => {
-						crash "integer exponentiation underflowed"
+						crash "Integer exponentiation underflowed"
 					}
 				}
 
@@ -8079,7 +8079,7 @@ Builtin :: [].{
 				match U32.pow_try(base, exponent) {
 					Ok(result) => result
 					Err(Overflow) => {
-						crash "integer exponentiation overflowed"
+						crash "Integer exponentiation overflowed"
 					}
 				}
 
@@ -8779,10 +8779,10 @@ Builtin :: [].{
 				match I32.pow_try(base, exponent) {
 					Ok(result) => result
 					Err(Overflow) => {
-						crash "integer exponentiation overflowed"
+						crash "Integer exponentiation overflowed"
 					}
 					Err(Underflow) => {
-						crash "integer exponentiation underflowed"
+						crash "Integer exponentiation underflowed"
 					}
 				}
 
@@ -9489,7 +9489,7 @@ Builtin :: [].{
 				match U64.pow_try(base, exponent) {
 					Ok(result) => result
 					Err(Overflow) => {
-						crash "integer exponentiation overflowed"
+						crash "Integer exponentiation overflowed"
 					}
 				}
 
@@ -10228,10 +10228,10 @@ Builtin :: [].{
 				match I64.pow_try(base, exponent) {
 					Ok(result) => result
 					Err(Overflow) => {
-						crash "integer exponentiation overflowed"
+						crash "Integer exponentiation overflowed"
 					}
 					Err(Underflow) => {
-						crash "integer exponentiation underflowed"
+						crash "Integer exponentiation underflowed"
 					}
 				}
 
@@ -10963,7 +10963,7 @@ Builtin :: [].{
 				match U128.pow_try(base, exponent) {
 					Ok(result) => result
 					Err(Overflow) => {
-						crash "integer exponentiation overflowed"
+						crash "Integer exponentiation overflowed"
 					}
 				}
 
@@ -11743,10 +11743,10 @@ Builtin :: [].{
 				match I128.pow_try(base, exponent) {
 					Ok(result) => result
 					Err(Overflow) => {
-						crash "integer exponentiation overflowed"
+						crash "Integer exponentiation overflowed"
 					}
 					Err(Underflow) => {
-						crash "integer exponentiation underflowed"
+						crash "Integer exponentiation underflowed"
 					}
 				}
 

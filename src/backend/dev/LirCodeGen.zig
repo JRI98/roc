@@ -26,6 +26,7 @@ const builtin = @import("builtin");
 const base = @import("base");
 const layout = @import("layout");
 const lir = @import("lir");
+const CheckedArithmetic = lir.CheckedArithmetic;
 const builtins = @import("builtins");
 const dev_wrappers = builtins.dev_wrappers;
 
@@ -294,6 +295,8 @@ pub const BuiltinFn = enum {
     f64_to_f32_try_unsafe,
     i128_to_dec_try_unsafe,
     u128_to_dec_try_unsafe,
+    num_mul_with_overflow_u128,
+    num_mul_with_overflow_i128,
     num_div_trunc_u128,
     num_div_trunc_i128,
     num_rem_trunc_u128,
@@ -445,6 +448,8 @@ pub const BuiltinFn = enum {
             .f64_to_f32_try_unsafe => "roc_builtins_f64_to_f32_try_unsafe",
             .i128_to_dec_try_unsafe => "roc_builtins_i128_to_dec_try_unsafe",
             .u128_to_dec_try_unsafe => "roc_builtins_u128_to_dec_try_unsafe",
+            .num_mul_with_overflow_u128 => "roc_builtins_num_mul_with_overflow_u128",
+            .num_mul_with_overflow_i128 => "roc_builtins_num_mul_with_overflow_i128",
             .num_div_trunc_u128 => "roc_builtins_num_div_trunc_u128",
             .num_div_trunc_i128 => "roc_builtins_num_div_trunc_i128",
             .num_rem_trunc_u128 => "roc_builtins_num_rem_trunc_u128",
@@ -3779,11 +3784,16 @@ pub fn LirCodeGen(comptime target: RocTarget) type {
                     const index_loc = try self.emitValueLocal(args[1]);
                     return try self.callListDropAt(ll, list_loc, index_loc);
                 },
-                .num_abs => {
+                .num_abs,
+                .num_abs_checked,
+                => {
                     // Absolute value: classify signedness from the operand layout.
                     // The result layout is not authoritative here because numeric methods
                     // can return a different signedness than their operand.
                     const val_loc = try self.emitValueLocal(args[0]);
+                    if (ll.op == .num_abs_checked) {
+                        try self.emitCheckedSignedLowestValue(val_loc, self.valueLayout(args[0]), ll.op);
+                    }
                     return try self.generateNumAbs(val_loc, self.valueLayout(args[0]));
                 },
                 .num_abs_diff => {
@@ -3807,12 +3817,19 @@ pub fn LirCodeGen(comptime target: RocTarget) type {
 
                 // Numeric arithmetic and comparison ops — route to existing binop helpers
                 .num_plus,
+                .num_plus_checked,
                 .num_minus,
+                .num_minus_checked,
                 .num_times,
+                .num_times_checked,
                 .num_div_by,
+                .num_div_by_checked,
                 .num_div_trunc_by,
+                .num_div_trunc_by_checked,
                 .num_rem_by,
+                .num_rem_by_checked,
                 .num_mod_by,
+                .num_mod_by_checked,
                 .num_shift_left_by,
                 .num_shift_right_by,
                 .num_shift_right_zf_by,
@@ -3863,6 +3880,15 @@ pub fn LirCodeGen(comptime target: RocTarget) type {
 
                     const is_float = operand_layout == .f32 or operand_layout == .f64;
                     const is_i128_op = operand_layout == .dec or operand_layout == .i128 or operand_layout == .u128;
+                    if (is_float and CheckedArithmetic.uncheckedOp(ll.op) != null) {
+                        if (builtin.mode == .Debug) {
+                            std.debug.panic(
+                                "LIR/codegen invariant violated: checked integer op {s} used float layout {s}",
+                                .{ @tagName(ll.op), @tagName(operand_layout) },
+                            );
+                        }
+                        unreachable;
+                    }
 
                     if (is_float) {
                         return self.generateFloatBinop(ll.op, lhs_loc, rhs_loc);
@@ -3875,10 +3901,15 @@ pub fn LirCodeGen(comptime target: RocTarget) type {
                     }
                 },
 
-                .num_negate => {
+                .num_negate,
+                .num_negate_checked,
+                => {
                     const inner_loc = try self.emitValueLocal(args[0]);
                     const is_float = ll.ret_layout == .f32 or ll.ret_layout == .f64;
                     const is_i128 = ll.ret_layout == .i128 or ll.ret_layout == .u128 or ll.ret_layout == .dec;
+                    if (ll.op == .num_negate_checked) {
+                        try self.emitCheckedSignedLowestValue(inner_loc, self.valueLayout(args[0]), ll.op);
+                    }
 
                     if (is_float) {
                         const float_reg = try self.ensureInFloatReg(inner_loc);
@@ -6470,14 +6501,16 @@ pub fn LirCodeGen(comptime target: RocTarget) type {
                 layout.Idx.u8, layout.Idx.u16, layout.Idx.u32, layout.Idx.u64, layout.Idx.u128 => true,
                 else => false,
             };
+            const checked_op: ?lir.LowLevel = if (CheckedArithmetic.uncheckedOp(op) != null) op else null;
+            const plain_op = CheckedArithmetic.uncheckedOp(op) orelse op;
 
-            const is_shift_op = switch (op) {
+            const is_shift_op = switch (plain_op) {
                 .num_shift_left_by, .num_shift_right_by, .num_shift_right_zf_by => true,
                 else => false,
             };
 
             if (narrow_signed_shift > 0 and !is_unsigned) {
-                if (op == .num_shift_right_zf_by) {
+                if (plain_op == .num_shift_right_zf_by) {
                     try self.emitShlImm(.w64, lhs_reg, lhs_reg, narrow_signed_shift);
                     try self.emitLsrImm(.w64, lhs_reg, lhs_reg, narrow_signed_shift);
                 } else {
@@ -6500,14 +6533,14 @@ pub fn LirCodeGen(comptime target: RocTarget) type {
             // Allocate result register
             const result_reg = try self.allocTempGeneral();
 
-            switch (op) {
+            switch (plain_op) {
                 .num_plus => {
                     if (comptime target.toCpuArch() == .aarch64) {
                         try self.codegen.emit.addsRegRegReg(.w64, result_reg, lhs_reg, rhs_reg);
                     } else {
                         try self.codegen.emitAdd(.w64, result_reg, lhs_reg, rhs_reg);
                     }
-                    try self.emitCheckedIntAddSubOverflow(op, result_reg, operand_layout, is_unsigned);
+                    if (checked_op) |tag| try self.emitCheckedIntAddSubOverflow(tag, result_reg, operand_layout, is_unsigned);
                 },
                 .num_minus => {
                     if (comptime target.toCpuArch() == .aarch64) {
@@ -6515,10 +6548,20 @@ pub fn LirCodeGen(comptime target: RocTarget) type {
                     } else {
                         try self.codegen.emitSub(.w64, result_reg, lhs_reg, rhs_reg);
                     }
-                    try self.emitCheckedIntAddSubOverflow(op, result_reg, operand_layout, is_unsigned);
+                    if (checked_op) |tag| try self.emitCheckedIntAddSubOverflow(tag, result_reg, operand_layout, is_unsigned);
                 },
-                .num_times => try self.codegen.emitMul(.w64, result_reg, lhs_reg, rhs_reg),
+                .num_times => {
+                    if (checked_op) |tag| {
+                        try self.emitCheckedIntMul(tag, result_reg, lhs_reg, rhs_reg, operand_layout, is_unsigned);
+                    } else {
+                        try self.codegen.emitMul(.w64, result_reg, lhs_reg, rhs_reg);
+                    }
+                },
                 .num_div_by, .num_div_trunc_by => {
+                    if (checked_op) |tag| {
+                        try self.emitCheckedZeroDenominator(tag, rhs_reg, operand_layout);
+                        try self.emitCheckedSignedMinDivOverflow(tag, lhs_reg, rhs_reg, operand_layout);
+                    }
                     // For integers, div and div_trunc are the same (integer division truncates)
                     if (is_unsigned) {
                         try self.codegen.emitUDiv(.w64, result_reg, lhs_reg, rhs_reg);
@@ -6527,13 +6570,24 @@ pub fn LirCodeGen(comptime target: RocTarget) type {
                     }
                 },
                 .num_rem_by => {
+                    var rem_done_patch: ?usize = null;
+                    if (checked_op) |tag| {
+                        try self.emitCheckedZeroDenominator(tag, rhs_reg, operand_layout);
+                        rem_done_patch = try self.emitCheckedSignedMinRemainderZero(lhs_reg, rhs_reg, result_reg, operand_layout);
+                    }
                     if (is_unsigned) {
                         try self.codegen.emitUMod(.w64, result_reg, lhs_reg, rhs_reg);
                     } else {
                         try self.codegen.emitSMod(.w64, result_reg, lhs_reg, rhs_reg);
                     }
+                    if (rem_done_patch) |patch| self.codegen.patchJump(patch, self.codegen.currentOffset());
                 },
                 .num_mod_by => {
+                    var mod_done_patch: ?usize = null;
+                    if (checked_op) |tag| {
+                        try self.emitCheckedZeroDenominator(tag, rhs_reg, operand_layout);
+                        mod_done_patch = try self.emitCheckedSignedMinRemainderZero(lhs_reg, rhs_reg, result_reg, operand_layout);
+                    }
                     if (is_unsigned) {
                         try self.codegen.emitUMod(.w64, result_reg, lhs_reg, rhs_reg);
                     } else {
@@ -6567,6 +6621,7 @@ pub fn LirCodeGen(comptime target: RocTarget) type {
                         self.codegen.freeGeneral(sign_check_reg);
                         self.codegen.freeGeneral(divisor_reg);
                     }
+                    if (mod_done_patch) |patch| self.codegen.patchJump(patch, self.codegen.currentOffset());
                 },
                 .num_shift_left_by => try self.emitShlReg(.w64, result_reg, lhs_reg, rhs_reg),
                 .num_shift_right_by => try self.emitAsrReg(.w64, result_reg, lhs_reg, rhs_reg),
@@ -6599,11 +6654,7 @@ pub fn LirCodeGen(comptime target: RocTarget) type {
             operand_layout: layout.Idx,
             is_unsigned: bool,
         ) Allocator.Error!void {
-            const message = switch (op) {
-                .num_plus => "Integer addition overflowed!",
-                .num_minus => "Integer subtraction overflowed!",
-                else => unreachable,
-            };
+            const message = checkedOverflowMessage(op);
 
             switch (operand_layout) {
                 .u8 => try self.emitUnsignedIntRangeCheck(result_reg, 255, message),
@@ -6613,8 +6664,8 @@ pub fn LirCodeGen(comptime target: RocTarget) type {
                 .i16 => try self.emitSignedIntRangeCheck(result_reg, -32_768, 32_767, message),
                 .i32 => try self.emitSignedIntRangeCheck(result_reg, -2_147_483_648, 2_147_483_647, message),
                 .u64 => try self.emitCrashOnCond(switch (op) {
-                    .num_plus => condUnsignedAddOverflow(),
-                    .num_minus => condUnsignedSubOverflow(),
+                    .num_plus_checked => condUnsignedAddOverflow(),
+                    .num_minus_checked => condUnsignedSubOverflow(),
                     else => unreachable,
                 }, message),
                 .i64 => try self.emitCrashOnCond(condOverflow(), message),
@@ -6654,21 +6705,139 @@ pub fn LirCodeGen(comptime target: RocTarget) type {
             self.codegen.patchJump(done_patch, self.codegen.currentOffset());
         }
 
+        fn emitCheckedZeroDenominator(self: *Self, op: lir.LowLevel, rhs_reg: GeneralReg, operand_layout: layout.Idx) Allocator.Error!void {
+            const message = checkedZeroDenominatorMessage(op, operand_layout);
+            try self.emitCmpImm(rhs_reg, 0);
+            try self.emitCrashOnCond(condEqual(), message);
+        }
+
+        fn emitCheckedSignedMinDivOverflow(self: *Self, op: lir.LowLevel, lhs_reg: GeneralReg, rhs_reg: GeneralReg, operand_layout: layout.Idx) Allocator.Error!void {
+            const lowest = signedLowestI64(operand_layout) orelse return;
+            try self.emitCmpRegImm64(lhs_reg, lowest);
+            const lhs_not_lowest = try self.emitJumpIfNotEqual();
+            try self.emitCmpRegImm64(rhs_reg, -1);
+            try self.emitCrashOnCond(condEqual(), checkedOverflowMessage(op));
+            self.codegen.patchJump(lhs_not_lowest, self.codegen.currentOffset());
+        }
+
+        fn emitCheckedSignedMinRemainderZero(
+            self: *Self,
+            lhs_reg: GeneralReg,
+            rhs_reg: GeneralReg,
+            result_reg: GeneralReg,
+            operand_layout: layout.Idx,
+        ) Allocator.Error!?usize {
+            const lowest = signedLowestI64(operand_layout) orelse return null;
+            try self.emitCmpRegImm64(lhs_reg, lowest);
+            const lhs_not_lowest = try self.emitJumpIfNotEqual();
+            try self.emitCmpRegImm64(rhs_reg, -1);
+            const rhs_not_neg_one = try self.emitJumpIfNotEqual();
+            try self.codegen.emitLoadImm(result_reg, 0);
+            const done_patch = try self.codegen.emitJump();
+            const normal_offset = self.codegen.currentOffset();
+            self.codegen.patchJump(lhs_not_lowest, normal_offset);
+            self.codegen.patchJump(rhs_not_neg_one, normal_offset);
+            return done_patch;
+        }
+
+        fn emitCheckedIntMul(
+            self: *Self,
+            op: lir.LowLevel,
+            result_reg: GeneralReg,
+            lhs_reg: GeneralReg,
+            rhs_reg: GeneralReg,
+            operand_layout: layout.Idx,
+            is_unsigned: bool,
+        ) Allocator.Error!void {
+            const message = checkedOverflowMessage(op);
+            switch (operand_layout) {
+                .u8,
+                .u16,
+                .u32,
+                .i8,
+                .i16,
+                .i32,
+                => {
+                    try self.codegen.emitMul(.w64, result_reg, lhs_reg, rhs_reg);
+                    if (is_unsigned) {
+                        switch (operand_layout) {
+                            .u8 => try self.emitUnsignedIntRangeCheck(result_reg, 255, message),
+                            .u16 => try self.emitUnsignedIntRangeCheck(result_reg, 65_535, message),
+                            .u32 => try self.emitUnsignedIntRangeCheck(result_reg, 4_294_967_295, message),
+                            else => unreachable,
+                        }
+                    } else {
+                        switch (operand_layout) {
+                            .i8 => try self.emitSignedIntRangeCheck(result_reg, -128, 127, message),
+                            .i16 => try self.emitSignedIntRangeCheck(result_reg, -32_768, 32_767, message),
+                            .i32 => try self.emitSignedIntRangeCheck(result_reg, -2_147_483_648, 2_147_483_647, message),
+                            else => unreachable,
+                        }
+                    }
+                },
+                .i64 => try self.emitCheckedI64Mul(result_reg, lhs_reg, rhs_reg, message),
+                .u64 => try self.emitCheckedU64Mul(result_reg, lhs_reg, rhs_reg, message),
+                else => unreachable,
+            }
+        }
+
+        fn emitCheckedI64Mul(self: *Self, result_reg: GeneralReg, lhs_reg: GeneralReg, rhs_reg: GeneralReg, message: []const u8) Allocator.Error!void {
+            if (comptime target.toCpuArch() == .aarch64) {
+                const high_reg = try self.allocTempGeneral();
+                const sign_reg = try self.allocTempGeneral();
+                try self.codegen.emit.mulRegRegReg(.w64, result_reg, lhs_reg, rhs_reg);
+                try self.codegen.emit.smulhRegRegReg(high_reg, lhs_reg, rhs_reg);
+                try self.emitAsrImm(.w64, sign_reg, result_reg, 63);
+                try self.emitCmpReg(high_reg, sign_reg);
+                try self.emitCrashOnCond(condNotEqual(), message);
+                self.codegen.freeGeneral(sign_reg);
+                self.codegen.freeGeneral(high_reg);
+            } else {
+                try self.codegen.emitMul(.w64, result_reg, lhs_reg, rhs_reg);
+                try self.emitCrashOnCond(condOverflow(), message);
+            }
+        }
+
+        fn emitCheckedU64Mul(self: *Self, result_reg: GeneralReg, lhs_reg: GeneralReg, rhs_reg: GeneralReg, message: []const u8) Allocator.Error!void {
+            if (comptime target.toCpuArch() == .aarch64) {
+                const high_reg = try self.allocTempGeneral();
+                try self.codegen.emit.mulRegRegReg(.w64, result_reg, lhs_reg, rhs_reg);
+                try self.codegen.emit.umulhRegRegReg(high_reg, lhs_reg, rhs_reg);
+                try self.emitCmpImm(high_reg, 0);
+                try self.emitCrashOnCond(condNotEqual(), message);
+                self.codegen.freeGeneral(high_reg);
+            } else {
+                var rhs_temp: ?GeneralReg = null;
+                const rhs_src = if (rhs_reg == .RAX and lhs_reg != .RAX) blk: {
+                    const temp = try self.allocTempGeneral();
+                    try self.codegen.emit.movRegReg(.w64, temp, rhs_reg);
+                    rhs_temp = temp;
+                    break :blk temp;
+                } else rhs_reg;
+                if (lhs_reg != .RAX) {
+                    try self.codegen.emit.movRegReg(.w64, .RAX, lhs_reg);
+                }
+                try self.codegen.emit.mulReg(.w64, rhs_src);
+                try self.emitCmpImm(.RDX, 0);
+                try self.emitCrashOnCond(condNotEqual(), message);
+                if (result_reg != .RAX) {
+                    try self.codegen.emit.movRegReg(.w64, result_reg, .RAX);
+                }
+                if (rhs_temp) |temp| self.codegen.freeGeneral(temp);
+            }
+        }
+
         fn emitCheckedI128AddSubOverflow(
             self: *Self,
             op: lir.LowLevel,
             operand_layout: layout.Idx,
         ) Allocator.Error!void {
-            const message = switch (op) {
-                .num_plus => "Integer addition overflowed!",
-                .num_minus => "Integer subtraction overflowed!",
-                else => unreachable,
-            };
+            const message = checkedOverflowMessage(op);
 
             switch (operand_layout) {
                 .u128 => try self.emitCrashOnCond(switch (op) {
-                    .num_plus => condUnsignedAddOverflow(),
-                    .num_minus => condUnsignedSubOverflow(),
+                    .num_plus_checked => condUnsignedAddOverflow(),
+                    .num_minus_checked => condUnsignedSubOverflow(),
                     else => unreachable,
                 }, message),
                 .i128 => try self.emitCrashOnCond(condOverflow(), message),
@@ -6731,6 +6900,24 @@ pub fn LirCodeGen(comptime target: RocTarget) type {
             return if (comptime target.toCpuArch() == .aarch64) .cc else .below;
         }
 
+        fn checkedOverflowMessage(op: lir.LowLevel) []const u8 {
+            return CheckedArithmetic.overflowMessage(op) orelse unreachable;
+        }
+
+        fn checkedZeroDenominatorMessage(op: lir.LowLevel, operand_layout: layout.Idx) []const u8 {
+            return CheckedArithmetic.zeroDenominatorMessage(op, operand_layout) orelse unreachable;
+        }
+
+        fn signedLowestI64(operand_layout: layout.Idx) ?i64 {
+            return switch (operand_layout) {
+                .i8 => std.math.minInt(i8),
+                .i16 => std.math.minInt(i16),
+                .i32 => std.math.minInt(i32),
+                .i64 => std.math.minInt(i64),
+                else => null,
+            };
+        }
+
         /// Generate 128-bit integer binary operation
         fn generateI128Binop(
             self: *Self,
@@ -6746,12 +6933,14 @@ pub fn LirCodeGen(comptime target: RocTarget) type {
             const lhs_parts = try self.getI128Parts(lhs_loc, signedness);
 
             const is_unsigned = operand_layout == .u128;
+            const checked_op: ?lir.LowLevel = if (CheckedArithmetic.uncheckedOp(op) != null) op else null;
+            const plain_op = CheckedArithmetic.uncheckedOp(op) orelse op;
 
-            if (op == .num_shift_left_by or op == .num_shift_right_by or op == .num_shift_right_zf_by) {
+            if (plain_op == .num_shift_left_by or plain_op == .num_shift_right_by or plain_op == .num_shift_right_zf_by) {
                 const result_low = try self.allocTempGeneral();
                 const result_high = try self.allocTempGeneral();
 
-                try self.callI128Shift(lhs_parts, rhs_loc, result_low, result_high, operand_layout, op);
+                try self.callI128Shift(lhs_parts, rhs_loc, result_low, result_high, operand_layout, plain_op);
                 self.codegen.freeGeneral(lhs_parts.low);
                 self.codegen.freeGeneral(lhs_parts.high);
 
@@ -6774,7 +6963,7 @@ pub fn LirCodeGen(comptime target: RocTarget) type {
             const result_low = try self.allocTempGeneral();
             const result_high = try self.allocTempGeneral();
 
-            switch (op) {
+            switch (plain_op) {
                 .num_plus => {
                     // 128-bit add: low = lhs_low + rhs_low, high = lhs_high + rhs_high + carry
                     if (comptime target.toCpuArch() == .aarch64) {
@@ -6788,7 +6977,7 @@ pub fn LirCodeGen(comptime target: RocTarget) type {
                         try self.codegen.emit.movRegReg(.w64, result_high, lhs_parts.high);
                         try self.codegen.emit.adcRegReg(.w64, result_high, rhs_parts.high);
                     }
-                    try self.emitCheckedI128AddSubOverflow(op, operand_layout);
+                    if (checked_op) |tag| try self.emitCheckedI128AddSubOverflow(tag, operand_layout);
                 },
                 .num_minus => {
                     // 128-bit sub: low = lhs_low - rhs_low, high = lhs_high - rhs_high - borrow
@@ -6803,7 +6992,7 @@ pub fn LirCodeGen(comptime target: RocTarget) type {
                         try self.codegen.emit.movRegReg(.w64, result_high, lhs_parts.high);
                         try self.codegen.emit.sbbRegReg(.w64, result_high, rhs_parts.high);
                     }
-                    try self.emitCheckedI128AddSubOverflow(op, operand_layout);
+                    if (checked_op) |tag| try self.emitCheckedI128AddSubOverflow(tag, operand_layout);
                 },
                 .num_times => {
                     if (operand_layout == .dec) {
@@ -6811,6 +7000,8 @@ pub fn LirCodeGen(comptime target: RocTarget) type {
                         // mulSaturatedC(RocDec, RocDec) -> RocDec
                         // RocDec is extern struct { num: i128 }
                         try self.callDecMul(lhs_parts, rhs_parts, result_low, result_high);
+                    } else if (checked_op) |tag| {
+                        try self.callI128MulWithOverflow(lhs_parts, rhs_parts, result_low, result_high, is_unsigned, tag);
                     } else {
                         // 128-bit multiply: (a_lo, a_hi) * (b_lo, b_hi)
                         // result_lo = low64(a_lo * b_lo)
@@ -6906,6 +7097,10 @@ pub fn LirCodeGen(comptime target: RocTarget) type {
                         // divC(RocDec, RocDec, *RocOps) -> i128
                         try self.callDecDiv(lhs_parts, rhs_parts, result_low, result_high);
                     } else {
+                        if (checked_op) |tag| {
+                            try self.emitCheckedI128ZeroDenominator(tag, rhs_parts, operand_layout);
+                            try self.emitCheckedI128SignedMinDivOverflow(tag, lhs_parts, rhs_parts, operand_layout);
+                        }
                         // 128-bit integer division: call builtin function
                         try self.callI128DivRem(lhs_parts, rhs_parts, result_low, result_high, is_unsigned, false);
                     }
@@ -6916,13 +7111,23 @@ pub fn LirCodeGen(comptime target: RocTarget) type {
                         // divTruncC(RocDec, RocDec, *RocOps) -> i128
                         try self.callDecDivTrunc(lhs_parts, rhs_parts, result_low, result_high);
                     } else {
+                        if (checked_op) |tag| {
+                            try self.emitCheckedI128ZeroDenominator(tag, rhs_parts, operand_layout);
+                            try self.emitCheckedI128SignedMinDivOverflow(tag, lhs_parts, rhs_parts, operand_layout);
+                        }
                         // 128-bit integer truncating division: same as regular i128 div
                         try self.callI128DivRem(lhs_parts, rhs_parts, result_low, result_high, is_unsigned, false);
                     }
                 },
                 .num_rem_by, .num_mod_by => {
+                    var done_patch: ?usize = null;
+                    if (checked_op) |tag| {
+                        try self.emitCheckedI128ZeroDenominator(tag, rhs_parts, operand_layout);
+                        done_patch = try self.emitCheckedI128SignedMinRemainderZero(lhs_parts, rhs_parts, result_low, result_high, operand_layout);
+                    }
                     // 128-bit integer remainder/modulo: call builtin function
                     try self.callI128DivRem(lhs_parts, rhs_parts, result_low, result_high, is_unsigned, true);
+                    if (done_patch) |patch| self.codegen.patchJump(patch, self.codegen.currentOffset());
                 },
                 // Bitwise operations: apply independently to each 64-bit word.
                 .num_bitwise_and => {
@@ -6963,7 +7168,7 @@ pub fn LirCodeGen(comptime target: RocTarget) type {
                     self.codegen.freeGeneral(result_low);
 
                     const result_reg = try self.allocTempGeneral();
-                    try self.generateI128Comparison(lhs_parts, rhs_parts, result_reg, op, is_unsigned);
+                    try self.generateI128Comparison(lhs_parts, rhs_parts, result_reg, plain_op, is_unsigned);
 
                     self.codegen.freeGeneral(lhs_parts.low);
                     self.codegen.freeGeneral(lhs_parts.high);
@@ -6978,7 +7183,7 @@ pub fn LirCodeGen(comptime target: RocTarget) type {
                     self.codegen.freeGeneral(result_low);
                     self.codegen.freeGeneral(lhs_parts.high);
                     self.codegen.freeGeneral(rhs_parts.high);
-                    return self.generateIntBinop(op, .{ .general_reg = lhs_parts.low }, .{ .general_reg = rhs_parts.low }, .i64);
+                    return self.generateIntBinop(plain_op, .{ .general_reg = lhs_parts.low }, .{ .general_reg = rhs_parts.low }, .i64);
                 },
             }
 
@@ -7741,6 +7946,113 @@ pub fn LirCodeGen(comptime target: RocTarget) type {
             // Load results from stack slot
             try self.codegen.emitLoadStack(.w64, result_low, result_slot);
             try self.codegen.emitLoadStack(.w64, result_high, result_slot + 8);
+        }
+
+        /// Call i128/u128 checked multiply builtin via decomposed wrapper.
+        /// Wrapper signature: (out_low: *u64, out_high: *u64, a_low: u64, a_high: u64, b_low: u64, b_high: u64) -> c_int
+        fn callI128MulWithOverflow(
+            self: *Self,
+            lhs_parts: I128Parts,
+            rhs_parts: I128Parts,
+            result_low: GeneralReg,
+            result_high: GeneralReg,
+            is_unsigned: bool,
+            op: lir.LowLevel,
+        ) Allocator.Error!void {
+            const fn_addr: usize = if (is_unsigned)
+                @intFromPtr(&dev_wrappers.roc_builtins_num_mul_with_overflow_u128)
+            else
+                @intFromPtr(&dev_wrappers.roc_builtins_num_mul_with_overflow_i128);
+            const builtin_fn: BuiltinFn = if (is_unsigned)
+                .num_mul_with_overflow_u128
+            else
+                .num_mul_with_overflow_i128;
+
+            const result_slot = self.codegen.allocStackSlot(16);
+            const base_reg = frame_ptr;
+
+            var builder = try Builder.init(&self.codegen.emit, &self.codegen.stack_offset);
+            try builder.addLeaArg(base_reg, result_slot);
+            try builder.addLeaArg(base_reg, result_slot + 8);
+            try builder.addRegArg(lhs_parts.low);
+            try builder.addRegArg(lhs_parts.high);
+            try builder.addRegArg(rhs_parts.low);
+            try builder.addRegArg(rhs_parts.high);
+            try self.callBuiltin(&builder, fn_addr, builtin_fn);
+
+            try self.emitCmpImm(ret_reg_0, 0);
+            try self.emitCrashOnCond(condNotEqual(), checkedOverflowMessage(op));
+
+            try self.codegen.emitLoadStack(.w64, result_low, result_slot);
+            try self.codegen.emitLoadStack(.w64, result_high, result_slot + 8);
+        }
+
+        fn emitCheckedI128ZeroDenominator(
+            self: *Self,
+            op: lir.LowLevel,
+            rhs_parts: I128Parts,
+            operand_layout: layout.Idx,
+        ) Allocator.Error!void {
+            try self.emitCmpImm(rhs_parts.low, 0);
+            const low_not_zero = try self.emitJumpIfNotEqual();
+            try self.emitCmpImm(rhs_parts.high, 0);
+            try self.emitCrashOnCond(condEqual(), checkedZeroDenominatorMessage(op, operand_layout));
+            self.codegen.patchJump(low_not_zero, self.codegen.currentOffset());
+        }
+
+        fn emitCheckedI128SignedMinDivOverflow(
+            self: *Self,
+            op: lir.LowLevel,
+            lhs_parts: I128Parts,
+            rhs_parts: I128Parts,
+            operand_layout: layout.Idx,
+        ) Allocator.Error!void {
+            if (operand_layout != .i128) return;
+
+            try self.emitCmpImm(lhs_parts.low, 0);
+            const lhs_low_not_zero = try self.emitJumpIfNotEqual();
+            try self.emitCmpRegImm64(lhs_parts.high, std.math.minInt(i64));
+            const lhs_high_not_min = try self.emitJumpIfNotEqual();
+            try self.emitCmpRegImm64(rhs_parts.low, -1);
+            const rhs_low_not_neg_one = try self.emitJumpIfNotEqual();
+            try self.emitCmpRegImm64(rhs_parts.high, -1);
+            try self.emitCrashOnCond(condEqual(), checkedOverflowMessage(op));
+
+            const normal_offset = self.codegen.currentOffset();
+            self.codegen.patchJump(lhs_low_not_zero, normal_offset);
+            self.codegen.patchJump(lhs_high_not_min, normal_offset);
+            self.codegen.patchJump(rhs_low_not_neg_one, normal_offset);
+        }
+
+        fn emitCheckedI128SignedMinRemainderZero(
+            self: *Self,
+            lhs_parts: I128Parts,
+            rhs_parts: I128Parts,
+            result_low: GeneralReg,
+            result_high: GeneralReg,
+            operand_layout: layout.Idx,
+        ) Allocator.Error!?usize {
+            if (operand_layout != .i128) return null;
+
+            try self.emitCmpImm(lhs_parts.low, 0);
+            const lhs_low_not_zero = try self.emitJumpIfNotEqual();
+            try self.emitCmpRegImm64(lhs_parts.high, std.math.minInt(i64));
+            const lhs_high_not_min = try self.emitJumpIfNotEqual();
+            try self.emitCmpRegImm64(rhs_parts.low, -1);
+            const rhs_low_not_neg_one = try self.emitJumpIfNotEqual();
+            try self.emitCmpRegImm64(rhs_parts.high, -1);
+            const rhs_high_not_neg_one = try self.emitJumpIfNotEqual();
+
+            try self.codegen.emitLoadImm(result_low, 0);
+            try self.codegen.emitLoadImm(result_high, 0);
+            const done_patch = try self.codegen.emitJump();
+
+            const normal_offset = self.codegen.currentOffset();
+            self.codegen.patchJump(lhs_low_not_zero, normal_offset);
+            self.codegen.patchJump(lhs_high_not_min, normal_offset);
+            self.codegen.patchJump(rhs_low_not_neg_one, normal_offset);
+            self.codegen.patchJump(rhs_high_not_neg_one, normal_offset);
+            return done_patch;
         }
 
         /// Call i128/u128 division or remainder builtin via decomposed wrapper.
@@ -8733,6 +9045,30 @@ pub fn LirCodeGen(comptime target: RocTarget) type {
                     @as(Condition, .above_or_equal),
                 else => null,
             };
+        }
+
+        fn emitCheckedSignedLowestValue(self: *Self, loc: ValueLocation, operand_layout: layout.Idx, op: lir.LowLevel) Allocator.Error!void {
+            const message = checkedOverflowMessage(op);
+            if (operand_layout == .i128) {
+                const parts = try self.getI128Parts(loc, .signed);
+                const high_lowest = try self.allocTempGeneral();
+                try self.emitCmpImm(parts.low, 0);
+                const low_not_zero = try self.emitJumpIfNotEqual();
+                try self.codegen.emitLoadImm(high_lowest, std.math.minInt(i64));
+                try self.emitCmpReg(parts.high, high_lowest);
+                try self.emitCrashOnCond(condEqual(), message);
+                self.codegen.patchJump(low_not_zero, self.codegen.currentOffset());
+                self.codegen.freeGeneral(high_lowest);
+                self.codegen.freeGeneral(parts.low);
+                self.codegen.freeGeneral(parts.high);
+                return;
+            }
+
+            const lowest = signedLowestI64(operand_layout) orelse return;
+            const src_reg = try self.ensureInGeneralReg(loc);
+            try self.emitCmpRegImm64(src_reg, lowest);
+            try self.emitCrashOnCond(condEqual(), message);
+            self.codegen.freeGeneral(src_reg);
         }
 
         /// Generate absolute value for a numeric type
