@@ -3491,6 +3491,34 @@ Pattern decision construction is part of the direct LIR builder. It consumes
 Lambda Mono patterns and committed layouts and emits LIR control flow. There is
 no persisted pattern-decision IR.
 
+Match compilation goes through one shared decision-tree module
+(`src/postcheck/match_tree.zig`), consumed by both LIR lowerers through thin
+accessor contexts. A match lowers to multiway tests — one `switch_stmt` per
+tested tag or integer position, one `str_match_set` per tested string position,
+one length switch per tested list position — with each occurrence (scrutinee
+position) read into at most one local per dominating scope: one discriminant
+read per tested tag position, one field read per destructured position, one
+length read per list position. Branch bodies and guards are lowered exactly
+once; a guard failure re-enters the residual tree for the rows below it without
+re-testing columns already known. Exhaustiveness is consumed, never re-derived:
+a tag test whose arms cover the occurrence type's committed variant set emits
+its last arm as the switch default (a single-variant union emits no dispatch at
+all); open matches keep the `comptime_exhaustiveness_failed` / `runtime_error`
+terminal.
+
+**The sharing invariant.** Monotype is a DAG: an expression id referenced from
+multiple positions is re-lowered at each reference, so downstream sharing must
+go through LIR join points (`join`/`jump`), never through re-lowering a
+Monotype id twice. PR 9707 removed the one known violator (the list-pattern
+desugarer) after measuring ~(elements+1)^branches statement blowup. The match
+compiler holds the invariant by construction: rows (branches) are never
+duplicated during specialization — a row that does not test the selected
+occurrence ends the test group instead of being copied into every arm, and the
+rows below the group compile once behind a shared exit join. Because rows never
+duplicate, emitted statements are O(total pattern size); a debug statement-count
+lint in the emitter asserts a hard multiplier bound per match so an exponential
+regression fails loudly instead of shipping.
+
 ### ARC
 
 The direct LIR builder emits ownership-neutral LIR. ARC insertion runs after
