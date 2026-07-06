@@ -82,13 +82,13 @@ fn resetCapturedOutput() void {
 }
 
 fn requireContains(haystack: []const u8, needle: []const u8, label: []const u8) void {
-    if (std.mem.indexOf(u8, haystack, needle) != null) return;
+    if (std.mem.find(u8, haystack, needle) != null) return;
     std.debug.print("FAIL: expected {s} to contain {s}\n{s}\n", .{ label, needle, haystack });
     std.process.exit(1);
 }
 
 fn requireNotContains(haystack: []const u8, needle: []const u8, label: []const u8) void {
-    if (std.mem.indexOf(u8, haystack, needle) == null) return;
+    if (std.mem.find(u8, haystack, needle) == null) return;
     std.debug.print("FAIL: expected {s} not to contain {s}\n{s}\n", .{ label, needle, haystack });
     std.process.exit(1);
 }
