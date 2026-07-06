@@ -59,6 +59,7 @@ pub const UnsupportedAliasWhereClause = types.UnsupportedAliasWhereClause;
 // Nominal type errors
 pub const CannotAccessOpaqueNominal = types.CannotAccessOpaqueNominal;
 pub const NominalTypeResolutionFailed = types.NominalTypeResolutionFailed;
+pub const InvalidNominalDeclRecursion = types.InvalidNominalDeclRecursion;
 
 // Platform errors
 pub const PlatformAliasNotFound = types.PlatformAliasNotFound;

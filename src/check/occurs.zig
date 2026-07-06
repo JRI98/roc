@@ -34,6 +34,19 @@ pub const Result = enum {
     infinite,
 };
 
+/// How the traversal reaches a nominal type's backing structure.
+pub const NominalBackingMode = enum {
+    /// Value-graph occurs: traverse the backing var embedded in each nominal
+    /// application (per-use instantiated copy).
+    embedded,
+    /// Declaration validation: resolve the application's declaration in the
+    /// store's declaration table by key and traverse the declaration's
+    /// backing template. Recursive references close cycles by identity, so
+    /// mutually recursive declarations are detected even though per-use
+    /// instantiation copies disconnect their embedded graphs.
+    declaration_table,
+};
+
 /// Check if a variable is recursive
 ///
 /// This uses `Scratch` as to hold intermediate values. `occurs` will reset it
@@ -44,12 +57,24 @@ pub const Result = enum {
 ///
 /// This function does not modify the `Store`.
 pub fn occurs(types_store: *Store, scratch: *Scratch, var_: Var) std.mem.Allocator.Error!Result {
+    return occursWithMode(types_store, scratch, var_, .embedded);
+}
+
+/// Check a nominal declaration for invalid recursion, resolving nominal
+/// backings through the store's declaration table (see
+/// `NominalBackingMode.declaration_table`). `var_` is the declaration's
+/// statement var, whose content is a nominal application of the declaration.
+pub fn occursDeclarationGraph(types_store: *Store, scratch: *Scratch, var_: Var) std.mem.Allocator.Error!Result {
+    return occursWithMode(types_store, scratch, var_, .declaration_table);
+}
+
+fn occursWithMode(types_store: *Store, scratch: *Scratch, var_: Var, mode: NominalBackingMode) std.mem.Allocator.Error!Result {
     scratch.reset();
 
     // Check for recursion. The root has no incoming edge, so it starts with the
     // empty edge. Whether the recursion is nominal/anonymous/infinite is decided
     // from the edges *within* the detected cycle, not from the root downward.
-    var check_occurs = CheckOccurs.init(types_store, scratch);
+    var check_occurs = CheckOccurs.init(types_store, scratch, mode);
     return try check_occurs.occurs(var_, Edge.none);
 }
 
@@ -70,12 +95,13 @@ const CheckOccurs = struct {
 
     types_store: *Store,
     scratch: *Scratch,
+    nominal_backing_mode: NominalBackingMode,
 
     /// Init CheckOccurs
     ///
     /// Note that this struct does not own any of it's fields
-    fn init(types_store: *Store, scratch: *Scratch) Self {
-        return .{ .types_store = types_store, .scratch = scratch };
+    fn init(types_store: *Store, scratch: *Scratch, nominal_backing_mode: NominalBackingMode) Self {
+        return .{ .types_store = types_store, .scratch = scratch, .nominal_backing_mode = nominal_backing_mode };
     }
 
     /// Iteratively check if a type is referenced by it's children
@@ -151,8 +177,22 @@ const CheckOccurs = struct {
                                         try self.pushVarsToProcess(elems, Edge.none);
                                     },
                                     .nominal_type => |nominal_type| {
-                                        const backing_var = self.types_store.getNominalBackingVar(nominal_type);
-                                        try self.pushVarToProcess(backing_var, Edge.nominal);
+                                        switch (self.nominal_backing_mode) {
+                                            .embedded => {
+                                                const backing_var = self.types_store.getNominalBackingVar(nominal_type);
+                                                try self.pushVarToProcess(backing_var, Edge.nominal);
+                                            },
+                                            .declaration_table => {
+                                                // Resolve the declaration by key so recursive
+                                                // references land on the one backing template.
+                                                // Applications without a source declaration have
+                                                // no declaration graph to traverse.
+                                                if (self.types_store.lookupNominalDecl(nominal_type)) |decl_idx| {
+                                                    const decl = self.types_store.getNominalDecl(decl_idx);
+                                                    try self.pushVarToProcess(decl.backing, Edge.nominal);
+                                                }
+                                            },
+                                        }
 
                                         // Arguments are ordinary positions; only the backing
                                         // var is "through" the nominal.

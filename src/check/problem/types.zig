@@ -37,6 +37,7 @@ pub const Problem = union(enum) {
     nominal_type_resolution_failed: NominalTypeResolutionFailed,
     recursive_alias: RecursiveAlias,
     unsupported_alias_where_clause: UnsupportedAliasWhereClause,
+    invalid_nominal_decl_recursion: InvalidNominalDeclRecursion,
     infinite_recursion: VarWithSnapshot,
     anonymous_recursion: VarWithSnapshot,
     polymorphic_value: VarWithSnapshot,
@@ -180,6 +181,24 @@ pub const ComptimeExpectFailed = struct {
 pub const ComptimeEvalError = struct {
     error_name: ExtraStringIdx,
     region: base.Region,
+};
+
+// nominal declaration errors //
+
+/// A nominal type declaration whose backing recursion is invalid: the
+/// declaration graph contains a cycle that is either structurally infinite
+/// (never passes through a tag-union/record payload position) or anonymous
+/// (never passes back through a nominal declaration's backing).
+pub const InvalidNominalDeclRecursion = struct {
+    /// The declaration statement var (source of the report's region).
+    decl_var: Var,
+    /// Snapshot of the offending cyclic type for display.
+    snapshot: SnapshotContentIdx,
+    /// The declared type's name.
+    type_name: Ident.Idx,
+    kind: Kind,
+
+    pub const Kind = enum { infinite, anonymous };
 };
 
 // generic errors //

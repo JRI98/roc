@@ -3400,6 +3400,70 @@ fn checkForInfiniteType(self: *Self, comptime Idx: anytype, idx: Idx) std.mem.Al
     }
 }
 
+/// Validate every local nominal type declaration's backing recursion, after
+/// all type declarations have been generated and before any value checking.
+///
+/// The traversal resolves nominal backings through the store's declaration
+/// table by key (`occurs.occursDeclarationGraph`), so recursive references
+/// close cycles by declaration identity — including mutual recursion that
+/// per-use instantiation copies disconnect. Classification matches the
+/// value-graph occurs rules: a cycle is valid only when it passes through
+/// both a recursion-allowed position (tag payload / record field) and a
+/// nominal backing.
+///
+/// An invalid declaration is reported once, here, at the declaration; the
+/// declaration is marked invalid in the table and its decl var and backing
+/// template are poisoned to `.err`, so every use is suppressed instead of
+/// re-reporting the same cycle.
+fn validateNominalDeclRecursion(self: *Self) std.mem.Allocator.Error!void {
+    const trace = tracy.trace(@src());
+    defer trace.end();
+
+    const self_origin = self.cir.selfModuleIdentity();
+    const decl_count = self.types.nominalDeclCount();
+    var decl_int: u32 = 0;
+    while (decl_int < decl_count) : (decl_int += 1) {
+        const decl_idx: types_mod.NominalDecl.Idx = @enumFromInt(decl_int);
+        const decl = self.types.getNominalDecl(decl_idx);
+
+        // Imported declarations were validated by their own module; module
+        // imports are acyclic, so no cycle involving a local declaration can
+        // route through them except via type arguments, which the local
+        // traversal covers.
+        if (decl.origin_module != self_origin) continue;
+
+        const decl_var: Var = @enumFromInt(decl.statement());
+        const resolved = self.types.resolveVar(decl_var).desc.content;
+        // A declaration whose generation already failed (malformed backing)
+        // has nothing further to validate.
+        if (resolved != .structure or resolved.structure != .nominal_type) continue;
+
+        const occurs_result = try occurs.occursDeclarationGraph(self.types, &self.occurs_scratch, decl_var);
+        const kind: problem.InvalidNominalDeclRecursion.Kind = switch (occurs_result) {
+            .valid => continue,
+            .infinite => .infinite,
+            .recursive_anonymous => .anonymous,
+        };
+
+        // Snapshot the declaration's backing template (not the cycle var,
+        // which resolves to the bare nominal application and would render as
+        // just the type's name).
+        const snapshot = try self.snapshots.snapshotVarForError(self.types, &self.type_writer, decl.backing);
+        _ = try self.problems.appendProblem(self.gpa, .{ .invalid_nominal_decl_recursion = .{
+            .decl_var = decl_var,
+            .snapshot = snapshot,
+            .type_name = decl.ident.ident_idx,
+            .kind = kind,
+        } });
+
+        // Poison the declaration: uses instantiate `.err` and are suppressed,
+        // and no later stage can walk the cyclic template graph.
+        self.types.markNominalDeclInvalid(decl_idx);
+        try self.types.setVarContent(decl_var, .err);
+        try self.types.setVarContent(decl.backing, .err);
+    }
+}
+
 fn expectedTupleVarForAccess(
     self: *Self,
     min_elems: u32,
@@ -5321,6 +5385,10 @@ fn checkFileInternal(self: *Self, skip_numeric_defaults: bool) std.mem.Allocator
             },
         }
     }
+
+    // With every declaration generated, validate nominal declaration
+    // recursion before any value checking consumes the declarations.
+    try self.validateNominalDeclRecursion();
 
     // Next, capture all top level defs
     // This is used to support out-of-order defs
@@ -8491,6 +8559,9 @@ pub fn checkExprRepl(self: *Self, expr_idx: CIR.Expr.Idx) std.mem.Allocator.Erro
         try self.generateStmtTypeDeclType(stmt_idx, &env);
     }
 
+    // Validate nominal declaration recursion before checking values.
+    try self.validateNominalDeclRecursion();
+
     // Set the rank to be outermost
     try env.var_pool.pushRank();
     std.debug.assert(env.rank() == .outermost);
@@ -8530,6 +8601,9 @@ pub fn checkExprReplWithDefs(self: *Self, expr_idx: CIR.Expr.Idx) std.mem.Alloca
         const stmt_idx = self.cir.store.statementAt(self.cir.builtin_statements, stmt_offset);
         try self.generateStmtTypeDeclType(stmt_idx, &env);
     }
+
+    // Validate nominal declaration recursion before checking values.
+    try self.validateNominalDeclRecursion();
 
     // Initialize top_level_ptrns with any defs from local type declarations
     for (0..self.cir.all_defs.span.len) |def_offset| {
@@ -16267,6 +16341,12 @@ fn checkNominalTypeUsage(
                 return .err;
             },
         }
+    } else if (nominal_resolved == .err) {
+        // The declaration itself is poisoned (malformed backing or invalid
+        // recursion) and that error was already reported at the declaration.
+        // Poison this use silently instead of piling on a resolution error.
+        try self.unifyWith(target_var, .err, env);
+        return .err;
     } else {
         // If the nominal type resolves to something other than a nominal_type structure,
         // report the error and set the expression to error type
