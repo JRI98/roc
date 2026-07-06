@@ -216,11 +216,11 @@ They can't be used with any other category of module besides type modules.
 Use `exposing` to bring specific items into scope without a package qualifier or module prefix:
 
 ```roc
-import pkg.Json exposing [encode, decode]
+import pkg.Json exposing [to_str, decode]
 import Http exposing [Request, Response]
 ```
 
-Now `encode` and `decode` can be called directly instead of `pkg.Json.encode` and `pkg.Json.decode`. Types like `Request` and `Response` can be used in annotations without the `Http.` prefix.
+Now `to_str` and `decode` can be called directly instead of `pkg.Json.to_str` and `pkg.Json.decode`. Types like `Request` and `Response` can be used in annotations without the `Http.` prefix.
 
 ### Renaming imported modules with `as`
 

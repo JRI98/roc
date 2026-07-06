@@ -54,33 +54,27 @@ pub const ModuleKind = union(enum) {
         malformed,
     };
 
-    /// Extern-compatible payload union for serialization
-    pub const Payload = extern union {
-        type_module_ident: Ident.Idx,
-        none: u32,
-    };
-
     /// Extern-compatible serialized form
     pub const Serialized = extern struct {
         tag: Tag,
-        payload: Payload,
+        payload: u32,
 
         pub fn encode(kind: ModuleKind) @This() {
             return switch (kind) {
-                .type_module => |idx| .{ .tag = .type_module, .payload = .{ .type_module_ident = idx } },
-                .default_app => .{ .tag = .default_app, .payload = .{ .none = 0 } },
-                .app => .{ .tag = .app, .payload = .{ .none = 0 } },
-                .package => .{ .tag = .package, .payload = .{ .none = 0 } },
-                .platform => .{ .tag = .platform, .payload = .{ .none = 0 } },
-                .hosted => .{ .tag = .hosted, .payload = .{ .none = 0 } },
-                .module => .{ .tag = .module, .payload = .{ .none = 0 } },
-                .malformed => .{ .tag = .malformed, .payload = .{ .none = 0 } },
+                .type_module => |idx| .{ .tag = .type_module, .payload = @as(u32, @bitCast(idx)) },
+                .default_app => .{ .tag = .default_app, .payload = 0 },
+                .app => .{ .tag = .app, .payload = 0 },
+                .package => .{ .tag = .package, .payload = 0 },
+                .platform => .{ .tag = .platform, .payload = 0 },
+                .hosted => .{ .tag = .hosted, .payload = 0 },
+                .module => .{ .tag = .module, .payload = 0 },
+                .malformed => .{ .tag = .malformed, .payload = 0 },
             };
         }
 
         pub fn decode(self: @This()) ModuleKind {
             return switch (self.tag) {
-                .type_module => .{ .type_module = self.payload.type_module_ident },
+                .type_module => .{ .type_module = @as(Ident.Idx, @bitCast(self.payload)) },
                 .default_app => .default_app,
                 .app => .app,
                 .package => .package,
@@ -121,7 +115,7 @@ pub const CommonIdents = extern struct {
     is_eq: Ident.Idx,
     to_hash: Ident.Idx,
     parser_for: Ident.Idx,
-    encode_to: Ident.Idx,
+    encoder_for: Ident.Idx,
 
     // Type/module names
     @"try": Ident.Idx,
@@ -242,7 +236,7 @@ pub const CommonIdents = extern struct {
             .is_eq = try common.insertIdent(gpa, Ident.for_text("is_eq")),
             .to_hash = try common.insertIdent(gpa, Ident.for_text("to_hash")),
             .parser_for = try common.insertIdent(gpa, Ident.for_text("parser_for")),
-            .encode_to = try common.insertIdent(gpa, Ident.for_text("encode_to")),
+            .encoder_for = try common.insertIdent(gpa, Ident.for_text("encoder_for")),
             .@"try" = try common.insertIdent(gpa, Ident.for_text("Try")),
             .out_of_range = try common.insertIdent(gpa, Ident.for_text("OutOfRange")),
             .builtin_module = try common.insertIdent(gpa, Ident.for_text("Builtin")),
@@ -359,7 +353,7 @@ pub const CommonIdents = extern struct {
             .is_eq = common.findIdent("is_eq") orelse unreachable,
             .to_hash = common.findIdent("to_hash") orelse unreachable,
             .parser_for = common.findIdent("parser_for") orelse unreachable,
-            .encode_to = common.findIdent("encode_to") orelse unreachable,
+            .encoder_for = common.findIdent("encoder_for") orelse unreachable,
             .@"try" = common.findIdent("Try") orelse unreachable,
             .out_of_range = common.findIdent("OutOfRange") orelse unreachable,
             .builtin_module = common.findIdent("Builtin") orelse unreachable,

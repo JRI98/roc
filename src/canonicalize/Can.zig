@@ -936,13 +936,8 @@ fn populateBuiltinAutoImportedTypes(
         });
     }
 
-    const encoding_ident = try calling_module_env.insertIdent(base.Ident.for_text("Encoding"));
-    const encoding_qualified_ident = try calling_module_env.insertIdent(base.Ident.for_text("Builtin.Encoding"));
-    try self.builtin_auto_imported_types.put(gpa, encoding_ident, .{
-        .env = builtin_module_env,
-        .statement_idx = null,
-        .qualified_type_ident = encoding_qualified_ident,
-    });
+    try putBuiltinAutoImportedContainerUnmanaged(gpa, &self.builtin_auto_imported_types, calling_module_env, builtin_module_env, "Encoding", "Builtin.Encoding");
+    try putBuiltinAutoImportedContainerUnmanaged(gpa, &self.builtin_auto_imported_types, calling_module_env, builtin_module_env, "Json", "Builtin.Encoding.Json");
 }
 
 /// Legacy helper for caller-owned import maps.
@@ -970,12 +965,40 @@ pub fn populateModuleEnvs(
         });
     }
 
-    const encoding_ident = try calling_module_env.insertIdent(base.Ident.for_text("Encoding"));
-    const encoding_qualified_ident = try calling_module_env.insertIdent(base.Ident.for_text("Builtin.Encoding"));
-    try module_envs_map.put(encoding_ident, .{
+    try putBuiltinAutoImportedContainerManaged(module_envs_map, calling_module_env, builtin_module_env, "Encoding", "Builtin.Encoding");
+    try putBuiltinAutoImportedContainerManaged(module_envs_map, calling_module_env, builtin_module_env, "Json", "Builtin.Encoding.Json");
+}
+
+fn putBuiltinAutoImportedContainerUnmanaged(
+    gpa: std.mem.Allocator,
+    map: *std.AutoHashMapUnmanaged(Ident.Idx, AutoImportedType),
+    calling_module_env: *ModuleEnv,
+    builtin_module_env: *const ModuleEnv,
+    display_name: []const u8,
+    qualified_name: []const u8,
+) Allocator.Error!void {
+    const display_ident = try calling_module_env.insertIdent(base.Ident.for_text(display_name));
+    const qualified_ident = try calling_module_env.insertIdent(base.Ident.for_text(qualified_name));
+    try map.put(gpa, display_ident, .{
         .env = builtin_module_env,
         .statement_idx = null,
-        .qualified_type_ident = encoding_qualified_ident,
+        .qualified_type_ident = qualified_ident,
+    });
+}
+
+fn putBuiltinAutoImportedContainerManaged(
+    map: *std.AutoHashMap(Ident.Idx, AutoImportedType),
+    calling_module_env: *ModuleEnv,
+    builtin_module_env: *const ModuleEnv,
+    display_name: []const u8,
+    qualified_name: []const u8,
+) Allocator.Error!void {
+    const display_ident = try calling_module_env.insertIdent(base.Ident.for_text(display_name));
+    const qualified_ident = try calling_module_env.insertIdent(base.Ident.for_text(qualified_name));
+    try map.put(display_ident, .{
+        .env = builtin_module_env,
+        .statement_idx = null,
+        .qualified_type_ident = qualified_ident,
     });
 }
 
@@ -3585,7 +3608,8 @@ fn canonicalizeAssociatedItems(
                             qualified_idx
                         else blk_tqd: {
                             const type_text = self.env.getIdent(type_name);
-                            break :blk_tqd try self.insertQualifiedIdent(type_text, decl_text);
+                            const fresh_decl_text = self.env.getIdent(decl_ident);
+                            break :blk_tqd try self.insertQualifiedIdent(type_text, fresh_decl_text);
                         };
                         const assoc_key: ?AST.DeclIndex.AssocValue = if (owner_type_path) |owner|
                             .{ .owner = owner, .item = decl_ident }
@@ -7114,7 +7138,7 @@ fn canonicalizeModuleQualifiedIdent(
             const fully_qualified_idx = try self.insertQualifiedIdent(qualified_text, nested_path);
             break :name_blk self.env.getIdent(fully_qualified_idx);
         } else name_blk: {
-            if (qualifier_tokens.len == 1) {
+            if (qualifier_tokens.len == 1 and !compiler_builtin_auto_import) {
                 break :name_blk field_text;
             }
             const qualified_text = if (compiler_builtin_auto_import)

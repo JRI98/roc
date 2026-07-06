@@ -379,7 +379,7 @@ fn stringLiteralBufferFromRef(base_ptr: [*]align(1) u8, image_size: usize, ref: 
     const len, const capacity = try checkByteListRef(image_size, ref);
     if (capacity == 0) return .{};
 
-    const ptr: [*]align(base.StringLiteral.Store.static_refcount_alignment) u8 = @ptrCast(@alignCast(base_ptr + try checkedOffset(ref)));
+    const ptr: [*]u8 = @ptrCast(base_ptr + try checkedOffset(ref));
     return base.StringLiteral.Store.Buffer.fromMappedSlice(ptr[0..len], capacity);
 }
 

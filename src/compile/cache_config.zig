@@ -37,7 +37,8 @@ pub const Constants = struct {
     /// 12: Builtin.Encoding.Json structural encode/parse support changed common identifiers.
     /// 13: ModuleEnv stores deep content identity hashes.
     /// 14: ModuleEnv also stores scheme instantiation evidence records.
-    pub const CACHE_VERSION = 14;
+    /// 15: Checked encoder_for runtime representation changed serialized compiler state.
+    pub const CACHE_VERSION = 15;
 };
 
 /// Configuration for the Roc cache system.

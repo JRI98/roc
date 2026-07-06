@@ -168,7 +168,7 @@ and generated code is unchanged.
 6. **Migration order.** Migrate one plan class at a time, each landing with a
    debug boundary check "no unresolved plan of this class reaches lowering":
    (a) value dispatch; (b) iterator `for` plans (`.iter`/`.next`);
-   (c) equality/hash; (d) `parser_for`/`encode_to`. Only after all classes
+   (c) equality/hash; (d) `parser_for`/`encoder_for`. Only after all classes
    migrate does the deletion PR land.
 
 7. **Serialization/caching.** Checked artifacts are cached. `direct(target)`

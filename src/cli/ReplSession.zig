@@ -1050,6 +1050,12 @@ test "Repl - list literals" {
     try expectAllNative("List.len([\"hello\", \"world\", \"test\"])", "3");
 }
 
+test "Repl - Json.to_str derives structural encoder_for for literals" {
+    try expectAllNative("Json.to_str([1, 2, 3])", "\"[1.0,2.0,3.0]\"");
+    try expectAllNative("Json.to_str({name: \"Bob\", age: 20})", "\"{\\\"age\\\":20.0,\\\"name\\\":\\\"Bob\\\"}\"");
+    try expectAllNative("Json.to_str(None)", "\"\\\"None\\\"\"");
+}
+
 test "Repl - list operations concat" {
     try expectAllNative("List.len(List.concat([1, 2], [3, 4]))", "4");
     try expectAllNative("List.len(List.concat([], [1, 2, 3]))", "3");
