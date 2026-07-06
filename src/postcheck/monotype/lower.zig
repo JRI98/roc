@@ -570,6 +570,12 @@ const Builder = struct {
     symbols: Common.SymbolGen = .{},
     type_cache: std.AutoHashMap(CheckedTypeAddress, Type.TypeId),
     generated_iter_types: std.AutoHashMap([32]u8, Type.TypeId),
+    /// Chain depth per minted iterator digest (source = 1, each adapter +1),
+    /// keyed the same as `generated_iter_types`. Bounds minting so a
+    /// recursively-constructed chain terminates specialization: past the
+    /// depth backstop the constructor keeps the public recursive `Iter`
+    /// result, which takes the sanctioned dynamic-boundary box.
+    generated_iter_depths: std.AutoHashMap([32]u8, u32),
     spec_store: specialize.SpecBuilder,
     /// Monotypes owned by the builder-global type cache. They are lowered
     /// without body evidence, so empty tag unions inside them are unresolved
@@ -622,6 +628,7 @@ const Builder = struct {
             .inline_expects = options.inline_expects,
             .type_cache = std.AutoHashMap(CheckedTypeAddress, Type.TypeId).init(allocator),
             .generated_iter_types = std.AutoHashMap([32]u8, Type.TypeId).init(allocator),
+            .generated_iter_depths = std.AutoHashMap([32]u8, u32).init(allocator),
             .spec_store = spec_store,
             .unsolved_monos = std.AutoHashMap(Type.TypeId, void).init(allocator),
             .lowered_templates = std.AutoHashMap(Ast.FnId, LoweredTemplate).init(allocator),
@@ -668,6 +675,7 @@ const Builder = struct {
         self.spec_store.deinit();
         self.unsolved_monos.deinit();
         self.generated_iter_types.deinit();
+        self.generated_iter_depths.deinit();
         self.type_cache.deinit();
         self.evidence_arena.deinit();
     }
@@ -10615,6 +10623,19 @@ const BodyContext = struct {
         const digest = self.generatedIteratorDigest(kind, item_ty, components, callable_evidence);
         if (self.builder.generated_iter_types.get(digest.bytes)) |cached| return cached;
 
+        // Depth backstop: a chain nested past the cap keeps the public
+        // recursive `Iter` result instead of minting deeper. Adapters over the
+        // public nominal never mint, so a recursively-constructed chain (its
+        // nesting depth a runtime value) reaches a fixed point here and
+        // specialization terminates; the public result takes the sanctioned
+        // dynamic-boundary box. A statically bounded chain deeper than the cap
+        // also boxes — a tier degradation, never a hang.
+        var chain_depth: u32 = 1;
+        for (components) |component| {
+            chain_depth = @max(chain_depth, self.mintedIteratorChainDepth(component, depth_walk_fuel) + 1);
+        }
+        if (chain_depth > max_minted_iterator_chain_depth) return public_iter_ty;
+
         const args = try self.allocator.alloc(Type.TypeId, components.len + 1);
         defer self.allocator.free(args);
         args[0] = item_ty;
@@ -10641,7 +10662,76 @@ const BodyContext = struct {
         };
         const generated = try self.builder.program.types.addRecursive(context, Context.fill);
         try self.builder.generated_iter_types.put(digest.bytes, generated);
+        try self.builder.generated_iter_depths.put(digest.bytes, chain_depth);
         return generated;
+    }
+
+    /// Maximum minted-chain depth (source = 1, each adapter +1). Bounding the
+    /// minted type universe is what guarantees specialization terminates for
+    /// recursively-constructed chains regardless of call structure: finitely
+    /// many minted types means finitely many templates, and template dedup
+    /// closes every recursion.
+    const max_minted_iterator_chain_depth: u32 = 16;
+
+    /// Recursion budget for the structural depth walk; exhausting it reports
+    /// the cap (never zero) so an unexpectedly deep or cyclic shape can only
+    /// over-trigger the backstop, never under-count into divergence.
+    const depth_walk_fuel: u32 = 64;
+
+    /// Chain depth of any minted iterator reachable inside `ty` by value:
+    /// a minted iterator reads its recorded depth; containers (named args,
+    /// records, tuples, tag payloads, list/box elements) take the max over
+    /// their children. Function types contribute nothing (their returns are
+    /// control flow, not stored data), and named backings are not walked (the
+    /// public recursive nominal self-references only through its backing).
+    fn mintedIteratorChainDepth(self: *BodyContext, ty: Type.TypeId, fuel: u32) u32 {
+        if (fuel == 0) return max_minted_iterator_chain_depth;
+        return switch (self.builder.program.types.get(ty)) {
+            .primitive, .erased, .zst, .func => 0,
+            .named => |named| blk: {
+                if (named.def.generated) |generated_digest| {
+                    if (named.builtin_owner) |owner| switch (owner) {
+                        .iter, .stream => break :blk self.builder.generated_iter_depths.get(generated_digest.bytes) orelse
+                            max_minted_iterator_chain_depth,
+                        else => {},
+                    };
+                }
+                var depth: u32 = 0;
+                const named_args = self.builder.program.types.span(named.args);
+                for (0..GuardedList.borrowLen(named_args)) |index| {
+                    depth = @max(depth, self.mintedIteratorChainDepth(GuardedList.at(named_args, index), fuel - 1));
+                }
+                break :blk depth;
+            },
+            .record => |fields| blk: {
+                var depth: u32 = 0;
+                const field_span = self.builder.program.types.fieldSpan(fields);
+                for (0..GuardedList.borrowLen(field_span)) |index| {
+                    depth = @max(depth, self.mintedIteratorChainDepth(GuardedList.at(field_span, index).ty, fuel - 1));
+                }
+                break :blk depth;
+            },
+            .tuple => |items| blk: {
+                var depth: u32 = 0;
+                const item_span = self.builder.program.types.span(items);
+                for (0..GuardedList.borrowLen(item_span)) |index| {
+                    depth = @max(depth, self.mintedIteratorChainDepth(GuardedList.at(item_span, index), fuel - 1));
+                }
+                break :blk depth;
+            },
+            .tag_union => |tags| blk: {
+                var depth: u32 = 0;
+                const tag_span = self.builder.program.types.tagSpan(tags);
+                for (0..GuardedList.borrowLen(tag_span)) |tag_index| {
+                    const payload_span = self.builder.program.types.span(GuardedList.at(tag_span, tag_index).payloads);
+                    for (0..GuardedList.borrowLen(payload_span)) |payload_index| {
+                        depth = @max(depth, self.mintedIteratorChainDepth(GuardedList.at(payload_span, payload_index), fuel - 1));
+                    }
+                }
+                break :blk depth;
+            },
+            .list, .box => |element| self.mintedIteratorChainDepth(element, fuel - 1),
+        };
     }
 
     fn generatedIteratorDigest(

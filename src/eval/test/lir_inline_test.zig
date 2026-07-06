@@ -3067,6 +3067,49 @@ test "iter alloc static: runtime-count map wrapping terminates at dynamic bounda
     try expectReachableProcShapeFieldEqual(allocator, &optimized.lowered, "packed_erased_fn_count", 0);
 }
 
+// Both sides of the depth backstop on statically bounded chains: a 10-adapter
+// chain (depth 11) stays under the cap and lowers flat, while a 20-adapter
+// chain (depth 21) trips it and takes the sanctioned box — but still compiles,
+// still avoids erased callables, and stays correct. Sources are generated so
+// the two tests differ only in adapter count.
+fn deepStaticChainSource(comptime map_count: usize) []const u8 {
+    comptime {
+        var source: []const u8 =
+            \\module [main]
+            \\
+            \\main : U64 -> U64
+            \\main = |n| {
+            \\    i0 = Iter.exclusive_range(0.U64, n)
+            \\
+        ;
+        for (0..map_count) |index| {
+            source = source ++ std.fmt.comptimePrint("    i{d} = Iter.map(i{d}, |x| x + 1)\n", .{ index + 1, index });
+        }
+        source = source ++ std.fmt.comptimePrint("    Iter.fold(i{d}, 0.U64, |acc, x| acc + x)\n}}\n", .{map_count});
+        return source;
+    }
+}
+
+test "iter alloc static: deep static chain under the depth cap stays flat" {
+    const allocator = std.testing.allocator;
+    const source = comptime deepStaticChainSource(10);
+    var ordinary = try lowerModuleWithOptions(allocator, source, .none, .{ .tag_reachability = true });
+    defer ordinary.deinit(allocator);
+    try expectReachableProcShapeFieldEqual(allocator, &ordinary.lowered, "box_box_count", 0);
+    try expectReachableProcShapeFieldEqual(allocator, &ordinary.lowered, "erased_call_count", 0);
+    try expectReachableProcShapeFieldEqual(allocator, &ordinary.lowered, "packed_erased_fn_count", 0);
+}
+
+test "iter alloc static: static chain past the depth cap boxes but compiles" {
+    const allocator = std.testing.allocator;
+    const source = comptime deepStaticChainSource(20);
+    var ordinary = try lowerModuleWithOptions(allocator, source, .none, .{ .tag_reachability = true });
+    defer ordinary.deinit(allocator);
+    try std.testing.expect(try reachableProcShapeFieldTotal(allocator, &ordinary.lowered, "box_box_count") > 0);
+    try expectReachableProcShapeFieldEqual(allocator, &ordinary.lowered, "erased_call_count", 0);
+    try expectReachableProcShapeFieldEqual(allocator, &ordinary.lowered, "packed_erased_fn_count", 0);
+}
+
 // The base `[list].iter().fold` must lower with no boxed iterator state and no
 // erased callable dispatch: the list literal may allocate its backing store, but
 // the iterator itself must carry its step closure inline by value. This asserts
