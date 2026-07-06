@@ -1921,6 +1921,36 @@ const Builder = struct {
         };
     }
 
+    const NominalConstructionLayer = struct {
+        named: Type.TypeId,
+        backing: Type.TypeId,
+    };
+
+    /// The nominal construction layer of `ty`: the nominal or opaque named
+    /// type reached after unwrapping transparent alias layers, paired with
+    /// its declared backing type. Constructor expressions and patterns
+    /// (tags, records, tuples) created at such a type must be typed at the
+    /// backing and wrapped in an explicit `.nominal` node per layer, so that
+    /// "the value is `.nominal`-wrapped" holds exactly when the type is
+    /// nominal, independent of whether the source construction was written
+    /// qualified. Returns null when `ty` is structural, an alias of a
+    /// structural type, or a named type whose backing is not present.
+    fn nominalConstructionLayer(self: *Builder, ty: Type.TypeId) ?NominalConstructionLayer {
+        var current = ty;
+        while (true) {
+            switch (self.program.types.get(current)) {
+                .named => |named| {
+                    const backing = named.backing orelse return null;
+                    switch (named.kind) {
+                        .alias => current = backing.ty,
+                        .nominal, .@"opaque" => return .{ .named = current, .backing = backing.ty },
+                    }
+                },
+                else => return null,
+            }
+        }
+    }
+
     fn shapeContent(self: *Builder, ty: Type.TypeId) Type.Content {
         var current = ty;
         while (true) {
@@ -4024,6 +4054,18 @@ const Builder = struct {
         switch (value) {
             .fn_value => |fn_id| {
                 const expr = try self.restoreConstFnExpr(store_view, type_view, fn_id, ty);
+                try self.const_expr_cache.put(address, expr);
+                return expr;
+            },
+            .tag, .record, .tuple => if (self.nominalConstructionLayer(ty)) |layer| {
+                const backing_expr = try self.restoreConstNodeAtType(store_view, type_view, node, layer.backing);
+                const expr = try self.program.addExpr(.{ .ty = layer.named, .data = .{ .nominal = backing_expr } });
+                try self.const_expr_cache.put(address, expr);
+                return expr;
+            },
+            .nominal => |nominal| if (self.nominalConstructionLayer(ty)) |layer| {
+                const backing_expr = try self.restoreConstNodeAtType(store_view, type_view, nominal.backing, layer.backing);
+                const expr = try self.program.addExpr(.{ .ty = layer.named, .data = .{ .nominal = backing_expr } });
                 try self.const_expr_cache.put(address, expr);
                 return expr;
             },
@@ -6375,6 +6417,20 @@ const BodyContext = struct {
         );
     }
 
+    /// Add a structural constructor expression (tag, record, or tuple),
+    /// typing it at the nominal construction backing and wrapping it in one
+    /// explicit `.nominal` node per nominal layer of `ty`. This keeps
+    /// nominal construction explicit in the IR even when the checked
+    /// expression was an unqualified constructor promoted to a nominal type
+    /// during unification.
+    fn addConstructorExpr(self: *BodyContext, ty: Type.TypeId, data: BodyExprData) Allocator.Error!DraftExprId {
+        if (self.builder.nominalConstructionLayer(ty)) |layer| {
+            const backing_expr = try self.addConstructorExpr(layer.backing, data);
+            return try self.addExpr(.{ .ty = layer.named, .data = .{ .nominal = backing_expr } });
+        }
+        return try self.addExpr(.{ .ty = ty, .data = data });
+    }
+
     fn addPat(self: *BodyContext, pat: BodyPat) Allocator.Error!DraftPatId {
         return try self.draft.addPat(.{ .ty = try self.draftTypeCell(pat.ty), .data = pat.data });
     }
@@ -8422,23 +8478,28 @@ const BodyContext = struct {
             .str_segment => |str| .{ .str_lit = try self.lowerStringLiteral(str) },
             .bytes_literal => |str| .{ .bytes_lit = try self.lowerStringLiteral(str) },
             .empty_list => .{ .list = .empty() },
-            .empty_record => .{ .record = .empty() },
+            .empty_record => return try self.addConstructorExpr(ty, .{ .record = .empty() }),
             .str => |segments| try self.lowerStr(segments),
             .lookup_local => |lookup| return try self.lowerLookupExprAtType(expr.ty, lookup.resolved, ty),
             .lookup_external => |resolved| return try self.lowerLookupExprAtType(expr.ty, resolved, ty),
             .lookup_required => |resolved| return try self.lowerLookupExprAtType(expr.ty, resolved, ty),
             .list => |items| .{ .list = try self.lowerListExpr(items, ty) },
-            .tuple => |items| .{ .tuple = try self.lowerExprSpanAtTypes(items, self.builder.tupleItemTypes(ty)) },
+            .tuple => |items| return try self.addConstructorExpr(ty, .{ .tuple = try self.lowerExprSpanAtTypes(items, self.builder.tupleItemTypes(ty)) }),
             .record => |record| return try self.lowerRecordExpr(record, ty),
-            .tag => |tag| blk: {
+            .tag => |tag| {
                 const name = try self.builder.tagName(self.view, tag.name);
-                break :blk .{ .tag = .{
+                return try self.addConstructorExpr(ty, .{ .tag = .{
                     .name = name,
                     .payloads = try self.lowerExprSpanAtTypes(tag.args, self.builder.tagPayloadTypes(ty, name)),
-                } };
+                } });
             },
-            .zero_argument_tag => |tag| .{ .tag = .{ .name = try self.builder.tagName(self.view, tag.name), .payloads = .empty() } },
-            .nominal => |nominal| .{ .nominal = try self.lowerExprAtType(nominal.backing_expr, self.builder.namedBackingType(ty) orelse ty) },
+            .zero_argument_tag => |tag| return try self.addConstructorExpr(ty, .{ .tag = .{ .name = try self.builder.tagName(self.view, tag.name), .payloads = .empty() } }),
+            .nominal => |nominal| {
+                if (self.builder.nominalConstructionLayer(ty)) |layer| {
+                    return try self.addExpr(.{ .ty = layer.named, .data = .{ .nominal = try self.lowerExprAtType(nominal.backing_expr, layer.backing) } });
+                }
+                return try self.addExpr(.{ .ty = ty, .data = .{ .nominal = try self.lowerExprAtType(nominal.backing_expr, self.builder.namedBackingType(ty) orelse ty) } });
+            },
             .closure => |closure| try self.lowerClosure(expr_id, closure, ty),
             .lambda => blk: {
                 break :blk try self.lowerLambdaExpr(
@@ -14839,6 +14900,14 @@ const BodyContext = struct {
             .fn_value => |fn_id| {
                 return try self.restoreConstFn(store_view, fn_id, ty);
             },
+            .tag, .record, .tuple => if (self.builder.nominalConstructionLayer(ty)) |layer| {
+                const backing_expr = try self.restoreConstNodeAtType(store_view, type_view, node, layer.backing);
+                return try self.addExpr(.{ .ty = layer.named, .data = .{ .nominal = backing_expr } });
+            },
+            .nominal => |nominal| if (self.builder.nominalConstructionLayer(ty)) |layer| {
+                const backing_expr = try self.restoreConstNodeAtType(store_view, type_view, nominal.backing, layer.backing);
+                return try self.addExpr(.{ .ty = layer.named, .data = .{ .nominal = backing_expr } });
+            },
             else => {},
         }
         const data = try self.restoreConstData(store_view, type_view, value, ty);
@@ -15992,7 +16061,7 @@ const BodyContext = struct {
                 .value = value,
             };
         }
-        const record_expr = try self.addExpr(.{ .ty = ty, .data = .{ .record = try self.addFieldExprSpan(lowered) } });
+        const record_expr = try self.addConstructorExpr(ty, .{ .record = try self.addFieldExprSpan(lowered) });
         if (base_record) |base_value| {
             return try self.addExpr(.{ .ty = ty, .data = .{ .let_ = .{
                 .bind = try self.bindPat(base_local orelse Common.invariant("record update lowered base without a base local"), base_ty),
@@ -21020,9 +21089,25 @@ const BodyContext = struct {
                     .local = local,
                 } };
             },
-            .applied_tag => |tag| try self.lowerTagPatternCollectingLists(tag, ty, checks_out),
-            .nominal => |nominal| .{ .nominal = try self.lowerPatternAtTypeCollectingLists(nominal.backing_pattern, self.builder.namedBackingType(ty) orelse ty, checks_out) },
-            .record_destructure => |destructs| try self.lowerRecordPatternCollectingLists(destructs, ty, checks_out),
+            .applied_tag => |tag| blk: {
+                if (self.builder.nominalConstructionLayer(ty)) |layer| {
+                    break :blk .{ .nominal = try self.lowerConstructorPatWrapped(pattern_id, layer.backing, checks_out) };
+                }
+                break :blk try self.lowerTagPatternCollectingLists(tag, ty, checks_out);
+            },
+            .nominal => |nominal| blk: {
+                const backing_ty = if (self.builder.nominalConstructionLayer(ty)) |layer|
+                    layer.backing
+                else
+                    self.builder.namedBackingType(ty) orelse ty;
+                break :blk .{ .nominal = try self.lowerPatternAtTypeCollectingLists(nominal.backing_pattern, backing_ty, checks_out) };
+            },
+            .record_destructure => |destructs| blk: {
+                if (self.builder.nominalConstructionLayer(ty)) |layer| {
+                    break :blk .{ .nominal = try self.lowerConstructorPatWrapped(pattern_id, layer.backing, checks_out) };
+                }
+                break :blk try self.lowerRecordPatternCollectingLists(destructs, ty, checks_out);
+            },
             .list => |list| blk: {
                 const local = try self.addLocal(self.builder.symbols.fresh(), ty);
                 try checks_out.append(self.allocator, .{
@@ -21033,7 +21118,12 @@ const BodyContext = struct {
                 });
                 break :blk .{ .bind = local };
             },
-            .tuple => |items| .{ .tuple = try self.lowerPatternSpanAtTypesCollectingLists(items, self.builder.tupleItemTypes(ty), checks_out) },
+            .tuple => |items| blk: {
+                if (self.builder.nominalConstructionLayer(ty)) |layer| {
+                    break :blk .{ .nominal = try self.lowerConstructorPatWrapped(pattern_id, layer.backing, checks_out) };
+                }
+                break :blk .{ .tuple = try self.lowerPatternSpanAtTypesCollectingLists(items, self.builder.tupleItemTypes(ty), checks_out) };
+            },
             .num_literal => |num| if (num.conversion) |conversion|
                 try self.bindLiteralGuardPattern(conversion, ty)
             else
@@ -21087,13 +21177,15 @@ const BodyContext = struct {
     fn lowerPatternSpanAtTypesCollectingLists(
         self: *BodyContext,
         checked_patterns: []const checked.CheckedPatternId,
-        tys: []const Type.TypeId,
+        tys: anytype,
         checks_out: *std.ArrayList(CollectedListPattern),
     ) Allocator.Error!DraftSpan(DraftPatId) {
-        if (checked_patterns.len != tys.len) Common.invariant("pattern arity differs from concrete checked type");
+        if (checked_patterns.len != GuardedList.borrowLen(tys)) Common.invariant("pattern arity differs from concrete checked type");
+        const stable_tys = try GuardedList.dupe(self.allocator, Type.TypeId, tys);
+        defer self.allocator.free(stable_tys);
         const lowered = try self.allocator.alloc(DraftPatId, checked_patterns.len);
         defer self.allocator.free(lowered);
-        for (checked_patterns, tys, 0..) |child, child_ty, i| {
+        for (checked_patterns, stable_tys, 0..) |child, child_ty, i| {
             lowered[i] = try self.lowerPatternAtTypeCollectingLists(child, child_ty, checks_out);
         }
         return try self.addPatSpan(lowered);
@@ -23633,18 +23725,36 @@ const BodyContext = struct {
                     .local = local,
                 } };
             },
-            .applied_tag => |tag| try self.lowerTagPattern(tag, ty),
+            .applied_tag => |tag| blk: {
+                if (self.builder.nominalConstructionLayer(ty)) |layer| {
+                    break :blk .{ .nominal = try self.lowerConstructorPatWrapped(pattern_id, layer.backing, null) };
+                }
+                break :blk try self.lowerTagPattern(tag, ty);
+            },
             .nominal => |nominal| blk: {
-                const backing_ty = self.builder.namedBackingType(ty) orelse ty;
+                const backing_ty = if (self.builder.nominalConstructionLayer(ty)) |layer|
+                    layer.backing
+                else
+                    self.builder.namedBackingType(ty) orelse ty;
                 break :blk .{ .nominal = try self.lowerPatternAtTypeCell(
                     nominal.backing_pattern,
                     try self.draftTypeCell(backing_ty),
                     backing_ty,
                 ) };
             },
-            .record_destructure => |destructs| try self.lowerRecordPattern(destructs, ty),
+            .record_destructure => |destructs| blk: {
+                if (self.builder.nominalConstructionLayer(ty)) |layer| {
+                    break :blk .{ .nominal = try self.lowerConstructorPatWrapped(pattern_id, layer.backing, null) };
+                }
+                break :blk try self.lowerRecordPattern(destructs, ty);
+            },
             .list => |list| try self.lowerListPattern(list, ty),
-            .tuple => |items| .{ .tuple = try self.lowerTuplePattern(items, ty) },
+            .tuple => |items| blk: {
+                if (self.builder.nominalConstructionLayer(ty)) |layer| {
+                    break :blk .{ .nominal = try self.lowerConstructorPatWrapped(pattern_id, layer.backing, null) };
+                }
+                break :blk .{ .tuple = try self.lowerTuplePattern(items, ty) };
+            },
             .num_literal => |num| if (num.conversion) |conversion|
                 try self.bindLiteralGuardPattern(conversion, ty)
             else
@@ -23739,6 +23849,41 @@ const BodyContext = struct {
             .name = name,
             .payloads = try self.lowerPatternSpanAtTypes(tag.args, self.builder.tagPayloadTypes(ty, name)),
         } };
+    }
+
+    /// Lower a structural constructor pattern (tag, record destructure, or
+    /// tuple) whose type is nominal: the structural pattern is typed at the
+    /// nominal construction backing and wrapped in one explicit `.nominal`
+    /// pattern per nominal layer of the type, mirroring constructor
+    /// expression lowering so pattern and value representations always
+    /// align.
+    fn lowerConstructorPatWrapped(
+        self: *BodyContext,
+        pattern_id: checked.CheckedPatternId,
+        ty: Type.TypeId,
+        checks_out: ?*std.ArrayList(CollectedListPattern),
+    ) Allocator.Error!DraftPatId {
+        if (self.builder.nominalConstructionLayer(ty)) |layer| {
+            const backing_pat = try self.lowerConstructorPatWrapped(pattern_id, layer.backing, checks_out);
+            return try self.addPat(.{ .ty = layer.named, .data = .{ .nominal = backing_pat } });
+        }
+        const pattern = self.view.bodies.pattern(pattern_id);
+        const data: BodyPatData = switch (pattern.data) {
+            .applied_tag => |tag| if (checks_out) |checks|
+                try self.lowerTagPatternCollectingLists(tag, ty, checks)
+            else
+                try self.lowerTagPattern(tag, ty),
+            .record_destructure => |destructs| if (checks_out) |checks|
+                try self.lowerRecordPatternCollectingLists(destructs, ty, checks)
+            else
+                try self.lowerRecordPattern(destructs, ty),
+            .tuple => |items| if (checks_out) |checks|
+                BodyPatData{ .tuple = try self.lowerPatternSpanAtTypesCollectingLists(items, self.builder.tupleItemTypes(ty), checks) }
+            else
+                BodyPatData{ .tuple = try self.lowerTuplePattern(items, ty) },
+            else => Common.invariant("nominal constructor pattern lowering reached a non-constructor checked pattern"),
+        };
+        return try self.addPat(.{ .ty = ty, .data = data });
     }
 
     fn lowerRecordPattern(self: *BodyContext, destructs: []const checked.CheckedRecordDestruct, ty: Type.TypeId) Allocator.Error!BodyPatData {

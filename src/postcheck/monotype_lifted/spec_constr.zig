@@ -276,6 +276,15 @@ const Value = union(enum) {
     callable: CallableValue,
 };
 
+/// Verdict of statically matching one pattern against a symbolic `Value`.
+/// `unknown` means the pattern probes information the pass does not track
+/// statically: an opaque `.expr` component, or a pattern form (list,
+/// string, numeric literal) with no `Value` representation. An `unknown`
+/// branch verdict must abort a match fold — the residual match stays in the
+/// output and decides at runtime — whereas `no_match` proves the branch can
+/// be skipped.
+const MatchVerdict = enum { match, no_match, unknown };
+
 const TagValue = struct {
     ty: Type.TypeId,
     name: names.TagNameId,
@@ -1189,6 +1198,10 @@ const Pass = struct {
 
     fn constructorShape(self: *Pass, expr_id: Ast.ExprId) Allocator.Error!?Shape {
         const expr = self.program.getExpr(expr_id);
+        switch (expr.data) {
+            .tag, .record, .tuple => assertStructuralConstructionType(self.program, expr.ty),
+            else => {},
+        }
         return switch (expr.data) {
             .tag => |tag| blk: {
                 const payloads = self.program.exprSpan(tag.payloads);
@@ -1525,6 +1538,7 @@ const Cloner = struct {
             },
             .fn_ref => |fn_ref| return try self.callableValueFromRef(expr.ty, fn_ref),
             .tag => |tag| {
+                assertStructuralConstructionType(self.pass.program, expr.ty);
                 const payload_exprs = try GuardedList.dupe(self.pass.allocator, Ast.ExprId, self.pass.program.exprSpan(tag.payloads));
                 defer self.pass.allocator.free(payload_exprs);
                 const payloads = try self.pass.arena.allocator().alloc(Value, payload_exprs.len);
@@ -1538,6 +1552,7 @@ const Cloner = struct {
                 } };
             },
             .record => |fields_span| {
+                assertStructuralConstructionType(self.pass.program, expr.ty);
                 const source_fields = try GuardedList.dupe(self.pass.allocator, Ast.FieldExpr, self.pass.program.fieldExprSpan(fields_span));
                 defer self.pass.allocator.free(source_fields);
                 const fields = try self.pass.arena.allocator().alloc(FieldValue, source_fields.len);
@@ -1553,6 +1568,7 @@ const Cloner = struct {
                 } };
             },
             .tuple => |items_span| {
+                assertStructuralConstructionType(self.pass.program, expr.ty);
                 const source_items = try GuardedList.dupe(self.pass.allocator, Ast.ExprId, self.pass.program.exprSpan(items_span));
                 defer self.pass.allocator.free(source_items);
                 const items = try self.pass.arena.allocator().alloc(Value, source_items.len);
@@ -1854,7 +1870,7 @@ const Cloner = struct {
         const value_expr = try self.materialize(value);
         const change_start = self.changes.items.len;
         const bound = try self.bindPatToReusableValue(let_.bind, value);
-        if (bound) {
+        if (bound == .match) {
             const rest = try self.cloneExprValue(let_.rest);
             self.restore(change_start);
             return rest;
@@ -1873,7 +1889,7 @@ const Cloner = struct {
         const value_expr = try self.materialize(value);
         const change_start = self.changes.items.len;
         const bound = try self.bindPatToReusableValue(let_.bind, value);
-        const rest = if (bound) blk: {
+        const rest = if (bound == .match) blk: {
             const cloned = try self.cloneExpr(let_.rest);
             self.restore(change_start);
             break :blk cloned;
@@ -1936,7 +1952,7 @@ const Cloner = struct {
 
                 const final_value = try self.cloneExprValue(block.final_expr);
                 const rest_ty = self.pass.program.getExpr(let_.rest).ty;
-                if (!try self.bindPatToReusableValue(let_.bind, final_value)) {
+                if (try self.bindPatToReusableValue(let_.bind, final_value) != .match) {
                     if (try self.cloneDivergentAtType(block.final_expr, rest_ty)) |divergent| {
                         self.restore(change_start);
                         return try self.addExpr(.{ .ty = rest_ty, .data = .{ .block = .{
@@ -1959,7 +1975,7 @@ const Cloner = struct {
             else => {
                 const branch_value = try self.cloneExprValue(branch_body);
                 const change_start = self.changes.items.len;
-                if (!try self.bindPatToReusableValue(let_.bind, branch_value)) {
+                if (try self.bindPatToReusableValue(let_.bind, branch_value) != .match) {
                     self.restore(change_start);
                     return null;
                 }
@@ -2332,9 +2348,16 @@ const Cloner = struct {
         for (0..branches.len) |branch_index| {
             const branch = GuardedList.at(branches, branch_index);
             const match_change_start = self.changes.items.len;
-            const matches = try self.bindPatToValue(branch.pat, scrutinee);
+            const verdict = try self.bindPatToValue(branch.pat, scrutinee);
             self.restore(match_change_start);
-            if (!matches) continue;
+            switch (verdict) {
+                // This branch can be neither ruled in nor ruled out
+                // statically, so the whole fold aborts and the residual
+                // match decides at runtime.
+                .unknown => return null,
+                .no_match => continue,
+                .match => {},
+            }
             if (branch.guard != null) return null;
 
             var pending_lets = std.ArrayList(PendingLet).empty;
@@ -2380,7 +2403,10 @@ const Cloner = struct {
                 return prepared;
             },
             .record => |fields_span| {
-                const record = recordFromValue(value) orelse return null;
+                const record = switch (value) {
+                    .record => |record| record,
+                    else => return null,
+                };
                 const fields = self.pass.program.recordDestructSpan(fields_span);
                 const prepared_fields = try self.pass.arena.allocator().alloc(FieldValue, record.fields.len);
                 for (record.fields, 0..) |field, index| {
@@ -2403,7 +2429,10 @@ const Cloner = struct {
                 } };
             },
             .tuple => |items_span| {
-                const tuple = tupleFromValue(value) orelse return null;
+                const tuple = switch (value) {
+                    .tuple => |tuple| tuple,
+                    else => return null,
+                };
                 const pats = self.pass.program.patSpan(items_span);
                 if (pats.len != tuple.items.len) return null;
                 const items = try self.pass.arena.allocator().alloc(Value, tuple.items.len);
@@ -2418,7 +2447,10 @@ const Cloner = struct {
                 } };
             },
             .tag => |tag_pat| {
-                const tag = tagFromValue(value) orelse return null;
+                const tag = switch (value) {
+                    .tag => |tag| tag,
+                    else => return null,
+                };
                 if (tag.name != tag_pat.name) return null;
                 const pats = self.pass.program.patSpan(tag_pat.payloads);
                 if (pats.len != tag.payloads.len) return null;
@@ -2834,60 +2866,91 @@ const Cloner = struct {
         return try self.wrapPendingLets(try self.cloneExprValue(body), pending_lets.items);
     }
 
-    fn bindPatToValue(self: *Cloner, pat_id: Ast.PatId, value: Value) Common.LowerError!bool {
+    fn bindPatToValue(self: *Cloner, pat_id: Ast.PatId, value: Value) Common.LowerError!MatchVerdict {
         const pat = self.pass.program.getPat(pat_id);
         switch (pat.data) {
             .bind => |local| {
                 try self.putSubst(local, value);
-                return true;
+                return .match;
             },
-            .wildcard => return true,
+            .wildcard => return .match,
             .as => |as| {
-                if (!try self.bindPatToValue(as.pattern, value)) return false;
+                const verdict = try self.bindPatToValue(as.pattern, value);
+                if (verdict != .match) return verdict;
                 try self.putSubst(as.local, value);
-                return true;
+                return .match;
             },
             .record => |fields_span| {
-                const record = recordFromValue(value) orelse return false;
+                const record = switch (value) {
+                    .record => |record| record,
+                    .expr => return .unknown,
+                    .tag, .tuple, .nominal, .callable => Common.invariant("record pattern matched a non-record value"),
+                };
                 const fields = self.pass.program.recordDestructSpan(fields_span);
+                var verdict: MatchVerdict = .match;
                 for (0..fields.len) |index| {
                     const field = GuardedList.at(fields, index);
-                    const field_value = fieldFromRecord(record, field.name) orelse return false;
-                    if (!try self.bindPatToValue(field.pattern, field_value)) return false;
+                    const field_value = fieldFromRecord(record, field.name) orelse
+                        Common.invariant("record pattern field was absent from the record value");
+                    switch (try self.bindPatToValue(field.pattern, field_value)) {
+                        .match => {},
+                        .no_match => return .no_match,
+                        .unknown => verdict = .unknown,
+                    }
                 }
-                return true;
+                return verdict;
             },
             .tuple => |items_span| {
-                const tuple = tupleFromValue(value) orelse return false;
+                const tuple = switch (value) {
+                    .tuple => |tuple| tuple,
+                    .expr => return .unknown,
+                    .tag, .record, .nominal, .callable => Common.invariant("tuple pattern matched a non-tuple value"),
+                };
                 const pats = self.pass.program.patSpan(items_span);
-                if (pats.len != tuple.items.len) return false;
+                if (pats.len != tuple.items.len) Common.invariant("tuple pattern arity differed from the tuple value");
+                var verdict: MatchVerdict = .match;
                 for (0..pats.len) |index| {
                     const child_pat = GuardedList.at(pats, index);
                     const child_value = tuple.items[index];
-                    if (!try self.bindPatToValue(child_pat, child_value)) return false;
+                    switch (try self.bindPatToValue(child_pat, child_value)) {
+                        .match => {},
+                        .no_match => return .no_match,
+                        .unknown => verdict = .unknown,
+                    }
                 }
-                return true;
+                return verdict;
             },
             .tag => |tag_pat| {
-                const tag = tagFromValue(value) orelse return false;
-                if (tag.name != tag_pat.name) return false;
+                const tag = switch (value) {
+                    .tag => |tag| tag,
+                    .expr => return .unknown,
+                    .record, .tuple, .nominal, .callable => Common.invariant("tag pattern matched a non-tag value"),
+                };
+                if (tag.name != tag_pat.name) return .no_match;
                 const pats = self.pass.program.patSpan(tag_pat.payloads);
-                if (pats.len != tag.payloads.len) return false;
+                if (pats.len != tag.payloads.len) Common.invariant("tag pattern payload arity differed from the tag value");
+                var verdict: MatchVerdict = .match;
                 for (0..pats.len) |index| {
                     const child_pat = GuardedList.at(pats, index);
                     const child_value = tag.payloads[index];
-                    if (!try self.bindPatToValue(child_pat, child_value)) return false;
+                    switch (try self.bindPatToValue(child_pat, child_value)) {
+                        .match => {},
+                        .no_match => return .no_match,
+                        .unknown => verdict = .unknown,
+                    }
                 }
-                return true;
+                return verdict;
             },
             .nominal => |backing_pat| {
                 const nominal = switch (value) {
                     .nominal => |nominal| nominal,
-                    else => return false,
+                    .expr => return .unknown,
+                    .tag, .record, .tuple, .callable => Common.invariant("nominal pattern matched an unwrapped constructor value"),
                 };
                 return try self.bindPatToValue(backing_pat, nominal.backing.*);
             },
-            // List patterns are not statically bound during specialization.
+            // These pattern forms have no symbolic `Value` representation,
+            // so their outcome is statically undecidable here.
             .list,
             .int_lit,
             .dec_lit,
@@ -2895,12 +2958,12 @@ const Cloner = struct {
             .frac_f64_lit,
             .str_lit,
             .str_pattern,
-            => return false,
+            => return .unknown,
         }
     }
 
-    fn bindPatToReusableValue(self: *Cloner, pat_id: Ast.PatId, value: Value) Common.LowerError!bool {
-        if (!self.valueCanSubstitute(value)) return false;
+    fn bindPatToReusableValue(self: *Cloner, pat_id: Ast.PatId, value: Value) Common.LowerError!MatchVerdict {
+        if (!self.valueCanSubstitute(value)) return .unknown;
         return try self.bindPatToValue(pat_id, value);
     }
 
@@ -3904,6 +3967,28 @@ fn shapeType(shape: Shape) Type.TypeId {
     };
 }
 
+/// Debug enforcement of the nominal construction invariant: a structural
+/// constructor expression (tag, record, tuple) must never be typed at a
+/// nominal type — Monotype lowering wraps every such construction in
+/// explicit `.nominal` nodes, and the static matcher relies on pattern and
+/// value representations aligning exactly.
+fn assertStructuralConstructionType(program: *const Ast.Program, ty: Type.TypeId) void {
+    if (!std.debug.runtime_safety) return;
+    var current = ty;
+    while (true) {
+        switch (program.types.get(current)) {
+            .named => |named| {
+                const backing = named.backing orelse return;
+                switch (named.kind) {
+                    .alias => current = backing.ty,
+                    .nominal, .@"opaque" => Common.invariant("structural constructor value was typed at a nominal type without its nominal wrapper"),
+                }
+            },
+            else => return,
+        }
+    }
+}
+
 fn valueType(program: *const Ast.Program, value: Value) Type.TypeId {
     return switch (value) {
         .expr => |expr| program.getExpr(expr).ty,
@@ -4052,8 +4137,14 @@ fn callableTargetMatches(program: *const Ast.Program, expected: Ast.FnId, actual
 }
 
 fn fieldFromValue(value: Value, name: names.RecordFieldNameId) ?Value {
-    const record = recordFromValue(value) orelse return null;
-    return fieldFromRecord(record, name);
+    return switch (value) {
+        .record => |record| fieldFromRecord(record, name),
+        // Field access on a nominal-typed record projects through the
+        // explicit construction wrapper, mirroring how `.field_access`
+        // itself is typed through the named type's backing.
+        .nominal => |nominal| fieldFromValue(nominal.backing.*, name),
+        else => null,
+    };
 }
 
 fn fieldFromRecord(record: RecordValue, name: names.RecordFieldNameId) ?Value {
@@ -4072,31 +4163,12 @@ fn recordPatField(fields: anytype, name: names.RecordFieldNameId) ?Ast.PatId {
 }
 
 fn itemFromValue(value: Value, index: u32) ?Value {
-    const tuple = tupleFromValue(value) orelse return null;
-    if (index >= tuple.items.len) return null;
-    return tuple.items[index];
-}
-
-fn tagFromValue(value: Value) ?TagValue {
     return switch (value) {
-        .tag => |tag| tag,
-        .nominal => |nominal| tagFromValue(nominal.backing.*),
-        else => null,
-    };
-}
-
-fn recordFromValue(value: Value) ?RecordValue {
-    return switch (value) {
-        .record => |record| record,
-        .nominal => |nominal| recordFromValue(nominal.backing.*),
-        else => null,
-    };
-}
-
-fn tupleFromValue(value: Value) ?TupleValue {
-    return switch (value) {
-        .tuple => |tuple| tuple,
-        .nominal => |nominal| tupleFromValue(nominal.backing.*),
+        .tuple => |tuple| if (index < tuple.items.len) tuple.items[index] else null,
+        // Tuple access on a nominal-typed tuple projects through the
+        // explicit construction wrapper, mirroring how `.tuple_access`
+        // itself is typed through the named type's backing.
+        .nominal => |nominal| itemFromValue(nominal.backing.*, index),
         else => null,
     };
 }
@@ -4219,6 +4291,149 @@ test "call-pattern specialization preserves imported direct calls" {
         },
         .lifted => return error.TestUnexpectedResult,
     }
+}
+
+test "static match verdicts separate definite no-match from statically undecidable" {
+    const allocator = std.testing.allocator;
+    var program = emptyLiftedProgramForTest(allocator);
+    defer program.deinit();
+
+    var pass = try Pass.init(allocator, &program);
+    defer pass.deinit();
+    var cloner = Cloner.initForRewrite(&pass);
+    defer cloner.deinit();
+
+    const u8_ty = try program.types.add(.{ .primitive = .u8 });
+    const union_ty = try program.types.add(.{ .tag_union = Type.Span.empty() });
+
+    const foo = try program.names.internTagLabel("Foo");
+    const bar = try program.names.internTagLabel("Bar");
+
+    const opaque_expr = try program.addExpr(.{ .ty = u8_ty, .data = .{ .local = try program.addLocal(@enumFromInt(1), u8_ty) } });
+    const opaque_value = Value{ .expr = opaque_expr };
+    const foo_value = Value{ .tag = .{ .ty = union_ty, .name = foo, .payloads = &.{opaque_value} } };
+
+    const wildcard_pat = try program.addPat(.{ .ty = u8_ty, .data = .wildcard });
+    const foo_pat = try program.addPat(.{ .ty = union_ty, .data = .{ .tag = .{
+        .name = foo,
+        .payloads = try program.addPatSpan(&.{wildcard_pat}),
+    } } });
+    const bar_pat = try program.addPat(.{ .ty = union_ty, .data = .{ .tag = .{
+        .name = bar,
+        .payloads = try program.addPatSpan(&.{wildcard_pat}),
+    } } });
+
+    // Same tag name matches; a different tag name is a definite no-match.
+    try std.testing.expectEqual(MatchVerdict.match, try cloner.bindPatToValue(foo_pat, foo_value));
+    try std.testing.expectEqual(MatchVerdict.no_match, try cloner.bindPatToValue(bar_pat, foo_value));
+
+    // A tag pattern probing an opaque expression component is undecidable.
+    try std.testing.expectEqual(MatchVerdict.unknown, try cloner.bindPatToValue(foo_pat, opaque_value));
+
+    // List, string, and numeric-literal patterns have no symbolic value
+    // representation, so they are undecidable even against known components.
+    const list_pat = try program.addPat(.{ .ty = u8_ty, .data = .{ .list = .{
+        .patterns = Ast.Span(Ast.PatId).empty(),
+        .rest = null,
+    } } });
+    const str_lit = try program.addStringLiteral("known");
+    const str_pat = try program.addPat(.{ .ty = u8_ty, .data = .{ .str_lit = str_lit } });
+    const int_pat = try program.addPat(.{ .ty = u8_ty, .data = .{ .int_lit = .{ .bytes = @bitCast(@as(i128, 0)), .kind = .i128 } } });
+    const foo_list_pat = try program.addPat(.{ .ty = union_ty, .data = .{ .tag = .{
+        .name = foo,
+        .payloads = try program.addPatSpan(&.{list_pat}),
+    } } });
+    const foo_str_pat = try program.addPat(.{ .ty = union_ty, .data = .{ .tag = .{
+        .name = foo,
+        .payloads = try program.addPatSpan(&.{str_pat}),
+    } } });
+    const foo_int_pat = try program.addPat(.{ .ty = union_ty, .data = .{ .tag = .{
+        .name = foo,
+        .payloads = try program.addPatSpan(&.{int_pat}),
+    } } });
+    try std.testing.expectEqual(MatchVerdict.unknown, try cloner.bindPatToValue(foo_list_pat, foo_value));
+    try std.testing.expectEqual(MatchVerdict.unknown, try cloner.bindPatToValue(foo_str_pat, foo_value));
+    try std.testing.expectEqual(MatchVerdict.unknown, try cloner.bindPatToValue(foo_int_pat, foo_value));
+
+    // Tuple patterns: a definite no-match on any element decides the whole
+    // pattern even when another element is undecidable; otherwise an
+    // undecidable element makes the whole pattern undecidable.
+    const tuple_ty = try program.types.add(.{ .tuple = Type.Span.empty() });
+    const tuple_value = Value{ .tuple = .{ .ty = tuple_ty, .items = &.{ foo_value, opaque_value } } };
+    const both_undecidable = try program.addPat(.{ .ty = tuple_ty, .data = .{ .tuple = try program.addPatSpan(&.{ foo_list_pat, list_pat }) } });
+    const excluded_and_undecidable = try program.addPat(.{ .ty = tuple_ty, .data = .{ .tuple = try program.addPatSpan(&.{ bar_pat, list_pat }) } });
+    const matched_and_undecidable = try program.addPat(.{ .ty = tuple_ty, .data = .{ .tuple = try program.addPatSpan(&.{ foo_pat, list_pat }) } });
+    try std.testing.expectEqual(MatchVerdict.unknown, try cloner.bindPatToValue(both_undecidable, tuple_value));
+    try std.testing.expectEqual(MatchVerdict.no_match, try cloner.bindPatToValue(excluded_and_undecidable, tuple_value));
+    try std.testing.expectEqual(MatchVerdict.unknown, try cloner.bindPatToValue(matched_and_undecidable, tuple_value));
+
+    // Nominal patterns delegate to the backing; probing an opaque value is
+    // undecidable.
+    const nominal_pat = try program.addPat(.{ .ty = union_ty, .data = .{ .nominal = foo_pat } });
+    const backing = Value{ .tag = .{ .ty = union_ty, .name = foo, .payloads = &.{opaque_value} } };
+    const nominal_value = Value{ .nominal = .{ .ty = union_ty, .backing = &backing } };
+    try std.testing.expectEqual(MatchVerdict.match, try cloner.bindPatToValue(nominal_pat, nominal_value));
+    try std.testing.expectEqual(MatchVerdict.unknown, try cloner.bindPatToValue(nominal_pat, opaque_value));
+}
+
+test "known match fold aborts on undecidable branches and trips the invariant when every branch is excluded" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+
+    const allocator = std.testing.allocator;
+    var program = emptyLiftedProgramForTest(allocator);
+    defer program.deinit();
+
+    var pass = try Pass.init(allocator, &program);
+    defer pass.deinit();
+    var cloner = Cloner.initForRewrite(&pass);
+    defer cloner.deinit();
+
+    const u8_ty = try program.types.add(.{ .primitive = .u8 });
+    const union_ty = try program.types.add(.{ .tag_union = Type.Span.empty() });
+    const foo = try program.names.internTagLabel("Foo");
+    const bar = try program.names.internTagLabel("Bar");
+
+    const foo_value = Value{ .tag = .{ .ty = union_ty, .name = foo, .payloads = &.{} } };
+    const foo_pat = try program.addPat(.{ .ty = union_ty, .data = .{ .tag = .{ .name = foo, .payloads = Ast.Span(Ast.PatId).empty() } } });
+    const bar_pat = try program.addPat(.{ .ty = union_ty, .data = .{ .tag = .{ .name = bar, .payloads = Ast.Span(Ast.PatId).empty() } } });
+    const list_pat = try program.addPat(.{ .ty = union_ty, .data = .{ .list = .{
+        .patterns = Ast.Span(Ast.PatId).empty(),
+        .rest = null,
+    } } });
+    const body = try program.addExpr(.{ .ty = u8_ty, .data = .unit });
+
+    // An undecidable branch before any definite match aborts the fold: the
+    // residual match stays in the output.
+    const undecidable_branches = try program.addBranchSpan(&.{
+        .{ .pat = list_pat, .body = body },
+        .{ .pat = foo_pat, .body = body },
+    });
+    try std.testing.expectEqual(@as(?Value, null), try cloner.simplifyKnownMatchValue(foo_value, undecidable_branches));
+
+    // A definite match after definite no-matches folds.
+    const folding_branches = try program.addBranchSpan(&.{
+        .{ .pat = bar_pat, .body = body },
+        .{ .pat = foo_pat, .body = body },
+    });
+    try std.testing.expect((try cloner.simplifyKnownMatchValue(foo_value, folding_branches)) != null);
+
+    // Every branch a definite no-match violates checker exhaustiveness: the
+    // invariant must fire. The panic aborts, so probe it from a fork.
+    const excluded_branches = try program.addBranchSpan(&.{
+        .{ .pat = bar_pat, .body = body },
+    });
+    const pid = try std.posix.fork();
+    if (pid == 0) {
+        const devnull = std.posix.open("/dev/null", .{ .ACCMODE = .WRONLY }, 0) catch std.posix.exit(2);
+        std.posix.dup2(devnull, std.posix.STDERR_FILENO) catch std.posix.exit(2);
+        _ = cloner.simplifyKnownMatchValue(foo_value, excluded_branches) catch std.posix.exit(2);
+        // Reaching this line means the invariant did not fire.
+        std.posix.exit(0);
+    }
+    const result = std.posix.waitpid(pid, 0);
+    const failed = std.posix.W.IFSIGNALED(result.status) or
+        (std.posix.W.IFEXITED(result.status) and std.posix.W.EXITSTATUS(result.status) != 0);
+    try std.testing.expect(failed);
 }
 
 test "call-pattern specialization declarations are referenced" {
