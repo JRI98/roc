@@ -26,6 +26,7 @@ const LirProgram = lir_core.Program;
 const RootMetadata = lir_core.RootMetadata.RootMetadata;
 const CheckedArithmetic = lir_core.CheckedArithmetic;
 const const_store = check.ConstStore;
+const PatternRefutability = can.PatternRefutability;
 
 /// Runtime field order for a named record field.
 pub const RuntimeRecordFieldSchema = struct {
@@ -4252,30 +4253,205 @@ const Lowerer = struct {
         return try self.result.store.addCFStmt(.{ .jump = .{ .target = miss_info.join_id } });
     }
 
+    const LiftedPatternRefutabilityAdapter = struct {
+        pub const PatternId = Lifted.PatId;
+
+        lowerer: *Lowerer,
+
+        pub fn patternClass(self: @This(), pat_id: PatternId) PatternRefutability.PatternClass {
+            const pat_data = self.lowerer.pat(pat_id);
+            return switch (pat_data.data) {
+                .bind,
+                .wildcard,
+                => .cannot_miss,
+                .as,
+                .nominal,
+                => .child,
+                .record => .record,
+                .tuple => .sequence,
+                .list => .list,
+                .tag,
+                .int_lit,
+                .dec_lit,
+                .frac_f32_lit,
+                .frac_f64_lit,
+                .str_lit,
+                .str_pattern,
+                => .can_miss,
+            };
+        }
+
+        pub fn child(self: @This(), pat_id: PatternId) PatternId {
+            const pat_data = self.lowerer.pat(pat_id);
+            return switch (pat_data.data) {
+                .as => |as| as.pattern,
+                .nominal => |inner| inner,
+                .bind,
+                .wildcard,
+                .record,
+                .tuple,
+                .list,
+                .tag,
+                .int_lit,
+                .dec_lit,
+                .frac_f32_lit,
+                .frac_f64_lit,
+                .str_lit,
+                .str_pattern,
+                => unreachable,
+            };
+        }
+
+        pub fn sequenceLen(self: @This(), pat_id: PatternId) usize {
+            const pat_data = self.lowerer.pat(pat_id);
+            return switch (pat_data.data) {
+                .tuple => |items| self.lowerer.solved.lifted.patSpan(items).len,
+                .bind,
+                .wildcard,
+                .as,
+                .record,
+                .list,
+                .tag,
+                .nominal,
+                .int_lit,
+                .dec_lit,
+                .frac_f32_lit,
+                .frac_f64_lit,
+                .str_lit,
+                .str_pattern,
+                => unreachable,
+            };
+        }
+
+        pub fn sequenceChild(self: @This(), pat_id: PatternId, index: usize) PatternId {
+            const pat_data = self.lowerer.pat(pat_id);
+            return switch (pat_data.data) {
+                .tuple => |items| self.lowerer.solved.lifted.patSpan(items)[index],
+                .bind,
+                .wildcard,
+                .as,
+                .record,
+                .list,
+                .tag,
+                .nominal,
+                .int_lit,
+                .dec_lit,
+                .frac_f32_lit,
+                .frac_f64_lit,
+                .str_lit,
+                .str_pattern,
+                => unreachable,
+            };
+        }
+
+        pub fn recordLen(self: @This(), pat_id: PatternId) usize {
+            const pat_data = self.lowerer.pat(pat_id);
+            return switch (pat_data.data) {
+                .record => |fields| self.lowerer.solved.lifted.recordDestructSpan(fields).len,
+                .bind,
+                .wildcard,
+                .as,
+                .tuple,
+                .list,
+                .tag,
+                .nominal,
+                .int_lit,
+                .dec_lit,
+                .frac_f32_lit,
+                .frac_f64_lit,
+                .str_lit,
+                .str_pattern,
+                => unreachable,
+            };
+        }
+
+        pub fn recordChild(self: @This(), pat_id: PatternId, index: usize) PatternId {
+            const pat_data = self.lowerer.pat(pat_id);
+            return switch (pat_data.data) {
+                .record => |fields| self.lowerer.solved.lifted.recordDestructSpan(fields)[index].pattern,
+                .bind,
+                .wildcard,
+                .as,
+                .tuple,
+                .list,
+                .tag,
+                .nominal,
+                .int_lit,
+                .dec_lit,
+                .frac_f32_lit,
+                .frac_f64_lit,
+                .str_lit,
+                .str_pattern,
+                => unreachable,
+            };
+        }
+
+        pub fn listFixedLen(self: @This(), pat_id: PatternId) usize {
+            const pat_data = self.lowerer.pat(pat_id);
+            return switch (pat_data.data) {
+                .list => |list| list.patterns.len,
+                .bind,
+                .wildcard,
+                .as,
+                .record,
+                .tuple,
+                .tag,
+                .nominal,
+                .int_lit,
+                .dec_lit,
+                .frac_f32_lit,
+                .frac_f64_lit,
+                .str_lit,
+                .str_pattern,
+                => unreachable,
+            };
+        }
+
+        pub fn listHasRest(self: @This(), pat_id: PatternId) bool {
+            const pat_data = self.lowerer.pat(pat_id);
+            return switch (pat_data.data) {
+                .list => |list| list.rest != null,
+                .bind,
+                .wildcard,
+                .as,
+                .record,
+                .tuple,
+                .tag,
+                .nominal,
+                .int_lit,
+                .dec_lit,
+                .frac_f32_lit,
+                .frac_f64_lit,
+                .str_lit,
+                .str_pattern,
+                => unreachable,
+            };
+        }
+
+        pub fn listRestPattern(self: @This(), pat_id: PatternId) ?PatternId {
+            const pat_data = self.lowerer.pat(pat_id);
+            return switch (pat_data.data) {
+                .list => |list| list.rest.?.pattern,
+                .bind,
+                .wildcard,
+                .as,
+                .record,
+                .tuple,
+                .tag,
+                .nominal,
+                .int_lit,
+                .dec_lit,
+                .frac_f32_lit,
+                .frac_f64_lit,
+                .str_lit,
+                .str_pattern,
+                => unreachable,
+            };
+        }
+    };
+
     fn patternCanMiss(self: *Lowerer, pat_id: Lifted.PatId) bool {
-        const pat_data = self.pat(pat_id);
-        return switch (pat_data.data) {
-            .bind, .wildcard => false,
-            .as => |as| self.patternCanMiss(as.pattern),
-            .record => |fields| blk: {
-                for (self.solved.lifted.recordDestructSpan(fields)) |field| {
-                    if (self.patternCanMiss(field.pattern)) break :blk true;
-                }
-                break :blk false;
-            },
-            .tuple => |items| blk: {
-                for (self.solved.lifted.patSpan(items)) |item| {
-                    if (self.patternCanMiss(item)) break :blk true;
-                }
-                break :blk false;
-            },
-            // A list pattern can fail unless it imposes no length constraint:
-            // only `[.. as rest]` / `[..]` (a rest with no fixed elements, which
-            // matches every list) is irrefutable.
-            .list => |list| list.patterns.len > 0 or list.rest == null,
-            .nominal => |inner| self.patternCanMiss(inner),
-            .tag, .int_lit, .dec_lit, .frac_f32_lit, .frac_f64_lit, .str_lit, .str_pattern => true,
-        };
+        return PatternRefutability.canMiss(LiftedPatternRefutabilityAdapter, .{ .lowerer = self }, pat_id);
     }
 
     fn lowerPatternThen(self: *Lowerer, pat_id: Lifted.PatId, source: LIR.LocalId, on_match: LIR.CFStmtId, miss: ?PatternMiss, continuation: LIR.CFStmtId) Common.LowerError!LIR.CFStmtId {

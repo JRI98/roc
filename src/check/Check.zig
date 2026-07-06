@@ -17,12 +17,14 @@ const occurs = @import("occurs.zig");
 const problem = @import("problem.zig");
 const snapshot_mod = @import("snapshot.zig");
 const exhaustive = @import("exhaustive.zig");
+const ExhaustivenessContext = @import("exhaustiveness_context.zig");
 const hoist_roots = @import("hoist_roots.zig");
 
 const MkSafeList = collections.SafeList;
 
 const CIR = can.CIR;
 const ModuleEnv = can.ModuleEnv;
+const PatternRefutability = can.PatternRefutability;
 const Allocator = std.mem.Allocator;
 const Ident = base.Ident;
 const Region = base.Region;
@@ -244,11 +246,8 @@ checking_binding_rhs_pattern: ?CIR.Pattern.Idx = null,
 /// the value is explicitly discarded, so no caller can later pin return-only
 /// where-clause obligations created by the RHS.
 discarded_binding_rhs_expr: ?CIR.Expr.Idx = null,
-/// Nonzero while checking source that constructs a compile-time value. Static
-/// exhaustiveness diagnostics under this depth are empirical candidates: the
-/// compile-time finalizer either observes them executing, reports their generated
-/// miss path, or discards them if the source was not reached.
-empirical_exhaustiveness_depth: u32 = 0,
+/// Tracks whether static exhaustiveness diagnostics are compile-time candidates.
+exhaustiveness_context: ExhaustivenessContext.Context = .{},
 /// Deferred def-level unifications (def_var = ptrn_var = expr_var).
 /// These must happen AFTER generalization to avoid lowering expr_var's rank
 /// before generalization can process it, but BEFORE eql constraint resolution
@@ -8223,8 +8222,8 @@ fn checkDef(self: *Self, def_idx: CIR.Def.Idx, env: *Env) std.mem.Allocator.Erro
         }
     };
 
-    self.empirical_exhaustiveness_depth += 1;
-    defer self.empirical_exhaustiveness_depth -= 1;
+    const exhaustiveness_scope = self.exhaustiveness_context.enterCompileTimeRoot();
+    defer exhaustiveness_scope.leave();
 
     // Infer types for the body, checking against the instantiated annotation.
     // Ordinary top-level constants are already compile-time roots, so nested
@@ -10120,42 +10119,236 @@ fn getPatternIdent(self: *const Self, ptrn_idx: CIR.Pattern.Idx) ?Ident.Idx {
     }
 }
 
+const CirPatternRefutabilityAdapter = struct {
+    pub const PatternId = CIR.Pattern.Idx;
+
+    checker: *const Self,
+
+    pub fn patternClass(self: @This(), pattern_idx: PatternId) PatternRefutability.PatternClass {
+        const pattern = self.checker.cir.store.getPattern(pattern_idx);
+        return switch (pattern) {
+            .assign,
+            .underscore,
+            .runtime_error,
+            => .cannot_miss,
+            .as,
+            .nominal,
+            .nominal_external,
+            => .child,
+            .tuple => .sequence,
+            .record_destructure => .record,
+            .list => .list,
+            .applied_tag,
+            .num_literal,
+            .small_dec_literal,
+            .dec_literal,
+            .frac_f32_literal,
+            .frac_f64_literal,
+            .str_literal,
+            .str_interpolation,
+            => .can_miss,
+        };
+    }
+
+    pub fn child(self: @This(), pattern_idx: PatternId) PatternId {
+        const pattern = self.checker.cir.store.getPattern(pattern_idx);
+        return switch (pattern) {
+            .as => |as_pattern| as_pattern.pattern,
+            .nominal => |nominal| nominal.backing_pattern,
+            .nominal_external => |nominal| nominal.backing_pattern,
+            .assign,
+            .applied_tag,
+            .record_destructure,
+            .list,
+            .tuple,
+            .num_literal,
+            .small_dec_literal,
+            .dec_literal,
+            .frac_f32_literal,
+            .frac_f64_literal,
+            .str_literal,
+            .str_interpolation,
+            .underscore,
+            .runtime_error,
+            => unreachable,
+        };
+    }
+
+    pub fn sequenceLen(self: @This(), pattern_idx: PatternId) usize {
+        const pattern = self.checker.cir.store.getPattern(pattern_idx);
+        return switch (pattern) {
+            .tuple => |tuple| self.checker.cir.store.slicePatterns(tuple.patterns).len,
+            .assign,
+            .as,
+            .applied_tag,
+            .nominal,
+            .nominal_external,
+            .record_destructure,
+            .list,
+            .num_literal,
+            .small_dec_literal,
+            .dec_literal,
+            .frac_f32_literal,
+            .frac_f64_literal,
+            .str_literal,
+            .str_interpolation,
+            .underscore,
+            .runtime_error,
+            => unreachable,
+        };
+    }
+
+    pub fn sequenceChild(self: @This(), pattern_idx: PatternId, index: usize) PatternId {
+        const pattern = self.checker.cir.store.getPattern(pattern_idx);
+        return switch (pattern) {
+            .tuple => |tuple| self.checker.cir.store.slicePatterns(tuple.patterns)[index],
+            .assign,
+            .as,
+            .applied_tag,
+            .nominal,
+            .nominal_external,
+            .record_destructure,
+            .list,
+            .num_literal,
+            .small_dec_literal,
+            .dec_literal,
+            .frac_f32_literal,
+            .frac_f64_literal,
+            .str_literal,
+            .str_interpolation,
+            .underscore,
+            .runtime_error,
+            => unreachable,
+        };
+    }
+
+    pub fn recordLen(self: @This(), pattern_idx: PatternId) usize {
+        const pattern = self.checker.cir.store.getPattern(pattern_idx);
+        return switch (pattern) {
+            .record_destructure => |destructure| self.checker.cir.store.sliceRecordDestructs(destructure.destructs).len,
+            .assign,
+            .as,
+            .applied_tag,
+            .nominal,
+            .nominal_external,
+            .list,
+            .tuple,
+            .num_literal,
+            .small_dec_literal,
+            .dec_literal,
+            .frac_f32_literal,
+            .frac_f64_literal,
+            .str_literal,
+            .str_interpolation,
+            .underscore,
+            .runtime_error,
+            => unreachable,
+        };
+    }
+
+    pub fn recordChild(self: @This(), pattern_idx: PatternId, index: usize) PatternId {
+        const pattern = self.checker.cir.store.getPattern(pattern_idx);
+        return switch (pattern) {
+            .record_destructure => |destructure| blk: {
+                const destruct_idx = self.checker.cir.store.sliceRecordDestructs(destructure.destructs)[index];
+                const destruct = self.checker.cir.store.getRecordDestruct(destruct_idx);
+                break :blk destruct.kind.toPatternIdx();
+            },
+            .assign,
+            .as,
+            .applied_tag,
+            .nominal,
+            .nominal_external,
+            .list,
+            .tuple,
+            .num_literal,
+            .small_dec_literal,
+            .dec_literal,
+            .frac_f32_literal,
+            .frac_f64_literal,
+            .str_literal,
+            .str_interpolation,
+            .underscore,
+            .runtime_error,
+            => unreachable,
+        };
+    }
+
+    pub fn listFixedLen(self: @This(), pattern_idx: PatternId) usize {
+        const pattern = self.checker.cir.store.getPattern(pattern_idx);
+        return switch (pattern) {
+            .list => |list| self.checker.cir.store.slicePatterns(list.patterns).len,
+            .assign,
+            .as,
+            .applied_tag,
+            .nominal,
+            .nominal_external,
+            .record_destructure,
+            .tuple,
+            .num_literal,
+            .small_dec_literal,
+            .dec_literal,
+            .frac_f32_literal,
+            .frac_f64_literal,
+            .str_literal,
+            .str_interpolation,
+            .underscore,
+            .runtime_error,
+            => unreachable,
+        };
+    }
+
+    pub fn listHasRest(self: @This(), pattern_idx: PatternId) bool {
+        const pattern = self.checker.cir.store.getPattern(pattern_idx);
+        return switch (pattern) {
+            .list => |list| list.rest_info != null,
+            .assign,
+            .as,
+            .applied_tag,
+            .nominal,
+            .nominal_external,
+            .record_destructure,
+            .tuple,
+            .num_literal,
+            .small_dec_literal,
+            .dec_literal,
+            .frac_f32_literal,
+            .frac_f64_literal,
+            .str_literal,
+            .str_interpolation,
+            .underscore,
+            .runtime_error,
+            => unreachable,
+        };
+    }
+
+    pub fn listRestPattern(self: @This(), pattern_idx: PatternId) ?PatternId {
+        const pattern = self.checker.cir.store.getPattern(pattern_idx);
+        return switch (pattern) {
+            .list => |list| list.rest_info.?.pattern,
+            .assign,
+            .as,
+            .applied_tag,
+            .nominal,
+            .nominal_external,
+            .record_destructure,
+            .tuple,
+            .num_literal,
+            .small_dec_literal,
+            .dec_literal,
+            .frac_f32_literal,
+            .frac_f64_literal,
+            .str_literal,
+            .str_interpolation,
+            .underscore,
+            .runtime_error,
+            => unreachable,
+        };
+    }
+};
+
 fn patternNeedsExhaustiveness(self: *const Self, pattern_idx: CIR.Pattern.Idx) bool {
-    const pattern = self.cir.store.getPattern(pattern_idx);
-    return switch (pattern) {
-        .assign, .underscore, .runtime_error => false,
-        .as => |as_pattern| self.patternNeedsExhaustiveness(as_pattern.pattern),
-        .applied_tag,
-        .list,
-        .num_literal,
-        .small_dec_literal,
-        .dec_literal,
-        .frac_f32_literal,
-        .frac_f64_literal,
-        .str_literal,
-        .str_interpolation,
-        => true,
-        .tuple => |tuple| {
-            for (self.cir.store.slicePatterns(tuple.patterns)) |elem_pattern_idx| {
-                if (self.patternNeedsExhaustiveness(elem_pattern_idx)) return true;
-            }
-            return false;
-        },
-        .record_destructure => |destructure| {
-            for (self.cir.store.sliceRecordDestructs(destructure.destructs)) |destruct_idx| {
-                const destruct = self.cir.store.getRecordDestruct(destruct_idx);
-                const sub_pattern_idx = switch (destruct.kind) {
-                    .Required => |sub_pattern| sub_pattern,
-                    .SubPattern => |sub_pattern| sub_pattern,
-                    .Rest => |sub_pattern| sub_pattern,
-                };
-                if (self.patternNeedsExhaustiveness(sub_pattern_idx)) return true;
-            }
-            return false;
-        },
-        .nominal => |nominal| self.patternNeedsExhaustiveness(nominal.backing_pattern),
-        .nominal_external => |nominal| self.patternNeedsExhaustiveness(nominal.backing_pattern),
-    };
+    return PatternRefutability.canMiss(CirPatternRefutabilityAdapter, .{ .checker = self }, pattern_idx);
 }
 
 const PatternBinding = struct {
@@ -11374,9 +11567,8 @@ fn checkExpr(self: *Self, expr_idx: CIR.Expr.Idx, env: *Env, expected: Expected)
 
             // Check the the body of the expr
             // If we have an expected function, use that as the expr's expected type
-            const saved_empirical_exhaustiveness_depth = self.empirical_exhaustiveness_depth;
-            self.empirical_exhaustiveness_depth = 0;
-            defer self.empirical_exhaustiveness_depth = saved_empirical_exhaustiveness_depth;
+            const exhaustiveness_scope = self.exhaustiveness_context.resetForRuntimeFunction();
+            defer exhaustiveness_scope.leave();
 
             const body_is_delayed_dependency = !is_immediate_callee;
             if (body_is_delayed_dependency) self.delayed_dependency_depth += 1;
@@ -12897,7 +13089,7 @@ fn closeAbsentConstructedPayloadVars(
 }
 
 fn pendingExhaustivenessMode(self: *const Self) ProblemStore.PendingStaticExhaustivenessMode {
-    return if (self.empirical_exhaustiveness_depth == 0) .static else .empirical;
+    return self.exhaustiveness_context.pendingStaticMode();
 }
 
 fn checkDestructureExhaustiveness(

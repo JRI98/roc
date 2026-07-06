@@ -17,6 +17,7 @@ const LirProgram = lir_core.Program;
 const RootMetadata = lir_core.RootMetadata.RootMetadata;
 const CheckedArithmetic = lir_core.CheckedArithmetic;
 const const_store = check.ConstStore;
+const PatternRefutability = can.PatternRefutability;
 
 /// Runtime field order for a named record field.
 pub const RuntimeRecordFieldSchema = struct {
@@ -2154,29 +2155,214 @@ const Lowerer = struct {
         return try self.result.store.addCFStmt(.{ .jump = .{ .target = miss_info.join_id } });
     }
 
+    const LambdaMonoPatternRefutabilityAdapter = struct {
+        pub const PatternId = LambdaMono.PatId;
+
+        lowerer: *Lowerer,
+
+        pub fn patternClass(self: @This(), pat_id: PatternId) PatternRefutability.PatternClass {
+            const pat_data = self.lowerer.pat(pat_id);
+            return switch (pat_data.data) {
+                .bind,
+                .wildcard,
+                => .cannot_miss,
+                .as,
+                .nominal,
+                => .child,
+                .record => .record,
+                .tuple => .sequence,
+                .list => .list,
+                .tag,
+                .callable,
+                .int_lit,
+                .dec_lit,
+                .frac_f32_lit,
+                .frac_f64_lit,
+                .str_lit,
+                .str_pattern,
+                => .can_miss,
+            };
+        }
+
+        pub fn child(self: @This(), pat_id: PatternId) PatternId {
+            const pat_data = self.lowerer.pat(pat_id);
+            return switch (pat_data.data) {
+                .as => |as| as.pattern,
+                .nominal => |inner| inner,
+                .bind,
+                .wildcard,
+                .record,
+                .tuple,
+                .list,
+                .tag,
+                .callable,
+                .int_lit,
+                .dec_lit,
+                .frac_f32_lit,
+                .frac_f64_lit,
+                .str_lit,
+                .str_pattern,
+                => unreachable,
+            };
+        }
+
+        pub fn sequenceLen(self: @This(), pat_id: PatternId) usize {
+            const pat_data = self.lowerer.pat(pat_id);
+            return switch (pat_data.data) {
+                .tuple => |items| self.lowerer.program.patSpan(items).len,
+                .bind,
+                .wildcard,
+                .as,
+                .record,
+                .list,
+                .tag,
+                .callable,
+                .nominal,
+                .int_lit,
+                .dec_lit,
+                .frac_f32_lit,
+                .frac_f64_lit,
+                .str_lit,
+                .str_pattern,
+                => unreachable,
+            };
+        }
+
+        pub fn sequenceChild(self: @This(), pat_id: PatternId, index: usize) PatternId {
+            const pat_data = self.lowerer.pat(pat_id);
+            return switch (pat_data.data) {
+                .tuple => |items| self.lowerer.program.patSpan(items)[index],
+                .bind,
+                .wildcard,
+                .as,
+                .record,
+                .list,
+                .tag,
+                .callable,
+                .nominal,
+                .int_lit,
+                .dec_lit,
+                .frac_f32_lit,
+                .frac_f64_lit,
+                .str_lit,
+                .str_pattern,
+                => unreachable,
+            };
+        }
+
+        pub fn recordLen(self: @This(), pat_id: PatternId) usize {
+            const pat_data = self.lowerer.pat(pat_id);
+            return switch (pat_data.data) {
+                .record => |fields| self.lowerer.program.recordDestructSpan(fields).len,
+                .bind,
+                .wildcard,
+                .as,
+                .tuple,
+                .list,
+                .tag,
+                .callable,
+                .nominal,
+                .int_lit,
+                .dec_lit,
+                .frac_f32_lit,
+                .frac_f64_lit,
+                .str_lit,
+                .str_pattern,
+                => unreachable,
+            };
+        }
+
+        pub fn recordChild(self: @This(), pat_id: PatternId, index: usize) PatternId {
+            const pat_data = self.lowerer.pat(pat_id);
+            return switch (pat_data.data) {
+                .record => |fields| self.lowerer.program.recordDestructSpan(fields)[index].pattern,
+                .bind,
+                .wildcard,
+                .as,
+                .tuple,
+                .list,
+                .tag,
+                .callable,
+                .nominal,
+                .int_lit,
+                .dec_lit,
+                .frac_f32_lit,
+                .frac_f64_lit,
+                .str_lit,
+                .str_pattern,
+                => unreachable,
+            };
+        }
+
+        pub fn listFixedLen(self: @This(), pat_id: PatternId) usize {
+            const pat_data = self.lowerer.pat(pat_id);
+            return switch (pat_data.data) {
+                .list => |list| list.patterns.len,
+                .bind,
+                .wildcard,
+                .as,
+                .record,
+                .tuple,
+                .tag,
+                .callable,
+                .nominal,
+                .int_lit,
+                .dec_lit,
+                .frac_f32_lit,
+                .frac_f64_lit,
+                .str_lit,
+                .str_pattern,
+                => unreachable,
+            };
+        }
+
+        pub fn listHasRest(self: @This(), pat_id: PatternId) bool {
+            const pat_data = self.lowerer.pat(pat_id);
+            return switch (pat_data.data) {
+                .list => |list| list.rest != null,
+                .bind,
+                .wildcard,
+                .as,
+                .record,
+                .tuple,
+                .tag,
+                .callable,
+                .nominal,
+                .int_lit,
+                .dec_lit,
+                .frac_f32_lit,
+                .frac_f64_lit,
+                .str_lit,
+                .str_pattern,
+                => unreachable,
+            };
+        }
+
+        pub fn listRestPattern(self: @This(), pat_id: PatternId) ?PatternId {
+            const pat_data = self.lowerer.pat(pat_id);
+            return switch (pat_data.data) {
+                .list => |list| list.rest.?.pattern,
+                .bind,
+                .wildcard,
+                .as,
+                .record,
+                .tuple,
+                .tag,
+                .callable,
+                .nominal,
+                .int_lit,
+                .dec_lit,
+                .frac_f32_lit,
+                .frac_f64_lit,
+                .str_lit,
+                .str_pattern,
+                => unreachable,
+            };
+        }
+    };
+
     fn patternCanMiss(self: *Lowerer, pat_id: LambdaMono.PatId) bool {
-        const pat_data = self.pat(pat_id);
-        return switch (pat_data.data) {
-            .bind, .wildcard => false,
-            .as => |as| self.patternCanMiss(as.pattern),
-            .record => |fields| blk: {
-                for (self.program.recordDestructSpan(fields)) |field| {
-                    if (self.patternCanMiss(field.pattern)) break :blk true;
-                }
-                break :blk false;
-            },
-            .tuple => |items| blk: {
-                for (self.program.patSpan(items)) |item| {
-                    if (self.patternCanMiss(item)) break :blk true;
-                }
-                break :blk false;
-            },
-            // Only `[.. as rest]` / `[..]` imposes no length constraint and is
-            // irrefutable; any fixed elements or an exact length can fail.
-            .list => |list| list.patterns.len > 0 or list.rest == null,
-            .nominal => |inner| self.patternCanMiss(inner),
-            .tag, .callable, .int_lit, .dec_lit, .frac_f32_lit, .frac_f64_lit, .str_lit, .str_pattern => true,
-        };
+        return PatternRefutability.canMiss(LambdaMonoPatternRefutabilityAdapter, .{ .lowerer = self }, pat_id);
     }
 
     fn lowerPatternThen(self: *Lowerer, pat_id: LambdaMono.PatId, source: LIR.LocalId, on_match: LIR.CFStmtId, miss: ?PatternMiss, continuation: LIR.CFStmtId) Common.LowerError!LIR.CFStmtId {

@@ -24,9 +24,11 @@ const GraphTypeFinals = solve.GraphTypeFinals;
 
 const Allocator = std.mem.Allocator;
 const checked = check.CheckedModule;
+const ExhaustivenessContext = check.ExhaustivenessContext;
 const names = check.CheckedNames;
 const static_dispatch = check.StaticDispatchRegistry;
 const Ident = base.Ident;
+const PatternRefutability = can.PatternRefutability;
 
 /// Internal control surface for Monotype specialization cache integration.
 pub const SpecializationCacheControl = struct {
@@ -5997,10 +5999,10 @@ const BodyContext = struct {
     owner_template: names.ProcTemplate,
     owner_context_fn_key: names.TypeDigest,
     current_fn_key: names.TypeDigest,
+    comptime_exhaustiveness_context: ExhaustivenessContext.Context,
     generated_encoder_source_fn_ty: ?checked.CheckedTypeId,
     generated_encoder_source_expr: ?checked.CheckedExprId,
     generated_encoder_lambda_index: u64,
-    comptime_exhaustiveness_depth: u32,
     binders: BinderMap,
     typed_binders: TypedBinders,
     local_proc_contexts: std.AutoHashMap(checked.PatternBinderId, LocalProcContext),
@@ -6235,10 +6237,10 @@ const BodyContext = struct {
             .owner_template = owner_template,
             .owner_context_fn_key = .{},
             .current_fn_key = .{},
+            .comptime_exhaustiveness_context = .{},
             .generated_encoder_source_fn_ty = null,
             .generated_encoder_source_expr = null,
             .generated_encoder_lambda_index = 0,
-            .comptime_exhaustiveness_depth = 0,
             .binders = BinderMap.init(allocator),
             .typed_binders = TypedBinders.init(allocator),
             .local_proc_contexts = std.AutoHashMap(checked.PatternBinderId, LocalProcContext).init(allocator),
@@ -6814,10 +6816,10 @@ const BodyContext = struct {
         errdefer child.deinit();
         child.owner_context_fn_key = self.owner_context_fn_key;
         child.current_fn_key = current_fn_key;
+        child.comptime_exhaustiveness_context = self.comptime_exhaustiveness_context;
         child.generated_encoder_source_fn_ty = self.generated_encoder_source_fn_ty;
         child.generated_encoder_source_expr = self.generated_encoder_source_expr;
         child.generated_encoder_lambda_index = self.generated_encoder_lambda_index;
-        child.comptime_exhaustiveness_depth = self.comptime_exhaustiveness_depth;
         child.source_region_override = self.source_region_override;
         child.current_entry_root = self.current_entry_root;
 
@@ -7975,8 +7977,8 @@ const BodyContext = struct {
         self.builder.program.current_loc = try self.sourceLocFor(body_region);
         self.builder.program.current_region = body_region;
 
-        const saved_comptime_depth = self.resetComptimeExhaustivenessDepth();
-        defer self.restoreComptimeExhaustivenessDepth(saved_comptime_depth);
+        const exhaustiveness_scope = self.comptime_exhaustiveness_context.resetForRuntimeFunction();
+        defer exhaustiveness_scope.leave();
 
         const args = try self.allocator.alloc(BodyTypedLocal, checked_args.len);
         defer self.allocator.free(args);
@@ -8202,23 +8204,13 @@ const BodyContext = struct {
         expr_id: checked.CheckedExprId,
         ty: Type.TypeId,
     ) Allocator.Error!DraftExprId {
-        self.comptime_exhaustiveness_depth += 1;
-        defer self.comptime_exhaustiveness_depth -= 1;
+        const exhaustiveness_scope = self.comptime_exhaustiveness_context.enterCompileTimeRoot();
+        defer exhaustiveness_scope.leave();
         return try self.lowerExprAtType(expr_id, ty);
     }
 
-    fn inComptimeExhaustivenessContext(self: *const BodyContext) bool {
-        return self.comptime_exhaustiveness_depth != 0;
-    }
-
-    fn resetComptimeExhaustivenessDepth(self: *BodyContext) u32 {
-        const saved = self.comptime_exhaustiveness_depth;
-        self.comptime_exhaustiveness_depth = 0;
-        return saved;
-    }
-
-    fn restoreComptimeExhaustivenessDepth(self: *BodyContext, saved: u32) void {
-        self.comptime_exhaustiveness_depth = saved;
+    fn shouldRecordComptimeSite(self: *const BodyContext, kind: ExhaustivenessContext.SiteKind) bool {
+        return self.comptime_exhaustiveness_context.shouldRecordSite(kind);
     }
 
     fn loweringOwnHoistedConstRoot(self: *BodyContext, entry: checked.HoistedConstEntry) bool {
@@ -13848,7 +13840,7 @@ const BodyContext = struct {
         if (expected_ret_ty != null) try self.constrainTypeToMono(checked_ret_ty, ret_ty);
         return .{
             .ret_ty = try self.lowerTypeCell(checked_ret_ty),
-            .data = try self.lowerDivergentExprDataAtType(operand, ret_ty),
+            .data = try self.lowerDivergentExprForEffectDataAtType(operand, ret_ty),
         };
     }
 
@@ -20299,43 +20291,234 @@ const BodyContext = struct {
         };
     }
 
+    const CheckedPatternRefutabilityAdapter = struct {
+        pub const PatternId = checked.CheckedPatternId;
+
+        ctx: *BodyContext,
+
+        pub fn patternClass(self: @This(), pattern_id: PatternId) PatternRefutability.PatternClass {
+            const pattern = self.ctx.view.bodies.pattern(pattern_id);
+            return switch (pattern.data) {
+                .pending,
+                .assign,
+                .underscore,
+                .runtime_error,
+                => .cannot_miss,
+                .as,
+                .nominal,
+                => .child,
+                .tuple => .sequence,
+                .record_destructure => .record,
+                .list => .list,
+                .applied_tag,
+                .num_literal,
+                .small_dec_literal,
+                .dec_literal,
+                .frac_f32_literal,
+                .frac_f64_literal,
+                .str_literal,
+                .str_interpolation,
+                => .can_miss,
+            };
+        }
+
+        pub fn child(self: @This(), pattern_id: PatternId) PatternId {
+            const pattern = self.ctx.view.bodies.pattern(pattern_id);
+            return switch (pattern.data) {
+                .as => |as| as.pattern,
+                .nominal => |nominal| nominal.backing_pattern,
+                .pending,
+                .assign,
+                .applied_tag,
+                .record_destructure,
+                .list,
+                .tuple,
+                .num_literal,
+                .small_dec_literal,
+                .dec_literal,
+                .frac_f32_literal,
+                .frac_f64_literal,
+                .str_literal,
+                .str_interpolation,
+                .underscore,
+                .runtime_error,
+                => unreachable,
+            };
+        }
+
+        pub fn sequenceLen(self: @This(), pattern_id: PatternId) usize {
+            const pattern = self.ctx.view.bodies.pattern(pattern_id);
+            return switch (pattern.data) {
+                .tuple => |items| items.len,
+                .pending,
+                .assign,
+                .as,
+                .applied_tag,
+                .nominal,
+                .record_destructure,
+                .list,
+                .num_literal,
+                .small_dec_literal,
+                .dec_literal,
+                .frac_f32_literal,
+                .frac_f64_literal,
+                .str_literal,
+                .str_interpolation,
+                .underscore,
+                .runtime_error,
+                => unreachable,
+            };
+        }
+
+        pub fn sequenceChild(self: @This(), pattern_id: PatternId, index: usize) PatternId {
+            const pattern = self.ctx.view.bodies.pattern(pattern_id);
+            return switch (pattern.data) {
+                .tuple => |items| items[index],
+                .pending,
+                .assign,
+                .as,
+                .applied_tag,
+                .nominal,
+                .record_destructure,
+                .list,
+                .num_literal,
+                .small_dec_literal,
+                .dec_literal,
+                .frac_f32_literal,
+                .frac_f64_literal,
+                .str_literal,
+                .str_interpolation,
+                .underscore,
+                .runtime_error,
+                => unreachable,
+            };
+        }
+
+        pub fn recordLen(self: @This(), pattern_id: PatternId) usize {
+            const pattern = self.ctx.view.bodies.pattern(pattern_id);
+            return switch (pattern.data) {
+                .record_destructure => |destructs| destructs.len,
+                .pending,
+                .assign,
+                .as,
+                .applied_tag,
+                .nominal,
+                .list,
+                .tuple,
+                .num_literal,
+                .small_dec_literal,
+                .dec_literal,
+                .frac_f32_literal,
+                .frac_f64_literal,
+                .str_literal,
+                .str_interpolation,
+                .underscore,
+                .runtime_error,
+                => unreachable,
+            };
+        }
+
+        pub fn recordChild(self: @This(), pattern_id: PatternId, index: usize) PatternId {
+            const pattern = self.ctx.view.bodies.pattern(pattern_id);
+            return switch (pattern.data) {
+                .record_destructure => |destructs| switch (destructs[index].kind) {
+                    .required, .sub_pattern, .rest => |child_pattern| child_pattern,
+                },
+                .pending,
+                .assign,
+                .as,
+                .applied_tag,
+                .nominal,
+                .list,
+                .tuple,
+                .num_literal,
+                .small_dec_literal,
+                .dec_literal,
+                .frac_f32_literal,
+                .frac_f64_literal,
+                .str_literal,
+                .str_interpolation,
+                .underscore,
+                .runtime_error,
+                => unreachable,
+            };
+        }
+
+        pub fn listFixedLen(self: @This(), pattern_id: PatternId) usize {
+            const pattern = self.ctx.view.bodies.pattern(pattern_id);
+            return switch (pattern.data) {
+                .list => |list| list.patterns.len,
+                .pending,
+                .assign,
+                .as,
+                .applied_tag,
+                .nominal,
+                .record_destructure,
+                .tuple,
+                .num_literal,
+                .small_dec_literal,
+                .dec_literal,
+                .frac_f32_literal,
+                .frac_f64_literal,
+                .str_literal,
+                .str_interpolation,
+                .underscore,
+                .runtime_error,
+                => unreachable,
+            };
+        }
+
+        pub fn listHasRest(self: @This(), pattern_id: PatternId) bool {
+            const pattern = self.ctx.view.bodies.pattern(pattern_id);
+            return switch (pattern.data) {
+                .list => |list| list.rest != null,
+                .pending,
+                .assign,
+                .as,
+                .applied_tag,
+                .nominal,
+                .record_destructure,
+                .tuple,
+                .num_literal,
+                .small_dec_literal,
+                .dec_literal,
+                .frac_f32_literal,
+                .frac_f64_literal,
+                .str_literal,
+                .str_interpolation,
+                .underscore,
+                .runtime_error,
+                => unreachable,
+            };
+        }
+
+        pub fn listRestPattern(self: @This(), pattern_id: PatternId) ?PatternId {
+            const pattern = self.ctx.view.bodies.pattern(pattern_id);
+            return switch (pattern.data) {
+                .list => |list| list.rest.?.pattern,
+                .pending,
+                .assign,
+                .as,
+                .applied_tag,
+                .nominal,
+                .record_destructure,
+                .tuple,
+                .num_literal,
+                .small_dec_literal,
+                .dec_literal,
+                .frac_f32_literal,
+                .frac_f64_literal,
+                .str_literal,
+                .str_interpolation,
+                .underscore,
+                .runtime_error,
+                => unreachable,
+            };
+        }
+    };
+
     fn patternCanMiss(self: *BodyContext, pattern_id: checked.CheckedPatternId) bool {
-        const pattern = self.view.bodies.pattern(pattern_id);
-        return switch (pattern.data) {
-            .assign,
-            .underscore,
-            => false,
-            .as => |as| self.patternCanMiss(as.pattern),
-            .nominal => |nominal| self.patternCanMiss(nominal.backing_pattern),
-            .tuple => |items| blk: {
-                for (items) |child| {
-                    if (self.patternCanMiss(child)) break :blk true;
-                }
-                break :blk false;
-            },
-            .record_destructure => |destructs| blk: {
-                for (destructs) |destruct| {
-                    const child = switch (destruct.kind) {
-                        .required, .sub_pattern, .rest => |child_pattern| child_pattern,
-                    };
-                    if (self.patternCanMiss(child)) break :blk true;
-                }
-                break :blk false;
-            },
-            .applied_tag,
-            .list,
-            .num_literal,
-            .small_dec_literal,
-            .dec_literal,
-            .frac_f32_literal,
-            .frac_f64_literal,
-            .str_literal,
-            .str_interpolation,
-            => true,
-            .pending,
-            .runtime_error,
-            => false,
-        };
+        return PatternRefutability.canMiss(CheckedPatternRefutabilityAdapter, .{ .ctx = self }, pattern_id);
     }
 
     fn recordDestructsNeedExplicitRest(self: *BodyContext, destructs: []const checked.CheckedRecordDestruct) bool {
@@ -21108,24 +21291,33 @@ const BodyContext = struct {
     }
 
     fn matchComptimeSite(self: *BodyContext, expr_id: checked.CheckedExprId, match: anytype) Allocator.Error!?DraftComptimeSiteId {
-        if (!self.inComptimeExhaustivenessContext()) return null;
         if (match.skip_exhaustiveness) return null;
-        const branch_regions = try self.matchBranchRegions(match.branches);
-        defer self.allocator.free(branch_regions);
-        const expr = self.view.bodies.expr(expr_id);
-        const site_kind: Ast.ComptimeSiteKind = switch (match.comptime_site_kind) {
+        const shared_site_kind: ExhaustivenessContext.SiteKind = switch (match.comptime_site_kind) {
             .match => .match,
             .destructure => .destructure,
         };
-        const checked_site = switch (match.comptime_site_kind) {
-            .match => self.view.exhaustiveness_sites.lookupByMatchExpr(expr_id),
-            .destructure => blk: {
-                if (match.branches.len != 1) break :blk null;
-                const patterns = match.branches[0].patternsSlice(self.view.bodies);
-                if (patterns.len != 1) break :blk null;
-                break :blk self.view.exhaustiveness_sites.lookupByDestructurePattern(patterns[0].pattern);
-            },
+        if (!self.shouldRecordComptimeSite(shared_site_kind)) return null;
+        const branch_regions = try self.matchBranchRegions(match.branches);
+        defer self.allocator.free(branch_regions);
+        const expr = self.view.bodies.expr(expr_id);
+        const site_kind: Ast.ComptimeSiteKind = switch (shared_site_kind) {
+            .match => .match,
+            .destructure => .destructure,
+            .if_ => Common.invariant("if site kind reached match comptime site lowering"),
         };
+        const checked_site = if (ExhaustivenessContext.siteHasPendingStaticDiagnostic(shared_site_kind))
+            switch (shared_site_kind) {
+                .match => self.view.exhaustiveness_sites.lookupByMatchExpr(expr_id),
+                .destructure => blk: {
+                    if (match.branches.len != 1) break :blk null;
+                    const patterns = match.branches[0].patternsSlice(self.view.bodies);
+                    if (patterns.len != 1) break :blk null;
+                    break :blk self.view.exhaustiveness_sites.lookupByDestructurePattern(patterns[0].pattern);
+                },
+                .if_ => Common.invariant("if site kind reached checked match site lookup"),
+            }
+        else
+            null;
         return try self.addComptimeSite(site_kind, expr.source_region, checked_site, branch_regions);
     }
 
@@ -21142,8 +21334,8 @@ const BodyContext = struct {
     }
 
     fn ifComptimeSite(self: *BodyContext, expr_id: checked.CheckedExprId, if_: anytype) Allocator.Error!?DraftComptimeSiteId {
-        if (!self.inComptimeExhaustivenessContext()) return null;
         if (!if_.warn_unused_branches) return null;
+        if (!self.shouldRecordComptimeSite(.if_)) return null;
         const branch_regions = try self.ifBranchRegions(if_);
         defer self.allocator.free(branch_regions);
         const expr = self.view.bodies.expr(expr_id);
@@ -21711,7 +21903,7 @@ const BodyContext = struct {
         } }));
 
         const source_expr = try self.localExpr(source_local, value_ty);
-        const comptime_site = if (self.inComptimeExhaustivenessContext() and self.patternCanMiss(pattern))
+        const comptime_site = if (self.shouldRecordComptimeSite(.destructure) and self.patternCanMiss(pattern))
             try self.addComptimeSite(.destructure, statement.source_region, self.view.exhaustiveness_sites.lookupByDestructurePattern(pattern), &.{})
         else
             null;
@@ -21819,6 +22011,51 @@ const BodyContext = struct {
         } };
     }
 
+    fn lowerDivergentExprForEffectDataAtType(
+        self: *BodyContext,
+        checked_expr_id: checked.CheckedExprId,
+        ty: Type.TypeId,
+    ) Allocator.Error!BodyExprData {
+        const effect_ty = try self.lowerExprType(checked_expr_id);
+        const effect = try self.lowerDivergentExprAtType(checked_expr_id, effect_ty);
+        const stmt = try self.addStmt(.{ .expr = effect });
+        return .{ .block = .{
+            .statements = try self.addStmtSpan(&[_]DraftStmtId{stmt}),
+            .final_expr = try self.unreachableAfterDivergentStatementExpr(ty),
+        } };
+    }
+
+    fn lowerFirstDivergentExprForEffectDataAtType(
+        self: *BodyContext,
+        items: []const checked.CheckedExprId,
+        ty: Type.TypeId,
+    ) Allocator.Error!BodyExprData {
+        for (items) |item| {
+            if (self.checkedExprDivergesInLoweredRuntime(item)) {
+                return try self.lowerDivergentExprForEffectDataAtType(item, ty);
+            }
+        }
+        Common.invariant("checked expression was marked divergent but no divergent child was found");
+    }
+
+    fn lowerDivergentRecordForEffectDataAtType(
+        self: *BodyContext,
+        record: anytype,
+        ty: Type.TypeId,
+    ) Allocator.Error!BodyExprData {
+        if (record.ext) |ext| {
+            if (self.checkedExprDivergesInLoweredRuntime(ext)) {
+                return try self.lowerDivergentExprForEffectDataAtType(ext, ty);
+            }
+        }
+        for (record.fields) |field| {
+            if (self.checkedExprDivergesInLoweredRuntime(field.value)) {
+                return try self.lowerDivergentExprForEffectDataAtType(field.value, ty);
+            }
+        }
+        Common.invariant("checked record expression was marked divergent but no divergent child was found");
+    }
+
     fn lowerDivergentExprDataAtType(
         self: *BodyContext,
         checked_expr_id: checked.CheckedExprId,
@@ -21826,19 +22063,97 @@ const BodyContext = struct {
     ) Allocator.Error!BodyExprData {
         const checked_expr = self.view.bodies.expr(checked_expr_id);
         return switch (checked_expr.data) {
-            .block => |block| try self.lowerBlock(block, ty),
-            .match_ => |match| try self.exprIdAsDivergentData(try self.lowerMatchExpr(checked_expr_id, match, ty)),
-            .if_ => |if_| try self.exprIdAsDivergentData(try self.lowerIfExpr(checked_expr_id, if_, ty)),
-            .ellipsis => .{ .crash = try self.addStringLiteral("not implemented") },
             .crash => |msg| .{ .crash = try self.lowerStringLiteral(msg) },
-            .runtime_error => .{ .crash = try self.addStringLiteral("runtime error") },
+            .ellipsis => .{ .crash = try self.addStringLiteral("not implemented") },
+            .break_ => try self.breakCurrentLoopExprData(),
+            .return_ => |ret| .{ .return_ = try self.lowerReturn(ret) },
             .expect_err => |expect_err| .{ .expect_err = .{
                 .msg = try self.lowerExpectErrMessage(expect_err.expr, expect_err.snippet),
                 .region = checked_expr.source_region,
             } },
-            .break_ => try self.breakCurrentLoopExprData(),
-            .return_ => |ret| .{ .return_ = try self.lowerReturn(ret) },
-            else => Common.invariant("checked expression was marked divergent but has no divergent lowering path"),
+            .str => |items| try self.lowerFirstDivergentExprForEffectDataAtType(items, ty),
+            .list => |items| try self.lowerFirstDivergentExprForEffectDataAtType(items, ty),
+            .tuple => |items| try self.lowerFirstDivergentExprForEffectDataAtType(items, ty),
+            .block => |block| try self.lowerBlock(block, ty),
+            .match_ => |match| try self.exprIdAsDivergentData(try self.lowerMatchExpr(checked_expr_id, match, ty)),
+            .if_ => |if_| try self.exprIdAsDivergentData(try self.lowerIfExpr(checked_expr_id, if_, ty)),
+            .call => |call| blk: {
+                if (self.checkedExprDivergesInLoweredRuntime(call.func)) {
+                    break :blk try self.lowerDivergentExprForEffectDataAtType(call.func, ty);
+                }
+                break :blk try self.lowerFirstDivergentExprForEffectDataAtType(call.args, ty);
+            },
+            .record => |record| try self.lowerDivergentRecordForEffectDataAtType(record, ty),
+            .tag => |tag| try self.lowerFirstDivergentExprForEffectDataAtType(tag.args, ty),
+            .nominal => |nominal| try self.lowerDivergentExprForEffectDataAtType(nominal.backing_expr, ty),
+            .binop => |binop| blk: {
+                if (self.checkedExprDivergesInLoweredRuntime(binop.lhs)) {
+                    break :blk try self.lowerDivergentExprForEffectDataAtType(binop.lhs, ty);
+                }
+                if (self.checkedExprDivergesInLoweredRuntime(binop.rhs)) {
+                    break :blk try self.lowerDivergentExprForEffectDataAtType(binop.rhs, ty);
+                }
+                Common.invariant("checked binary expression was marked divergent but no divergent child was found");
+            },
+            .unary_minus,
+            .unary_not,
+            .dbg,
+            => |child| try self.lowerDivergentExprForEffectDataAtType(child, ty),
+            .expect => |child| if (self.builder.inline_expects == .run)
+                try self.lowerDivergentExprForEffectDataAtType(child, ty)
+            else
+                Common.invariant("omitted checked expect reached divergent runtime lowering"),
+            .field_access => |field| try self.lowerDivergentExprForEffectDataAtType(field.receiver, ty),
+            .structural_eq => |eq| blk: {
+                if (self.checkedExprDivergesInLoweredRuntime(eq.lhs)) {
+                    break :blk try self.lowerDivergentExprForEffectDataAtType(eq.lhs, ty);
+                }
+                if (self.checkedExprDivergesInLoweredRuntime(eq.rhs)) {
+                    break :blk try self.lowerDivergentExprForEffectDataAtType(eq.rhs, ty);
+                }
+                Common.invariant("checked structural equality was marked divergent but no divergent child was found");
+            },
+            .structural_hash => |hash| blk: {
+                if (self.checkedExprDivergesInLoweredRuntime(hash.value)) {
+                    break :blk try self.lowerDivergentExprForEffectDataAtType(hash.value, ty);
+                }
+                if (self.checkedExprDivergesInLoweredRuntime(hash.hasher)) {
+                    break :blk try self.lowerDivergentExprForEffectDataAtType(hash.hasher, ty);
+                }
+                Common.invariant("checked structural hash was marked divergent but no divergent child was found");
+            },
+            .tuple_access => |access| try self.lowerDivergentExprForEffectDataAtType(access.tuple, ty),
+            .for_ => |for_| try self.lowerDivergentExprForEffectDataAtType(for_.expr, ty),
+            .run_low_level => |low_level| try self.lowerFirstDivergentExprForEffectDataAtType(low_level.args, ty),
+            .pending,
+            .num,
+            .frac_f32,
+            .frac_f64,
+            .dec,
+            .dec_small,
+            .num_from_numeral,
+            .typed_int,
+            .typed_frac,
+            .typed_num_from_numeral,
+            .str_from_quote,
+            .str_segment,
+            .bytes_literal,
+            .lookup_local,
+            .lookup_external,
+            .lookup_required,
+            .empty_list,
+            .empty_record,
+            .zero_argument_tag,
+            .closure,
+            .lambda,
+            .dispatch_call,
+            .interpolation,
+            .method_eq,
+            .type_dispatch_call,
+            .runtime_error,
+            .anno_only,
+            .hosted_lambda,
+            => Common.invariant("non-divergent checked expression reached divergent lowering"),
         };
     }
 
@@ -23008,7 +23323,7 @@ const BodyContext = struct {
     ) Allocator.Error!DraftStmt {
         const value = try self.lowerExpr(expr);
         const value_ty = try self.exprType(value);
-        const comptime_site = if (self.inComptimeExhaustivenessContext() and self.patternCanMiss(pattern))
+        const comptime_site = if (self.shouldRecordComptimeSite(.destructure) and self.patternCanMiss(pattern))
             try self.addComptimeSite(.destructure, source_region, self.view.exhaustiveness_sites.lookupByDestructurePattern(pattern), &.{})
         else
             null;
