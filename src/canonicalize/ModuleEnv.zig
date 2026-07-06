@@ -115,7 +115,7 @@ pub const CommonIdents = extern struct {
     is_eq: Ident.Idx,
     to_hash: Ident.Idx,
     parser_for: Ident.Idx,
-    encode_to: Ident.Idx,
+    encoder_for: Ident.Idx,
 
     // Type/module names
     @"try": Ident.Idx,
@@ -236,7 +236,7 @@ pub const CommonIdents = extern struct {
             .is_eq = try common.insertIdent(gpa, Ident.for_text("is_eq")),
             .to_hash = try common.insertIdent(gpa, Ident.for_text("to_hash")),
             .parser_for = try common.insertIdent(gpa, Ident.for_text("parser_for")),
-            .encode_to = try common.insertIdent(gpa, Ident.for_text("encode_to")),
+            .encoder_for = try common.insertIdent(gpa, Ident.for_text("encoder_for")),
             .@"try" = try common.insertIdent(gpa, Ident.for_text("Try")),
             .out_of_range = try common.insertIdent(gpa, Ident.for_text("OutOfRange")),
             .builtin_module = try common.insertIdent(gpa, Ident.for_text("Builtin")),
@@ -353,7 +353,7 @@ pub const CommonIdents = extern struct {
             .is_eq = common.findIdent("is_eq") orelse unreachable,
             .to_hash = common.findIdent("to_hash") orelse unreachable,
             .parser_for = common.findIdent("parser_for") orelse unreachable,
-            .encode_to = common.findIdent("encode_to") orelse unreachable,
+            .encoder_for = common.findIdent("encoder_for") orelse unreachable,
             .@"try" = common.findIdent("Try") orelse unreachable,
             .out_of_range = common.findIdent("OutOfRange") orelse unreachable,
             .builtin_module = common.findIdent("Builtin") orelse unreachable,

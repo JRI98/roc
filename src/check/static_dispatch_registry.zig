@@ -297,7 +297,7 @@ fn generatedStructuralTargetForMethodBinding(
 
     const common = module.commonIdents();
     if (method_ident.eql(common.parser_for)) return .generated_structural_parser;
-    if (method_ident.eql(common.encode_to)) return .generated_structural_encoder;
+    if (method_ident.eql(common.encoder_for)) return .generated_structural_encoder;
     return null;
 }
 
@@ -597,7 +597,7 @@ pub const StaticDispatchResultMode = union(enum) {
     parser_for: struct {
         structural_allowed: bool,
     },
-    encode_to: struct {
+    encoder_for: struct {
         structural_allowed: bool,
     },
 };
@@ -1406,8 +1406,8 @@ fn staticDispatchResultModeForCheckedValueCall(
             .structural_allowed = true,
         } };
     }
-    if (method_name.eql(common.encode_to)) {
-        return .{ .encode_to = .{
+    if (method_name.eql(common.encoder_for)) {
+        return .{ .encoder_for = .{
             .structural_allowed = true,
         } };
     }

@@ -1174,7 +1174,7 @@ concrete monomorphic dispatcher type has already determined the owner.
 Some method registry targets are generated structural targets rather than
 procedure bodies. A nominal or opaque type can opt in to a compiler-derived
 structural codec with an annotation-only associated method such as
-`parser_for : _` or `encode_to : _`. Canonicalization may represent this marker
+`parser_for : _` or `encoder_for : _`. Canonicalization may represent this marker
 as `e_anno_only` or, for hosted/type-module processing, as a zero-argument
 `e_hosted_lambda`; `CheckedModule.method_registry` records it explicitly as a
 generated parser or generated encoder target. Post-check lowering must consume
@@ -1206,7 +1206,8 @@ thing = Json.parse(json_str)?
 thing = Json.parse_trailing_commas(json_str)?
 thing = Json.Utf8.parse(json_bytes)?
 
-json_str = Json.encode(thing)?
+json_str = Json.to_str(thing)
+json_str = Json.to_str_try(floaty_thing)?
 json_bytes = Json.Utf8.encode(thing)?
 
 headers = Encoding.HttpHeader.parse(raw_headers)?
@@ -1214,23 +1215,28 @@ headers = Encoding.HttpHeader.parse(raw_headers)?
 
 The convenience functions construct the internal format state directly, call the
 value or type's ordinary method, validate the remaining state if the format
-requires it, and return the final `Try`. They do not need a required `init`,
-`finish`, or `default` hook. The runtime cursor types are implementation
-details of the builtin format module, not public `Json.State` or
+requires it, and return the final public value. A fallible helper such as
+`Json.to_str_try` returns a `Try` and preserves the encoder's error type. This
+is for values that cannot always be represented as JSON, such as `F32` or `F64`
+values that are `NaN`, positive infinity, or negative infinity. An infallible
+helper such as `Json.to_str` requires an empty encoder error type and returns
+the string directly. They do not need a required `init`, `finish`, or `default`
+hook. The runtime cursor types are implementation details of the builtin format
+module, not public `Json.State` or
 `Encoding.HttpHeader.State` APIs.
 
 The underlying parse method is public and callable. It is deliberately curried:
 
 ```roc
 a.parser_for : encoding -> (state -> Try({ value : a, rest : state }, err))
-a.encode_to : a, encoding -> (state -> Try(state, err))
+a.encoder_for : encoding -> (a, state -> Try(state, err))
 ```
 
-`parser_for` is a method on the value type being produced. `encode_to` is a method
-on the value being serialized. Structural types get these methods from the
-compiler. Nominal types may define them explicitly, and structural derivation
-uses those explicit nominal methods when a field, payload, list element, nested
-value, or other sub-shape has that nominal type.
+`parser_for` is a method on the value type being produced. `encoder_for` is a
+method on the value type being serialized. Structural types get these methods
+from the compiler. Nominal types may define them explicitly, and structural
+derivation uses those explicit nominal methods when a field, payload, list
+element, nested value, or other sub-shape has that nominal type.
 
 The `encoding` argument is the pure format/configuration value used to construct
 the specialized parser. It may represent choices such as JSON object field
@@ -1239,7 +1245,9 @@ header matching mode. The `state`
 argument is the runtime cursor or output state. Keeping these separate matters:
 parser construction can transform the requested structural shape before the
 runtime scan starts, while the returned runtime function threads only the cursor
-state and parsed values.
+state and parsed values. Encoder construction can similarly precompute
+shape-specific metadata before the returned runtime function receives the value
+and output state.
 
 For example, the builtin HTTP header helper inside `Builtin.Encoding` has this
 shape:
@@ -1268,8 +1276,10 @@ zero-sized internal encoding value.
 
 The error type is inferred from the format methods. All `Try` errors in one
 parse or encode operation unify with the public function's returned error type.
-When a concrete operation cannot fail, its error type is empty, so an exhaustive
-`Ok(value) = Json.encode(thing)` binding is accepted.
+When a concrete encode operation cannot fail, its error type is empty, so
+`Json.to_str` can bind the underlying encoder result with an exhaustive
+`Ok(encoded_state) = ...` pattern and return `Str` directly. When a concrete
+encode operation can fail, `Json.to_str_try` returns `Try(Str, err)` instead.
 
 Checking derives structural methods by emitting ordinary static-dispatch
 constraints. For example, deriving `a.parser_for` for a concrete shape asks the
@@ -1710,7 +1720,7 @@ JsonEncoding :: [Default, CamelCase, TrailingCommas].{
 			TrailingCommas => True
 		}
 
-	parse_str : JsonEncoding, JsonState -> Try({ value : Str, rest : JsonState }, Json)
+	parse_str : JsonEncoding, JsonState -> Try({ value : Str, rest : JsonState }, Json.ParseErr)
 	parse_record_field : JsonEncoding, Encoding.FieldName.FieldNames(_shape), JsonState -> Try(
 		[
 			Field({ field : Encoding.FieldName(_shape), rest : JsonState }),
@@ -1719,18 +1729,20 @@ JsonEncoding :: [Default, CamelCase, TrailingCommas].{
 			Continue({ rest : JsonState }),
 			Done({ rest : JsonState }),
 		],
-		Json,
+		Json.ParseErr,
 	)
-	skip_record_field : JsonEncoding, JsonState -> Try(JsonState, Json)
-	missing_record_field : JsonEncoding, Str, JsonState -> Json
+	skip_record_field : JsonEncoding, JsonState -> Try(JsonState, Json.ParseErr)
+	missing_record_field : JsonEncoding, Str, JsonState -> Json.ParseErr
 	missing_optional_field : JsonEncoding, Str, JsonState -> [Missing]
-	parse_tag_union : JsonEncoding, Encoding.ParseTagUnionSpec(a), JsonState -> Try({ value : a, rest : JsonState }, Json)
+	parse_tag_union : JsonEncoding, Encoding.ParseTagUnionSpec(a), JsonState -> Try({ value : a, rest : JsonState }, Json.ParseErr)
 }
 
-Json := [MissingRequired, InvalidJson].{
-	parse : Str -> Try(a, Json)
+Json :: {}.{
+	ParseErr : [MissingRequiredField(Str), InvalidJson(Str)]
+
+	parse : Str -> Try(a, Json.ParseErr)
 		where [
-			a.parser_for : JsonEncoding -> (JsonState -> Try({ value : a, rest : JsonState }, Json)),
+			a.parser_for : JsonEncoding -> (JsonState -> Try({ value : a, rest : JsonState }, Json.ParseErr)),
 		]
 	parse = |json| {
 		Shape : a
@@ -1742,14 +1754,14 @@ Json := [MissingRequired, InvalidJson].{
 				if Str.is_empty(Str.trim_start(rest)) {
 					Ok(parsed.value)
 				} else {
-					Err(Json.InvalidJson)
+					Err(InvalidJson("Invalid JSON"))
 				}
 		}
 	}
 
-	parse_trailing_commas : Str -> Try(a, Json)
+	parse_trailing_commas : Str -> Try(a, Json.ParseErr)
 		where [
-			a.parser_for : JsonEncoding -> (JsonState -> Try({ value : a, rest : JsonState }, Json)),
+			a.parser_for : JsonEncoding -> (JsonState -> Try({ value : a, rest : JsonState }, Json.ParseErr)),
 		]
 	parse_trailing_commas = |json| {
 		Shape : a
@@ -1761,14 +1773,14 @@ Json := [MissingRequired, InvalidJson].{
 				if Str.is_empty(Str.trim_start(rest)) {
 					Ok(parsed.value)
 				} else {
-					Err(Json.InvalidJson)
+					Err(InvalidJson("Invalid JSON"))
 				}
 		}
 	}
 
-	parser_camel : () -> (Str -> Try(a, Json))
+	parser_camel : () -> (Str -> Try(a, Json.ParseErr))
 		where [
-			a.parser_for : JsonEncoding -> (JsonState -> Try({ value : a, rest : JsonState }, Json)),
+			a.parser_for : JsonEncoding -> (JsonState -> Try({ value : a, rest : JsonState }, Json.ParseErr)),
 		]
 	parser_camel = || {
 		Shape : a
@@ -1782,7 +1794,7 @@ Json := [MissingRequired, InvalidJson].{
 					if Str.is_empty(Str.trim_start(rest)) {
 						Ok(parsed.value)
 					} else {
-						Err(Json.InvalidJson)
+						Err(InvalidJson("Invalid JSON"))
 					}
 			}
 		}
@@ -1806,7 +1818,7 @@ The exact derived parser type for a JSON record is:
 		},
 		rest : JsonState,
 	},
-	Json,
+	Json.ParseErr,
 ))
 ```
 
@@ -1818,7 +1830,7 @@ The exact derived parser type for an externally tagged JSON union is:
 		value : [Admin({ name : Str }), Guest],
 		rest : JsonState,
 	},
-	Json,
+	Json.ParseErr,
 ))
 ```
 
@@ -1875,7 +1887,7 @@ parse_token = |input| {
 }
 ```
 
-Encoding is symmetric. Structural `encode_to` methods call the format's output
+Encoding is symmetric. Structural `encoder_for` methods call the format's output
 methods for strings, records, tag unions, lists, and other shapes. A format's
 output state owns whatever builder it needs. JSON encoding to `Str` allocates
 the final string in the ordinary way, and JSON UTF-8 encoding produces
@@ -1885,15 +1897,18 @@ inferred `Try` error type as parsing.
 The public structural encode method has this exact shape:
 
 ```roc
-value.encode_to : value, encoding -> (state -> Try(state, err))
+value.encoder_for : encoding -> (value, state -> Try(state, err))
 ```
 
 Generated encoders compose child error rows. JSON helpers that cannot fail use a
 named `_never_fails` row variable so they can sequence with encoders that can
-fail. JSON `F32` and `F64` encoders are the deliberate failing scalar case:
-finite values encode as JSON numbers, while `NaN`, positive infinity, and
-negative infinity return `Err(NaN)`, `Err(Infinity)`, or
-`Err(NegativeInfinity)`. They must not encode non-finite values as JSON `null`.
+fail. `Json.to_str` requires the final structural encoder's error type to be the
+empty row `[]`; `Json.to_str_try` preserves the final structural encoder's error
+type as `Try(Str, err)`. JSON `F32` and `F64` encoders are the deliberate failing
+scalar case: finite values encode as JSON numbers, while `NaN`, positive
+infinity, and negative infinity return `Err(NaN)`, `Err(Infinity)`, or
+`Err(NegativeInfinity)`. They must not encode non-finite values as JSON `null`,
+and they do not satisfy `Json.to_str`'s infallible encoder requirement.
 
 For a concrete record, the compiler can derive:
 
@@ -1901,7 +1916,7 @@ For a concrete record, the compiler can derive:
 {
 	count : U64,
 	foo_bar : Str,
-}.encode_to : { count : U64, foo_bar : Str }, MyEncoding -> (MyEncoding -> Try(MyEncoding, MyErr))
+}.encoder_for : MyEncoding -> ({ count : U64, foo_bar : Str }, MyState -> Try(MyState, MyErr))
 ```
 
 The encoding type owns the output methods required by that shape:
@@ -1909,12 +1924,47 @@ The encoding type owns the output methods required by that shape:
 ```roc
 MyEncoding :: [Out(Str)].{
 	rename_field : MyEncoding, Str -> Str
-	begin_record : MyEncoding -> Try(MyEncoding, MyErr)
-	encode_record_field : Str, MyEncoding -> Try(MyEncoding, MyErr)
-	end_record : MyEncoding -> Try(MyEncoding, MyErr)
-	encode_str : Str, MyEncoding -> Try(MyEncoding, MyErr)
-	encode_u64 : U64, MyEncoding -> Try(MyEncoding, MyErr)
+	encode_record :
+		MyState,
+		U64,
+		(MyState, (MyState, Str, (MyState -> Try(MyState, MyErr)) -> Try(MyState, MyErr)) -> Try(MyState, MyErr))
+			-> Try(MyState, MyErr)
+	encode_str : Str, MyState -> Try(MyState, MyErr)
+	encode_u64 : U64, MyState -> Try(MyState, MyErr)
 }
+```
+
+The `U64` argument is the statically-known number of record fields that will be
+encoded. The callback receives the current state and a field writer supplied by
+the format. Generated record encoders call the field writer once per present
+field:
+
+```roc
+MyEncoding.encode_record(
+	state,
+	2,
+	|state0, field| {
+		state1 = field(state0, "count", |s| encode_count(value.count, s))?
+		field(state1, "foo-bar", |s| encode_foo_bar(value.foo_bar, s))
+	},
+)
+```
+
+Tuples and lists use the same ownership pattern, except their writer has no
+field name:
+
+```roc
+encode_tuple :
+	MyState,
+	U64,
+	(MyState, (MyState, (MyState -> Try(MyState, MyErr)) -> Try(MyState, MyErr)) -> Try(MyState, MyErr))
+		-> Try(MyState, MyErr)
+
+encode_list :
+	MyState,
+	U64,
+	(MyState, (MyState, (MyState -> Try(MyState, MyErr)) -> Try(MyState, MyErr)) -> Try(MyState, MyErr))
+		-> Try(MyState, MyErr)
 ```
 
 ### Compile-Time Literal Conversions
@@ -2562,8 +2612,8 @@ lowering a body. A specialization request is identified by:
 const SpecIdentity = struct {
     callable: CallableIdentity,
     source_fn_ty_digest: TypeDigest,
-    mono_fn_ty_digest: TypeDigest,
-    mono_fn_ty: TypeId,
+    request_fn_ty_digest: TypeDigest,
+    request_fn_ty: TypeId,
 };
 
 const CallableIdentity = union(enum) {
@@ -2589,19 +2639,39 @@ const SpecStatus = enum {
 
 const SpecRecord = struct {
     identity: SpecIdentity,
+    request_fn_ty: TypeId,
+    request_fn_ty_digest: TypeDigest,
+    solved_fn_ty: TypeId,
+    solved_fn_ty_digest: TypeDigest,
     fn: FnId,
     status: SpecStatus,
 };
 ```
 
 `source_fn_ty_digest` records the checked source function type after
-instantiation into the requesting graph. `mono_fn_ty_digest` records the closed
-requested function type. The digests make lookup fast, but they are not the only
-correctness check. When a digest match is found, the store must also verify
-the checked callable identity and exact structural equality of the closed
-Monotype function type. Digest collisions are therefore harmless.
+instantiation into the requesting graph. `request_fn_ty_digest` records the
+closed function type REQUESTED by the call site that reserved the record. The
+digests make lookup fast, but they are not the only correctness check. When a
+digest match is found, the store must also verify the checked callable identity
+and exact structural equality of the closed Monotype function type. Digest
+collisions are therefore harmless.
 
-The in-memory builder owns a transient hash table from `SpecIdentity` to
+The identity is immutable: it is written once when the record is reserved and
+never rewritten, so no structure that indexes by identity ever needs a rekey or
+a second synchronized entry. Later refinements are data on the record. The
+request view may be refined while the record is still `reserved` — once per
+deferring graph that seals its view of the request; the solved view records the
+body's solved type when the record becomes `ready`. Each refinement registers
+an *alias* lookup entry (the new digest also reaches the same record), so a
+request shaped like the current request reuses the record even after the body
+solved a more specific type — the record is never widened (the one-way snapshot
+rule above). Status transitions (`reserved → lowering → ready`) and both
+refinements happen only through the specialization store's API. A record
+loaded from another shard's cache is a finished snapshot and matches only at
+its solved shape: a requester that matches it already has the solved type, so
+no evidence needs to flow back.
+
+The in-memory builder owns a transient hash table from lookup keys to
 `SpecId`, plus the append-only `SpecRecord` array. The output program owns the
 records and the function bodies, not the hash table. A loaded cache file may
 build a transient hash table over the mapped records, but the file itself stores
