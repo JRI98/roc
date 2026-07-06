@@ -93,6 +93,7 @@ const CheckedModuleCacheRunError = eval.BuiltinModules.InitError || Allocator.Er
     TestUnexpectedResult,
 };
 const OverwriteFilesUnderDirError = Allocator.Error || std.Io.Dir.OpenError || std.Io.Dir.SelectiveWalker.Error || std.Io.Dir.WriteFileError;
+const CorruptCheckedModuleCacheError = Allocator.Error || std.Io.Dir.OpenError || std.Io.Dir.SelectiveWalker.Error || std.Io.Dir.ReadFileAllocError || std.Io.Dir.WriteFileError || error{FileNotFound};
 const TypeCheckedResult = messages.TypeCheckedResult;
 const CompileFailure = messages.CompileFailure;
 const DiscoveredLocalImport = messages.DiscoveredLocalImport;
@@ -3183,7 +3184,7 @@ pub const Coordinator = struct {
         if (!manager.config.enabled) return;
 
         const entries_dir = manager.config.getCheckedArtifactCacheDir(manager.allocator) catch {
-            manager.stats.recordStoreFailure();
+            manager.recordStoreFailure();
             return;
         };
         defer manager.allocator.free(entries_dir);
@@ -3201,13 +3202,13 @@ pub const Coordinator = struct {
 
         var env_writer = CompactWriter.init();
         serializeForCache(ModuleEnv, artifact.moduleEnvConst(), &env_writer, arena_alloc) catch {
-            manager.stats.recordStoreFailure();
+            manager.recordStoreFailure();
             return;
         };
 
         var artifact_writer = CompactWriter.init();
         serializeForCache(check.CheckedArtifact.CheckedModuleArtifact, artifact, &artifact_writer, arena_alloc) catch {
-            manager.stats.recordStoreFailure();
+            manager.recordStoreFailure();
             return;
         };
 
@@ -3215,7 +3216,7 @@ pub const Coordinator = struct {
         const artifact_len = artifact_writer.total_bytes;
 
         const entry = manager.allocator.alloc(u8, checked_module_cache_header_len + env_len + artifact_len) catch {
-            manager.stats.recordStoreFailure();
+            manager.recordStoreFailure();
             return;
         };
         defer manager.allocator.free(entry);
@@ -3241,7 +3242,10 @@ pub const Coordinator = struct {
 
         const current_env = mod.moduleEnv() orelse return false;
         if (!resolvedDirectImportsHaveCheckedOutput(current_env, imported_artifacts)) return false;
-        const cache_key = self.checkedModuleCacheKey(current_env, imported_envs, imported_artifacts, platform_requirement_context, explicit_roots) catch return false;
+        const cache_key = self.checkedModuleCacheKey(current_env, imported_envs, imported_artifacts, platform_requirement_context, explicit_roots) catch {
+            manager.stats.recordMiss();
+            return false;
+        };
 
         return self.installCachedCheckedArtifact(pkg, mod, cache_key, current_env);
     }
@@ -3295,6 +3299,10 @@ pub const Coordinator = struct {
         defer if (source_owned) module_alloc.free(source);
 
         const serialized_ptr: *ModuleEnv.Serialized = @ptrCast(@alignCast(buffer.ptr));
+        serialized_ptr.validate(buffer.len) catch {
+            manager.stats.recordInvalidation();
+            return false;
+        };
         const cached_env = serialized_ptr.deserializeWithMutableTypes(
             @intFromPtr(buffer.ptr),
             module_alloc,
@@ -5520,6 +5528,37 @@ fn overwriteFilesUnderDir(allocator: Allocator, absolute_dir: []const u8, conten
     return overwritten;
 }
 
+fn corruptFirstCheckedModuleEnvIdentBytesLen(allocator: Allocator, checked_module_cache_dir: []const u8) CorruptCheckedModuleCacheError!void {
+    const env_ident_bytes_len_offset =
+        checked_module_cache_header_len +
+        @offsetOf(ModuleEnv.Serialized, "common") +
+        @offsetOf(base.CommonEnv.Serialized, "idents") +
+        @offsetOf(base.Ident.Store.Serialized, "interner") +
+        @offsetOf(base.SmallStringInterner.Serialized, "bytes") +
+        @offsetOf(collections.SafeList(u8).Serialized, "len");
+
+    const io = std.testing.io;
+    var dir = try std.Io.Dir.openDirAbsolute(io, checked_module_cache_dir, .{ .iterate = true });
+    defer dir.close(io);
+
+    var walker = try dir.walk(allocator);
+    defer walker.deinit();
+
+    while (try walker.next(io)) |entry| {
+        if (entry.kind != .file) continue;
+
+        const bytes = try dir.readFileAlloc(io, entry.path, allocator, .limited(@import("cache_config.zig").Constants.MAX_CACHE_SIZE));
+        defer allocator.free(bytes);
+        if (bytes.len < env_ident_bytes_len_offset + @sizeOf(u64)) continue;
+
+        std.mem.writeInt(u64, bytes[env_ident_bytes_len_offset..][0..8], std.math.maxInt(u64), .little);
+        try dir.writeFile(io, .{ .sub_path = entry.path, .data = bytes });
+        return;
+    }
+
+    return error.FileNotFound;
+}
+
 test "Coordinator checked cache key requires checked direct imports" {
     const allocator = std.testing.allocator;
 
@@ -5675,6 +5714,27 @@ test "Coordinator corrupt checked module cache entries compile from source" {
 
     const second = try compileAppWithCheckedModuleCache(allocator, cache_dir, "test/str/app_message.roc");
     try std.testing.expectEqual(@as(u32, 0), second.build.cache_hits);
+    try std.testing.expect(second.build.modules_compiled > 0);
+    try std.testing.expect(second.cache.invalidations > 0);
+}
+
+test "Coordinator corrupt checked module cache env relocations compile from source" {
+    const allocator = std.testing.allocator;
+
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    const cache_dir = try tmp_dir.dir.realPathFileAlloc(std.testing.io, ".", allocator);
+    defer allocator.free(cache_dir);
+
+    const first = try compileAppWithCheckedModuleCache(allocator, cache_dir, "test/str/app_message.roc");
+    try std.testing.expect(first.cache.stores > 0);
+
+    const config = CacheConfig{ .cache_dir = cache_dir };
+    const checked_module_cache_dir = try config.getCheckedArtifactCacheDir(allocator);
+    defer allocator.free(checked_module_cache_dir);
+    try corruptFirstCheckedModuleEnvIdentBytesLen(allocator, checked_module_cache_dir);
+
+    const second = try compileAppWithCheckedModuleCache(allocator, cache_dir, "test/str/app_message.roc");
     try std.testing.expect(second.build.modules_compiled > 0);
     try std.testing.expect(second.cache.invalidations > 0);
 }

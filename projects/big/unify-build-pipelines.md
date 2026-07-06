@@ -220,9 +220,6 @@ work, it deduplicates it.
 
 ## Related projects
 
-- [Cache hardening](../small/cache-hardening.md) — the cache the unified
-  core wires everywhere; hardening its edges pays off more once every
-  pipeline uses it.
 - [Decision-tree match compiler](../big/decision-tree-match-compiler.md)
   — the single-lowerer story pairs with this project's single-orchestrator
   story.

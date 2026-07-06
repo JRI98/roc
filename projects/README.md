@@ -70,7 +70,6 @@ Small:
 - [small/store-generation-counters.md](small/store-generation-counters.md)
 - [small/checked-arithmetic-lir-ops.md](small/checked-arithmetic-lir-ops.md)
 - [small/shared-checked-type-traversal.md](small/shared-checked-type-traversal.md)
-- [small/cache-hardening.md](small/cache-hardening.md)
 - [small/glue-consumes-committed-layouts.md](small/glue-consumes-committed-layouts.md)
 - [small/structural-hoist-contexts.md](small/structural-hoist-contexts.md)
 
@@ -95,12 +94,11 @@ leverage and keeps prerequisites satisfied:
 5. `big/total-dispatch-plans.md`
 6. `big/immutable-specialization-identity.md`
 7. `small/shared-checked-type-traversal.md`
-8. `small/cache-hardening.md`
-9. `big/arc-certifier-lattice-join.md`
-10. `big/arc-inserter-join-summaries.md`
-11. `big/exact-numeral-pipeline.md`
-12. `big/generalization-time-ambiguity.md`
-13. `big/unify-build-pipelines.md`
-14. `big/decision-tree-match-compiler.md`
-15. `small/glue-consumes-committed-layouts.md`
-16. `small/structural-hoist-contexts.md`
+8. `big/arc-certifier-lattice-join.md`
+9. `big/arc-inserter-join-summaries.md`
+10. `big/exact-numeral-pipeline.md`
+11. `big/generalization-time-ambiguity.md`
+12. `big/unify-build-pipelines.md`
+13. `big/decision-tree-match-compiler.md`
+14. `small/glue-consumes-committed-layouts.md`
+15. `small/structural-hoist-contexts.md`

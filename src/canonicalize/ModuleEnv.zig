@@ -3235,6 +3235,35 @@ pub const Serialized = extern struct {
     _reserved_flags: [2]u8 = .{ 0, 0 },
     _padding: [6]u8 = .{ 0, 0, 0, 0, 0, 0 },
 
+    comptime {
+        const renamed_fields = [_]collections.serde_validation.FieldRename{
+            .{ .owner = "display_module_name_idx", .serialized = "display_module_name_idx_reserved" },
+            .{ .owner = "qualified_module_ident", .serialized = "qualified_module_ident_reserved" },
+            .{ .owner = "self_module_identity", .serialized = "self_module_identity_reserved" },
+            .{ .owner = "evaluation_order", .serialized = "evaluation_order_reserved" },
+            .{ .owner = "import_mapping", .serialized = "import_mapping_reserved" },
+        };
+        const serialized_only_fields = [_][]const u8{
+            "self_module_identity_padding", // Fixed-width padding for the reserved identity slot.
+            "runtime_prepared_padding", // Fixed-width padding for the serialized bool.
+            "_reserved_flags", // Format-reserved bytes for fields removed from ModuleEnv.
+            "_padding", // Tail padding kept explicit and zeroed for deterministic bytes.
+        };
+        collections.serde_validation.assertBidirectionalFieldSet(
+            Self,
+            Serialized,
+            &.{},
+            &serialized_only_fields,
+            &renamed_fields,
+        );
+        collections.serde_validation.assertSerializedRelocatable(Serialized);
+    }
+
+    pub fn validate(self: *const Serialized, backing_len: usize) error{CorruptArtifact}!void {
+        if (backing_len < @sizeOf(Serialized)) return error.CorruptArtifact;
+        try collections.validateSerializedRelocations(Serialized, self, backing_len);
+    }
+
     /// Serialize a ModuleEnv into this Serialized struct, appending data to the writer
     pub fn serialize(
         self: *Serialized,
