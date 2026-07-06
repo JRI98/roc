@@ -4069,15 +4069,25 @@ test "call-pattern scans direct call and function reference capture operands" {
         .id = check.CheckedModule.CaptureId.generatedLift(0),
         .value = return_expr,
     }});
-    const fn_ref = try program.addExpr(.{ .ty = unit_ty, .data = .{ .fn_ref = .{
-        .fn_id = @enumFromInt(0),
-        .captures = captures,
-    } } });
-    const call_proc = try program.addExpr(.{ .ty = unit_ty, .data = .{ .call_proc = .{
-        .callee = .{ .lifted = @enumFromInt(0) },
-        .args = Ast.Span(Ast.ExprId).empty(),
-        .captures = captures,
-    } } });
+    const fn_ref = try program.addExpr(.{
+        .ty = unit_ty,
+        .data = .{
+            .fn_ref = .{
+                .fn_id = undefined, // not read by the call-pattern scanners under test
+                .captures = captures,
+            },
+        },
+    });
+    const call_proc = try program.addExpr(.{
+        .ty = unit_ty,
+        .data = .{
+            .call_proc = .{
+                .callee = undefined, // not read by the call-pattern scanners under test
+                .args = Ast.Span(Ast.ExprId).empty(),
+                .captures = captures,
+            },
+        },
+    });
 
     try std.testing.expect(exprContainsReturn(&program, fn_ref));
     try std.testing.expectEqual(@as(usize, 1), localUseCountInExpr(&program, local, fn_ref));

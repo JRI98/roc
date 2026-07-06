@@ -7823,12 +7823,37 @@ const BodyContext = struct {
                 .view = self.view,
                 .declaration = self.view.types.nominalDeclarationById(id),
             },
-            .local_box_payload_capability,
-            .imported_declaration,
-            .imported_box_payload_capability,
-            .builtin,
-            .opaque_without_backing,
-            => null,
+            .local_box_payload_capability => blk: {
+                const lookup = self.builder.nominalDeclarationFor(self.view, nominal) orelse
+                    Common.invariant("local box-payload nominal had no declaration source");
+                break :blk .{
+                    .view = lookup.view,
+                    .declaration = lookup.declaration,
+                };
+            },
+            .imported_declaration => |imported| blk: {
+                const source_view = self.builder.moduleForId(checked.importedNominalDeclarationModuleId(imported));
+                break :blk .{
+                    .view = source_view,
+                    .declaration = source_view.types.nominalDeclarationById(imported.declaration),
+                };
+            },
+            .imported_box_payload_capability => blk: {
+                const lookup = self.builder.nominalDeclarationFor(self.view, nominal) orelse
+                    Common.invariant("imported box-payload nominal had no declaration source");
+                break :blk .{
+                    .view = lookup.view,
+                    .declaration = lookup.declaration,
+                };
+            },
+            .builtin => blk: {
+                const lookup = self.builder.nominalDeclarationFor(self.view, nominal) orelse break :blk null;
+                break :blk .{
+                    .view = lookup.view,
+                    .declaration = lookup.declaration,
+                };
+            },
+            .opaque_without_backing => null,
         };
     }
 

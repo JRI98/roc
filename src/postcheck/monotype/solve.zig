@@ -164,14 +164,14 @@ const RelationStamp = struct {
     right_version: u32,
 };
 
-const NominalBackingCacheKey = struct {
+const NominalBackingInstanceId = struct {
     module_bytes: [32]u8,
     declaration_id: u32,
     args: []const NodeId,
 };
 
 const NominalBackingCacheContext = struct {
-    pub fn hash(_: NominalBackingCacheContext, key: NominalBackingCacheKey) u64 {
+    pub fn hash(_: NominalBackingCacheContext, key: NominalBackingInstanceId) u64 {
         var hasher = std.hash.Wyhash.init(0);
         hasher.update(&key.module_bytes);
         var declaration_id = std.mem.nativeToLittle(u32, key.declaration_id);
@@ -185,7 +185,7 @@ const NominalBackingCacheContext = struct {
         return hasher.final();
     }
 
-    pub fn eql(_: NominalBackingCacheContext, left: NominalBackingCacheKey, right: NominalBackingCacheKey) bool {
+    pub fn eql(_: NominalBackingCacheContext, left: NominalBackingInstanceId, right: NominalBackingInstanceId) bool {
         return std.mem.eql(u8, left.module_bytes[0..], right.module_bytes[0..]) and
             left.declaration_id == right.declaration_id and
             nodeSliceEql(left.args, right.args);
@@ -234,7 +234,7 @@ pub const InstGraph = struct {
     /// keyed by the source declaration and the exact argument cells that seeded
     /// the declaration formal scope. This preserves per-argument correctness
     /// without rebuilding the same backing template repeatedly.
-    nominal_backings: std.HashMap(NominalBackingCacheKey, NodeId, NominalBackingCacheContext, 80),
+    nominal_backings: std.HashMap(NominalBackingInstanceId, NodeId, NominalBackingCacheContext, 80),
     /// Template body requests made while lowering this specialization,
     /// processed once its body is complete and its types are final.
     deferred_templates: std.ArrayList(DeferredTemplate) = .empty,
@@ -261,7 +261,7 @@ pub const InstGraph = struct {
             .dirty_set = std.AutoHashMap(NodeId, void).init(allocator),
             .row_exts = std.AutoHashMap(NodeId, NodeId).init(allocator),
             .row_parents = std.AutoHashMap(NodeId, std.ArrayList(NodeId)).init(allocator),
-            .nominal_backings = std.HashMap(NominalBackingCacheKey, NodeId, NominalBackingCacheContext, 80).init(allocator),
+            .nominal_backings = std.HashMap(NominalBackingInstanceId, NodeId, NominalBackingCacheContext, 80).init(allocator),
         };
         return graph;
     }
