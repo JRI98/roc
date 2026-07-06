@@ -1773,9 +1773,10 @@ fn parseSymbolMapCollectionTokens(
     open_tag: AST.Diagnostic.Tag,
     close_tag: AST.Diagnostic.Tag,
 ) std.mem.Allocator.Error!AST.SymbolMapEntry.Span {
+    const start = self.pos;
     self.expect(.OpenCurly) catch {
         _ = try self.pushMalformed(AST.SymbolMapEntry.Idx, open_tag, self.pos);
-        return .{ .span = .{ .start = 0, .len = 0 } };
+        return .{ .span = .{ .start = 0, .len = 0 }, .region = .{ .start = start, .end = self.pos } };
     };
     const top = self.store.scratchSymbolMapEntryTop();
     while (self.peek() != .CloseCurly and self.peek() != .EndOfFile) {
@@ -1787,9 +1788,9 @@ fn parseSymbolMapCollectionTokens(
     self.expect(.CloseCurly) catch {
         self.store.clearScratchSymbolMapEntriesFrom(top);
         _ = try self.pushMalformed(AST.SymbolMapEntry.Idx, close_tag, self.pos);
-        return .{ .span = .{ .start = 0, .len = 0 } };
+        return .{ .span = .{ .start = 0, .len = 0 }, .region = .{ .start = start, .end = self.pos } };
     };
-    return try self.store.symbolMapEntrySpanFrom(top);
+    return try self.store.symbolMapEntrySpanFrom(top, .{ .start = start, .end = self.pos });
 }
 
 fn parsePlatformHeaderTokens(self: *Parser) std.mem.Allocator.Error!AST.Header.Idx {

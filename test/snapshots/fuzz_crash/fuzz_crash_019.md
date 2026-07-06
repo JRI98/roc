@@ -1628,17 +1628,21 @@ Map(a, b) : Lis, (ab) -> List(b)
 
 MapML # Ag
 	: # Aon
-		List(),
+		List( # rg
+		),
 		(ab) -> # row
 			List(b) # z)
 
-line : () # Co
+line : ( # Cm
+) # Co
 
 Som : { foo : O, bar : g }
 
-Ml(a) : {}
+Ml(a) : { # ld
+}
 
-Soine(a) : {} #
+Soine(a) : { #
+} #
 
 Maybe(a) : [Somne]
 

@@ -2246,7 +2246,10 @@ pub const SymbolMapEntry = struct {
     region: TokenizedRegion,
 
     pub const Idx = enum(u32) { _ };
-    pub const Span = struct { span: base.DataSpan };
+    pub const Span = struct {
+        span: base.DataSpan,
+        region: TokenizedRegion = TokenizedRegion.empty(),
+    };
 };
 
 /// Single target entry: x64musl: { inputs: ["crt1.o", "host.o", app], output: Exe }
