@@ -112,6 +112,7 @@ const SnapshotError =
         BufferTooSmall,
         CacheRoundTripValidationFailed,
         CacheVersionHashMismatch,
+        CorruptSerializedModuleEnv,
         ErrFinalizingHTMLWriter,
         InvalidMagicNumber,
         MissingBuiltinModule,
