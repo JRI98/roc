@@ -1450,7 +1450,9 @@ const Inserter = struct {
 
         var uninitialized_owned = try path.owned.clone();
         defer uninitialized_owned.deinit();
-        uninitialized_owned.unset(switch_stmt.payload);
+        // The branch proves the cell uninitialized: the payload binding
+        // ends with nothing to release.
+        _ = self.transferForInit(&uninitialized_owned, switch_stmt.payload);
 
         try self.pushRewritePath(tasks, switch_stmt.initialized_branch, &initialized_owned, path.options, &state.initialized_branch);
         try self.pushRewritePath(tasks, switch_stmt.uninitialized_branch, &uninitialized_owned, path.options, &state.uninitialized_branch);
@@ -1997,7 +1999,9 @@ const Inserter = struct {
 
                     var uninitialized_owned = try path.owned.clone();
                     defer uninitialized_owned.deinit();
-                    uninitialized_owned.unset(switch_stmt.payload);
+                    // The branch proves the cell uninitialized: the payload
+                    // binding ends with nothing to release.
+                    _ = self.transferForInit(&uninitialized_owned, switch_stmt.payload);
 
                     try self.pushAnalysisPath(tasks, switch_stmt.initialized_branch, path.stop, &initialized_owned, path.exits, path.loop_keep, path.scoped_joins, path.seen);
                     try self.pushAnalysisPath(tasks, switch_stmt.uninitialized_branch, path.stop, &uninitialized_owned, path.exits, path.loop_keep, path.scoped_joins, path.seen);
@@ -2306,9 +2310,7 @@ const Inserter = struct {
         return !self.owned_param_override.contains(local);
     }
 
-    // =====================================================================
     // Ownership-transfer keying layer
-    // =====================================================================
     //
     // Every ownership-transfer decision in this pass routes through this
     // section, so the alias-to-unit keying rules live in exactly one place
