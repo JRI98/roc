@@ -3466,19 +3466,19 @@ fn processDocsSnapshot(
         return false;
     };
 
-    // 4. Get compiled modules and extract docs
-    const modules = build_env.getCompiledModules(allocator) catch |err| {
-        std.log.err("Failed to get compiled modules: {}", .{err});
+    // 4. Get documentable modules and extract docs
+    const modules = build_env.getDocumentationModules(allocator) catch |err| {
+        std.log.err("Failed to get documentable modules: {}", .{err});
         return false;
     };
     defer allocator.free(modules);
 
     if (modules.len == 0) {
-        std.log.err("No modules were compiled", .{});
+        std.log.err("No documentable modules were compiled", .{});
         return false;
     }
 
-    // Extract docs from each compiled module
+    // Extract docs from each documentable module
     var module_docs_list = std.ArrayList(docs_mod.DocModel.ModuleDocs).empty;
     defer {
         for (module_docs_list.items) |*md| md.deinit(allocator);
@@ -3501,8 +3501,8 @@ fn processDocsSnapshot(
         try module_docs_list.append(allocator, mod_docs);
     }
 
-    // Modules are collected in package hash-map order, which is not
-    // deterministic; docs output must be.
+    // Module collection can still depend on package hash-map order for
+    // non-platform roots, and docs output must be deterministic.
     std.mem.sort(docs_mod.DocModel.ModuleDocs, module_docs_list.items, {}, docs_mod.DocModel.moduleDocsLessThan);
 
     // Build PackageDocs
