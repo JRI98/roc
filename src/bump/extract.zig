@@ -435,6 +435,7 @@ const Extractor = struct {
                 .external => |external| .{ .external = .{
                     .url_id = try alloc.dupe(u8, external.url_id),
                     .major = external.major,
+                    .minor = external.minor,
                 } },
                 .unstable => |spec| return self.fail(.unstable_dependency_in_public_api, spec),
             };

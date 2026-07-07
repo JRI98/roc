@@ -292,11 +292,11 @@ test "changing nominal arity is major" {
     try std.testing.expectEqual(Magnitude.major, try diffMagnitude(&old, &new));
 }
 
-fn externalRefApi(major: u32) std.mem.Allocator.Error!PackageApi {
+fn externalRefApi(major: u32, minor: u32) std.mem.Allocator.Error!PackageApi {
     var api = PackageApi.init(gpa);
     errdefer api.deinit();
     const ref = try api.addType(.{ .named = .{
-        .origin = .{ .external = .{ .url_id = "example.com/json", .major = major } },
+        .origin = .{ .external = .{ .url_id = "example.com/json", .major = major, .minor = minor } },
         .path = "Json.Decoder",
         .args = &.{},
     } });
@@ -306,12 +306,33 @@ fn externalRefApi(major: u32) std.mem.Allocator.Error!PackageApi {
 }
 
 test "changing an external dependency major version in a signature is major" {
-    var old = try externalRefApi(1);
+    var old = try externalRefApi(1, 0);
     defer old.deinit();
-    var new = try externalRefApi(2);
+    var new = try externalRefApi(2, 0);
     defer new.deinit();
 
     try std.testing.expectEqual(Magnitude.major, try diffMagnitude(&old, &new));
+}
+
+test "changing an external dependency 0.X group in a signature is major" {
+    var old = try externalRefApi(0, 5);
+    defer old.deinit();
+    var new = try externalRefApi(0, 6);
+    defer new.deinit();
+
+    try std.testing.expectEqual(Magnitude.major, try diffMagnitude(&old, &new));
+}
+
+test "an external dependency patch difference within a 0.X group is not a change" {
+    // 0.5.1 and 0.5.2 of the same dependency render identically: only the
+    // 0.X compatibility group is part of type identity, mirroring version
+    // solving. Both sides here use group 0.5.
+    var old = try externalRefApi(0, 5);
+    defer old.deinit();
+    var new = try externalRefApi(0, 5);
+    defer new.deinit();
+
+    try std.testing.expectEqual(Magnitude.patch, try diffMagnitude(&old, &new));
 }
 
 test "magnitudes combine to the maximum" {

@@ -371,7 +371,8 @@ test "download URL validation parses optional version component" {
         try testing.expectEqual(@as(u32, 2), parsed.version.minor);
         try testing.expectEqual(@as(u32, 3), parsed.version.patch);
         try testing.expect(parsed.version.isPresent());
-        try testing.expectEqualStrings("example.com/packages", parsed.urlId(url));
+        try testing.expectEqualStrings("example.com/packages", parsed.urlIdPrefix(url));
+        try testing.expectEqualStrings("", parsed.urlIdSuffix(url));
     }
 
     {
@@ -381,18 +382,17 @@ test "download URL validation parses optional version component" {
         try testing.expectEqualStrings(expected_hash, parsed.hash);
         try testing.expectEqual(download.Version.none, parsed.version);
         try testing.expect(!parsed.version.isPresent());
-        try testing.expectEqualStrings("example.com/packages", parsed.urlId(url));
+        try testing.expectEqualStrings("example.com/packages", parsed.urlIdPrefix(url));
+        try testing.expectEqualStrings("", parsed.urlIdSuffix(url));
     }
 }
 
-test "download URL validation only recognizes strict version components" {
+test "download URL validation ignores non-version number sequences" {
     const expected_hash = "4ZGqXJtqH5n9wMmQ7nPQTU8zgHBNfZ3kcVnNcL3hKqXf";
     const urls = [_][]const u8{
-        "https://example.com/packages/v1.2.3/4ZGqXJtqH5n9wMmQ7nPQTU8zgHBNfZ3kcVnNcL3hKqXf.tar.zst",
         "https://example.com/packages/1.2/4ZGqXJtqH5n9wMmQ7nPQTU8zgHBNfZ3kcVnNcL3hKqXf.tar.zst",
         "https://example.com/packages/1.2.3.4/4ZGqXJtqH5n9wMmQ7nPQTU8zgHBNfZ3kcVnNcL3hKqXf.tar.zst",
         "https://example.com/packages/1.2.x/4ZGqXJtqH5n9wMmQ7nPQTU8zgHBNfZ3kcVnNcL3hKqXf.tar.zst",
-        "https://example.com/packages/-1.2.3/4ZGqXJtqH5n9wMmQ7nPQTU8zgHBNfZ3kcVnNcL3hKqXf.tar.zst",
         "https://example.com/packages/1.2.4294967296/4ZGqXJtqH5n9wMmQ7nPQTU8zgHBNfZ3kcVnNcL3hKqXf.tar.zst",
     };
 
@@ -402,7 +402,29 @@ test "download URL validation only recognizes strict version components" {
         try testing.expectEqualStrings(expected_hash, parsed.hash);
         try testing.expectEqual(download.Version.none, parsed.version);
         try testing.expect(!parsed.version.isPresent());
-        try testing.expectEqualStrings(url[8 .. url.len - "/4ZGqXJtqH5n9wMmQ7nPQTU8zgHBNfZ3kcVnNcL3hKqXf.tar.zst".len], parsed.urlId(url));
+        try testing.expectEqualStrings(url[8 .. url.len - "/4ZGqXJtqH5n9wMmQ7nPQTU8zgHBNfZ3kcVnNcL3hKqXf.tar.zst".len], parsed.urlIdPrefix(url));
+        try testing.expectEqualStrings("", parsed.urlIdSuffix(url));
+    }
+}
+
+test "download URL validation finds versions embedded in a path segment" {
+    const cases = [_]struct { url: []const u8, prefix: []const u8 }{
+        .{
+            .url = "https://example.com/packages/v1.2.3/4ZGqXJtqH5n9wMmQ7nPQTU8zgHBNfZ3kcVnNcL3hKqXf.tar.zst",
+            .prefix = "example.com/packages/v",
+        },
+        .{
+            .url = "https://example.com/packages/-1.2.3/4ZGqXJtqH5n9wMmQ7nPQTU8zgHBNfZ3kcVnNcL3hKqXf.tar.zst",
+            .prefix = "example.com/packages/-",
+        },
+    };
+
+    for (cases) |case| {
+        const parsed = try download.validateUrl(case.url);
+
+        try testing.expectEqual(download.Version{ .major = 1, .minor = 2, .patch = 3 }, parsed.version);
+        try testing.expectEqualStrings(case.prefix, parsed.urlIdPrefix(case.url));
+        try testing.expectEqualStrings("", parsed.urlIdSuffix(case.url));
     }
 }
 
@@ -432,7 +454,7 @@ test "download URL validation accepts 0.x versions" {
     for (cases) |case| {
         const parsed = try download.validateUrl(case.url);
         try testing.expectEqual(case.version, parsed.version);
-        try testing.expectEqualStrings("example.com/packages", parsed.urlId(case.url));
+        try testing.expectEqualStrings("example.com/packages", parsed.urlIdPrefix(case.url));
     }
 }
 

@@ -6052,6 +6052,10 @@ fn resolveUrlBundle(ctx: *CliCtx, url: []const u8) (CliError || error{OutOfMemor
             .url = url,
             .reason = "This URL uses the reserved version 0.0.0, which means \"no version\". The lowest publishable version is 0.0.1.",
         } }),
+        error.AmbiguousVersion => return ctx.fail(.{ .invalid_url = .{
+            .url = url,
+            .reason = "This URL contains more than one version number. A package URL must contain exactly one MAJOR.MINOR.PATCH version before its hash.",
+        } }),
         else => return ctx.fail(.{ .invalid_url = .{
             .url = url,
             .reason = "Invalid URL format or missing hash. URLs must end with a base58-encoded BLAKE3 hash filename (e.g., '<hash>.tar.zst').",
@@ -12900,9 +12904,14 @@ fn bumpExtractApi(ctx: *CliCtx, build_env: *compile.BuildEnv, side: []const u8) 
                 if (pkg.url) |*url_source| {
                     const parsed = base.url.parseUrlPath(url_source.url) catch break :origin_blk .{ .unstable = url_source.url };
                     if (!parsed.version.isPresent()) break :origin_blk .{ .unstable = url_source.url };
+                    const url_id = try std.fmt.allocPrint(ctx.arena, "{s}{s}", .{
+                        parsed.urlIdPrefix(url_source.url),
+                        parsed.urlIdSuffix(url_source.url),
+                    });
                     break :origin_blk .{ .external = .{
-                        .url_id = parsed.urlId(url_source.url),
+                        .url_id = url_id,
                         .major = parsed.version.major,
+                        .minor = parsed.version.minor,
                     } };
                 }
                 // Path dependencies have no stable published identity.

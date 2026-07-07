@@ -713,13 +713,6 @@ pub const PackageState = struct {
         self.root_file_state = state;
     }
 
-    pub fn urlId(self: *const PackageState) ?[]const u8 {
-        if (self.url) |url| {
-            return url.urlId();
-        }
-        return null;
-    }
-
     /// Ensure a module exists, creating it if necessary
     pub fn ensureModule(self: *PackageState, gpa: Allocator, name: []const u8, path: []const u8) Allocator.Error!ModuleId {
         if (self.module_names.get(name)) |id| {

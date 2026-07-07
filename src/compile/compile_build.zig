@@ -1193,13 +1193,6 @@ pub const BuildEnv = struct {
         provides_entries: std.ArrayListUnmanaged(ProvidesEntry) = .empty,
         targets_config: ?targets_config_mod.TargetsConfig = null,
 
-        fn urlId(self: *const Package) ?[]const u8 {
-            if (self.url) |url| {
-                return url.urlId();
-            }
-            return null;
-        }
-
         fn deinit(self: *Package, gpa: Allocator) void {
             if (self.url) |*url| url.deinit(gpa);
             if (self.targets_config) |tc| tc.deinit(gpa);

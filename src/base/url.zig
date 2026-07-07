@@ -3,13 +3,25 @@
 const std = @import("std");
 
 /// Compact slice coordinates for a package URL id inside a full URL.
+///
+/// The url id is everything between the scheme and the security hash with the
+/// version number removed. Since the version may appear anywhere in that
+/// range, the id is the concatenation of the spans before and after it (the
+/// suffix is empty for versionless URLs).
 pub const UrlId = struct {
-    start: u32,
-    len: u32,
+    prefix_start: u32,
+    prefix_len: u32,
+    suffix_start: u32 = 0,
+    suffix_len: u32 = 0,
 
-    pub fn slice(self: UrlId, url: []const u8) []const u8 {
-        const start: usize = self.start;
-        return url[start..][0..self.len];
+    pub fn prefix(self: UrlId, url: []const u8) []const u8 {
+        const start: usize = self.prefix_start;
+        return url[start..][0..self.prefix_len];
+    }
+
+    pub fn suffix(self: UrlId, url: []const u8) []const u8 {
+        const start: usize = self.suffix_start;
+        return url[start..][0..self.suffix_len];
     }
 };
 
@@ -70,15 +82,19 @@ pub const Version = struct {
 };
 
 /// The components parsed out of a package URL: the trailing content hash, the
-/// optional version path segment, and the span of the package's url id (the
-/// part between the scheme and the version/hash segments).
+/// optional version (which may appear anywhere before the hash), and the
+/// spans of the package's url id (everything else).
 pub const ParsedUrl = struct {
     hash: []const u8,
     version: Version,
     url_id: UrlId,
 
-    pub fn urlId(self: ParsedUrl, url: []const u8) []const u8 {
-        return self.url_id.slice(url);
+    pub fn urlIdPrefix(self: ParsedUrl, url: []const u8) []const u8 {
+        return self.url_id.prefix(url);
+    }
+
+    pub fn urlIdSuffix(self: ParsedUrl, url: []const u8) []const u8 {
+        return self.url_id.suffix(url);
     }
 };
 
@@ -114,55 +130,147 @@ fn schemeContentStart(url: []const u8) ?usize {
     return scheme_marker + 3;
 }
 
-fn makeUrlId(url: []const u8, start: usize, end: usize) error{InvalidUrl}!UrlId {
-    var trimmed_end = end;
-    while (trimmed_end > start and url[trimmed_end - 1] == '/') {
-        trimmed_end -= 1;
+/// Whether a character is in the Bitcoin base58 alphabet (alphanumerics
+/// without 0, O, I, and l). Must match the alphabet in the base58 module,
+/// which this module cannot import.
+fn isBase58Char(char: u8) bool {
+    return switch (char) {
+        '1'...'9', 'A'...'H', 'J'...'N', 'P'...'Z', 'a'...'k', 'm'...'z' => true,
+        else => false,
+    };
+}
+
+const VersionOccurrence = struct {
+    /// Absolute url index of the version's first character.
+    start: usize,
+    /// Absolute url index one past the version's last character.
+    end: usize,
+    version: Version,
+};
+
+/// Find the single MAJOR.MINOR.PATCH occurrence in url[region_start..region_end].
+///
+/// An occurrence is three all-digit runs joined by dots whose surrounding
+/// characters (if any) are neither digits nor dots, so a component of a
+/// four-number sequence like 1.2.3.4 never matches. Returns null when the
+/// region contains no version, and errors when it contains more than one:
+/// per the package URL design, a URL is only versioned when exactly one part
+/// of it parses as a version.
+fn findVersionOccurrence(url: []const u8, region_start: usize, region_end: usize) error{AmbiguousVersion}!?VersionOccurrence {
+    var found: ?VersionOccurrence = null;
+    var i = region_start;
+    while (i < region_end) {
+        if (!std.ascii.isDigit(url[i]) or
+            (i > region_start and (std.ascii.isDigit(url[i - 1]) or url[i - 1] == '.')))
+        {
+            i += 1;
+            continue;
+        }
+
+        const occurrence = matchVersionAt(url, i, region_end) orelse {
+            i += 1;
+            continue;
+        };
+        if (found != null) return error.AmbiguousVersion;
+        found = occurrence;
+        i = occurrence.end;
+    }
+    return found;
+}
+
+/// Try to match D+.D+.D+ starting exactly at url[start], bounded on the right
+/// by region_end or a character that is neither a digit nor a dot.
+fn matchVersionAt(url: []const u8, start: usize, region_end: usize) ?VersionOccurrence {
+    var i = start;
+    var components: [3]u32 = undefined;
+    for (0..3) |component_index| {
+        if (component_index > 0) {
+            if (i >= region_end or url[i] != '.') return null;
+            i += 1;
+        }
+        const digits_start = i;
+        while (i < region_end and std.ascii.isDigit(url[i])) i += 1;
+        if (i == digits_start) return null;
+        components[component_index] = std.fmt.parseInt(u32, url[digits_start..i], 10) catch return null;
+    }
+    if (i < region_end and (std.ascii.isDigit(url[i]) or url[i] == '.')) return null;
+    return .{
+        .start = start,
+        .end = i,
+        .version = .{ .major = components[0], .minor = components[1], .patch = components[2] },
+    };
+}
+
+fn makeUrlId(url: []const u8, prefix_start: usize, prefix_end: usize, suffix_start: usize, suffix_end: usize) error{InvalidUrl}!UrlId {
+    var trimmed_suffix_end = suffix_end;
+    while (trimmed_suffix_end > suffix_start and url[trimmed_suffix_end - 1] == '/') {
+        trimmed_suffix_end -= 1;
     }
 
-    if (trimmed_end <= start) return error.InvalidUrl;
+    // With no suffix, the prefix is the tail of the id and gets the same trim.
+    var trimmed_prefix_end = prefix_end;
+    if (trimmed_suffix_end == suffix_start) {
+        while (trimmed_prefix_end > prefix_start and url[trimmed_prefix_end - 1] == '/') {
+            trimmed_prefix_end -= 1;
+        }
+    }
+
+    if (trimmed_prefix_end <= prefix_start and trimmed_suffix_end <= suffix_start) return error.InvalidUrl;
 
     return .{
-        .start = std.math.cast(u32, start) orelse return error.InvalidUrl,
-        .len = std.math.cast(u32, trimmed_end - start) orelse return error.InvalidUrl,
+        .prefix_start = std.math.cast(u32, prefix_start) orelse return error.InvalidUrl,
+        .prefix_len = std.math.cast(u32, trimmed_prefix_end - prefix_start) orelse return error.InvalidUrl,
+        .suffix_start = std.math.cast(u32, suffix_start) orelse return error.InvalidUrl,
+        .suffix_len = std.math.cast(u32, trimmed_suffix_end - suffix_start) orelse return error.InvalidUrl,
     };
 }
 
 /// Parse a package URL's path into its trailing content hash, optional
-/// MAJOR.MINOR.PATCH version segment, and url id span.
-pub fn parseUrlPath(url: []const u8) error{ InvalidUrl, InvalidVersion, NoHashInUrl }!ParsedUrl {
+/// MAJOR.MINOR.PATCH version, and url id spans.
+///
+/// The hash is the trailing run of base58 characters in the final path
+/// segment (ignoring a .tar.zst extension), so filenames may carry a prefix
+/// like "roc-thing-" as long as it ends with a non-base58 separator. The
+/// version may appear anywhere between the scheme and the hash — as its own
+/// path segment, a filename prefix, or embedded in a segment like
+/// "v1.9.0-rc2" — but at most once.
+pub fn parseUrlPath(url: []const u8) error{ InvalidUrl, InvalidVersion, AmbiguousVersion, NoHashInUrl }!ParsedUrl {
     const url_id_start = schemeContentStart(url) orelse return error.InvalidUrl;
     const last_slash = std.mem.findLast(u8, url, "/") orelse return error.NoHashInUrl;
     if (last_slash < url_id_start) return error.NoHashInUrl;
 
-    const hash_part = url[last_slash + 1 ..];
+    const filename = url[last_slash + 1 ..];
 
-    const hash = if (std.mem.endsWith(u8, hash_part, ".tar.zst"))
-        hash_part[0 .. hash_part.len - 8]
+    const stem = if (std.mem.endsWith(u8, filename, ".tar.zst"))
+        filename[0 .. filename.len - 8]
     else
-        hash_part;
+        filename;
 
+    var hash_start_in_stem = stem.len;
+    while (hash_start_in_stem > 0 and isBase58Char(stem[hash_start_in_stem - 1])) {
+        hash_start_in_stem -= 1;
+    }
+    const hash = stem[hash_start_in_stem..];
     if (hash.len == 0) {
         return error.NoHashInUrl;
     }
+    const hash_start = last_slash + 1 + hash_start_in_stem;
 
-    const before_hash = url[0..last_slash];
-    const version_parse = if (std.mem.findLast(u8, before_hash, "/")) |version_slash|
-        if (version_slash >= url_id_start) parseVersionComponent(before_hash[version_slash + 1 ..]) else null
-    else
-        null;
-    if (version_parse) |parsed_version| {
+    const occurrence = try findVersionOccurrence(url, url_id_start, hash_start);
+
+    var version = Version.none;
+    var prefix_end = hash_start;
+    var suffix_start = hash_start;
+    if (occurrence) |occ| {
         // 0.0.0 is reserved as the no-version sentinel; the lowest publishable
         // version is 0.0.1.
-        if (!parsed_version.isPresent()) return error.InvalidVersion;
+        if (!occ.version.isPresent()) return error.InvalidVersion;
+        version = occ.version;
+        prefix_end = occ.start;
+        suffix_start = occ.end;
     }
-    const version = version_parse orelse Version.none;
-    const url_id_end = if (version_parse != null)
-        std.mem.findLast(u8, before_hash, "/").?
-    else
-        last_slash;
 
-    const url_id = makeUrlId(url, url_id_start, url_id_end) catch return error.InvalidUrl;
+    const url_id = makeUrlId(url, url_id_start, prefix_end, suffix_start, hash_start) catch return error.InvalidUrl;
 
     return .{
         .hash = hash,
@@ -212,11 +320,12 @@ test "isSafeUrl" {
     try testing.expect(!isSafeUrl("platform.roc"));
 }
 
-test "UrlId returns slice from full URL" {
+test "UrlId returns prefix and suffix slices from full URL" {
     const url = "https://example.com/foo/bar/1.2.3/hash";
-    const id = UrlId{ .start = 8, .len = 19 };
+    const id = UrlId{ .prefix_start = 8, .prefix_len = 20, .suffix_start = 33, .suffix_len = 1 };
 
-    try std.testing.expectEqualStrings("example.com/foo/bar", id.slice(url));
+    try std.testing.expectEqualStrings("example.com/foo/bar/", id.prefix(url));
+    try std.testing.expectEqualStrings("/", id.suffix(url));
 }
 
 test "parseUrlPath extracts url id" {
@@ -224,7 +333,8 @@ test "parseUrlPath extracts url id" {
         const url = "https://example.com/foo/bar/1.2.3/4ZGqXJtqH5n9wMmQ7nPQTU8zgHBNfZ3kcVnNcL3hKqXf.tar.zst";
         const parsed = try parseUrlPath(url);
 
-        try std.testing.expectEqualStrings("example.com/foo/bar", parsed.urlId(url));
+        try std.testing.expectEqualStrings("example.com/foo/bar", parsed.urlIdPrefix(url));
+        try std.testing.expectEqualStrings("", parsed.urlIdSuffix(url));
         try std.testing.expectEqual(Version{ .major = 1, .minor = 2, .patch = 3 }, parsed.version);
     }
 
@@ -232,7 +342,8 @@ test "parseUrlPath extracts url id" {
         const url = "https://example.com/foo/bar/4ZGqXJtqH5n9wMmQ7nPQTU8zgHBNfZ3kcVnNcL3hKqXf.tar.zst";
         const parsed = try parseUrlPath(url);
 
-        try std.testing.expectEqualStrings("example.com/foo/bar", parsed.urlId(url));
+        try std.testing.expectEqualStrings("example.com/foo/bar", parsed.urlIdPrefix(url));
+        try std.testing.expectEqualStrings("", parsed.urlIdSuffix(url));
         try std.testing.expectEqual(Version.none, parsed.version);
     }
 
@@ -240,23 +351,101 @@ test "parseUrlPath extracts url id" {
         const url = "http://127.0.0.1:8000/1.2.3/4ZGqXJtqH5n9wMmQ7nPQTU8zgHBNfZ3kcVnNcL3hKqXf.tar.zst";
         const parsed = try parseUrlPath(url);
 
-        try std.testing.expectEqualStrings("127.0.0.1:8000", parsed.urlId(url));
+        try std.testing.expectEqualStrings("127.0.0.1:8000", parsed.urlIdPrefix(url));
+        try std.testing.expectEqualStrings("", parsed.urlIdSuffix(url));
+        try std.testing.expectEqual(Version{ .major = 1, .minor = 2, .patch = 3 }, parsed.version);
     }
 
     {
         const url = "https://example.com/foo/1.2.x/4ZGqXJtqH5n9wMmQ7nPQTU8zgHBNfZ3kcVnNcL3hKqXf.tar.zst";
         const parsed = try parseUrlPath(url);
 
-        try std.testing.expectEqualStrings("example.com/foo/1.2.x", parsed.urlId(url));
+        try std.testing.expectEqualStrings("example.com/foo/1.2.x", parsed.urlIdPrefix(url));
+        try std.testing.expectEqual(Version.none, parsed.version);
     }
 
     {
         const url = "https://example.com/foo/1.0.1/4ZGqXJtqH5n9wMmQ7nPQTU8zgHBNfZ3kcVnNcL3hKqXf.tar.zst";
         const parsed = try parseUrlPath(url);
 
-        try std.testing.expectEqualStrings("example.com/foo", parsed.urlId(url));
+        try std.testing.expectEqualStrings("example.com/foo", parsed.urlIdPrefix(url));
+        try std.testing.expectEqualStrings("", parsed.urlIdSuffix(url));
         try std.testing.expectEqual(Version{ .major = 1, .minor = 0, .patch = 1 }, parsed.version);
     }
+}
+
+test "parseUrlPath finds the version anywhere before the hash" {
+    // Version as a filename prefix.
+    {
+        const url = "https://example.com/pkg/2.5.10-4ZGqXJtqH5n9wMmQ7nPQTU8zgHBNfZ3kcVnNcL3hKqXf.tar.zst";
+        const parsed = try parseUrlPath(url);
+
+        try std.testing.expectEqual(Version{ .major = 2, .minor = 5, .patch = 10 }, parsed.version);
+        try std.testing.expectEqualStrings("4ZGqXJtqH5n9wMmQ7nPQTU8zgHBNfZ3kcVnNcL3hKqXf", parsed.hash);
+        try std.testing.expectEqualStrings("example.com/pkg/", parsed.urlIdPrefix(url));
+        try std.testing.expectEqualStrings("-", parsed.urlIdSuffix(url));
+    }
+
+    // Version as its own path segment, GitHub releases style.
+    {
+        const url = "https://github.com/roc-lang/basic-cli/releases/download/0.7.0/4ZGqXJtqH5n9wMmQ7nPQTU8zgHBNfZ3kcVnNcL3hKqXf.tar.zst";
+        const parsed = try parseUrlPath(url);
+
+        try std.testing.expectEqual(Version{ .major = 0, .minor = 7, .patch = 0 }, parsed.version);
+        try std.testing.expectEqualStrings("github.com/roc-lang/basic-cli/releases/download", parsed.urlIdPrefix(url));
+        try std.testing.expectEqualStrings("", parsed.urlIdSuffix(url));
+    }
+
+    // Version embedded in a tag segment with a prefixed filename, GitLab
+    // releases style.
+    {
+        const url = "https://gitlab.com/repo/user/-/releases/v1.9.0-rc2/downloads/roc-thing-4ZGqXJtqH5n9wMmQ7nPQTU8zgHBNfZ3kcVnNcL3hKqXf.tar.zst";
+        const parsed = try parseUrlPath(url);
+
+        try std.testing.expectEqual(Version{ .major = 1, .minor = 9, .patch = 0 }, parsed.version);
+        try std.testing.expectEqualStrings("4ZGqXJtqH5n9wMmQ7nPQTU8zgHBNfZ3kcVnNcL3hKqXf", parsed.hash);
+        try std.testing.expectEqualStrings("gitlab.com/repo/user/-/releases/v", parsed.urlIdPrefix(url));
+        try std.testing.expectEqualStrings("-rc2/downloads/roc-thing-", parsed.urlIdSuffix(url));
+    }
+
+    // Two URLs for different versions of the same package share their url id.
+    {
+        const url_a = "https://gitlab.com/repo/user/-/releases/v1.9.0-rc2/downloads/roc-thing-4ZGqXJtqH5n9wMmQ7nPQTU8zgHBNfZ3kcVnNcL3hKqXf.tar.zst";
+        const url_b = "https://gitlab.com/repo/user/-/releases/v2.0.0-rc2/downloads/roc-thing-5ZGqXJtqH5n9wMmQ7nPQTU8zgHBNfZ3kcVnNcL3hKqXg.tar.zst";
+        const parsed_a = try parseUrlPath(url_a);
+        const parsed_b = try parseUrlPath(url_b);
+
+        try std.testing.expectEqualStrings(parsed_a.urlIdPrefix(url_a), parsed_b.urlIdPrefix(url_b));
+        try std.testing.expectEqualStrings(parsed_a.urlIdSuffix(url_a), parsed_b.urlIdSuffix(url_b));
+    }
+}
+
+test "parseUrlPath extracts a trailing base58 hash from a prefixed filename" {
+    const url = "https://example.com/pkg/roc-thing-4ZGqXJtqH5n9wMmQ7nPQTU8zgHBNfZ3kcVnNcL3hKqXf.tar.zst";
+    const parsed = try parseUrlPath(url);
+
+    try std.testing.expectEqualStrings("4ZGqXJtqH5n9wMmQ7nPQTU8zgHBNfZ3kcVnNcL3hKqXf", parsed.hash);
+    try std.testing.expectEqual(Version.none, parsed.version);
+    try std.testing.expectEqualStrings("example.com/pkg/roc-thing-", parsed.urlIdPrefix(url));
+}
+
+test "parseUrlPath rejects URLs with more than one version" {
+    try std.testing.expectError(
+        error.AmbiguousVersion,
+        parseUrlPath("https://example.com/1.2.3/pkg-1.2.3-4ZGqXJtqH5n9wMmQ7nPQTU8zgHBNfZ3kcVnNcL3hKqXf.tar.zst"),
+    );
+    try std.testing.expectError(
+        error.AmbiguousVersion,
+        parseUrlPath("https://example.com/1.2.3/pkg-4.5.6-4ZGqXJtqH5n9wMmQ7nPQTU8zgHBNfZ3kcVnNcL3hKqXf.tar.zst"),
+    );
+}
+
+test "parseUrlPath ignores four-part number sequences" {
+    const url = "https://example.com/foo/1.2.3.4/4ZGqXJtqH5n9wMmQ7nPQTU8zgHBNfZ3kcVnNcL3hKqXf.tar.zst";
+    const parsed = try parseUrlPath(url);
+
+    try std.testing.expectEqual(Version.none, parsed.version);
+    try std.testing.expectEqualStrings("example.com/foo/1.2.3.4", parsed.urlIdPrefix(url));
 }
 
 test "parseUrlPath rejects the reserved 0.0.0 version" {
@@ -287,7 +476,7 @@ test "parseUrlPath accepts 0.x versions" {
     };
     for (cases) |case| {
         const parsed = try parseUrlPath(case.url);
-        try std.testing.expectEqualStrings("example.com/foo", parsed.urlId(case.url));
+        try std.testing.expectEqualStrings("example.com/foo", parsed.urlIdPrefix(case.url));
         try std.testing.expectEqual(case.version, parsed.version);
     }
 }

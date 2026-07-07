@@ -143,14 +143,17 @@ pub const TypeOrigin = union(enum) {
     self,
     /// Declared in the compiler builtins.
     builtin,
-    /// Declared in a versioned URL dependency. The major version is part of
-    /// identity: pointing the public API at a different major of the same
-    /// dependency is a breaking change.
+    /// Declared in a versioned URL dependency. The compatibility group is
+    /// part of identity: pointing the public API at a different major (or a
+    /// different 0.X group before 1.0.0) of the same dependency is a breaking
+    /// change.
     external: External,
 
     pub const External = struct {
         url_id: []const u8,
         major: u32,
+        /// The compatibility boundary within major 0; ignored from 1.0.0 on.
+        minor: u32,
     };
 };
 
@@ -410,7 +413,11 @@ fn writeTypeSExpr(self: *const PackageApi, id: TypeId, writer: *std.Io.Writer, s
                 .external => |external| {
                     try writer.writeAll("(pkg \"");
                     try writeEscaped(writer, external.url_id);
-                    try writer.print("\" {d})", .{external.major});
+                    if (external.major == 0) {
+                        try writer.print("\" 0.{d})", .{external.minor});
+                    } else {
+                        try writer.print("\" {d})", .{external.major});
+                    }
                 },
             }
             try writer.writeAll(" \"");
@@ -594,7 +601,11 @@ fn renderType(self: *const PackageApi, id: TypeId, writer: *std.Io.Writer, state
         .named => |named| {
             switch (named.origin) {
                 .self, .builtin => {},
-                .external => |external| try writer.print("{s} (major {d}) : ", .{ external.url_id, external.major }),
+                .external => |external| if (external.major == 0) {
+                    try writer.print("{s} (compat 0.{d}) : ", .{ external.url_id, external.minor });
+                } else {
+                    try writer.print("{s} (major {d}) : ", .{ external.url_id, external.major });
+                },
             }
             try writer.writeAll(named.path);
             if (named.args.len > 0) {

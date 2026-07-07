@@ -7,7 +7,7 @@ const roc_target = @import("roc_target");
 
 const BuildEnv = @import("../compile_build.zig").BuildEnv;
 
-const fake_hash = "FakeHashAbcDefGhiJkLmNoPqRsTuVwXyZ1234567890";
+const fake_hash = "FakeHashAbcDefGhiJkLmNoPqRsTuVwXyZ123456789o";
 const util_url = "https://example.com/foo/util/1.2.3/" ++ fake_hash ++ ".tar.zst";
 
 test "URL dependency resolves from a warm cache with no network, and its modules are not bundleable" {
@@ -55,7 +55,7 @@ test "URL dependency resolves from a warm cache with no network, and its modules
     // came from a URL.
     const util_pkg = build_env.packages.getPtr(util_url) orelse return error.TestUnexpectedResult;
     try std.testing.expect(util_pkg.url != null);
-    try std.testing.expectEqualStrings("example.com/foo/util", util_pkg.url.?.urlId());
+    try std.testing.expectEqualStrings("example.com/foo/util", util_pkg.url.?.urlIdPrefix());
 
     // The root's shorthand points at the URL package.
     const root_pkg_name = build_env.discovered_pkg_name orelse return error.TestUnexpectedResult;
