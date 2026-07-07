@@ -2288,6 +2288,7 @@ pub fn build(b: *std.Build) void {
     const run_snapshot_tool_step = b.step("run-snapshot-tool", "Run the snapshot tool to update snapshot files");
     const echo_wasm_step = b.step("build-echo-wasm", "Build the echo platform to zig-out/lib/echo.wasm");
     const echo_wasm_archive_step = b.step("build-echo-wasm-archive", "Build echo.wasm and zstd-compress it to zig-out/lib/echo.wasm.zst");
+    const build_glue_release_step = b.step("build-glue-release", "Build release-ready glue package and specs");
 
     const build_test_hosts_step = b.step("build-test-hosts", "Build test platform host libraries");
     const build_release_step = b.step("build-release", "Build optimized release binary for distribution");
@@ -2327,6 +2328,7 @@ pub fn build(b: *std.Build) void {
     const test_progress_interval_ms = b.option(u64, "test-progress-interval-ms", "Print non-TTY parallel test progress every N milliseconds; 0 disables it") orelse 0;
     const eval_no_fork = b.option(bool, "eval-no-fork", "Run eval tests in-process instead of through fork isolation") orelse false;
     const eval_time_worker = b.option(bool, "eval-time-worker", "Print eval worker startup timing instrumentation") orelse false;
+    const glue_release_tag = b.option([]const u8, "glue-release-tag", "Nightly release tag used in generated glue package URLs");
     if (shared_memory_size) |size| {
         if (size == 0) {
             std.log.err("-Dshared-memory-size must be greater than 0", .{});
@@ -3440,6 +3442,38 @@ pub fn build(b: *std.Build) void {
         // Ensure the wasm is built before the test runs.
         run_echo_wasm_test.step.dependOn(&echo_wasm_install.step);
         run_test_echo_wasm_step.dependOn(&run_echo_wasm_test.step);
+    }
+
+    {
+        const glue_release_exe = b.addExecutable(.{
+            .name = "glue_release",
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("src/build/glue_release.zig"),
+                .target = target,
+                .optimize = optimize,
+            }),
+        });
+        configureBackend(glue_release_exe, target);
+
+        const glue_package_cmd = b.addRunArtifact(roc_exe);
+        glue_package_cmd.setCwd(b.path("src/glue/platform"));
+        glue_package_cmd.addArgs(&.{ "bundle", "--output-dir" });
+        const glue_package_dir = glue_package_cmd.addOutputDirectoryArg("glue-package");
+        glue_package_cmd.addArg("main.roc");
+
+        const glue_release_cmd = b.addRunArtifact(glue_release_exe);
+        glue_release_cmd.addArg(glue_release_tag orelse "nightly-local");
+        glue_release_cmd.addDirectoryArg(glue_package_dir);
+        const glue_release_dir = glue_release_cmd.addOutputDirectoryArg("glue-release");
+
+        const glue_release_install = b.addInstallDirectory(.{
+            .source_dir = glue_release_dir,
+            .install_dir = .prefix,
+            .install_subdir = "glue-release",
+        });
+        const clean_glue_release_install = RemoveDirTreeStep.create(b, b.getInstallPath(.prefix, "glue-release"));
+        glue_release_install.step.dependOn(&clean_glue_release_install.step);
+        build_glue_release_step.dependOn(&glue_release_install.step);
     }
 
     // Build playground integration tests - now enabled for all optimization modes.
