@@ -111,8 +111,12 @@ seen_annos: std.AutoHashMap(CIR.TypeAnno.Idx, Var),
 env_pool: EnvPool,
 /// wrapper around generalization, contains some internal state used to do it's work
 generalizer: Generalizer,
-/// A list of generated constraints with solving deferred
+/// A list of generated recursive/cross-definition constraints with solving deferred.
 constraints: Constraint.SafeList,
+/// Return-flow constraints (`return` and `?`) owned by the lambda that produced them.
+return_constraints: std.ArrayListUnmanaged(ReturnConstraint),
+/// Stack of active lambda-owned return constraint ranges.
+return_constraint_frames: std.ArrayListUnmanaged(ReturnConstraintFrame),
 /// A map from one var to another. Used in instantiation and var copying
 var_map: std.AutoHashMap(Var, Var),
 /// Static-dispatch constraint function vars copied during instantiation.
@@ -193,8 +197,7 @@ local_processing_ptrns: std.AutoHashMapUnmanaged(CIR.Pattern.Idx, LocalDefProces
 /// rather than the shared `constraints` list because sequential scoping
 /// guarantees local recursion is a single self/enclosing chain — never a mutual
 /// group — so these need no cycle machinery, no per-use instantiation, and no
-/// entanglement with the other constraint kinds (notably early-return / `?`
-/// constraints, which `processReturnConstraints` compacts mid-body).
+/// entanglement with other deferred constraint kinds.
 local_recursive_refs: std.ArrayListUnmanaged(LocalRecursiveRef) = .empty,
 /// The name of the enclosing function, if known.
 /// Used to provide better error messages when type checking lambda arguments.
@@ -1118,6 +1121,17 @@ const ScratchStaticDispatchConstraint = struct {
     constraint: types_mod.StaticDispatchConstraint,
 };
 
+const ReturnConstraint = struct {
+    expected: Var,
+    actual: Var,
+    ctx: problem.Context,
+};
+
+const ReturnConstraintFrame = struct {
+    lambda: CIR.Expr.Idx,
+    start: usize,
+};
+
 /// A constraint generated during type checking, to be checked at the end
 ///
 /// In most cases, we don't defer constraint checking and unify things
@@ -1310,6 +1324,8 @@ fn initAssumePrepared(
         .var_map = std.AutoHashMap(Var, Var).init(gpa),
         .constraint_fn_var_map = std.AutoHashMap(Var, Var).init(gpa),
         .constraints = try Constraint.SafeList.initCapacity(gpa, 32),
+        .return_constraints = .empty,
+        .return_constraint_frames = .empty,
         .var_set = std.AutoHashMap(Var, void).init(gpa),
         .rigid_var_substitutions = std.AutoHashMapUnmanaged(Ident.Idx, Var){},
         .type_decl_rigid_vars = std.AutoHashMapUnmanaged(Ident.Idx, Var){},
@@ -1447,6 +1463,8 @@ pub fn deinit(self: *Self) void {
     self.var_map.deinit();
     self.constraint_fn_var_map.deinit();
     self.constraints.deinit(self.gpa);
+    self.return_constraints.deinit(self.gpa);
+    self.return_constraint_frames.deinit(self.gpa);
     self.var_set.deinit();
     self.rigid_var_substitutions.deinit(self.gpa);
     self.type_decl_rigid_vars.deinit(self.gpa);
@@ -11881,6 +11899,10 @@ fn checkExpr(self: *Self, expr_idx: CIR.Expr.Idx, env: *Env, expected: Expected)
             }
 
             const lambda_body_expected = Expected.none().withHoistPosition(expected.hoist_position);
+            try self.pushReturnConstraintFrame(expr_idx);
+            var return_constraints_processed = false;
+            defer if (!return_constraints_processed) self.discardReturnConstraintFrame(expr_idx);
+
             const body_does_fx = if (mb_anno_func) |expected_func| blk: {
                 const lambda_body_does_fx = try self.checkExpr(lambda.body, env, lambda_body_expected.withBranchResult(expected_func.ret));
                 try self.closeAbsentConstructedPayloadVars(lambda.body, body_var);
@@ -11897,9 +11919,8 @@ fn checkExpr(self: *Self, expr_idx: CIR.Expr.Idx, env: *Env, expected: Expected)
             // (for correct error reporting) but before the function type is generalized
             // (so instantiated copies at call sites have the complete type, including
             // both Ok and Err variants from the ? operator).
-            // Only processes early_return/try_suffix_return constraints; anonymous
-            // constraints (e.g. from recursive lookups) are left for later.
-            try self.processReturnConstraints(env);
+            try self.processReturnConstraints(env, expr_idx);
+            return_constraints_processed = true;
 
             try self.checkForInfiniteType(CIR.Expr.Idx, lambda.body);
 
@@ -12574,18 +12595,11 @@ fn checkExpr(self: *Self, expr_idx: CIR.Expr.Idx, env: *Env, expected: Expected)
             if (return_expected.returnResult()) |expected_return| {
                 _ = try self.unifyInContext(expected_return, ret_var, env, return_ctx);
             } else {
-                // Write down this constraint for later validation.
-                // We assert the lambda's body type and the return value type are equivalent.
-                // This constraint is processed at the end of e_lambda (after the body is
-                // fully checked) to ensure proper error reporting while also running before
-                // generalization to prevent layout mismatches at instantiated call sites.
+                // Validate the lambda body type against the return value after the
+                // body is fully checked, but before the lambda generalizes.
                 const lambda_expr = self.cir.store.getExpr(ret.lambda);
                 std.debug.assert(lambda_expr == .e_lambda);
-                _ = try self.constraints.append(self.gpa, Constraint{ .eql = .{
-                    .expected = ModuleEnv.varFrom(lambda_expr.e_lambda.body),
-                    .actual = ret_var,
-                    .ctx = return_ctx,
-                } });
+                try self.appendReturnConstraint(ret.lambda, ModuleEnv.varFrom(lambda_expr.e_lambda.body), ret_var, return_ctx);
             }
 
             // Note that we DO NOT unify the return type with the expr here.
@@ -13928,15 +13942,11 @@ fn checkBlockStatements(self: *Self, statements: CIR.Statement.Span, env: *Env, 
                 if (return_expected.returnResult()) |expected_return| {
                     _ = try self.unifyInContext(expected_return, ret_var, env, .early_return);
                 } else {
-                    // Write down this constraint for later validation
-                    // We assert the lambda's type and the return type are equiv
+                    // Validate the lambda body type against the return value after the
+                    // body is fully checked, but before the lambda generalizes.
                     const lambda_expr = self.cir.store.getExpr(ret.lambda);
                     std.debug.assert(lambda_expr == .e_lambda);
-                    _ = try self.constraints.append(self.gpa, Constraint{ .eql = .{
-                        .expected = ModuleEnv.varFrom(lambda_expr.e_lambda.body),
-                        .actual = ret_var,
-                        .ctx = .early_return,
-                    } });
+                    try self.appendReturnConstraint(ret.lambda, ModuleEnv.varFrom(lambda_expr.e_lambda.body), ret_var, .early_return);
                 }
 
                 // A return statement's type should be a flex var so it can unify with any type.
@@ -16645,9 +16655,9 @@ fn defaultLiteralsAtGeneralizationBoundary(self: *Self, def_root_var: Var, env: 
 
     // Recursive-reference edges (`ctx == .recursive_def`) link a recursive call's
     // flex reference to the def's own (annotated) type and resolve only after this
-    // boundary, at the cycle root. Unlike an early-return edge, the reference is an
-    // internal body var unreachable from the def's signature, so the fixpoint below
-    // never activates it. Seed the reachable closure of each recursive call's
+    // boundary, at the cycle root. The reference is an internal body var unreachable
+    // from the def's signature, so the fixpoint below never activates it. Seed the
+    // reachable closure of each recursive call's
     // RETURN: a literal whose dispatch hangs off an unresolved recursive result
     // (e.g. `fc(.., fc(..) + 1)` where `fc : I64, I64 -> I64` — `1`'s `plus`
     // receiver is `fc(..)`'s return) stays protected until the recursion resolves
@@ -16696,11 +16706,11 @@ fn defaultLiteralsAtGeneralizationBoundary(self: *Self, def_root_var: Var, env: 
         }
     }
 
-    // Pending `eql` constraints are unify-later edges (early returns,
-    // recursive-group cross-references); a literal awaiting unification with the
-    // def's type through one is NOT ambiguous. Close the set over them — when one
-    // side of an edge is in, collect both sides — to fixpoint, since collecting
-    // one edge can make another edge's side reachable.
+    // Pending `eql` constraints are recursive-group cross-reference edges; a
+    // literal awaiting unification with the def's type through one is NOT
+    // ambiguous. Close the set over them — when one side of an edge is in,
+    // collect both sides — to fixpoint, since collecting one edge can make
+    // another edge's side reachable.
     var changed = true;
     while (changed) {
         changed = false;
@@ -17321,32 +17331,67 @@ fn isDecNominal(self: *Self, var_: Var) bool {
     return nominal.ident.ident_idx.eql(self.cir.idents.dec_type);
 }
 
-/// Process only early_return and try_operator constraints, keeping other
-/// constraints for later processing. Called at the end of e_lambda to ensure return type
-/// information is unified with the body type before the function type is generalized,
-/// without prematurely processing other constraints from recursive lookups.
-fn processReturnConstraints(self: *Self, env: *Env) std.mem.Allocator.Error!void {
-    const original_len = self.constraints.items.items.len;
-    var write_idx: usize = 0;
-    for (0..original_len) |read_idx| {
-        const constraint = self.constraints.items.items[read_idx];
-        switch (constraint) {
-            .eql => |eql| switch (eql.ctx) {
-                .early_return => {
-                    _ = try self.unifyInContext(eql.expected, eql.actual, env, .early_return);
-                },
-                .try_operator => {
-                    _ = try self.unifyInContext(eql.expected, eql.actual, env, .try_operator);
-                },
-                else => {
-                    self.constraints.items.items[write_idx] = constraint;
-                    write_idx += 1;
-                },
+fn pushReturnConstraintFrame(self: *Self, lambda_idx: CIR.Expr.Idx) std.mem.Allocator.Error!void {
+    try self.return_constraint_frames.append(self.gpa, .{
+        .lambda = lambda_idx,
+        .start = self.return_constraints.items.len,
+    });
+}
+
+fn discardReturnConstraintFrame(self: *Self, lambda_idx: CIR.Expr.Idx) void {
+    std.debug.assert(self.return_constraint_frames.items.len > 0);
+    const frame_idx = self.return_constraint_frames.items.len - 1;
+    const frame = self.return_constraint_frames.items[frame_idx];
+    std.debug.assert(frame.lambda == lambda_idx);
+    self.return_constraints.shrinkRetainingCapacity(frame.start);
+    self.return_constraint_frames.shrinkRetainingCapacity(frame_idx);
+}
+
+fn appendReturnConstraint(
+    self: *Self,
+    lambda_idx: CIR.Expr.Idx,
+    expected: Var,
+    actual: Var,
+    ctx: problem.Context,
+) std.mem.Allocator.Error!void {
+    switch (ctx) {
+        .early_return, .try_operator => {},
+        else => unreachable,
+    }
+
+    std.debug.assert(self.return_constraint_frames.items.len > 0);
+    const frame = self.return_constraint_frames.items[self.return_constraint_frames.items.len - 1];
+    std.debug.assert(frame.lambda == lambda_idx);
+    try self.return_constraints.append(self.gpa, .{
+        .expected = expected,
+        .actual = actual,
+        .ctx = ctx,
+    });
+}
+
+/// Process the return-flow constraints owned by this lambda. Called at the end
+/// of e_lambda to ensure return type information is unified with the body type
+/// before the function type is generalized.
+fn processReturnConstraints(self: *Self, env: *Env, lambda_idx: CIR.Expr.Idx) std.mem.Allocator.Error!void {
+    std.debug.assert(self.return_constraint_frames.items.len > 0);
+    const frame_idx = self.return_constraint_frames.items.len - 1;
+    const frame = self.return_constraint_frames.items[frame_idx];
+    std.debug.assert(frame.lambda == lambda_idx);
+
+    for (self.return_constraints.items[frame.start..]) |constraint| {
+        switch (constraint.ctx) {
+            .early_return => {
+                _ = try self.unifyInContext(constraint.expected, constraint.actual, env, .early_return);
             },
+            .try_operator => {
+                _ = try self.unifyInContext(constraint.expected, constraint.actual, env, .try_operator);
+            },
+            else => unreachable,
         }
     }
-    std.debug.assert(self.constraints.items.items.len == original_len);
-    self.constraints.items.shrinkRetainingCapacity(write_idx);
+
+    self.return_constraints.shrinkRetainingCapacity(frame.start);
+    self.return_constraint_frames.shrinkRetainingCapacity(frame_idx);
 }
 
 /// Validate the recursive references recorded while checking a LOCAL block def's
