@@ -12751,63 +12751,42 @@ fn generateDocs(
     const DocModel = docs.DocModel;
     const extract = docs.extract;
 
-    // Determine if we're documenting a platform or something else by checking the module path
-    // If the path contains "platform", we're documenting a platform directly
-    const is_documenting_platform = std.mem.find(u8, module_path, "platform") != null;
-
-    // Collect ModuleDocs from all compiled modules
+    // Collect ModuleDocs from the explicit documentation surface.
     var module_docs_list = std.ArrayList(DocModel.ModuleDocs).empty;
     defer {
         for (module_docs_list.items) |*mod| mod.deinit(ctx.gpa);
         module_docs_list.deinit(ctx.gpa);
     }
 
-    var is_package = false;
+    const is_package = build_env.rootIsPackage();
 
-    // Track why modules were dropped so a zero-module result can explain itself
+    // Track why docs extraction produced nothing so a zero-module result can
+    // explain itself.
     // instead of silently writing an empty docs site.
     var modules_seen: usize = 0;
-    var skipped_platform: usize = 0;
-    var skipped_package: usize = 0;
     var extract_failed: usize = 0;
 
-    var sched_iter = build_env.schedulers.iterator();
-    while (sched_iter.next()) |sched_entry| {
+    const modules = build_env.getDocumentationModules(ctx.gpa) catch |err| {
+        std.debug.print("Error: failed to collect documentable modules for '{s}': {}\n", .{ module_path, err });
+        return error.DocsFailed;
+    };
+    defer ctx.gpa.free(modules);
+
+    for (modules) |module_info| {
         // Docs show the alias the root uses for a package, not its internal
         // identity name (full URL or absolute path).
-        const sched_pkg_name = build_env.rootAliasForPackage(sched_entry.key_ptr.*) orelse sched_entry.key_ptr.*;
-        const package_env = sched_entry.value_ptr.*;
+        const sched_pkg_name = build_env.rootAliasForPackage(module_info.package_name) orelse module_info.package_name;
+        modules_seen += 1;
 
-        for (package_env.modules.items) |*module_state| {
-            if (module_state.moduleEnv()) |mod_env| {
-                modules_seen += 1;
-
-                // Skip platform main.roc modules when documenting an app
-                // Platform modules are still included when documenting a platform directly
-                if (mod_env.module_kind == .platform and !is_documenting_platform) {
-                    skipped_platform += 1;
-                    continue;
-                }
-
-                // Skip package definition files — they just declare which modules
-                // are exposed and don't contain docs of their own.
-                if (mod_env.module_kind == .package) {
-                    is_package = true;
-                    skipped_package += 1;
-                    continue;
-                }
-
-                var mod_docs = extract.extractModuleDocs(ctx.gpa, mod_env, sched_pkg_name, module_state.path) catch |err| {
-                    std.debug.print("Warning: failed to extract docs for module {s}: {}\n", .{ module_state.name, err });
-                    extract_failed += 1;
-                    continue;
-                };
-                module_docs_list.append(ctx.gpa, mod_docs) catch {
-                    mod_docs.deinit(ctx.gpa);
-                    continue;
-                };
-            }
-        }
+        var mod_docs = extract.extractModuleDocs(ctx.gpa, module_info.semantic.env, sched_pkg_name, module_info.path) catch |err| {
+            std.debug.print("Warning: failed to extract docs for module {s}: {}\n", .{ module_info.name, err });
+            extract_failed += 1;
+            continue;
+        };
+        module_docs_list.append(ctx.gpa, mod_docs) catch {
+            mod_docs.deinit(ctx.gpa);
+            continue;
+        };
     }
 
     // If no documentable modules were collected, fail loudly instead of
@@ -12831,15 +12810,15 @@ fn generateDocs(
             // Modules existed but every one was filtered out; report the
             // breakdown so the user knows which filter dropped them.
             std.debug.print(
-                "  Saw {d} module(s), all skipped: {d} platform, {d} package definition, {d} failed extraction.\n",
-                .{ modules_seen, skipped_platform, skipped_package, extract_failed },
+                "  Saw {d} documentable module candidate(s), {d} failed extraction.\n",
+                .{ modules_seen, extract_failed },
             );
         }
         return error.DocsFailed;
     }
 
-    // Modules are collected in package hash-map order, which is not
-    // deterministic; docs output must be.
+    // Module collection can still depend on package hash-map order for
+    // non-platform roots, and docs output must be deterministic.
     std.mem.sort(DocModel.ModuleDocs, module_docs_list.items, {}, DocModel.moduleDocsLessThan);
 
     // Determine the package name for the docs header.
