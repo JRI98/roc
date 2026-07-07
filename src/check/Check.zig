@@ -207,6 +207,14 @@ platform_required_defs: std.AutoHashMapUnmanaged(CIR.Def.Idx, PlatformRequiredDe
 /// mutual recursion, are rejected during canonicalization (local defs are
 /// sequentially scoped), so this is always a single self/enclosing chain.
 local_processing_ptrns: std.AutoHashMapUnmanaged(CIR.Pattern.Idx, LocalDefProcessed) = .{},
+
+/// Every local binding root (`x = ..` / `var x = ..` statement pattern)
+/// encountered while checking, in solve order. The settled-state occurs sweep
+/// checks these alongside the top-level defs: a local binding's cyclic type
+/// may never be reachable from the enclosing def's root type, and checking
+/// earlier would be premature (an anonymous cycle can still become valid by
+/// lifting into a nominal while the surrounding expression is checked).
+local_binding_roots: std.ArrayListUnmanaged(CIR.Pattern.Idx) = .empty,
 /// The name of the enclosing function, if known.
 /// Used to provide better error messages when type checking lambda arguments.
 enclosing_func_name: ?Ident.Idx,
@@ -1565,6 +1573,7 @@ pub fn deinit(self: *Self) void {
     self.top_level_ptrns.deinit(self.gpa);
     self.platform_required_defs.deinit(self.gpa);
     self.local_processing_ptrns.deinit(self.gpa);
+    self.local_binding_roots.deinit(self.gpa);
     self.type_writer.deinit();
     self.instantiation_dispatchers.deinit(self.gpa);
     self.ambiguity_candidates.deinit(self.gpa);
@@ -3345,14 +3354,17 @@ fn unifyInContext(self: *Self, a: Var, b: Var, env: *Env, ctx: problem.Context) 
     return self.runUnify(a, b, env, .{ .context = ctx });
 }
 
-/// Check if a variable contains an infinite type after solving a definition.
+/// Check if a variable contains an infinite type after solving a binding.
 /// This catches cases like `f = |x| f([x])` which creates `a = List(a)`.
-/// Similar to Rust's check_for_infinite_type called after LetCon.
+///
+/// Runs at binding roots: top-level defs (`CIR.Def.Idx`, the settled-state
+/// sweep), local bindings (`CIR.Pattern.Idx`, when their statement finishes
+/// solving), and standalone checked expressions (`CIR.Expr.Idx`, REPL roots).
 fn checkForInfiniteType(self: *Self, comptime Idx: anytype, idx: Idx) std.mem.Allocator.Error!void {
     const trace = tracy.trace(@src());
     defer trace.end();
 
-    std.debug.assert(Idx == CIR.Def.Idx or Idx == CIR.Expr.Idx);
+    std.debug.assert(Idx == CIR.Def.Idx or Idx == CIR.Expr.Idx or Idx == CIR.Pattern.Idx);
 
     const var_ = ModuleEnv.varFrom(idx);
     const occurs_result = try occurs.occurs(self.types, &self.occurs_scratch, var_);
@@ -3362,20 +3374,24 @@ fn checkForInfiniteType(self: *Self, comptime Idx: anytype, idx: Idx) std.mem.Al
             // This is fine - no cycle, or valid recursion through a nominal type
         },
         .recursive_anonymous => {
+            // Anonymous recursion (recursive type not through a nominal
+            // type) is a surface rule enforced at OBSERVABLE roots:
+            // top-level defs and checked expression roots. A local binding's
+            // generalized scheme may legitimately hold an anonymous cycle
+            // that every use site resolves by lifting into a nominal type
+            // (e.g. a local recursive closure whose instantiations always
+            // unify with `Iter`) — rejecting it here would reject working
+            // code, so local roots only reject structurally infinite types.
+            if (comptime Idx == CIR.Pattern.Idx) return;
+
             std.debug.assert(self.occurs_scratch.err_var != null);
             const err_var = self.occurs_scratch.err_var.?;
 
-            // Anonymous recursion (recursive type not through a nominal type)
             const snapshot = try self.snapshots.snapshotVarForError(self.types, &self.type_writer, err_var);
             _ = try self.problems.appendProblem(self.gpa, .{ .anonymous_recursion = .{
                 .var_ = var_,
                 .snapshot = snapshot,
-                .def_name = if (comptime Idx == CIR.Def.Idx) blk: {
-                    const def = self.cir.store.getDef(idx);
-                    break :blk self.getPatternIdent(def.pattern);
-                } else blk: {
-                    break :blk null;
-                },
+                .def_name = self.bindingRootName(Idx, idx),
             } });
             try self.types.setVarContent(var_, .err);
         },
@@ -3388,16 +3404,43 @@ fn checkForInfiniteType(self: *Self, comptime Idx: anytype, idx: Idx) std.mem.Al
             _ = try self.problems.appendProblem(self.gpa, .{ .infinite_recursion = .{
                 .var_ = var_,
                 .snapshot = snapshot,
-                .def_name = if (comptime Idx == CIR.Def.Idx) blk: {
-                    const def = self.cir.store.getDef(idx);
-                    break :blk self.getPatternIdent(def.pattern);
-                } else blk: {
-                    break :blk null;
-                },
+                .def_name = self.bindingRootName(Idx, idx),
             } });
             try self.types.setVarContent(var_, .err);
         },
     }
+}
+
+/// The settled-state occurs sweep: check every binding root — top-level defs
+/// and recorded local bindings — for infinite/anonymous-recursive types, after
+/// all deferred constraints have been solved.
+fn checkBindingRootsForInfiniteTypes(self: *Self) std.mem.Allocator.Error!void {
+    const trace = tracy.trace(@src());
+    defer trace.end();
+
+    // Local bindings first: when a local binding's cycle is also reachable
+    // from the enclosing top-level def's type, reporting (and poisoning) the
+    // local binding attributes the error to the tighter root and suppresses a
+    // duplicate report at the def.
+    for (self.local_binding_roots.items) |pattern_idx| {
+        try self.checkForInfiniteType(CIR.Pattern.Idx, pattern_idx);
+    }
+    for (0..self.cir.all_defs.span.len) |def_offset| {
+        const def_idx = self.cir.store.defAt(self.cir.all_defs, def_offset);
+        try self.checkForInfiniteType(CIR.Def.Idx, def_idx);
+    }
+}
+
+/// The display name for a binding root being occurs-checked, when it has one.
+fn bindingRootName(self: *const Self, comptime Idx: anytype, idx: Idx) ?Ident.Idx {
+    if (comptime Idx == CIR.Def.Idx) {
+        const def = self.cir.store.getDef(idx);
+        return self.getPatternIdent(def.pattern);
+    }
+    if (comptime Idx == CIR.Pattern.Idx) {
+        return self.getPatternIdent(idx);
+    }
+    return null;
 }
 
 /// Validate every local nominal type declaration's backing recursion, after
@@ -5477,11 +5520,9 @@ fn checkFileInternal(self: *Self, skip_numeric_defaults: bool) std.mem.Allocator
 
     try self.finalizeTypes(&env, .{ .module = .{ .skip_numeric_defaults = skip_numeric_defaults } });
 
-    // After solving all deferred constraints, check for infinite types
-    for (0..self.cir.all_defs.span.len) |def_offset| {
-        const def_idx = self.cir.store.defAt(self.cir.all_defs, def_offset);
-        try self.checkForInfiniteType(CIR.Def.Idx, def_idx);
-    }
+    // After solving all deferred constraints, check every binding root
+    // (top-level defs and local bindings) for infinite types
+    try self.checkBindingRootsForInfiniteTypes();
 
     if (!self.has_can_error_diagnostics()) {
         try self.poisonErroneousValueUses();
@@ -8572,8 +8613,10 @@ pub fn checkExprRepl(self: *Self, expr_idx: CIR.Expr.Idx) std.mem.Allocator.Erro
     try self.finalizeTypes(&env, .{ .repl_expr = expr_idx });
     try self.reportPolymorphicConstrainedExpr(expr_idx);
 
-    // Check for infinite types
+    // Check for infinite types, at the expression root and at every binding
+    // root the expression contains
     try self.checkForInfiniteType(CIR.Expr.Idx, expr_idx);
+    try self.checkBindingRootsForInfiniteTypes();
 
     self.debugAssertNominalDeclTableComplete();
 }
@@ -8634,16 +8677,35 @@ pub fn checkExprReplWithDefs(self: *Self, expr_idx: CIR.Expr.Idx) std.mem.Alloca
     // Check the expr
     _ = try self.checkExpr(expr_idx, &env, Expected.none());
 
-    try self.finalizeTypes(&env, .{ .repl_expr = expr_idx });
+    // Check any accumulated constraints
+    try self.checkAllConstraints(&env);
+    try self.resolvePendingTupleAccesses(&env, false);
+    try self.checkAllConstraints(&env);
+    try self.resolveNumericLiteralsFromContext(&env);
+    try self.finalizeLiteralDefaults(&env);
 
-    // After solving all deferred constraints, check for infinite types —
-    // per-def AND for the result expression itself, matching checkExprRepl
-    // (its type may be infinite/anonymously recursive, which the per-def
-    // checks above don't cover).
-    for (0..self.cir.all_defs.span.len) |def_offset| {
-        const def_idx = self.cir.store.defAt(self.cir.all_defs, def_offset);
-        try self.checkForInfiniteType(CIR.Def.Idx, def_idx);
+    // After finalizing literal defaults, resolve any remaining deferred static
+    // dispatch constraints: committing a default can generate deferred
+    // method_call constraints (e.g. Dec.to_str returns Str). Without this step,
+    // the return type of methods on numerics stays an unconstrained flex var,
+    // causing incorrect .zst layouts.
+    if (env.deferred_static_dispatch_constraints.items.items.len > 0) {
+        try self.checkStaticDispatchConstraints(&env, true);
+        try self.checkAllConstraints(&env);
     }
+
+    // After solving all deferred constraints, check every binding root
+    // (top-level defs and local bindings) for infinite types
+    try self.checkBindingRootsForInfiniteTypes();
+
+    // Check the result expression itself, matching checkExprRepl: its type may
+    // have incompatible constraints (e.g. !3) or be infinite/anonymously
+    // recursive, neither of which is covered by the per-def checks above.
+    const expr_var = ModuleEnv.varFrom(expr_idx);
+    try self.checkFlexVarConstraintCompatibility(expr_var, &env, true);
+    try self.validateResolvedOpenNumeralLiterals(&env, true);
+    try self.resolvePendingTupleAccesses(&env, true);
+    try self.checkAllConstraints(&env);
     try self.checkForInfiniteType(CIR.Expr.Idx, expr_idx);
 
     try self.reportPolymorphicConstrainedExpr(expr_idx);
@@ -12411,7 +12473,12 @@ fn checkExpr(self: *Self, expr_idx: CIR.Expr.Idx, env: *Env, expected: Expected)
             try self.processReturnConstraints(env, expr_idx);
             return_constraints_processed = true;
 
-            try self.checkForInfiniteType(CIR.Expr.Idx, lambda.body);
+            // NOTE: no occurs check here. Infinite/anonymous-recursive types
+            // are detected at binding roots (top-level defs, local bindings,
+            // REPL roots) — a cyclic type constructed while checking this
+            // body is reachable from the enclosing binding's root type, and
+            // running occurs per syntactic lambda re-traversed the whole body
+            // type graph once per nesting level.
 
             // Create the function type
             if (body_does_fx) {
@@ -14184,6 +14251,15 @@ fn checkBlockStatements(self: *Self, statements: CIR.Statement.Span, env: *Env, 
                     _ = self.local_processing_ptrns.remove(decl_stmt.pattern);
                     _ = self.predeclared_local_scheme_vars.remove(decl_stmt.pattern);
                 }
+
+                // This statement is a binding root whose type may never be
+                // reachable from the enclosing def's root type. Record it for
+                // the settled-state occurs sweep — checking immediately would
+                // be premature: an anonymous cycle can still become valid by
+                // lifting into a nominal type when the surrounding expression
+                // is checked (e.g. a recursive closure whose result is later
+                // unified with Iter).
+                try self.local_binding_roots.append(self.gpa, decl_stmt.pattern);
             },
             .s_var => |var_stmt| {
                 self.markCurrentHoistRuntimeDependency();
@@ -14225,6 +14301,10 @@ fn checkBlockStatements(self: *Self, statements: CIR.Statement.Span, env: *Env, 
                 if (var_pattern_result.isOk()) {
                     try self.checkDestructureExhaustiveness(var_stmt.pattern_idx, var_stmt.expr, var_expr, env, stmt_region);
                 }
+
+                // `var` statements are binding roots too (they never
+                // generalize, but their type can still be made cyclic).
+                try self.local_binding_roots.append(self.gpa, var_stmt.pattern_idx);
             },
             .s_var_uninitialized => |var_stmt| {
                 self.markCurrentHoistRuntimeDependency();
