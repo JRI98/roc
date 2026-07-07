@@ -909,12 +909,13 @@ identity remains the source identity used for `TypeDef`, diagnostics, source
 locations, and name-store interning. Alias and nominal checked payloads also
 carry the checked module id that owns the declaration or representation
 authority. For local named types, that id is the current checked module id; for
-imports, projection copies the imported owner id; for builtins, it is the
-builtin checked module id.
+imports, checked type copying preserves the imported owner id; for builtins, it
+is the builtin checked module id.
 
-Post-check stages consume the owner checked module id directly as a checked
-module address. If a checked type mentions an owner checked module id that is
-not present in lowering visibility, the checked module producer is incomplete.
+Monotype and runtime lowering consume the owner checked module id directly as a
+checked module address. If a checked type mentions an owner checked module id
+that is not present in lowering visibility, the checked module producer is
+incomplete.
 
 ### Compile-Time Constants and Hoisted Roots
 
