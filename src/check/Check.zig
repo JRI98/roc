@@ -7580,6 +7580,40 @@ fn exprHasEffectfulFunctionBody(self: *const Self, expr_idx: CIR.Expr.Idx) bool 
     };
 }
 
+/// Whether `def_idx` belongs to a binding group that is still on the check
+/// stack — mid-check, or checked but suspended at its boundary, so its
+/// members' vars are not yet generalized.
+fn defInOnStackGroup(self: *const Self, def_idx: CIR.Def.Idx) bool {
+    const group_index = self.def_group.get(def_idx) orelse return false;
+    for (self.group_stack.items) |frame| {
+        if (frame.group_index == group_index) return true;
+    }
+    return false;
+}
+
+/// Whether a call's callee is a recursive reference to a def that has not
+/// finished checking — a self-call, or a call between members of an on-stack
+/// binding group (top-level or block-local).
+///
+/// A binding group's effectfulness is a fixpoint over the effects its bodies
+/// actually perform. A recursive call through the group's own declared `=>`
+/// scheme must not seed that fixpoint: otherwise every annotated-effectful
+/// recursive function would be reported as needing a `!` name even when its
+/// body never performs an effect. Calls to defs of already-finished groups
+/// are not exempt — their effectfulness is settled.
+fn callTargetIsInFlightRecursiveRef(self: *const Self, func_expr_idx: CIR.Expr.Idx) bool {
+    const pattern_idx = switch (self.cir.store.getExpr(func_expr_idx)) {
+        .e_lookup_local => |lookup| lookup.pattern_idx,
+        else => return false,
+    };
+    if (self.local_processing_ptrns.contains(pattern_idx)) return true;
+    const processing_def = self.top_level_ptrns.get(pattern_idx) orelse return false;
+    return switch (processing_def.status) {
+        .processing => true,
+        .not_processed, .processed => self.defInOnStackGroup(processing_def.def_idx),
+    };
+}
+
 fn checkEffectfulFunctionName(self: *Self, pattern_idx: CIR.Pattern.Idx, expr_idx: CIR.Expr.Idx) std.mem.Allocator.Error!void {
     const ident = self.getPatternIdent(pattern_idx) orelse return;
     if (ident.attributes.effectful) return;
@@ -12383,9 +12417,13 @@ fn checkExpr(self: *Self, expr_idx: CIR.Expr.Idx, env: *Env, expected: Expected)
                         };
                         const mb_func = if (mb_func_info) |info| info.func else null;
 
-                        // If the function being called is effectful, mark this expression as effectful
+                        // If the function being called is effectful, mark this
+                        // expression as effectful. A recursive call within the
+                        // current binding group is exempt: the group's own
+                        // declared `=>` scheme must not seed its effectfulness
+                        // fixpoint (see callTargetIsInFlightRecursiveRef).
                         if (mb_func_info) |info| {
-                            if (info.is_effectful) {
+                            if (info.is_effectful and !self.callTargetIsInFlightRecursiveRef(call.func)) {
                                 does_fx = true;
                             }
                         }
