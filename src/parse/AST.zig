@@ -279,6 +279,7 @@ pub fn parseDiagnosticToReport(self: *AST, env: *const CommonEnv, diagnostic: Di
         .nominal_associated_cannot_have_final_expression => "Expression In Associated Items",
         .deprecated_number_suffix => "Deprecated Number Suffix",
         .expr_double_dot_is_not_range => "Not A Range Operator",
+        .record_field_name_cannot_be_var => "Invalid Record Field Name",
         else => "Parse Error",
     };
 
@@ -311,6 +312,7 @@ pub fn parseDiagnosticToReport(self: *AST, env: *const CommonEnv, diagnostic: Di
         .nominal_associated_cannot_have_final_expression => "Associated items (such as types or methods) can only have associated types and values, not plain expressions.",
         .deprecated_number_suffix => "This number literal uses a deprecated suffix syntax.",
         .expr_double_dot_is_not_range => ".. is not an operator. For an exclusive range use ..<; for an inclusive range use ..=.",
+        .record_field_name_cannot_be_var => "Record field names cannot start with a dollar sign.",
         else => "",
     };
 
@@ -585,6 +587,13 @@ pub fn parseDiagnosticToReport(self: *AST, env: *const CommonEnv, diagnostic: Di
             return report;
         },
         .expr_double_dot_is_not_range => {},
+        .record_field_name_cannot_be_var => {
+            try report.document.addReflowingText("Names that start with ");
+            try report.document.addAnnotated("$", .emphasized);
+            try report.document.addReflowingText(" are reassignable variables declared with the ");
+            try report.document.addKeyword("var");
+            try report.document.addReflowingText(" keyword, so they cannot be used as record field names.");
+        },
         else => {
             const tag_name = @tagName(diagnostic.tag);
             const owned_tag = try report.addOwnedString(tag_name);
@@ -711,6 +720,8 @@ pub const Diagnostic = struct {
         var_must_have_ident,
         var_expected_equals,
         var_type_anno_needs_var_keyword,
+        /// `$name` idents are reassignable variables and cannot name record fields
+        record_field_name_cannot_be_var,
         for_expected_in,
         match_branch_wrong_arrow,
         match_branch_missing_arrow,

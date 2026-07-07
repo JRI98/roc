@@ -8,30 +8,19 @@ type=expr
 { $field : "value" }
 ~~~
 # EXPECTED
-PARSE ERROR - dollar_prefix_field_name.md:1:3:1:9
-PARSE ERROR - dollar_prefix_field_name.md:1:10:1:11
+INVALID RECORD FIELD NAME - dollar_prefix_field_name.md:1:3:1:9
 # PROBLEMS
 
-┌─────────────┐
-│ PARSE ERROR ├─ A parsing error occurred: expected_expr_record_field_name ───┐
-└┬────────────┘                                                               │
+┌───────────────────────────┐
+│ INVALID RECORD FIELD NAME ├─ Record field names cannot start with a ────────┐
+└┬──────────────────────────┘  dollar sign.                                   │
  │                                                                            │
  │  { $field : "value" }                                                      │
  │    ‾‾‾‾‾‾                                                                  │
  └─────────────────────────────────────────── dollar_prefix_field_name.md:1:3 ┘
 
-    This is an unexpected parsing error. Please check your syntax.
-
-
-┌─────────────┐
-│ PARSE ERROR ├─ A parsing error occurred: ───────────────────────────────────┐
-└┬────────────┘  expected_expr_close_curly_or_comma                           │
- │                                                                            │
- │  { $field : "value" }                                                      │
- │           ‾                                                                │
- └────────────────────────────────────────── dollar_prefix_field_name.md:1:10 ┘
-
-    This is an unexpected parsing error. Please check your syntax.
+    Names that start with $ are reassignable variables declared with the `var`
+    keyword, so they cannot be used as record field names.
 
 # TOKENS
 ~~~zig
@@ -40,19 +29,24 @@ EndOfFile,
 ~~~
 # PARSE
 ~~~clojure
-(e-malformed (reason "expected_expr_close_curly_or_comma"))
+(e-record
+	(field (field "$field")
+		(e-string
+			(e-string-part (raw "value")))))
 ~~~
 # FORMATTED
 ~~~roc
-
+{ $field: "value" }
 ~~~
 # CANONICALIZE
 ~~~clojure
-(can-ir (empty true))
+(e-record
+	(fields
+		(field (name "$field")
+			(e-string
+				(e-literal (string "value"))))))
 ~~~
 # TYPES
 ~~~clojure
-(inferred-types
-	(defs)
-	(expressions))
+(expr (type "{ $field: Str }"))
 ~~~
