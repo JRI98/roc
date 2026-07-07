@@ -88,12 +88,12 @@ The current implementation answers that with local analysis calls:
   proc emission. A different but overlapping ownership state is a different
   entry and therefore a fresh walk.
 
-There is an adjacent project,
-`projects/big/arc-certifier-lattice-join.md`, for the debug certifier. It
-proposes replacing the certifier's distinct-entry-state enumeration with a
-finite lattice fixpoint and centralizing ownership-transfer keying. This
-project is the production-inserter counterpart: it attacks compile time in
-`arc.zig`, not the debug-only certifier.
+The debug certifier already landed this discipline: its distinct-entry-state
+enumeration was replaced with a finite lattice fixpoint (`JoinGroup` joining
+in `src/lir/arc_certify.zig`), and ownership-transfer keying is centralized
+in `arc.zig`'s transfer layer. This project is the production-inserter
+counterpart: it attacks compile time in `arc.zig`, not the debug-only
+certifier.
 
 One existing LIR pass is the closest implementation model:
 `src/lir/tag_reachability.zig`. It tracks possible tag values in monotone
@@ -163,9 +163,9 @@ change is how it answers liveness and join-keep questions.
 
 ### Part 1: shared transfer decisions
 
-Do this after, or together with, the ownership-transfer keying portion of
-`arc-certifier-lattice-join.md`. The summary solver must not create a third
-copy of transfer semantics.
+Build on the landed ownership-transfer keying layer in `arc.zig` (the
+`transferFor*` functions shared by both walks). The summary solver must not
+create a third copy of transfer semantics.
 
 Create a shared inserter transfer layer used by:
 
@@ -374,19 +374,11 @@ explained by a correctness bug in the old inserter or rejected.
 - Differential debug tests that run old and new join summaries together
   during migration, deleted or converted to invariant tests once the old path
   is removed.
-- A post-ARC LIR byte-identity corpus check, shared with
-  `arc-certifier-lattice-join.md`'s ownership-transfer refactor.
+- A post-ARC LIR byte-identity corpus check, as used to land the
+  ownership-transfer keying layer.
 
 ## Related projects
 
-- [ARC Certifier Lattice Join and Centralized Ownership-Transfer Keying](./arc-certifier-lattice-join.md)
-  - supplies the shared transfer-keying discipline this project should reuse;
-  its lattice/fixpoint design is the debug-certifier analogue of this
-  production-inserter project.
 - [A Decision-Tree Match Compiler](./decision-tree-match-compiler.md)
   - references `src/lir/tag_reachability.zig`, the existing LIR monotone
   fixpoint pass this project should use as an implementation model.
-- [Total Dispatch Plans](./total-dispatch-plans.md)
-  - makes structural `encoder_for` dispatch explicit at check time. That fixes
-  why structural JSON encoders are selected; this project fixes why compiling
-  the generated encoder LIR is too slow.

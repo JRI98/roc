@@ -218,6 +218,3 @@ construction.
 
 ## Related projects
 
-- [ARC Certifier Lattice Join and Centralized Ownership-Transfer Keying](../big/arc-certifier-lattice-join.md)
-  — the compile-time twin of this cleanup: both replace per-site
-  open-coded ownership reasoning with one shared, documented definition.

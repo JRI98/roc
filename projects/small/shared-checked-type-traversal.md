@@ -189,5 +189,3 @@ below current levels.
 
 - [Debug Generation Counters on Growable Stores](../small/store-generation-counters.md)
   — the sibling "make the invariant structural" project for store borrows.
-- [Immutable Specialization Identity](../big/immutable-specialization-identity.md)
-  — the Monotype-side consumer of digest/traversal discipline.

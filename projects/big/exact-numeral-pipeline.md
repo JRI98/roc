@@ -135,7 +135,7 @@ checking; decide the default in one module; produce bits exactly once.
    `RocDec.fromF64 orelse` panic. `from_numeral` folding consumes the exact
    payload directly instead of round-tripping through
    `numeralLiteralDecimalText`.
-5. **Ordering interaction**: ../big/total-dispatch-plans.md requires a
+5. **Ordering interaction**: static-dispatch plan finalization requires a
    single type-finalization point; defaulting must be complete before
    dispatch plans freeze, so the oracle runs as part of that finalization
    point, not scattered across generalization boundaries.
@@ -196,7 +196,5 @@ panics for representability are deleted, not relocated.
 
 ## Related projects
 
-- [Total dispatch plans](../big/total-dispatch-plans.md) — defines the
-  single type-finalization point the defaulting oracle plugs into.
 - [Checked arithmetic ops in LIR](../small/checked-arithmetic-lir-ops.md)
   — its cross-engine conformance suite hosts the literal tests.

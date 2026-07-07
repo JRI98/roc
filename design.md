@@ -4034,16 +4034,29 @@ against the borrow typing rules:
   borrow's lifetime is contained in the lender's
 - every join body holds under the entry state of each jump that reaches it:
   jump states are summarized over the names the body relies on (liveness,
-  unit counts, alias partition, and borrow anchors), and the body is
-  certified once per distinct summary, exactly as shared switch suffixes are
-  re-walked per distinct inflowing state
+  unit counts, alias partition, and borrow anchors) and joined into a
+  forward dataflow fixpoint — summaries agreeing on every name's ownership
+  mode share one abstraction whose must-alias partition is the meet of
+  theirs (with per-fine-class balances re-attributed by constraint
+  propagation), and the body is re-certified only when a jump strictly
+  refines that abstraction. Mode disagreements split the abstraction along
+  exactly the entry-state modes real in-edges disagree about, so refinement never
+  manufactures entry states no jump produced; in the worst case it
+  degenerates to one walk per distinct summary, with no capacity cap and no
+  skip path. The join is monotone over a finite-height lattice (partition
+  refinement is bounded by the name count; balance divergence across
+  mode-identical entries is itself a finding — per-iteration accumulation),
+  so certification of every procedure runs to completion
 - every call site satisfies the callee variant's signature, and every pinned
   signature holds
 
 The certifier consumes only the emitted LIR and the stage-local signature
-table. A certifier failure is a compiler bug and stops compilation. Release
-builds compile the certifier away entirely, like every other debug-only
-boundary check.
+table, and leaves no unverified residue: every procedure is certified to a
+fixpoint. The guaranteed property is that every emitted schedule balances
+ownership on all paths — each unit released or transferred exactly once, no
+use after death, no release of a borrow. A certifier failure is a compiler
+bug and stops compilation. Release builds compile the certifier away
+entirely, like every other debug-only boundary check.
 
 ### Thread-Confined Reference Counts
 
