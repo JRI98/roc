@@ -803,6 +803,81 @@ cache hit with a matching key and version is consumed as already-checked output;
 the compiler must not pay an extra pass to rediscover whether the cached output
 is complete for the checked module.
 
+## Def Checking Order
+
+Type checking processes a module's top-level defs as binding groups: the SCC
+condensation of the name-reference graph, in deterministic topological order
+(groups ordered by their first member's source position among independent
+groups; members within a group in source order). The graph covers every name
+reference in a def's expression tree — nested lambda bodies and blocks
+included — plus statically-resolvable type-qualified method-call targets. It
+is transient checking input computed from canonicalization output when
+checking starts and freed with the checker; a checked module never stores it.
+
+Because groups are checked in dependency order, a name reference between
+groups always points at an already-checked def. There is no re-entrant
+`checkDef` from inside an expression walk, and no code path exists for a name
+reference to an unchecked def outside the current group (it is a debug
+invariant violation).
+
+Annotated schemes come before any body. A pre-pass declares a standalone
+generalized scheme from every eligible annotation (a simple `.assign` binding
+whose annotation has no `_` hole): the annotation's type is generated once in
+place, deep-copied into disjoint orphan vars, generalized, and the annotation
+nodes are reset so the def's own body check generates them again exactly as
+always. A reference to an annotated def — by name or by dispatch — before or
+while its body checks instantiates this standalone scheme, exactly like a
+reference to an imported scheme copy; the def itself still checks with its
+annotation generated in its body's frame, sharing vars with the scheme the
+checked module outputs, which checked dispatch-evidence resolution relies on.
+
+The recursion rule is the ML binding-group rule. A recursive group gets one
+shared rank frame: members' patterns are ranked in it first, an in-group
+reference to an unannotated member unifies monomorphically with the member's
+in-flight type (call-site constraints flow into the inferred scheme), unannotated
+members' top-level lambdas stay in the frame instead of generalizing on their
+own, and the whole group generalizes at the frame's boundary. References to
+annotated members instantiate the pre-declared scheme, preserving sound
+polymorphic recursion for annotated defs. The same rule applies to
+block-local `s_decl` functions: each local function decl is a binding group
+of one with its own rank frame, and annotated (type-var-free) locals
+pre-declare their scheme. There is no deferred post-generalization validation
+of recursive references anywhere; the monomorphic rule leaves nothing to
+validate afterwards. A consequence is that an unannotated recursive def
+used at two incompatible types within its own group is a type error — the
+old deferral silently accepted such programs unsoundly.
+
+Static-dispatch dependencies are inherently dynamic (`|a| a.foo()` dispatches
+on an inferred type), so they cannot be in the name graph. When a deferred
+static-dispatch constraint resolves to an unchecked, unannotated local def
+mid-body, the target is only *recorded* (`pending_dispatch_targets`, owned by
+the discovering group) and the constraint re-deferred; the constraint's vars
+are pinned at the group's boundary rank so no inner lambda can generalize
+them first. At the group's generalization boundary — a singleton def's RHS
+frame or a recursive group's shared frame, where no mid-body state is pending
+— the driver checks each target's group in its own nested frame (together
+with any unchecked topological prefix), re-runs dispatch, and interleaves
+boundary literal defaulting to a fixpoint before generalizing. Group checks
+nest only at such boundaries.
+
+Group suspension and merge need no dedicated machinery: a suspended group's
+members are `.processed` with still-live, not-yet-generalized vars, so a
+dispatch back-edge from a nested group links to them monomorphically and rank
+adjustment keeps the shared structure at the suspended group's rank, where it
+generalizes when that group's boundary completes. A group therefore never
+generalizes while one of its deferred dispatch constraints into an unchecked
+group is outstanding, and a suspended group is never re-entered — both are
+asserted in
+debug builds (`group_stack`, group states, and the pending-target
+stack-suffix discipline).
+
+Deferred early-return / `?` constraints record the lambda that created them,
+and each lambda's end drains exactly its own entries; a drain cannot touch
+another lambda's constraints, by construction. Rank bookkeeping is therefore
+strictly stack-shaped: unification only ever runs while the frame owning its
+vars is active, and `addVarToRank`'s debug guard is a regression tripwire
+rather than a reachable condition.
+
 ## Checked Boundary
 
 Checked CIR is the last source-level representation. It owns:
