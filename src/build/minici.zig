@@ -146,28 +146,6 @@ fn runStatusText(result: CommandResult) []const u8 {
     return "failed";
 }
 
-// CI runners discard the workspace, so a failed step's log file is
-// unreachable there; echo its tail to stdout so the GitHub log (and any
-// retry wrapper matching on output) can see the actual error.
-const log_tail_max_bytes: usize = 64 * 1024;
-
-fn printLogTail(allocator: std.mem.Allocator, io: std.Io, log_path: []const u8) void {
-    const contents = std.Io.Dir.cwd().readFileAlloc(io, log_path, allocator, .limited(256 * 1024 * 1024)) catch |err| {
-        std.debug.print("  (could not read log {s}: {s})\n", .{ log_path, @errorName(err) });
-        return;
-    };
-    defer allocator.free(contents);
-    const tail = contents[contents.len -| log_tail_max_bytes..];
-    if (tail.len < contents.len) {
-        std.debug.print("  --- log tail (last {d} of {d} bytes) ---\n", .{ tail.len, contents.len });
-    } else {
-        std.debug.print("  --- log ---\n", .{});
-    }
-    std.debug.print("{s}", .{tail});
-    if (tail.len > 0 and tail[tail.len - 1] != '\n') std.debug.print("\n", .{});
-    std.debug.print("  --- end log ---\n", .{});
-}
-
 fn printRerunHint(result: CommandResult) void {
     const step_name = if (result.command.len > 2) result.command[2] else "build-ci";
     std.debug.print("  Re-run failed step: `zig build {s} --summary all --color off", .{step_name});
@@ -305,11 +283,14 @@ fn findCoreError(log: []const u8) ?[]const u8 {
 }
 
 /// Echoes a failing step's captured output to the console so the failure is
-/// actionable without re-running the step. It first tries to extract just the
-/// core error (a harness summary, or a failed `zig build` step's error output);
-/// when no known shape matches it falls back to showing the head and tail of the
-/// whole log with the noisy middle elided. The full output always remains in
-/// `result.log_path`, which `printRerunHint` points at.
+/// actionable without re-running the step. CI runners discard the workspace, so
+/// a failed step's log file is unreachable there; echoing puts the actual error
+/// into the GitHub log (and in front of any retry wrapper matching on output).
+/// It first tries to extract just the core error (a harness summary, or a failed
+/// `zig build` step's error output); when no known shape matches it falls back to
+/// showing the head and tail of the whole log with the noisy middle elided. The
+/// full output always remains in `result.log_path`, which `printRerunHint`
+/// points at.
 fn printFailureLog(allocator: std.mem.Allocator, io: std.Io, result: CommandResult) void {
     const contents = std.Io.Dir.cwd().readFileAlloc(io, result.log_path, allocator, .limited(256 * 1024 * 1024)) catch |err| {
         std.debug.print("  (could not read log `{s}`: {s})\n", .{ result.log_path, @errorName(err) });
@@ -992,7 +973,6 @@ pub fn main(init: std.process.Init) !void {
     if (!isPass(build_result)) {
         printFailureLog(allocator, io, build_result);
         printRerunHint(build_result);
-        printLogTail(allocator, io, build_result.log_path);
         try writeReportJson(allocator, io, run_started_unix_ms, build_result, results.items);
         try writeHtml(allocator, io, run_started_unix_ms, build_result, results.items);
         std.process.exit(1);
@@ -1018,7 +998,6 @@ pub fn main(init: std.process.Init) !void {
         if (!isSuccessful(result)) {
             printFailureLog(allocator, io, result);
             printRerunHint(result);
-            printLogTail(allocator, io, result.log_path);
         }
 
         if (isCheckJob(job.name) and !isSuccessful(result)) {
