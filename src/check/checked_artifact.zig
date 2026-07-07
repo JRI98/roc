@@ -11608,10 +11608,6 @@ fn isExprNodeTag(tag: CIR.Node.Tag) bool {
     return Ident.textStartsWith(@tagName(tag), "expr_");
 }
 
-fn isPatternNodeTag(tag: CIR.Node.Tag) bool {
-    return Ident.textStartsWith(@tagName(tag), "pattern_");
-}
-
 fn isStatementNodeTag(tag: CIR.Node.Tag) bool {
     return Ident.textStartsWith(@tagName(tag), "statement_");
 }
