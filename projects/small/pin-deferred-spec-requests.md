@@ -201,11 +201,11 @@ tree:
 
 ## Related projects
 
-- [../big/total-dispatch-plans.md](../big/total-dispatch-plans.md) — the
-  same discipline (downstream consumes checked data; no re-derivation)
-  applied to dispatch; this project applies it to specialization request
-  types.
-- [../big/immutable-specialization-identity.md](../big/immutable-specialization-identity.md)
-  — the other identity/typing surface of `lower.zig` specialization records;
-  pinning requests at checked types also reduces the pressure that made
-  request/solved dual entries diverge.
+- The landed total-dispatch-plans work — the same discipline (downstream
+  consumes checked data; no re-derivation) applied to dispatch; this project
+  applies it to specialization request types.
+- The landed immutable specialization identity work (`SpecIdentity`,
+  `SpecBuilder` in `src/postcheck/monotype/`) — the other identity/typing
+  surface of `lower.zig` specialization records; pinning requests at checked
+  types also reduces the pressure that made request/solved dual entries
+  diverge.

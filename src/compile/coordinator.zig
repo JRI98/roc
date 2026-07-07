@@ -713,13 +713,6 @@ pub const PackageState = struct {
         self.root_file_state = state;
     }
 
-    pub fn urlId(self: *const PackageState) ?[]const u8 {
-        if (self.url) |url| {
-            return url.urlId();
-        }
-        return null;
-    }
-
     /// Ensure a module exists, creating it if necessary
     pub fn ensureModule(self: *PackageState, gpa: Allocator, name: []const u8, path: []const u8) Allocator.Error!ModuleId {
         if (self.module_names.get(name)) |id| {
@@ -5528,7 +5521,7 @@ fn overwriteFilesUnderDir(allocator: Allocator, absolute_dir: []const u8, conten
     return overwritten;
 }
 
-fn corruptCheckedModuleEnvIdentBytesLen(allocator: Allocator, checked_module_cache_dir: []const u8) CorruptCheckedModuleCacheError!usize {
+fn corruptCheckedModuleEnvIdentBytesLens(allocator: Allocator, checked_module_cache_dir: []const u8) CorruptCheckedModuleCacheError!usize {
     const env_ident_bytes_len_offset =
         checked_module_cache_header_len +
         @offsetOf(ModuleEnv.Serialized, "common") +
@@ -5734,7 +5727,7 @@ test "Coordinator corrupt checked module cache env relocations compile from sour
     const config = CacheConfig{ .cache_dir = cache_dir };
     const checked_module_cache_dir = try config.getCheckedArtifactCacheDir(allocator);
     defer allocator.free(checked_module_cache_dir);
-    const corrupted = try corruptCheckedModuleEnvIdentBytesLen(allocator, checked_module_cache_dir);
+    const corrupted = try corruptCheckedModuleEnvIdentBytesLens(allocator, checked_module_cache_dir);
     try std.testing.expect(corrupted > 0);
 
     const second = try compileAppWithCheckedModuleCache(allocator, cache_dir, "test/str/app_message.roc");

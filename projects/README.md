@@ -33,30 +33,17 @@ completely.
 ### Dependency chains
 
 **Chain A — dispatch:**
-1. [big/total-dispatch-plans.md](big/total-dispatch-plans.md)
-2. [big/generalization-time-ambiguity.md](big/generalization-time-ambiguity.md)
-   — shares the constraint-provenance foundation with total dispatch plans;
-   doable before it, but cheaper after.
+1. [big/generalization-time-ambiguity.md](big/generalization-time-ambiguity.md)
+   — builds on the landed total static-dispatch plan work and replaces the
+   remaining ambiguity sweep with a generalization-time rule.
 
-**Chain B — identity:**
-1. [big/immutable-specialization-identity.md](big/immutable-specialization-identity.md)
-   — the remaining identity project. Content-based nominal identity has landed,
-   but specialization records still rekey themselves during Monotype lowering.
+**Chain B — ARC:**
+1. [big/arc-inserter-join-summaries.md](big/arc-inserter-join-summaries.md)
+   — applies the certifier's landed finite-summary/dataflow discipline to
+   production ARC insertion, replacing join and liveness re-walks that make
+   generated structural encoders compile in minutes.
 
-Chain B also strengthens Chain A (stable cross-module references for resolved
-dispatch targets) and the glue project, but does not block them.
-
-**Chain C — ARC:**
-1. [big/arc-certifier-lattice-join.md](big/arc-certifier-lattice-join.md)
-   — removes the remaining certifier skip path and centralizes
-   ownership-transfer keying. The current code already warns on skips and
-   fails CI when skips occur; this project closes the hole for real.
-2. [big/arc-inserter-join-summaries.md](big/arc-inserter-join-summaries.md)
-   — applies the same finite-summary/dataflow discipline to production ARC
-   insertion, replacing join and liveness re-walks that make generated
-   structural encoders compile in minutes.
-
-**Chain D — numerics:**
+**Chain C — numerics:**
 1. [big/exact-numeral-pipeline.md](big/exact-numeral-pipeline.md)
 - [small/checked-arithmetic-lir-ops.md](small/checked-arithmetic-lir-ops.md)
   is independent of both and can land any time.
@@ -91,14 +78,11 @@ leverage and keeps prerequisites satisfied:
 2. `small/centralize-slice-reuse-predicate.md`
 3. `small/store-generation-counters.md`
 4. `small/checked-arithmetic-lir-ops.md`
-5. `big/total-dispatch-plans.md`
-6. `big/immutable-specialization-identity.md`
-7. `small/shared-checked-type-traversal.md`
-8. `big/arc-certifier-lattice-join.md`
-9. `big/arc-inserter-join-summaries.md`
-10. `big/exact-numeral-pipeline.md`
-11. `big/generalization-time-ambiguity.md`
-12. `big/unify-build-pipelines.md`
-13. `big/decision-tree-match-compiler.md`
-14. `small/glue-consumes-committed-layouts.md`
-15. `small/structural-hoist-contexts.md`
+5. `small/shared-checked-type-traversal.md`
+6. `big/arc-inserter-join-summaries.md`
+7. `big/exact-numeral-pipeline.md`
+8. `big/generalization-time-ambiguity.md`
+9. `big/unify-build-pipelines.md`
+10. `big/decision-tree-match-compiler.md`
+11. `small/glue-consumes-committed-layouts.md`
+12. `small/structural-hoist-contexts.md`

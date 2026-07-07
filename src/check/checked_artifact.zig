@@ -13130,8 +13130,7 @@ fn sealCheckedProcedureTemplateRefs(
 
 /// Resolve every static-dispatch plan and instantiation-site obligation to an
 /// explicit `direct` / `constraint(k)` / `structural` / `checked_error`
-/// resolution, and publish each template's evidence params
-/// (projects/big/total-dispatch-plans.md).
+/// resolution, and publish each template's evidence params.
 ///
 /// Runs after `sealCheckedProcedureTemplateRefs` so plans and value refs are
 /// grouped per template: `constraint(k)` indexes the enclosing template's

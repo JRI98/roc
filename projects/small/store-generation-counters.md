@@ -139,6 +139,4 @@ The existing historical regression tests must remain green:
 ## Related Projects
 
 - [A Shared Cycle-Guarded Checked-Type Traversal](../small/shared-checked-type-traversal.md)
-  - the sibling project for traversal invariants.
-- [Immutable Specialization Identity](../big/immutable-specialization-identity.md)
-  - reduces append-while-walking pressure in specialization code.
+  — the sibling "make the invariant structural" project for traversals.

@@ -3552,37 +3552,18 @@ root proc ids, platform entrypoints, and target usize.
 
 Structural record layout is order-insensitive: fields are sorted
 lexicographically by name and then stably by descending alignment, so source
-field order never affects memory. Nominal records instead lay out fields in
-*declared* order, so a nominal record can be given the exact memory layout of a
-chosen C struct and exchanged with a host with no per-field translation.
+field order never affects memory. Nominal records use the same structural
+layout by default. A nominal record opts into declared-order layout only by
+including an unnamed field in its declaration.
 
-The padding invariant is unchanged: a committed struct never contains internal
-alignment padding between fields. Because every layout's size is a multiple of
-its alignment, descending-alignment order always satisfies this, and it is the
-order structural records use. Declared order does not always satisfy it, so
-nominal layout commit verifies the declared order and only repairs it when it
-would introduce internal padding:
-
-- Verify: walk fields in declared order; if every field is naturally aligned at
-  its running offset, commit the declared order unchanged. This accepts
-  hand-tuned layouts — including ones, as in many C structs, where a
-  lower-alignment field validly precedes a higher-alignment one because earlier
-  fields already advanced the offset to the needed boundary — without reordering
-  them.
-- Repair: when declared order would require padding, commit the no-padding order
-  that is lexicographically closest to declared order. The longest valid
-  declared prefix is kept, and at each forced break the earliest-declared field
-  that still admits a no-padding completion is chosen. A completion always
-  exists (descending-alignment witnesses one from offset zero), so repair is
-  total and is never reported as an error: eliminating padding is the compiler's
-  responsibility, not the programmer's.
-
-Repair is a greedy walk with a memoized feasibility check. Feasibility depends
-only on the running offset modulo the maximum field alignment and on the
-multiset of remaining field shapes, of which there are few, so it is cheap and
-needs no backtracking. Reordering never changes a struct's size or alignment —
-every no-padding order shares both — so it only changes which field name lands
-at which offset.
+Declared-order nominal layout is for host-facing records that intentionally
+mirror a C struct. When a nominal declaration contains an unnamed field, layout
+commit sends the fields to the store in declaration order and commits that
+order verbatim. The store inserts normal C-style implicit padding between
+fields as alignment requires, and rounds the total size up to the maximum field
+alignment. It does not repair or reorder the declaration. Padding is represented
+in committed layout fields, so later stages consume committed offsets and sizes
+instead of reconstructing them.
 
 Nominal record declarations may contain unnamed fields, written `_` or
 `_`-prefixed (`_reserved`). An unnamed field reserves the size of its type but
@@ -3590,9 +3571,9 @@ stores nothing, is not accessible, and imposes no alignment requirement on
 itself (its bytes are uninitialized), which lets a declaration reproduce a C
 struct's explicit padding without a dummy value to initialize. Layout treats
 unnamed fields as alignment-one spacers, so they advance the offset by their
-size yet repair may place them at any offset. They contribute their size but not
-their alignment to the struct, so pure padding never inflates a struct's
-alignment. Using an unnamed field in a structural record type is rejected during
+size in the committed field order. They contribute their size but not their
+alignment to the struct, so pure padding never inflates a struct's alignment.
+Using an unnamed field in a structural record type is rejected during
 canonicalization.
 
 Declared field order is explicit data. Record rows are sorted lexicographically
@@ -3602,11 +3583,11 @@ fixed order, so the declared order is not recoverable from the lowered record
 itself. Canonicalization preserves it — a nominal declaration's record
 annotation keeps its fields in source order — and it is carried forward as a
 datum on the nominal type, distinct from the (lexicographic) backing row, so
-later stages consume it without rescanning declarations. The struct commit
-applies it as the declared order described above; field-name resolution
-continues to use the lexicographic row order, independent of the layout offset
-map. The same datum is consumed by the interpreter's layout store, so all
-backends agree.
+later stages consume it without rescanning declarations. The struct commit uses
+it only for the unnamed-field opt-in described above; otherwise nominal records
+use the structural order of their backing row. Field-name resolution continues
+to use the lexicographic row order, independent of the layout offset map. The
+same data is consumed by the interpreter's layout store, so all backends agree.
 
 ### Pattern Lowering
 
@@ -4034,16 +4015,29 @@ against the borrow typing rules:
   borrow's lifetime is contained in the lender's
 - every join body holds under the entry state of each jump that reaches it:
   jump states are summarized over the names the body relies on (liveness,
-  unit counts, alias partition, and borrow anchors), and the body is
-  certified once per distinct summary, exactly as shared switch suffixes are
-  re-walked per distinct inflowing state
+  unit counts, alias partition, and borrow anchors) and joined into a
+  forward dataflow fixpoint — summaries agreeing on every name's ownership
+  mode share one abstraction whose must-alias partition is the meet of
+  theirs (with per-fine-class balances re-attributed by constraint
+  propagation), and the body is re-certified only when a jump strictly
+  refines that abstraction. Mode disagreements split the abstraction along
+  exactly the entry-state modes real in-edges disagree about, so refinement never
+  manufactures entry states no jump produced; in the worst case it
+  degenerates to one walk per distinct summary, with no capacity cap and no
+  skip path. The join is monotone over a finite-height lattice (partition
+  refinement is bounded by the name count; balance divergence across
+  mode-identical entries is itself a finding — per-iteration accumulation),
+  so certification of every procedure runs to completion
 - every call site satisfies the callee variant's signature, and every pinned
   signature holds
 
 The certifier consumes only the emitted LIR and the stage-local signature
-table. A certifier failure is a compiler bug and stops compilation. Release
-builds compile the certifier away entirely, like every other debug-only
-boundary check.
+table, and leaves no unverified residue: every procedure is certified to a
+fixpoint. The guaranteed property is that every emitted schedule balances
+ownership on all paths — each unit released or transferred exactly once, no
+use after death, no release of a borrow. A certifier failure is a compiler
+bug and stops compilation. Release builds compile the certifier away
+entirely, like every other debug-only boundary check.
 
 ### Thread-Confined Reference Counts
 

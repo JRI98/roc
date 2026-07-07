@@ -646,31 +646,26 @@ const Inserter = struct {
             var current_start = path.cursor;
             switch (stmt) {
                 .assign_ref => |assign| {
-                    var retain_assign_ref_target = true;
-                    const target_borrowed = self.isBindingBorrowed(assign.target);
-                    if (target_borrowed) {
+                    var transfer = AliasBindTransfer{ .retain_target = true, .release_old_target = false };
+                    if (self.isBindingBorrowed(assign.target)) {
                         // Borrowed bindings carry no ownership unit and emit
                         // no RC statements; the lender's liveness group keeps
                         // the value alive across every use.
-                        retain_assign_ref_target = false;
+                        transfer.retain_target = false;
                     } else switch (assign.op) {
                         .local => |source| {
                             if (assign.target != source) {
-                                const move_value = try self.canMoveSetLocalValue(&path.owned, source, assign.next, path.options.loop_keep);
-                                current_start = try self.releaseOldTargetIfNeeded(assign.target, &path.owned, current_start);
-                                if (move_value) {
-                                    self.unsetOwnedUnit(&path.owned, source);
-                                    retain_assign_ref_target = false;
-                                }
-                                self.addOwnedIfRc(&path.owned, assign.target);
+                                transfer = try self.transferForAliasBind(&path.owned, assign.target, source, assign.next, path.options.loop_keep);
                             } else {
-                                retain_assign_ref_target = false;
+                                transfer.retain_target = false;
                             }
                         },
                         else => {
-                            current_start = try self.releaseOldTargetIfNeeded(assign.target, &path.owned, current_start);
-                            self.addOwnedIfRc(&path.owned, assign.target);
+                            transfer.release_old_target = self.transferForFreshBind(&path.owned, assign.target);
                         },
+                    }
+                    if (transfer.release_old_target) {
+                        current_start = try self.emitRebindRelease(assign.target, current_start);
                     }
                     var deaths: std.ArrayList(LIR.LocalId) = .empty;
                     errdefer deaths.deinit(self.store.allocator);
@@ -679,14 +674,15 @@ const Inserter = struct {
                     try path.frames.append(self.store.allocator, .{
                         .stmt = path.cursor,
                         .head = current_start,
-                        .retain_assign_ref_target = retain_assign_ref_target,
+                        .retain_assign_ref_target = transfer.retain_target,
                         .post_release = try self.takePostReleases(&deaths),
                     });
                     path.cursor = assign.next;
                 },
                 .assign_literal => |assign| {
-                    current_start = try self.releaseOldTargetIfNeeded(assign.target, &path.owned, current_start);
-                    self.addOwnedIfRc(&path.owned, assign.target);
+                    if (self.transferForFreshBind(&path.owned, assign.target)) {
+                        current_start = try self.emitRebindRelease(assign.target, current_start);
+                    }
                     var deaths: std.ArrayList(LIR.LocalId) = .empty;
                     errdefer deaths.deinit(self.store.allocator);
                     const singles = [_]LIR.LocalId{assign.target};
@@ -699,7 +695,9 @@ const Inserter = struct {
                     path.cursor = assign.next;
                 },
                 .init_uninitialized => |uninit| {
-                    current_start = try self.releaseOldTargetIfNeeded(uninit.target, &path.owned, current_start);
+                    if (self.transferForInit(&path.owned, uninit.target)) {
+                        current_start = try self.emitRebindRelease(uninit.target, current_start);
+                    }
                     try path.frames.append(self.store.allocator, .{ .stmt = path.cursor, .head = current_start });
                     path.cursor = uninit.next;
                 },
@@ -709,43 +707,34 @@ const Inserter = struct {
                     // specialization is on, and never for pinned callees,
                     // whose vectors are ABI contracts.
                     const unique_demand = self.variants.enabled and !self.solution.isPinnedProc(assign.proc);
-                    var arg_ownership = try self.callArgOwnership(assign.proc, &path.owned, callee_sig, unique_demand, assign.args, assign.next, assign.target, path.options.loop_keep);
-                    defer arg_ownership.deinit(self.store.allocator);
-                    const call_target = try self.variantForCall(assign.proc, arg_ownership.demanded);
-                    if (!self.spanUsesLocal(assign.args, assign.target)) {
-                        current_start = try self.releaseOldTargetIfNeeded(assign.target, &path.owned, current_start);
+                    var transfer = try self.transferForCall(&path.owned, assign.proc, callee_sig, unique_demand, assign.args, assign.next, assign.target, null, path.options.loop_keep);
+                    defer transfer.deinit(self.store.allocator);
+                    const call_target = try self.variantForCall(assign.proc, transfer.args.demanded);
+                    if (transfer.release_old_target) {
+                        current_start = try self.emitRebindRelease(assign.target, current_start);
                     }
-                    self.unsetArgs(&path.owned, arg_ownership.transfer_args.items);
-                    self.addCallResultOwnedIfRc(&path.owned, assign.target, arg_ownership.demanded.ret_mode);
-                    current_start = try self.retainArgs(arg_ownership.retain_args.items, current_start);
-                    // A borrowed-return result that must be owned here pays
-                    // one retain right after the call.
-                    const retain_call_result = arg_ownership.demanded.ret_mode == .borrowed and
-                        self.localContainsRefcounted(assign.target) and
-                        !self.isBindingBorrowed(assign.target);
+                    current_start = try self.retainArgs(transfer.args.retain_args.items, current_start);
                     var deaths: std.ArrayList(LIR.LocalId) = .empty;
                     errdefer deaths.deinit(self.store.allocator);
-                    try self.noteCallResultDeathIfUnused(&path.owned, assign.target, arg_ownership.demanded.ret_mode, assign.next, path.options.loop_keep, &deaths);
+                    try self.noteCallResultDeathIfUnused(&path.owned, assign.target, transfer.args.demanded.ret_mode, assign.next, path.options.loop_keep, &deaths);
                     try self.postStmtDeaths(&path.owned, &.{}, assign.args, assign.next, path.options.loop_keep, &deaths);
                     try path.frames.append(self.store.allocator, .{
                         .stmt = path.cursor,
                         .head = current_start,
-                        .retain_call_result = retain_call_result,
+                        .retain_call_result = transfer.retain_call_result,
                         .call_target_override = call_target,
                         .post_release = try self.takePostReleases(&deaths),
                     });
                     path.cursor = assign.next;
                 },
                 .assign_call_erased => |assign| {
-                    var arg_ownership = try self.callArgOwnership(null, &path.owned, arc_sig.RcSig.all_owned, false, assign.args, assign.next, assign.target, path.options.loop_keep);
-                    defer arg_ownership.deinit(self.store.allocator);
-                    if (!self.spanUsesLocal(assign.args, assign.target) and assign.closure != assign.target) {
-                        current_start = try self.releaseOldTargetIfNeeded(assign.target, &path.owned, current_start);
+                    var transfer = try self.transferForCall(&path.owned, null, arc_sig.RcSig.all_owned, false, assign.args, assign.next, assign.target, assign.closure, path.options.loop_keep);
+                    defer transfer.deinit(self.store.allocator);
+                    if (transfer.release_old_target) {
+                        current_start = try self.emitRebindRelease(assign.target, current_start);
                     }
-                    self.unsetArgs(&path.owned, arg_ownership.transfer_args.items);
-                    self.addCallResultOwnedIfRc(&path.owned, assign.target, .owned);
                     current_start = try self.retainLocalIfRc(assign.closure, current_start);
-                    current_start = try self.retainArgs(arg_ownership.retain_args.items, current_start);
+                    current_start = try self.retainArgs(transfer.args.retain_args.items, current_start);
                     var deaths: std.ArrayList(LIR.LocalId) = .empty;
                     errdefer deaths.deinit(self.store.allocator);
                     try self.noteCallResultDeathIfUnused(&path.owned, assign.target, .owned, assign.next, path.options.loop_keep, &deaths);
@@ -759,12 +748,10 @@ const Inserter = struct {
                     path.cursor = assign.next;
                 },
                 .assign_packed_erased_fn => |assign| {
-                    var transfer_single = false;
-                    if (assign.capture) |capture| {
-                        transfer_single = try self.singleTransfer(capture, assign.next, assign.target, &path.owned, path.options.loop_keep);
+                    const transfer = try self.transferForSingle(&path.owned, assign.capture, assign.target, assign.next, path.options.loop_keep);
+                    if (transfer.release_old_target) {
+                        current_start = try self.emitRebindRelease(assign.target, current_start);
                     }
-                    current_start = try self.releaseOldTargetIfNeeded(assign.target, &path.owned, current_start);
-                    self.addOwnedIfRc(&path.owned, assign.target);
                     var deaths: std.ArrayList(LIR.LocalId) = .empty;
                     errdefer deaths.deinit(self.store.allocator);
                     const singles = [_]LIR.LocalId{ assign.capture orelse assign.target, assign.target };
@@ -772,47 +759,18 @@ const Inserter = struct {
                     try path.frames.append(self.store.allocator, .{
                         .stmt = path.cursor,
                         .head = current_start,
-                        .transfer_single = transfer_single,
+                        .transfer_single = transfer.transfer_single,
                         .post_release = try self.takePostReleases(&deaths),
                     });
                     path.cursor = assign.next;
                 },
                 .assign_low_level => |assign| {
-                    if ((assign.rc_effect.result_aliases_consumed_args & ~assign.rc_effect.consume_args) != 0) {
-                        arcInvariant("ARC low-level result-token metadata referenced a non-consumed argument");
-                    }
-                    const preserve_consumed_args = try self.preserveConsumedArgMask(
-                        assign.args,
-                        assign.rc_effect.consume_args,
-                        assign.next,
-                        assign.target,
-                        path.options.loop_keep,
-                    );
-                    const unique_args = self.uniqueArgsMask(
-                        assign.args,
-                        assign.rc_effect,
-                        assign.target,
-                        preserve_consumed_args,
-                        &path.owned,
-                    );
-                    const target_consumed = self.maskedArgsContainLocal(assign.args, assign.rc_effect.consume_args, assign.target);
-                    if (target_consumed) {
-                        self.unsetOwnedUnit(&path.owned, assign.target);
-                    } else {
-                        current_start = try self.releaseOldTargetIfNeeded(assign.target, &path.owned, current_start);
+                    const transfer = try self.transferForLowLevel(&path.owned, assign.args, assign.rc_effect, assign.target, assign.next, path.options.loop_keep, true);
+                    if (transfer.release_old_target) {
+                        current_start = try self.emitRebindRelease(assign.target, current_start);
                     }
                     if (assign.rc_effect.consume_args != 0) {
-                        self.unsetMaskedArgsExcept(&path.owned, assign.args, assign.rc_effect.consume_args & ~preserve_consumed_args, assign.target);
-                    }
-                    // Retained positions whose group dies here move their
-                    // unit into the result instead of paying a retain.
-                    var transfer_mask: u64 = 0;
-                    if (assign.rc_effect.retain_args != 0) {
-                        transfer_mask = try self.spanTransferMask(assign.args, assign.rc_effect.retain_args, assign.next, assign.target, &path.owned, path.options.loop_keep);
-                    }
-                    self.addOwnedIfRc(&path.owned, assign.target);
-                    if (assign.rc_effect.consume_args != 0) {
-                        current_start = try self.retainMaskedArgs(assign.args, preserve_consumed_args, current_start);
+                        current_start = try self.retainMaskedArgs(assign.args, transfer.preserve_consumed_args, current_start);
                     }
                     var deaths: std.ArrayList(LIR.LocalId) = .empty;
                     errdefer deaths.deinit(self.store.allocator);
@@ -821,17 +779,18 @@ const Inserter = struct {
                     try path.frames.append(self.store.allocator, .{
                         .stmt = path.cursor,
                         .head = current_start,
-                        .transfer_mask = transfer_mask,
+                        .transfer_mask = transfer.transfer_mask,
                         .skip_result_retain = self.isBindingBorrowed(assign.target),
-                        .unique_args = unique_args,
+                        .unique_args = transfer.unique_args,
                         .post_release = try self.takePostReleases(&deaths),
                     });
                     path.cursor = assign.next;
                 },
                 .assign_list => |assign| {
-                    const transfer_mask = try self.spanTransferMask(assign.elems, ~@as(u64, 0), assign.next, assign.target, &path.owned, path.options.loop_keep);
-                    current_start = try self.releaseOldTargetIfNeeded(assign.target, &path.owned, current_start);
-                    self.addOwnedIfRc(&path.owned, assign.target);
+                    const transfer = try self.transferForAggregate(&path.owned, assign.elems, assign.target, assign.next, path.options.loop_keep);
+                    if (transfer.release_old_target) {
+                        current_start = try self.emitRebindRelease(assign.target, current_start);
+                    }
                     var deaths: std.ArrayList(LIR.LocalId) = .empty;
                     errdefer deaths.deinit(self.store.allocator);
                     const singles = [_]LIR.LocalId{assign.target};
@@ -839,15 +798,16 @@ const Inserter = struct {
                     try path.frames.append(self.store.allocator, .{
                         .stmt = path.cursor,
                         .head = current_start,
-                        .transfer_mask = transfer_mask,
+                        .transfer_mask = transfer.transfer_mask,
                         .post_release = try self.takePostReleases(&deaths),
                     });
                     path.cursor = assign.next;
                 },
                 .assign_struct => |assign| {
-                    const transfer_mask = try self.spanTransferMask(assign.fields, ~@as(u64, 0), assign.next, assign.target, &path.owned, path.options.loop_keep);
-                    current_start = try self.releaseOldTargetIfNeeded(assign.target, &path.owned, current_start);
-                    self.addOwnedIfRc(&path.owned, assign.target);
+                    const transfer = try self.transferForAggregate(&path.owned, assign.fields, assign.target, assign.next, path.options.loop_keep);
+                    if (transfer.release_old_target) {
+                        current_start = try self.emitRebindRelease(assign.target, current_start);
+                    }
                     var deaths: std.ArrayList(LIR.LocalId) = .empty;
                     errdefer deaths.deinit(self.store.allocator);
                     const singles = [_]LIR.LocalId{assign.target};
@@ -855,18 +815,16 @@ const Inserter = struct {
                     try path.frames.append(self.store.allocator, .{
                         .stmt = path.cursor,
                         .head = current_start,
-                        .transfer_mask = transfer_mask,
+                        .transfer_mask = transfer.transfer_mask,
                         .post_release = try self.takePostReleases(&deaths),
                     });
                     path.cursor = assign.next;
                 },
                 .assign_tag => |assign| {
-                    var transfer_single = false;
-                    if (assign.payload) |payload| {
-                        transfer_single = try self.singleTransfer(payload, assign.next, assign.target, &path.owned, path.options.loop_keep);
+                    const transfer = try self.transferForSingle(&path.owned, assign.payload, assign.target, assign.next, path.options.loop_keep);
+                    if (transfer.release_old_target) {
+                        current_start = try self.emitRebindRelease(assign.target, current_start);
                     }
-                    current_start = try self.releaseOldTargetIfNeeded(assign.target, &path.owned, current_start);
-                    self.addOwnedIfRc(&path.owned, assign.target);
                     var deaths: std.ArrayList(LIR.LocalId) = .empty;
                     errdefer deaths.deinit(self.store.allocator);
                     const singles = [_]LIR.LocalId{ assign.payload orelse assign.target, assign.target };
@@ -874,24 +832,15 @@ const Inserter = struct {
                     try path.frames.append(self.store.allocator, .{
                         .stmt = path.cursor,
                         .head = current_start,
-                        .transfer_single = transfer_single,
+                        .transfer_single = transfer.transfer_single,
                         .post_release = try self.takePostReleases(&deaths),
                     });
                     path.cursor = assign.next;
                 },
                 .set_local => |assign| {
-                    var retain_set_target = assign.target != assign.value;
-                    if (assign.target != assign.value) {
-                        const move_value = try self.canMoveSetLocalValue(&path.owned, assign.value, assign.next, path.options.loop_keep);
-                        switch (assign.mode) {
-                            .replace_existing, .initialize_join_param => current_start = try self.releaseOldTargetIfNeeded(assign.target, &path.owned, current_start),
-                            .initialize_join_result => {},
-                        }
-                        if (move_value) {
-                            self.unsetOwnedUnit(&path.owned, assign.value);
-                            retain_set_target = false;
-                        }
-                        self.addOwnedIfRc(&path.owned, assign.target);
+                    const transfer = try self.transferForSetLocal(&path.owned, assign.target, assign.value, assign.mode, assign.next, path.options.loop_keep);
+                    if (transfer.release_old_target) {
+                        current_start = try self.emitRebindRelease(assign.target, current_start);
                     }
                     var deaths: std.ArrayList(LIR.LocalId) = .empty;
                     errdefer deaths.deinit(self.store.allocator);
@@ -900,7 +849,7 @@ const Inserter = struct {
                     try path.frames.append(self.store.allocator, .{
                         .stmt = path.cursor,
                         .head = current_start,
-                        .retain_set_target = retain_set_target,
+                        .retain_set_target = transfer.retain_target,
                         .post_release = try self.takePostReleases(&deaths),
                     });
                     path.cursor = assign.next;
@@ -931,25 +880,25 @@ const Inserter = struct {
                 },
                 .incref => |rc| {
                     if (path.options.boundaries.len == 0) arcInvariant("ARC insertion received already-reference-counted LIR");
-                    self.addOwnedIfRc(&path.owned, rc.value);
+                    self.noteEmittedRetain(&path.owned, rc.value);
                     try path.frames.append(self.store.allocator, .{ .stmt = path.cursor, .head = current_start });
                     path.cursor = rc.next;
                 },
                 .decref => |rc| {
                     if (path.options.boundaries.len == 0) arcInvariant("ARC insertion received already-reference-counted LIR");
-                    path.owned.unset(rc.value);
+                    self.noteEmittedRelease(&path.owned, rc.value);
                     try path.frames.append(self.store.allocator, .{ .stmt = path.cursor, .head = current_start });
                     path.cursor = rc.next;
                 },
                 .decref_if_initialized => |rc| {
                     if (path.options.boundaries.len == 0) arcInvariant("ARC insertion received already-reference-counted LIR");
-                    path.owned.unset(rc.value);
+                    self.noteEmittedRelease(&path.owned, rc.value);
                     try path.frames.append(self.store.allocator, .{ .stmt = path.cursor, .head = current_start });
                     path.cursor = rc.next;
                 },
                 .free => |rc| {
                     if (path.options.boundaries.len == 0) arcInvariant("ARC insertion received already-reference-counted LIR");
-                    path.owned.unset(rc.value);
+                    self.noteEmittedRelease(&path.owned, rc.value);
                     try path.frames.append(self.store.allocator, .{ .stmt = path.cursor, .head = current_start });
                     path.cursor = rc.next;
                 },
@@ -1015,10 +964,9 @@ const Inserter = struct {
                         // The caller borrows the result from its own
                         // arguments; no unit transfers.
                         tail = try self.releaseAll(&path.owned, tail);
-                    } else if (self.ownsUnit(&path.owned, ret_stmt.value)) {
+                    } else if (self.consumeAtTerminal(&path.owned, ret_stmt.value)) {
                         // Move on return: the binding's own unit transfers to
                         // the caller; no retain/release pair is needed.
-                        self.unsetOwnedUnit(&path.owned, ret_stmt.value);
                         tail = try self.releaseAll(&path.owned, tail);
                     } else {
                         tail = try self.releaseAll(&path.owned, tail);
@@ -1038,8 +986,7 @@ const Inserter = struct {
                     // Terminal: the message's ownership unit transfers to the
                     // failure report, so it is not released here.
                     var tail = path.cursor;
-                    if (self.ownsUnit(&path.owned, expect_err_stmt.message)) {
-                        self.unsetOwnedUnit(&path.owned, expect_err_stmt.message);
+                    if (self.consumeAtTerminal(&path.owned, expect_err_stmt.message)) {
                         tail = try self.releaseAll(&path.owned, tail);
                     } else {
                         tail = try self.releaseAll(&path.owned, tail);
@@ -1499,11 +1446,13 @@ const Inserter = struct {
 
         var initialized_owned = try path.owned.clone();
         defer initialized_owned.deinit();
-        self.addOwnedIfRc(&initialized_owned, switch_stmt.payload);
+        self.placeUnit(&initialized_owned, switch_stmt.payload);
 
         var uninitialized_owned = try path.owned.clone();
         defer uninitialized_owned.deinit();
-        uninitialized_owned.unset(switch_stmt.payload);
+        // The branch proves the cell uninitialized: the payload binding
+        // ends with nothing to release.
+        _ = self.transferForInit(&uninitialized_owned, switch_stmt.payload);
 
         try self.pushRewritePath(tasks, switch_stmt.initialized_branch, &initialized_owned, path.options, &state.initialized_branch);
         try self.pushRewritePath(tasks, switch_stmt.uninitialized_branch, &uninitialized_owned, path.options, &state.uninitialized_branch);
@@ -1713,7 +1662,7 @@ const Inserter = struct {
             const step = GuardedList.at(steps, step_index);
             switch (step.capture) {
                 .discard => {},
-                .view => |local| self.addOwnedIfRc(&match_owned, local),
+                .view => |local| self.placeUnit(&match_owned, local),
             }
         }
 
@@ -1773,7 +1722,7 @@ const Inserter = struct {
                 const step = GuardedList.at(steps, step_index);
                 switch (step.capture) {
                     .discard => {},
-                    .view => |local| self.addOwnedIfRc(&match_owned, local),
+                    .view => |local| self.placeUnit(&match_owned, local),
                 }
             }
             try self.pushRewritePath(tasks, arm.on_match, &match_owned, path.options, &state.on_matches[arm_index]);
@@ -1907,12 +1856,10 @@ const Inserter = struct {
                         switch (assign.op) {
                             .local => |source| {
                                 if (assign.target != source) {
-                                    const move_value = try self.canMoveSetLocalValue(&path.owned, source, assign.next, path.loop_keep);
-                                    if (move_value) self.unsetOwnedUnit(&path.owned, source);
-                                    self.addOwnedIfRc(&path.owned, assign.target);
+                                    _ = try self.transferForAliasBind(&path.owned, assign.target, source, assign.next, path.loop_keep);
                                 }
                             },
-                            else => self.addOwnedIfRc(&path.owned, assign.target),
+                            else => _ = self.transferForFreshBind(&path.owned, assign.target),
                         }
                     }
                     const singles = [_]LIR.LocalId{ refOpSource(assign.op), assign.target };
@@ -1920,99 +1867,65 @@ const Inserter = struct {
                     path.cursor = assign.next;
                 },
                 .init_uninitialized => |uninit| {
-                    path.owned.unset(uninit.target);
+                    _ = self.transferForInit(&path.owned, uninit.target);
                     path.cursor = uninit.next;
                 },
                 .assign_literal => |assign| {
-                    self.addOwnedIfRc(&path.owned, assign.target);
+                    _ = self.transferForFreshBind(&path.owned, assign.target);
                     const singles = [_]LIR.LocalId{assign.target};
                     try self.postStmtDeaths(&path.owned, &singles, null, assign.next, path.loop_keep, null);
                     path.cursor = assign.next;
                 },
                 .assign_call => |assign| {
-                    // The demanded vector is unused on analysis paths, so
-                    // skip the unique-demand scan.
-                    var arg_ownership = try self.callArgOwnership(null, &path.owned, self.solution.sigOf(assign.proc), false, assign.args, assign.next, assign.target, path.loop_keep);
-                    defer arg_ownership.deinit(self.store.allocator);
-                    self.unsetArgs(&path.owned, arg_ownership.transfer_args.items);
-                    self.addCallResultOwnedIfRc(&path.owned, assign.target, arg_ownership.demanded.ret_mode);
-                    try self.noteCallResultDeathIfUnused(&path.owned, assign.target, arg_ownership.demanded.ret_mode, assign.next, path.loop_keep, null);
+                    // The demanded vector is unused on analysis paths (call
+                    // targets are not materialized here), so skip the
+                    // unique-demand scan.
+                    var transfer = try self.transferForCall(&path.owned, null, self.solution.sigOf(assign.proc), false, assign.args, assign.next, assign.target, null, path.loop_keep);
+                    defer transfer.deinit(self.store.allocator);
+                    try self.noteCallResultDeathIfUnused(&path.owned, assign.target, transfer.args.demanded.ret_mode, assign.next, path.loop_keep, null);
                     try self.postStmtDeaths(&path.owned, &.{}, assign.args, assign.next, path.loop_keep, null);
                     path.cursor = assign.next;
                 },
                 .assign_call_erased => |assign| {
-                    var arg_ownership = try self.callArgOwnership(null, &path.owned, arc_sig.RcSig.all_owned, false, assign.args, assign.next, assign.target, path.loop_keep);
-                    defer arg_ownership.deinit(self.store.allocator);
-                    self.unsetArgs(&path.owned, arg_ownership.transfer_args.items);
-                    self.addCallResultOwnedIfRc(&path.owned, assign.target, .owned);
+                    var transfer = try self.transferForCall(&path.owned, null, arc_sig.RcSig.all_owned, false, assign.args, assign.next, assign.target, assign.closure, path.loop_keep);
+                    defer transfer.deinit(self.store.allocator);
                     try self.noteCallResultDeathIfUnused(&path.owned, assign.target, .owned, assign.next, path.loop_keep, null);
                     const singles = [_]LIR.LocalId{assign.closure};
                     try self.postStmtDeaths(&path.owned, &singles, assign.args, assign.next, path.loop_keep, null);
                     path.cursor = assign.next;
                 },
                 .assign_packed_erased_fn => |assign| {
-                    if (assign.capture) |capture| {
-                        _ = try self.singleTransfer(capture, assign.next, assign.target, &path.owned, path.loop_keep);
-                    }
-                    self.addOwnedIfRc(&path.owned, assign.target);
+                    _ = try self.transferForSingle(&path.owned, assign.capture, assign.target, assign.next, path.loop_keep);
                     const singles = [_]LIR.LocalId{ assign.capture orelse assign.target, assign.target };
                     try self.postStmtDeaths(&path.owned, &singles, null, assign.next, path.loop_keep, null);
                     path.cursor = assign.next;
                 },
                 .assign_low_level => |assign| {
-                    const preserve_consumed_args = try self.preserveConsumedArgMask(
-                        assign.args,
-                        assign.rc_effect.consume_args,
-                        assign.next,
-                        assign.target,
-                        path.loop_keep,
-                    );
-                    const target_consumed = self.maskedArgsContainLocal(assign.args, assign.rc_effect.consume_args, assign.target);
-                    if (target_consumed) {
-                        self.unsetOwnedUnit(&path.owned, assign.target);
-                    }
-                    self.unsetMaskedArgsExcept(&path.owned, assign.args, assign.rc_effect.consume_args & ~preserve_consumed_args, assign.target);
-                    if (assign.rc_effect.retain_args != 0) {
-                        _ = try self.spanTransferMask(assign.args, assign.rc_effect.retain_args, assign.next, assign.target, &path.owned, path.loop_keep);
-                    }
-                    self.addOwnedIfRc(&path.owned, assign.target);
+                    _ = try self.transferForLowLevel(&path.owned, assign.args, assign.rc_effect, assign.target, assign.next, path.loop_keep, false);
                     const singles = [_]LIR.LocalId{assign.target};
                     try self.postStmtDeaths(&path.owned, &singles, assign.args, assign.next, path.loop_keep, null);
                     path.cursor = assign.next;
                 },
                 .assign_list => |assign| {
-                    _ = try self.spanTransferMask(assign.elems, ~@as(u64, 0), assign.next, assign.target, &path.owned, path.loop_keep);
-                    self.addOwnedIfRc(&path.owned, assign.target);
+                    _ = try self.transferForAggregate(&path.owned, assign.elems, assign.target, assign.next, path.loop_keep);
                     const singles = [_]LIR.LocalId{assign.target};
                     try self.postStmtDeaths(&path.owned, &singles, assign.elems, assign.next, path.loop_keep, null);
                     path.cursor = assign.next;
                 },
                 .assign_struct => |assign| {
-                    _ = try self.spanTransferMask(assign.fields, ~@as(u64, 0), assign.next, assign.target, &path.owned, path.loop_keep);
-                    self.addOwnedIfRc(&path.owned, assign.target);
+                    _ = try self.transferForAggregate(&path.owned, assign.fields, assign.target, assign.next, path.loop_keep);
                     const singles = [_]LIR.LocalId{assign.target};
                     try self.postStmtDeaths(&path.owned, &singles, assign.fields, assign.next, path.loop_keep, null);
                     path.cursor = assign.next;
                 },
                 .assign_tag => |assign| {
-                    if (assign.payload) |payload| {
-                        _ = try self.singleTransfer(payload, assign.next, assign.target, &path.owned, path.loop_keep);
-                    }
-                    self.addOwnedIfRc(&path.owned, assign.target);
+                    _ = try self.transferForSingle(&path.owned, assign.payload, assign.target, assign.next, path.loop_keep);
                     const singles = [_]LIR.LocalId{ assign.payload orelse assign.target, assign.target };
                     try self.postStmtDeaths(&path.owned, &singles, null, assign.next, path.loop_keep, null);
                     path.cursor = assign.next;
                 },
                 .set_local => |assign| {
-                    if (assign.target != assign.value) {
-                        const move_value = try self.canMoveSetLocalValue(&path.owned, assign.value, assign.next, path.loop_keep);
-                        switch (assign.mode) {
-                            .replace_existing, .initialize_join_param => path.owned.unset(assign.target),
-                            .initialize_join_result => {},
-                        }
-                        if (move_value) self.unsetOwnedUnit(&path.owned, assign.value);
-                    }
-                    self.addOwnedIfRc(&path.owned, assign.target);
+                    _ = try self.transferForSetLocal(&path.owned, assign.target, assign.value, assign.mode, assign.next, path.loop_keep);
                     const singles = [_]LIR.LocalId{ assign.value, assign.target };
                     try self.postStmtDeaths(&path.owned, &singles, null, assign.next, path.loop_keep, null);
                     path.cursor = assign.next;
@@ -2028,19 +1941,19 @@ const Inserter = struct {
                     path.cursor = expect_stmt.next;
                 },
                 .incref => |rc| {
-                    self.addOwnedIfRc(&path.owned, rc.value);
+                    self.noteEmittedRetain(&path.owned, rc.value);
                     path.cursor = rc.next;
                 },
                 .decref => |rc| {
-                    path.owned.unset(rc.value);
+                    self.noteEmittedRelease(&path.owned, rc.value);
                     path.cursor = rc.next;
                 },
                 .decref_if_initialized => |rc| {
-                    path.owned.unset(rc.value);
+                    self.noteEmittedRelease(&path.owned, rc.value);
                     path.cursor = rc.next;
                 },
                 .free => |rc| {
-                    path.owned.unset(rc.value);
+                    self.noteEmittedRelease(&path.owned, rc.value);
                     path.cursor = rc.next;
                 },
                 .switch_stmt => |switch_stmt| {
@@ -2082,11 +1995,13 @@ const Inserter = struct {
                 .switch_initialized_payload => |switch_stmt| {
                     var initialized_owned = try path.owned.clone();
                     defer initialized_owned.deinit();
-                    self.addOwnedIfRc(&initialized_owned, switch_stmt.payload);
+                    self.placeUnit(&initialized_owned, switch_stmt.payload);
 
                     var uninitialized_owned = try path.owned.clone();
                     defer uninitialized_owned.deinit();
-                    uninitialized_owned.unset(switch_stmt.payload);
+                    // The branch proves the cell uninitialized: the payload
+                    // binding ends with nothing to release.
+                    _ = self.transferForInit(&uninitialized_owned, switch_stmt.payload);
 
                     try self.pushAnalysisPath(tasks, switch_stmt.initialized_branch, path.stop, &initialized_owned, path.exits, path.loop_keep, path.scoped_joins, path.seen);
                     try self.pushAnalysisPath(tasks, switch_stmt.uninitialized_branch, path.stop, &uninitialized_owned, path.exits, path.loop_keep, path.scoped_joins, path.seen);
@@ -2101,7 +2016,7 @@ const Inserter = struct {
                         const step = GuardedList.at(steps, step_index);
                         switch (step.capture) {
                             .discard => {},
-                            .view => |local| self.addOwnedIfRc(&match_owned, local),
+                            .view => |local| self.placeUnit(&match_owned, local),
                         }
                     }
                     try self.pushAnalysisPath(tasks, str_match.on_match, path.stop, &match_owned, path.exits, path.loop_keep, path.scoped_joins, path.seen);
@@ -2120,7 +2035,7 @@ const Inserter = struct {
                             const step = GuardedList.at(steps, step_index);
                             switch (step.capture) {
                                 .discard => {},
-                                .view => |local| self.addOwnedIfRc(&match_owned, local),
+                                .view => |local| self.placeUnit(&match_owned, local),
                             }
                         }
                         try self.pushAnalysisPath(tasks, arm.on_match, path.stop, &match_owned, path.exits, path.loop_keep, path.scoped_joins, path.seen);
@@ -2395,18 +2310,85 @@ const Inserter = struct {
         return !self.owned_param_override.contains(local);
     }
 
-    fn addOwnedIfRc(self: *Inserter, owned: *OwnedSet, local: LIR.LocalId) void {
+    // Ownership-transfer keying layer
+    //
+    // Every ownership-transfer decision in this pass routes through this
+    // section, so the alias-to-unit keying rules live in exactly one place
+    // (issue 9703 was a transfer that tested and cleared the `OwnedSet` by
+    // an alias's own local id while the solver had put the unit on the
+    // alias's source local). The layer has two levels:
+    //
+    // Keying primitives — the only code allowed to touch `OwnedSet` bits at
+    // a transfer site:
+    // - `unitOf` is the single alias-to-unit resolution: a borrowed pure
+    //   same-value alias moves its source's unit; everything else moves its
+    //   own.
+    // - `ownsUnit` / `takeUnit` test / test-and-clear a unit by its unit
+    //   local.
+    // - `placeUnit` places a fresh unit on the *name* being bound; borrowed
+    //   bindings never carry a unit. `placeConditionalUnit` and
+    //   `placeCallResultUnit` are its two mode-specific variants.
+    // - `takeRebindTarget` ends the previous binding of a name that is
+    //   being rebound. Rebinding kills only that name's own binding — a
+    //   rebound borrowed alias must not release its source's unit — so this
+    //   one is keyed by the raw local id on purpose.
+    // - `noteEmittedRetain` / `noteEmittedRelease` replay already-emitted RC
+    //   statements into the state during boundary re-walks; emitted RC
+    //   statements name unit locals directly, so raw keying is exact there.
+    //
+    // Per-instruction transfer functions (`transferFor*`,
+    // `consumeAtTerminal`) — one per ownership-moving instruction kind.
+    // Each advances the abstract ownership state exactly once and returns
+    // the emission decisions as a small struct. The rewrite walk
+    // (`processRewritePath`) materializes RC statements from the decisions;
+    // the analysis walk (`processAnalysisPath`) applies the same state
+    // transition and discards them. Adding an ownership-moving LIR
+    // instruction means adding one transfer function here, called
+    // identically by both walks, instead of two hand-synchronized copies.
+
+    /// The single alias-to-unit resolution used by every transfer site.
+    fn unitOf(self: *const Inserter, local: LIR.LocalId) LIR.LocalId {
+        return self.solution.unitLocalOf(local);
+    }
+
+    fn ownsUnit(self: *const Inserter, owned: *const OwnedSet, local: LIR.LocalId) bool {
+        return owned.contains(self.unitOf(local));
+    }
+
+    /// Test-and-clear by unit key; returns whether a unit moved.
+    fn takeUnit(self: *const Inserter, owned: *OwnedSet, local: LIR.LocalId) bool {
+        const unit = self.unitOf(local);
+        if (!owned.contains(unit)) return false;
+        owned.unset(unit);
+        return true;
+    }
+
+    fn unsetOwnedUnit(self: *const Inserter, owned: *OwnedSet, local: LIR.LocalId) void {
+        owned.unset(self.unitOf(local));
+    }
+
+    /// Places a fresh ownership unit on the name being bound. Borrowed
+    /// bindings carry no unit: the lender's liveness group keeps the value
+    /// alive across every use.
+    fn placeUnit(self: *Inserter, owned: *OwnedSet, local: LIR.LocalId) void {
         if (!self.localContainsRefcounted(local)) return;
         if (self.isBindingBorrowed(local)) return;
         owned.set(local);
     }
 
-    fn addConditionallyOwnedIfRc(self: *Inserter, owned: *OwnedSet, local: LIR.LocalId) void {
+    /// Places a conditionally-present unit (maybe-initialized join payload
+    /// cells). The overwrite of such a cell is still the lifetime end of the
+    /// previous payload, so the unit is placed even on a solved-borrowed
+    /// binding.
+    fn placeConditionalUnit(self: *Inserter, owned: *OwnedSet, local: LIR.LocalId) void {
         if (!self.localContainsRefcounted(local)) return;
         owned.set(local);
     }
 
-    fn addCallResultOwnedIfRc(
+    /// Places the unit a call result carries: an owned return always hands
+    /// the caller a unit, and a borrowed return still needs one here unless
+    /// the result binding itself is borrowed.
+    fn placeCallResultUnit(
         self: *Inserter,
         owned: *OwnedSet,
         local: LIR.LocalId,
@@ -2420,12 +2402,264 @@ const Inserter = struct {
         }
     }
 
-    fn ownsUnit(self: *const Inserter, owned: *const OwnedSet, local: LIR.LocalId) bool {
-        return owned.contains(self.solution.unitLocalOf(local));
+    /// Ends the previous binding of a name being rebound, returning whether
+    /// a release must be emitted before the rebind. Keyed by the raw local
+    /// id on purpose: rebinding a name kills only that name's own binding,
+    /// never the unit of a value the name merely borrowed (audited for
+    /// issue 9703's keying class — see the layer comment above).
+    fn takeRebindTarget(_: *const Inserter, owned: *OwnedSet, target: LIR.LocalId) bool {
+        if (!owned.contains(target)) return false;
+        owned.unset(target);
+        return true;
     }
 
-    fn unsetOwnedUnit(self: *const Inserter, owned: *OwnedSet, local: LIR.LocalId) void {
-        owned.unset(self.solution.unitLocalOf(local));
+    /// Replays an already-emitted incref into the state during a boundary
+    /// re-walk (the only context where the walks see RC statements).
+    fn noteEmittedRetain(self: *Inserter, owned: *OwnedSet, value: LIR.LocalId) void {
+        self.placeUnit(owned, value);
+    }
+
+    /// Replays an already-emitted decref/free into the state during a
+    /// boundary re-walk. Emitted RC statements name unit locals directly.
+    fn noteEmittedRelease(_: *const Inserter, owned: *OwnedSet, value: LIR.LocalId) void {
+        owned.unset(value);
+    }
+
+    const AliasBindTransfer = struct {
+        /// Retain the target right after the bind; false when the source's
+        /// unit moved into the target or the binding is borrowed.
+        retain_target: bool,
+        release_old_target: bool,
+    };
+
+    /// `assign_ref` with a pure same-value `local` op, and `set_local`:
+    /// binding one name to another name's value. A dying source moves its
+    /// unit instead of paying a retain/release pair.
+    fn transferForAliasBind(
+        self: *Inserter,
+        owned: *OwnedSet,
+        target: LIR.LocalId,
+        source: LIR.LocalId,
+        next: LIR.CFStmtId,
+        loop_keep: ?*const OwnedSet,
+    ) ResourceError!AliasBindTransfer {
+        const move_value = try self.canMoveSetLocalValue(owned, source, next, loop_keep);
+        const release_old_target = self.takeRebindTarget(owned, target);
+        if (move_value) _ = self.takeUnit(owned, source);
+        self.placeUnit(owned, target);
+        return .{ .retain_target = !move_value, .release_old_target = release_old_target };
+    }
+
+    /// A binding whose value is freshly produced by the statement itself
+    /// (literals, payload reads): the new binding owns one unit; the old
+    /// binding, if any, dies here.
+    fn transferForFreshBind(self: *Inserter, owned: *OwnedSet, target: LIR.LocalId) bool {
+        const release_old_target = self.takeRebindTarget(owned, target);
+        self.placeUnit(owned, target);
+        return release_old_target;
+    }
+
+    /// `init_uninitialized`: the target's previous binding dies and nothing
+    /// replaces it.
+    fn transferForInit(self: *Inserter, owned: *OwnedSet, target: LIR.LocalId) bool {
+        return self.takeRebindTarget(owned, target);
+    }
+
+    /// `set_local`: like an alias bind, but the write mode decides whether
+    /// the target's previous binding dies (join-result initialization writes
+    /// into a cell that holds no previous value).
+    fn transferForSetLocal(
+        self: *Inserter,
+        owned: *OwnedSet,
+        target: LIR.LocalId,
+        value: LIR.LocalId,
+        mode: LIR.SetLocalWriteMode,
+        next: LIR.CFStmtId,
+        loop_keep: ?*const OwnedSet,
+    ) ResourceError!AliasBindTransfer {
+        if (target == value) return .{ .retain_target = false, .release_old_target = false };
+        const move_value = try self.canMoveSetLocalValue(owned, value, next, loop_keep);
+        const release_old_target = switch (mode) {
+            .replace_existing, .initialize_join_param => self.takeRebindTarget(owned, target),
+            .initialize_join_result => false,
+        };
+        if (move_value) _ = self.takeUnit(owned, value);
+        self.placeUnit(owned, target);
+        return .{ .retain_target = !move_value, .release_old_target = release_old_target };
+    }
+
+    const CallTransfer = struct {
+        args: CallArgOwnership,
+        release_old_target: bool,
+        /// The callee returns a borrow of its arguments but this binding
+        /// needs its own unit: pay one retain right after the call.
+        retain_call_result: bool,
+
+        fn deinit(self: *CallTransfer, allocator: std.mem.Allocator) void {
+            self.args.deinit(allocator);
+        }
+    };
+
+    /// Direct and erased calls: owned argument positions consume the
+    /// caller's units (dying arguments move, surviving ones pay a retain),
+    /// and the result binding receives the returned unit. `extra_use` is the
+    /// erased call's closure operand, which keeps the target's old binding
+    /// alive through the call like an argument does.
+    fn transferForCall(
+        self: *Inserter,
+        owned: *OwnedSet,
+        callee: ?LIR.LirProcSpecId,
+        callee_sig: arc_sig.RcSig,
+        unique_demand: bool,
+        args: LIR.LocalSpan,
+        next: LIR.CFStmtId,
+        target: LIR.LocalId,
+        extra_use: ?LIR.LocalId,
+        loop_keep: ?*const OwnedSet,
+    ) ResourceError!CallTransfer {
+        var arg_ownership = try self.callArgOwnership(callee, owned, callee_sig, unique_demand, args, next, target, loop_keep);
+        errdefer arg_ownership.deinit(self.store.allocator);
+        const target_feeds_call = self.spanUsesLocal(args, target) or
+            (extra_use != null and extra_use.? == target);
+        const release_old_target = if (target_feeds_call)
+            false
+        else
+            self.takeRebindTarget(owned, target);
+        self.unsetArgs(owned, arg_ownership.transfer_args.items);
+        self.placeCallResultUnit(owned, target, arg_ownership.demanded.ret_mode);
+        const retain_call_result = arg_ownership.demanded.ret_mode == .borrowed and
+            self.localContainsRefcounted(target) and
+            !self.isBindingBorrowed(target);
+        return .{
+            .args = arg_ownership,
+            .release_old_target = release_old_target,
+            .retain_call_result = retain_call_result,
+        };
+    }
+
+    const AggregateTransfer = struct {
+        /// Span-indexed operand positions whose unit moves into the
+        /// constructed value instead of being retained.
+        transfer_mask: u64,
+        release_old_target: bool,
+    };
+
+    /// List and struct construction: every refcounted operand occurrence
+    /// moves one unit into the aggregate; dying operands transfer their own
+    /// unit, surviving ones pay a retain (emitted as the trailing increfs).
+    fn transferForAggregate(
+        self: *Inserter,
+        owned: *OwnedSet,
+        operands: LIR.LocalSpan,
+        target: LIR.LocalId,
+        next: LIR.CFStmtId,
+        loop_keep: ?*const OwnedSet,
+    ) ResourceError!AggregateTransfer {
+        const transfer_mask = try self.spanTransferMask(operands, ~@as(u64, 0), next, target, owned, loop_keep);
+        const release_old_target = self.takeRebindTarget(owned, target);
+        self.placeUnit(owned, target);
+        return .{ .transfer_mask = transfer_mask, .release_old_target = release_old_target };
+    }
+
+    const SingleTransfer = struct {
+        /// Move the tag payload or packed capture instead of retaining it.
+        transfer_single: bool,
+        release_old_target: bool,
+    };
+
+    /// Tag construction and packed erased-fn capture: the single operand
+    /// variant of `transferForAggregate`.
+    fn transferForSingle(
+        self: *Inserter,
+        owned: *OwnedSet,
+        payload: ?LIR.LocalId,
+        target: LIR.LocalId,
+        next: LIR.CFStmtId,
+        loop_keep: ?*const OwnedSet,
+    ) ResourceError!SingleTransfer {
+        var transfer_single = false;
+        if (payload) |operand| {
+            transfer_single = try self.singleTransfer(operand, next, target, owned, loop_keep);
+        }
+        const release_old_target = self.takeRebindTarget(owned, target);
+        self.placeUnit(owned, target);
+        return .{ .transfer_single = transfer_single, .release_old_target = release_old_target };
+    }
+
+    const LowLevelTransfer = struct {
+        /// Consumed positions whose group survives this statement: they pay
+        /// a retain before the op to preserve the caller's unit.
+        preserve_consumed_args: u64,
+        /// Retained positions whose group dies here: their unit moves into
+        /// the result instead of paying the trailing retain.
+        transfer_mask: u64,
+        /// Runtime uniqueness checks this statement proved redundant, by
+        /// argument position.
+        unique_args: u64,
+        release_old_target: bool,
+    };
+
+    /// Low-level ops: `RcEffect` masks say which positions the op consumes
+    /// or retains; this decides which of those transfers move existing units
+    /// and which pay retains. `want_unique` gates the uniqueness-claim scan,
+    /// whose result only affects materialized statements.
+    fn transferForLowLevel(
+        self: *Inserter,
+        owned: *OwnedSet,
+        args: LIR.LocalSpan,
+        rc_effect: LIR.LowLevel.RcEffect,
+        target: LIR.LocalId,
+        next: LIR.CFStmtId,
+        loop_keep: ?*const OwnedSet,
+        want_unique: bool,
+    ) ResourceError!LowLevelTransfer {
+        if ((rc_effect.result_aliases_consumed_args & ~rc_effect.consume_args) != 0) {
+            arcInvariant("ARC low-level result-token metadata referenced a non-consumed argument");
+        }
+        const preserve_consumed_args = try self.preserveConsumedArgMask(args, rc_effect.consume_args, next, target, loop_keep);
+        const unique_args = if (want_unique)
+            self.uniqueArgsMask(args, rc_effect, target, preserve_consumed_args, owned)
+        else
+            0;
+        const target_consumed = self.maskedArgsContainLocal(args, rc_effect.consume_args, target);
+        var release_old_target = false;
+        if (target_consumed) {
+            _ = self.takeUnit(owned, target);
+        } else {
+            release_old_target = self.takeRebindTarget(owned, target);
+        }
+        if (rc_effect.consume_args != 0) {
+            self.unsetMaskedArgsExcept(owned, args, rc_effect.consume_args & ~preserve_consumed_args, target);
+        }
+        var transfer_mask: u64 = 0;
+        if (rc_effect.retain_args != 0) {
+            transfer_mask = try self.spanTransferMask(args, rc_effect.retain_args, next, target, owned, loop_keep);
+        }
+        self.placeUnit(owned, target);
+        return .{
+            .preserve_consumed_args = preserve_consumed_args,
+            .transfer_mask = transfer_mask,
+            .unique_args = unique_args,
+            .release_old_target = release_old_target,
+        };
+    }
+
+    /// Terminal consumption (`ret` with an owned return mode, `expect_err`):
+    /// returns true when the local's own unit moves out with the terminal,
+    /// so no retain is needed.
+    fn consumeAtTerminal(self: *Inserter, owned: *OwnedSet, local: LIR.LocalId) bool {
+        if (!self.ownsUnit(owned, local)) return false;
+        _ = self.takeUnit(owned, local);
+        return true;
+    }
+
+    /// Emits the release decided by a `release_old_target` transfer
+    /// decision, honoring conditional presence of maybe-initialized cells.
+    fn emitRebindRelease(self: *Inserter, target: LIR.LocalId, next: LIR.CFStmtId) ResourceError!LIR.CFStmtId {
+        if (self.solution.maybeUninitializedCondition(target)) |condition| {
+            return try self.releaseMaybeInitializedLocal(condition.local, condition.mask, target, next);
+        }
+        return try self.releaseLocalIfRc(target, next);
     }
 
     fn cachedJoinBodyOwnedSet(
@@ -2568,7 +2802,7 @@ const Inserter = struct {
         const params_borrow = self.store.getLocalSpan(params);
         for (0..GuardedList.borrowLen(params_borrow)) |index| {
             const param = GuardedList.at(params_borrow, index);
-            self.addOwnedIfRc(&owned, param);
+            self.placeUnit(&owned, param);
         }
         const maybe_uninitialized_params_borrow = self.store.getLocalSpan(maybe_uninitialized_params);
         for (0..GuardedList.borrowLen(maybe_uninitialized_params_borrow)) |index| {
@@ -2578,7 +2812,7 @@ const Inserter = struct {
             // payload, so the loop body must enter with conditional ownership
             // even when read-before-rebind analysis would otherwise classify
             // the param as borrowed.
-            self.addConditionallyOwnedIfRc(&owned, param);
+            self.placeConditionalUnit(&owned, param);
         }
         try self.cacheJoinBodyOwnedSet(entry_owned, join_id, params, maybe_uninitialized_params, remainder, body, &owned, reachable);
         return owned;
@@ -2735,15 +2969,6 @@ const Inserter = struct {
     fn takePostReleases(self: *Inserter, deaths: *std.ArrayList(LIR.LocalId)) ResourceError![]const LIR.LocalId {
         if (deaths.items.len == 0) return &.{};
         return try deaths.toOwnedSlice(self.store.allocator);
-    }
-
-    fn releaseOldTargetIfNeeded(self: *Inserter, target: LIR.LocalId, owned: *OwnedSet, next: LIR.CFStmtId) ResourceError!LIR.CFStmtId {
-        if (!owned.contains(target)) return next;
-        owned.unset(target);
-        if (self.solution.maybeUninitializedCondition(target)) |condition| {
-            return try self.releaseMaybeInitializedLocal(condition.local, condition.mask, target, next);
-        }
-        return try self.releaseLocalIfRc(target, next);
     }
 
     fn canMoveSetLocalValue(
@@ -7045,6 +7270,28 @@ test "RC alias into set_local moves the leader unit" {
     const alias_assign = try f.assignRefLocal(alias, value, set_result);
     const body = try f.assignStr(value, "through-set-local", alias_assign);
     _ = try f.addProc(&.{}, body, .str);
+    try f.run();
+    try testing.expectEqual(@as(usize, 0), f.countAllRc());
+}
+
+test "RC alias passed as a dying call argument moves the leader unit" {
+    // Issue 9703's keying class, through the call-argument transfer path:
+    // the pure alias is borrowed, so its ownership unit lives on the source
+    // local. Passing the alias as a dying owned call argument must move the
+    // *source's* unit (no retain before the call, no release after), keyed
+    // through unitOf — testing or clearing the OwnedSet by the alias's own
+    // id would leak the source's unit. The debug certifier re-checks the
+    // emitted schedule during `run`.
+    var f = try ArcTest.init(testing.allocator);
+    defer f.deinit();
+    const value = try f.local(.str);
+    const alias = try f.local(.str);
+    const result = try f.local(.i64);
+    const ret = try f.ret(result);
+    const call = try f.assignCall(result, &.{alias}, ret);
+    const alias_assign = try f.assignRefLocal(alias, value, call);
+    const body = try f.assignStr(value, "through-call-arg", alias_assign);
+    _ = try f.addProc(&.{}, body, .i64);
     try f.run();
     try testing.expectEqual(@as(usize, 0), f.countAllRc());
 }

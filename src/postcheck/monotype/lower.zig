@@ -177,8 +177,7 @@ const MethodLookup = struct {
 /// `nested`) or a compiler-derived structural implementation. Fully
 /// materialized at the requesting call edge — checked `constraint(k)` refs are
 /// substituted from the requester's own evidence there — so a specialization's
-/// vector is self-contained (dictionary passing evaluated at compile time;
-/// projects/big/total-dispatch-plans.md).
+/// vector is self-contained (dictionary passing evaluated at compile time).
 const SpecEvidence = union(enum) {
     target: *const SpecEvidenceTarget,
     structural: static_dispatch.StructuralKind,

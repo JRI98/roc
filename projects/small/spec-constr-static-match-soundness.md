@@ -225,6 +225,7 @@ unmodified tree:
 - [cross-phase-coverage-parity-tests.md](./cross-phase-coverage-parity-tests.md)
   — the same producer/consumer discipline; the refutability suite is the
   natural home for the verdict matrix.
-- [../big/immutable-specialization-identity.md](../big/immutable-specialization-identity.md)
-  — documents spec_constr's second specialization-identity space
-  (`CallPattern`); relevant context for anyone extending the pass.
+- The landed immutable specialization identity work (`SpecIdentity`,
+  `SpecBuilder` in `src/postcheck/monotype/`) — spec_constr's `CallPattern`
+  space is the second, separate specialization-identity space; relevant
+  context for anyone extending the pass.
