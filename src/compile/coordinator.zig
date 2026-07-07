@@ -3652,8 +3652,15 @@ pub const Coordinator = struct {
             if (can.BuiltinLowLevel.isBuiltinModule(env)) {
                 try can.BuiltinLowLevel.apply(env);
             } else if (self.enable_hosted_transform) {
-                // The app package doesn't need hosted lambdas.
-                if (self.app_package_name == null or !std.mem.eql(u8, result.package_name, self.app_package_name.?)) {
+                // Only the platform package provides hosted functions, so only
+                // its modules' annotation-only declarations become hosted
+                // lambdas. Regular package/module dependencies may legitimately
+                // contain annotation-only (unimplemented) declarations; turning
+                // those into hosted lambdas would incorrectly make the
+                // effectful-function-name check flag them as effects.
+                const is_platform_pkg = self.platform_root_package_name != null and
+                    std.mem.eql(u8, result.package_name, self.platform_root_package_name.?);
+                if (is_platform_pkg) {
                     if (can.HostedCompiler.replaceAnnoOnlyWithHosted(env)) |modified_defs| {
                         var defs = modified_defs;
                         defs.deinit(env.gpa);
