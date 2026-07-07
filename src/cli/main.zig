@@ -13080,7 +13080,7 @@ fn rocDocs(ctx: *CliCtx, args: cli_args.DocsArgs) CliMainError!void {
     var result_with_env = checkFileWithBuildEnvPreserved(
         ctx,
         args.path,
-        null,
+        args.main,
         args.time,
         cache_config,
         null, // max_threads: use default (single-threaded for now)

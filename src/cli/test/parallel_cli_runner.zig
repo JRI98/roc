@@ -378,6 +378,7 @@ const CustomCase = enum {
     verbose_and_non_verbose_failure_format_match,
     build_warning_interpreter,
     issue_9392_deterministic_no_cache,
+    docs_main_platform_url_package,
     build_issue_9435_hosted_nominal_return,
     bundle_complex_package,
     glue_debug,
@@ -1117,6 +1118,7 @@ const subcommand_cases = [_]CliCase{
     .{ .id = 0, .suite = .subcommands, .name = "issue 9961: non-colliding associated alias and qualified self-module reference keep resolving", .body = .{ .command = .{ .args = &.{ "check", "--no-cache" }, .roc_file = "test/cli/issue_9961_assoc_reexport/Controls.roc", .exit = .success, .contains_any = &.{.{ .needles = &no_errors_needles }}, .not_contains = &.{ .{ .stream = .stderr, .text = "RECURSIVE ALIAS" }, .{ .stream = .stderr, .text = "panic" } } } } },
     .{ .id = 0, .suite = .subcommands, .name = "issue 9912: associated value self-reference reports invalid assignment instead of overflowing", .body = .{ .command = .{ .args = &.{ "check", "--no-cache" }, .roc_file = "test/cli/issue_9912_assoc_self_value/SelfRef.roc", .exit = .not_panic, .stderr_min_len = 1, .contains = &.{.{ .stream = .stderr, .text = "INVALID ASSIGNMENT TO ITSELF" }}, .not_contains = &.{ .{ .stream = .stderr, .text = "overflowed its stack" }, .{ .stream = .stderr, .text = "panic" } } } } },
     .{ .id = 0, .suite = .subcommands, .name = "issue 9912: platform module via --main with unresolvable package reports import errors without overflow", .body = .{ .command = .{ .args = &.{ "check", "--main=test/cli/issue_9912_platform_url_package/platform/main.roc", "--no-cache" }, .roc_file = "test/cli/issue_9912_platform_url_package/platform/Api.roc", .exit = .not_panic, .stderr_min_len = 1, .not_contains = &.{ .{ .stream = .stderr, .text = "overflowed its stack" }, .{ .stream = .stderr, .text = "panic" } } } } },
+    .{ .id = 0, .suite = .subcommands, .name = "issue 9912: roc docs uses --main platform URL package dependencies", .body = .{ .custom = .docs_main_platform_url_package } },
     .{ .id = 0, .suite = .subcommands, .name = "roc check succeeds on Parser type module", .body = .{ .command = .{ .args = &.{ "check", "--no-cache" }, .roc_file = "test/package_simple_parser/Parser.roc", .not_contains = &.{.{ .stream = .stderr, .text = "error" }} } } },
     .{ .id = 0, .suite = .subcommands, .name = "roc check succeeds when block-local associated value captures local value", .body = .{ .command = .{ .args = &.{ "check", "--no-cache" }, .roc_file = "test/cli/block_local_assoc_capture/Test.roc", .exit = .success } } },
     .{ .id = 0, .suite = .subcommands, .name = "roc test runs expects in Parser type module (interpreter)", .backend = .interpreter, .body = .{ .command = .{ .args = &.{ "test", "--opt=interpreter", "--no-cache" }, .roc_file = "test/package_simple_parser/Parser.roc", .contains = &.{ .{ .stream = .stdout, .text = "passed" }, .{ .stream = .stdout, .text = "(7)" } } } } },
@@ -2025,6 +2027,7 @@ fn runCustomCase(
         .verbose_and_non_verbose_failure_format_match => customVerboseAndNonVerboseFailureFormatMatch(io, allocator, &timer, timeout_ms, spec.backend orelse .interpreter),
         .build_warning_interpreter => customBuildWarningInterpreter(io, allocator, &env, &timer, timeout_ms),
         .issue_9392_deterministic_no_cache => customIssue9392Deterministic(io, allocator, &env, &timer, timeout_ms),
+        .docs_main_platform_url_package => customDocsMainPlatformUrlPackage(io, allocator, &env, &timer, timeout_ms),
         .build_issue_9435_hosted_nominal_return => customBuildIssue9435(io, allocator, &env, &timer, timeout_ms),
         .bundle_complex_package => customBundleComplexPackage(io, allocator, &env, &timer, timeout_ms),
         .glue_debug => customGlueDebug(io, allocator, &env, &timer, timeout_ms),
@@ -4897,6 +4900,113 @@ fn customIssue9392Deterministic(io: std.Io, allocator: Allocator, env: *const Ca
     };
     if (runRocAndCheck(io, allocator, env, timer, timeout_ms, command)) |failure| return failure;
     if (runRocAndCheck(io, allocator, env, timer, timeout_ms, command)) |failure| return failure;
+    return null;
+}
+
+fn customDocsMainPlatformUrlPackage(
+    io: std.Io,
+    allocator: Allocator,
+    env: *const CaseEnv,
+    timer: *harness.Timer,
+    timeout_ms: u64,
+) ?TestResult {
+    const fake_hash = "FakeHashAbcDefGhiJkLmNoPqRsTuVwXyZ123456789o";
+    const package_url = "https://example.com/roc/http/1.2.3/" ++ fake_hash ++ ".tar.zst";
+
+    const cache_package_dir = std.fs.path.join(allocator, &.{ env.dirs.roc_cache_dir, "roc", "packages", fake_hash }) catch |err|
+        return customInfraFailure(allocator, timer, "failed to allocate package cache path: {}", .{err});
+    defer allocator.free(cache_package_dir);
+    std.Io.Dir.cwd().createDirPath(io, cache_package_dir) catch |err|
+        return customInfraFailure(allocator, timer, "failed to create package cache: {}", .{err});
+
+    const cached_main = std.fs.path.join(allocator, &.{ cache_package_dir, "main.roc" }) catch |err|
+        return customInfraFailure(allocator, timer, "failed to allocate cached package main path: {}", .{err});
+    defer allocator.free(cached_main);
+    std.Io.Dir.cwd().writeFile(io, .{
+        .sub_path = cached_main,
+        .data = "package [Request] {}\n",
+    }) catch |err| return customInfraFailure(allocator, timer, "failed to write cached package main: {}", .{err});
+
+    const cached_request = std.fs.path.join(allocator, &.{ cache_package_dir, "Request.roc" }) catch |err|
+        return customInfraFailure(allocator, timer, "failed to allocate cached Request module path: {}", .{err});
+    defer allocator.free(cached_request);
+    std.Io.Dir.cwd().writeFile(io, .{
+        .sub_path = cached_request,
+        .data =
+        \\Request := {}.{
+        \\    ## Set a request URI.
+        \\    with_uri : Request, Str -> Request
+        \\    with_uri = |request, _uri| request
+        \\}
+        \\
+        ,
+    }) catch |err| return customInfraFailure(allocator, timer, "failed to write cached Request module: {}", .{err});
+
+    const platform_dir = std.fs.path.join(allocator, &.{ env.dirs.work_dir, "issue_9912_docs_platform", "platform" }) catch |err|
+        return customInfraFailure(allocator, timer, "failed to allocate platform path: {}", .{err});
+    defer allocator.free(platform_dir);
+    std.Io.Dir.cwd().createDirPath(io, platform_dir) catch |err|
+        return customInfraFailure(allocator, timer, "failed to create platform directory: {}", .{err});
+
+    const platform_main = std.fs.path.join(allocator, &.{ platform_dir, "main.roc" }) catch |err|
+        return customInfraFailure(allocator, timer, "failed to allocate platform main path: {}", .{err});
+    defer allocator.free(platform_main);
+    const platform_source = std.mem.concat(allocator, u8, &.{
+        "platform \"docs-url-repro\"\n",
+        "    requires {} { main : {} -> {} }\n",
+        "    exposes [Api]\n",
+        "    packages {\n",
+        "        http: \"",
+        package_url,
+        "\",\n",
+        "    }\n",
+        "    provides { \"roc_main\": main_for_host }\n",
+        "    hosted {}\n",
+        "    targets: {}\n\n",
+        "import Api\n\n",
+        "main_for_host : {} -> {}\n",
+        "main_for_host = |{}| main({})\n",
+    }) catch |err| return customInfraFailure(allocator, timer, "failed to render platform source: {}", .{err});
+    defer allocator.free(platform_source);
+    std.Io.Dir.cwd().writeFile(io, .{
+        .sub_path = platform_main,
+        .data = platform_source,
+    }) catch |err| return customInfraFailure(allocator, timer, "failed to write platform main: {}", .{err});
+
+    const api_path = std.fs.path.join(allocator, &.{ platform_dir, "Api.roc" }) catch |err|
+        return customInfraFailure(allocator, timer, "failed to allocate Api module path: {}", .{err});
+    defer allocator.free(api_path);
+    std.Io.Dir.cwd().writeFile(io, .{
+        .sub_path = api_path,
+        .data =
+        \\import http.Request
+        \\
+        \\## Re-export request helper from the URL package.
+        \\request_with_uri = Request.with_uri
+        \\
+        ,
+    }) catch |err| return customInfraFailure(allocator, timer, "failed to write Api module: {}", .{err});
+
+    const main_arg = std.fmt.allocPrint(allocator, "--main={s}", .{platform_main}) catch |err|
+        return customInfraFailure(allocator, timer, "failed to allocate --main arg: {}", .{err});
+    defer allocator.free(main_arg);
+    const output_dir = std.fs.path.join(allocator, &.{ env.dirs.work_dir, "issue_9912_docs_out" }) catch |err|
+        return customInfraFailure(allocator, timer, "failed to allocate docs output path: {}", .{err});
+    defer allocator.free(output_dir);
+    const output_arg = std.fmt.allocPrint(allocator, "--output={s}", .{output_dir}) catch |err|
+        return customInfraFailure(allocator, timer, "failed to allocate --output arg: {}", .{err});
+    defer allocator.free(output_arg);
+
+    const args = [_][]const u8{ "docs", "--no-cache", main_arg, output_arg };
+    if (runRocAndCheck(io, allocator, env, timer, timeout_ms, .{
+        .args = &args,
+        .roc_file = api_path,
+        .file_path_mode = .absolute,
+        .exit = .success,
+        .contains = &.{.{ .stream = .stdout, .text = "Generated docs for" }},
+        .not_contains = &.{ .{ .stream = .stderr, .text = "overflowed its stack" }, .{ .stream = .stderr, .text = "panic" } },
+    })) |failure| return failure;
+
     return null;
 }
 

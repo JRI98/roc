@@ -230,6 +230,7 @@ pub const BuildEnv = struct {
     discovered_root_abs: ?[]const u8 = null,
     discovered_root_dir: ?[]const u8 = null,
     discovered_pkg_name: ?[]const u8 = null,
+    entry_module_abs: ?[]const u8 = null,
 
     // Owned resolver ctx pointers for cleanup (typed)
     resolver_ctxs: std.array_list.Managed(*ResolverCtx),
@@ -352,6 +353,7 @@ pub const BuildEnv = struct {
         // Free discovery state
         if (self.discovered_root_abs) |ra| self.gpa.free(ra);
         if (self.discovered_root_dir) |rd| self.gpa.free(rd);
+        if (self.entry_module_abs) |entry| self.gpa.free(@constCast(entry));
         // discovered_pkg_name is borrowed from the packages map key.
 
         // Free resolver ctxs owned by this BuildEnv (if any)
@@ -548,49 +550,16 @@ pub const BuildEnv = struct {
 
     pub fn buildWithMain(self: *BuildEnv, root_file: []const u8, main_file: []const u8) BuildWithMainError!void {
         try self.discoverDependencies(main_file);
-        try self.replaceDiscoveredRootFile(root_file);
+        try self.setDiscoveredEntryModule(root_file);
         try self.compileDiscovered();
     }
 
-    fn replaceDiscoveredRootFile(self: *BuildEnv, root_file: []const u8) BuildError!void {
-        const pkg_name = self.discovered_pkg_name orelse return error.Internal;
-        const pkg = self.packages.getPtr(pkg_name) orelse return error.Internal;
-
+    fn setDiscoveredEntryModule(self: *BuildEnv, root_file: []const u8) BuildError!void {
+        _ = self.discovered_pkg_name orelse return error.Internal;
         const root_abs = try self.makeAbsolute(root_file);
         errdefer self.gpa.free(root_abs);
-
-        var header_info = try self.parseHeaderDeps(root_abs);
-        defer header_info.deinit(self.gpa);
-
-        const is_executable = header_info.kind == .app or header_info.kind == .default_app;
-        if (!is_executable and header_info.kind != .module and header_info.kind != .type_module and header_info.kind != .package and header_info.kind != .platform) {
-            return error.UnsupportedHeader;
-        }
-
-        freeSlice(self.gpa, pkg.root_file);
-        pkg.root_file = root_abs;
-        pkg.root_file_state = header_info.source_file_state;
-        pkg.kind = header_info.kind;
-
-        for (pkg.provides_entries.items) |entry| {
-            freeConstSlice(self.gpa, entry.roc_ident);
-            freeConstSlice(self.gpa, entry.ffi_symbol);
-        }
-        pkg.provides_entries.deinit(self.gpa);
-        pkg.provides_entries = .empty;
-        self.clearPackageExposes(pkg);
-        if (pkg.targets_config) |tc| tc.deinit(self.gpa);
-        pkg.targets_config = null;
-
-        if (header_info.kind == .platform or header_info.kind == .app or header_info.kind == .default_app) {
-            pkg.provides_entries = header_info.provides_entries;
-            header_info.provides_entries = .empty;
-            pkg.targets_config = header_info.targets_config;
-            header_info.targets_config = null;
-            if (header_info.kind == .platform) {
-                self.moveHeaderExposesToPackage(pkg, &header_info);
-            }
-        }
+        if (self.entry_module_abs) |old| self.gpa.free(@constCast(old));
+        self.entry_module_abs = root_abs;
     }
 
     /// Initialize the actor model coordinator.
@@ -688,7 +657,7 @@ pub const BuildEnv = struct {
 
         // Resolve the full dependency graph (downloads plus version solving),
         // then materialize the resolved packages and their shorthands.
-        if (header_info.kind == .app or header_info.kind == .default_app or header_info.kind == .package) {
+        if (header_info.kind == .app or header_info.kind == .default_app or header_info.kind == .package or header_info.kind == .platform) {
             try self.resolveAndMaterialize(key_pkg);
         }
     }
@@ -789,6 +758,21 @@ pub const BuildEnv = struct {
 
         // Queue initial parse task
         try coord.enqueueParseTask(pkg_name, root_id);
+
+        if (self.entry_module_abs) |entry_file| {
+            if (!std.mem.eql(u8, entry_file, pkg_root_file)) {
+                const entry_module_name = PackageEnv.moduleNameFromPath(entry_file);
+                const entry_id = try coord_pkg.ensureModule(self.gpa, entry_module_name, entry_file);
+                const entry_module = &coord_pkg.modules.items[entry_id];
+                entry_module.validate_as_explicit_roots = true;
+                if (entry_module.phase == .Parse) {
+                    entry_module.depth = 0;
+                    coord_pkg.remaining_modules += 1;
+                    coord.total_remaining += 1;
+                    try coord.enqueueParseTask(pkg_name, entry_id);
+                }
+            }
+        }
 
         // Also queue the platform's root module if this is an app
         // The platform's root module contains the `requires` clause which must be compiled
