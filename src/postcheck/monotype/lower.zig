@@ -2650,7 +2650,7 @@ const Builder = struct {
     /// behind its request type, and value flow alone cannot reach
     /// type-level-only positions such as phantom nominal type arguments.
     /// Instantiating the requested template's checked function root into the
-    /// requester's graph at request creation delivers those checked facts
+    /// requester's graph at request creation delivers those checked root nodes
     /// before sealing, so a row that still takes its `row_default` at seal
     /// time is genuinely unconstrained rather than starved. Each request pins
     /// a fresh instantiation: the checked root is generalized, and two
