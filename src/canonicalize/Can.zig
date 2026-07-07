@@ -1568,6 +1568,102 @@ fn aliasBindingTargetName(self: *const Self, binding: Scope.TypeBinding) ?Ident.
     };
 }
 
+/// The type path an alias type path points at, when the alias declaration's
+/// annotation is a plain (possibly applied) type reference — the path-level
+/// counterpart of `aliasBindingTargetName`, covering associated aliases such
+/// as `Api.ThingAlias : Thing`. Null for every other declaration or
+/// annotation shape.
+fn aliasTypePathTarget(
+    self: *Self,
+    path: AST.DeclIndex.TypePathIdx,
+) std.mem.Allocator.Error!?AST.DeclIndex.TypePathIdx {
+    const decl_index = &self.parse_ir.decl_index;
+    const decl_idx = self.firstUsableParserTypeDecl(decl_index.typeDeclsForPath(path)) orelse return null;
+    const decl = decl_index.decls.items[@intFromEnum(decl_idx)];
+    if (decl.kind != .type_alias) return null;
+    const anno_raw = decl.anno orelse return null;
+
+    // Unwrap parens and type application down to the base type reference.
+    const ty = ty_blk: {
+        var current: AST.TypeAnno.Idx = @enumFromInt(anno_raw);
+        while (true) {
+            switch (self.parse_ir.store.getTypeAnno(current)) {
+                .parens => |parens| current = parens.anno,
+                .apply => |apply| {
+                    const args = self.parse_ir.store.typeAnnoSlice(apply.args);
+                    if (args.len == 0) return null;
+                    current = args[0];
+                },
+                .ty => |ty| break :ty_blk ty,
+                else => return null,
+            }
+        }
+    };
+
+    const top = self.scratch_idents.top();
+    defer self.scratch_idents.clearFrom(top);
+    for (self.parse_ir.store.tokenSlice(ty.qualifiers)) |raw_tok| {
+        const segment = self.parse_ir.tokens.resolveIdentifier(@intCast(raw_tok)) orelse return null;
+        try self.scratch_idents.append(segment);
+    }
+    const name_ident = self.parse_ir.tokens.resolveIdentifier(ty.token) orelse return null;
+    try self.scratch_idents.append(name_ident);
+
+    const target = self.parserTypePathForDependencySegments(decl, self.scratch_idents.sliceFromStart(top)) orelse return null;
+    if (target == path) return null;
+    return target;
+}
+
+/// The dotted source path of a parser type path plus a trailing item, e.g.
+/// the path `Api.ThingAlias` and item `from_u64` produce the ident
+/// `Api.ThingAlias.from_u64`.
+fn qualifiedIdentForTypePathItem(
+    self: *Self,
+    path: AST.DeclIndex.TypePathIdx,
+    item: Ident.Idx,
+) std.mem.Allocator.Error!Ident.Idx {
+    const decl_index = &self.parse_ir.decl_index;
+    const top = self.scratch_idents.top();
+    defer self.scratch_idents.clearFrom(top);
+    var current: ?AST.DeclIndex.TypePathIdx = path;
+    while (current) |idx| {
+        const segment = decl_index.type_paths.items[@intFromEnum(idx)];
+        try self.scratch_idents.append(segment.name);
+        current = segment.parent;
+    }
+
+    const bytes_top = self.scratchBytesTop();
+    defer self.clearScratchBytesFrom(bytes_top);
+    const segments = self.scratch_idents.sliceFromStart(top);
+    var i = segments.len;
+    while (i > 0) {
+        i -= 1;
+        try self.scratchAppendSlice(self.env.getIdent(segments[i]));
+        try self.scratchAppendByte('.');
+    }
+    try self.scratchAppendSlice(self.env.getIdent(item));
+    return self.env.insertIdent(base.Ident.for_text(self.scratchBytesFrom(bytes_top)));
+}
+
+/// The qualifier chain joined with dots, e.g. tokens for `Api` and
+/// `ThingAlias` produce the ident `Api.ThingAlias`. Null when a qualifier
+/// token is not an identifier.
+fn joinedQualifierIdent(
+    self: *Self,
+    qualifier_tokens: []const u32,
+) std.mem.Allocator.Error!?Ident.Idx {
+    const bytes_top = self.scratchBytesTop();
+    defer self.clearScratchBytesFrom(bytes_top);
+    var first = true;
+    for (qualifier_tokens) |raw_tok| {
+        const segment = self.parse_ir.tokens.resolveIdentifier(@intCast(raw_tok)) orelse return null;
+        if (!first) try self.scratchAppendByte('.');
+        try self.scratchAppendSlice(self.env.getIdent(segment));
+        first = false;
+    }
+    return try self.env.insertIdent(base.Ident.for_text(self.scratchBytesFrom(bytes_top)));
+}
+
 fn qualifierTypePath(
     self: *Self,
     qualifier_tokens: []const u32,
@@ -6972,8 +7068,20 @@ fn canonicalizeQualifiedIdentExpr(
     }
 
     if (try self.qualifierTypePath(qualifier_tokens)) |owner_path| {
-        if (try self.lookupOrCreateAssocValuePattern(owner_path, ident, qualified_ident, region)) |pattern_idx| {
-            return try self.canonicalizedAssociatedLookup(owner_path, pattern_idx, region);
+        // Type aliases are transparent for associated-item lookup through
+        // declared type paths too: `Api.ThingAlias : Thing` resolves
+        // `Api.ThingAlias.from_u64` against `Thing`'s associated items
+        // (#9875). Follow the (finite, cycle-guarded) alias chain of type
+        // paths until an associated item matches.
+        var path = owner_path;
+        var pattern_ident = qualified_ident;
+        var alias_hops: u32 = 32;
+        while (alias_hops > 0) : (alias_hops -= 1) {
+            if (try self.lookupOrCreateAssocValuePattern(path, ident, pattern_ident, region)) |pattern_idx| {
+                return try self.canonicalizedAssociatedLookup(path, pattern_idx, region);
+            }
+            path = (try self.aliasTypePathTarget(path)) orelse break;
+            pattern_ident = try self.qualifiedIdentForTypePathItem(path, ident);
         }
     }
 
@@ -6997,8 +7105,21 @@ fn canonicalizeQualifiedIdentExpr(
     };
 
     const module_name = if (module_info) |info| info.module_name else {
-        if (try self.canonicalizeTypeAssociatedLookup(module_alias, ident, region)) |expr| {
-            return expr;
+        if (qualifier_tokens.len == 1) {
+            if (try self.canonicalizeTypeAssociatedLookup(module_alias, ident, region)) |expr| {
+                return expr;
+            }
+        } else if ((try self.scopeLookupOrPrepareTypeBinding(module_alias)) != null) {
+            // A multi-segment chain rooted at a type resolved no associated
+            // item; the report names the full path rather than collapsing it
+            // to its first segment.
+            if (try self.joinedQualifierIdent(qualifier_tokens)) |parent_ident| {
+                return try self.canonicalizedMalformedExpr(Diagnostic{ .nested_value_not_found = .{
+                    .parent_name = parent_ident,
+                    .nested_name = ident,
+                    .region = region,
+                } });
+            }
         }
 
         return try self.canonicalizedMalformedExpr(Diagnostic{ .qualified_ident_does_not_exist = .{

@@ -15467,6 +15467,10 @@ fn rewriteEqBinopAsMethodEq(self: *Self, constraint: StaticDispatchConstraint) v
             );
         },
         .e_method_eq => |eq| {
+            // A discharge of an instantiated copy carries the copy's fn var;
+            // the node must keep the scheme-pristine fn var stamped at plan
+            // creation, so only the node's own constraint may restamp it.
+            if (eq.constraint_fn_var != constraint.fn_var) return;
             self.cir.store.replaceExprWithMethodEq(
                 expr_idx,
                 eq.lhs,
