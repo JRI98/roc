@@ -4,6 +4,7 @@ const std = @import("std");
 
 const Allocator = std.mem.Allocator;
 
+/// Policy for pending checked-type payloads reached by identity-variable scans.
 pub const PendingPolicy = enum {
     /// Treat a pending payload as identity-containing so callers cannot
     /// accidentally publish a completed non-identity result from an unfinished root.
@@ -13,6 +14,7 @@ pub const PendingPolicy = enum {
     tolerate,
 };
 
+/// Memoized boolean traversal with active-cycle hits returning false.
 pub fn BoolPredicateTraversal(comptime Key: type, comptime Context: type) type {
     return struct {
         const Self = @This();
@@ -54,12 +56,13 @@ pub fn BoolPredicateTraversal(comptime Key: type, comptime Context: type) type {
             entry.value_ptr.* = .active;
             errdefer _ = self.memo.remove(key);
             const result = try self.context.visit(self, key);
-            entry.value_ptr.* = .{ .complete = result };
+            self.memo.getPtr(key).?.* = .{ .complete = result };
             return result;
         }
     };
 }
 
+/// Reserve-then-fill traversal for building recursive graph results.
 pub fn ReserveThenFillTraversal(comptime Key: type, comptime Result: type, comptime Context: type) type {
     return struct {
         const Self = @This();
@@ -98,6 +101,7 @@ pub fn ReserveThenFillTraversal(comptime Key: type, comptime Result: type, compt
     };
 }
 
+/// Active-path traversal for digest builders that encode back edges by depth.
 pub fn DigestTraversal(comptime Key: type, comptime Context: type) type {
     return struct {
         const Self = @This();
@@ -139,6 +143,7 @@ pub fn DigestTraversal(comptime Key: type, comptime Context: type) type {
     };
 }
 
+/// Return whether a checked-type root contains any identity variables.
 pub fn checkedTypeContainsIdentityVariables(
     comptime Key: type,
     comptime Context: type,
@@ -151,6 +156,7 @@ pub fn checkedTypeContainsIdentityVariables(
     return try traversal.visit(root);
 }
 
+/// Return whether any checked-type root in a slice contains identity variables.
 pub fn checkedTypeSliceContainsIdentityVariables(
     comptime Key: type,
     comptime Context: type,
@@ -166,6 +172,7 @@ pub fn checkedTypeSliceContainsIdentityVariables(
     return false;
 }
 
+/// Visit child roots for a checked-type payload during an identity-variable scan.
 pub fn checkedTypePayloadContainsIdentityVariables(
     comptime pending_policy: PendingPolicy,
     traversal: anytype,
@@ -314,20 +321,45 @@ test "BoolPredicateTraversal still finds true branch beside a cycle" {
     try std.testing.expectEqual(@as(u8, 1), visits[3]);
 }
 
+const RehashPredicateTestContext = struct {
+    visits: *[256]u8,
+
+    fn visit(self: *@This(), traversal: anytype, key: u8) Allocator.Error!bool {
+        self.visits[key] += 1;
+        if (key == 1) {
+            var child: u8 = 2;
+            while (child < 200) : (child += 1) {
+                if (try traversal.visit(child)) return true;
+            }
+        }
+        return false;
+    }
+};
+
+test "BoolPredicateTraversal completes root after recursive inserts rehash memo" {
+    var visits = [_]u8{0} ** 256;
+    var context = RehashPredicateTestContext{ .visits = &visits };
+    var traversal = BoolPredicateTraversal(u8, RehashPredicateTestContext).init(std.testing.allocator, &context);
+    defer traversal.deinit();
+
+    try std.testing.expect(!try traversal.visit(1));
+    try std.testing.expect(!try traversal.visit(1));
+    try std.testing.expectEqual(@as(u8, 1), visits[1]);
+    try std.testing.expectEqual(@as(u8, 1), visits[199]);
+}
+
 const ReserveTestContext = struct {
     edges: []const TestEdge,
     next: u8 = 10,
     back_edge_result: u8 = 0,
 
-    fn reserve(self: *@This(), key: u8) Allocator.Error!u8 {
-        _ = key;
+    fn reserve(self: *@This(), _: u8) Allocator.Error!u8 {
         const out = self.next;
         self.next += 1;
         return out;
     }
 
-    fn fill(self: *@This(), traversal: anytype, key: u8, reserved: u8) Allocator.Error!void {
-        _ = reserved;
+    fn fill(self: *@This(), traversal: anytype, key: u8, _: u8) Allocator.Error!void {
         const entry = self.findEdge(key);
         for (entry.children) |child| {
             const child_result = try traversal.visit(child);
