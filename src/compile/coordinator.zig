@@ -1755,10 +1755,6 @@ pub const Coordinator = struct {
         };
     }
 
-    fn checkedArtifactKeyFromArtifactRef(ref: canonical.ArtifactRef) CheckedArtifact.CheckedModuleArtifactKey {
-        return .{ .bytes = ref.bytes };
-    }
-
     fn checkedArtifactKeyEql(
         a: CheckedArtifact.CheckedModuleArtifactKey,
         b: CheckedArtifact.CheckedModuleArtifactKey,

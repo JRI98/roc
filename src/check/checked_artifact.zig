@@ -23803,16 +23803,6 @@ fn importedViewIdentityMatches(view: ImportedModuleView, origin_hash: *const [32
     return base.ModuleIdentity.eql(&view.module_identity.stable_hash, origin_hash);
 }
 
-fn appendPublicApiDependencyView(
-    allocator: Allocator,
-    artifact_key: CheckedModuleArtifactKey,
-    keys: *ArtifactKeyAccumulator,
-    view: ImportedModuleView,
-) Allocator.Error!void {
-    if (checkedArtifactKeyEql(view.key, artifact_key)) return;
-    _ = try keys.append(allocator, view.key);
-}
-
 fn appendPublicApiClosureDependencyKey(
     allocator: Allocator,
     artifact_key: CheckedModuleArtifactKey,
@@ -24223,27 +24213,6 @@ const LoweringVisibilityBuilder = struct {
         };
         try self.appendKey(artifact);
         try self.appendTypePayload(artifact, view.checked_types, root);
-    }
-
-    fn appendTypeScheme(self: *LoweringVisibilityBuilder, artifact: CheckedModuleArtifactKey, scheme: CheckedTypeSchemeId) Allocator.Error!void {
-        if (checkedArtifactKeyEql(artifact, self.artifact_key)) {
-            const index: usize = @intFromEnum(scheme);
-            if (index >= self.checked_types.schemes.items.len) {
-                checkedArtifactInvariant("lowering visibility referenced missing local checked type scheme", .{});
-            }
-            try self.appendTypeRoot(artifact, self.checked_types.schemes.items[index].root);
-            return;
-        }
-
-        const view = self.viewByKey(artifact) orelse {
-            checkedArtifactInvariant("lowering visibility type scheme referenced unavailable checked artifact", .{});
-        };
-        const index: usize = @intFromEnum(scheme);
-        if (index >= view.checked_types.schemes.len) {
-            checkedArtifactInvariant("lowering visibility referenced missing imported checked type scheme", .{});
-        }
-        try self.appendKey(artifact);
-        try self.appendTypeRoot(artifact, view.checked_types.schemes[index].root);
     }
 
     fn appendTypePayload(
