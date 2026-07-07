@@ -15,6 +15,7 @@ const TypedCIR = @import("typed_cir.zig");
 const checked_ids = @import("checked_ids.zig");
 const static_dispatch = @import("static_dispatch_registry.zig");
 const dispatch_evidence = @import("dispatch_evidence.zig");
+const checked_traverse = @import("checked_traverse.zig");
 const canonical = @import("canonical_names.zig");
 const canonical_type_keys = @import("canonical_type_keys.zig");
 const hoist_roots = @import("hoist_roots.zig");
@@ -4376,10 +4377,14 @@ pub const CheckedTypeStore = struct {
         allocator: Allocator,
         roots: []const CheckedTypeId,
     ) Allocator.Error!bool {
-        for (roots) |root| {
-            if (try self.checkedTypeContainsIdentityVariables(allocator, root)) return true;
-        }
-        return false;
+        var context = CheckedTypeIdentityScan{ .store = self };
+        return try checked_traverse.checkedTypeSliceContainsIdentityVariables(
+            CheckedTypeId,
+            CheckedTypeIdentityScan,
+            allocator,
+            &context,
+            roots,
+        );
     }
 
     fn checkedTypeContainsIdentityVariables(
@@ -4387,78 +4392,37 @@ pub const CheckedTypeStore = struct {
         allocator: Allocator,
         root: CheckedTypeId,
     ) Allocator.Error!bool {
-        var active = std.AutoHashMap(CheckedTypeId, void).init(allocator);
-        defer active.deinit();
-        return try self.checkedTypeContainsIdentityVariablesHelp(root, &active);
+        var context = CheckedTypeIdentityScan{ .store = self };
+        return try checked_traverse.checkedTypeContainsIdentityVariables(
+            CheckedTypeId,
+            CheckedTypeIdentityScan,
+            allocator,
+            &context,
+            root,
+        );
     }
+};
 
-    fn checkedTypeContainsIdentityVariablesHelp(
-        self: *const CheckedTypeStore,
+const CheckedTypeIdentityScan = struct {
+    store: *const CheckedTypeStore,
+
+    pub fn visit(
+        self: *@This(),
+        traversal: anytype,
         root: CheckedTypeId,
-        active: *std.AutoHashMap(CheckedTypeId, void),
     ) Allocator.Error!bool {
         const index: usize = @intFromEnum(root);
-        if (index >= self.payloads.items.len) {
+        if (index >= self.store.payloads.items.len) {
             checkedArtifactInvariant("checked type identity scan referenced a missing payload", .{});
         }
-        if (active.contains(root)) return false;
-        try active.put(root, {});
-        defer _ = active.remove(root);
-
-        return switch (self.payload(root)) {
-            .pending,
-            .flex,
-            .rigid,
-            => true,
-            .empty_record,
-            .empty_tag_union,
-            => false,
-            .alias => |alias| blk: {
-                if (try self.checkedTypeContainsIdentityVariablesHelp(alias.backing, active)) break :blk true;
-                for (alias.args) |arg| {
-                    if (try self.checkedTypeContainsIdentityVariablesHelp(arg, active)) break :blk true;
-                }
-                break :blk false;
-            },
-            .record => |record| blk: {
-                for (record.fields) |field| {
-                    if (try self.checkedTypeContainsIdentityVariablesHelp(field.ty, active)) break :blk true;
-                }
-                break :blk try self.checkedTypeContainsIdentityVariablesHelp(record.ext, active);
-            },
-            .record_unbound => |fields| blk: {
-                for (fields) |field| {
-                    if (try self.checkedTypeContainsIdentityVariablesHelp(field.ty, active)) break :blk true;
-                }
-                break :blk false;
-            },
-            .tuple => |items| blk: {
-                for (items) |item| {
-                    if (try self.checkedTypeContainsIdentityVariablesHelp(item, active)) break :blk true;
-                }
-                break :blk false;
-            },
-            .nominal => |nominal| blk: {
-                for (nominal.args) |arg| {
-                    if (try self.checkedTypeContainsIdentityVariablesHelp(arg, active)) break :blk true;
-                }
-                break :blk false;
-            },
-            .function => |function| blk: {
-                for (function.args) |arg| {
-                    if (try self.checkedTypeContainsIdentityVariablesHelp(arg, active)) break :blk true;
-                }
-                break :blk try self.checkedTypeContainsIdentityVariablesHelp(function.ret, active);
-            },
-            .tag_union => |tag_union| blk: {
-                for (tag_union.tags) |tag| {
-                    for (tag.argsSlice(self)) |arg| {
-                        if (try self.checkedTypeContainsIdentityVariablesHelp(arg, active)) break :blk true;
-                    }
-                }
-                break :blk try self.checkedTypeContainsIdentityVariablesHelp(tag_union.ext, active);
-            },
-        };
+        return try checked_traverse.checkedTypePayloadContainsIdentityVariables(
+            .forbid,
+            traversal,
+            self.store,
+            root,
+            self.store.payload(root),
+            self,
+        );
     }
 };
 
@@ -5310,12 +5274,14 @@ fn checkedTypeIdsContainIdentityVariables(
     store: *const CheckedTypeStore,
     ids: []const CheckedTypeId,
 ) Allocator.Error!bool {
-    var active = std.AutoHashMap(CheckedTypeId, void).init(allocator);
-    defer active.deinit();
-    for (ids) |id| {
-        if (try checkedTypeContainsIdentityVariablesPayloadsHelp(store, id, &active)) return true;
-    }
-    return false;
+    var context = CheckedTypeIdentityScan{ .store = store };
+    return try checked_traverse.checkedTypeSliceContainsIdentityVariables(
+        CheckedTypeId,
+        CheckedTypeIdentityScan,
+        allocator,
+        &context,
+        ids,
+    );
 }
 
 fn checkedTypeContainsIdentityVariablesPayloads(
@@ -5323,70 +5289,14 @@ fn checkedTypeContainsIdentityVariablesPayloads(
     store: *const CheckedTypeStore,
     root: CheckedTypeId,
 ) Allocator.Error!bool {
-    var active = std.AutoHashMap(CheckedTypeId, void).init(allocator);
-    defer active.deinit();
-    return try checkedTypeContainsIdentityVariablesPayloadsHelp(store, root, &active);
-}
-
-fn checkedTypeContainsIdentityVariablesPayloadsHelp(
-    store: *const CheckedTypeStore,
-    root: CheckedTypeId,
-    active: *std.AutoHashMap(CheckedTypeId, void),
-) Allocator.Error!bool {
-    const index: usize = @intFromEnum(root);
-    if (index >= store.payloads.items.len) checkedArtifactInvariant("checked type identity scan referenced a missing payload", .{});
-    if (active.contains(root)) return false;
-    try active.put(root, {});
-    defer _ = active.remove(root);
-
-    return switch (store.payload(root)) {
-        .pending,
-        .flex,
-        .rigid,
-        => true,
-        .empty_record,
-        .empty_tag_union,
-        => false,
-        .alias => |alias| blk: {
-            if (try checkedTypeContainsIdentityVariablesPayloadsHelp(store, alias.backing, active)) break :blk true;
-            break :blk try checkedTypeIdsContainIdentityVariablesPayloadsHelp(store, alias.args, active);
-        },
-        .record => |record| blk: {
-            for (record.fields) |field| {
-                if (try checkedTypeContainsIdentityVariablesPayloadsHelp(store, field.ty, active)) break :blk true;
-            }
-            break :blk try checkedTypeContainsIdentityVariablesPayloadsHelp(store, record.ext, active);
-        },
-        .record_unbound => |fields| blk: {
-            for (fields) |field| {
-                if (try checkedTypeContainsIdentityVariablesPayloadsHelp(store, field.ty, active)) break :blk true;
-            }
-            break :blk false;
-        },
-        .tuple => |items| try checkedTypeIdsContainIdentityVariablesPayloadsHelp(store, items, active),
-        .nominal => |nominal| try checkedTypeIdsContainIdentityVariablesPayloadsHelp(store, nominal.args, active),
-        .function => |function| blk: {
-            if (try checkedTypeIdsContainIdentityVariablesPayloadsHelp(store, function.args, active)) break :blk true;
-            break :blk try checkedTypeContainsIdentityVariablesPayloadsHelp(store, function.ret, active);
-        },
-        .tag_union => |tag_union| blk: {
-            for (tag_union.tags) |tag| {
-                if (try checkedTypeIdsContainIdentityVariablesPayloadsHelp(store, tag.argsSlice(store), active)) break :blk true;
-            }
-            break :blk try checkedTypeContainsIdentityVariablesPayloadsHelp(store, tag_union.ext, active);
-        },
-    };
-}
-
-fn checkedTypeIdsContainIdentityVariablesPayloadsHelp(
-    store: *const CheckedTypeStore,
-    ids: []const CheckedTypeId,
-    active: *std.AutoHashMap(CheckedTypeId, void),
-) Allocator.Error!bool {
-    for (ids) |id| {
-        if (try checkedTypeContainsIdentityVariablesPayloadsHelp(store, id, active)) return true;
-    }
-    return false;
+    var context = CheckedTypeIdentityScan{ .store = store };
+    return try checked_traverse.checkedTypeContainsIdentityVariables(
+        CheckedTypeId,
+        CheckedTypeIdentityScan,
+        allocator,
+        &context,
+        root,
+    );
 }
 
 fn appendExplicitCheckedTypePayload(
@@ -5984,89 +5894,28 @@ const SubstitutedCheckedTypeKeyBuilder = struct {
         self: *SubstitutedCheckedTypeKeyBuilder,
         roots: []const CheckedTypeId,
     ) Allocator.Error!bool {
-        for (roots) |root| {
-            if (try self.typeContainsIdentityVariables(root)) return true;
-        }
-        return false;
+        var context = SubstitutedCheckedTypeIdentityScan{ .builder = self };
+        return try checked_traverse.checkedTypeSliceContainsIdentityVariables(
+            CheckedTypeId,
+            SubstitutedCheckedTypeIdentityScan,
+            self.allocator,
+            &context,
+            roots,
+        );
     }
 
     fn typeContainsIdentityVariables(
         self: *SubstitutedCheckedTypeKeyBuilder,
         root: CheckedTypeId,
     ) Allocator.Error!bool {
-        var active = std.AutoHashMap(CheckedTypeId, void).init(self.allocator);
-        defer active.deinit();
-        return try self.typeContainsIdentityVariablesHelp(root, &active);
-    }
-
-    fn typeContainsIdentityVariablesHelp(
-        self: *SubstitutedCheckedTypeKeyBuilder,
-        source: CheckedTypeId,
-        active: *std.AutoHashMap(CheckedTypeId, void),
-    ) Allocator.Error!bool {
-        const id = self.substitutedRoot(source);
-        const raw: usize = @intFromEnum(id);
-        if (raw >= self.store.payloadCount()) {
-            checkedArtifactInvariant("checked type substitution key identity scan referenced missing payload", .{});
-        }
-        if (active.contains(id)) return false;
-        try active.put(id, {});
-        defer _ = active.remove(id);
-
-        return switch (self.store.payload(@enumFromInt(raw))) {
-            .pending,
-            .flex,
-            .rigid,
-            => true,
-            .empty_record,
-            .empty_tag_union,
-            => false,
-            .alias => |alias| blk: {
-                if (try self.typeContainsIdentityVariablesHelp(alias.backing, active)) break :blk true;
-                for (alias.args) |arg| {
-                    if (try self.typeContainsIdentityVariablesHelp(arg, active)) break :blk true;
-                }
-                break :blk false;
-            },
-            .record => |record| blk: {
-                for (record.fields) |field| {
-                    if (try self.typeContainsIdentityVariablesHelp(field.ty, active)) break :blk true;
-                }
-                break :blk try self.typeContainsIdentityVariablesHelp(record.ext, active);
-            },
-            .record_unbound => |fields| blk: {
-                for (fields) |field| {
-                    if (try self.typeContainsIdentityVariablesHelp(field.ty, active)) break :blk true;
-                }
-                break :blk false;
-            },
-            .tuple => |items| blk: {
-                for (items) |item| {
-                    if (try self.typeContainsIdentityVariablesHelp(item, active)) break :blk true;
-                }
-                break :blk false;
-            },
-            .nominal => |nominal| blk: {
-                for (nominal.args) |arg| {
-                    if (try self.typeContainsIdentityVariablesHelp(arg, active)) break :blk true;
-                }
-                break :blk false;
-            },
-            .function => |function| blk: {
-                for (function.args) |arg| {
-                    if (try self.typeContainsIdentityVariablesHelp(arg, active)) break :blk true;
-                }
-                break :blk try self.typeContainsIdentityVariablesHelp(function.ret, active);
-            },
-            .tag_union => |tag_union| blk: {
-                for (tag_union.tags) |tag| {
-                    for (tag.argsSlice(self.store)) |arg| {
-                        if (try self.typeContainsIdentityVariablesHelp(arg, active)) break :blk true;
-                    }
-                }
-                break :blk try self.typeContainsIdentityVariablesHelp(tag_union.ext, active);
-            },
-        };
+        var context = SubstitutedCheckedTypeIdentityScan{ .builder = self };
+        return try checked_traverse.checkedTypeContainsIdentityVariables(
+            CheckedTypeId,
+            SubstitutedCheckedTypeIdentityScan,
+            self.allocator,
+            &context,
+            root,
+        );
     }
 
     fn recordFieldForKeyLessThan(self: *SubstitutedCheckedTypeKeyBuilder, lhs: RecordFieldForKey, rhs: RecordFieldForKey) bool {
@@ -6132,6 +5981,32 @@ const SubstitutedCheckedTypeKeyBuilder = struct {
             @as(u8, @truncate(value >> 16)),
             @as(u8, @truncate(value >> 24)),
         });
+    }
+};
+
+const SubstitutedCheckedTypeIdentityScan = struct {
+    builder: *SubstitutedCheckedTypeKeyBuilder,
+
+    pub fn visit(
+        self: *@This(),
+        traversal: anytype,
+        source: CheckedTypeId,
+    ) Allocator.Error!bool {
+        const id = self.builder.substitutedRoot(source);
+        if (id != source) return try traversal.visit(id);
+
+        const raw: usize = @intFromEnum(id);
+        if (raw >= self.builder.store.payloadCount()) {
+            checkedArtifactInvariant("checked type substitution key identity scan referenced missing payload", .{});
+        }
+        return try checked_traverse.checkedTypePayloadContainsIdentityVariables(
+            .forbid,
+            traversal,
+            self.builder.store,
+            id,
+            self.builder.store.payload(@enumFromInt(raw)),
+            self,
+        );
     }
 };
 
@@ -18714,93 +18589,28 @@ const PlatformAppRelationTypeResolver = struct {
         self: *const PlatformAppRelationTypeResolver,
         roots: []const CheckedTypeId,
     ) Allocator.Error!bool {
-        for (roots) |root| {
-            if (try self.typeContainsIdentityVariables(root)) return true;
-        }
-        return false;
+        var context = PlatformAppRelationIdentityScan{ .resolver = self };
+        return try checked_traverse.checkedTypeSliceContainsIdentityVariables(
+            CheckedTypeId,
+            PlatformAppRelationIdentityScan,
+            self.allocator,
+            &context,
+            roots,
+        );
     }
 
     fn typeContainsIdentityVariables(
         self: *const PlatformAppRelationTypeResolver,
         root: CheckedTypeId,
     ) Allocator.Error!bool {
-        var active = std.AutoHashMap(CheckedTypeId, void).init(self.allocator);
-        defer active.deinit();
-        return try self.typeContainsIdentityVariablesHelp(root, &active);
-    }
-
-    fn typeContainsIdentityVariablesHelp(
-        self: *const PlatformAppRelationTypeResolver,
-        root: CheckedTypeId,
-        active: *std.AutoHashMap(CheckedTypeId, void),
-    ) Allocator.Error!bool {
-        if (self.substitutions.get(root)) |replacement| return try self.typeContainsIdentityVariablesHelp(replacement, active);
-        const index: usize = @intFromEnum(root);
-        if (index >= self.store.payloads.items.len) {
-            checkedArtifactInvariant("platform/app relation identity scan referenced missing checked type payload", .{});
-        }
-        if (active.contains(root)) return false;
-        try active.put(root, {});
-        defer _ = active.remove(root);
-
-        switch (self.store.payloads.items[index]) {
-            .pending => return self.pendingRootContainsIdentityVariables(root),
-            else => {},
-        }
-        return switch (self.payload(root)) {
-            .pending => unreachable,
-            .flex,
-            .rigid,
-            => true,
-            .empty_record,
-            .empty_tag_union,
-            => false,
-            .alias => |alias| blk: {
-                if (try self.typeContainsIdentityVariablesHelp(alias.backing, active)) break :blk true;
-                for (alias.args) |arg| {
-                    if (try self.typeContainsIdentityVariablesHelp(arg, active)) break :blk true;
-                }
-                break :blk false;
-            },
-            .record => |record| blk: {
-                for (record.fields) |field| {
-                    if (try self.typeContainsIdentityVariablesHelp(field.ty, active)) break :blk true;
-                }
-                break :blk try self.typeContainsIdentityVariablesHelp(record.ext, active);
-            },
-            .record_unbound => |fields| blk: {
-                for (fields) |field| {
-                    if (try self.typeContainsIdentityVariablesHelp(field.ty, active)) break :blk true;
-                }
-                break :blk false;
-            },
-            .tuple => |items| blk: {
-                for (items) |item| {
-                    if (try self.typeContainsIdentityVariablesHelp(item, active)) break :blk true;
-                }
-                break :blk false;
-            },
-            .nominal => |nominal| blk: {
-                for (nominal.args) |arg| {
-                    if (try self.typeContainsIdentityVariablesHelp(arg, active)) break :blk true;
-                }
-                break :blk false;
-            },
-            .function => |function| blk: {
-                for (function.args) |arg| {
-                    if (try self.typeContainsIdentityVariablesHelp(arg, active)) break :blk true;
-                }
-                break :blk try self.typeContainsIdentityVariablesHelp(function.ret, active);
-            },
-            .tag_union => |tag_union| blk: {
-                for (tag_union.tags) |tag| {
-                    for (tag.argsSlice(self.store)) |arg| {
-                        if (try self.typeContainsIdentityVariablesHelp(arg, active)) break :blk true;
-                    }
-                }
-                break :blk try self.typeContainsIdentityVariablesHelp(tag_union.ext, active);
-            },
-        };
+        var context = PlatformAppRelationIdentityScan{ .resolver = self };
+        return try checked_traverse.checkedTypeContainsIdentityVariables(
+            CheckedTypeId,
+            PlatformAppRelationIdentityScan,
+            self.allocator,
+            &context,
+            root,
+        );
     }
 
     fn pendingRootContainsIdentityVariables(self: *const PlatformAppRelationTypeResolver, root: CheckedTypeId) bool {
@@ -18821,6 +18631,36 @@ const PlatformAppRelationTypeResolver = struct {
             checkedArtifactInvariant("platform/app relation referenced missing checked type payload", .{});
         }
         return self.store.payload(@enumFromInt(index));
+    }
+};
+
+const PlatformAppRelationIdentityScan = struct {
+    resolver: *const PlatformAppRelationTypeResolver,
+
+    pub fn visit(
+        self: *@This(),
+        traversal: anytype,
+        root: CheckedTypeId,
+    ) Allocator.Error!bool {
+        if (self.resolver.substitutions.get(root)) |replacement| {
+            return try traversal.visit(replacement);
+        }
+        const index: usize = @intFromEnum(root);
+        if (index >= self.resolver.store.payloads.items.len) {
+            checkedArtifactInvariant("platform/app relation identity scan referenced missing checked type payload", .{});
+        }
+        return try checked_traverse.checkedTypePayloadContainsIdentityVariables(
+            .tolerate,
+            traversal,
+            self.resolver.store,
+            root,
+            self.resolver.payload(root),
+            self,
+        );
+    }
+
+    pub fn pendingContainsIdentityVariables(self: *@This(), root: CheckedTypeId) bool {
+        return self.resolver.pendingRootContainsIdentityVariables(root);
     }
 };
 
@@ -29580,6 +29420,88 @@ test "checked type store preserves distinct identity roots with equal variable s
     try std.testing.expectEqual(@as(usize, 2), store.roots.items.len);
     try std.testing.expectEqual(@as(usize, 2), store.payloads.items.len);
     try std.testing.expectEqualDeep(store.payload(first), store.payload(second));
+}
+
+test "checked type identity scan terminates on self-referential alias backing" {
+    const allocator = std.testing.allocator;
+
+    var names = canonical.CanonicalNameStore.init(allocator);
+    defer names.deinit();
+
+    const module_identity = try names.internModuleIdentity(&([_]u8{0x90} ** 32));
+    const alias_name = try names.internTypeName("Self");
+
+    var store = CheckedTypeStore{};
+    defer store.deinit(allocator);
+
+    const root = try store.reserveSyntheticTypeRoot(allocator, testCanonicalTypeKey(90));
+    try store.fillSyntheticTypeRoot(allocator, root, .{ .alias = .{
+        .name = alias_name,
+        .origin_module = module_identity,
+        .backing = root,
+    } });
+
+    try std.testing.expect(!try store.checkedTypeContainsIdentityVariables(allocator, root));
+    try std.testing.expect(!try checkedTypeContainsIdentityVariablesPayloads(allocator, &store, root));
+}
+
+test "checked type identity scan finds identity beside recursive tag cycle" {
+    const allocator = std.testing.allocator;
+
+    var names = canonical.CanonicalNameStore.init(allocator);
+    defer names.deinit();
+
+    const tag_node = try names.internTagLabel("Node");
+    const tag_leaf = try names.internTagLabel("Leaf");
+
+    var store = CheckedTypeStore{};
+    defer store.deinit(allocator);
+
+    const empty_tags = try store.appendSyntheticPayloadRoot(allocator, &names, .empty_tag_union);
+    const root = try store.reserveSyntheticTypeRoot(allocator, testCanonicalTypeKey(91));
+    const identity = try store.reserveSyntheticTypeRoot(allocator, testCanonicalTypeKey(92));
+    try store.fillSyntheticTypeRoot(allocator, identity, .{ .flex = .{} });
+
+    const node_args = try allocator.alloc(CheckedTypeId, 1);
+    node_args[0] = root;
+    const leaf_args = try allocator.alloc(CheckedTypeId, 1);
+    leaf_args[0] = identity;
+    const tags = try allocator.alloc(CheckedTagBuild, 2);
+    tags[0] = .{ .name = tag_node, .args = node_args };
+    tags[1] = .{ .name = tag_leaf, .args = leaf_args };
+    try store.fillSyntheticTypeRoot(allocator, root, .{ .tag_union = .{
+        .tags = tags,
+        .ext = empty_tags,
+    } });
+
+    try std.testing.expect(try store.checkedTypeContainsIdentityVariables(allocator, root));
+    try std.testing.expect(try checkedTypeIdsContainIdentityVariables(allocator, &store, &.{root}));
+}
+
+test "platform app relation identity scan tolerates active pending root" {
+    const allocator = std.testing.allocator;
+
+    var names = canonical.CanonicalNameStore.init(allocator);
+    defer names.deinit();
+
+    var store = CheckedTypeStore{};
+    defer store.deinit(allocator);
+
+    const root = try store.reserveSyntheticTypeRoot(allocator, testCanonicalTypeKey(93));
+
+    var resolver = PlatformAppRelationTypeResolver.init(allocator, &names, &store);
+    defer resolver.deinit();
+
+    try std.testing.expect(try resolver.typeContainsIdentityVariables(root));
+
+    const finalize_input = PlatformAppRelationFinalizeInput{
+        .root = @intFromEnum(root),
+        .context = .value,
+    };
+    try resolver.finalizing.put(finalize_input, root);
+    defer _ = resolver.finalizing.remove(finalize_input);
+
+    try std.testing.expect(!try resolver.typeContainsIdentityVariables(root));
 }
 
 test "provided callable-containing record constant is a data export, not a runtime root" {
