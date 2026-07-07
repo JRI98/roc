@@ -42,7 +42,7 @@ NO CHANGE
 (can-ir
 	(d-let
 		(p-assign (ident "r"))
-		(e-call (constraint-fn-var 544)
+		(e-call (constraint-fn-var 242)
 			(e-lookup-external
 				(builtin))
 			(e-num (value "0"))

@@ -87,7 +87,7 @@ _ = function(value)
 			(args
 				(p-assign (ident "convertible")))
 			(e-block
-				(e-dispatch-call (method "to_i32_wrap") (constraint-fn-var 305)
+				(e-dispatch-call (method "to_i32_wrap") (constraint-fn-var 211)
 					(receiver
 						(e-lookup-local
 							(p-assign (ident "convertible"))))
@@ -108,7 +108,7 @@ _ = function(value)
 			(ty-lookup (name "I32") (builtin))))
 	(d-let
 		(p-underscore)
-		(e-call (constraint-fn-var 419)
+		(e-call (constraint-fn-var 239)
 			(e-lookup-local
 				(p-assign (ident "function")))
 			(e-lookup-local

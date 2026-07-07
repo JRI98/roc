@@ -114,7 +114,7 @@ match list {
 								(p-assign (ident "first"))
 								(p-assign (ident "second"))))))
 				(value
-					(e-dispatch-call (method "plus") (constraint-fn-var 333)
+					(e-dispatch-call (method "plus") (constraint-fn-var 227)
 						(receiver
 							(e-lookup-local
 								(p-assign (ident "first"))))
@@ -154,9 +154,9 @@ match list {
 							(rest-at (index 3)
 								(p-assign (ident "more"))))))
 				(value
-					(e-dispatch-call (method "plus") (constraint-fn-var 381)
+					(e-dispatch-call (method "plus") (constraint-fn-var 243)
 						(receiver
-							(e-dispatch-call (method "plus") (constraint-fn-var 379)
+							(e-dispatch-call (method "plus") (constraint-fn-var 241)
 								(receiver
 									(e-lookup-local
 										(p-assign (ident "x"))))

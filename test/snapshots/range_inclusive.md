@@ -36,7 +36,7 @@ NO CHANGE
 (can-ir
 	(d-let
 		(p-assign (ident "r"))
-		(e-call (constraint-fn-var 447)
+		(e-call (constraint-fn-var 229)
 			(e-lookup-external
 				(builtin))
 			(e-num (value "1"))

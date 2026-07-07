@@ -532,18 +532,23 @@ pub const Frac = struct {
 
 // nominal types //
 
-/// A nominal user-defined type
+/// A nominal type application in the value type graph: the declaration's
+/// identity plus the actual type arguments, and nothing else. The backing
+/// type lives exclusively in the declaration table (see `NominalDecl`); code
+/// that legitimately needs it instantiates the declaration's backing template
+/// with these args substituted for the declaration's formals.
 pub const NominalType = struct {
     pub const Source = NominalSource;
 
     ident: TypeIdent,
-    vars: Var.SafeList.NonEmptyRange,
+    /// The actual type arguments (may be empty).
+    args: Var.SafeList.Range,
     /// Env-local index of the declaring module's deep content identity in the
     /// owning module env's identity table (see `base.module_identity`).
     origin_module: ModuleIdentity.Idx,
-    /// Packed source-declaration and opacity bits. The statement index is a
-    /// decl LOCATOR for resolving method tables in the owning env — never
-    /// part of identity.
+    /// Packed source-declaration and opacity bits. Together with
+    /// `origin_module`, the statement is the declaration KEY for the
+    /// declaration table; it also locates method tables in the owning env.
     source: NominalSource,
 
     pub fn sourceDecl(self: NominalType) SourceDecl {

@@ -459,10 +459,8 @@ test "occurs: no recursion through two levels (v1 = Box(v2), v2 = Str)" {
     const v2 = try types_store.fresh();
 
     // Create a nominal Box type wrapping v2
-    const backing_var = try types_store.freshFromContent(Content{ .structure = .empty_record });
     try types_store.setVarContent(v1, try types_store.mkNominal(
         undefined,
-        backing_var,
         &.{v2},
         base.ModuleIdentity.Idx.NONE,
         false,
@@ -605,10 +603,8 @@ test "occurs: nested recursive tag union (v = [ Cons(elem, Box(v)) ] )" {
 
     // Wrap the recursive var in a nominal Box to simulate nesting
     const boxed_linked_list = try types_store.fresh();
-    const box_backing_var = try types_store.freshFromContent(.{ .structure = .empty_record });
     try types_store.setVarContent(boxed_linked_list, try types_store.mkNominal(
         undefined,
-        box_backing_var,
         &.{linked_list},
         base.ModuleIdentity.Idx.NONE,
         false,
@@ -651,7 +647,6 @@ test "occurs: recursive tag union (v = List: [ Cons(Elem, List), Nil ])" {
     const backing_var = try types_store.freshFromContent(try types_store.mkTagUnion(&.{ cons_tag, nil_tag }, ext));
     try types_store.setVarContent(nominal_type, try types_store.mkNominal(
         undefined,
-        backing_var,
         &.{},
         base.ModuleIdentity.Idx.NONE,
         false,
@@ -691,7 +686,6 @@ test "occurs: recursive tag union with multiple nominals (TypeA := TypeB, TypeB 
     // Set up TypeB = [ Cons(Elem, TypeA), Nil ]
     try types_store.setVarContent(type_b_nominal, try types_store.mkNominal(
         undefined,
-        type_b_backing,
         &.{},
         base.ModuleIdentity.Idx.NONE,
         false,
@@ -700,7 +694,6 @@ test "occurs: recursive tag union with multiple nominals (TypeA := TypeB, TypeB 
     // Set up TypeA = Type B
     try types_store.setVarContent(type_a_nominal, try types_store.mkNominal(
         undefined,
-        type_b_nominal,
         &.{},
         base.ModuleIdentity.Idx.NONE,
         false,
@@ -734,16 +727,11 @@ test "occurs: valid nominal recursion does not hide later invalid recursion" {
     const invalid_tuple_elems = try types_store.appendVars(&[_]Var{invalid_inner});
     try types_store.setRootVarContent(invalid_inner, .{ .structure = .{ .tuple = .{ .elems = invalid_tuple_elems } } });
 
-    // Valid branch: List := [ Cons(List), Nil ].
+    // Valid branch: a nominal application (its declaration graph is not part
+    // of the value graph, so it is trivially acyclic here).
     const list_nominal = try types_store.fresh();
-    const ext = try types_store.fresh();
-    const cons_tag_args = try types_store.appendVars(&[_]Var{list_nominal});
-    const cons_tag = types.Tag{ .name = undefined, .args = cons_tag_args };
-    const nil_tag = types.Tag{ .name = undefined, .args = Var.SafeList.Range.empty() };
-    const list_backing = try types_store.freshFromContent(try types_store.mkTagUnion(&.{ cons_tag, nil_tag }, ext));
     try types_store.setVarContent(list_nominal, try types_store.mkNominal(
         undefined,
-        list_backing,
         &.{},
         base.ModuleIdentity.Idx.NONE,
         false,
@@ -773,16 +761,11 @@ test "occurs: valid nominal return recursion does not hide invalid argument recu
     const invalid_arg_tuple_elems = try types_store.appendVars(&[_]Var{invalid_arg});
     try types_store.setRootVarContent(invalid_arg, .{ .structure = .{ .tuple = .{ .elems = invalid_arg_tuple_elems } } });
 
-    // Valid return branch: List := [ Cons(List), Nil ].
+    // Valid return branch: a nominal application (trivially acyclic in the
+    // value graph).
     const list_nominal = try types_store.fresh();
-    const ext = try types_store.fresh();
-    const cons_tag_args = try types_store.appendVars(&[_]Var{list_nominal});
-    const cons_tag = types.Tag{ .name = undefined, .args = cons_tag_args };
-    const nil_tag = types.Tag{ .name = undefined, .args = Var.SafeList.Range.empty() };
-    const list_backing = try types_store.freshFromContent(try types_store.mkTagUnion(&.{ cons_tag, nil_tag }, ext));
     try types_store.setVarContent(list_nominal, try types_store.mkNominal(
         undefined,
-        list_backing,
         &.{},
         base.ModuleIdentity.Idx.NONE,
         false,
@@ -826,11 +809,9 @@ test "occurs: anonymous recursion in a nominal's type argument is not valid (reg
     try types_store.setRootVarContent(inner, try types_store.mkTagUnion(&.{ cons_tag, nil_tag }, ext));
 
     // Wrapper(Inner) := {}  -- nominal with `inner` as its only type argument
-    const wrapper_backing = try types_store.freshFromContent(.{ .structure = .empty_record });
     const wrapper = try types_store.fresh();
     try types_store.setVarContent(wrapper, try types_store.mkNominal(
         undefined,
-        wrapper_backing,
         &.{inner},
         base.ModuleIdentity.Idx.NONE,
         false,
@@ -868,7 +849,6 @@ test "occurs: value graph never traverses a nominal's backing (args only)" {
     const n = try types_store.fresh();
     try types_store.setVarContent(n, try types_store.mkNominal(
         undefined,
-        inner,
         &.{},
         base.ModuleIdentity.Idx.NONE,
         false,
@@ -890,10 +870,9 @@ fn testRegisterDecl(
     statement: u32,
     backing: Var,
     args: []const Var,
-) !Var {
+) std.mem.Allocator.Error!Var {
     const content = try types_store.mkNominalWithSourceDecl(
         .{ .ident_idx = @bitCast(@as(u32, 1)) },
-        backing,
         args,
         origin,
         statement,
@@ -923,13 +902,12 @@ test "occursDeclarationGraph: valid recursion through a tag payload" {
     var scratch = try Scratch.init(gpa);
     defer scratch.deinit();
 
-    const origin: base.ModuleIdentity.Idx = @enumFromInt(0);
+    const origin: base.ModuleIdentity.Idx = @enumFromInt(1);
 
     const backing = try types_store.fresh();
     // Recursive reference: an app of the same declaration inside the payload.
     const rec_app = try types_store.freshFromContent(try types_store.mkNominalWithSourceDecl(
         .{ .ident_idx = @bitCast(@as(u32, 1)) },
-        backing,
         &.{},
         origin,
         7,
@@ -955,12 +933,11 @@ test "occursDeclarationGraph: self-recursion through a tuple is infinite" {
     var scratch = try Scratch.init(gpa);
     defer scratch.deinit();
 
-    const origin: base.ModuleIdentity.Idx = @enumFromInt(0);
+    const origin: base.ModuleIdentity.Idx = @enumFromInt(1);
 
     const backing = try types_store.fresh();
     const rec_app = try types_store.freshFromContent(try types_store.mkNominalWithSourceDecl(
         .{ .ident_idx = @bitCast(@as(u32, 1)) },
-        backing,
         &.{},
         origin,
         7,
@@ -985,20 +962,16 @@ test "occursDeclarationGraph: mutual recursion closes by declaration key" {
     var scratch = try Scratch.init(gpa);
     defer scratch.deinit();
 
-    const origin: base.ModuleIdentity.Idx = @enumFromInt(0);
+    const origin: base.ModuleIdentity.Idx = @enumFromInt(1);
 
     // Reserve backing vars for both declarations first.
     const t_backing = try types_store.fresh();
     const u_backing = try types_store.fresh();
 
-    // T's template: a tuple holding an app of U. The app's embedded backing
-    // deliberately points at a DEAD-END copy (a flex var) to model what
-    // per-use instantiation actually produces; only the declaration table
-    // can reach U's real template.
-    const u_backing_deadend = try types_store.fresh();
+    // T's template: a tuple holding an app of U. The application carries no
+    // backing; only the declaration table can reach U's template.
     const u_app = try types_store.freshFromContent(try types_store.mkNominalWithSourceDecl(
         .{ .ident_idx = @bitCast(@as(u32, 2)) },
-        u_backing_deadend,
         &.{},
         origin,
         9,
@@ -1007,12 +980,9 @@ test "occursDeclarationGraph: mutual recursion closes by declaration key" {
     const t_elems = try types_store.appendVars(&[_]Var{u_app});
     try types_store.setRootVarContent(t_backing, .{ .structure = .{ .tuple = .{ .elems = t_elems } } });
 
-    // U's template: a tuple holding an app of T, likewise with a dead-end
-    // embedded backing.
-    const t_backing_deadend = try types_store.fresh();
+    // U's template: a tuple holding an app of T.
     const t_app = try types_store.freshFromContent(try types_store.mkNominalWithSourceDecl(
         .{ .ident_idx = @bitCast(@as(u32, 1)) },
-        t_backing_deadend,
         &.{},
         origin,
         7,
@@ -1037,7 +1007,7 @@ test "occursDeclarationGraph: anonymous recursion inside a template is rejected"
     var scratch = try Scratch.init(gpa);
     defer scratch.deinit();
 
-    const origin: base.ModuleIdentity.Idx = @enumFromInt(0);
+    const origin: base.ModuleIdentity.Idx = @enumFromInt(1);
 
     const inner = try types_store.fresh();
     const ext = try types_store.fresh();

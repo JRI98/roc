@@ -56,12 +56,12 @@ NO CHANGE
 				(p-assign (ident "name"))))
 		(s-let
 			(p-assign (ident "#interp_1"))
-			(e-dispatch-call (method "to_str") (constraint-fn-var 267)
+			(e-dispatch-call (method "to_str") (constraint-fn-var 193)
 				(receiver
 					(e-lookup-local
 						(p-assign (ident "age"))))
 				(args)))
-		(e-interpolation (constraint-fn-var 326)
+		(e-interpolation (constraint-fn-var 212)
 			(first
 				(e-literal (string "Hello ")))
 			(parts

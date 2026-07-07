@@ -92,7 +92,7 @@ NO CHANGE
 				(e-block
 					(s-reassign
 						(p-assign (ident "total_"))
-						(e-dispatch-call (method "plus") (constraint-fn-var 615)
+						(e-dispatch-call (method "plus") (constraint-fn-var 287)
 							(receiver
 								(e-lookup-local
 									(p-assign (ident "total_"))))

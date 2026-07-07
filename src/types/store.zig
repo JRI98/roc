@@ -677,23 +677,22 @@ pub const Store = struct {
         };
     }
 
-    /// Make nominal data type
+    /// Make a nominal type application: identity plus actual type args only.
+    /// The backing type lives in the declaration table, not the application.
     /// Does not insert content into the types store
     pub fn mkNominal(
         self: *Self,
         ident: TypeIdent,
-        backing_var: Var,
         args: []const Var,
         origin_module: base.ModuleIdentity.Idx,
         is_opaque: bool,
     ) std.mem.Allocator.Error!Content {
-        return self.mkNominalWithSourceDecl(ident, backing_var, args, origin_module, null, is_opaque);
+        return self.mkNominalWithSourceDecl(ident, args, origin_module, null, is_opaque);
     }
 
     pub fn mkNominalWithSourceDecl(
         self: *Self,
         ident: TypeIdent,
-        backing_var: Var,
         args: []const Var,
         origin_module: base.ModuleIdentity.Idx,
         source_decl: ?u32,
@@ -701,7 +700,6 @@ pub const Store = struct {
     ) std.mem.Allocator.Error!Content {
         return self.mkNominalWithSourceDeclAndBuiltinOrigin(
             ident,
-            backing_var,
             args,
             origin_module,
             source_decl,
@@ -713,7 +711,6 @@ pub const Store = struct {
     pub fn mkNominalWithSourceDeclAndBuiltinOrigin(
         self: *Self,
         ident: TypeIdent,
-        backing_var: Var,
         args: []const Var,
         origin_module: base.ModuleIdentity.Idx,
         source_decl: ?u32,
@@ -725,17 +722,12 @@ pub const Store = struct {
             is_opaque,
             builtin_origin,
         );
-        const backing_idx = try self.appendVar(backing_var);
-        var span = try self.appendVars(args);
-
-        // Adjust args span to include backing  var
-        span.start = backing_idx;
-        span.count = span.count + 1;
+        const args_range = try self.appendVars(args);
 
         return Content{ .structure = FlatType{
             .nominal_type = NominalType{
                 .ident = ident,
-                .vars = .{ .nonempty = span },
+                .args = args_range,
                 .origin_module = origin_module,
                 .source = source,
             },
@@ -1017,20 +1009,12 @@ pub const Store = struct {
 
     // helpers - nominal types //
 
-    // Nominal types contain a span of variables. In this span, the 1st element
-    // is the backing variable, and the remainder are the arguments
-
-    /// Get the backing var for this nominal type
-    pub fn getNominalBackingVar(self: *const Self, nominal: NominalType) Var {
-        std.debug.assert(nominal.vars.nonempty.count > 0);
-        return self.vars.get(nominal.vars.nonempty.start).*;
-    }
+    // A nominal application carries only its actual type arguments; backing
+    // structure is resolved through the declaration table.
 
     /// Get the arg vars for this nominal type
     pub fn sliceNominalArgs(self: *const Self, nominal: NominalType) []Var {
-        std.debug.assert(nominal.vars.nonempty.count > 0);
-        const slice = self.vars.sliceRange(nominal.vars.nonempty);
-        return slice[1..];
+        return self.vars.sliceRange(nominal.args);
     }
 
     /// Get the arg vars range for this nominal type.
@@ -1038,18 +1022,21 @@ pub const Store = struct {
     /// Unlike sliceNominalArgs, this returns indices that remain valid even if
     /// the underlying storage is reallocated.
     pub fn getNominalArgsRange(nominal: NominalType) VarSafeList.Range {
-        std.debug.assert(nominal.vars.nonempty.count > 0);
-        var span = nominal.vars.nonempty;
-        span.dropFirstElem();
-        return span;
+        return nominal.args;
     }
 
     /// Get the an iterator arg vars for this nominal type
     pub fn iterNominalArgs(self: *const Self, nominal: NominalType) VarSafeList.Iterator {
-        std.debug.assert(nominal.vars.nonempty.count > 0);
-        var span = nominal.vars.nonempty;
-        span.dropFirstElem();
-        return self.vars.iterRange(span);
+        return self.vars.iterRange(nominal.args);
+    }
+
+    /// Whether this nominal application's declaration is known invalid
+    /// (malformed backing or invalid recursion). Applications whose
+    /// declaration cannot be resolved (no source declaration — possible only
+    /// for hand-constructed types in tests) count as valid.
+    pub fn nominalDeclIsInvalid(self: *const Self, nominal: NominalType) bool {
+        const decl_idx = self.lookupNominalDecl(nominal) orelse return false;
+        return !self.getNominalDecl(decl_idx).isValid();
     }
 
     // nominal declaration table //
@@ -1967,7 +1954,7 @@ test "Store basic CompactWriter roundtrip" {
     try std.testing.expectEqual(deser_flex_resolved.desc_idx, deser_redirect_resolved.desc_idx);
 }
 
-fn testNominalDecl(origin_module: base.ModuleIdentity.Idx, statement: u32, backing: Var) !NominalDecl {
+fn testNominalDecl(origin_module: base.ModuleIdentity.Idx, statement: u32, backing: Var) error{OutOfMemory}!NominalDecl {
     return NominalDecl{
         .ident = .{ .ident_idx = @bitCast(@as(u32, 1)) },
         .origin_module = origin_module,
@@ -1992,8 +1979,8 @@ test "nominal declaration table: register, lookup, upsert" {
     const backing_b = try store.fresh();
     const backing_c = try store.fresh();
 
-    const origin_0: base.ModuleIdentity.Idx = @enumFromInt(0);
-    const origin_1: base.ModuleIdentity.Idx = @enumFromInt(1);
+    const origin_0: base.ModuleIdentity.Idx = @enumFromInt(1);
+    const origin_1: base.ModuleIdentity.Idx = @enumFromInt(2);
 
     // Register out of key order to exercise sorted insertion.
     const idx_b = try store.registerNominalDecl(try testNominalDecl(origin_1, 5, backing_b));
@@ -2027,7 +2014,6 @@ test "nominal declaration table: register, lookup, upsert" {
     // Lookup through a nominal application resolves by (origin, statement).
     const app_content = try store.mkNominalWithSourceDecl(
         .{ .ident_idx = @bitCast(@as(u32, 1)) },
-        backing_b,
         &.{},
         origin_1,
         5,
@@ -2102,7 +2088,6 @@ test "Store comprehensive CompactWriter roundtrip" {
     const builtin_module_idx = base.ModuleIdentity.Idx.NONE;
     const list_content = try original.mkNominal(
         .{ .ident_idx = list_ident_idx },
-        list_elem,
         &[_]Var{list_elem},
         builtin_module_idx,
         false,
@@ -2608,7 +2593,6 @@ test "source declaration overflow is rejected before mutating type store" {
         error.OutOfMemory,
         store.mkNominalWithSourceDecl(
             .{ .ident_idx = base.Ident.Idx.NONE },
-            unread_backing_var,
             &.{},
             base.ModuleIdentity.Idx.NONE,
             NominalType.Source.max_statement + 1,

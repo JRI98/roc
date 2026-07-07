@@ -58,6 +58,9 @@ const LayoutTest = struct {
         // creates types in self.type_store (a separate store). Set the override so the
         // layout store uses our test's type store when resolving type variables.
         self.layout_store.setOverrideTypesStore(&self.type_store);
+        // Opening nominal declarations instantiates backing templates, which
+        // needs a mutable view of the same store.
+        self.layout_store.setMutableTypesStore(&self.type_store);
     }
 
     fn deinit(self: *LayoutTest) void {
@@ -72,7 +75,6 @@ const LayoutTest = struct {
     fn mkBoxType(self: *LayoutTest, elem_var: types.Var, box_ident_idx: base.Ident.Idx, builtin_identity: base.ModuleIdentity.Idx) Allocator.Error!types.Var {
         const box_content = try self.type_store.mkNominalWithSourceDeclAndBuiltinOrigin(
             .{ .ident_idx = box_ident_idx },
-            elem_var,
             &[_]types.Var{elem_var},
             builtin_identity,
             null,
@@ -139,6 +141,7 @@ test "fromTypeVar - zero-sized types (ZST)" {
     lt.module_env_ptr[0] = &lt.module_env;
     lt.layout_store = try Store.init(&lt.module_env_ptr, null, lt.gpa, base.target.TargetUsize.native);
     lt.layout_store.setOverrideTypesStore(&lt.type_store);
+    lt.layout_store.setMutableTypesStore(&lt.type_store);
     lt.type_scope = TypeScope.init(lt.gpa);
     defer lt.deinit();
 
@@ -158,7 +161,6 @@ test "fromTypeVar - zero-sized types (ZST)" {
 
     const list_zst_content = try lt.type_store.mkNominalWithSourceDeclAndBuiltinOrigin(
         .{ .ident_idx = list_ident_idx },
-        empty_tag_union_var,
         &[_]types.Var{empty_tag_union_var},
         builtin_module_idx,
         null,
@@ -183,6 +185,7 @@ test "fromTypeVar - record with only zero-sized fields" {
     lt.module_env_ptr[0] = &lt.module_env;
     lt.layout_store = try Store.init(&lt.module_env_ptr, null, lt.gpa, base.target.TargetUsize.native);
     lt.layout_store.setOverrideTypesStore(&lt.type_store);
+    lt.layout_store.setMutableTypesStore(&lt.type_store);
     lt.type_scope = TypeScope.init(lt.gpa);
     defer lt.deinit();
 
@@ -214,6 +217,7 @@ test "record extension with empty_record succeeds" {
     lt.module_env_ptr[0] = &lt.module_env;
     lt.layout_store = try Store.init(&lt.module_env_ptr, null, lt.gpa, base.target.TargetUsize.native);
     lt.layout_store.setOverrideTypesStore(&lt.type_store);
+    lt.layout_store.setMutableTypesStore(&lt.type_store);
     lt.type_scope = TypeScope.init(lt.gpa);
     defer lt.deinit();
 
@@ -243,6 +247,7 @@ test "deeply nested containers with inner ZST" {
     lt.module_env_ptr[0] = &lt.module_env;
     lt.layout_store = try Store.init(&lt.module_env_ptr, null, lt.gpa, base.target.TargetUsize.native);
     lt.layout_store.setOverrideTypesStore(&lt.type_store);
+    lt.layout_store.setMutableTypesStore(&lt.type_store);
     lt.type_scope = TypeScope.init(lt.gpa);
     defer lt.deinit();
 
@@ -251,7 +256,6 @@ test "deeply nested containers with inner ZST" {
     const inner_box = try lt.mkBoxType(empty_record, box_ident_idx, builtin_module_idx);
     const inner_list_content = try lt.type_store.mkNominalWithSourceDeclAndBuiltinOrigin(
         .{ .ident_idx = list_ident_idx },
-        inner_box,
         &[_]types.Var{inner_box},
         builtin_module_idx,
         null,
@@ -262,7 +266,6 @@ test "deeply nested containers with inner ZST" {
     const outer_box = try lt.mkBoxType(inner_list, box_ident_idx, builtin_module_idx);
     const outer_list_content = try lt.type_store.mkNominalWithSourceDeclAndBuiltinOrigin(
         .{ .ident_idx = list_ident_idx },
-        outer_box,
         &[_]types.Var{outer_box},
         builtin_module_idx,
         null,
@@ -302,6 +305,7 @@ test "nested ZST detection - List of record with ZST field" {
     lt.module_env_ptr[0] = &lt.module_env;
     lt.layout_store = try Store.init(&lt.module_env_ptr, null, lt.gpa, base.target.TargetUsize.native);
     lt.layout_store.setOverrideTypesStore(&lt.type_store);
+    lt.layout_store.setMutableTypesStore(&lt.type_store);
     lt.type_scope = TypeScope.init(lt.gpa);
     defer lt.deinit();
 
@@ -312,7 +316,7 @@ test "nested ZST detection - List of record with ZST field" {
     const record_var = try lt.type_store.freshFromContent(.{ .structure = .{ .record = .{ .fields = fields, .ext = empty_record_var } } });
 
     // List of this record should be list_of_zst since the record only has ZST fields
-    const list_content = try lt.type_store.mkNominalWithSourceDeclAndBuiltinOrigin(.{ .ident_idx = list_ident_idx }, record_var, &[_]types.Var{record_var}, builtin_module_idx, null, false, true);
+    const list_content = try lt.type_store.mkNominalWithSourceDeclAndBuiltinOrigin(.{ .ident_idx = list_ident_idx }, &[_]types.Var{record_var}, builtin_module_idx, null, false, true);
     const list_var = try lt.type_store.freshFromContent(list_content);
     const list_idx = try lt.layout_store.fromTypeVar(0, list_var, &lt.type_scope, null);
     try testing.expect(lt.layout_store.getLayout(list_idx).tag == .list_of_zst);
@@ -332,6 +336,7 @@ test "nested ZST detection - Box of tuple with ZST elements" {
     lt.module_env_ptr[0] = &lt.module_env;
     lt.layout_store = try Store.init(&lt.module_env_ptr, null, lt.gpa, base.target.TargetUsize.native);
     lt.layout_store.setOverrideTypesStore(&lt.type_store);
+    lt.layout_store.setMutableTypesStore(&lt.type_store);
     lt.type_scope = TypeScope.init(lt.gpa);
     defer lt.deinit();
 
@@ -367,6 +372,7 @@ test "nested ZST detection - deeply nested" {
     lt.module_env_ptr[0] = &lt.module_env;
     lt.layout_store = try Store.init(&lt.module_env_ptr, null, lt.gpa, base.target.TargetUsize.native);
     lt.layout_store.setOverrideTypesStore(&lt.type_store);
+    lt.layout_store.setMutableTypesStore(&lt.type_store);
     lt.type_scope = TypeScope.init(lt.gpa);
     defer lt.deinit();
 
@@ -390,7 +396,7 @@ test "nested ZST detection - deeply nested" {
     const outer_record_var = try lt.type_store.freshFromContent(.{ .structure = .{ .record = .{ .fields = outer_record_fields, .ext = empty_record_var } } });
 
     // List({ field: ({ field2: {} }, ()) })
-    const list_content = try lt.type_store.mkNominalWithSourceDeclAndBuiltinOrigin(.{ .ident_idx = list_ident_idx }, outer_record_var, &[_]types.Var{outer_record_var}, builtin_module_idx, null, false, true);
+    const list_content = try lt.type_store.mkNominalWithSourceDeclAndBuiltinOrigin(.{ .ident_idx = list_ident_idx }, &[_]types.Var{outer_record_var}, builtin_module_idx, null, false, true);
     const list_var = try lt.type_store.freshFromContent(list_content);
     const list_idx = try lt.layout_store.fromTypeVar(0, list_var, &lt.type_scope, null);
 
@@ -424,6 +430,7 @@ test "fromTypeVar - flex var with method constraint returning open tag union" {
     lt.module_env_ptr[0] = &lt.module_env;
     lt.layout_store = try Store.init(&lt.module_env_ptr, null, lt.gpa, base.target.TargetUsize.native);
     lt.layout_store.setOverrideTypesStore(&lt.type_store);
+    lt.layout_store.setMutableTypesStore(&lt.type_store);
     lt.type_scope = TypeScope.init(lt.gpa);
     defer lt.deinit();
 
@@ -433,7 +440,6 @@ test "fromTypeVar - flex var with method constraint returning open tag union" {
     // Create List(a)
     const list_content = try lt.type_store.mkNominalWithSourceDeclAndBuiltinOrigin(
         .{ .ident_idx = list_ident_idx },
-        elem_var,
         &[_]types.Var{elem_var},
         builtin_module_idx,
         null,
@@ -467,12 +473,23 @@ test "fromTypeVar - flex var with method constraint returning open tag union" {
         .ext = try lt.type_store.freshFromContent(.{ .structure = .empty_tag_union }),
     };
     const try_backing_var = try lt.type_store.freshFromContent(.{ .structure = .{ .tag_union = try_backing_tag_union } });
+    _ = try lt.type_store.registerNominalDecl(.{
+        .ident = .{ .ident_idx = try_ident_idx },
+        .origin_module = builtin_module_idx,
+        .source = try types.NominalType.Source.initChecked(
+            try types.SourceDecl.fromStatementWithBuiltinOriginChecked(7001, true),
+            false,
+            true,
+        ),
+        .formals = try lt.type_store.appendVars(&[_]types.Var{ elem_var, error_tag_union_var }),
+        .backing = try_backing_var,
+        .flags = .{ .valid = true },
+    });
     const try_content = try lt.type_store.mkNominalWithSourceDeclAndBuiltinOrigin(
         .{ .ident_idx = try_ident_idx },
-        try_backing_var,
         &[_]types.Var{ elem_var, error_tag_union_var },
         builtin_module_idx,
-        null,
+        7001,
         false,
         true, // builtin origin
     );
@@ -498,7 +515,6 @@ test "fromTypeVar - flex var with method constraint returning open tag union" {
     // Now create a List with this constrained flex element
     const outer_list_content = try lt.type_store.mkNominalWithSourceDeclAndBuiltinOrigin(
         .{ .ident_idx = list_ident_idx },
-        constrained_flex,
         &[_]types.Var{constrained_flex},
         builtin_module_idx,
         null,
@@ -548,6 +564,7 @@ test "fromTypeVar - type alias inside Try nominal (issue #8708)" {
     lt.module_env_ptr[0] = &lt.module_env;
     lt.layout_store = try Store.init(&lt.module_env_ptr, null, lt.gpa, base.target.TargetUsize.native);
     lt.layout_store.setOverrideTypesStore(&lt.type_store);
+    lt.layout_store.setMutableTypesStore(&lt.type_store);
     lt.type_scope = TypeScope.init(lt.gpa);
     defer lt.deinit();
 
@@ -592,12 +609,23 @@ test "fromTypeVar - type alias inside Try nominal (issue #8708)" {
     const try_backing_var = try lt.type_store.freshFromContent(.{ .structure = .{ .tag_union = try_backing_tag_union } });
 
     // Create the Try nominal type: Try(TokenContents, Str)
+    _ = try lt.type_store.registerNominalDecl(.{
+        .ident = .{ .ident_idx = try_ident_idx },
+        .origin_module = builtin_module_idx,
+        .source = try types.NominalType.Source.initChecked(
+            try types.SourceDecl.fromStatementWithBuiltinOriginChecked(7002, true),
+            false,
+            true,
+        ),
+        .formals = try lt.type_store.appendVars(&[_]types.Var{ token_contents_alias_var, str_var }),
+        .backing = try_backing_var,
+        .flags = .{ .valid = true },
+    });
     const try_content = try lt.type_store.mkNominalWithSourceDeclAndBuiltinOrigin(
         .{ .ident_idx = try_ident_idx },
-        try_backing_var,
         &[_]types.Var{ token_contents_alias_var, str_var },
         builtin_module_idx,
-        null,
+        7002,
         false,
         true, // builtin origin
     );
@@ -639,6 +667,7 @@ test "fromTypeVar - recursive nominal type with nested Box at depth 2+ (issue #8
     lt.module_env_ptr[0] = &lt.module_env;
     lt.layout_store = try Store.init(&lt.module_env_ptr, null, lt.gpa, base.target.TargetUsize.native);
     lt.layout_store.setOverrideTypesStore(&lt.type_store);
+    lt.layout_store.setMutableTypesStore(&lt.type_store);
     lt.type_scope = TypeScope.init(lt.gpa);
     defer lt.deinit();
 
@@ -652,7 +681,6 @@ test "fromTypeVar - recursive nominal type with nested Box at depth 2+ (issue #8
     // Create Box(recursive_var) - this references the recursive var before we define the nominal
     const box_content = try lt.type_store.mkNominalWithSourceDeclAndBuiltinOrigin(
         .{ .ident_idx = box_ident_idx },
-        recursive_var,
         &[_]types.Var{recursive_var},
         builtin_module_idx,
         null,
@@ -681,12 +709,23 @@ test "fromTypeVar - recursive nominal type with nested Box at depth 2+ (issue #8
     const tag_union_var = try lt.type_store.freshFromContent(.{ .structure = .{ .tag_union = tag_union } });
 
     // Create the nominal type content: RichDoc := [PlainText(Str), Wrapped(Box(RichDoc))]
+    _ = try lt.type_store.registerNominalDecl(.{
+        .ident = .{ .ident_idx = rich_doc_ident_idx },
+        .origin_module = builtin_module_idx,
+        .source = try types.NominalType.Source.initChecked(
+            try types.SourceDecl.fromStatementWithBuiltinOriginChecked(7003, true),
+            false,
+            true,
+        ),
+        .formals = try lt.type_store.appendVars(&[_]types.Var{}),
+        .backing = tag_union_var,
+        .flags = .{ .valid = true },
+    });
     const rich_doc_content = try lt.type_store.mkNominalWithSourceDeclAndBuiltinOrigin(
         .{ .ident_idx = rich_doc_ident_idx },
-        tag_union_var,
         &[_]types.Var{},
         builtin_module_idx,
-        null,
+        7003,
         false,
         true, // builtin origin
     );
@@ -739,6 +778,7 @@ test "layoutSizeAlign - recursive nominal type with record containing List (issu
     lt.module_env_ptr[0] = &lt.module_env;
     lt.layout_store = try Store.init(&lt.module_env_ptr, null, lt.gpa, base.target.TargetUsize.native);
     lt.layout_store.setOverrideTypesStore(&lt.type_store);
+    lt.layout_store.setMutableTypesStore(&lt.type_store);
     lt.type_scope = TypeScope.init(lt.gpa);
     defer lt.deinit();
 
@@ -753,7 +793,6 @@ test "layoutSizeAlign - recursive nominal type with record containing List (issu
     // The recursion goes through List in a record field, not through Box
     const list_recursive_content = try lt.type_store.mkNominalWithSourceDeclAndBuiltinOrigin(
         .{ .ident_idx = list_ident_idx },
-        recursive_var,
         &[_]types.Var{recursive_var},
         builtin_module_idx,
         null,
@@ -799,12 +838,23 @@ test "layoutSizeAlign - recursive nominal type with record containing List (issu
     const tag_union_var = try lt.type_store.freshFromContent(.{ .structure = .{ .tag_union = tag_union } });
 
     // Create the nominal type content: Statement := [FuncCall({...}), ForLoop({block: List(Statement)})]
+    _ = try lt.type_store.registerNominalDecl(.{
+        .ident = .{ .ident_idx = statement_ident_idx },
+        .origin_module = builtin_module_idx,
+        .source = try types.NominalType.Source.initChecked(
+            try types.SourceDecl.fromStatementWithBuiltinOriginChecked(7004, true),
+            false,
+            true,
+        ),
+        .formals = try lt.type_store.appendVars(&[_]types.Var{}),
+        .backing = tag_union_var,
+        .flags = .{ .valid = true },
+    });
     const statement_content = try lt.type_store.mkNominalWithSourceDeclAndBuiltinOrigin(
         .{ .ident_idx = statement_ident_idx },
-        tag_union_var,
         &[_]types.Var{},
         builtin_module_idx,
-        null,
+        7004,
         false,
         true, // builtin origin
     );
@@ -854,6 +904,7 @@ test "fromTypeVar - recursive nominal with Box has no double-boxing (issue #8916
     lt.module_env_ptr[0] = &lt.module_env;
     lt.layout_store = try Store.init(&lt.module_env_ptr, null, lt.gpa, base.target.TargetUsize.native);
     lt.layout_store.setOverrideTypesStore(&lt.type_store);
+    lt.layout_store.setMutableTypesStore(&lt.type_store);
     lt.type_scope = TypeScope.init(lt.gpa);
     defer lt.deinit();
 
@@ -865,7 +916,6 @@ test "fromTypeVar - recursive nominal with Box has no double-boxing (issue #8916
     // Create Box(recursive_var)
     const box_content = try lt.type_store.mkNominalWithSourceDeclAndBuiltinOrigin(
         .{ .ident_idx = box_ident_idx },
-        recursive_var,
         &[_]types.Var{recursive_var},
         builtin_module_idx,
         null,
@@ -891,12 +941,23 @@ test "fromTypeVar - recursive nominal with Box has no double-boxing (issue #8916
     const tag_union_var = try lt.type_store.freshFromContent(.{ .structure = .{ .tag_union = tag_union } });
 
     // Create the nominal type content: Nat := [Zero, Suc(Box(Nat))]
+    _ = try lt.type_store.registerNominalDecl(.{
+        .ident = .{ .ident_idx = nat_ident_idx },
+        .origin_module = builtin_module_idx,
+        .source = try types.NominalType.Source.initChecked(
+            try types.SourceDecl.fromStatementWithBuiltinOriginChecked(7005, true),
+            false,
+            true,
+        ),
+        .formals = try lt.type_store.appendVars(&[_]types.Var{}),
+        .backing = tag_union_var,
+        .flags = .{ .valid = true },
+    });
     const nat_content = try lt.type_store.mkNominalWithSourceDeclAndBuiltinOrigin(
         .{ .ident_idx = nat_ident_idx },
-        tag_union_var,
         &[_]types.Var{},
         builtin_module_idx,
-        null,
+        7005,
         false,
         true, // builtin origin
     );

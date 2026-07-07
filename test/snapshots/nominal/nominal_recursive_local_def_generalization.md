@@ -191,7 +191,7 @@ NO CHANGE
 													(p-nominal
 														(p-applied-tag))))
 											(value
-												(e-call (constraint-fn-var 380)
+												(e-call (constraint-fn-var 297)
 													(e-lookup-local
 														(p-assign (ident "delRBTree")))
 													(e-nominal (nominal "RBTree")
@@ -223,7 +223,7 @@ NO CHANGE
 													(p-nominal
 														(p-applied-tag))))
 											(value
-												(e-call (constraint-fn-var 422)
+												(e-call (constraint-fn-var 330)
 													(e-lookup-local
 														(p-assign (ident "delRBTree")))
 													(e-lookup-local
@@ -235,7 +235,7 @@ NO CHANGE
 											(value
 												(e-lookup-local
 													(p-assign (ident "t")))))))))))
-				(e-call (constraint-fn-var 428)
+				(e-call (constraint-fn-var 337)
 					(e-lookup-local
 						(p-assign (ident "delCurr")))
 					(e-lookup-local

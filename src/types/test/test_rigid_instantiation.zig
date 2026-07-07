@@ -330,7 +330,6 @@ test "instantiate - alias preserves structure" {
     const builtin_module_idx = base.ModuleIdentity.Idx.NONE;
     const backing_content = try env.types.mkNominal(
         .{ .ident_idx = list_ident_idx },
-        rigid_a,
         &[_]Var{rigid_a},
         builtin_module_idx,
         false,
@@ -380,7 +379,6 @@ test "instantiate - box and list" {
         const builtin_module_idx = base.ModuleIdentity.Idx.NONE;
         const box_content = try env.types.mkNominal(
             .{ .ident_idx = box_ident_idx },
-            rigid_a,
             &[_]Var{rigid_a},
             builtin_module_idx,
             false,
@@ -411,7 +409,6 @@ test "instantiate - box and list" {
         const builtin_module_idx = base.ModuleIdentity.Idx.NONE;
         const list_content = try env.types.mkNominal(
             .{ .ident_idx = list_ident_idx },
-            rigid_a,
             &[_]Var{rigid_a},
             builtin_module_idx,
             false,

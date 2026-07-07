@@ -310,21 +310,17 @@ fn copyNominalType(ctx: *const CopyContext, source_nominal: NominalType) std.mem
     var dest_args = std.ArrayList(Var).empty;
     defer dest_args.deinit(ctx.dest_store.gpa);
 
-    const origin_backing = ctx.source_store.getNominalBackingVar(source_nominal);
-    const dest_backing = try copyVarCtx(ctx, origin_backing);
-    try dest_args.append(ctx.dest_store.gpa, dest_backing);
-
     const origin_args = ctx.source_store.sliceNominalArgs(source_nominal);
     for (origin_args) |arg_var| {
         const dest_arg = try copyVarCtx(ctx, arg_var);
         try dest_args.append(ctx.dest_store.gpa, dest_arg);
     }
 
-    const dest_vars_span = try ctx.dest_store.appendVars(dest_args.items);
+    const dest_args_range = try ctx.dest_store.appendVars(dest_args.items);
 
     return NominalType{
         .ident = types_mod.TypeIdent{ .ident_idx = translated_ident },
-        .vars = .{ .nonempty = dest_vars_span },
+        .args = dest_args_range,
         .origin_module = translated_origin,
         .source = source_nominal.source,
     };
@@ -421,7 +417,9 @@ fn copyNominalDeclEntry(
         .origin_module = translated_origin,
         .source = source_entry.source,
         .formals = Var.SafeList.Range.empty(),
-        .backing = @enumFromInt(0),
+        // Never read while the copy is in flight (see above); both fields are
+        // filled in below once the graph copy completes.
+        .backing = undefined,
         .flags = source_entry.flags,
     });
 

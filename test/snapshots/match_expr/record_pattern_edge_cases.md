@@ -163,7 +163,7 @@ match ... {
 							(p-assign (ident "#interp_0"))
 							(e-lookup-local
 								(p-assign (ident "c"))))
-						(e-interpolation (constraint-fn-var 424)
+						(e-interpolation (constraint-fn-var 312)
 							(first
 								(e-literal (string "deeply nested: ")))
 							(parts
@@ -188,7 +188,7 @@ match ... {
 							(p-assign (ident "#interp_1"))
 							(e-lookup-local
 								(p-assign (ident "x"))))
-						(e-interpolation (constraint-fn-var 482)
+						(e-interpolation (constraint-fn-var 332)
 							(first
 								(e-literal (string "mixed with empty: ")))
 							(parts
@@ -220,7 +220,7 @@ match ... {
 							(p-assign (ident "#interp_3"))
 							(e-lookup-local
 								(p-assign (ident "simple"))))
-						(e-interpolation (constraint-fn-var 543)
+						(e-interpolation (constraint-fn-var 353)
 							(first
 								(e-literal (string "mixed: ")))
 							(parts
@@ -259,7 +259,7 @@ match ... {
 							(p-assign (ident "#interp_5"))
 							(e-lookup-local
 								(p-assign (ident "d"))))
-						(e-interpolation (constraint-fn-var 605)
+						(e-interpolation (constraint-fn-var 375)
 							(first
 								(e-literal (string "multiple nested: ")))
 							(parts
@@ -283,7 +283,7 @@ match ... {
 							(p-assign (ident "#interp_6"))
 							(e-lookup-local
 								(p-assign (ident "x"))))
-						(e-interpolation (constraint-fn-var 662)
+						(e-interpolation (constraint-fn-var 394)
 							(first
 								(e-literal (string "renamed: ")))
 							(parts
@@ -313,12 +313,12 @@ match ... {
 								(p-assign (ident "firstName"))))
 						(s-let
 							(p-assign (ident "#interp_8"))
-							(e-dispatch-call (method "to_str") (constraint-fn-var 666)
+							(e-dispatch-call (method "to_str") (constraint-fn-var 398)
 								(receiver
 									(e-lookup-local
 										(p-assign (ident "userAge"))))
 								(args)))
-						(e-interpolation (constraint-fn-var 725)
+						(e-interpolation (constraint-fn-var 417)
 							(first
 								(e-literal (string "renamed nested: ")))
 							(parts

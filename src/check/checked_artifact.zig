@@ -1391,6 +1391,12 @@ fn verifyCompileTimeRequestsScheduled(
     }
 }
 
+/// Which graph the concreteness walk is inspecting: the value graph (type
+/// variables are NOT concrete) or a nominal declaration's backing template
+/// (rigids there are the declaration's formals, standing for args the walk
+/// already checked at the application, so they count as concrete).
+const ConcreteRootWalk = enum { value_graph, decl_template };
+
 fn checkedTypeIsConcreteCompileTimeRoot(
     allocator: Allocator,
     checked_types: *const CheckedTypeStore,
@@ -1398,10 +1404,11 @@ fn checkedTypeIsConcreteCompileTimeRoot(
 ) Allocator.Error!bool {
     var active = std.AutoHashMap(CheckedTypeId, void).init(allocator);
     defer active.deinit();
-    return try checkedTypeIsConcreteCompileTimeRootInner(checked_types, root, &active);
+    return try checkedTypeIsConcreteCompileTimeRootInner(.value_graph, checked_types, root, &active);
 }
 
 fn checkedTypeIsConcreteCompileTimeRootInner(
+    comptime walk: ConcreteRootWalk,
     checked_types: *const CheckedTypeStore,
     root: CheckedTypeId,
     active: *std.AutoHashMap(CheckedTypeId, void),
@@ -1416,20 +1423,19 @@ fn checkedTypeIsConcreteCompileTimeRootInner(
     }
     return switch (checked_types.payload(@enumFromInt(index))) {
         .pending => checkedArtifactInvariant("compile-time root checked type was pending", .{}),
-        .flex,
-        .rigid,
-        => false,
+        .flex => false,
+        .rigid => walk == .decl_template,
         .empty_record,
         .empty_tag_union,
         => true,
-        .alias => |alias| (try checkedTypeSpanIsConcreteCompileTimeRoot(checked_types, alias.args, active)) and
-            try checkedTypeIsConcreteCompileTimeRootInner(checked_types, alias.backing, active),
-        .record => |record| (try checkedFieldTypesAreConcreteCompileTimeRoots(checked_types, record.fields, active)) and
-            try checkedTypeIsConcreteCompileTimeRootInner(checked_types, record.ext, active),
-        .record_unbound => |fields| checkedFieldTypesAreConcreteCompileTimeRoots(checked_types, fields, active),
-        .tuple => |items| checkedTypeSpanIsConcreteCompileTimeRoot(checked_types, items, active),
+        .alias => |alias| (try checkedTypeSpanIsConcreteCompileTimeRoot(walk, checked_types, alias.args, active)) and
+            try checkedTypeIsConcreteCompileTimeRootInner(walk, checked_types, alias.backing, active),
+        .record => |record| (try checkedFieldTypesAreConcreteCompileTimeRoots(walk, checked_types, record.fields, active)) and
+            try checkedTypeIsConcreteCompileTimeRootInner(walk, checked_types, record.ext, active),
+        .record_unbound => |fields| checkedFieldTypesAreConcreteCompileTimeRoots(walk, checked_types, fields, active),
+        .tuple => |items| checkedTypeSpanIsConcreteCompileTimeRoot(walk, checked_types, items, active),
         .nominal => |nominal| blk: {
-            if (!try checkedTypeSpanIsConcreteCompileTimeRoot(checked_types, nominal.args, active)) break :blk false;
+            if (!try checkedTypeSpanIsConcreteCompileTimeRoot(walk, checked_types, nominal.args, active)) break :blk false;
             switch (nominal.representation) {
                 .builtin => |builtin_type| switch (builtinRuntimeEncoding(builtin_type)) {
                     .primitive,
@@ -1451,45 +1457,50 @@ fn checkedTypeIsConcreteCompileTimeRootInner(
                 .opaque_without_backing => break :blk true,
                 else => {},
             }
-            break :blk try checkedTypeIsConcreteCompileTimeRootInner(checked_types, nominal.backing, active);
+            // The use payload's backing is a projection of the declaration's
+            // backing TEMPLATE: its formals stand for the args checked above.
+            break :blk try checkedTypeIsConcreteCompileTimeRootInner(.decl_template, checked_types, nominal.backing, active);
         },
         .function => |function| !function.needs_instantiation and
-            (try checkedTypeSpanIsConcreteCompileTimeRoot(checked_types, function.args, active)) and
-            try checkedTypeIsConcreteCompileTimeRootInner(checked_types, function.ret, active),
-        .tag_union => |tag_union| (try checkedTagsAreConcreteCompileTimeRoots(checked_types, tag_union.tags, active)) and
-            try checkedTypeIsConcreteCompileTimeRootInner(checked_types, tag_union.ext, active),
+            (try checkedTypeSpanIsConcreteCompileTimeRoot(walk, checked_types, function.args, active)) and
+            try checkedTypeIsConcreteCompileTimeRootInner(walk, checked_types, function.ret, active),
+        .tag_union => |tag_union| (try checkedTagsAreConcreteCompileTimeRoots(walk, checked_types, tag_union.tags, active)) and
+            try checkedTypeIsConcreteCompileTimeRootInner(walk, checked_types, tag_union.ext, active),
     };
 }
 
 fn checkedTypeSpanIsConcreteCompileTimeRoot(
+    comptime walk: ConcreteRootWalk,
     checked_types: *const CheckedTypeStore,
     items: []const CheckedTypeId,
     active: *std.AutoHashMap(CheckedTypeId, void),
 ) Allocator.Error!bool {
     for (items) |item| {
-        if (!try checkedTypeIsConcreteCompileTimeRootInner(checked_types, item, active)) return false;
+        if (!try checkedTypeIsConcreteCompileTimeRootInner(walk, checked_types, item, active)) return false;
     }
     return true;
 }
 
 fn checkedFieldTypesAreConcreteCompileTimeRoots(
+    comptime walk: ConcreteRootWalk,
     checked_types: *const CheckedTypeStore,
     fields: []const CheckedRecordField,
     active: *std.AutoHashMap(CheckedTypeId, void),
 ) Allocator.Error!bool {
     for (fields) |field| {
-        if (!try checkedTypeIsConcreteCompileTimeRootInner(checked_types, field.ty, active)) return false;
+        if (!try checkedTypeIsConcreteCompileTimeRootInner(walk, checked_types, field.ty, active)) return false;
     }
     return true;
 }
 
 fn checkedTagsAreConcreteCompileTimeRoots(
+    comptime walk: ConcreteRootWalk,
     checked_types: *const CheckedTypeStore,
     tags: []const CheckedTag,
     active: *std.AutoHashMap(CheckedTypeId, void),
 ) Allocator.Error!bool {
     for (tags) |tag| {
-        if (!try checkedTypeSpanIsConcreteCompileTimeRoot(checked_types, tag.argsSlice(checked_types), active)) return false;
+        if (!try checkedTypeSpanIsConcreteCompileTimeRoot(walk, checked_types, tag.argsSlice(checked_types), active)) return false;
     }
     return true;
 }
@@ -3465,6 +3476,14 @@ const CheckedTypePublication = struct {
 
 /// Public `CheckedTypeStore` declaration.
 pub const CheckedTypeStore = struct {
+    /// Transient projection state (never serialized): non-null while a
+    /// nominal use's backing template is being projected. Nested template
+    /// references (including mutual recursion between declarations) must
+    /// share this private id space so in-progress cycles close on their
+    /// pending ids; when null, a nominal use forks a fresh private space —
+    /// sharing template ids ACROSS uses would let Monotype's instantiation
+    /// graphs bind one use's formals to another use's monos.
+    template_use_active: ?*std.AutoHashMap(Var, CheckedTypeId) = null,
     roots: std.ArrayList(CheckedTypeRoot) = .empty,
     schemes: std.ArrayList(CheckedTypeScheme) = .empty,
     payloads: std.ArrayList(StoredCheckedTypePayload) = .empty,
@@ -3485,6 +3504,10 @@ pub const CheckedTypeStore = struct {
     /// True for a store reconstructed from a serialized buffer (pools point into
     /// buffer-owned memory and must not be freed).
     serialized: bool = false,
+
+    /// Build-only projection state that is never serialized; null on a
+    /// frozen store.
+    pub const serde_transient_fields = [_][]const u8{"template_use_active"};
 
     /// The shared flat pool of `CheckedTypeId`s backing range fields.
     pub fn typeIdPool(self: *const CheckedTypeStore) []const CheckedTypeId {
@@ -6369,6 +6392,38 @@ fn copyCheckedFlatType(
         },
         .nominal_type => |nominal| blk: {
             const builtin_nominal = categorizeBuiltinNominal(module, imports, nominal);
+            // The application carries no backing; the use payload's `backing`
+            // is a projection of the DECLARATION's backing template (formals
+            // appear as rigid type variables). Each use projects the template
+            // into a PRIVATE id space (see `template_use_active`): the ids
+            // feed Monotype instantiation graphs that bind them to the use's
+            // monos, so they must not be shared across uses.
+            const backing_id: CheckedTypeId = backing_blk: {
+                const type_store = module.typeStoreConst();
+                if (type_store.lookupNominalDecl(nominal)) |decl_idx| {
+                    const decl = type_store.getNominalDecl(decl_idx);
+                    if (decl.isValid()) {
+                        if (store.template_use_active) |use_active| {
+                            // Nested/mutual template reference inside the
+                            // same use: stay in its private id space (its
+                            // in-progress entries close recursive cycles).
+                            break :backing_blk try appendCheckedTypeRoot(allocator, module, names, imports, store, use_active, decl.backing);
+                        }
+                        var use_active = std.AutoHashMap(Var, CheckedTypeId).init(allocator);
+                        defer use_active.deinit();
+                        store.template_use_active = &use_active;
+                        defer store.template_use_active = null;
+                        break :backing_blk try appendCheckedTypeRoot(allocator, module, names, imports, store, &use_active, decl.backing);
+                    }
+                }
+                // Applications of invalid/unresolvable declarations are
+                // poisoned to err during checking, and erroneous modules never
+                // publish artifacts (same contract as the `.err` arm below).
+                if (builtin.mode == .Debug) {
+                    std.debug.panic("checked artifact invariant violated: nominal application without a valid declaration reached artifact publication", .{});
+                }
+                unreachable;
+            };
             break :blk .{
                 .nominal = .{
                     .name = try names.internTypeIdent(module.identStoreConst(), nominal.ident.ident_idx),
@@ -6377,7 +6432,7 @@ fn copyCheckedFlatType(
                     .source_decl = nominal.sourceDeclOptional(),
                     .builtin = builtin_nominal,
                     .is_opaque = nominal.isOpaque(),
-                    .backing = try appendCheckedTypeRoot(allocator, module, names, imports, store, active, module.typeStoreConst().getNominalBackingVar(nominal)),
+                    .backing = backing_id,
                     .representation = try checkedNominalRepresentationForSourceNominal(module, names, imports, nominal, builtin_nominal),
                     .args = try copyCheckedTypeRange(allocator, module, names, imports, store, active, module.typeStoreConst().sliceNominalArgs(nominal)),
                     // Padding lives on the nominal declaration (built from its source
@@ -6875,7 +6930,7 @@ test "checked artifact builtin nominal categorization requires explicit builtin 
     const builtin_hash = builtin_env.contentIdentityHash() orelse unreachable;
     const nominal = types.NominalType{
         .ident = .{ .ident_idx = module.commonIdents().bool_type },
-        .vars = undefined,
+        .args = types.Var.SafeList.Range.empty(),
         .origin_module = try @constCast(module.moduleEnvConst()).internModuleIdentity(builtin_hash, base.Ident.Idx.NONE),
         .source = try types.NominalType.Source.initChecked(try types.types.SourceDecl.fromStatementChecked(bool_source_decl), false, false),
     };

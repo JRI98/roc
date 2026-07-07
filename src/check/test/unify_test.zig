@@ -50,6 +50,10 @@ const TestEnv = struct {
     type_writer: types_mod.TypeWriter,
     scratch: Scratch,
     occurs_scratch: occurs.Scratch,
+    /// Per-name declaration statements minted by `mkNominalTypeWithOpacity`,
+    /// so repeated helper calls for one name share one declaration identity.
+    nominal_decl_statements: std.AutoHashMapUnmanaged(Ident.Idx, u32),
+    next_nominal_decl_statement: u32,
 
     /// Init everything needed to test unify
     /// This includes allocating module_env on the heap
@@ -69,11 +73,14 @@ const TestEnv = struct {
             .type_writer = try types_mod.TypeWriter.initFromParts(gpa, &module_env.types, module_env.getIdentStore(), null),
             .scratch = try Scratch.init(module_env.gpa),
             .occurs_scratch = try occurs.Scratch.init(module_env.gpa),
+            .nominal_decl_statements = .empty,
+            .next_nominal_decl_statement = 0,
         };
     }
 
     /// Deinit the test env, including deallocing the module_env from the heap
     fn deinit(self: *Self) void {
+        self.nominal_decl_statements.deinit(self.module_env.gpa);
         self.module_env.deinit();
         self.module_env.gpa.destroy(self.module_env);
         self.snapshots.deinit();
@@ -167,24 +174,49 @@ const TestEnv = struct {
 
     // helpers - nominal type //
 
-    fn mkNominalType(self: *Self, name: []const u8, backing_var: Var, args: []const Var) std.mem.Allocator.Error!Content {
-        return try self.module_env.types.mkNominal(
-            try self.mkTypeIdent(name),
-            backing_var,
+    /// Make a nominal application AND (once per name) register its
+    /// declaration in the store's declaration table, exactly as the checker
+    /// does for local declarations. The test's arg vars double as the
+    /// declaration's formals: opening seeds an identity substitution, and
+    /// since test vars are not generalized the open yields the very backing
+    /// graph the test built — preserving pre-#9983 test semantics where the
+    /// backing was embedded in the application.
+    fn mkNominalTypeWithOpacity(self: *Self, name: []const u8, backing_var: Var, args: []const Var, is_opaque: bool) std.mem.Allocator.Error!Content {
+        const ident = try self.mkTypeIdent(name);
+
+        const gop = try self.nominal_decl_statements.getOrPut(self.module_env.gpa, ident.ident_idx);
+        if (!gop.found_existing) {
+            self.next_nominal_decl_statement += 1;
+            gop.value_ptr.* = self.next_nominal_decl_statement;
+            _ = try self.module_env.types.registerNominalDecl(.{
+                .ident = ident,
+                .origin_module = self.module_env.selfModuleIdentity(),
+                .source = try types_mod.NominalType.Source.initChecked(
+                    try types_mod.SourceDecl.fromStatementChecked(gop.value_ptr.*),
+                    is_opaque,
+                    false,
+                ),
+                .formals = try self.module_env.types.appendVars(args),
+                .backing = backing_var,
+                .flags = .{ .valid = true },
+            });
+        }
+
+        return try self.module_env.types.mkNominalWithSourceDecl(
+            ident,
             args,
             self.module_env.selfModuleIdentity(), // Use this module's identity for proper canLiftInner check
-            false, // Use nominal for tests
+            gop.value_ptr.*,
+            is_opaque,
         );
     }
 
+    fn mkNominalType(self: *Self, name: []const u8, backing_var: Var, args: []const Var) std.mem.Allocator.Error!Content {
+        return try self.mkNominalTypeWithOpacity(name, backing_var, args, false);
+    }
+
     fn mkOpaqueType(self: *Self, name: []const u8, backing_var: Var, args: []const Var) std.mem.Allocator.Error!Content {
-        return try self.module_env.types.mkNominal(
-            try self.mkTypeIdent(name),
-            backing_var,
-            args,
-            self.module_env.selfModuleIdentity(), // Use this module's identity for proper canLiftInner check
-            true, // Opaque type
-        );
+        return try self.mkNominalTypeWithOpacity(name, backing_var, args, true);
     }
 
     fn mkList(self: *Self, elem_var: Var) std.mem.Allocator.Error!Content {
@@ -917,10 +949,21 @@ test "unify - distinct concrete builtin numeric nominals never unify" {
     );
 
     const u8_backing = try env.module_env.types.freshFromContent(Content{ .structure = .empty_tag_union });
+    _ = try env.module_env.types.registerNominalDecl(.{
+        .ident = try env.mkTypeIdent("U8"),
+        .origin_module = origin_module,
+        .source = try types_mod.NominalType.Source.initChecked(
+            try types_mod.SourceDecl.fromStatementWithBuiltinOriginChecked(1, true),
+            true,
+            true,
+        ),
+        .formals = types_mod.Var.SafeList.Range.empty(),
+        .backing = u8_backing,
+        .flags = .{ .valid = true },
+    });
     const u8_var = try env.module_env.types.freshFromContent(
         try env.module_env.types.mkNominalWithSourceDeclAndBuiltinOrigin(
             try env.mkTypeIdent("U8"),
-            u8_backing,
             &[_]Var{},
             origin_module,
             1, // source decl
@@ -930,10 +973,21 @@ test "unify - distinct concrete builtin numeric nominals never unify" {
     );
 
     const i64_backing = try env.module_env.types.freshFromContent(Content{ .structure = .empty_tag_union });
+    _ = try env.module_env.types.registerNominalDecl(.{
+        .ident = try env.mkTypeIdent("I64"),
+        .origin_module = origin_module,
+        .source = try types_mod.NominalType.Source.initChecked(
+            try types_mod.SourceDecl.fromStatementWithBuiltinOriginChecked(2, true),
+            true,
+            true,
+        ),
+        .formals = types_mod.Var.SafeList.Range.empty(),
+        .backing = i64_backing,
+        .flags = .{ .valid = true },
+    });
     const i64_var = try env.module_env.types.freshFromContent(
         try env.module_env.types.mkNominalWithSourceDeclAndBuiltinOrigin(
             try env.mkTypeIdent("I64"),
-            i64_backing,
             &[_]Var{},
             origin_module,
             2, // source decl
@@ -2144,7 +2198,6 @@ const DeclaringModule = struct {
         const backing = try self.env.types.freshFromContent(Content{ .structure = .empty_record });
         const content = try self.env.types.mkNominalWithSourceDecl(
             .{ .ident_idx = ident },
-            backing,
             &.{},
             self.env.selfModuleIdentity(),
             source_decl,

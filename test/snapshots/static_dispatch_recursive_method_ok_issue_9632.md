@@ -144,9 +144,9 @@ result = empty.total()
 									(pattern (degenerate false)
 										(p-applied-tag)))
 								(value
-									(e-dispatch-call (method "plus") (constraint-fn-var 411)
+									(e-dispatch-call (method "plus") (constraint-fn-var 265)
 										(receiver
-											(e-dispatch-call (method "total") (constraint-fn-var 405)
+											(e-dispatch-call (method "total") (constraint-fn-var 259)
 												(receiver
 													(e-field-access (field "rest")
 														(receiver
@@ -170,7 +170,7 @@ result = empty.total()
 			(ty-lookup (name "Tree") (local))))
 	(d-let
 		(p-assign (ident "result"))
-		(e-dispatch-call (method "total") (constraint-fn-var 521)
+		(e-dispatch-call (method "total") (constraint-fn-var 309)
 			(receiver
 				(e-lookup-local
 					(p-assign (ident "empty"))))

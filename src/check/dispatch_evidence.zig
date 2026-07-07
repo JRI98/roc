@@ -215,11 +215,15 @@ fn walk(
                     try pushChildren(gpa, scratch, entry);
                 },
                 .nominal_type => |nominal| {
+                    // A nominal application's structure is its args; backing
+                    // structure is declaration data and is not part of the
+                    // scheme's type graph. (`.nominal_backing` path steps are
+                    // no longer produced; the kind remains for alias-style
+                    // walkers and old artifacts.)
                     scratch.children.clearRetainingCapacity();
                     for (store.sliceNominalArgs(nominal), 0..) |arg, i| {
                         try scratch.children.append(gpa, .{ .var_ = arg, .step = step(.nominal_arg, @intCast(i)) });
                     }
-                    try scratch.children.append(gpa, .{ .var_ = store.getNominalBackingVar(nominal), .step = step(.nominal_backing, 0) });
                     try pushChildren(gpa, scratch, entry);
                 },
                 .fn_pure, .fn_effectful, .fn_unbound => |func| {

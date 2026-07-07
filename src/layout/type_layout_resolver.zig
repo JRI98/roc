@@ -1,6 +1,7 @@
 //! Resolves type-checker vars into canonical ordinary-data layouts through the shared layout store.
 
 const std = @import("std");
+const zig_builtin = @import("builtin");
 const base = @import("base");
 const can = @import("can");
 const types = @import("types");
@@ -34,15 +35,38 @@ const BuildState = struct {
     refs_by_var: std.AutoHashMap(ModuleVarKey, GraphRef),
     depends_on_unresolved_type_params: bool = false,
 
+    /// Formal root var -> the actual arg's already-built layout ref, bound
+    /// while building a nominal declaration's backing template (the explicit
+    /// opening operation of issue #9983). Vars visited while any binding is
+    /// active are template vars shared across instantiations, so the
+    /// var-keyed caches are bypassed for them.
+    template_bindings: std.AutoHashMap(ModuleVarKey, GraphRef),
+    /// Stack of in-progress declaration openings; a template's recursive
+    /// reference (same declaration, same arg layout refs) closes onto the
+    /// open's placeholder instead of re-entering.
+    active_opens: std.ArrayList(ActiveOpen) = .empty,
+
+    const ActiveOpen = struct {
+        module_idx: u32,
+        origin_module: base.ModuleIdentity.Idx,
+        statement: u32,
+        arg_refs: []const GraphRef,
+        placeholder: GraphRef,
+    };
+
     fn init(allocator: std.mem.Allocator) BuildState {
         return .{
             .refs_by_var = std.AutoHashMap(ModuleVarKey, GraphRef).init(allocator),
+            .template_bindings = std.AutoHashMap(ModuleVarKey, GraphRef).init(allocator),
         };
     }
 
     fn deinit(self: *BuildState, allocator: std.mem.Allocator) void {
         self.graph.deinit(allocator);
         self.refs_by_var.deinit();
+        self.template_bindings.deinit();
+        for (self.active_opens.items) |open| allocator.free(open.arg_refs);
+        self.active_opens.deinit(allocator);
     }
 };
 
@@ -137,8 +161,19 @@ pub const Resolver = struct {
         const current = input.resolved;
         const cache_key = ModuleVarKey{ .module_idx = current_module_idx, .var_ = current.var_ };
 
-        if (build_state.refs_by_var.get(cache_key)) |cached| return cached;
-        if (self.canonical_cache.get(cache_key)) |cached| return .{ .canonical = cached };
+        // While a declaration opening is active, the vars being visited are
+        // template vars shared across instantiations: their layout depends on
+        // the active formal bindings, so the var-keyed caches are bypassed
+        // (recursion is closed via `active_opens` in buildNominalRef).
+        const caching_enabled = build_state.template_bindings.count() == 0;
+
+        if (caching_enabled) {
+            if (build_state.refs_by_var.get(cache_key)) |cached| return cached;
+            if (self.canonical_cache.get(cache_key)) |cached| return .{ .canonical = cached };
+        } else if (build_state.template_bindings.get(cache_key)) |bound| {
+            // A declaration formal: its layout is the actual arg's layout.
+            return bound;
+        }
 
         switch (current.desc.content) {
             .flex => |flex| return self.resolveUnboundFlex(current_module_idx, flex.constraints, parent_context, build_state),
@@ -187,7 +222,9 @@ pub const Resolver = struct {
                     ),
                 };
 
-                try build_state.refs_by_var.put(cache_key, resolved_ref);
+                if (caching_enabled) {
+                    try build_state.refs_by_var.put(cache_key, resolved_ref);
+                }
                 return resolved_ref;
             },
         }
@@ -243,20 +280,109 @@ pub const Resolver = struct {
             return try self.buildNode(build_state, .{ .list = child_ref });
         }
 
+        const ts = self.getTypesStore(module_idx);
+
+        // The explicit declaration-backed opening operation (issue #9983):
+        // a nominal application carries no backing, so its layout is the
+        // declaration's backing template with the application's arg LAYOUTS
+        // bound to the declaration's formals.
+        const decl_idx = ts.lookupNominalDecl(nominal_type) orelse {
+            if (zig_builtin.mode == .Debug) {
+                std.debug.panic("layout invariant violated: nominal application has no declaration table entry in its store", .{});
+            }
+            unreachable;
+        };
+        const decl = ts.getNominalDecl(decl_idx);
+        // Applications of invalid declarations are poisoned to err during
+        // checking and never reach layout.
+        std.debug.assert(decl.isValid());
+
+        // Build the arg layout refs first (ordinary positions under the
+        // current scopes/bindings).
+        const args = ts.sliceNominalArgs(nominal_type);
+        const arg_refs = try self.allocator.alloc(GraphRef, args.len);
+        var arg_refs_owned = true;
+        defer if (arg_refs_owned) self.allocator.free(arg_refs);
+        for (args, arg_refs) |arg_var, *arg_ref| {
+            arg_ref.* = try self.buildRefForVar(
+                module_idx,
+                arg_var,
+                type_scope,
+                caller_module_idx,
+                .ordinary,
+                build_state,
+            );
+        }
+
+        const statement = nominal_type.sourceDecl().statement;
+
+        // A recursive template reference denotes an in-progress opening of
+        // the same declaration with the same arg layouts: close the cycle on
+        // that opening's placeholder.
+        for (build_state.active_opens.items) |open| {
+            if (open.module_idx == module_idx and
+                open.origin_module == nominal_type.origin_module and
+                open.statement == statement and
+                graphRefsEqual(open.arg_refs, arg_refs))
+            {
+                return open.placeholder;
+            }
+        }
+
+        const caching_enabled = build_state.template_bindings.count() == 0;
         const cache_key = ModuleVarKey{ .module_idx = module_idx, .var_ = nominal_var };
-        if (build_state.refs_by_var.get(cache_key)) |cached| return cached;
-        if (self.canonical_cache.get(cache_key)) |cached| return .{ .canonical = cached };
-        if (self.findEquivalentNominalRef(module_idx, nominal_type, build_state)) |cached| return cached;
-        if (self.findEquivalentNominalLayout(module_idx, nominal_type)) |cached| return .{ .canonical = cached };
+        if (caching_enabled) {
+            if (build_state.refs_by_var.get(cache_key)) |cached| return cached;
+            if (self.canonical_cache.get(cache_key)) |cached| return .{ .canonical = cached };
+            if (self.findEquivalentNominalRef(module_idx, nominal_type, build_state)) |cached| return cached;
+            if (self.findEquivalentNominalLayout(module_idx, nominal_type)) |cached| return .{ .canonical = cached };
+        }
 
         const placeholder_id = try build_state.graph.reserveNode(self.allocator);
         const placeholder_ref = GraphRef{ .local = placeholder_id };
-        try build_state.refs_by_var.put(cache_key, placeholder_ref);
+        if (caching_enabled) {
+            try build_state.refs_by_var.put(cache_key, placeholder_ref);
+        }
 
-        const backing_var = self.getTypesStore(module_idx).getNominalBackingVar(nominal_type);
+        try build_state.active_opens.append(self.allocator, .{
+            .module_idx = module_idx,
+            .origin_module = nominal_type.origin_module,
+            .statement = statement,
+            .arg_refs = arg_refs,
+            .placeholder = placeholder_ref,
+        });
+        arg_refs_owned = false; // now owned by the active open
+        defer {
+            const popped = build_state.active_opens.pop().?;
+            self.allocator.free(popped.arg_refs);
+        }
+
+        // Bind the declaration's formals to the arg layout refs, saving any
+        // outer bindings for the same formals (re-entrant openings of one
+        // declaration with different args restore them on the way out).
+        const formals = ts.sliceVars(decl.formals);
+        std.debug.assert(formals.len == args.len);
+        const saved_bindings = try self.allocator.alloc(?GraphRef, formals.len);
+        defer self.allocator.free(saved_bindings);
+        for (formals, arg_refs, saved_bindings) |formal_var, arg_ref, *saved| {
+            const formal_key = ModuleVarKey{ .module_idx = module_idx, .var_ = ts.resolveVar(formal_var).var_ };
+            saved.* = build_state.template_bindings.get(formal_key);
+            try build_state.template_bindings.put(formal_key, arg_ref);
+        }
+        defer {
+            for (formals, saved_bindings) |formal_var, saved| {
+                const formal_key = ModuleVarKey{ .module_idx = module_idx, .var_ = ts.resolveVar(formal_var).var_ };
+                if (saved) |prev| {
+                    build_state.template_bindings.put(formal_key, prev) catch unreachable;
+                } else {
+                    _ = build_state.template_bindings.remove(formal_key);
+                }
+            }
+        }
+
         const backing_ref = try self.buildRefForVar(
             module_idx,
-            backing_var,
+            decl.backing,
             type_scope,
             caller_module_idx,
             .ordinary,
@@ -267,7 +393,9 @@ pub const Resolver = struct {
             .canonical => {
                 // `internGraph` validates every reserved node, even when the caller returns a canonical ref.
                 build_state.graph.setNode(placeholder_id, .{ .nominal = backing_ref });
-                try build_state.refs_by_var.put(cache_key, backing_ref);
+                if (caching_enabled) {
+                    try build_state.refs_by_var.put(cache_key, backing_ref);
+                }
                 return backing_ref;
             },
             .local => |backing_node_id| {
@@ -801,6 +929,14 @@ pub const Resolver = struct {
         return true;
     }
 };
+
+fn graphRefsEqual(a: []const GraphRef, b: []const GraphRef) bool {
+    if (a.len != b.len) return false;
+    for (a, b) |lhs, rhs| {
+        if (!std.meta.eql(lhs, rhs)) return false;
+    }
+    return true;
+}
 
 fn recordFieldSeen(fields: []const types.RecordField, name: Ident.Idx) bool {
     for (fields) |field| {
