@@ -94,6 +94,15 @@ const ActiveDeclTypeEntry = struct {
     previous: ?usize,
 };
 
+/// Identifies the associated-block type alias declaration whose annotation is
+/// currently being canonicalized, in both lookup representations: canonical
+/// scope bindings carry the CIR statement, parser declaration inventory
+/// carries the parser declaration index.
+const DefiningAssocAlias = struct {
+    parser_decl_idx: AST.DeclIndex.DeclIdx,
+    stmt_idx: Statement.Idx,
+};
+
 const TypePathNames = struct {
     without_module_prefix: ?Ident.Idx = null,
     with_module_prefix: ?Ident.Idx = null,
@@ -336,6 +345,14 @@ loop_depth: u32 = 0,
 /// This is null when we're inside a lambda or other context where inner definitions
 /// are independent of outer ones.
 defining_bound_vars: ?DataSpan = null,
+/// The associated-block type alias declaration whose annotation is currently
+/// being canonicalized. A type lookup made by that annotation must not resolve
+/// to this declaration itself: the name means whatever it means outside the
+/// declaration (e.g. an imported type module re-exported under the same name),
+/// so resolution skips this declaration and proceeds outward. Saved and
+/// restored strictly LIFO around the annotation canonicalization, mirroring
+/// `defining_bound_vars`.
+defining_assoc_alias: ?DefiningAssocAlias = null,
 /// The identifier of the block-local definition whose body is currently being
 /// canonicalized, if any. Saved/restored around each local decl body so that
 /// references can be attributed to the def that made them (for sequential
@@ -1265,9 +1282,17 @@ fn declScopeExit(self: *Self) void {
     }
 }
 
-fn activeDeclScopeDeclaresValue(self: *Self, ident: Ident.Idx) ?ActiveDeclBinding {
-    const entry_idx = self.active_decl_values.get(ident) orelse return null;
-    return self.active_decl_value_entries.items[entry_idx].binding;
+/// Whether an active-declaration-scope entry for `ident` names the associated
+/// value item whose body is currently being canonicalized. Such an entry must
+/// not satisfy a lookup made by that body: the item being defined is not a
+/// valid target for its own (non-lambda) right-hand side.
+fn activeDeclEntryIsDefiningItem(self: *Self, binding: ActiveDeclBinding, ident: Ident.Idx) bool {
+    if (self.defining_bound_vars == null) return false;
+    const parser_decl_scope = self.parse_ir.decl_index.scopes.items[@intFromEnum(binding.parser_scope)];
+    if (parser_decl_scope.kind != .associated) return false;
+    const owner_path = parser_decl_scope.owner_type_path orelse return false;
+    const pattern_idx = self.assoc_value_patterns.get(.{ .owner = owner_path, .item = ident }) orelse return false;
+    return self.isDefiningBoundVar(pattern_idx);
 }
 
 fn annoOnlyDeclsResolveAsValues(self: *const Self) bool {
@@ -1308,8 +1333,21 @@ fn valueBucketIsForwardVisible(
 }
 
 fn activeDeclScopeDeclaresType(self: *Self, ident: Ident.Idx) ?ActiveDeclTypeEntry {
-    const entry_idx = self.active_decl_types.get(ident) orelse return null;
-    return self.active_decl_type_entries.items[entry_idx];
+    var maybe_entry_idx = self.active_decl_types.get(ident);
+    while (maybe_entry_idx) |entry_idx| {
+        const entry = self.active_decl_type_entries.items[entry_idx];
+        // The alias whose annotation is being canonicalized never satisfies
+        // that annotation's own lookups; fall through to any shadowed
+        // declaration of the same name.
+        if (self.defining_assoc_alias) |defining| {
+            if (entry.decl_idx == defining.parser_decl_idx) {
+                maybe_entry_idx = entry.previous;
+                continue;
+            }
+        }
+        return entry;
+    }
+    return null;
 }
 
 fn parserTypeDeclCanPrepare(self: *const Self, decl: AST.DeclIndex.Decl) bool {
@@ -2202,6 +2240,26 @@ fn registerTypeDecl(
             if (ast_stmt_idx) |idx| self.parserTypePathForAstStatement(idx) else null,
         );
         defer self.restoreTypeAnnoOwnerPathStack(owner_path_stack_top);
+
+        // While an associated-block alias's annotation is being canonicalized,
+        // the alias itself must not satisfy the annotation's lookups: an alias
+        // cannot be recursive, so a name that would resolve to this declaration
+        // means whatever it means outside it (e.g. `Thing : Thing` re-exporting
+        // an imported `Thing` type module). Nominal backing annotations keep
+        // seeing their own declaration: recursive nominal types are legal.
+        const saved_defining_assoc_alias = self.defining_assoc_alias;
+        defer self.defining_assoc_alias = saved_defining_assoc_alias;
+        if (type_decl.kind == .alias and parent_name != null) {
+            if (ast_stmt_idx) |idx| {
+                if (self.parse_ir.decl_index.declForStatement(@intFromEnum(idx))) |decl_idx| {
+                    self.defining_assoc_alias = .{
+                        .parser_decl_idx = decl_idx,
+                        .stmt_idx = type_decl_stmt_idx,
+                    };
+                }
+            }
+        }
+
         break :blk switch (type_decl.kind) {
             .alias => try self.canonicalizeTypeAnno(type_decl.anno, .type_decl_anno),
             .nominal, .@"opaque" => try self.canonicalizeNominalBackingAnno(type_decl.anno),
@@ -3288,6 +3346,14 @@ fn finishAssociatedDeclBody(
     try self.publishAssociatedAliasSinks(state.work.alias_sinks, work.decl_ident, pattern_idx);
 }
 
+/// Whether an associated value item's body is a lambda, mirroring the parser
+/// declaration inventory's `value_form == .lambda` classification. Lambda
+/// items may reference themselves (recursion), so they skip the
+/// defining-bound-vars self-reference guard just like ordinary declarations.
+fn associatedBodyIsLambda(self: *const Self, ast_body: AST.Expr.Idx) bool {
+    return self.parse_ir.store.getExpr(ast_body) == .lambda;
+}
+
 fn canonicalizeAssociatedDeclBodyNow(
     self: *Self,
     work: AssociatedDeclBodyWork,
@@ -3298,7 +3364,17 @@ fn canonicalizeAssociatedDeclBodyNow(
     self.in_statement_position = false;
     defer self.in_statement_position = saved_stmt_pos;
 
+    // Track the item's pattern so a reference to it from its own body is
+    // reported as a self-referential definition, matching ordinary
+    // declarations.
+    const saved_defining_bound_vars = self.defining_bound_vars;
+    if (!self.associatedBodyIsLambda(work.ast_body)) {
+        self.defining_bound_vars = try self.beginDefiningBoundVars(work.pattern_idx, self.scratch_reassign_targets.top());
+    }
+
     const can_expr = try self.canonicalizeExprOrMalformed(work.ast_body);
+
+    self.endDefiningBoundVars(saved_defining_bound_vars);
     try self.finishAssociatedDeclBody(work, can_expr);
 }
 
@@ -6977,9 +7053,16 @@ fn canonicalizedLocalLookup(
 fn canonicalizedAssociatedLookup(
     self: *Self,
     owner_path: AST.DeclIndex.TypePathIdx,
+    ident: Ident.Idx,
     pattern_idx: Pattern.Idx,
     region: Region,
 ) std.mem.Allocator.Error!CanonicalizedExpr {
+    if (self.isDefiningBoundVar(pattern_idx)) {
+        return try self.canonicalizedMalformedExpr(Diagnostic{ .self_referential_definition = .{
+            .ident = ident,
+            .region = region,
+        } });
+    }
     try self.used_patterns.put(self.env.gpa, pattern_idx, {});
     return self.canonicalizedAssociatedForwardLookup(owner_path, pattern_idx, region);
 }
@@ -7062,6 +7145,12 @@ fn canonicalizeQualifiedIdentExpr(
 
     switch (self.scopeLookup(.ident, qualified_ident)) {
         .found => |found_pattern_idx| {
+            if (self.isDefiningBoundVar(found_pattern_idx)) {
+                return try self.canonicalizedMalformedExpr(Diagnostic{ .self_referential_definition = .{
+                    .ident = qualified_ident,
+                    .region = region,
+                } });
+            }
             return try self.canonicalizedLocalLookup(found_pattern_idx, region);
         },
         .not_found => {},
@@ -7078,7 +7167,7 @@ fn canonicalizeQualifiedIdentExpr(
         var alias_hops: u32 = 32;
         while (alias_hops > 0) : (alias_hops -= 1) {
             if (try self.lookupOrCreateAssocValuePattern(path, ident, pattern_ident, region)) |pattern_idx| {
-                return try self.canonicalizedAssociatedLookup(path, pattern_idx, region);
+                return try self.canonicalizedAssociatedLookup(path, pattern_ident, pattern_idx, region);
             }
             path = (try self.aliasTypePathTarget(path)) orelse break;
             pattern_ident = try self.qualifiedIdentForTypePathItem(path, ident);
@@ -7245,7 +7334,7 @@ fn canonicalizeTypeAssociatedLookup(
     if (local_type_binding) |binding_location| {
         if (self.typePathForBinding(binding_location.binding.*)) |owner_path| {
             if (try self.lookupOrCreateAssocValuePattern(owner_path, ident, type_qualified_idx, region)) |pattern_idx| {
-                return try self.canonicalizedAssociatedLookup(owner_path, pattern_idx, region);
+                return try self.canonicalizedAssociatedLookup(owner_path, type_qualified_idx, pattern_idx, region);
             }
         }
 
@@ -7474,7 +7563,32 @@ fn canonicalizeUnqualifiedIdentExpr(
                 }
             }
 
-            const active_decl_scope = self.activeDeclScopeDeclaresValue(ident) orelse {
+            // Walk the active declaration scopes for this name, skipping the
+            // associated item whose body is currently being canonicalized: the
+            // item being defined never satisfies its own lookup, so the name
+            // resolves outward (e.g. to a shadowed top-level function). When
+            // the name resolves ONLY to the item being defined, that is a
+            // self-referential definition.
+            var skipped_defining_item = false;
+            const active_decl_scope = blk: {
+                var maybe_entry_idx = self.active_decl_values.get(ident);
+                while (maybe_entry_idx) |entry_idx| {
+                    const entry = self.active_decl_value_entries.items[entry_idx];
+                    if (self.activeDeclEntryIsDefiningItem(entry.binding, ident)) {
+                        skipped_defining_item = true;
+                        maybe_entry_idx = entry.previous;
+                        continue;
+                    }
+                    break :blk entry.binding;
+                }
+                break :blk null;
+            } orelse {
+                if (skipped_defining_item) {
+                    return try self.canonicalizedMalformedExpr(Diagnostic{ .self_referential_definition = .{
+                        .ident = ident,
+                        .region = region,
+                    } });
+                }
                 return try self.canonicalizedMalformedExpr(Diagnostic{ .ident_not_in_scope = .{
                     .ident = ident,
                     .region = region,
@@ -10764,9 +10878,19 @@ fn runExprKernel(
                     self.in_statement_position = false;
                     errdefer self.in_statement_position = saved_stmt_pos;
 
+                    // Track the item's pattern so a reference to it from its
+                    // own body is reported as a self-referential definition,
+                    // matching ordinary declarations.
+                    const saved_defining_bound_vars = self.defining_bound_vars;
+                    if (!self.associatedBodyIsLambda(decl_work.ast_body)) {
+                        self.defining_bound_vars = try self.beginDefiningBoundVars(decl_work.pattern_idx, self.scratch_reassign_targets.top());
+                    }
+                    errdefer self.endDefiningBoundVars(saved_defining_bound_vars);
+
                     try stacks.pushFinishAssociatedDeclBody(frame_allocator, .{
                         .work = decl_work,
                         .saved_stmt_pos = saved_stmt_pos,
+                        .saved_defining_bound_vars = saved_defining_bound_vars,
                     });
                     try stacks.pushParse(frame_allocator, .{ .idx = decl_work.ast_body, .target = .scratch });
                 },
@@ -10783,6 +10907,7 @@ fn runExprKernel(
             const state = stacks.takeFinishAssociatedDeclBody();
             defer if (state.work.type_var_scope) |scope_idx| self.scopeExitTypeVar(scope_idx);
             defer self.in_statement_position = state.saved_stmt_pos;
+            self.endDefiningBoundVars(state.saved_defining_bound_vars);
 
             const result_start = child_slots.items.len - 1;
             const can_expr = try self.exprOrMalformedFromResult(child_slots.items[result_start].expr, state.work.ast_body);
@@ -15307,6 +15432,7 @@ fn storeExprKernelOutput(
 const ExprFinishAssociatedDeclBodyWork = struct {
     work: AssociatedDeclBodyWork,
     saved_stmt_pos: bool,
+    saved_defining_bound_vars: ?DataSpan,
 };
 
 const ExprBlockNextWork = struct {
@@ -19824,10 +19950,23 @@ fn scopeLookupTypeBindingInCanonicalScopes(self: *Self, ident_idx: Ident.Idx) ?T
     var i = self.scopes.items.len;
     while (i > 0) {
         i -= 1;
-        if (self.typeBindingLocationInScope(i, ident_idx)) |location| return location;
+        if (self.typeBindingLocationInScope(i, ident_idx)) |location| {
+            // The alias whose annotation is being canonicalized never
+            // satisfies that annotation's own lookups; keep searching
+            // outward (e.g. toward an imported type module of the same
+            // name).
+            if (self.typeBindingIsDefiningAssocAlias(location.binding.*)) continue;
+            return location;
+        }
     }
 
     return null;
+}
+
+fn typeBindingIsDefiningAssocAlias(self: *const Self, binding: Scope.TypeBinding) bool {
+    const defining = self.defining_assoc_alias orelse return false;
+    const stmt_idx = typeBindingStatement(binding) orelse return false;
+    return stmt_idx == defining.stmt_idx;
 }
 
 fn typeBindingLocationInScope(
