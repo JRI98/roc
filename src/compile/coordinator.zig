@@ -713,13 +713,6 @@ pub const PackageState = struct {
         self.root_file_state = state;
     }
 
-    pub fn urlId(self: *const PackageState) ?[]const u8 {
-        if (self.url) |url| {
-            return url.urlId();
-        }
-        return null;
-    }
-
     /// Ensure a module exists, creating it if necessary
     pub fn ensureModule(self: *PackageState, gpa: Allocator, name: []const u8, path: []const u8) Allocator.Error!ModuleId {
         if (self.module_names.get(name)) |id| {
@@ -5528,7 +5521,7 @@ fn overwriteFilesUnderDir(allocator: Allocator, absolute_dir: []const u8, conten
     return overwritten;
 }
 
-fn corruptFirstCheckedModuleEnvIdentBytesLen(allocator: Allocator, checked_module_cache_dir: []const u8) CorruptCheckedModuleCacheError!void {
+fn corruptCheckedModuleEnvIdentBytesLens(allocator: Allocator, checked_module_cache_dir: []const u8) CorruptCheckedModuleCacheError!usize {
     const env_ident_bytes_len_offset =
         checked_module_cache_header_len +
         @offsetOf(ModuleEnv.Serialized, "common") +
@@ -5544,6 +5537,7 @@ fn corruptFirstCheckedModuleEnvIdentBytesLen(allocator: Allocator, checked_modul
     var walker = try dir.walk(allocator);
     defer walker.deinit();
 
+    var corrupted: usize = 0;
     while (try walker.next(io)) |entry| {
         if (entry.kind != .file) continue;
 
@@ -5553,10 +5547,11 @@ fn corruptFirstCheckedModuleEnvIdentBytesLen(allocator: Allocator, checked_modul
 
         std.mem.writeInt(u64, bytes[env_ident_bytes_len_offset..][0..8], std.math.maxInt(u64), .little);
         try dir.writeFile(io, .{ .sub_path = entry.path, .data = bytes });
-        return;
+        corrupted += 1;
     }
 
-    return error.FileNotFound;
+    if (corrupted == 0) return error.FileNotFound;
+    return corrupted;
 }
 
 test "Coordinator checked cache key requires checked direct imports" {
@@ -5732,7 +5727,8 @@ test "Coordinator corrupt checked module cache env relocations compile from sour
     const config = CacheConfig{ .cache_dir = cache_dir };
     const checked_module_cache_dir = try config.getCheckedArtifactCacheDir(allocator);
     defer allocator.free(checked_module_cache_dir);
-    try corruptFirstCheckedModuleEnvIdentBytesLen(allocator, checked_module_cache_dir);
+    const corrupted = try corruptCheckedModuleEnvIdentBytesLens(allocator, checked_module_cache_dir);
+    try std.testing.expect(corrupted > 0);
 
     const second = try compileAppWithCheckedModuleCache(allocator, cache_dir, "test/str/app_message.roc");
     try std.testing.expect(second.build.modules_compiled > 0);
