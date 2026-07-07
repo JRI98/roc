@@ -322,14 +322,6 @@ executable_root_defs: std.ArrayListUnmanaged(CIR.Def.Idx),
 /// statement checking record a local binding candidate without storing a result
 /// on the checked expression itself.
 last_hoist_result: ?CompletedHoistResult,
-/// Nonzero while checking a body that is already evaluated as an ordinary
-/// top-level compile-time root. Nested hoisted roots there would only add
-/// metadata and duplicate compile-time work.
-hoist_suppressed_depth: u32,
-/// Nonzero while checking a conditionally evaluated expression whose own
-/// eligibility still contributes to an enclosing expression, but whose child
-/// expressions must not become independent compile-time roots.
-hoist_selection_suppressed_depth: u32,
 /// True when canonicalization already recorded diagnostics before type checking.
 /// In that case, we avoid adding "erroneous value" diagnostics during checking
 /// to prevent cascading errors from malformed nodes.
@@ -473,6 +465,10 @@ bench_probe_refuted: usize = 0,
 /// Union-find roots resolve at consumption time (eager roots would go stale).
 /// Duplicates are harmless — the consumer inserts into a set.
 checked_lambda_params: std.ArrayListUnmanaged(CIR.Pattern.Span),
+/// Lambdas whose bodies actually perform effects. This records direct checker
+/// output so binding-name diagnostics do not infer effectfulness from
+/// annotations that only make a pure body have an effectful function type.
+effectful_lambda_bodies: std.AutoHashMap(CIR.Expr.Idx, void),
 /// Scratch for `beginCommitProbe`: the caller env's var-pool length per rank
 /// at probe start, restored on a failed probe's rollback. One buffer suffices
 /// because commit-probes never nest — but the type store's trail-based
@@ -606,10 +602,30 @@ const LocalRecursiveRef = struct {
     def_name: ?Ident.Idx,
 };
 
+const HoistPosition = enum {
+    /// The expression is inside a body that is already a compile-time root.
+    /// Nested hoisted roots would duplicate compile-time work, and eligibility
+    /// should not feed warnings or enclosing hoist frames.
+    comptime_root,
+    /// The expression may still prove top-level-equivalent for warnings and
+    /// enclosing roots, but it must not become an independent selected root.
+    suppressed,
+    /// The expression is in a structurally unguarded runtime position where
+    /// selected roots may be emitted.
+    eligible,
+
+    fn allowsSelection(self: @This()) bool {
+        return self == .eligible;
+    }
+
+    fn allowsSemanticEligibility(self: @This()) bool {
+        return self != .comptime_root;
+    }
+};
+
 const HoistFrame = struct {
     expr: CIR.Expr.Idx,
-    suppressed: bool,
-    selection_suppressed: bool,
+    hoist_position: HoistPosition,
     binding_rhs: bool,
     binding_pattern: ?CIR.Pattern.Idx,
     candidate_start: usize,
@@ -619,7 +635,7 @@ const HoistFrame = struct {
     has_observable_effect: bool = false,
 
     fn eligible(self: @This()) bool {
-        return !self.suppressed and
+        return self.hoist_position.allowsSemanticEligibility() and
             !self.has_runtime_dependency and
             !self.has_observable_effect;
     }
@@ -630,6 +646,7 @@ const CompletedHoistResult = struct {
     eligible: bool,
     top_level_equivalent: bool,
     has_observable_effect: bool,
+    hoist_position: HoistPosition,
 };
 
 const HoistPatternExtraction = hoist_roots.PatternExtraction;
@@ -1340,8 +1357,6 @@ fn initAssumePrepared(
         .selected_hoisted_roots = .empty,
         .executable_root_defs = .empty,
         .last_hoist_result = null,
-        .hoist_suppressed_depth = 0,
-        .hoist_selection_suppressed_depth = 0,
         .has_can_diagnostics = if (cir.store.scratch) |scratch| scratch.diagnostics.top() > 0 else false,
         .instantiation_dispatchers = .empty,
         .ambiguity_candidates = .empty,
@@ -1376,6 +1391,7 @@ fn initAssumePrepared(
         .known_empty_payload_vars_destructure = .empty,
         .known_empty_payload_vars_match = .empty,
         .checked_lambda_params = .empty,
+        .effectful_lambda_bodies = std.AutoHashMap(CIR.Expr.Idx, void).init(gpa),
         .probe_var_pool_lens = .empty,
     };
 
@@ -1490,6 +1506,7 @@ pub fn deinit(self: *Self) void {
     self.known_empty_payload_vars_destructure.deinit(self.gpa);
     self.known_empty_payload_vars_match.deinit(self.gpa);
     self.checked_lambda_params.deinit(self.gpa);
+    self.effectful_lambda_bodies.deinit();
     self.probe_var_pool_lens.deinit(self.gpa);
 }
 
@@ -1505,11 +1522,10 @@ pub fn addExecutableRootDef(self: *Self, def_idx: CIR.Def.Idx) Allocator.Error!v
     try self.executable_root_defs.append(self.gpa, def_idx);
 }
 
-fn beginHoistFrame(self: *Self, expr: CIR.Expr.Idx, binding_rhs: bool) Allocator.Error!HoistFrameGuard {
+fn beginHoistFrame(self: *Self, expr: CIR.Expr.Idx, binding_rhs: bool, hoist_position: HoistPosition) Allocator.Error!HoistFrameGuard {
     try self.hoist_frames.append(self.gpa, .{
         .expr = expr,
-        .suppressed = self.hoist_suppressed_depth != 0,
-        .selection_suppressed = self.hoist_selection_suppressed_depth != 0,
+        .hoist_position = hoist_position,
         .binding_rhs = binding_rhs,
         .binding_pattern = if (binding_rhs) self.checking_binding_rhs_pattern else null,
         .candidate_start = self.hoist_expr_candidates.items.len,
@@ -1551,16 +1567,16 @@ fn finishHoistFrame(self: *Self, expr: CIR.Expr.Idx, does_fx: bool) Allocator.Er
     const top_level_equivalent = semantically_eligible and !frame.has_contextual_dependency;
     const can_be_root = top_level_equivalent and self.exprCanBeHoistedRoot(expr);
     const can_cover_children = top_level_equivalent and self.exprCanCoverHoistedChildren(expr);
-    const selection_suppressed = frame.suppressed or frame.selection_suppressed;
+    const selection_allowed = frame.hoist_position.allowsSelection();
     const binding_rhs_can_cover_children = frame.binding_rhs and
         top_level_equivalent and
-        !selection_suppressed and
+        selection_allowed and
         self.exprCanBeHoistedBindingRoot(expr) and
         !isFunctionDef(&self.cir.store, self.cir.store.getExpr(expr)) and
         !self.varIsFunctionType(ModuleEnv.varFrom(expr));
     const current_covers_children = (can_cover_children and !frame.binding_rhs) or binding_rhs_can_cover_children;
     const has_child_candidates = self.hoist_expr_candidates.items.len > frame.candidate_start;
-    const action: HoistSelectionAction = if (selection_suppressed)
+    const action: HoistSelectionAction = if (!selection_allowed)
         .suppress_children
     else if (current_covers_children)
         .cover_with_current_root
@@ -1570,14 +1586,14 @@ fn finishHoistFrame(self: *Self, expr: CIR.Expr.Idx, does_fx: bool) Allocator.Er
         .drop_empty;
     const should_flush_child_candidates = action == .flush_child_candidates;
     const should_bubble_to_parent = frame_index != 0 and
-        can_be_root and !frame.binding_rhs and !selection_suppressed;
+        can_be_root and !frame.binding_rhs and selection_allowed;
     if (should_bubble_to_parent) {
         try self.hoist_expr_candidates.ensureUnusedCapacity(self.gpa, 1);
     }
 
     const should_flush_deferred_binding_dependencies = frame.binding_rhs and
         !binding_rhs_can_cover_children and
-        !selection_suppressed and
+        selection_allowed and
         self.hoist_deferred_binding_dependencies.items.len > frame.deferred_dependency_start;
     if (should_flush_child_candidates or should_flush_deferred_binding_dependencies) {
         var transaction = HoistSelectionTransaction.init(self);
@@ -1617,6 +1633,7 @@ fn finishHoistFrame(self: *Self, expr: CIR.Expr.Idx, does_fx: bool) Allocator.Er
         .eligible = semantically_eligible,
         .top_level_equivalent = top_level_equivalent,
         .has_observable_effect = frame.has_observable_effect,
+        .hoist_position = frame.hoist_position,
     };
     self.last_hoist_result = completed;
 
@@ -1624,7 +1641,7 @@ fn finishHoistFrame(self: *Self, expr: CIR.Expr.Idx, does_fx: bool) Allocator.Er
         const parent = &self.hoist_frames.items[frame_index - 1];
         if (!completed.eligible) {
             parent.has_runtime_dependency = true;
-        } else if (can_be_root and !frame.binding_rhs and !selection_suppressed) {
+        } else if (can_be_root and !frame.binding_rhs and selection_allowed) {
             self.hoist_expr_candidates.appendAssumeCapacity(expr);
         }
     }
@@ -1641,12 +1658,6 @@ fn markCurrentHoistRuntimeDependency(self: *Self) void {
 fn markCurrentHoistObservableEffect(self: *Self) void {
     if (self.hoist_frames.items.len == 0) return;
     self.hoist_frames.items[self.hoist_frames.items.len - 1].has_observable_effect = true;
-}
-
-fn checkExprWithHoistSelectionSuppressed(self: *Self, expr: CIR.Expr.Idx, env: *Env, expected: Expected) Allocator.Error!bool {
-    self.hoist_selection_suppressed_depth += 1;
-    defer self.hoist_selection_suppressed_depth -= 1;
-    return try self.checkExpr(expr, env, expected);
 }
 
 fn checkedExprBlocksLaterHoists(self: *const Self, expr: CIR.Expr.Idx, does_fx: bool) bool {
@@ -1676,10 +1687,16 @@ fn warnIfComptimeConditionalExpr(
     } });
 }
 
-fn recordHoistBindingCandidate(self: *Self, pattern: CIR.Pattern.Idx, expr: CIR.Expr.Idx) Allocator.Error!void {
-    if (self.hoist_suppressed_depth != 0 or self.hoist_selection_suppressed_depth != 0) return;
+fn recordHoistBindingCandidate(
+    self: *Self,
+    pattern: CIR.Pattern.Idx,
+    expr: CIR.Expr.Idx,
+    hoist_position: HoistPosition,
+) Allocator.Error!void {
     const completed = self.last_hoist_result orelse return;
-    if (completed.expr != expr or !completed.top_level_equivalent) return;
+    if (completed.expr != expr) return;
+    if (builtin.mode == .Debug) std.debug.assert(completed.hoist_position == hoist_position);
+    if (!completed.hoist_position.allowsSelection() or !completed.top_level_equivalent) return;
     if (!self.patternCanOwnHoistedBindingRoot(pattern)) return;
     if (!self.exprCanBeHoistedBindingRoot(expr)) return;
     if (isFunctionDef(&self.cir.store, self.cir.store.getExpr(expr))) return;
@@ -1708,10 +1725,16 @@ fn recordHoistBindingCandidate(self: *Self, pattern: CIR.Pattern.Idx, expr: CIR.
     };
 }
 
-fn recordHoistPatternProvenance(self: *Self, pattern: CIR.Pattern.Idx, expr: CIR.Expr.Idx) Allocator.Error!void {
-    if (self.hoist_suppressed_depth != 0 or self.hoist_selection_suppressed_depth != 0) return;
+fn recordHoistPatternProvenance(
+    self: *Self,
+    pattern: CIR.Pattern.Idx,
+    expr: CIR.Expr.Idx,
+    hoist_position: HoistPosition,
+) Allocator.Error!void {
     const completed = self.last_hoist_result orelse return;
-    if (completed.expr != expr or !completed.top_level_equivalent) return;
+    if (completed.expr != expr) return;
+    if (builtin.mode == .Debug) std.debug.assert(completed.hoist_position == hoist_position);
+    if (!completed.hoist_position.allowsSelection() or !completed.top_level_equivalent) return;
     if (!self.exprCanBeHoistedBindingRoot(expr)) return;
     if (isFunctionDef(&self.cir.store, self.cir.store.getExpr(expr))) return;
     if (self.varIsFunctionType(ModuleEnv.varFrom(expr))) return;
@@ -1767,6 +1790,7 @@ fn recordHoistSingleBranchMatchPatternProvenance(
     match: CIR.Expr.Match,
     branch: CIR.Expr.Match.Branch,
     branch_patterns: []const CIR.Expr.Match.BranchPattern.Idx,
+    hoist_position: HoistPosition,
 ) Allocator.Error!void {
     if (match.is_try_suffix) return;
     if (match.branches.span.len != 1) return;
@@ -1777,7 +1801,7 @@ fn recordHoistSingleBranchMatchPatternProvenance(
     if (branch_pattern.degenerate) return;
     if (!self.patternIsIrrefutableForHoistExtraction(branch_pattern.pattern)) return;
 
-    try self.recordHoistPatternProvenance(branch_pattern.pattern, match.cond);
+    try self.recordHoistPatternProvenance(branch_pattern.pattern, match.cond, hoist_position);
 }
 
 fn patternIsIrrefutableForHoistExtraction(self: *Self, pattern: CIR.Pattern.Idx) bool {
@@ -2435,8 +2459,6 @@ const HoistSelectionTestState = struct {
         checker.hoist_invalidated_exprs = .{};
         checker.selected_hoisted_roots = .empty;
         checker.last_hoist_result = null;
-        checker.hoist_suppressed_depth = 0;
-        checker.hoist_selection_suppressed_depth = 0;
         return .{
             .checker = checker,
             .allocator = allocator,
@@ -2554,7 +2576,7 @@ test "hoist frame finish leaves child candidates unchanged when selection alloca
     defer state.deinit();
     const child_expr = try state.borrowCheckedContext(&test_env.checker);
 
-    var guard = try state.checker.beginHoistFrame(parent_expr, false);
+    var guard = try state.checker.beginHoistFrame(parent_expr, false, .eligible);
     defer guard.deinit();
     try state.checker.hoist_expr_candidates.append(std.testing.allocator, child_expr);
     state.checker.markCurrentHoistRuntimeDependency();
@@ -2580,6 +2602,31 @@ test "hoist frame finish leaves child candidates unchanged when selection alloca
     try std.testing.expectEqual(@as(?CIR.Pattern.Idx, null), state.checker.selected_hoisted_roots.items[0].pattern);
 }
 
+test "fresh expected context suppresses hoist selection by default" {
+    try std.testing.expectEqual(HoistPosition.suppressed, Expected.none().hoist_position);
+
+    const parent_expr: CIR.Expr.Idx = @enumFromInt(1);
+    const TestEnv = @import("test/TestEnv.zig");
+    var test_env = try TestEnv.initExpr("HoistSelection", "1.I64");
+    defer test_env.deinit();
+    try test_env.assertNoErrors();
+
+    var state = HoistSelectionTestState.init(std.testing.allocator);
+    defer state.deinit();
+    const child_expr = try state.borrowCheckedContext(&test_env.checker);
+
+    var guard = try state.checker.beginHoistFrame(parent_expr, false, Expected.none().hoist_position);
+    defer guard.deinit();
+    try state.checker.hoist_expr_candidates.append(std.testing.allocator, child_expr);
+    state.checker.markCurrentHoistRuntimeDependency();
+
+    try guard.finish(false);
+    try std.testing.expectEqual(@as(usize, 0), state.checker.hoist_frames.items.len);
+    try std.testing.expectEqual(@as(usize, 0), state.checker.hoist_expr_candidates.items.len);
+    try std.testing.expectEqual(@as(usize, 0), state.checker.selected_hoisted_roots.items.len);
+    try std.testing.expectEqual(@as(usize, 0), state.checker.hoist_selected_exprs.count());
+}
+
 test "hoist frame finish is atomic when child flush precedes deferred dependency failure" {
     const parent_expr: CIR.Expr.Idx = @enumFromInt(1);
     const dependency_pattern: CIR.Pattern.Idx = @enumFromInt(2);
@@ -2595,7 +2642,7 @@ test "hoist frame finish is atomic when child flush precedes deferred dependency
         const child_expr = try state.borrowCheckedContext(&test_env.checker);
 
         state.checker.checking_binding_rhs_pattern = null;
-        var guard = try state.checker.beginHoistFrame(parent_expr, true);
+        var guard = try state.checker.beginHoistFrame(parent_expr, true, .eligible);
         defer guard.deinit();
         try state.checker.hoist_expr_candidates.append(std.testing.allocator, child_expr);
         try state.checker.hoist_deferred_binding_dependencies.append(std.testing.allocator, dependency_pattern);
@@ -7439,7 +7486,7 @@ fn checkExpectBody(
     self.current_expect_region = expect_region;
     defer self.current_expect_region = saved_expect_region;
 
-    return try self.checkExprWithHoistSelectionSuppressed(body, env, expected.suppressComptimeConditionWarnings());
+    return try self.checkExpr(body, env, expected.suppressComptimeConditionWarnings().suppressHoistSelection());
 }
 
 fn varIsFunctionType(self: *Self, var_: Var) bool {
@@ -7495,6 +7542,25 @@ fn varIsEffectfulFunction(self: *Self, var_: Var) bool {
             .err, .flex, .rigid => return false,
         }
     }
+}
+
+fn exprHasEffectfulFunctionBody(self: *const Self, expr_idx: CIR.Expr.Idx) bool {
+    return switch (self.cir.store.getExpr(expr_idx)) {
+        .e_lambda => self.effectful_lambda_bodies.contains(expr_idx),
+        .e_closure => |closure| self.effectful_lambda_bodies.contains(closure.lambda_idx),
+        .e_hosted_lambda => true,
+        else => false,
+    };
+}
+
+fn checkEffectfulFunctionName(self: *Self, pattern_idx: CIR.Pattern.Idx, expr_idx: CIR.Expr.Idx) std.mem.Allocator.Error!void {
+    const ident = self.getPatternIdent(pattern_idx) orelse return;
+    if (ident.attributes.effectful) return;
+    if (!self.exprHasEffectfulFunctionBody(expr_idx)) return;
+
+    _ = try self.problems.appendProblem(self.gpa, .{ .effectful_function_name = .{
+        .region = self.cir.store.getNodeRegion(ModuleEnv.nodeIdxFrom(pattern_idx)),
+    } });
 }
 
 fn varHasUnresolvedContent(
@@ -8431,14 +8497,14 @@ fn checkDef(self: *Self, def_idx: CIR.Def.Idx, env: *Env) std.mem.Allocator.Erro
     // hoisted roots inside them would duplicate compile-time work. Top-level
     // functions are not evaluated as data constants, so their bodies may still
     // contain top-level-equivalent local values.
-    const suppress_nested_hoists = !isFunctionDef(&self.cir.store, self.cir.store.getExpr(def.expr));
-    if (suppress_nested_hoists) self.hoist_suppressed_depth += 1;
-    defer {
-        if (suppress_nested_hoists) self.hoist_suppressed_depth -= 1;
-    }
+    const def_is_function = isFunctionDef(&self.cir.store, self.cir.store.getExpr(def.expr));
+    const def_expectation = if (def_is_function)
+        expectation.withHoistPosition(.eligible)
+    else
+        expectation.forComptimeRoot();
     self.checking_binding_rhs = true;
     self.checking_binding_rhs_pattern = def.pattern;
-    const def_does_fx = try self.checkExpr(def.expr, env, expectation);
+    const def_does_fx = try self.checkExpr(def.expr, env, def_expectation);
     if (def.annotation != null) {
         if (platform_required) |required| {
             if (self.defer_generalize) {
@@ -8475,6 +8541,9 @@ fn checkDef(self: *Self, def_idx: CIR.Def.Idx, env: *Env) std.mem.Allocator.Erro
         try self.erroneous_value_patterns.put(self.gpa, def.pattern, {});
     }
     try self.closeAbsentConstructedPayloadVars(def.expr, expr_var);
+    if (isFunctionDef(&self.cir.store, self.cir.store.getExpr(def.expr))) {
+        try self.checkEffectfulFunctionName(def.pattern, def.expr);
+    }
 
     if (self.defer_generalize) {
         // defer_generalize is only set when a cycle root has been identified.
@@ -9800,6 +9869,7 @@ const Expected = struct {
     branch_result: ?Var = null,
     return_result: ?Var = null,
     comptime_condition_warnings: enum { emit, suppress } = .emit,
+    hoist_position: HoistPosition = .suppressed,
 
     const ExpectedType = struct {
         var_: Var,
@@ -9821,6 +9891,7 @@ const Expected = struct {
             .branch_result = self.branch_result,
             .return_result = self.return_result,
             .comptime_condition_warnings = self.comptime_condition_warnings,
+            .hoist_position = self.hoist_position,
         };
     }
 
@@ -9831,6 +9902,7 @@ const Expected = struct {
             .branch_result = self.branch_result,
             .return_result = self.return_result,
             .comptime_condition_warnings = self.comptime_condition_warnings,
+            .hoist_position = self.hoist_position,
         };
     }
 
@@ -9841,6 +9913,33 @@ const Expected = struct {
             .branch_result = branch_result,
             .return_result = self.return_result orelse branch_result,
             .comptime_condition_warnings = self.comptime_condition_warnings,
+            .hoist_position = self.hoist_position,
+        };
+    }
+
+    fn withHoistPosition(self: Expected, hoist_position: HoistPosition) Expected {
+        return .{
+            .annotation = self.annotation,
+            .expected_type = self.expected_type,
+            .branch_result = self.branch_result,
+            .return_result = self.return_result,
+            .comptime_condition_warnings = self.comptime_condition_warnings,
+            .hoist_position = hoist_position,
+        };
+    }
+
+    fn suppressHoistSelection(self: Expected) Expected {
+        return self.withHoistPosition(.suppressed);
+    }
+
+    fn forComptimeRoot(self: Expected) Expected {
+        return .{
+            .annotation = self.annotation,
+            .expected_type = self.expected_type,
+            .branch_result = self.branch_result,
+            .return_result = self.return_result,
+            .comptime_condition_warnings = .suppress,
+            .hoist_position = .comptime_root,
         };
     }
 
@@ -9849,6 +9948,7 @@ const Expected = struct {
             .branch_result = self.branch_result,
             .return_result = self.return_result,
             .comptime_condition_warnings = self.comptime_condition_warnings,
+            .hoist_position = .suppressed,
         };
     }
 
@@ -9856,6 +9956,7 @@ const Expected = struct {
         return .{
             .return_result = self.return_result,
             .comptime_condition_warnings = self.comptime_condition_warnings,
+            .hoist_position = self.hoist_position,
         };
     }
 
@@ -9865,6 +9966,7 @@ const Expected = struct {
             .branch_result = expected_return,
             .return_result = expected_return,
             .comptime_condition_warnings = self.comptime_condition_warnings,
+            .hoist_position = self.hoist_position,
         };
     }
 
@@ -9875,6 +9977,7 @@ const Expected = struct {
             .branch_result = self.branch_result,
             .return_result = self.return_result,
             .comptime_condition_warnings = .suppress,
+            .hoist_position = self.hoist_position,
         };
     }
 
@@ -10885,7 +10988,7 @@ fn checkExpr(self: *Self, expr_idx: CIR.Expr.Idx, env: *Env, expected: Expected)
     const child_expected = expected.forStatement();
     self.checking_binding_rhs_pattern = binding_rhs_pattern;
     errdefer self.checking_binding_rhs_pattern = null;
-    var hoist_frame = try self.beginHoistFrame(expr_idx, is_binding_rhs);
+    var hoist_frame = try self.beginHoistFrame(expr_idx, is_binding_rhs, expected.hoist_position);
     self.checking_binding_rhs_pattern = null;
     defer hoist_frame.deinit();
 
@@ -11551,7 +11654,7 @@ fn checkExpr(self: *Self, expr_idx: CIR.Expr.Idx, env: *Env, expected: Expected)
 
             const compile_time_known_binding = known: {
                 if (self.patternIsTopLevel(lookup.pattern_idx)) break :known true;
-                if (self.hoist_selection_suppressed_depth != 0) {
+                if (expected.hoist_position == .suppressed) {
                     if (self.hoist_known_values.get(lookup.pattern_idx)) |known_value| {
                         switch (known_value) {
                             .pattern_extraction => {
@@ -11627,7 +11730,7 @@ fn checkExpr(self: *Self, expr_idx: CIR.Expr.Idx, env: *Env, expected: Expected)
 
             // Check the final expression
             const final_expr_does_fx = if (stmt_result.blocks_later_hoists)
-                try self.checkExprWithHoistSelectionSuppressed(block.final_expr, env, expected)
+                try self.checkExpr(block.final_expr, env, expected.suppressHoistSelection())
             else
                 try self.checkExpr(block.final_expr, env, expected);
             does_fx = final_expr_does_fx or does_fx;
@@ -11777,13 +11880,14 @@ fn checkExpr(self: *Self, expr_idx: CIR.Expr.Idx, env: *Env, expected: Expected)
                 if (body_is_delayed_dependency) self.delayed_dependency_depth -= 1;
             }
 
+            const lambda_body_expected = Expected.none().withHoistPosition(expected.hoist_position);
             const body_does_fx = if (mb_anno_func) |expected_func| blk: {
-                const lambda_body_does_fx = try self.checkExpr(lambda.body, env, Expected.none().withBranchResult(expected_func.ret));
+                const lambda_body_does_fx = try self.checkExpr(lambda.body, env, lambda_body_expected.withBranchResult(expected_func.ret));
                 try self.closeAbsentConstructedPayloadVars(lambda.body, body_var);
                 _ = try self.unifyInContext(expected_func.ret, body_var, env, anno_context);
                 break :blk lambda_body_does_fx;
             } else blk: {
-                const lambda_body_does_fx = try self.checkExpr(lambda.body, env, Expected.none());
+                const lambda_body_does_fx = try self.checkExpr(lambda.body, env, lambda_body_expected);
                 try self.closeAbsentConstructedPayloadVars(lambda.body, body_var);
                 break :blk lambda_body_does_fx;
             };
@@ -11801,6 +11905,7 @@ fn checkExpr(self: *Self, expr_idx: CIR.Expr.Idx, env: *Env, expected: Expected)
 
             // Create the function type
             if (body_does_fx) {
+                try self.effectful_lambda_bodies.put(expr_idx, {});
                 try self.unifyWith(expr_var, try self.types.mkFuncEffectful(arg_vars, body_var), env);
             } else {
                 try self.unifyWith(expr_var, try self.types.mkFuncUnbound(arg_vars, body_var), env);
@@ -13504,7 +13609,7 @@ fn checkBlockStatements(self: *Self, statements: CIR.Statement.Span, env: *Env, 
     var diverges = false;
     var blocks_later_hoists = false;
     var warn_unreachable = false;
-    const statement_expected = expected.forStatement();
+    const base_statement_expected = expected.forStatement();
     for (0..statements.span.len) |stmt_offset| {
         const stmt_idx = self.cir.store.statementAt(statements, stmt_offset);
         const stmt = self.cir.store.getStatement(stmt_idx);
@@ -13519,11 +13624,10 @@ fn checkBlockStatements(self: *Self, statements: CIR.Statement.Span, env: *Env, 
 
         try self.setVarRank(stmt_var, env);
 
-        const suppress_statement_hoists = blocks_later_hoists;
-        if (suppress_statement_hoists) self.hoist_selection_suppressed_depth += 1;
-        defer {
-            if (suppress_statement_hoists) self.hoist_selection_suppressed_depth -= 1;
-        }
+        const statement_expected = if (blocks_later_hoists)
+            base_statement_expected.suppressHoistSelection()
+        else
+            base_statement_expected;
 
         var statement_blocks_later_hoists = false;
         switch (stmt) {
@@ -13571,11 +13675,14 @@ fn checkBlockStatements(self: *Self, statements: CIR.Statement.Span, env: *Env, 
                 const decl_expr_does_fx = try self.checkExpr(decl_stmt.expr, env, expectation);
                 does_fx = decl_expr_does_fx or does_fx;
                 statement_blocks_later_hoists = self.checkedExprBlocksLaterHoists(decl_stmt.expr, decl_expr_does_fx);
-                try self.recordHoistBindingCandidate(decl_stmt.pattern, decl_stmt.expr);
+                try self.recordHoistBindingCandidate(decl_stmt.pattern, decl_stmt.expr, expectation.hoist_position);
                 if (decl_stmt.anno == null and self.erroneous_value_exprs.contains(decl_stmt.expr)) {
                     try self.erroneous_value_patterns.put(self.gpa, decl_stmt.pattern, {});
                 }
                 try self.closeAbsentConstructedPayloadVars(decl_stmt.expr, decl_expr_var);
+                if (decl_is_fn) {
+                    try self.checkEffectfulFunctionName(decl_stmt.pattern, decl_stmt.expr);
+                }
 
                 // A record-destructure binding gets a dedicated context so the
                 // report can suggest `field: _` or `..` when the pattern is too
@@ -13588,7 +13695,7 @@ fn checkBlockStatements(self: *Self, statements: CIR.Statement.Span, env: *Env, 
 
                 if (decl_pattern_result.isOk()) {
                     try self.checkDestructureExhaustiveness(decl_stmt.pattern, decl_stmt.expr, decl_expr_var, env, stmt_region);
-                    try self.recordHoistPatternProvenance(decl_stmt.pattern, decl_stmt.expr);
+                    try self.recordHoistPatternProvenance(decl_stmt.pattern, decl_stmt.expr, expectation.hoist_position);
                 }
 
                 if (decl_is_fn) {
@@ -13730,7 +13837,7 @@ fn checkBlockStatements(self: *Self, statements: CIR.Statement.Span, env: *Env, 
                 //     print!($count.toStr())  <<<<
                 //     $count = $count + 1
                 // }
-                does_fx = try self.checkExpr(while_stmt.body, env, statement_expected) or does_fx;
+                does_fx = try self.checkExpr(while_stmt.body, env, statement_expected.suppressHoistSelection()) or does_fx;
                 const empty_rec = try self.freshFromContent(.{ .structure = .empty_record }, env, cond_region);
                 _ = try self.unify(stmt_var, empty_rec, env);
             },
@@ -13744,7 +13851,7 @@ fn checkBlockStatements(self: *Self, statements: CIR.Statement.Span, env: *Env, 
                 const bool_var = try self.freshBool(env, cond_region);
                 _ = try self.unify(bool_var, cond_var, env);
 
-                does_fx = try self.checkExpr(while_stmt.body, env, statement_expected) or does_fx;
+                does_fx = try self.checkExpr(while_stmt.body, env, statement_expected.suppressHoistSelection()) or does_fx;
                 const empty_rec = try self.freshFromContent(.{ .structure = .empty_record }, env, cond_region);
                 _ = try self.unify(stmt_var, empty_rec, env);
             },
@@ -13758,7 +13865,7 @@ fn checkBlockStatements(self: *Self, statements: CIR.Statement.Span, env: *Env, 
                 const bool_var = try self.freshBool(env, cond_region);
                 _ = try self.unify(bool_var, cond_var, env);
 
-                does_fx = try self.checkExpr(while_stmt.body, env, statement_expected) or does_fx;
+                does_fx = try self.checkExpr(while_stmt.body, env, statement_expected.suppressHoistSelection()) or does_fx;
                 try self.unifyWith(stmt_var, .{ .flex = Flex.init() }, env);
                 diverges = true;
             },
@@ -13856,6 +13963,7 @@ fn checkBlockStatements(self: *Self, statements: CIR.Statement.Span, env: *Env, 
                 try self.unifyWith(stmt_var, .err, env);
             },
             .s_break => {
+                statement_blocks_later_hoists = true;
                 diverges = true;
             },
         }
@@ -13976,7 +14084,7 @@ fn checkIfElseExpr(
     }
 
     // Then we check the 1st branch's body
-    does_fx = try self.checkExprWithHoistSelectionSuppressed(first_branch.body, env, expected.forBranchBody()) or does_fx;
+    does_fx = try self.checkExpr(first_branch.body, env, expected.forBranchBody()) or does_fx;
 
     if (expected_branch_ret) |expected_ret| {
         const branch_ctx = problem.Context{ .if_branch = .{
@@ -14000,7 +14108,7 @@ fn checkIfElseExpr(
         const branch = self.cir.store.getIfBranch(branch_idx);
 
         // Check the branches condition
-        does_fx = try self.checkExpr(branch.cond, env, child_expected) or does_fx;
+        does_fx = try self.checkExpr(branch.cond, env, child_expected.suppressHoistSelection()) or does_fx;
         const cond_var: Var = ModuleEnv.varFrom(branch.cond);
         const branch_bool_var = try self.freshBool(env, expr_region);
         const cond_result = try self.unifyInContext(branch_bool_var, cond_var, env, .if_condition);
@@ -14009,7 +14117,7 @@ fn checkIfElseExpr(
         }
 
         // Check the branch body
-        does_fx = try self.checkExprWithHoistSelectionSuppressed(branch.body, env, expected.forBranchBody()) or does_fx;
+        does_fx = try self.checkExpr(branch.body, env, expected.forBranchBody()) or does_fx;
 
         // Check against expected return type BEFORE pairwise unification
         if (expected_branch_ret) |expected_ret| {
@@ -14036,7 +14144,7 @@ fn checkIfElseExpr(
                 for (branches[cur_index + 1 ..]) |remaining_branch_idx| {
                     const remaining_branch = self.cir.store.getIfBranch(remaining_branch_idx);
 
-                    does_fx = try self.checkExpr(remaining_branch.cond, env, child_expected) or does_fx;
+                    does_fx = try self.checkExpr(remaining_branch.cond, env, child_expected.suppressHoistSelection()) or does_fx;
                     const remaining_cond_var: Var = ModuleEnv.varFrom(remaining_branch.cond);
 
                     const fresh_bool = try self.freshBool(env, expr_region);
@@ -14045,7 +14153,7 @@ fn checkIfElseExpr(
                         try self.warnIfComptimeConditionalExpr(remaining_branch.cond, .if_condition, expected);
                     }
 
-                    does_fx = try self.checkExprWithHoistSelectionSuppressed(remaining_branch.body, env, expected.forBranchBody()) or does_fx;
+                    does_fx = try self.checkExpr(remaining_branch.body, env, expected.forBranchBody()) or does_fx;
                     try self.unifyWith(ModuleEnv.varFrom(remaining_branch.body), .err, env);
                 }
 
@@ -14058,7 +14166,7 @@ fn checkIfElseExpr(
     }
 
     // Check the final else
-    does_fx = try self.checkExprWithHoistSelectionSuppressed(if_.final_else, env, expected.forBranchBody()) or does_fx;
+    does_fx = try self.checkExpr(if_.final_else, env, expected.forBranchBody()) or does_fx;
 
     // Check final else against expected return type before pairwise unification
     if (expected_branch_ret) |expected_ret| {
@@ -14200,13 +14308,13 @@ fn checkMatchExpr(
         }
 
         if (!had_type_error) {
-            try self.recordHoistSingleBranchMatchPatternProvenance(match, first_branch, first_branch_ptrn_idxs);
+            try self.recordHoistSingleBranchMatchPatternProvenance(match, first_branch, first_branch_ptrn_idxs, child_expected.hoist_position);
         }
         try self.recordHoistMatchBranchContextualBindings(first_branch_ptrn_idxs, match_hoist_owner);
 
         // Check guard if present
         if (first_branch.guard) |guard_idx| {
-            does_fx = try self.checkExprWithHoistSelectionSuppressed(guard_idx, env, child_expected) or does_fx;
+            does_fx = try self.checkExpr(guard_idx, env, child_expected.suppressHoistSelection()) or does_fx;
             const guard_var = ModuleEnv.varFrom(guard_idx);
             const guard_bool_var = try self.freshBool(env, expr_region);
             const guard_result = try self.unifyInContext(guard_bool_var, guard_var, env, .if_condition);
@@ -14216,7 +14324,7 @@ fn checkMatchExpr(
         }
 
         // Check the first branch's value, then use that at the branch_var
-        does_fx = try self.checkExprWithHoistSelectionSuppressed(first_branch.value, env, expected.forBranchBody()) or does_fx;
+        does_fx = try self.checkExpr(first_branch.value, env, expected.forBranchBody()) or does_fx;
         val_var = ModuleEnv.varFrom(first_branch.value);
 
         // Check first branch body against expected return type
@@ -14264,7 +14372,7 @@ fn checkMatchExpr(
 
         // Check guard if present
         if (branch.guard) |guard_idx| {
-            does_fx = try self.checkExprWithHoistSelectionSuppressed(guard_idx, env, child_expected) or does_fx;
+            does_fx = try self.checkExpr(guard_idx, env, child_expected.suppressHoistSelection()) or does_fx;
             const guard_var = ModuleEnv.varFrom(guard_idx);
             const branch_guard_bool_var = try self.freshBool(env, expr_region);
             const guard_result = try self.unifyInContext(branch_guard_bool_var, guard_var, env, .if_condition);
@@ -14274,7 +14382,7 @@ fn checkMatchExpr(
         }
 
         // Then, check the body
-        does_fx = try self.checkExprWithHoistSelectionSuppressed(branch.value, env, expected.forBranchBody()) or does_fx;
+        does_fx = try self.checkExpr(branch.value, env, expected.forBranchBody()) or does_fx;
 
         // Check branch body against expected return type BEFORE pairwise unification.
         // Pairwise unification poisons ALL connected vars via union-find on failure,
@@ -14323,7 +14431,7 @@ fn checkMatchExpr(
                     try self.recordHoistMatchBranchContextualBindings(other_branch_ptrn_idxs, match_hoist_owner);
 
                     // Then check the other branch's exprs
-                    does_fx = try self.checkExprWithHoistSelectionSuppressed(other_branch.value, env, expected.forBranchBody()) or does_fx;
+                    does_fx = try self.checkExpr(other_branch.value, env, expected.forBranchBody()) or does_fx;
                     try self.unifyWith(ModuleEnv.varFrom(other_branch.value), .err, env);
                 }
 
@@ -15086,7 +15194,7 @@ fn checkIteratorForLoop(
 
     try self.cir.recordForLoopDispatchPlan(loop_node, ModuleEnv.nodeIdxFrom(pattern), ModuleEnv.nodeIdxFrom(iterable), iter_fn_var, next_fn_var);
 
-    does_fx = try self.checkExpr(body, env, child_expected) or does_fx;
+    does_fx = try self.checkExpr(body, env, child_expected.suppressHoistSelection()) or does_fx;
     return does_fx;
 }
 

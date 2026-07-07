@@ -383,7 +383,7 @@ fn problemBlocksCheckedArtifact(problem: check.problem.Problem) bool {
             .recursive_dispatch,
             => true,
         },
-        .redundant_pattern, .unmatchable_pattern, .comptime_unused_branch, .comptime_condition, .literal_defaulted => false,
+        .effectful_function_name, .redundant_pattern, .unmatchable_pattern, .comptime_unused_branch, .comptime_condition, .literal_defaulted => false,
         else => true,
     };
 }
@@ -391,6 +391,7 @@ fn problemBlocksCheckedArtifact(problem: check.problem.Problem) bool {
 fn problemAllowsLoweringWithUserErrors(problem: check.problem.Problem) bool {
     return switch (problem) {
         .static_dispatch => |static_dispatch| staticDispatchAllowsLoweringWithUserErrors(static_dispatch),
+        .effectful_function_name => true,
         .type_mismatch,
         .type_apply_mismatch_arities,
         .cannot_access_opaque_nominal,
@@ -454,6 +455,7 @@ fn problemLoweringWithUserErrorsRationale(kind: check.problem.Problem.Tag) []con
         .polymorphic_var_annotation => "Polymorphic var annotations cannot produce a concrete mutable storage type.",
         .effectful_top_level => "Effectful top-level initialization cannot be represented as a checked constant.",
         .effectful_expect => "Effectful expect evaluation cannot be treated as ordinary lowered user code.",
+        .effectful_function_name => "Effectful function-name reports are warnings and do not block lowering.",
         .annotation_only_value => "Annotation-only values have no runtime expression to lower.",
         .hosted_unboxed_function => "Hosted unboxed functions violate the host boundary representation contract.",
         .host_boundary_open_row => "Open rows at host boundaries have no concrete ABI shape.",

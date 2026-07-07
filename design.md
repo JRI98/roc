@@ -935,6 +935,19 @@ restore selected hoisted locals. Therefore same-module compile-time roots are
 emitted as one dependency-sorted request stream, not as permanently separated
 top-level and hoisted groups.
 
+Hoisted-root selection is positional as well as dependency-based. Selection may
+fire only in structurally unguarded positions of runtime bodies, and the checker
+must carry that position as explicit checking context while computing
+hoistability in the normal recursive traversal. Eager child expressions inherit
+their parent's position. Branch bodies, match guards, expect bodies, loop bodies,
+statements after a prior effect/divergence blocker, block finals after such a
+blocker, and conditions reached only after earlier conditional branches are
+suppressed: they may still prove top-level-equivalent for enclosing expressions
+or warnings, but they must not become independent roots. Ordinary top-level
+constant bodies use a stronger compile-time-root context that suppresses nested
+root selection and nested eligibility entirely, because the enclosing body is
+already evaluated at compile time.
+
 Canonicalization's top-level dependency order remains an input for ordinary
 top-level constants, and checking should prefer to emit selected hoisted roots
 in dependency-first order as it proves and selects them. The request order is

@@ -38,6 +38,8 @@ pub const SortedArrayBuilder = @import("SortedArrayBuilder.zig").SortedArrayBuil
 pub const ExposedItems = @import("ExposedItems.zig").ExposedItems;
 pub const ExposedItemTarget = @import("ExposedItems.zig").ExposedItemTarget;
 pub const CompactWriter = @import("CompactWriter.zig");
+pub const serde_validation = @import("serde_validation.zig");
+pub const validateSerializedRelocations = serde_validation.validateSerializedRelocations;
 
 /// Single-threaded arena allocator; the non-atomic counterpart to
 /// `std.heap.ArenaAllocator`.

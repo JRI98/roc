@@ -223,31 +223,6 @@ pub fn validateOffsetLen(elem_size: u64, elem_align: u64, offset: i64, len: u64,
     return collections.validateRelocatedSpan(elem_align, offset, bytes, backing_len);
 }
 
-/// True if `T` transitively embeds a relocatable marker (a type declaring
-/// `serialized_relocatable_pointers`). Used by `validateSerialized` to reject a
-/// marker hidden inside a union variant, where validation cannot pick the active
-/// variant without a tag.
-fn comptimeHasMarker(comptime T: type) bool {
-    return switch (@typeInfo(T)) {
-        .@"struct" => |s| blk: {
-            if (@hasDecl(T, "serialized_relocatable_pointers")) break :blk true;
-            inline for (s.fields) |f| {
-                if (comptimeHasMarker(f.type)) break :blk true;
-            }
-            break :blk false;
-        },
-        .@"union" => |u| blk: {
-            inline for (u.fields) |f| {
-                if (comptimeHasMarker(f.type)) break :blk true;
-            }
-            break :blk false;
-        },
-        .array => |a| comptimeHasMarker(a.child),
-        .optional => |o| comptimeHasMarker(o.child),
-        else => false,
-    };
-}
-
 /// L-10 whole-artifact validation pass: walk a relocated `Serialized` value and
 /// bounds-check every relocatable marker's `(offset, len)` against `backing_len`
 /// BEFORE any consumer dereferences it, so a truncated or corrupt blob produces a
@@ -256,25 +231,7 @@ fn comptimeHasMarker(comptime T: type) bool {
 /// `validateRelocations`; everything else is recursed into. Pure structural walk
 /// driven by the type, mirroring `relocatablePointerCount`/`assertSerializedRelocatable`.
 pub fn validateSerialized(comptime T: type, self: *const T, backing_len: u64) error{CorruptArtifact}!void {
-    switch (@typeInfo(T)) {
-        .@"struct" => |s| {
-            if (@hasDecl(T, "serialized_relocatable_pointers")) {
-                try self.validateRelocations(backing_len);
-                return;
-            }
-            inline for (s.fields) |f| {
-                try validateSerialized(f.type, &@field(self, f.name), backing_len);
-            }
-        },
-        .array => |a| {
-            for (self) |*elem| try validateSerialized(a.child, elem, backing_len);
-        },
-        .@"union" => {
-            if (comptime comptimeHasMarker(T)) @compileError("Serialized union '" ++ @typeName(T) ++
-                "' has a variant containing a relocatable marker; L-10 validation cannot pick the active variant without a tag. Restructure so the marker is a plain struct field.");
-        },
-        else => {},
-    }
+    try collections.validateSerializedRelocations(T, self, backing_len);
 }
 
 /// Relocatable serialized form of an `?T` of POD `T`. Encodes presence as a

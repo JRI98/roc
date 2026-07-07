@@ -205,9 +205,3 @@ comptime assertions already exist).
   produce a glue-time error naming the type, not a zero-sized field.
 - Issue 9865 repro stays green: nominal record declared in one platform
   module, re-exported and used from another, glued and byte-checked.
-
-## Related projects
-
-- [Cache hardening](../small/cache-hardening.md) — committed layouts read
-  from cached artifacts are only as trustworthy as the cache's
-  enforcement edges.
