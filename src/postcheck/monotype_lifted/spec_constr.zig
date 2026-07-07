@@ -2737,13 +2737,30 @@ const Pass = struct {
         };
     }
 
+    /// Total work budget for deriving one shape. Values reachable here are
+    /// not always small finite trees — a loop-carried value can reference
+    /// itself through the fixpoint of a recursive construction, and deep
+    /// chains share substructure — so the walk spends one shared budget per
+    /// node visit and degrades to `.any` (no known shape) when it runs out.
+    /// `.any` is this function's existing "don't specialize on this" answer,
+    /// so exhaustion is a missed specialization, never a wrong shape. See
+    /// design.md "Core Principles" on bounded post-check walks.
+    const shape_work_budget: u32 = 4096;
+
     fn shapeFromValue(self: *Pass, value: Value) Allocator.Error!?Shape {
+        var budget: u32 = shape_work_budget;
+        return try self.shapeFromValueBudgeted(value, &budget);
+    }
+
+    fn shapeFromValueBudgeted(self: *Pass, value: Value, budget: *u32) Allocator.Error!?Shape {
+        if (budget.* == 0) return null;
+        budget.* -= 1;
         return switch (value) {
             .expr => |expr| try self.constructorShape(expr),
             .tag => |tag| blk: {
                 const payloads = try self.arena.allocator().alloc(Shape, tag.payloads.len);
                 for (tag.payloads, 0..) |payload, index| {
-                    payloads[index] = (try self.shapeFromValue(payload)) orelse
+                    payloads[index] = (try self.shapeFromValueBudgeted(payload, budget)) orelse
                         .{ .any = valueType(self.program, payload) };
                 }
                 break :blk Shape{ .tag = .{
@@ -2757,7 +2774,7 @@ const Pass = struct {
                 for (record.fields, 0..) |field, index| {
                     fields[index] = .{
                         .name = field.name,
-                        .shape = (try self.shapeFromValue(field.value)) orelse
+                        .shape = (try self.shapeFromValueBudgeted(field.value, budget)) orelse
                             .{ .any = valueType(self.program, field.value) },
                     };
                 }
@@ -2769,7 +2786,7 @@ const Pass = struct {
             .tuple => |tuple| blk: {
                 const items = try self.arena.allocator().alloc(Shape, tuple.items.len);
                 for (tuple.items, 0..) |item, index| {
-                    items[index] = (try self.shapeFromValue(item)) orelse
+                    items[index] = (try self.shapeFromValueBudgeted(item, budget)) orelse
                         .{ .any = valueType(self.program, item) };
                 }
                 break :blk Shape{ .tuple = .{
@@ -2778,7 +2795,7 @@ const Pass = struct {
                 } };
             },
             .nominal => |nominal| blk: {
-                const backing_shape = (try self.shapeFromValue(nominal.backing.*)) orelse break :blk null;
+                const backing_shape = (try self.shapeFromValueBudgeted(nominal.backing.*, budget)) orelse break :blk null;
                 const stored = try self.arena.allocator().create(Shape);
                 stored.* = backing_shape;
                 break :blk Shape{ .nominal = .{
@@ -2789,7 +2806,7 @@ const Pass = struct {
             .callable => |callable| blk: {
                 const captures = try self.arena.allocator().alloc(Shape, callable.captures.len);
                 for (callable.captures, 0..) |capture, index| {
-                    captures[index] = (try self.shapeFromValue(capture.value)) orelse
+                    captures[index] = (try self.shapeFromValueBudgeted(capture.value, budget)) orelse
                         .{ .any = valueType(self.program, capture.value) };
                 }
                 break :blk Shape{ .callable = .{
@@ -3213,31 +3230,64 @@ const Cloner = struct {
         };
     }
 
+    /// Total work budget for walking one substitution-candidate value.
+    ///
+    /// A known value is not always a small finite tree. A loop-carried value
+    /// can reference itself through the fixpoint of a recursive construction
+    /// (e.g. an iterator wrapped around itself a runtime number of times,
+    /// where the step callable's capture reaches the nominal whose backing
+    /// reaches the callable again), and a deep statically-built chain shares
+    /// substructure between levels, so a per-level depth budget still permits
+    /// combinatorially many paths through the shared nodes. The budget is
+    /// therefore spent per NODE VISIT — one shared counter across the whole
+    /// walk — which bounds total work absolutely for cycles and shared
+    /// structure alike. See design.md "Core Principles" on bounded post-check
+    /// walks.
+    ///
+    /// A work budget is the right bound here, rather than a visited set,
+    /// because this predicate is allowed to answer "no" spuriously: declining
+    /// a substitution keeps the construction materialized, which is a missed
+    /// optimization and never a miscompile. A cyclic value exhausts the
+    /// budget and gets "no" — the correct answer, since a self-referential
+    /// value cannot be substituted anyway — and a value large enough to
+    /// exhaust it honestly is one whose substitution would bloat the clone
+    /// regardless. Value identity is also too murky for a reliable visited
+    /// set: values are by-value unions holding slices, with only the nominal
+    /// backing behind a stable pointer.
+    const value_substitute_work_budget: u32 = 4096;
+
     fn valueCanSubstitute(self: *Cloner, value: Value) bool {
+        var budget: u32 = value_substitute_work_budget;
+        return self.valueCanSubstituteBudgeted(value, &budget);
+    }
+
+    fn valueCanSubstituteBudgeted(self: *Cloner, value: Value, budget: *u32) bool {
+        if (budget.* == 0) return false;
+        budget.* -= 1;
         return switch (value) {
             .expr => |expr| self.exprCanSubstitute(expr),
             .tag => |tag| blk: {
                 for (tag.payloads) |payload| {
-                    if (!self.valueCanSubstitute(payload)) break :blk false;
+                    if (!self.valueCanSubstituteBudgeted(payload, budget)) break :blk false;
                 }
                 break :blk true;
             },
             .record => |record| blk: {
                 for (record.fields) |field| {
-                    if (!self.valueCanSubstitute(field.value)) break :blk false;
+                    if (!self.valueCanSubstituteBudgeted(field.value, budget)) break :blk false;
                 }
                 break :blk true;
             },
             .tuple => |tuple| blk: {
                 for (tuple.items) |item| {
-                    if (!self.valueCanSubstitute(item)) break :blk false;
+                    if (!self.valueCanSubstituteBudgeted(item, budget)) break :blk false;
                 }
                 break :blk true;
             },
-            .nominal => |nominal| self.valueCanSubstitute(nominal.backing.*),
+            .nominal => |nominal| self.valueCanSubstituteBudgeted(nominal.backing.*, budget),
             .callable => |callable| blk: {
                 for (callable.captures) |capture| {
-                    if (!self.valueCanSubstitute(capture.value)) break :blk false;
+                    if (!self.valueCanSubstituteBudgeted(capture.value, budget)) break :blk false;
                 }
                 break :blk true;
             },
@@ -4444,6 +4494,28 @@ const Cloner = struct {
         }
     }
 
+    /// Node-count threshold above which a known constructor value bound to an
+    /// inlined or matched local is boxed instead of substituted or reused. A
+    /// statically constructed adapter chain is tens of nodes; a
+    /// recursively-constructed chain wrapped a runtime number of times has no
+    /// static depth, so its fixpoint known value instead fills the shape work
+    /// budget and reaches thousands of nodes. Substituting that value shares it
+    /// into every use, where each level of specialization re-walks and
+    /// re-inlines the whole thing, and the total never settles. A value this
+    /// large is past the point where per-use specialization pays for itself, so
+    /// binding it once behind a local (the sanctioned dynamic boundary) both
+    /// bounds the work and is the right code: real chains stay an order of
+    /// magnitude under the threshold and keep their per-use specialization.
+    /// Declining to track a value is a missed optimization, never a wrong
+    /// lowering. See design.md "Core Principles" on bounded post-check walks.
+    const known_value_track_cap: usize = 512;
+
+    /// Materialize a known value once and bind it reuse-safely, so it is no
+    /// longer tracked as a known constructor at its use sites.
+    fn boxDeepKnownValue(self: *Cloner, value: Value) Common.LowerError!Value {
+        return try self.makeReusableForMatch(.{ .expr = try self.materialize(value) });
+    }
+
     fn valueForMatchLocal(
         self: *Cloner,
         local: Ast.LocalId,
@@ -4451,6 +4523,9 @@ const Cloner = struct {
         body: Ast.ExprId,
         unsafe_count: usize,
     ) Common.LowerError!Value {
+        if (self.knownConstructorSize(value) >= known_value_track_cap) {
+            return try self.boxDeepKnownValue(value);
+        }
         const uses = localUseCountInExpr(self.pass.program, local, body);
         if (self.valueCanSubstitute(value) or
             (unsafe_count == 1 and uses == 1 and localUseBeforeEffect(self.pass.program, local, body)))
@@ -4467,6 +4542,9 @@ const Cloner = struct {
         body: Ast.ExprId,
         unsafe_count: usize,
     ) Common.LowerError!Value {
+        if (self.knownConstructorSize(value) >= known_value_track_cap) {
+            return try self.boxDeepKnownValue(value);
+        }
         const uses = localUseCountInExpr(self.pass.program, local, body);
         if (self.valueCanSubstitute(value) or
             (unsafe_count == 1 and uses == 1 and localUseBeforeEffect(self.pass.program, local, body)))
@@ -4476,6 +4554,23 @@ const Cloner = struct {
         return try self.makeReusableForMatch(value);
     }
 
+    /// Reported size for a known value that exhausts the size work budget: a
+    /// value too large to measure counts as effectively unbounded. Reporting a
+    /// value this large (rather than a truncated count) errs the inline
+    /// recursion guard toward declining — a call whose size reads as the cap is
+    /// never strictly smaller than an active frame, so it takes the residual
+    /// (boxed) call — which is the safe direction for a depth/size measure.
+    const known_constructor_size_cap: usize = 1 << 40;
+
+    /// Total work budget for measuring one known value's constructor size.
+    /// Substitution shares one value union across every use site, so a value
+    /// built by a recursively-constructed chain is reached by combinatorially
+    /// many paths; an unmemoized count re-descends the shared substructure and
+    /// need not terminate in bounded time. The count spends one shared budget
+    /// per node visit and reports the cap when it runs out. See design.md
+    /// "Core Principles" on bounded post-check walks.
+    const known_constructor_size_work_budget: u32 = 4096;
+
     /// Count the constructor nodes (tag, record, tuple, nominal, callable) in a
     /// known value, treating opaque `expr` leaves as zero. This is the measure
     /// the inline recursion guard shrinks: a call re-entering a function already
@@ -4483,27 +4578,34 @@ const Cloner = struct {
     /// are strictly smaller, so inlining an adapter step's `Iter.next` on its
     /// inner iterator (one layer smaller) makes progress and terminates.
     fn knownConstructorSize(self: *Cloner, value: Value) usize {
+        var budget: u32 = known_constructor_size_work_budget;
+        return self.knownConstructorSizeBudgeted(value, &budget);
+    }
+
+    fn knownConstructorSizeBudgeted(self: *Cloner, value: Value, budget: *u32) usize {
+        if (budget.* == 0) return known_constructor_size_cap;
+        budget.* -= 1;
         return switch (value) {
             .expr => 0,
             .tag => |tag| blk: {
                 var count: usize = 1;
-                for (tag.payloads) |payload| count += self.knownConstructorSize(payload);
+                for (tag.payloads) |payload| count += self.knownConstructorSizeBudgeted(payload, budget);
                 break :blk count;
             },
             .record => |record| blk: {
                 var count: usize = 1;
-                for (record.fields) |field| count += self.knownConstructorSize(field.value);
+                for (record.fields) |field| count += self.knownConstructorSizeBudgeted(field.value, budget);
                 break :blk count;
             },
             .tuple => |tuple| blk: {
                 var count: usize = 1;
-                for (tuple.items) |item| count += self.knownConstructorSize(item);
+                for (tuple.items) |item| count += self.knownConstructorSizeBudgeted(item, budget);
                 break :blk count;
             },
-            .nominal => |nominal| 1 + self.knownConstructorSize(nominal.backing.*),
+            .nominal => |nominal| 1 + self.knownConstructorSizeBudgeted(nominal.backing.*, budget),
             .callable => |callable| blk: {
                 var count: usize = 1;
-                for (callable.captures) |capture| count += self.knownConstructorSize(capture.value);
+                for (callable.captures) |capture| count += self.knownConstructorSizeBudgeted(capture.value, budget);
                 break :blk count;
             },
         };
@@ -4555,34 +4657,84 @@ const Cloner = struct {
         return total;
     }
 
+    /// Reported unsafe-leaf count for a known value that exhausts the work
+    /// budget: a value too large to scan counts as having many unsafe leaves.
+    /// Reporting the cap (rather than a truncated count) errs every consumer
+    /// toward reuse — a count above one fails the `unsafe_count == 1`
+    /// single-substitution conditions, so the value is bound to a local and
+    /// evaluated once instead of duplicated — which is the safe direction: it
+    /// can never drop or reorder an effect a truncated count would have missed.
+    const unsafe_leaf_count_cap: usize = 1 << 40;
+
+    /// Total work budget for scanning one known value's unsafe leaves. Shared
+    /// substructure makes an unmemoized scan re-descend combinatorially many
+    /// paths, so the scan spends one shared budget per node visit and reports
+    /// the cap when it runs out. See design.md "Core Principles" on bounded
+    /// post-check walks.
+    const unsafe_leaf_count_work_budget: u32 = 4096;
+
     fn unsafeLeafCount(self: *Cloner, value: Value) usize {
+        var budget: u32 = unsafe_leaf_count_work_budget;
+        return self.unsafeLeafCountBudgeted(value, &budget);
+    }
+
+    fn unsafeLeafCountBudgeted(self: *Cloner, value: Value, budget: *u32) usize {
+        if (budget.* == 0) return unsafe_leaf_count_cap;
+        budget.* -= 1;
         return switch (value) {
             .expr => |expr| if (self.exprCanSubstitute(expr)) 0 else 1,
             .tag => |tag| blk: {
                 var count: usize = 0;
-                for (tag.payloads) |payload| count += self.unsafeLeafCount(payload);
+                for (tag.payloads) |payload| count += self.unsafeLeafCountBudgeted(payload, budget);
                 break :blk count;
             },
             .record => |record| blk: {
                 var count: usize = 0;
-                for (record.fields) |field| count += self.unsafeLeafCount(field.value);
+                for (record.fields) |field| count += self.unsafeLeafCountBudgeted(field.value, budget);
                 break :blk count;
             },
             .tuple => |tuple| blk: {
                 var count: usize = 0;
-                for (tuple.items) |item| count += self.unsafeLeafCount(item);
+                for (tuple.items) |item| count += self.unsafeLeafCountBudgeted(item, budget);
                 break :blk count;
             },
-            .nominal => |nominal| self.unsafeLeafCount(nominal.backing.*),
+            .nominal => |nominal| self.unsafeLeafCountBudgeted(nominal.backing.*, budget),
             .callable => |callable| blk: {
                 var count: usize = 0;
-                for (callable.captures) |capture| count += self.unsafeLeafCount(capture.value);
+                for (callable.captures) |capture| count += self.unsafeLeafCountBudgeted(capture.value, budget);
                 break :blk count;
             },
         };
     }
 
+    /// Total work budget for making one value reuse-safe. A known value is not
+    /// always a small finite tree: substitution shares one value union across
+    /// every use site, so a value built by a recursively-constructed chain (an
+    /// iterator wrapped around itself through many map layers) is a compact
+    /// graph reached by combinatorially many distinct paths, and this walk
+    /// probes each visited node with `valueCanSubstitute` — itself a full
+    /// sub-walk — so its cost is the node count times that probe and grows far
+    /// past any per-level depth. The walk spends one shared budget per node
+    /// visit and, when it runs out, keeps the remaining sub-value materialized
+    /// as-is instead of continuing to rewrite it. See design.md "Core
+    /// Principles" on bounded post-check walks.
+    ///
+    /// Keeping a sub-value as-is declines the single-evaluation rewrite for it,
+    /// the same conservative direction the substitution check takes on its own
+    /// exhaustion: the values large enough to exhaust this budget are the deep
+    /// constructor chains of recursive iterator construction, whose leaves are
+    /// pure structural components, so leaving them un-rewritten at worst
+    /// recomputes a pure leaf and never drops or reorders an effect.
+    const make_reusable_work_budget: u32 = 4096;
+
     fn makeReusableForMatch(self: *Cloner, value: Value) Common.LowerError!Value {
+        var budget: u32 = make_reusable_work_budget;
+        return try self.makeReusableForMatchBudgeted(value, &budget);
+    }
+
+    fn makeReusableForMatchBudgeted(self: *Cloner, value: Value, budget: *u32) Common.LowerError!Value {
+        if (budget.* == 0) return value;
+        budget.* -= 1;
         if (self.valueCanSubstitute(value)) return value;
         return switch (value) {
             .expr => |expr| blk: {
@@ -4602,7 +4754,7 @@ const Cloner = struct {
             .tag => |tag| blk: {
                 const payloads = try self.pass.arena.allocator().alloc(Value, tag.payloads.len);
                 for (tag.payloads, 0..) |payload, index| {
-                    payloads[index] = try self.makeReusableForMatch(payload);
+                    payloads[index] = try self.makeReusableForMatchBudgeted(payload, budget);
                 }
                 break :blk Value{ .tag = .{
                     .ty = tag.ty,
@@ -4615,7 +4767,7 @@ const Cloner = struct {
                 for (record.fields, 0..) |field, index| {
                     fields[index] = .{
                         .name = field.name,
-                        .value = try self.makeReusableForMatch(field.value),
+                        .value = try self.makeReusableForMatchBudgeted(field.value, budget),
                     };
                 }
                 break :blk Value{ .record = .{
@@ -4626,7 +4778,7 @@ const Cloner = struct {
             .tuple => |tuple| blk: {
                 const items = try self.pass.arena.allocator().alloc(Value, tuple.items.len);
                 for (tuple.items, 0..) |item, index| {
-                    items[index] = try self.makeReusableForMatch(item);
+                    items[index] = try self.makeReusableForMatchBudgeted(item, budget);
                 }
                 break :blk Value{ .tuple = .{
                     .ty = tuple.ty,
@@ -4635,7 +4787,7 @@ const Cloner = struct {
             },
             .nominal => |nominal| blk: {
                 const backing = try self.pass.arena.allocator().create(Value);
-                backing.* = try self.makeReusableForMatch(nominal.backing.*);
+                backing.* = try self.makeReusableForMatchBudgeted(nominal.backing.*, budget);
                 break :blk Value{ .nominal = .{
                     .ty = nominal.ty,
                     .backing = backing,
@@ -4646,7 +4798,7 @@ const Cloner = struct {
                 for (callable.captures, 0..) |capture, index| {
                     captures[index] = .{
                         .id = capture.id,
-                        .value = try self.makeReusableForMatch(capture.value),
+                        .value = try self.makeReusableForMatchBudgeted(capture.value, budget),
                     };
                 }
                 break :blk Value{ .callable = .{

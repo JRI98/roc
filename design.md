@@ -94,6 +94,26 @@ selected by LIR ARC insertion. Consumers may lazily cache code or interpreter
 execution plans for that helper, but they must not select a different helper
 from local layout data. Reference-counting policy belongs to LIR ARC insertion.
 
+Recursive walks over post-check types and values must be bounded. A structure
+reachable after checking can be self-referential — a recursive nominal's
+backing, or the fixpoint value of a recursively-constructed chain (an iterator
+wrapped around itself a runtime number of times) — so "this walk terminates"
+is an assumption, not a property, unless the walk either traverses a provably
+acyclic structure or carries an explicit budget. When a budget is exhausted,
+the walk must fail toward the conservative answer for its question — decline
+the optimization, keep the value materialized, take the boxed representation —
+never toward a hang, an unbounded specialization set, or a wrong result. The
+budget must be chosen so exhaustion errs in the safe direction for that
+specific question: a substitution check answers "cannot substitute" (a missed
+optimization), a minted-chain depth walk reports the cap (the chain takes the
+sanctioned dynamic-boundary box). Two standing instances: Monotype bounds
+minted iterator chain depth at the single construction choke point
+(`generatedIteratorType`), which is what guarantees specialization terminates
+for recursively-constructed chains regardless of call structure; and
+constructor specialization bounds its substitution-candidate value walk
+(`valueCanSubstitute`), because a loop-carried value can reference itself and
+a cyclic value is correctly non-substitutable anyway.
+
 ## Checking Effects And Const Roots
 
 Checking owns Roc effect validation, compile-time evaluation eligibility, and

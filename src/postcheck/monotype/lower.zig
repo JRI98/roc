@@ -10670,12 +10670,21 @@ const BodyContext = struct {
     /// minted type universe is what guarantees specialization terminates for
     /// recursively-constructed chains regardless of call structure: finitely
     /// many minted types means finitely many templates, and template dedup
-    /// closes every recursion.
+    /// closes every recursion. This is deliberately a bound on the TYPES
+    /// rather than on any call or request path — a recursive construction has
+    /// many routes into specialization, and capping the type universe covers
+    /// all of them at the single point where minted types are born. See
+    /// design.md "Core Principles" on bounded post-check walks: exhaustion
+    /// errs toward the sanctioned dynamic-boundary box (a tier degradation on
+    /// an implausibly deep static chain), never toward divergence.
     const max_minted_iterator_chain_depth: u32 = 16;
 
     /// Recursion budget for the structural depth walk; exhausting it reports
     /// the cap (never zero) so an unexpectedly deep or cyclic shape can only
-    /// over-trigger the backstop, never under-count into divergence.
+    /// over-trigger the backstop, never under-count into divergence. The safe
+    /// direction here is the opposite of a substitution check's: reporting
+    /// too SHALLOW a depth would let minting continue past the cap and
+    /// diverge, so the walk must fail deep, not shallow.
     const depth_walk_fuel: u32 = 64;
 
     /// Chain depth of any minted iterator reachable inside `ty` by value:

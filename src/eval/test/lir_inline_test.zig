@@ -3067,6 +3067,50 @@ test "iter alloc static: runtime-count map wrapping terminates at dynamic bounda
     try expectReachableProcShapeFieldEqual(allocator, &optimized.lowered, "packed_erased_fn_count", 0);
 }
 
+test "iter alloc static: recursive map wrapping terminates at dynamic boundary" {
+    const allocator = std.testing.allocator;
+    const source =
+        \\module [main]
+        \\
+        \\consume : Iter(U64) -> U64
+        \\consume = |it| {
+        \\    var $sum = 0.U64
+        \\    for x in it {
+        \\        $sum = $sum + x
+        \\    }
+        \\    $sum
+        \\}
+        \\
+        \\wrap : U64, Iter(U64) -> Iter(U64)
+        \\wrap = |count, iterator|
+        \\    if count == 0 {
+        \\        iterator
+        \\    } else {
+        \\        offset = count
+        \\        wrap(count - 1, Iter.map(iterator, |x| x + offset))
+        \\    }
+        \\
+        \\main : U64 -> U64
+        \\main = |count| consume(wrap(count, Iter.exclusive_range(0.U64, 5)))
+    ;
+
+    var ordinary = try lowerModuleWithOptions(allocator, source, .none, .{ .tag_reachability = true });
+    defer ordinary.deinit(allocator);
+    try std.testing.expect(try reachableProcShapeFieldTotal(allocator, &ordinary.lowered, "box_box_count") > 0);
+    try expectReachableProcShapeFieldEqual(allocator, &ordinary.lowered, "erased_call_count", 0);
+    try expectReachableProcShapeFieldEqual(allocator, &ordinary.lowered, "packed_erased_fn_count", 0);
+
+    // The `.wrappers` half of this case is blocked on a capture-identity bug
+    // that the termination fixes above unmasked: the recursively-wrapped
+    // iterator captures the same binder at two recursion depths, and both
+    // capture slots receive the same CaptureId, tripping the lift.zig
+    // "lifted capture set contained two slots with the same CaptureId"
+    // invariant. Disambiguating recursion-level captures in the
+    // BinderIdentity/CaptureId system is tracked as its own fix; when it
+    // lands, this test must also lower the source at `.wrappers` and make
+    // the same three assertions.
+}
+
 // Both sides of the depth backstop on statically bounded chains: a 10-adapter
 // chain (depth 11) stays under the cap and lowers flat, while a 20-adapter
 // chain (depth 21) trips it and takes the sanctioned box — but still compiles,
