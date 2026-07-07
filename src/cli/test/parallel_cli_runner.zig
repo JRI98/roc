@@ -756,8 +756,8 @@ const non_exhaustive_destructure_needles = [_]OutputNeedle{
 };
 
 const crash_expression_needles = [_]OutputNeedle{
-    .{ .stream = .stderr, .text = "CRASH IN EXPRESSION" },
-    .{ .stream = .stderr, .text = "Wrap it in a block expression" },
+    .{ .stream = .stderr, .text = "CRASH STATEMENT IN EXPRESSION" },
+    .{ .stream = .stderr, .text = "block expression" },
 };
 
 const warning_needles = [_]OutputNeedle{
@@ -766,8 +766,8 @@ const warning_needles = [_]OutputNeedle{
 };
 
 const repl_parse_diagnostic_needles = [_]OutputNeedle{
-    .{ .stream = .stderr, .text = "PARSE ERROR" },
-    .{ .stream = .stderr, .text = "UNEXPECTED TOKEN" },
+    .{ .stream = .stderr, .text = "UNEXPECTED EXPRESSION SYNTAX" },
+    .{ .stream = .stderr, .text = "I was parsing an expression" },
 };
 
 const format_needles = [_]OutputNeedle{
@@ -853,7 +853,7 @@ const subcommand_cases = [_]CliCase{
     .{ .id = 0, .suite = .subcommands, .name = "issue 9508: anonymous recursive tag type reports an error", .body = .{ .command = .{ .args = &.{"--no-cache"}, .roc_file = "test/cli/issue_9508_anonymous_recursion.roc", .exit = .failure, .contains = &.{.{ .stream = .stderr, .text = "ANONYMOUS RECURSION" }}, .not_contains = &.{ .{ .stream = .stderr, .text = "overflowed its stack" }, .{ .stream = .stderr, .text = "panic" } } } } },
     .{ .id = 0, .suite = .subcommands, .name = "issue 9210: ambiguous tuple access in a lambda", .body = .{ .command = .{ .args = &.{ "check", "--no-cache" }, .roc_file = "test/cli/issue_9210_tuple_access_lambda.roc", .exit = .failure, .contains = &.{.{ .stream = .stderr, .text = "AMBIGUOUS TUPLE ACCESS" }}, .not_contains = &.{.{ .stream = .stderr, .text = "TYPE MISMATCH" }} } } },
     .{ .id = 0, .suite = .subcommands, .name = "issue 2686: bare List tag payload reports its missing type argument", .body = .{ .command = .{ .args = &.{ "check", "--no-cache" }, .roc_file = "test/cli/issue_2686_bare_list_payload.roc", .exit = .failure, .contains = &.{ .{ .stream = .stderr, .text = "TOO FEW ARGS" }, .{ .stream = .stderr, .text = "expects 1 argument" } } } } },
-    .{ .id = 0, .suite = .subcommands, .name = "issue 9499: crash in match branch reports one targeted parse error", .body = .{ .command = .{ .args = &.{ "check", "--no-cache" }, .roc_file = "test/cli/Issue9499CrashMatchBranch.roc", .exit = .failure, .contains = &crash_expression_needles, .not_contains = &.{ .{ .stream = .stderr, .text = "UNEXPECTED TOKEN IN EXPRESSION" }, .{ .stream = .stderr, .text = "match_branch_missing_arrow" }, .{ .stream = .stderr, .text = "expected_close_curly_at_end_of_match" } } } } },
+    .{ .id = 0, .suite = .subcommands, .name = "issue 9499: crash in match branch reports one targeted parse error", .body = .{ .command = .{ .args = &.{ "check", "--no-cache" }, .roc_file = "test/cli/Issue9499CrashMatchBranch.roc", .exit = .failure, .contains = &crash_expression_needles, .not_contains = &.{ .{ .stream = .stderr, .text = "UNEXPECTED EXPRESSION SYNTAX" }, .{ .stream = .stderr, .text = "match_branch_missing_arrow" }, .{ .stream = .stderr, .text = "expected_close_curly_at_end_of_match" } } } } },
     .{ .id = 0, .suite = .subcommands, .name = "issue 9544: list function parameter destructure must be exhaustive", .body = .{ .command = .{ .args = &.{ "check", "--no-cache" }, .roc_file = "test/cli/Issue9544NonExhaustiveParam.roc", .exit = .failure, .contains = &non_exhaustive_destructure_needles } } },
     .{ .id = 0, .suite = .subcommands, .name = "roc check generated module graph succeeds with 1 file and 1 symbol", .body = .{ .custom = .generated_graph_1_1 } },
     .{ .id = 0, .suite = .subcommands, .name = "roc check generated module graph succeeds with 5 files and 5 symbols", .body = .{ .custom = .generated_graph_5_5 } },

@@ -1170,7 +1170,7 @@ test "Repl - invalid syntax preserves definitions" {
 
     const diagnostic = try repl.step("x +");
     defer testing.allocator.free(diagnostic);
-    try testing.expect(std.mem.find(u8, diagnostic, "UNEXPECTED TOKEN") != null);
+    try testing.expect(std.mem.find(u8, diagnostic, "UNEXPECTED EXPRESSION SYNTAX") != null);
 
     const result = try repl.step("x");
     defer testing.allocator.free(result);

@@ -1,23 +1,23 @@
 # META
 ~~~ini
-description=Dollar-prefixed record field names are rejected
+description=Dollar-prefixed expression record field names are rejected
 type=expr
 ~~~
 # SOURCE
 ~~~roc
-{ $field : "value" }
+{ $name: "Ada" }
 ~~~
 # EXPECTED
-INVALID RECORD FIELD NAME - dollar_prefix_field_name.md:1:3:1:9
+INVALID RECORD FIELD NAME - error_dollar_prefix_expr_field.md:1:3:1:8
 # PROBLEMS
 
 ┌───────────────────────────┐
 │ INVALID RECORD FIELD NAME ├─ Record field names cannot start with a ────────┐
 └┬──────────────────────────┘  dollar sign.                                   │
  │                                                                            │
- │  { $field : "value" }                                                      │
- │    ‾‾‾‾‾‾                                                                  │
- └─────────────────────────────────────────── dollar_prefix_field_name.md:1:3 ┘
+ │  { $name: "Ada" }                                                          │
+ │    ‾‾‾‾‾                                                                   │
+ └───────────────────────────────────── error_dollar_prefix_expr_field.md:1:3 ┘
 
     Names that start with `$` are reassignable variables declared with the
     `var` keyword, so they cannot be used as record field names.
@@ -30,23 +30,23 @@ EndOfFile,
 # PARSE
 ~~~clojure
 (e-record
-	(field (field "$field")
+	(field (field "$name")
 		(e-string
-			(e-string-part (raw "value")))))
+			(e-string-part (raw "Ada")))))
 ~~~
 # FORMATTED
 ~~~roc
-{ $field: "value" }
+NO CHANGE
 ~~~
 # CANONICALIZE
 ~~~clojure
 (e-record
 	(fields
-		(field (name "$field")
+		(field (name "$name")
 			(e-string
-				(e-literal (string "value"))))))
+				(e-literal (string "Ada"))))))
 ~~~
 # TYPES
 ~~~clojure
-(expr (type "{ $field: Str }"))
+(expr (type "{ $name: Str }"))
 ~~~
