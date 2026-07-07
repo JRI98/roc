@@ -22,6 +22,7 @@ const InstBacking = solve.InstBacking;
 const InstDeclaredField = solve.InstDeclaredField;
 const InstVariable = solve.InstVariable;
 const GraphTypeFinals = solve.GraphTypeFinals;
+const EntryRoot = solve.EntryRoot;
 
 const Allocator = std.mem.Allocator;
 const checked = check.CheckedModule;
@@ -1281,7 +1282,7 @@ const Builder = struct {
         requester: ?*InstGraph,
         reserved_fn_id: ?Ast.FnId,
         source_region_override: ?base.Region,
-        current_entry_root: ?checked.ComptimeRootId,
+        current_entry_root: ?EntryRoot,
     ) Allocator.Error!Ast.DefId {
         self.count("template_requests");
         var reserved_def: ?Ast.DefId = null;
@@ -6106,8 +6107,10 @@ const BodyContext = struct {
     source_region_override: ?base.Region = null,
     /// The specific compile-time entry root currently being lowered. Hoisted
     /// constants only count as "own" roots for this exact entry, not for every
-    /// specialization of the same procedure template.
-    current_entry_root: ?checked.ComptimeRootId = null,
+    /// specialization of the same procedure template. Module-qualified because
+    /// the root id travels through template requests into other modules'
+    /// body contexts, where the same integer names an unrelated root.
+    current_entry_root: ?EntryRoot = null,
     /// Evidence for the current callable's dispatch requirements (innermost
     /// vector plus lexical parents for nested local functions). Body contexts
     /// created for the same specialization (dispatch call contexts, nested
@@ -7965,7 +7968,7 @@ const BodyContext = struct {
                 const root = self.view.compile_time_roots.root(wrapper.root);
                 const saved_entry_root = self.current_entry_root;
                 defer self.current_entry_root = saved_entry_root;
-                self.current_entry_root = wrapper.root;
+                self.current_entry_root = .{ .module = self.view.key, .root = wrapper.root };
                 const saved_source_region_override = self.source_region_override;
                 defer self.source_region_override = saved_source_region_override;
                 self.source_region_override = switch (root.kind) {
@@ -8290,8 +8293,8 @@ const BodyContext = struct {
     }
 
     fn loweringOwnHoistedConstRoot(self: *BodyContext, entry: checked.HoistedConstEntry) bool {
-        if (self.current_entry_root) |root| {
-            return entry.root == root;
+        if (self.current_entry_root) |entry_root| {
+            return moduleBytesEqual(entry_root.module.bytes, self.view.key.bytes) and entry.root == entry_root.root;
         }
 
         const wrapper = self.view.entry_wrappers.lookupByRoot(entry.root) orelse
@@ -8317,7 +8320,7 @@ const BodyContext = struct {
                 self.builder.program.current_region = source_region;
                 break :blk try self.restoreConstNodeAtType(self.view, self.view, stored.node, ty);
             },
-            .eval_template => |eval| try self.lowerConstEvalTemplateUse(self.view, eval, ty, source_region, entry.root),
+            .eval_template => |eval| try self.lowerConstEvalTemplateUse(self.view, eval, ty, source_region, .{ .module = self.view.key, .root = entry.root }),
             .reserved => Common.invariant("reserved hoisted const template reached Monotype"),
         };
     }
@@ -14768,7 +14771,7 @@ const BodyContext = struct {
         eval: checked.ConstEvalTemplate,
         ty: Type.TypeId,
         source_region_override: ?base.Region,
-        current_entry_root: ?checked.ComptimeRootId,
+        current_entry_root: ?EntryRoot,
     ) Allocator.Error!DraftExprId {
         const body = store_view.checked_const_bodies.get(eval.body);
         const entry_template = store_view.templates.get(eval.entry_template.template);

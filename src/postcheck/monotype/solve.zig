@@ -24,6 +24,15 @@ const names = check.CheckedNames;
 const static_dispatch = check.StaticDispatchRegistry;
 const Ident = base.Ident;
 
+/// A compile-time entry root qualified by the checked module that owns it.
+/// `ComptimeRootId`s are module-local, so a root that travels across template
+/// requests must carry its owning module to stay comparable: the same integer
+/// id names unrelated roots in different modules.
+pub const EntryRoot = struct {
+    module: checked.ModuleId,
+    root: checked.ComptimeRootId,
+};
+
 /// A procedure template body request deferred to the end of the requesting
 /// specialization, when that specialization's types are final. Requesting at
 /// final types keeps specialization keys stable: two requests whose types
@@ -36,7 +45,7 @@ pub const DeferredTemplate = struct {
     source_fn_key: names.TypeDigest,
     fn_ty: Type.TypeId,
     source_region_override: ?base.Region,
-    current_entry_root: ?checked.ComptimeRootId,
+    current_entry_root: ?EntryRoot,
 };
 
 /// Identity of a node in a specialization's instantiation graph.
