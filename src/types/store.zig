@@ -776,7 +776,12 @@ pub const Store = struct {
         return switch (content) {
             .flex => true, // Flexible variables need instantiation
             .rigid => true, // Rigid variables need instantiation when used outside their defining scope
-            .alias => true, // Aliases may contain type variables, so assume they need instantiation
+            // An alias is transparent: it needs instantiation exactly when its
+            // backing type does. Aliases cannot be recursive, so this walk
+            // terminates. Treating every alias as needing instantiation would
+            // (among other things) exclude concrete alias-annotated top-level
+            // values from compile-time evaluation.
+            .alias => |alias| self.needsInstantiation(self.getAliasBackingVar(alias)),
             .structure => |flat_type| self.needsInstantiationFlatType(flat_type),
             .err => false,
         };
