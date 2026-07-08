@@ -643,6 +643,7 @@ fn writePackageIndex(ctx: *const RenderContext, gpa: Allocator, io: std.Io, dir:
     try w.writeAll("        <h1 class=\"module-name\">");
     try writeHtmlEscaped(w, display_name);
     try w.writeAll("</h1>\n");
+    try writeDocsStreamChunk(w);
 
     // Module list
     try w.writeAll("        <ul class=\"index-module-links\">\n");
@@ -654,6 +655,7 @@ fn writePackageIndex(ctx: *const RenderContext, gpa: Allocator, io: std.Io, dir:
         try w.writeAll("</a></li>\n");
     }
     try w.writeAll("        </ul>\n");
+    try writeDocsStreamChunk(w);
 
     try writeFooter(w);
     try w.writeAll("    </main>\n");
@@ -694,6 +696,7 @@ fn writeModulePageToDir(ctx: *const RenderContext, gpa: Allocator, io: std.Io, d
     try w.writeAll("        <h1 class=\"module-name\">");
     try writeHtmlEscaped(w, mod.name);
     try w.writeAll("</h1>\n");
+    try writeDocsStreamChunk(w);
 
     // Build entry tree (automatically collapses redundant top-level node
     // matching the module name, e.g. Parser > Parser or Builtin > Builtin).
@@ -708,6 +711,7 @@ fn writeModulePageToDir(ctx: *const RenderContext, gpa: Allocator, io: std.Io, d
                 try w.writeAll(":= ");
                 try renderDocTypeHtml(w, ctx, gpa, sig, false);
                 try w.writeAll("</code>\n");
+                try writeDocsStreamChunk(w);
             }
         }
     }
@@ -723,6 +727,7 @@ fn writeModulePageToDir(ctx: *const RenderContext, gpa: Allocator, io: std.Io, d
         try w.writeAll("        <div class=\"module-doc\">\n");
         try renderDocComment(w, ctx, dwl.doc, dwl.start_line);
         try w.writeAll("        </div>\n");
+        try writeDocsStreamChunk(w);
     }
 
     // Render entries
@@ -802,9 +807,35 @@ fn writeMainOpen(w: Writer, ctx: *const RenderContext, gpa: Allocator, base: []c
     try w.writeAll("            </ul>\n");
     try w.writeAll("        </form>\n");
     try w.writeAll("        <div class=\"main-content\">\n");
+    try writeDocsStreamStart(w);
+}
+
+// These bang comments are invisible during ordinary document loads, but the
+// docs soft-navigation code fetches pages as bytes and uses them as stream
+// boundaries. The NUL start marker tells the runtime where .main-content
+// begins; chunk markers are emitted only after complete top-level chunks that
+// can be safely appended to the live DOM and syntax-highlighted immediately;
+// the end marker lets the runtime flush the final content chunk and cancel the
+// response before reading footer/closing document HTML. This lets long docs
+// pages show useful highlighted content before the whole HTML file has loaded.
+// NUL, Unit Separator, and Record Separator are all one-byte unprintable
+// ASCII control characters, and Roc source cannot contain any of them
+// naturally. Browsers replace NULs while parsing HTML, but fetch() exposes the
+// original byte before the HTML parser sees it.
+fn writeDocsStreamStart(w: Writer) error{WriteFailed}!void {
+    try w.writeAll("<!--!\x00-->\n");
+}
+
+fn writeDocsStreamChunk(w: Writer) error{WriteFailed}!void {
+    try w.writeAll("<!--!\x1f-->\n");
+}
+
+fn writeDocsStreamEnd(w: Writer) error{WriteFailed}!void {
+    try w.writeAll("<!--!\x1e-->\n");
 }
 
 fn writeFooter(w: Writer) error{WriteFailed}!void {
+    try writeDocsStreamEnd(w);
     try w.writeAll("        </div>\n");
     try w.writeAll("        <footer><p>Made by people who like to make nice things.</p></footer>\n");
 }
@@ -1128,6 +1159,9 @@ fn renderEntryTree(
 
             try writeIndent(w, base);
             try w.writeAll("</article>\n");
+            if (depth == 1) {
+                try writeDocsStreamChunk(w);
+            }
         }
     } else if (node.children.items.len > 0) {
         // Non-leaf group node — render a group header and recurse at deeper depth
@@ -1145,6 +1179,9 @@ fn renderEntryTree(
         }
         try writeIndent(w, base);
         try w.writeAll("</section>\n");
+        if (depth == 1) {
+            try writeDocsStreamChunk(w);
+        }
     }
 }
 
