@@ -4455,6 +4455,9 @@ const Inserter = struct {
     fn retainLocalIfRcCount(self: *Inserter, local: LIR.LocalId, count: u16, next: LIR.CFStmtId) ResourceError!LIR.CFStmtId {
         if (count == 0) return next;
         if (!self.localContainsRefcounted(local)) return next;
+        if (count == 1) {
+            if (self.matchingImmediateDecref(local, next)) |after_decref| return after_decref;
+        }
         const rc = self.rcHelperForLocal(.incref, local);
         return try self.store.addCFStmt(.{ .incref = .{
             .value = local,
@@ -4463,6 +4466,13 @@ const Inserter = struct {
             .atomicity = self.rcAtomicity(local),
             .next = next,
         } });
+    }
+
+    fn matchingImmediateDecref(self: *Inserter, local: LIR.LocalId, next: LIR.CFStmtId) ?LIR.CFStmtId {
+        return switch (self.store.getCFStmt(next)) {
+            .decref => |rc| if (rc.value == local) rc.next else null,
+            else => null,
+        };
     }
 
     fn retainStrMatchSourceForCaptures(self: *Inserter, source: LIR.LocalId, steps: LIR.StrMatchStepSpan, next: LIR.CFStmtId) ResourceError!LIR.CFStmtId {
@@ -7295,6 +7305,36 @@ test "RC interprocedural: borrowed return borrows the argument in the caller" {
     try f.expectRc(alias, 0, 0, 0);
     try f.expectRc(value, 0, 1, 0);
 }
+
+test "RC interprocedural: unused borrowed return elides retain release pair" {
+    var f = try ArcTest.init(testing.allocator);
+    defer f.deinit();
+
+    const id_param = try f.local(.str);
+    const id_ret = try f.ret(id_param);
+    const identity = try f.addProc(&.{id_param}, id_ret, .str);
+
+    const value = try f.local(.str);
+    const unused_result = try f.local(.str);
+    const final_result = try f.local(.i64);
+    const ret = try f.ret(final_result);
+    const final_assign = try f.assignI64(final_result, 1, ret);
+    const call = try f.store.addCFStmt(.{ .assign_call = .{
+        .target = unused_result,
+        .proc = identity,
+        .args = try f.span(&.{value}),
+        .next = final_assign,
+    } });
+    const body = try f.assignStr(value, "unused-borrowed-return", call);
+    _ = try f.addProc(&.{}, body, .i64);
+
+    try f.run();
+
+    try f.expectRc(id_param, 0, 0, 0);
+    try f.expectRc(unused_result, 0, 0, 0);
+    try f.expectRc(value, 0, 1, 0);
+}
+
 test "RC borrow survives the lender moving into an aggregate" {
     var f = try ArcTest.init(testing.allocator);
     defer f.deinit();
