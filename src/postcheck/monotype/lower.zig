@@ -888,44 +888,12 @@ const Builder = struct {
         };
     }
 
-    fn declaredModuleForAlias(self: *Builder, view: ModuleView, alias: checked.CheckedAliasType) names.CheckedModuleDigest {
-        return self.moduleDigestForOrigin(view, alias.origin_module);
+    fn declaredModuleForAlias(_: *Builder, _: ModuleView, alias: checked.CheckedAliasType) names.CheckedModuleDigest {
+        return moduleDigestFromId(alias.owner_module);
     }
 
-    fn declaredModuleForNominal(self: *Builder, view: ModuleView, nominal: checked.CheckedNominalType) names.CheckedModuleDigest {
-        return switch (nominal.representation) {
-            .imported_declaration => |imported| moduleDigestFromId(checked.importedNominalDeclarationModuleId(imported)),
-            .imported_box_payload_capability => |imported| moduleDigestFromId(checked.importedBoxPayloadCapabilityModuleId(imported)),
-            .builtin,
-            .local_declaration,
-            .local_box_payload_capability,
-            .opaque_without_backing,
-            => self.moduleDigestForOrigin(view, nominal.origin_module),
-        };
-    }
-
-    /// Resolve a named type's declaring module by 32-byte content identity —
-    /// an exact comparison against each candidate view's module identity
-    /// hash. Byte-identical module content reached through several checked
-    /// modules is interchangeable as a declaring module; the first match wins.
-    fn moduleDigestForOrigin(self: *Builder, view: ModuleView, origin_module: names.ModuleIdentityId) names.CheckedModuleDigest {
-        const origin_hash = view.names.moduleIdentityBytes(origin_module);
-        if (moduleViewIdentityMatches(view, origin_hash)) return moduleDigestFromId(view.key);
-
-        const root = moduleView(self.root_view);
-        if (moduleViewIdentityMatches(root, origin_hash)) return moduleDigestFromId(root.key);
-
-        for (self.modules.imports) |imported| {
-            const imported_view = moduleView(imported);
-            if (moduleViewIdentityMatches(imported_view, origin_hash)) return moduleDigestFromId(imported_view.key);
-        }
-
-        for (self.modules.root.relation_modules) |relation| {
-            const relation_view = moduleView(relation);
-            if (moduleViewIdentityMatches(relation_view, origin_hash)) return moduleDigestFromId(relation_view.key);
-        }
-
-        Common.invariant("checked named type origin module was not available to Monotype lowering");
+    fn declaredModuleForNominal(_: *Builder, _: ModuleView, nominal: checked.CheckedNominalType) names.CheckedModuleDigest {
+        return moduleDigestFromId(nominal.owner_module);
     }
 
     fn lowerRoot(self: *Builder, request: checked.RootRequest) Allocator.Error!void {
@@ -2470,7 +2438,7 @@ const Builder = struct {
                 break :blk .{ .view = sv, .declaration = decl, .padding_field_tys = capability.paddingFieldTys(sv.interface_capabilities) };
             },
             .builtin => blk: {
-                const source_view = self.moduleForDigest(self.moduleDigestForOrigin(view, nominal.origin_module));
+                const source_view = self.moduleForId(nominal.owner_module);
                 const source_decl = nominal.source_decl orelse break :blk null;
                 for (source_view.types.nominal_declarations) |decl| {
                     if (decl.source_statement != source_decl) continue;

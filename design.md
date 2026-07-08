@@ -748,6 +748,16 @@ CheckedModuleId =
   + direct_import_checked_module_ids
 ```
 
+The cache id is not merely the module's source bytes plus recursive import
+ids. Source bytes are only one input. The id also includes the compiler build
+hash, the module identity, the checking context identity, and the ordered direct
+import checked module ids. The checking context identity includes import-name
+hashes, resolved import ids, platform requirement context, platform/app
+relation identity, and explicit root requests. Any additional checked tables
+stored in the checked module cache must be deterministic output of those
+checked inputs and the checked modules they name. Such tables are serialized
+data, not new cache-id inputs.
+
 `module_identity` includes the module's name. Canonicalization output is not
 a function of source bytes alone — a type module's main type takes its name
 from the module's file name — so no key or identity derived from module
@@ -762,6 +772,22 @@ runtime behavior or performance of the compiled program, except for debug
 information. Compiling one large module and compiling the same code split across
 imports must produce the same reachable specializations, callable
 representations, layout decisions, ARC statements, and backend behavior.
+
+Checked modules store the target-independent lowering visibility selected by
+checking. This includes the complete checked module id set needed by later
+post-check stages for the module's explicit roots, checked type roots, checked
+type schemes, public API dependencies, type-owner dependencies, and
+platform/app relation closures. The set is duplicate-free and stable. It is
+serialized as relocatable sorted POD slices, with binary-search lookup where a
+map is needed; mutable hash maps may be used only while constructing the checked
+module and must not be the persisted representation.
+
+On a cache hit, the coordinator consumes this lowering visibility directly to
+materialize imported checked module views. It must not rebuild the same set by
+walking checked bodies, checked type roots, checked type schemes, public API
+dependency lists, or platform/app relation closure data. Recomputing that
+visibility during post-check lowering is a producer-boundary bug: the checked
+module cache already owns this target-independent checked information.
 
 The compiler does not cache Monotype IR, Monotype Lifted IR, Lambda Solved IR,
 Lambda Mono decisions, LIR, or any callable/layout representation derived from
@@ -952,6 +978,19 @@ as:
 - opaque, nominal, alias, row, and builtin ownership data
 
 Those data must remain target-independent and representation-free.
+
+Named checked types carry explicit owner identity. The source-origin module
+identity remains the source identity used for `TypeDef`, diagnostics, source
+locations, and name-store interning. Alias and nominal checked payloads also
+carry the checked module id that owns the declaration or representation
+authority. For local named types, that id is the current checked module id; for
+imports, checked type copying preserves the imported owner id; for builtins, it
+is the builtin checked module id.
+
+Monotype and runtime lowering consume the owner checked module id directly as a
+checked module address. If a checked type mentions an owner checked module id
+that is not present in lowering visibility, the checked module producer is
+incomplete.
 
 ### Compile-Time Constants and Hoisted Roots
 
@@ -2419,6 +2458,16 @@ declaration template. Box payload capabilities remain separate explicit
 representation authorities; their backing roots come from the capability entry
 in checked module data instead of from declaration template lookup.
 
+Named type ownership is already decided before Monotype lowering starts. A
+checked alias or nominal payload names its owner checked module id explicitly,
+and the lowering input includes every checked module id recorded in checked
+lowering visibility. Monotype may build a stage-local lookup table from those
+ids to module views for speed, but that lookup is only an address table over
+explicit checked data. The source-origin identity remains part of the lowered
+type definition identity; the owner checked module id is the module address used
+to find checked declarations, representation authorities, method owners, and
+type-store entries.
+
 This solves two classes of bugs:
 
 - generic nominal backings cannot accidentally swap, lose, or default one
@@ -2636,7 +2685,7 @@ Monotype IR has no:
 - source `for` node
 - source row variable requiring closure
 - uninstantiated checked type variable
-- pending owner search
+- missing checked owner address
 
 `FnDef` is the checked identity for a checked, imported, nested, hosted,
 promoted, or checked-stage generated function. It does not contain a capture
@@ -4990,7 +5039,7 @@ The post-check pipeline must not contain:
   patching lowering paths
 - checked-module runtime payloads, value conversion plans, callable-set
   descriptors, or erased ABI decisions
-- owner discovery by method-registry intersection
+- method-registry intersection used as an ownership source
 - backend reference-counting decisions
 - mode, lifetime, or RC-signature data stored in checked modules, LirImage,
   or any structure that outlives ARC insertion
