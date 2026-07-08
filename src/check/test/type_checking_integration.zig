@@ -1465,6 +1465,25 @@ test "check type - alias open tag union" {
     try checkTypesModule(source, .{ .pass = .last_def }, "{} -> MyAlias([C])");
 }
 
+test "check type - alias forward reference in open tag union completes" {
+    // repro for https://github.com/roc-lang/roc/issues/9959
+    const source =
+        \\Repro :: U8
+        \\
+        \\hang : Str -> Foo([])
+        \\hang = |_| { foo: Thing }
+        \\
+        \\Foo(tags) : { foo: Union(tags) }
+        \\
+        \\Union(others) : [Thing, ..others]
+    ;
+
+    var test_env = try TestEnv.init("Repro", source);
+    defer test_env.deinit();
+
+    try test_env.assertNoErrors();
+}
+
 test "check type - alias open record" {
     const source =
         \\main! = |_| {}

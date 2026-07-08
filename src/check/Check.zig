@@ -46,6 +46,14 @@ const ProblemStore = @import("problem.zig").Store;
 
 const Self = @This();
 
+const TypeDeclGenerationState = enum {
+    not_generated,
+    generating,
+    generated,
+};
+
+const no_def_group = std.math.maxInt(u32);
+
 const InterpolationConstraintId = enum(u32) { _ };
 
 const InterpolationConstraintMetadata = struct {
@@ -106,8 +114,8 @@ import_mapping: @import("types").import_mapping.ImportMapping,
 unify_scratch: unifier.Scratch,
 /// reusable scratch arrays used in occurs check
 occurs_scratch: occurs.Scratch,
-/// annos we've already seen when generation a type from an annotation
-seen_annos: std.AutoHashMap(CIR.TypeAnno.Idx, Var),
+/// Type annotation nodes already seen while generating one annotation type.
+seen_annos: std.DynamicBitSetUnmanaged,
 /// A pool of solver envs
 env_pool: EnvPool,
 /// wrapper around generalization, contains some internal state used to do it's work
@@ -130,6 +138,9 @@ rigid_var_substitutions: std.AutoHashMapUnmanaged(Ident.Idx, Var),
 /// Used to resolve rigid vars in local type decl bodies that were not
 /// rewritten as rigid_var_lookup during canonicalization.
 type_decl_rigid_vars: std.AutoHashMapUnmanaged(Ident.Idx, Var),
+/// Type declaration bodies are generated on demand so forward references
+/// instantiate fully generated declarations instead of predeclared shells.
+type_decl_generation_states: std.ArrayListUnmanaged(TypeDeclGenerationState) = .empty,
 /// scratch vars used to build up intermediate lists, used for various things
 scratch_vars: base.Scratch(Var),
 /// scratch tags used to build up intermediate lists, used for various things
@@ -172,8 +183,8 @@ reported_constraint_errors: std.AutoHashMap(ReportedConstraintError, void),
 reported_effectful_expect: std.AutoHashMap(Var, void),
 /// Region of the expect body currently being checked, if any.
 current_expect_region: ?Region,
-/// Map representation all top level patterns, and if we've processed them yet
-top_level_ptrns: std.AutoHashMap(CIR.Pattern.Idx, DefProcessed),
+/// Dense table of top-level patterns, and whether their defs have been processed.
+top_level_ptrns: std.ArrayListUnmanaged(?DefProcessed),
 /// Read-only platform requirement surface used only when checking an app root.
 platform_requirements: ?PlatformRequirementInput,
 /// App defs constrained by platform requirements before their bodies are checked.
@@ -217,7 +228,7 @@ type_writer: types_mod.TypeWriter,
 /// the checked module.
 check_order: ?DependencyGraph.EvaluationOrder = null,
 /// Which check-order group each top-level def belongs to.
-def_group: std.AutoHashMapUnmanaged(CIR.Def.Idx, u32) = .empty,
+def_group: std.ArrayListUnmanaged(u32) = .empty,
 /// Per-group progress; a `.checking` group has a frame on `group_stack`.
 group_states: std.ArrayListUnmanaged(GroupState) = .empty,
 /// Groups currently being checked, outermost first. Nesting happens only at
@@ -242,7 +253,7 @@ pending_dispatch_targets: std.ArrayListUnmanaged(CIR.Def.Idx) = .empty,
 /// generated again, in the body's frame, sharing vars with the body so
 /// dispatch-evidence publication sees one coherent scheme); references after
 /// that use the def's own pattern var as always.
-predeclared_scheme_vars: std.AutoHashMapUnmanaged(CIR.Def.Idx, Var) = .empty,
+predeclared_scheme_vars: std.ArrayListUnmanaged(?Var) = .empty,
 /// The block-local (`s_decl`) analogue of `predeclared_scheme_vars`, keyed by
 /// pattern and live only while the local def is in flight (entries are
 /// removed when the statement finishes).
@@ -507,6 +518,51 @@ const DefProcessed = struct {
     def_name: ?Ident.Idx,
     status: HasProcessed,
 };
+
+fn topLevelPattern(self: *const Self, pattern: CIR.Pattern.Idx) ?DefProcessed {
+    return self.top_level_ptrns.items[nodeSlot(pattern)];
+}
+
+fn setTopLevelPattern(self: *Self, pattern: CIR.Pattern.Idx, value: DefProcessed) void {
+    self.top_level_ptrns.items[nodeSlot(pattern)] = value;
+}
+
+fn patternIsTopLevelDef(self: *const Self, pattern: CIR.Pattern.Idx) bool {
+    return self.topLevelPattern(pattern) != null;
+}
+
+fn defGroupIndex(self: *const Self, def_idx: CIR.Def.Idx) ?u32 {
+    const group_index = self.def_group.items[nodeSlot(def_idx)];
+    return if (group_index == no_def_group) null else group_index;
+}
+
+fn setDefGroupIndex(self: *Self, def_idx: CIR.Def.Idx, group_index: u32) void {
+    self.def_group.items[nodeSlot(def_idx)] = group_index;
+}
+
+fn predeclaredSchemeVar(self: *const Self, def_idx: CIR.Def.Idx) ?Var {
+    return self.predeclared_scheme_vars.items[nodeSlot(def_idx)];
+}
+
+fn setPredeclaredSchemeVar(self: *Self, def_idx: CIR.Def.Idx, scheme_var: Var) void {
+    self.predeclared_scheme_vars.items[nodeSlot(def_idx)] = scheme_var;
+}
+
+fn typeDeclGenerationState(self: *const Self, decl_idx: CIR.Statement.Idx) TypeDeclGenerationState {
+    return self.type_decl_generation_states.items[nodeSlot(decl_idx)];
+}
+
+fn setTypeDeclGenerationState(self: *Self, decl_idx: CIR.Statement.Idx, state: TypeDeclGenerationState) void {
+    self.type_decl_generation_states.items[nodeSlot(decl_idx)] = state;
+}
+
+fn typeAnnoSeen(self: *const Self, anno_idx: CIR.TypeAnno.Idx) bool {
+    return self.seen_annos.isSet(nodeSlot(anno_idx));
+}
+
+fn markTypeAnnoSeen(self: *Self, anno_idx: CIR.TypeAnno.Idx) void {
+    self.seen_annos.set(nodeSlot(anno_idx));
+}
 
 /// A static-dispatch receiver var created by instantiating a constrained
 /// scheme, recorded for the end-of-check constraint fixpoint
@@ -1257,6 +1313,21 @@ fn preflightForTypeChecking(cir: *ModuleEnv) std.mem.Allocator.Error!void {
     }
 }
 
+fn nodeSlot(idx: anytype) usize {
+    return @intFromEnum(ModuleEnv.nodeIdxFrom(idx));
+}
+
+fn initNodeSlots(
+    comptime T: type,
+    allocator: std.mem.Allocator,
+    node_count: usize,
+    value: T,
+) std.mem.Allocator.Error!std.ArrayListUnmanaged(T) {
+    var slots: std.ArrayListUnmanaged(T) = .empty;
+    try slots.appendNTimes(allocator, value, node_count);
+    return slots;
+}
+
 fn initAssumePrepared(
     gpa: std.mem.Allocator,
     types: *types_mod.Store,
@@ -1301,6 +1372,8 @@ fn initAssumePrepared(
     );
     errdefer import_mapping.deinit();
 
+    const node_count: usize = @intCast(cir.store.nodes.len());
+
     const self: Self = .{
         .gpa = gpa,
         .types = types,
@@ -1320,7 +1393,7 @@ fn initAssumePrepared(
         .import_mapping = import_mapping,
         .unify_scratch = try unifier.Scratch.init(gpa),
         .occurs_scratch = try occurs.Scratch.init(gpa),
-        .seen_annos = std.AutoHashMap(CIR.TypeAnno.Idx, Var).init(gpa),
+        .seen_annos = try std.DynamicBitSetUnmanaged.initEmpty(gpa, node_count),
         .env_pool = try EnvPool.init(gpa),
         .generalizer = try Generalizer.init(gpa, types),
         .var_map = std.AutoHashMap(Var, Var).init(gpa),
@@ -1331,6 +1404,7 @@ fn initAssumePrepared(
         .var_set = std.AutoHashMap(Var, void).init(gpa),
         .rigid_var_substitutions = std.AutoHashMapUnmanaged(Ident.Idx, Var){},
         .type_decl_rigid_vars = std.AutoHashMapUnmanaged(Ident.Idx, Var){},
+        .type_decl_generation_states = try initNodeSlots(TypeDeclGenerationState, gpa, node_count, .not_generated),
         .scratch_vars = try base.Scratch(types_mod.Var).init(gpa),
         .scratch_tags = try base.Scratch(types_mod.Tag).init(gpa),
         .scratch_record_fields = try base.Scratch(types_mod.RecordField).init(gpa),
@@ -1348,10 +1422,12 @@ fn initAssumePrepared(
         .reported_constraint_errors = std.AutoHashMap(ReportedConstraintError, void).init(gpa),
         .reported_effectful_expect = std.AutoHashMap(Var, void).init(gpa),
         .current_expect_region = null,
-        .top_level_ptrns = std.AutoHashMap(CIR.Pattern.Idx, DefProcessed).init(gpa),
+        .top_level_ptrns = try initNodeSlots(?DefProcessed, gpa, node_count, null),
         .platform_requirements = null,
         .platform_required_defs = .{},
         .enclosing_func_name = null,
+        .def_group = try initNodeSlots(u32, gpa, node_count, no_def_group),
+        .predeclared_scheme_vars = try initNodeSlots(?Var, gpa, node_count, null),
         // Initialize with null import_mapping - caller should call fixupTypeWriter() after storing Check
         .type_writer = try types_mod.TypeWriter.initFromParts(gpa, types, cir.getIdentStore(), null),
         .value_lookup_tracking = .empty,
@@ -1427,7 +1503,7 @@ pub fn deinit(self: *Self) void {
     self.import_mapping.deinit();
     self.unify_scratch.deinit();
     self.occurs_scratch.deinit();
-    self.seen_annos.deinit();
+    self.seen_annos.deinit(self.gpa);
     if (self.check_order) |*order| order.deinit();
     self.def_group.deinit(self.gpa);
     self.group_states.deinit(self.gpa);
@@ -1469,6 +1545,7 @@ pub fn deinit(self: *Self) void {
     self.var_set.deinit();
     self.rigid_var_substitutions.deinit(self.gpa);
     self.type_decl_rigid_vars.deinit(self.gpa);
+    self.type_decl_generation_states.deinit(self.gpa);
     self.scratch_vars.deinit();
     self.scratch_tags.deinit();
     self.scratch_record_fields.deinit();
@@ -1484,7 +1561,7 @@ pub fn deinit(self: *Self) void {
     self.interpolation_constraint_metadata.deinit(self.gpa);
     self.reported_constraint_errors.deinit();
     self.reported_effectful_expect.deinit();
-    self.top_level_ptrns.deinit();
+    self.top_level_ptrns.deinit(self.gpa);
     self.platform_required_defs.deinit(self.gpa);
     self.local_processing_ptrns.deinit(self.gpa);
     self.type_writer.deinit();
@@ -2842,7 +2919,7 @@ test "hoist known value insertion rolls back map when scope tracking allocation 
 }
 
 fn patternIsTopLevel(self: *Self, pattern: CIR.Pattern.Idx) bool {
-    return self.top_level_ptrns.contains(pattern);
+    return self.patternIsTopLevelDef(pattern);
 }
 
 fn exprCanBeHoistedRoot(self: *Self, expr: CIR.Expr.Idx) bool {
@@ -5175,11 +5252,8 @@ fn checkFileInternal(self: *Self, skip_numeric_defaults: bool) std.mem.Allocator
         const stmt_var = ModuleEnv.varFrom(stmt_idx);
 
         switch (stmt) {
-            .s_alias_decl => |alias| {
-                try self.generateAliasDecl(stmt_idx, stmt_var, alias, &env);
-            },
-            .s_nominal_decl => |nominal| {
-                try self.generateNominalDecl(stmt_idx, stmt_var, nominal, &env);
+            .s_alias_decl, .s_nominal_decl => {
+                _ = try self.ensureTypeDeclGenerated(stmt_idx, &env);
             },
             .s_runtime_error => {
                 try self.setVarRank(stmt_var, &env);
@@ -5200,7 +5274,7 @@ fn checkFileInternal(self: *Self, skip_numeric_defaults: bool) std.mem.Allocator
     for (0..self.cir.all_defs.span.len) |def_offset| {
         const def_idx = self.cir.store.defAt(self.cir.all_defs, def_offset);
         const def = self.cir.store.getDef(def_idx);
-        try self.top_level_ptrns.put(def.pattern, DefProcessed{
+        self.setTopLevelPattern(def.pattern, DefProcessed{
             .def_idx = def_idx,
             .def_name = null,
             .status = .not_processed,
@@ -7584,7 +7658,7 @@ fn exprHasEffectfulFunctionBody(self: *const Self, expr_idx: CIR.Expr.Idx) bool 
 /// stack — mid-check, or checked but suspended at its boundary, so its
 /// members' vars are not yet generalized.
 fn defInOnStackGroup(self: *const Self, def_idx: CIR.Def.Idx) bool {
-    const group_index = self.def_group.get(def_idx) orelse return false;
+    const group_index = self.defGroupIndex(def_idx) orelse return false;
     for (self.group_stack.items) |frame| {
         if (frame.group_index == group_index) return true;
     }
@@ -7607,7 +7681,7 @@ fn callTargetIsInFlightRecursiveRef(self: *const Self, func_expr_idx: CIR.Expr.I
         else => return false,
     };
     if (self.local_processing_ptrns.contains(pattern_idx)) return true;
-    const processing_def = self.top_level_ptrns.get(pattern_idx) orelse return false;
+    const processing_def = self.topLevelPattern(pattern_idx) orelse return false;
     return switch (processing_def.status) {
         .processing => true,
         .not_processed, .processed => self.defInOnStackGroup(processing_def.def_idx),
@@ -8409,7 +8483,7 @@ pub fn checkExprReplWithDefs(self: *Self, expr_idx: CIR.Expr.Idx) std.mem.Alloca
     for (0..self.cir.all_defs.span.len) |def_offset| {
         const def_idx = self.cir.store.defAt(self.cir.all_defs, def_offset);
         const def = self.cir.store.getDef(def_idx);
-        try self.top_level_ptrns.put(def.pattern, DefProcessed{
+        self.setTopLevelPattern(def.pattern, DefProcessed{
             .def_idx = def_idx,
             .def_name = null,
             .status = .not_processed,
@@ -8480,7 +8554,7 @@ fn checkDef(self: *Self, def_idx: CIR.Def.Idx, env: *Env) std.mem.Allocator.Erro
 
     const def = self.cir.store.getDef(def_idx);
 
-    if (self.top_level_ptrns.get(def.pattern)) |processing_def| {
+    if (self.topLevelPattern(def.pattern)) |processing_def| {
         if (processing_def.status == .processed) {
             // If we've already processed this def, return immediately
             return;
@@ -8504,7 +8578,7 @@ fn checkDef(self: *Self, def_idx: CIR.Def.Idx, env: *Env) std.mem.Allocator.Erro
 
     // Make as processing
     const def_name = self.getPatternIdent(def.pattern);
-    try self.top_level_ptrns.put(def.pattern, .{
+    self.setTopLevelPattern(def.pattern, .{
         .def_idx = def_idx,
         .def_name = def_name,
         .status = .processing,
@@ -8611,7 +8685,7 @@ fn checkDef(self: *Self, def_idx: CIR.Def.Idx, env: *Env) std.mem.Allocator.Erro
     }
 
     // Mark as processed
-    try self.top_level_ptrns.put(def.pattern, .{
+    self.setTopLevelPattern(def.pattern, .{
         .def_idx = def_idx,
         .def_name = def_name,
         .status = .processed,
@@ -8631,7 +8705,7 @@ fn setupCheckOrder(self: *Self) std.mem.Allocator.Error!void {
     try self.group_states.appendNTimes(self.gpa, .pending, sccs.len);
     for (sccs, 0..) |scc, group_index| {
         for (scc.defs) |def_idx| {
-            try self.def_group.put(self.gpa, def_idx, @intCast(group_index));
+            self.setDefGroupIndex(def_idx, @intCast(group_index));
         }
     }
 }
@@ -8649,7 +8723,7 @@ fn predeclareAnnotatedDefSchemes(self: *Self, env: *Env) std.mem.Allocator.Error
         const annotation_idx = def.annotation orelse continue;
         if (!(try self.annotationIsPredeclarableScheme(def.pattern, annotation_idx))) continue;
         const scheme_var = try self.predeclareAnnotationScheme(annotation_idx, env);
-        try self.predeclared_scheme_vars.put(self.gpa, def_idx, scheme_var);
+        self.setPredeclaredSchemeVar(def_idx, scheme_var);
     }
 }
 
@@ -8838,7 +8912,7 @@ fn defInCurrentRecursiveGroup(self: *const Self, def_idx: CIR.Def.Idx) bool {
     if (self.group_stack.items.len == 0) return false;
     const frame = self.group_stack.items[self.group_stack.items.len - 1];
     if (!self.check_order.?.sccs[frame.group_index].is_recursive) return false;
-    const group_index = self.def_group.get(def_idx) orelse return false;
+    const group_index = self.defGroupIndex(def_idx) orelse return false;
     return group_index == frame.group_index;
 }
 
@@ -8933,7 +9007,7 @@ fn checkGroup(self: *Self, group_index: u32, env: *Env) std.mem.Allocator.Error!
 
         for (scc.defs) |member_def_idx| {
             const member_def = self.cir.store.getDef(member_def_idx);
-            if (!self.predeclared_scheme_vars.contains(member_def_idx) and
+            if (self.predeclaredSchemeVar(member_def_idx) == null and
                 isFunctionDef(&self.cir.store, self.cir.store.getExpr(member_def.expr)))
             {
                 // An unannotated member's top-level RHS lives in the group
@@ -9006,7 +9080,7 @@ fn resolveGroupPendingDispatchTargets(self: *Self, env: *Env) std.mem.Allocator.
     while (self.pending_dispatch_targets.items.len > top) {
         while (self.pending_dispatch_targets.items.len > top) {
             const target_def = self.pending_dispatch_targets.pop().?;
-            const target_group = self.def_group.get(target_def).?;
+            const target_group = self.defGroupIndex(target_def).?;
             try self.ensureGroupsCheckedUpTo(target_group, env);
         }
         try self.checkStaticDispatchConstraints(env, false);
@@ -9068,6 +9142,40 @@ fn generateStmtTypeDeclType(
             // Do nothing
         },
     }
+}
+
+fn ensureTypeDeclGenerated(
+    self: *Self,
+    decl_idx: CIR.Statement.Idx,
+    env: *Env,
+) std.mem.Allocator.Error!bool {
+    switch (self.typeDeclGenerationState(decl_idx)) {
+        .generated => return true,
+        .generating => return switch (self.cir.store.getStatement(decl_idx)) {
+            .s_alias_decl => false,
+            .s_nominal_decl => true,
+            else => true,
+        },
+        .not_generated => {},
+    }
+
+    self.setTypeDeclGenerationState(decl_idx, .generating);
+    errdefer self.setTypeDeclGenerationState(decl_idx, .not_generated);
+
+    const outer_seen_annos = self.seen_annos;
+    const outer_type_decl_rigid_vars = self.type_decl_rigid_vars;
+    self.seen_annos = try std.DynamicBitSetUnmanaged.initEmpty(self.gpa, @intCast(self.cir.store.nodes.len()));
+    self.type_decl_rigid_vars = .{};
+    defer {
+        self.seen_annos.deinit(self.gpa);
+        self.seen_annos = outer_seen_annos;
+        self.type_decl_rigid_vars.deinit(self.gpa);
+        self.type_decl_rigid_vars = outer_type_decl_rigid_vars;
+    }
+
+    try self.generateStmtTypeDeclType(decl_idx, env);
+    self.setTypeDeclGenerationState(decl_idx, .generated);
+    return true;
 }
 
 fn aliasOriginModule(self: *const Self) base.ModuleIdentity.Idx {
@@ -9181,7 +9289,7 @@ fn generateAliasDecl(
 
     // Now we have a built of list of rigid variables for the decl lhs (header).
     // With this in hand, we can now generate the type for the lhs (body).
-    self.seen_annos.clearRetainingCapacity();
+    self.seen_annos.unsetAll();
     const backing_var: Var = ModuleEnv.varFrom(alias.anno);
     try self.generateAnnoTypeInPlace(alias.anno, env, .{ .type_decl = .{
         .idx = decl_idx,
@@ -9243,7 +9351,7 @@ fn generateNominalDecl(
 
     // Now we have a built of list of rigid variables for the decl lhs (header).
     // With this in hand, we can now generate the type for the lhs (body).
-    self.seen_annos.clearRetainingCapacity();
+    self.seen_annos.unsetAll();
     const backing_var: Var = ModuleEnv.varFrom(nominal.anno);
     try self.generateAnnoTypeInPlace(nominal.anno, env, .{ .type_decl = .{
         .idx = decl_idx,
@@ -9267,7 +9375,7 @@ fn generateStandaloneTypeAnno(
     defer trace.end();
 
     // Reset seen type annos
-    self.seen_annos.clearRetainingCapacity();
+    self.seen_annos.unsetAll();
 
     // Save top of scratch static dispatch constraints
     const scratch_static_dispatch_constraints_top = self.scratch_static_dispatch_constraints.top();
@@ -9361,7 +9469,7 @@ fn generateAnnotationType(self: *Self, annotation_idx: CIR.Annotation.Idx, env: 
     const annotation = self.cir.store.getAnnotation(annotation_idx);
 
     // Reset seen type annos
-    self.seen_annos.clearRetainingCapacity();
+    self.seen_annos.unsetAll();
 
     // Save top of scratch static dispatch constraints
     const scratch_static_dispatch_constraints_top = self.scratch_static_dispatch_constraints.top();
@@ -9454,7 +9562,7 @@ fn generateAnnoTypeInPlace(self: *Self, anno_idx: CIR.TypeAnno.Idx, env: *Env, c
 
     // First, check if we've seen this anno before
     // This guards against recursive types
-    if (self.seen_annos.get(anno_idx)) |_| {
+    if (self.typeAnnoSeen(anno_idx)) {
         return;
     }
 
@@ -9465,7 +9573,7 @@ fn generateAnnoTypeInPlace(self: *Self, anno_idx: CIR.TypeAnno.Idx, env: *Env, c
     try self.setVarRank(anno_var, env);
 
     // Put this anno in the "seen" map immediately, to support recursive references
-    try self.seen_annos.put(anno_idx, anno_var);
+    self.markTypeAnnoSeen(anno_idx);
 
     switch (anno) {
         .rigid_var => |rigid| {
@@ -9574,6 +9682,14 @@ fn generateAnnoTypeInPlace(self: *Self, anno_idx: CIR.TypeAnno.Idx, env: *Env, c
                     if (is_for_clause_alias) {
                         _ = try self.unify(anno_var, local_decl_var, env);
                     } else {
+                        if (!try self.ensureTypeDeclGenerated(local.decl_idx, env)) {
+                            _ = try self.problems.appendProblem(self.gpa, .{ .recursive_alias = .{
+                                .type_name = lookup.name,
+                                .region = anno_region,
+                            } });
+                            try self.unifyWith(anno_var, .err, env);
+                            return;
+                        }
                         const instantiated_var = try self.instantiateVar(local_decl_var, env, .{ .explicit = anno_region });
                         _ = try self.unify(anno_var, instantiated_var, env);
                     }
@@ -9670,6 +9786,15 @@ fn generateAnnoTypeInPlace(self: *Self, anno_idx: CIR.TypeAnno.Idx, env: *Env, c
                             // Otherwise, we're in an annotation and this cannot
                             // be recursive
                         },
+                    }
+
+                    if (!try self.ensureTypeDeclGenerated(local.decl_idx, env)) {
+                        _ = try self.problems.appendProblem(self.gpa, .{ .recursive_alias = .{
+                            .type_name = a.name,
+                            .region = anno_region,
+                        } });
+                        try self.unifyWith(anno_var, .err, env);
+                        return;
                     }
 
                     // Resolve the referenced type
@@ -11931,7 +12056,7 @@ fn checkExpr(self: *Self, expr_idx: CIR.Expr.Idx, env: *Env, expected: Expected)
                 .pattern_idx = lookup.pattern_idx,
             });
 
-            const mb_processing_def = self.top_level_ptrns.get(lookup.pattern_idx);
+            const mb_processing_def = self.topLevelPattern(lookup.pattern_idx);
             if (mb_processing_def) |processing_def| {
                 const referenced_def = self.cir.store.getDef(processing_def.def_idx);
                 // A reference to an annotated def whose body has not been
@@ -11939,7 +12064,7 @@ fn checkExpr(self: *Self, expr_idx: CIR.Expr.Idx, env: *Env, expected: Expected)
                 // uniform rule: annotated references never need the body.
                 // (Once the def is `.processed`, its own pattern var carries
                 // the checked scheme and the ordinary tail below applies.)
-                const mb_predeclared_scheme = self.predeclared_scheme_vars.get(processing_def.def_idx);
+                const mb_predeclared_scheme = self.predeclaredSchemeVar(processing_def.def_idx);
 
                 switch (processing_def.status) {
                     .not_processed => {
@@ -13174,7 +13299,7 @@ fn validateToInspectMethodTypeForArg(
 
 fn exprIsTopLevelLookup(self: *Self, expr_idx: CIR.Expr.Idx) bool {
     return switch (self.cir.store.getExpr(expr_idx)) {
-        .e_lookup_local => |lookup| self.top_level_ptrns.contains(lookup.pattern_idx),
+        .e_lookup_local => |lookup| self.patternIsTopLevelDef(lookup.pattern_idx),
         else => false,
     };
 }
@@ -18116,10 +18241,10 @@ fn checkStaticDispatchConstraints(self: *Self, env: *Env, is_numeric_default_pas
                         // Check if we've processed this def already. An
                         // annotated def whose body is unchecked or in flight
                         // resolves through its pre-declared scheme instead.
-                        const mb_processing_def = self.top_level_ptrns.get(def.pattern);
+                        const mb_processing_def = self.topLevelPattern(def.pattern);
                         if (mb_processing_def) |processing_def| {
                             std.debug.assert(processing_def.def_idx == def_idx);
-                            const mb_predeclared_scheme = self.predeclared_scheme_vars.get(def_idx);
+                            const mb_predeclared_scheme = self.predeclaredSchemeVar(def_idx);
                             switch (processing_def.status) {
                                 .not_processed => if (mb_predeclared_scheme) |scheme_var| {
                                     predeclared_scheme_for_method = scheme_var;
@@ -18409,10 +18534,10 @@ fn checkStaticDispatchConstraints(self: *Self, env: *Env, is_numeric_default_pas
                         // unannotated unchecked targets are recorded for the
                         // group boundary; in-flight unannotated targets link
                         // monomorphically (the binding-group recursion rule).
-                        const mb_processing_def = self.top_level_ptrns.get(def.pattern);
+                        const mb_processing_def = self.topLevelPattern(def.pattern);
                         if (mb_processing_def) |processing_def| {
                             std.debug.assert(processing_def.def_idx == def_idx);
-                            const mb_predeclared_scheme = self.predeclared_scheme_vars.get(def_idx);
+                            const mb_predeclared_scheme = self.predeclaredSchemeVar(def_idx);
                             switch (processing_def.status) {
                                 .not_processed => if (mb_predeclared_scheme) |scheme_var| {
                                     predeclared_scheme_for_method = scheme_var;
