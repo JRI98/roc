@@ -45,7 +45,7 @@ pub fn run(store: *LirStore) ResourceError!void {
     };
     defer pass.variants.deinit();
 
-    const proc_count = store.proc_specs.items.len;
+    const proc_count = store.procSpecCount();
     var proc_index: usize = 0;
     while (proc_index < proc_count) : (proc_index += 1) {
         try pass.transformProc(@enumFromInt(proc_index));
@@ -304,7 +304,7 @@ const BodyCloner = struct {
     new_locals: std.ArrayList(LocalId),
 
     fn init(store: *LirStore, accumulator: LocalId) ResourceError!BodyCloner {
-        const local_map = try store.allocator.alloc(?LocalId, store.locals.items.len);
+        const local_map = try store.allocator.alloc(?LocalId, store.localCount());
         @memset(local_map, null);
         return .{
             .store = store,

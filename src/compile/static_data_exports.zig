@@ -233,9 +233,9 @@ const StaticDataBuilder = struct {
     }
 
     fn staticDataConstNode(self: *StaticDataBuilder, value: lir.Program.StaticDataValue) ConstNode {
-        const module = self.moduleForConst(value.const_ref);
+        const module = self.moduleForConst(value.const_locator);
         if (value.node) |node| return .{ .module = module, .id = node };
-        const template = module.templates.get(value.const_ref);
+        const template = module.templates.get(value.const_locator);
         return switch (template.state) {
             .stored_const => |stored| .{ .module = module, .id = stored.node },
             .reserved,

@@ -790,7 +790,7 @@ test "reachable proc pass marks static data callable plans" {
     try result.const_plans.append(std.testing.allocator, .{ .erased_fn = erased_set });
     const static_data: LIR.StaticDataId = @enumFromInt(@as(u32, @intCast(result.static_data_values.items.len)));
     try result.static_data_values.append(std.testing.allocator, .{
-        .const_ref = .{
+        .const_locator = .{
             .artifact = .{},
             .owner = .{
                 .top_level_binding = .{
@@ -899,7 +899,7 @@ test "reachable proc pass marks finite callable capture plans" {
     try result.const_plans.append(std.testing.allocator, .{ .fn_value = fn_set });
     const static_data: LIR.StaticDataId = @enumFromInt(@as(u32, @intCast(result.static_data_values.items.len)));
     try result.static_data_values.append(std.testing.allocator, .{
-        .const_ref = .{
+        .const_locator = .{
             .artifact = .{},
             .owner = .{
                 .top_level_binding = .{

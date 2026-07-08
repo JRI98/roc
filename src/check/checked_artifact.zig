@@ -22542,6 +22542,9 @@ pub const ConstRef = struct {
     source_scheme: canonical.CanonicalTypeSchemeKey,
 };
 
+/// Public checked constant locator declaration.
+pub const ConstLocator = ConstRef;
+
 /// Return the checked module id that owns a compile-time constant.
 pub fn constModuleId(ref: ConstRef) ModuleId {
     return ref.artifact;

@@ -1286,7 +1286,7 @@ const Lowerer = struct {
         const source = GuardedList.at(self.solved.lifted.static_data_values.unsafeRawItemsForView(), raw);
         const result_id: LIR.StaticDataId = @enumFromInt(@as(u32, @intCast(self.result.static_data_values.items.len)));
         try self.result.static_data_values.append(self.allocator, .{
-            .const_ref = source.const_ref,
+            .const_locator = source.const_locator,
             .node = source.node,
             .checked_type = source.checked_type,
             .layout_idx = layout_idx,

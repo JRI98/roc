@@ -45,7 +45,7 @@ pub fn run(store: *LirStore, layouts: *layout_mod.Store) ResourceError!void {
     };
     defer pass.variants.deinit();
 
-    const proc_count = store.proc_specs.items.len;
+    const proc_count = store.procSpecCount();
     var proc_index: usize = 0;
     while (proc_index < proc_count) : (proc_index += 1) {
         try pass.transformProc(@enumFromInt(proc_index));
@@ -321,7 +321,7 @@ const BodyCloner = struct {
     new_locals: std.ArrayList(LocalId),
 
     fn init(store: *LirStore, out_ptr: LocalId, store_unit: LocalId) ResourceError!BodyCloner {
-        const local_map = try store.allocator.alloc(?LocalId, store.locals.items.len);
+        const local_map = try store.allocator.alloc(?LocalId, store.localCount());
         @memset(local_map, null);
         return .{
             .store = store,
@@ -885,11 +885,11 @@ test "return slot shares one variant for identical proc and layout demands" {
         .ret_layout = .zst,
     });
 
-    const before_proc_count = store.proc_specs.items.len;
+    const before_proc_count = store.procSpecCount();
     try run(&store, &layouts);
 
     const rewritten_a = store.getCFStmt(call_a).assign_call;
     const rewritten_b = store.getCFStmt(call_b).assign_call;
     try std.testing.expectEqual(rewritten_a.proc, rewritten_b.proc);
-    try std.testing.expectEqual(@as(usize, before_proc_count + 1), store.proc_specs.items.len);
+    try std.testing.expectEqual(@as(usize, before_proc_count + 1), store.procSpecCount());
 }

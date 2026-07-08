@@ -1333,7 +1333,7 @@ fn writeProvidedDataExport(hasher: *std.crypto.hash.sha2.Sha256, data: checked.P
 }
 
 fn writeStaticDataRequest(hasher: *std.crypto.hash.sha2.Sha256, request: Common.StaticDataRequest) void {
-    writeConstData(hasher, request.const_ref);
+    writeConstData(hasher, request.const_locator);
     writeOptionalConstNodeId(hasher, request.node);
     writeCheckedTypeId(hasher, request.checked_type);
 }

@@ -42,7 +42,7 @@ pub const ResourceError = Allocator.Error;
 
 /// Rewrite eligible box unwrap/update pairs to direct box reuse helper calls.
 pub fn run(store: *LirStore, layouts: *layout_mod.Store) ResourceError!void {
-    const proc_count = store.proc_specs.items.len;
+    const proc_count = store.procSpecCount();
     var proc_index: usize = 0;
     while (proc_index < proc_count) : (proc_index += 1) {
         const proc_id: LIR.LirProcSpecId = @enumFromInt(proc_index);
@@ -269,7 +269,8 @@ const Transform = struct {
             unique_len += 1;
         }
 
-        self.store.getProcSpecPtr(self.proc_id).frame_locals = try self.store.addLocalSpan(merged.items[0..unique_len]);
+        const frame_locals = try self.store.addLocalSpan(merged.items[0..unique_len]);
+        self.store.getProcSpecPtr(self.proc_id).frame_locals = frame_locals;
     }
 
     fn localIdLessThan(_: void, a: LocalId, b: LocalId) bool {
