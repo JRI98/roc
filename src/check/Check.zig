@@ -8674,7 +8674,7 @@ fn predeclareAnnotatedDefSchemes(self: *Self, env: *Env) std.mem.Allocator.Error
         const def_idx = self.cir.store.defAt(self.cir.all_defs, def_offset);
         const def = self.cir.store.getDef(def_idx);
         const annotation_idx = def.annotation orelse continue;
-        if (!(try self.annotationIsPredeclarableScheme(def.pattern, annotation_idx))) continue;
+        if (!self.annotationIsPredeclarableScheme(def.pattern, annotation_idx)) continue;
         const scheme_var = try self.predeclareAnnotationScheme(annotation_idx, env);
         self.setPredeclaredSchemeVar(def_idx, scheme_var);
     }
@@ -8689,9 +8689,9 @@ fn annotationIsPredeclarableScheme(
     self: *Self,
     pattern_idx: CIR.Pattern.Idx,
     annotation_idx: CIR.Annotation.Idx,
-) std.mem.Allocator.Error!bool {
+) bool {
     if (self.cir.store.getPattern(pattern_idx) != .assign) return false;
-    return !(try self.annotationContainsUnderscore(annotation_idx));
+    return !self.cir.store.getAnnotation(annotation_idx).contains_underscore;
 }
 
 /// Build a standalone generalized scheme from an annotation, leaving the
@@ -8744,20 +8744,6 @@ fn resetAnnotationNodes(self: *Self, annotation_idx: CIR.Annotation.Idx) std.mem
     for (nodes.items) |anno_idx| {
         try self.types.resetVarToUnbound(ModuleEnv.varFrom(anno_idx), Rank.outermost);
     }
-}
-
-/// Whether the annotation's type (or any of its where-clause method
-/// signatures) contains an `_` inference hole.
-fn annotationContainsUnderscore(self: *Self, annotation_idx: CIR.Annotation.Idx) std.mem.Allocator.Error!bool {
-    var stack_allocator_state = std.heap.stackFallback(1024, self.gpa);
-    const stack_allocator = stack_allocator_state.get();
-    var nodes: std.ArrayList(CIR.TypeAnno.Idx) = .empty;
-    defer nodes.deinit(stack_allocator);
-    try self.collectAnnotationTypeAnnos(annotation_idx, &nodes, stack_allocator);
-    for (nodes.items) |anno_idx| {
-        if (self.cir.store.getTypeAnno(anno_idx) == .underscore) return true;
-    }
-    return false;
 }
 
 /// Collect every TypeAnno node in an annotation — its type tree plus its
@@ -13899,7 +13885,7 @@ fn checkBlockStatements(self: *Self, statements: CIR.Statement.Span, env: *Env, 
                 const decl_predeclared = decl_is_fn and decl_stmt.anno != null and
                     self.cir.store.getPattern(decl_stmt.pattern) == .assign and
                     !self.cir.store.getAnnotation(decl_stmt.anno.?).mentions_type_var and
-                    !(try self.annotationContainsUnderscore(decl_stmt.anno.?));
+                    !self.cir.store.getAnnotation(decl_stmt.anno.?).contains_underscore;
                 if (decl_predeclared) {
                     const scheme_var = try self.predeclareAnnotationScheme(decl_stmt.anno.?, env);
                     try self.predeclared_local_scheme_vars.put(self.gpa, decl_stmt.pattern, scheme_var);

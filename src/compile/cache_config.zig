@@ -42,7 +42,8 @@ pub const Constants = struct {
     /// 17: Numeral literals carry materialization metadata.
     /// 18: Exact-numeral pipeline: parser-owned numeral digit tables, the
     ///     exact-numeral pattern node, and NumeralInfo constraint payloads.
-    pub const CACHE_VERSION = 18;
+    /// 19: Annotation node payload records a precomputed `contains_underscore` flag.
+    pub const CACHE_VERSION = 19;
 };
 
 /// Configuration for the Roc cache system.

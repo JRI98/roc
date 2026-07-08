@@ -2054,6 +2054,7 @@ pub fn getAnnotation(store: *const NodeStore, annotation: CIR.Annotation.Idx) CI
         .where = where_clause,
         .mentions_type_var = p.mentions_type_var,
         .introduces_type_var = p.introduces_type_var,
+        .contains_underscore = p.contains_underscore,
     };
 }
 
@@ -3312,6 +3313,7 @@ pub fn addAnnotation(store: *NodeStore, annotation: CIR.Annotation, region: base
     // off the annotation rather than re-walking the type tree (see getAnnotation).
     const mentions_type_var = store.typeAnnoHasTypeVar(annotation.anno, .any);
     const introduces_type_var = store.typeAnnoHasTypeVar(annotation.anno, .introduced_only);
+    const contains_underscore = store.annotationContainsUnderscore(annotation.anno, annotation.where);
 
     if (annotation.where) |where_clause| {
         const where_span2_idx: u32 = @intCast(store.span2_data.len());
@@ -3325,6 +3327,7 @@ pub fn addAnnotation(store: *NodeStore, annotation: CIR.Annotation, region: base
             .has_where = true,
             .mentions_type_var = mentions_type_var,
             .introduces_type_var = introduces_type_var,
+            .contains_underscore = contains_underscore,
         } });
     } else {
         node.setPayload(.{ .annotation = .{
@@ -3333,6 +3336,7 @@ pub fn addAnnotation(store: *NodeStore, annotation: CIR.Annotation, region: base
             .has_where = false,
             .mentions_type_var = mentions_type_var,
             .introduces_type_var = introduces_type_var,
+            .contains_underscore = contains_underscore,
         } });
     }
 
@@ -3379,6 +3383,54 @@ fn typeAnnoHasTypeVar(store: *const NodeStore, anno_idx: CIR.TypeAnno.Idx, compt
 fn anyTypeAnnoHasTypeVar(store: *const NodeStore, annos: CIR.TypeAnno.Span, comptime scan: TypeVarScan) bool {
     for (store.sliceTypeAnnos(annos)) |anno_idx| {
         if (store.typeAnnoHasTypeVar(anno_idx, scan)) return true;
+    }
+    return false;
+}
+
+/// Returns true if the annotation contains an `_` inference hole — in its type
+/// tree (`anno`) or in any where-clause method signature. Derived once by
+/// `addAnnotation` so the check phase can read `Annotation.contains_underscore`
+/// instead of re-walking the tree.
+fn annotationContainsUnderscore(store: *const NodeStore, anno_idx: CIR.TypeAnno.Idx, where: ?CIR.WhereClause.Span) bool {
+    if (store.typeAnnoContainsUnderscore(anno_idx)) return true;
+    if (where) |where_span| {
+        for (store.sliceWhereClauses(where_span)) |where_idx| {
+            switch (store.getWhereClause(where_idx)) {
+                .w_method => |method| {
+                    if (store.typeAnnoContainsUnderscore(method.var_)) return true;
+                    if (store.anyTypeAnnoContainsUnderscore(method.args)) return true;
+                    if (store.typeAnnoContainsUnderscore(method.ret)) return true;
+                },
+                .w_alias, .w_malformed => {},
+            }
+        }
+    }
+    return false;
+}
+
+fn typeAnnoContainsUnderscore(store: *const NodeStore, anno_idx: CIR.TypeAnno.Idx) bool {
+    return switch (store.getTypeAnno(anno_idx)) {
+        .underscore => true,
+        .rigid_var, .rigid_var_lookup, .lookup, .malformed => false,
+        .apply => |a| store.anyTypeAnnoContainsUnderscore(a.args),
+        .tag_union => |tu| store.anyTypeAnnoContainsUnderscore(tu.tags) or
+            (if (tu.ext) |ext| store.typeAnnoContainsUnderscore(ext) else false),
+        .tag => |t| store.anyTypeAnnoContainsUnderscore(t.args),
+        .tuple => |t| store.anyTypeAnnoContainsUnderscore(t.elems),
+        .record => |r| blk: {
+            for (store.sliceAnnoRecordFields(r.fields)) |field_idx| {
+                if (store.typeAnnoContainsUnderscore(store.getAnnoRecordField(field_idx).ty)) break :blk true;
+            }
+            break :blk if (r.ext) |ext| store.typeAnnoContainsUnderscore(ext) else false;
+        },
+        .@"fn" => |f| store.anyTypeAnnoContainsUnderscore(f.args) or store.typeAnnoContainsUnderscore(f.ret),
+        .parens => |p| store.typeAnnoContainsUnderscore(p.anno),
+    };
+}
+
+fn anyTypeAnnoContainsUnderscore(store: *const NodeStore, annos: CIR.TypeAnno.Span) bool {
+    for (store.sliceTypeAnnos(annos)) |anno_idx| {
+        if (store.typeAnnoContainsUnderscore(anno_idx)) return true;
     }
     return false;
 }

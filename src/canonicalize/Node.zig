@@ -1045,7 +1045,9 @@ pub const Payload = extern union {
         /// Whether the annotation *introduces* a type variable (`.rigid_var`), as
         /// opposed to only referencing one from an enclosing scope.
         introduces_type_var: bool,
-        _padding: [1]u8 = .{0},
+        /// Whether the annotation (its type tree or any where-clause method
+        /// signature) contains an `_` inference hole.
+        contains_underscore: bool,
     };
 
     // === Diagnostic payload structs ===
@@ -1151,9 +1153,9 @@ pub const Payload = extern union {
     // Compile-time size verification
     comptime {
         std.debug.assert(@sizeOf(Payload) == 16);
-        // anno + where_span2_idx (2 x u32) + 3 bool flags + 1 byte padding. The
-        // explicit `_padding` keeps the trailing byte defined for deterministic
-        // serialization; assert the size so a stray field can't silently grow it.
+        // anno + where_span2_idx (2 x u32) + 4 bool flags. The four bools fill
+        // the trailing 4 bytes exactly (no padding); assert the size so a stray
+        // field can't silently grow it.
         std.debug.assert(@sizeOf(Annotation) == 12);
     }
 };
