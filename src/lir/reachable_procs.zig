@@ -6,6 +6,7 @@
 
 const std = @import("std");
 const base = @import("base");
+const check = @import("check");
 const collections = @import("collections");
 const core = @import("lir_core");
 
@@ -868,7 +869,7 @@ test "reachable proc pass marks finite callable capture plans" {
 
     const finite_captures = try std.testing.allocator.alloc(LirProgram.CaptureSlot, 1);
     finite_captures[0] = .{
-        .id = .{ .generated = 0 },
+        .id = check.ConstStore.CaptureId.generatedLift(0),
         .slot = 0,
         .ty = undefined, // Reachability tests do not inspect checked capture types.
         .plan = erased_plan,

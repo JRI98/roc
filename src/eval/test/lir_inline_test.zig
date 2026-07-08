@@ -1089,6 +1089,7 @@ fn markReachableLiftedExpr(
         },
         .field_access => |field| markReachableLiftedExpr(program, field.receiver, reachable),
         .tuple_access => |access| markReachableLiftedExpr(program, access.tuple, reachable),
+        .static_data_candidate => |candidate| markReachableLiftedExpr(program, candidate.runtime_expr, reachable),
         .structural_eq => |eq| {
             markReachableLiftedExpr(program, eq.lhs, reachable);
             markReachableLiftedExpr(program, eq.rhs, reachable);
@@ -3200,7 +3201,7 @@ fn reachableReturnSlotProcCount(
         const args = lowered.lir_result.store.getLocalSpan(proc.args);
         if (proc.ret_layout == .zst and args.len != 0) candidate: {
             const first_arg_layout = lowered.lir_result.layouts.getLayout(
-                lowered.lir_result.store.getLocal(args[0]).layout_idx,
+                lowered.lir_result.store.getLocal(GuardedList.at(args, 0)).layout_idx,
             );
             if (first_arg_layout.tag != .ptr) break :candidate;
             const result_layout = lowered.lir_result.layouts.getLayout(first_arg_layout.getIdx());
@@ -5267,13 +5268,15 @@ test "spec constr keeps a same-binder scalar distinct from a substituted aggrega
     // The input program has no tuple nested directly inside another tuple, so a
     // nested tuple after specialization means the substituted aggregate leaked
     // into the scalar slot.
-    for (lifted.exprs.items) |expr| {
+    for (lifted.exprsView()) |expr| {
         const items = switch (expr.data) {
             .tuple => |items| items,
             else => continue,
         };
-        for (lifted.exprSpan(items)) |item| {
-            switch (lifted.exprs.items[@intFromEnum(item)].data) {
+        const tuple_items = lifted.exprSpan(items);
+        for (0..tuple_items.len) |index| {
+            const item = GuardedList.at(tuple_items, index);
+            switch (lifted.getExpr(item).data) {
                 .tuple => return error.SubstitutedAggregateLeakedIntoScalar,
                 else => {},
             }

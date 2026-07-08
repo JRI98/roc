@@ -29,6 +29,7 @@ const layout_mod = @import("layout");
 
 const LIR = core.LIR;
 const LirStore = core.LirStore;
+const GuardedList = LirStore.GuardedList;
 const CFStmtId = LIR.CFStmtId;
 const LocalId = LIR.LocalId;
 const LowLevelOp = LIR.LowLevel;
@@ -106,8 +107,8 @@ const ReturnSlotPass = struct {
 
         const store_args = self.store.getLocalSpan(store_stmt.args);
         if (store_args.len != 2) return false;
-        const destination = store_args[0];
-        if (store_args[1] != stored_value) return false;
+        const destination = GuardedList.at(store_args, 0);
+        if (GuardedList.at(store_args, 1) != stored_value) return false;
 
         const destination_layout = self.layouts.getLayout(self.store.getLocal(destination).layout_idx);
         if (destination_layout.tag != .ptr) return false;
@@ -118,7 +119,10 @@ const ReturnSlotPass = struct {
         var args = std.ArrayList(LocalId).empty;
         defer args.deinit(self.store.allocator);
         try args.append(self.store.allocator, destination);
-        try args.appendSlice(self.store.allocator, self.store.getLocalSpan(call_stmt.args));
+        const call_args = self.store.getLocalSpan(call_stmt.args);
+        for (0..call_args.len) |index| {
+            try args.append(self.store.allocator, GuardedList.at(call_args, index));
+        }
 
         self.store.getCFStmtPtr(call_stmt_id).* = .{ .assign_call = .{
             .target = store_stmt.target,
@@ -202,7 +206,8 @@ const ReturnSlotPass = struct {
         defer variant_args.deinit(self.store.allocator);
         variant_args.appendAssumeCapacity(out_ptr);
 
-        for (source_args) |source_arg| {
+        for (0..source_args.len) |index| {
+            const source_arg = GuardedList.at(source_args, index);
             const arg = try self.store.addLocal(.{ .layout_idx = self.store.getLocal(source_arg).layout_idx });
             variant_args.appendAssumeCapacity(arg);
         }
@@ -210,15 +215,17 @@ const ReturnSlotPass = struct {
         var cloner = try BodyCloner.init(self.store, out_ptr, store_unit);
         defer cloner.deinit();
 
-        for (source_args, variant_args.items[1..]) |source_arg, variant_arg| {
+        for (0..source_args.len) |index| {
+            const source_arg = GuardedList.at(source_args, index);
+            const variant_arg = variant_args.items[index + 1];
             cloner.local_map[@intFromEnum(source_arg)] = variant_arg;
         }
 
         const source_frame = self.store.getLocalSpan(source_spec.frame_locals);
         try cloner.new_locals.appendSlice(self.store.allocator, variant_args.items);
         try cloner.new_locals.append(self.store.allocator, store_unit);
-        for (source_frame) |local| {
-            _ = try cloner.mapLocal(local);
+        for (0..source_frame.len) |index| {
+            _ = try cloner.mapLocal(GuardedList.at(source_frame, index));
         }
 
         const body = try cloner.cloneStmt(source_body);
@@ -273,8 +280,9 @@ const ReturnSlotPass = struct {
             .switch_stmt => |s| {
                 if (s.continuation) |continuation| try work.append(self.store.allocator, continuation);
                 try work.append(self.store.allocator, s.default_branch);
-                for (self.store.getCFSwitchBranches(s.branches)) |branch| {
-                    try work.append(self.store.allocator, branch.body);
+                const branches = self.store.getCFSwitchBranches(s.branches);
+                for (0..branches.len) |index| {
+                    try work.append(self.store.allocator, GuardedList.at(branches, index).body);
                 }
             },
             .switch_initialized_payload => |s| {
@@ -286,8 +294,9 @@ const ReturnSlotPass = struct {
                 try work.append(self.store.allocator, s.on_miss);
             },
             .str_match_set => |s| {
-                for (self.store.getStrMatchArms(s.arms)) |arm| {
-                    try work.append(self.store.allocator, arm.on_match);
+                const arms = self.store.getStrMatchArms(s.arms);
+                for (0..arms.len) |index| {
+                    try work.append(self.store.allocator, GuardedList.at(arms, index).on_match);
                 }
                 try work.append(self.store.allocator, s.on_miss);
             },
@@ -561,7 +570,9 @@ const BodyCloner = struct {
         const old_branches = self.store.getCFSwitchBranches(s.branches);
         const branches = try self.store.allocator.alloc(LIR.CFSwitchBranch, old_branches.len);
         defer self.store.allocator.free(branches);
-        for (old_branches, branches) |old, *new| {
+        for (0..old_branches.len) |index| {
+            const old = GuardedList.at(old_branches, index);
+            const new = &branches[index];
             new.* = .{
                 .value = old.value,
                 .body = try self.cloneStmt(old.body),
@@ -580,7 +591,9 @@ const BodyCloner = struct {
         const old_arms = self.store.getStrMatchArms(s.arms);
         const arms = try self.store.allocator.alloc(LIR.StrMatchArm, old_arms.len);
         defer self.store.allocator.free(arms);
-        for (old_arms, arms) |old, *new| {
+        for (0..old_arms.len) |index| {
+            const old = GuardedList.at(old_arms, index);
+            const new = &arms[index];
             new.* = .{
                 .prefix = old.prefix,
                 .steps = try self.mapStrMatchSteps(old.steps),
@@ -599,7 +612,9 @@ const BodyCloner = struct {
         const old_steps = self.store.getStrMatchSteps(span);
         const steps = try self.store.allocator.alloc(LIR.StrMatchStep, old_steps.len);
         defer self.store.allocator.free(steps);
-        for (old_steps, steps) |old, *new| {
+        for (0..old_steps.len) |index| {
+            const old = GuardedList.at(old_steps, index);
+            const new = &steps[index];
             new.* = old;
             new.capture = switch (old.capture) {
                 .discard => .discard,
@@ -637,8 +652,8 @@ const BodyCloner = struct {
         const old_locals = self.store.getLocalSpan(span);
         const locals = try self.store.allocator.alloc(LocalId, old_locals.len);
         defer self.store.allocator.free(locals);
-        for (old_locals, locals) |old, *new| {
-            new.* = try self.mapLocal(old);
+        for (0..old_locals.len) |index| {
+            locals[index] = try self.mapLocal(GuardedList.at(old_locals, index));
         }
         return try self.store.addLocalSpan(locals);
     }
@@ -776,19 +791,27 @@ test "return slot creates an explicit ptr-result variant for aggregate call stor
     try std.testing.expect(rewritten.proc != callee);
     try std.testing.expectEqual(store_unit, rewritten.target);
     try std.testing.expectEqual(ret, rewritten.next);
-    try std.testing.expectEqualSlices(LocalId, &.{ destination, arg }, store.getLocalSpan(rewritten.args));
+    const rewritten_args = store.getLocalSpan(rewritten.args);
+    try std.testing.expectEqual(@as(usize, 2), rewritten_args.len);
+    try std.testing.expectEqual(destination, GuardedList.at(rewritten_args, 0));
+    try std.testing.expectEqual(arg, GuardedList.at(rewritten_args, 1));
 
     const variant = store.getProcSpec(rewritten.proc);
     try std.testing.expectEqual(layout_mod.Idx.zst, variant.ret_layout);
     const variant_args = store.getLocalSpan(variant.args);
     try std.testing.expectEqual(@as(usize, 2), variant_args.len);
-    try std.testing.expectEqual(aggregate_ptr, store.getLocal(variant_args[0]).layout_idx);
-    try std.testing.expectEqual(layout_mod.Idx.u64, store.getLocal(variant_args[1]).layout_idx);
+    const variant_dest = GuardedList.at(variant_args, 0);
+    const variant_value = GuardedList.at(variant_args, 1);
+    try std.testing.expectEqual(aggregate_ptr, store.getLocal(variant_dest).layout_idx);
+    try std.testing.expectEqual(layout_mod.Idx.u64, store.getLocal(variant_value).layout_idx);
 
     const variant_store = store.getCFStmt(variant.body.?).store_struct;
-    try std.testing.expectEqual(variant_args[0], variant_store.dest);
+    try std.testing.expectEqual(variant_dest, variant_store.dest);
     try std.testing.expectEqual(aggregate, variant_store.struct_layout);
-    try std.testing.expectEqualSlices(LocalId, &.{ variant_args[1], variant_args[1] }, store.getLocalSpan(variant_store.fields));
+    const variant_store_fields = store.getLocalSpan(variant_store.fields);
+    try std.testing.expectEqual(@as(usize, 2), variant_store_fields.len);
+    try std.testing.expectEqual(variant_value, GuardedList.at(variant_store_fields, 0));
+    try std.testing.expectEqual(variant_value, GuardedList.at(variant_store_fields, 1));
     try std.testing.expectEqual(layout_mod.Idx.zst, store.getLocal(store.getCFStmt(variant_store.next).ret.value).layout_idx);
 
     const caller_proc = store.getProcSpec(caller);
@@ -835,11 +858,11 @@ test "return slot lowers direct tag return into destination store" {
     const variant_args = store.getLocalSpan(variant.args);
 
     const variant_store = store.getCFStmt(variant.body.?).store_tag;
-    try std.testing.expectEqual(variant_args[0], variant_store.dest);
+    try std.testing.expectEqual(GuardedList.at(variant_args, 0), variant_store.dest);
     try std.testing.expectEqual(aggregate, variant_store.tag_layout);
     try std.testing.expectEqual(@as(u16, 0), variant_store.variant_index);
     try std.testing.expectEqual(@as(u16, 0), variant_store.discriminant);
-    try std.testing.expectEqual(variant_args[1], variant_store.payload.?);
+    try std.testing.expectEqual(GuardedList.at(variant_args, 1), variant_store.payload.?);
     try std.testing.expectEqual(layout_mod.Idx.zst, store.getLocal(store.getCFStmt(variant_store.next).ret.value).layout_idx);
 }
 

@@ -7782,6 +7782,7 @@ fn emptySolvedProgramForTest(allocator: std.mem.Allocator) Solved.Program {
         .empty,
         .empty,
         .empty,
+        .empty,
         0,
     );
     return Solved.Program.init(allocator, lifted);

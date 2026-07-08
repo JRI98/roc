@@ -2058,6 +2058,18 @@ fn patchGlobalIndexCodeRelocation(
             const table_idx = try self.ensureTableElement(sym.index);
             overwritePaddedU32(target_bytes, patch_offset, table_idx);
         },
+        .data => {
+            const o: usize = @intCast(patch_offset);
+            if (o == 0) unreachable;
+            if (target_bytes[o - 1] != Op.global_get) unreachable;
+            if (sym.isUndefined()) unreachable;
+            std.debug.assert(sym.index < self.data_segments.items.len);
+
+            target_bytes[o - 1] = Op.i32_const;
+            const segment = self.data_segments.items[sym.index];
+            const address = segment.offset + sym.data_offset;
+            overwritePaddedU32(target_bytes, patch_offset, address);
+        },
         else => unreachable,
     }
 }
@@ -6153,6 +6165,39 @@ test "resolveCodeRelocations — global_index_leb function symbol rewrites funct
     try std.testing.expectEqual(@as(u32, 0), decodePaddedU32(module.code_bytes.items[1..6]));
     try std.testing.expectEqual(@as(usize, 1), module.table_func_indices.items.len);
     try std.testing.expectEqual(defined.function.raw(), module.table_func_indices.items[0]);
+}
+
+test "resolveCodeRelocations — global_index_leb data symbol rewrites data reference to memory address" {
+    const allocator = std.testing.allocator;
+    var module = Self.init(allocator);
+    defer module.deinit();
+
+    const segment_index: u32 = @intCast(module.data_segments.items.len);
+    try module.data_segments.append(allocator, .{
+        .offset = 4096,
+        .data = try allocator.dupe(u8, &.{ 0, 0, 0, 0, 1, 2, 3, 4 }),
+    });
+    try module.linking.symbol_table.append(allocator, .{
+        .kind = .data,
+        .flags = 0,
+        .name = "static_value",
+        .index = segment_index,
+        .data_offset = 4,
+        .data_size = 4,
+    });
+
+    try module.code_bytes.append(allocator, Op.global_get);
+    try appendPaddedU32(allocator, &module.code_bytes, 999);
+    try module.reloc_code.entries.append(allocator, .{ .index = .{
+        .type_id = .global_index_leb,
+        .offset = 1,
+        .symbol_index = 0,
+    } });
+
+    try module.resolveCodeRelocations();
+
+    try std.testing.expectEqual(Op.i32_const, module.code_bytes.items[0]);
+    try std.testing.expectEqual(@as(u32, 4100), decodePaddedU32(module.code_bytes.items[1..6]));
 }
 
 test "resolveCodeRelocations — function_offset_i32 resolves to function body offset" {

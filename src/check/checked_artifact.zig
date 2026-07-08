@@ -22551,7 +22551,7 @@ pub fn constModuleId(ref: ConstRef) ModuleId {
 }
 
 /// Public `ConstOwner` declaration.
-pub const ConstOwner = union(enum) {
+pub const ConstOwner = union(enum(u8)) {
     top_level_binding: ConstTopLevelOwner,
     hoisted_expr: ConstHoistedOwner,
 };

@@ -33,6 +33,7 @@ const layout_mod = @import("layout");
 
 const LIR = core.LIR;
 const LirStore = core.LirStore;
+const GuardedList = LirStore.GuardedList;
 const LocalId = LIR.LocalId;
 const CFStmtId = LIR.CFStmtId;
 const LowLevelOp = LIR.LowLevel;
@@ -100,7 +101,7 @@ const Transform = struct {
             else => return false,
         };
         const call_args = self.store.getLocalSpan(call_stmt.args);
-        if (call_args.len != 1 or call_args[0] != unbox_stmt.target) return false;
+        if (call_args.len != 1 or GuardedList.at(call_args, 0) != unbox_stmt.target) return false;
 
         const payload_alias = self.forwardLocalAliasChain(call_stmt.target, call_stmt.next);
         const payload_value = payload_alias.value;
@@ -111,7 +112,7 @@ const Transform = struct {
         };
         if (box_stmt.op != .box_box) return false;
         const box_args = self.store.getLocalSpan(box_stmt.args);
-        if (box_args.len != 1 or box_args[0] != payload_value) return false;
+        if (box_args.len != 1 or GuardedList.at(box_args, 0) != payload_value) return false;
 
         const ret_stmt_id = box_stmt.next;
         const ret_stmt = switch (self.store.getCFStmt(ret_stmt_id)) {
@@ -120,7 +121,7 @@ const Transform = struct {
         };
         if (ret_stmt.value != box_stmt.target) return false;
 
-        const boxed = unbox_args[0];
+        const boxed = GuardedList.at(unbox_args, 0);
         const result_box = box_stmt.target;
         if (boxed == result_box) return false;
 
@@ -258,7 +259,7 @@ const Transform = struct {
         const old = self.store.getLocalSpan(proc.frame_locals);
         var merged = try std.ArrayList(LocalId).initCapacity(self.store.allocator, old.len + self.new_locals.items.len);
         defer merged.deinit(self.store.allocator);
-        merged.appendSliceAssumeCapacity(old);
+        for (0..old.len) |index| merged.appendAssumeCapacity(GuardedList.at(old, index));
         merged.appendSliceAssumeCapacity(self.new_locals.items);
         std.mem.sort(LocalId, merged.items, {}, localIdLessThan);
 
@@ -343,24 +344,24 @@ test "box reuse rewrites the direct unbox call rebox return chain" {
     const prepare = store.getCFStmt(unbox).assign_low_level;
     try std.testing.expectEqual(LowLevelOp.box_prepare_update, prepare.op);
     try std.testing.expectEqual(result_box, prepare.target);
-    try std.testing.expectEqual(boxed_arg, store.getLocalSpan(prepare.args)[0]);
+    try std.testing.expectEqual(boxed_arg, GuardedList.at(store.getLocalSpan(prepare.args), 0));
 
     const cast = store.getCFStmt(prepare.next).assign_low_level;
     try std.testing.expectEqual(LowLevelOp.ptr_cast, cast.op);
     const payload_ptr = cast.target;
-    try std.testing.expectEqual(result_box, store.getLocalSpan(cast.args)[0]);
+    try std.testing.expectEqual(result_box, GuardedList.at(store.getLocalSpan(cast.args), 0));
 
     const load = store.getCFStmt(cast.next).assign_low_level;
     try std.testing.expectEqual(LowLevelOp.ptr_load, load.op);
     try std.testing.expectEqual(old_payload, load.target);
-    try std.testing.expectEqual(payload_ptr, store.getLocalSpan(load.args)[0]);
+    try std.testing.expectEqual(payload_ptr, GuardedList.at(store.getLocalSpan(load.args), 0));
     try std.testing.expectEqual(call, load.next);
 
     const store_payload = store.getCFStmt(rebox).assign_low_level;
     try std.testing.expectEqual(LowLevelOp.ptr_store, store_payload.op);
     const store_args = store.getLocalSpan(store_payload.args);
-    try std.testing.expectEqual(payload_ptr, store_args[0]);
-    try std.testing.expectEqual(new_payload, store_args[1]);
+    try std.testing.expectEqual(payload_ptr, GuardedList.at(store_args, 0));
+    try std.testing.expectEqual(new_payload, GuardedList.at(store_args, 1));
     try std.testing.expectEqual(ret, store_payload.next);
 
     const frame_locals = store.getLocalSpan(store.getProcSpec(caller).frame_locals);

@@ -4578,7 +4578,7 @@ const Cloner = struct {
     /// recursion guard toward declining — a call whose size reads as the cap is
     /// never strictly smaller than an active frame, so it takes the residual
     /// (boxed) call — which is the safe direction for a depth/size measure.
-    const known_constructor_size_cap: usize = 1 << 40;
+    const known_constructor_size_cap: usize = std.math.maxInt(usize);
 
     /// Total work budget for measuring one known value's constructor size.
     /// Substitution shares one value union across every use site, so a value
@@ -4683,7 +4683,7 @@ const Cloner = struct {
     /// single-substitution conditions, so the value is bound to a local and
     /// evaluated once instead of duplicated — which is the safe direction: it
     /// can never drop or reorder an effect a truncated count would have missed.
-    const unsafe_leaf_count_cap: usize = 1 << 40;
+    const unsafe_leaf_count_cap: usize = std.math.maxInt(usize);
 
     /// Total work budget for scanning one known value's unsafe leaves. Shared
     /// substructure makes an unmemoized scan re-descend combinatorially many
