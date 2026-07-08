@@ -1,3 +1,4 @@
+#![no_std]
 #![allow(improper_ctypes)]
 #![allow(improper_ctypes_definitions)]
 
@@ -16,7 +17,38 @@ const POISON_BYTE: u8 = 0xCC;
 unsafe extern "C" {
     fn malloc(size: usize) -> *mut c_void;
     fn free(ptr: *mut c_void);
+    fn write(fd: i32, buf: *const u8, count: usize) -> isize;
+    fn exit(status: i32) -> !;
 }
+
+fn write_stderr(bytes: &[u8]) {
+    unsafe {
+        let _ = write(2, bytes.as_ptr(), bytes.len());
+        let _ = write(2, b"\n".as_ptr(), 1);
+    }
+}
+
+fn write_stderr_fmt(args: fmt::Arguments<'_>) {
+    let mut buf = [0; 512];
+    let len = {
+        let mut writer = ReportWriter::new(&mut buf);
+        let _ = writer.write_fmt(args);
+        writer.len
+    };
+    write_stderr(&buf[..len]);
+}
+
+fn exit_failure() -> ! {
+    unsafe { exit(1) }
+}
+
+#[panic_handler]
+fn panic(_: &core::panic::PanicInfo<'_>) -> ! {
+    exit_failure()
+}
+
+#[no_mangle]
+pub extern "C" fn rust_eh_personality() {}
 
 #[derive(Clone, Copy)]
 struct Allocation {
@@ -251,7 +283,7 @@ fn current_host() -> &'static abi::RocHost {
     let host_ptr = unsafe { HOST_PTR };
     if host_ptr.is_null() {
         env_mut().fail(format_args!("RocHost was not initialized"));
-        std::process::exit(1);
+        exit_failure();
     }
     unsafe { &*host_ptr }
 }
@@ -277,22 +309,22 @@ extern "C" fn host_realloc(host: *mut abi::RocHost, ptr: *mut c_void, new_length
 
 extern "C" fn host_dbg(_host: *mut abi::RocHost, bytes: *const u8, len: usize) {
     let slice = unsafe { core::slice::from_raw_parts(bytes, len) };
-    eprintln!("{}", String::from_utf8_lossy(slice));
+    write_stderr(slice);
 }
 
 extern "C" fn host_expect_failed(host: *mut abi::RocHost, bytes: *const u8, len: usize) {
     let slice = unsafe { core::slice::from_raw_parts(bytes, len) };
-    eprintln!("{}", String::from_utf8_lossy(slice));
+    write_stderr(slice);
     let env = unsafe { &mut *((*host).env as *mut ContractEnv) };
     env.fail(format_args!("roc_expect_failed"));
 }
 
 extern "C" fn host_crashed(host: *mut abi::RocHost, bytes: *const u8, len: usize) {
     let slice = unsafe { core::slice::from_raw_parts(bytes, len) };
-    eprintln!("{}", String::from_utf8_lossy(slice));
+    write_stderr(slice);
     let env = unsafe { &mut *((*host).env as *mut ContractEnv) };
     env.fail(format_args!("roc_crashed"));
-    std::process::exit(1);
+    exit_failure();
 }
 
 #[no_mangle]
@@ -313,22 +345,22 @@ pub extern "C" fn roc_realloc(ptr: *mut c_void, new_length: usize, alignment: us
 #[no_mangle]
 pub extern "C" fn roc_dbg(bytes: *const u8, len: usize) {
     let slice = unsafe { core::slice::from_raw_parts(bytes, len) };
-    eprintln!("{}", String::from_utf8_lossy(slice));
+    write_stderr(slice);
 }
 
 #[no_mangle]
 pub extern "C" fn roc_expect_failed(bytes: *const u8, len: usize) {
     let slice = unsafe { core::slice::from_raw_parts(bytes, len) };
-    eprintln!("{}", String::from_utf8_lossy(slice));
+    write_stderr(slice);
     env_mut().fail(format_args!("roc_expect_failed"));
 }
 
 #[no_mangle]
 pub extern "C" fn roc_crashed(bytes: *const u8, len: usize) {
     let slice = unsafe { core::slice::from_raw_parts(bytes, len) };
-    eprintln!("{}", String::from_utf8_lossy(slice));
+    write_stderr(slice);
     env_mut().fail(format_args!("roc_crashed"));
-    std::process::exit(1);
+    exit_failure();
 }
 
 #[no_mangle]
@@ -450,18 +482,18 @@ pub extern "C" fn main(_argc: i32, _argv: *const *const u8) -> i32 {
         } else {
             &env.report[..env.report_len]
         };
-        eprintln!("{}", String::from_utf8_lossy(message));
-        eprintln!(
+        write_stderr(message);
+        write_stderr_fmt(format_args!(
             "alloc_count={} dealloc_count={} live={} allocator_errors={}",
             env.alloc_count, env.dealloc_count, env.live_alloc_count, env.allocator_error_count
-        );
+        ));
         return 1;
     }
 
     let env = env_mut();
-    eprintln!(
+    write_stderr_fmt(format_args!(
         "PASS glue-runtime cli-main RustGlue native alloc={} dealloc={}",
         env.alloc_count, env.dealloc_count
-    );
+    ));
     0
 }

@@ -1,3 +1,4 @@
+#![no_std]
 #![allow(improper_ctypes)]
 #![allow(improper_ctypes_definitions)]
 
@@ -5,11 +6,64 @@
 mod abi;
 
 use core::ffi::c_void;
+use core::fmt::{self, Write};
 
 unsafe extern "C" {
     fn malloc(size: usize) -> *mut c_void;
     fn free(ptr: *mut c_void);
+    fn write(fd: i32, buf: *const u8, count: usize) -> isize;
+    fn exit(status: i32) -> !;
 }
+
+struct ReportWriter<'a> {
+    buf: &'a mut [u8],
+    len: usize,
+}
+
+impl<'a> ReportWriter<'a> {
+    fn new(buf: &'a mut [u8]) -> Self {
+        Self { buf, len: 0 }
+    }
+}
+
+impl Write for ReportWriter<'_> {
+    fn write_str(&mut self, value: &str) -> fmt::Result {
+        let remaining = self.buf.len().saturating_sub(self.len);
+        let write_len = remaining.min(value.len());
+        self.buf[self.len..self.len + write_len].copy_from_slice(&value.as_bytes()[..write_len]);
+        self.len += write_len;
+        Ok(())
+    }
+}
+
+fn write_stderr(bytes: &[u8]) {
+    unsafe {
+        let _ = write(2, bytes.as_ptr(), bytes.len());
+        let _ = write(2, b"\n".as_ptr(), 1);
+    }
+}
+
+fn write_stderr_fmt(args: fmt::Arguments<'_>) {
+    let mut buf = [0; 512];
+    let len = {
+        let mut writer = ReportWriter::new(&mut buf);
+        let _ = writer.write_fmt(args);
+        writer.len
+    };
+    write_stderr(&buf[..len]);
+}
+
+fn exit_failure() -> ! {
+    unsafe { exit(1) }
+}
+
+#[panic_handler]
+fn panic(_: &core::panic::PanicInfo<'_>) -> ! {
+    exit_failure()
+}
+
+#[no_mangle]
+pub extern "C" fn rust_eh_personality() {}
 
 static mut ALLOC_COUNT: usize = 0;
 static mut DEALLOC_COUNT: usize = 0;
@@ -83,7 +137,7 @@ pub extern "C" fn roc_realloc(ptr: *mut c_void, new_length: usize, alignment: us
 #[no_mangle]
 pub extern "C" fn roc_dbg(bytes: *const u8, len: usize) {
     let slice = unsafe { core::slice::from_raw_parts(bytes, len) };
-    eprintln!("{}", String::from_utf8_lossy(slice));
+    write_stderr(slice);
 }
 
 #[no_mangle]
@@ -94,7 +148,7 @@ pub extern "C" fn roc_expect_failed(_bytes: *const u8, _len: usize) {
 #[no_mangle]
 pub extern "C" fn roc_crashed(_bytes: *const u8, _len: usize) {
     fail("roc_crashed");
-    std::process::exit(1);
+    exit_failure();
 }
 
 #[no_mangle]
@@ -173,13 +227,16 @@ pub extern "C" fn main(_argc: i32, _argv: *const *const u8) -> i32 {
             } else {
                 &(&*core::ptr::addr_of!(REPORT))[..REPORT_LEN]
             };
-            eprintln!("{}", String::from_utf8_lossy(message));
-            eprintln!("alloc={} dealloc={}", alloc_count, dealloc_count);
+            write_stderr(message);
+            write_stderr_fmt(format_args!("alloc={} dealloc={}", alloc_count, dealloc_count));
             return 1;
         }
         let alloc_count = ALLOC_COUNT;
         let dealloc_count = DEALLOC_COUNT;
-        eprintln!("PASS glue-runtime type-catalog RustGlue native alloc={} dealloc={}", alloc_count, dealloc_count);
+        write_stderr_fmt(format_args!(
+            "PASS glue-runtime type-catalog RustGlue native alloc={} dealloc={}",
+            alloc_count, dealloc_count
+        ));
     }
     0
 }

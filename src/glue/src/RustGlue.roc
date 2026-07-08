@@ -896,6 +896,7 @@ generate_rust_imports : Str
 generate_rust_imports =
 	\\use core::ffi::c_void;
 	\\use core::sync::atomic::{fence, AtomicIsize, Ordering};
+	\\#[cfg(not(no_roc_std_helpers))]
 	\\use std::alloc::Layout;
 	\\
 
@@ -2392,8 +2393,10 @@ generate_default_allocators_direct_rust =
 	\\///
 	\\/// Memory layout: each allocation prepends size metadata so that dealloc/realloc
 	\\/// can recover the original allocation size because `roc_dealloc` receives no length.
+	\\#[cfg(not(no_roc_std_helpers))]
 	\\pub struct DefaultAllocators;
 	\\
+	\\#[cfg(not(no_roc_std_helpers))]
 	\\impl DefaultAllocators {
 	\\    /// Allocate memory using the Rust global allocator.
 	\\    pub extern "C" fn roc_alloc(_roc_host: *mut RocHost, length: usize, alignment: usize) -> *mut c_void {
@@ -2464,8 +2467,10 @@ generate_default_allocators_direct_rust =
 generate_default_handlers_direct_rust : Str
 generate_default_handlers_direct_rust =
 	\\/// Default handlers for dbg, expect-failed, and crash.
+	\\#[cfg(not(no_roc_std_helpers))]
 	\\pub struct DefaultHandlers;
 	\\
+	\\#[cfg(not(no_roc_std_helpers))]
 	\\impl DefaultHandlers {
 	\\    /// Print a `dbg` expression to stderr.
 	\\    pub extern "C" fn roc_dbg(_roc_host: *mut RocHost, bytes: *const u8, len: usize) {
@@ -2503,6 +2508,7 @@ generate_make_roc_host_rust =
 	\\///
 	\\/// This is only for helper functions in this generated file. It is not passed to
 	\\/// compiled Roc code, which uses the direct symbol ABI declared above.
+	\\#[cfg(not(no_roc_std_helpers))]
 	\\pub fn make_roc_host(env: *mut c_void) -> RocHost {
 	\\    RocHost {
 	\\        env,

@@ -5353,9 +5353,6 @@ fn runGlueRuntimeCase(
                 return addPreservedWorkDirMessage(allocator, customInfraFailure(allocator, &timer, "failed to copy glue runtime crt1.o: {}", .{err}), env.dirs.work_dir);
             copyNativeMuslTargetFile(io, allocator, target, "libc.a", target_dir) catch |err|
                 return addPreservedWorkDirMessage(allocator, customInfraFailure(allocator, &timer, "failed to copy glue runtime libc.a: {}", .{err}), env.dirs.work_dir);
-            if (prepareGlueRuntimeUnwindLibrary(io, allocator, &env, &timer, timeout_ms, target, target_dir)) |failure| {
-                return addPreservedWorkDirMessage(allocator, failure, env.dirs.work_dir);
-            }
         },
         .wasm32 => {},
     }
@@ -5617,6 +5614,8 @@ fn compileGlueRuntimeRustHost(
         "warnings",
         "--target",
         target.rust_target,
+        "--cfg",
+        "no_roc_std_helpers",
         "-C",
         "panic=abort",
         "--crate-type",
@@ -5668,51 +5667,6 @@ fn compileGlueRuntimeRustWasmHost(
     }, project_root_path, .{ .args = &.{} })) |failure| return failure;
 
     return null;
-}
-
-fn prepareGlueRuntimeUnwindLibrary(
-    io: std.Io,
-    allocator: Allocator,
-    env: *const CaseEnv,
-    timer: *harness.Timer,
-    timeout_ms: u64,
-    target: NativeMuslTarget,
-    target_dir: []const u8,
-) ?TestResult {
-    const dest = std.fs.path.join(allocator, &.{ target_dir, "libunwind.a" }) catch |err|
-        return customInfraFailure(allocator, timer, "failed to allocate glue runtime libunwind path: {}", .{err});
-
-    const lib_dir = rustTargetLibDir(io, allocator, env, timer, timeout_ms, target) orelse return customInfraFailure(allocator, timer, "failed to locate Rust target library dir", .{});
-    const src = std.fs.path.join(allocator, &.{ lib_dir, "self-contained", "libunwind.a" }) catch |err|
-        return customInfraFailure(allocator, timer, "failed to allocate Rust target libunwind archive path: {}", .{err});
-
-    std.Io.Dir.cwd().copyFile(src, std.Io.Dir.cwd(), dest, io, .{}) catch |err|
-        return customInfraFailure(allocator, timer, "failed to copy Rust target libunwind archive: {}", .{err});
-
-    return null;
-}
-
-fn rustTargetLibDir(
-    io: std.Io,
-    allocator: Allocator,
-    env: *const CaseEnv,
-    timer: *harness.Timer,
-    timeout_ms: u64,
-    target: NativeMuslTarget,
-) ?[]const u8 {
-    const child_timeout_ms = childCommandTimeoutMs(timer, timeout_ms) orelse return null;
-    const result = runRawInEnv(io, allocator, env, &.{
-        "rustc",
-        "--print",
-        "target-libdir",
-        "--target",
-        target.rust_target,
-    }, project_root_path, null, child_timeout_ms) catch return null;
-
-    if (checkCommandExpectation(allocator, result, .{ .args = &.{} })) |_| return null;
-    const trimmed = std.mem.trim(u8, result.stdout, " \r\n\t");
-    if (trimmed.len == 0) return null;
-    return allocator.dupe(u8, trimmed) catch null;
 }
 
 fn customGlueDebug(io: std.Io, allocator: Allocator, env: *const CaseEnv, timer: *harness.Timer, timeout_ms: u64) ?TestResult {
