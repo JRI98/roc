@@ -6386,10 +6386,15 @@ fn copyCheckedFlatType(
         .record_unbound => |fields| .{
             .record_unbound = try copyCheckedRecordFields(allocator, module, names, imports, store, active, fields),
         },
-        .record => |record| .{ .record = .{
-            .fields = try copyCheckedRecordFields(allocator, module, names, imports, store, active, record.fields),
-            .ext = try appendCheckedTypeRootWithRowDefault(allocator, module, names, imports, store, active, record.ext, .empty_record),
-        } },
+        .record => |record| blk: {
+            if (record.fields.len() == 0 and checkedRecordExtIsEmpty(module, record.ext)) {
+                break :blk .empty_record;
+            }
+            break :blk .{ .record = .{
+                .fields = try copyCheckedRecordFields(allocator, module, names, imports, store, active, record.fields),
+                .ext = try appendCheckedTypeRootWithRowDefault(allocator, module, names, imports, store, active, record.ext, .empty_record),
+            } };
+        },
         .tuple => |tuple| .{
             .tuple = try copyCheckedTypeRange(allocator, module, names, imports, store, active, module.typeStoreConst().sliceVars(tuple.elems)),
         },
@@ -6416,10 +6421,29 @@ fn copyCheckedFlatType(
         .fn_pure => |func| .{ .function = try copyCheckedFunctionType(allocator, module, names, imports, store, active, .pure, func) },
         .fn_effectful => |func| .{ .function = try copyCheckedFunctionType(allocator, module, names, imports, store, active, .effectful, func) },
         .fn_unbound => |func| .{ .function = try copyCheckedFunctionType(allocator, module, names, imports, store, active, .pure, func) },
-        .tag_union => |tag_union| .{ .tag_union = .{
-            .tags = try copyCheckedTags(allocator, module, names, imports, store, active, tag_union.tags),
-            .ext = try appendCheckedTypeRootWithRowDefault(allocator, module, names, imports, store, active, tag_union.ext, .empty_tag_union),
-        } },
+        .tag_union => |tag_union| blk: {
+            if (tag_union.tags.len() == 0 and checkedTagUnionExtIsEmpty(module, tag_union.ext)) {
+                break :blk .empty_tag_union;
+            }
+            break :blk .{ .tag_union = .{
+                .tags = try copyCheckedTags(allocator, module, names, imports, store, active, tag_union.tags),
+                .ext = try appendCheckedTypeRootWithRowDefault(allocator, module, names, imports, store, active, tag_union.ext, .empty_tag_union),
+            } };
+        },
+    };
+}
+
+fn checkedRecordExtIsEmpty(module: TypedCIR.Module, ext: Var) bool {
+    return switch (module.typeStoreConst().resolveVar(ext).desc.content) {
+        .structure => |flat| flat == .empty_record,
+        else => false,
+    };
+}
+
+fn checkedTagUnionExtIsEmpty(module: TypedCIR.Module, ext: Var) bool {
+    return switch (module.typeStoreConst().resolveVar(ext).desc.content) {
+        .structure => |flat| flat == .empty_tag_union,
+        else => false,
     };
 }
 
@@ -6701,6 +6725,87 @@ fn testTypeDeclSourceDeclForIdent(module_env: *const ModuleEnv, type_ident: base
         if (candidate.eql(type_ident)) return source_decl;
     }
     return error.MissingTestTypeDecl;
+}
+
+const ExpectSingleNominalBackingPayloadError = Allocator.Error || error{
+    WriteFailed,
+    TestExpectedEqual,
+    TestUnexpectedResult,
+    CorruptEmbeddedBuiltins,
+    ExpectedNominalStatement,
+    ExpectedNominalRoot,
+    ExpectedNominalPayload,
+};
+
+fn expectSingleNominalBackingPayload(allocator: Allocator, module_name: []const u8, source: []const u8, expected: CheckedTypePayload) ExpectSingleNominalBackingPayloadError!void {
+    const testing = std.testing;
+    const TestEnv = @import("test/TestEnv.zig");
+
+    var test_env = try TestEnv.init(module_name, source);
+    defer test_env.deinit();
+    try test_env.assertNoErrors();
+
+    const source_modules = [_]TypedCIR.Modules.SourceModule{
+        .{ .precompiled = test_env.module_env },
+    };
+    var modules = try TypedCIR.Modules.init(allocator, &source_modules);
+    defer modules.deinit();
+
+    const module = modules.module(0);
+    const module_env = module.moduleEnvConst();
+    var names = canonical.CanonicalNameStore.init(allocator);
+    defer names.deinit();
+    try internLoweringVisibleNames(module_env, &names);
+
+    const module_name_id = try names.internModuleName(module_env.module_name);
+    const display_module_name = try names.internModuleIdent(module.identStoreConst(), module_env.display_module_name_idx);
+    const qualified_module_name = try names.internModuleIdent(module.identStoreConst(), module_env.qualified_module_ident);
+    const module_identity = ModuleIdentity{
+        .stable_hash = computeStableModuleIdentityHash(module_env),
+        .module_idx = module.moduleIndex(),
+        .module_name = module_name_id,
+        .display_module_name = display_module_name,
+        .qualified_module_name = qualified_module_name,
+        .kind = module_env.module_kind,
+    };
+    _ = try names.internModuleIdentity(&module_identity.stable_hash);
+
+    var checking_context_identity = try CheckingContextIdentity.fromModule(allocator, module, &.{}, null, null, &.{});
+    defer checking_context_identity.deinit(allocator);
+    const artifact_key = CheckedModuleArtifactKey.computeFromSourceHash(
+        hashModuleSourceInputs(module_env),
+        module_identity,
+        checking_context_identity,
+        &.{},
+    );
+
+    var source_nodes = try CheckedSourceNodes.init(allocator, module);
+    defer source_nodes.deinit(allocator);
+
+    var publication = try CheckedTypeStore.fromModule(allocator, module, &names, artifact_key, &.{}, &.{}, &source_nodes);
+    defer publication.deinit(allocator);
+
+    const nominal_stmt = for (module_env.store.sliceStatements(module_env.all_statements)) |statement_idx| {
+        switch (module_env.store.getStatement(statement_idx)) {
+            .s_nominal_decl => break statement_idx,
+            else => {},
+        }
+    } else return error.ExpectedNominalStatement;
+
+    const nominal_root = publication.rootForSourceVar(module, ModuleEnv.varFrom(nominal_stmt)) orelse return error.ExpectedNominalRoot;
+    const nominal = switch (publication.store.payload(nominal_root)) {
+        .nominal => |payload| payload,
+        else => return error.ExpectedNominalPayload,
+    };
+    try testing.expectEqual(expected, publication.store.payload(nominal.backing));
+}
+
+test "checked type publication normalizes closed empty tag union backing" {
+    try expectSingleNominalBackingPayload(std.testing.allocator, "Foo", "Foo := []", .empty_tag_union);
+}
+
+test "checked type publication normalizes closed empty record backing" {
+    try expectSingleNominalBackingPayload(std.testing.allocator, "Foo", "Foo := {}", .empty_record);
 }
 
 test "checked artifact builtin nominal categorization requires explicit builtin origin" {
