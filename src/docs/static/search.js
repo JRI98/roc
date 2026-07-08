@@ -83,6 +83,45 @@ const setupSearch = () => {
 
     searchForm.addEventListener("keydown", searchKeyDown);
 
+    function addLangRefSearchEntries() {
+      if (searchTypeAhead.dataset.langRefReady === "true") return;
+
+      document
+        .querySelectorAll("#sidebar-nav .langref-articles a[href]")
+        .forEach((sidebarLink) => {
+          const name = sidebarLink.textContent.replace(/\s+/g, " ").trim();
+          if (name === "") return;
+
+          const item = document.createElement("li");
+          item.classList.add("hidden");
+
+          const link = document.createElement("a");
+          link.classList.add("type-ahead-link", "type-ahead-langref");
+          link.href = sidebarLink.getAttribute("href");
+
+          const defName = document.createElement("span");
+          defName.classList.add("type-ahead-def-name", "type-ahead-langref-title");
+          defName.textContent = name;
+
+          const context = document.createElement("span");
+          context.classList.add("type-ahead-langref-context");
+          context.textContent = "Language Reference";
+
+          const signature = document.createElement("span");
+          signature.classList.add("type-ahead-signature");
+          signature.textContent = "Language Reference";
+          signature.hidden = true;
+
+          link.append(defName, " in ", context, signature);
+          item.appendChild(link);
+          searchTypeAhead.appendChild(item);
+        });
+
+      searchTypeAhead.dataset.langRefReady = "true";
+    }
+
+    addLangRefSearchEntries();
+
     function search() {
       topSearchResultListItem = undefined;
       let text = searchBox.value.toLowerCase(); // Search is case-insensitive.
