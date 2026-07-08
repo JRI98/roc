@@ -2727,6 +2727,13 @@ fn numeralInfoFitsDec(info: types_mod.NumeralInfo) bool {
 pub const DeferredConstraintCheck = struct {
     var_: Var,
     constraints: StaticDispatchConstraint.SafeList.Range,
+    /// True when the constraint's method target resolved to an unchecked,
+    /// unannotated local def and the checker re-deferred it for resolution at
+    /// the enclosing binding group's generalization boundary. Such an entry is
+    /// not "resolvable" for the literal-defaulting cascade even though its
+    /// receiver is concrete — re-processing it before the target's group is
+    /// checked would just re-defer it again.
+    waiting_on_target_def: bool = false,
 
     pub const SafeList = MkSafeList(@This());
 };
