@@ -2624,21 +2624,6 @@ const Builder = struct {
         return gop.value_ptr.*;
     }
 
-    fn staticDataCandidateExpr(
-        self: *Builder,
-        ty: Type.TypeId,
-        static_data: Common.StaticDataId,
-        runtime_expr: Ast.ExprId,
-    ) Allocator.Error!Ast.ExprId {
-        return try self.program.addExpr(.{
-            .ty = ty,
-            .data = .{ .static_data_candidate = .{
-                .static_data = static_data,
-                .runtime_expr = runtime_expr,
-            } },
-        });
-    }
-
     const BareFnCandidate = enum {
         disallow,
         allow,

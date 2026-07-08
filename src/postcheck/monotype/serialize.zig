@@ -1322,16 +1322,6 @@ fn writeRootSource(hasher: *std.crypto.hash.sha2.Sha256, source: checked.RootSou
     }
 }
 
-fn writeProvidedDataExport(hasher: *std.crypto.hash.sha2.Sha256, data: checked.ProvidedDataExport) void {
-    writeHashU32(hasher, @intFromEnum(data.source_name));
-    writeHashU32(hasher, @intFromEnum(data.ffi_symbol));
-    writeHashU32(hasher, @intFromEnum(data.def));
-    writeHashU32(hasher, @intFromEnum(data.pattern));
-    writeCheckedTypeId(hasher, data.checked_type);
-    writeHashBytes32(hasher, data.source_scheme.bytes);
-    writeConstData(hasher, data.const_ref);
-}
-
 fn writeStaticDataRequest(hasher: *std.crypto.hash.sha2.Sha256, request: Common.StaticDataRequest) void {
     writeConstData(hasher, request.const_locator);
     writeOptionalConstNodeId(hasher, request.node);
