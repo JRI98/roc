@@ -134,6 +134,7 @@ const Lowerer = struct {
     type_layouts: []?layout.Idx,
     const_plan_map: []?LirProgram.ConstPlanId,
     const_type_map: []?check.ConstStore.ConstTypeId,
+    static_data_map: []?LIR.StaticDataId,
     next_join_point: u32 = 0,
     loop_stack: std.ArrayList(LoopContext),
     current_ret_ty: ?Type.TypeId = null,
@@ -177,6 +178,10 @@ const Lowerer = struct {
         errdefer allocator.free(const_type_map);
         @memset(const_type_map, null);
 
+        const static_data_map = try allocator.alloc(?LIR.StaticDataId, program.static_data_values.len());
+        errdefer allocator.free(static_data_map);
+        @memset(static_data_map, null);
+
         return .{
             .allocator = allocator,
             .program = program,
@@ -188,12 +193,14 @@ const Lowerer = struct {
             .type_layouts = type_layouts,
             .const_plan_map = const_plan_map,
             .const_type_map = const_type_map,
+            .static_data_map = static_data_map,
             .loop_stack = .empty,
         };
     }
 
     fn deinit(self: *Lowerer) void {
         self.loop_stack.deinit(self.allocator);
+        self.allocator.free(self.static_data_map);
         self.allocator.free(self.const_type_map);
         self.allocator.free(self.const_plan_map);
         self.allocator.free(self.type_layouts);
@@ -210,6 +217,7 @@ const Lowerer = struct {
             .runtime_schemas = self.runtime_schemas,
         };
         self.loop_stack.deinit(self.allocator);
+        self.allocator.free(self.static_data_map);
         self.allocator.free(self.const_type_map);
         self.allocator.free(self.const_plan_map);
         self.allocator.free(self.type_layouts);
@@ -222,6 +230,7 @@ const Lowerer = struct {
         self.type_layouts = &.{};
         self.const_plan_map = &.{};
         self.const_type_map = &.{};
+        self.static_data_map = &.{};
         self.loop_stack = .empty;
         return output;
     }
@@ -417,6 +426,104 @@ const Lowerer = struct {
         const plan = try self.buildConstPlan(ty);
         self.result.const_plans.items[@intFromEnum(id)] = plan;
         return id;
+    }
+
+    fn lirStaticDataFor(
+        self: *Lowerer,
+        id: Common.StaticDataId,
+        ty: Type.TypeId,
+        layout_idx: layout.Idx,
+        plan: LirProgram.ConstPlanId,
+    ) Common.LowerError!LIR.StaticDataId {
+        const raw = @intFromEnum(id);
+        if (raw >= self.static_data_map.len) Common.invariant("static data candidate id exceeded Lambda Mono static data table");
+        if (self.static_data_map[raw]) |existing| return existing;
+
+        const source = GuardedList.at(self.program.static_data_values.unsafeRawItemsForView(), raw);
+        const result_id: LIR.StaticDataId = @enumFromInt(@as(u32, @intCast(self.result.static_data_values.items.len)));
+        try self.result.static_data_values.append(self.allocator, .{
+            .const_ref = source.const_ref,
+            .node = source.node,
+            .checked_type = source.checked_type,
+            .layout_idx = layout_idx,
+            .plan = plan,
+        });
+        self.static_data_map[raw] = result_id;
+        _ = ty;
+        return result_id;
+    }
+
+    fn constPlanNeedsStaticData(self: *Lowerer, plan_id: LirProgram.ConstPlanId, layout_idx: layout.Idx) bool {
+        const layout_data = self.result.layouts.getLayout(layout_idx);
+        if (self.result.layouts.layoutSize(layout_data) == 0) return false;
+        return switch (self.result.const_plans.items[@intFromEnum(plan_id)]) {
+            .pending => Common.invariant("pending const plan reached static-data selection"),
+            .zst,
+            .scalar,
+            => false,
+            .str,
+            .list,
+            .box,
+            .fn_value,
+            .erased_fn,
+            => true,
+            .tuple => |plans| self.aggregatePlanNeedsStaticData(plans, layout_idx),
+            .record => |plans| self.aggregatePlanNeedsStaticData(plans, layout_idx),
+            .tag_union => |variants| self.tagPlanNeedsStaticData(variants, layout_idx),
+            .named => |named| switch (layout_data.tag) {
+                .box,
+                .box_of_zst,
+                => true,
+                else => self.constPlanNeedsStaticData(named.backing, layout_idx),
+            },
+        };
+    }
+
+    fn aggregatePlanNeedsStaticData(self: *Lowerer, plans: []const LirProgram.ConstPlanId, layout_idx: layout.Idx) bool {
+        if (plans.len == 0) return false;
+        const layout_data = self.result.layouts.getLayout(layout_idx);
+        return switch (layout_data.tag) {
+            .zst => false,
+            .box,
+            .box_of_zst,
+            .list,
+            .list_of_zst,
+            .closure,
+            .erased_callable,
+            => true,
+            .struct_ => blk: {
+                const struct_idx = layout_data.getStruct().idx;
+                for (plans, 0..) |plan, index| {
+                    const field_layout = self.result.layouts.getStructFieldLayoutByOriginalIndex(struct_idx, @intCast(index));
+                    if (self.constPlanNeedsStaticData(plan, field_layout)) break :blk true;
+                }
+                break :blk false;
+            },
+            else => Common.invariant("aggregate const plan reached a non-aggregate layout"),
+        };
+    }
+
+    fn tagPlanNeedsStaticData(self: *Lowerer, variants: []const LirProgram.ConstTagVariant, layout_idx: layout.Idx) bool {
+        const layout_data = self.result.layouts.getLayout(layout_idx);
+        switch (layout_data.tag) {
+            .zst, .scalar => return false,
+            .box, .box_of_zst => return true,
+            .tag_union => {},
+            else => Common.invariant("tag const plan reached a non-tag layout"),
+        }
+        const data = self.result.layouts.getTagUnionData(layout_data.getTagUnion().idx);
+        const layout_variants = self.result.layouts.getTagUnionVariants(data);
+        if (layout_variants.len != variants.len) Common.invariant("tag const plan variant count differed from layout variant count");
+        for (variants, 0..) |variant, index| {
+            if (variant.payloads.len == 0) continue;
+            const payload_layout = layout_variants.get(@intCast(index)).payload_layout;
+            if (variant.payloads.len == 1) {
+                if (self.constPlanNeedsStaticData(variant.payloads[0], payload_layout)) return true;
+            } else if (self.aggregatePlanNeedsStaticData(variant.payloads, payload_layout)) {
+                return true;
+            }
+        }
+        return false;
     }
 
     fn buildConstPlan(self: *Lowerer, ty: Type.TypeId) Common.LowerError!LirProgram.ConstPlan {
@@ -870,6 +977,25 @@ const Lowerer = struct {
         return try self.lowerExprInto(ret_local, expr_id, ret_stmt);
     }
 
+    fn lowerStaticDataCandidateInto(
+        self: *Lowerer,
+        target: LIR.LocalId,
+        candidate: LambdaMono.StaticDataCandidate,
+        ty: Type.TypeId,
+        next: LIR.CFStmtId,
+    ) Common.LowerError!LIR.CFStmtId {
+        const layout_idx = self.result.store.getLocal(target).layout_idx;
+        const plan = try self.constPlanOfType(ty);
+        if (self.constPlanNeedsStaticData(plan, layout_idx)) {
+            return try self.result.store.addCFStmt(.{ .assign_literal = .{
+                .target = target,
+                .value = .{ .static_data = try self.lirStaticDataFor(candidate.static_data, ty, layout_idx, plan) },
+                .next = next,
+            } });
+        }
+        return try self.lowerExprInto(target, candidate.runtime_expr, next);
+    }
+
     fn lowerExprInto(
         self: *Lowerer,
         target: LIR.LocalId,
@@ -932,6 +1058,7 @@ const Lowerer = struct {
                 } });
             },
             .uninitialized, .uninitialized_payload => next,
+            .static_data_candidate => |candidate| try self.lowerStaticDataCandidateInto(target, candidate, expr_data.ty, next),
             .list => |items| try self.lowerListInto(target, items, next),
             .tuple => |items| try self.lowerTupleInto(target, items, next),
             .record => |fields| try self.lowerRecordInto(target, expr_data.ty, fields, next),

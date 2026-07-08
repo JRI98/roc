@@ -60,7 +60,7 @@ const ConstStrDataSite = struct {
     data: u32,
 };
 
-/// Build readonly data exports for provided constants.
+/// Build readonly data symbols for provided constants and internal LIR static values.
 pub fn buildProvidedDataExports(
     allocator: Allocator,
     modules: ModuleViews,
@@ -69,10 +69,15 @@ pub fn buildProvidedDataExports(
 ) MaterializationError![]StaticDataExport {
     const root = modules.root orelse {
         if (hasProvidedData(modules)) staticDataInvariant("provided data exports require a root checked module");
+        if (lowered) |lowered_program| {
+            if (lowered_program.lir_result.static_data_values.items.len != 0) {
+                staticDataInvariant("internal static data values require a root checked module");
+            }
+        }
         return try allocator.alloc(StaticDataExport, 0);
     };
     const lowered_program = lowered orelse {
-        if (moduleHasProvidedData(root.module)) staticDataInvariant("provided data exports require LIR layout output");
+        if (moduleHasProvidedData(root.module)) staticDataInvariant("static data exports require LIR layout output");
         return try allocator.alloc(StaticDataExport, 0);
     };
 
@@ -146,6 +151,13 @@ const StaticDataBuilder = struct {
     fn build(self: *StaticDataBuilder) MaterializationError![]StaticDataExport {
         errdefer self.deinitNodes();
 
+        try self.buildProvidedExports();
+        try self.buildInternalStaticValues();
+
+        return try self.nodes.toOwnedSlice(self.allocator);
+    }
+
+    fn buildProvidedExports(self: *StaticDataBuilder) MaterializationError!void {
         for (self.root.module.provided_exports.exports) |provided| {
             const data = switch (provided) {
                 .data => |data| data,
@@ -166,11 +178,31 @@ const StaticDataBuilder = struct {
                 .bytes = materialized.bytes,
                 .alignment = materialized.alignment,
                 .is_global = true,
+                .is_exported = true,
                 .relocations = materialized.relocations,
             });
         }
+    }
 
-        return try self.nodes.toOwnedSlice(self.allocator);
+    fn buildInternalStaticValues(self: *StaticDataBuilder) MaterializationError!void {
+        for (self.lowered.lir_result.static_data_values.items, 0..) |value, index| {
+            const static_data_id: lir.LIR.StaticDataId = @enumFromInt(@as(u32, @intCast(index)));
+            const symbol_name = try lir.Program.staticDataSymbolName(self.allocator, static_data_id);
+            errdefer self.allocator.free(symbol_name);
+
+            const const_node = self.staticDataConstNode(value);
+            const materialized = try self.materializeValue(const_node, value.plan, value.layout_idx);
+            errdefer self.deinitMaterialized(materialized);
+
+            try self.nodes.append(self.allocator, .{
+                .symbol_name = symbol_name,
+                .bytes = materialized.bytes,
+                .alignment = materialized.alignment,
+                .is_global = true,
+                .is_exported = false,
+                .relocations = materialized.relocations,
+            });
+        }
     }
 
     fn deinitNodes(self: *StaticDataBuilder) void {
@@ -200,6 +232,18 @@ const StaticDataBuilder = struct {
         };
     }
 
+    fn staticDataConstNode(self: *StaticDataBuilder, value: lir.Program.StaticDataValue) ConstNode {
+        const module = self.moduleForConst(value.const_ref);
+        if (value.node) |node| return .{ .module = module, .id = node };
+        const template = module.templates.get(value.const_ref);
+        return switch (template.state) {
+            .stored_const => |stored| .{ .module = module, .id = stored.node },
+            .reserved,
+            .eval_template,
+            => staticDataInvariant("internal static data const was not stored before static materialization"),
+        };
+    }
+
     fn moduleForConst(self: *StaticDataBuilder, ref: CheckedModule.ConstRef) ConstModule {
         if (moduleBytesEqual(self.root.module.key.bytes, ref.artifact.bytes)) return .{
             .key = self.root.module.key,
@@ -207,6 +251,14 @@ const StaticDataBuilder = struct {
             .templates = &self.root.module.const_templates,
             .store = &self.root.module.const_store,
         };
+        for (self.root.relation_modules) |relation| {
+            if (moduleBytesEqual(relation.key.bytes, ref.artifact.bytes)) return .{
+                .key = relation.key,
+                .names = relation.canonical_names,
+                .templates = relation.const_templates,
+                .store = relation.const_store,
+            };
+        }
         for (self.imports) |imported| {
             if (moduleBytesEqual(imported.key.bytes, ref.artifact.bytes)) return .{
                 .key = imported.key,
@@ -215,7 +267,7 @@ const StaticDataBuilder = struct {
                 .store = imported.const_store,
             };
         }
-        staticDataInvariant("provided data export referenced a const outside the lowering module set");
+        staticDataInvariant("static data export referenced a const outside the lowering module set");
     }
 
     fn requestedLayout(self: *StaticDataBuilder, checked_type: CheckedModule.CheckedTypeId) lir.Program.RequestedLayout {
@@ -880,6 +932,7 @@ const StaticDataBuilder = struct {
             .bytes = bytes,
             .alignment = @max(payload_alignment, self.word_size),
             .is_global = false,
+            .is_exported = false,
             .relocations = relocations,
         });
 

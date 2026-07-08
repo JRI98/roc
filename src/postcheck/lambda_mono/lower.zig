@@ -43,6 +43,7 @@ pub fn run(
     name_store = undefined;
     string_literals = undefined;
     program.source_files = Ast.ProgramList([]const u8, "source_files").fromArrayList(owned.lifted.takeSourceFiles());
+    program.static_data_values = Ast.ProgramList(Ast.StaticDataValue, "static_data_values").fromArrayList(owned.lifted.takeStaticDataValues());
     errdefer program.deinit();
 
     const solved_view = movedSolvedView(&owned, &program);
@@ -88,6 +89,7 @@ fn movedSolvedView(source: *const Solved.Program, moved: *const Ast.Program) Sol
             .roots = lifted.roots,
             .layout_requests = lifted.layout_requests,
             .runtime_schema_requests = lifted.runtime_schema_requests,
+            .static_data_values = moved.static_data_values.unsafeRawItemsForView(),
             .comptime_sites = lifted.comptime_sites,
             .source_files = moved.source_files.unsafeRawItemsForView(),
             .expr_locs = lifted.expr_locs,
@@ -554,6 +556,10 @@ const Lowerer = struct {
             .dec_lit => |value| .{ .dec_lit = value },
             .str_lit => |value| .{ .str_lit = value },
             .bytes_lit => |value| .{ .bytes_lit = value },
+            .static_data_candidate => |candidate| .{ .static_data_candidate = .{
+                .static_data = candidate.static_data,
+                .runtime_expr = try self.lowerExpr(candidate.runtime_expr),
+            } },
             .uninitialized => .uninitialized,
             .uninitialized_payload => |payload| .{ .uninitialized_payload = .{
                 .condition = try self.localFor(payload.condition, try self.lowerType(self.solved.local_tys[@intFromEnum(payload.condition)])),

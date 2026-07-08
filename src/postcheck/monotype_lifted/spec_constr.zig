@@ -631,6 +631,7 @@ const Pass = struct {
                 const payloads = self.program.exprSpan(tag.payloads);
                 for (0..payloads.len) |index| try self.markArgUsesInExpr(fn_id, GuardedList.at(payloads, index), changed);
             },
+            .static_data_candidate => |candidate| try self.markArgUsesInExpr(fn_id, candidate.runtime_expr, changed),
             .nominal,
             .dbg,
             .expect,
@@ -788,6 +789,7 @@ const Pass = struct {
             => |items| try self.collectCallPatternsInExprSpan(owner, items),
             .record => |fields| try self.collectCallPatternsInFieldExprSpan(owner, fields),
             .tag => |tag| try self.collectCallPatternsInExprSpan(owner, tag.payloads),
+            .static_data_candidate => |candidate| try self.collectCallPatternsInExpr(owner, candidate.runtime_expr),
             .nominal,
             .dbg,
             .expect,
@@ -1148,6 +1150,7 @@ const Pass = struct {
                 for (0..branches.len) |index| try self.collectBranchBoundLocals(GuardedList.at(branches, index).body, out);
             },
             .nominal, .dbg, .expect => |child| try self.collectBranchBoundLocals(child, out),
+            .static_data_candidate => |candidate| try self.collectBranchBoundLocals(candidate.runtime_expr, out),
             .return_ => |ret| try self.collectBranchBoundLocals(ret.value, out),
             .comptime_branch_taken => |taken| try self.collectBranchBoundLocals(taken.body, out),
             else => {},
@@ -1217,6 +1220,7 @@ const Pass = struct {
                 return false;
             },
             .nominal, .dbg, .expect => |child| return self.loopConsumesBranchBoundLocal(child, set),
+            .static_data_candidate => |candidate| return self.loopConsumesBranchBoundLocal(candidate.runtime_expr, set),
             .return_ => |ret| return self.loopConsumesBranchBoundLocal(ret.value, set),
             .comptime_branch_taken => |taken| return self.loopConsumesBranchBoundLocal(taken.body, set),
             else => return false,
@@ -1761,6 +1765,7 @@ const Pass = struct {
                 }
                 return self.exprHasExhaustedYield(block.final_expr, depth + 1);
             },
+            .static_data_candidate => |candidate| return self.exprHasExhaustedYield(candidate.runtime_expr, depth + 1),
             .let_ => |let_| return self.exprHasExhaustedYield(let_.value, depth + 1) or
                 self.exprHasExhaustedYield(let_.rest, depth + 1),
             else => return false,
@@ -2074,6 +2079,10 @@ const Pass = struct {
                 .name = tag.name,
                 .payloads = (try self.cloneExprSpanFresh(tag.payloads, renames)) orelse return null,
             } },
+            .static_data_candidate => |candidate| .{ .static_data_candidate = .{
+                .static_data = candidate.static_data,
+                .runtime_expr = (try self.cloneExprFresh(candidate.runtime_expr, renames)) orelse return null,
+            } },
             .nominal => |backing| .{ .nominal = (try self.cloneExprFresh(backing, renames)) orelse return null },
             .fn_ref => |fn_ref| .{ .fn_ref = .{
                 .fn_id = fn_ref.fn_id,
@@ -2360,6 +2369,7 @@ const Pass = struct {
                 try self.collectIteratorLoops(if_.final_else, out);
             },
             .nominal, .dbg, .expect => |child| try self.collectIteratorLoops(child, out),
+            .static_data_candidate => |candidate| try self.collectIteratorLoops(candidate.runtime_expr, out),
             .return_ => |ret| try self.collectIteratorLoops(ret.value, out),
             .comptime_branch_taken => |taken| try self.collectIteratorLoops(taken.body, out),
             else => {},
@@ -2424,6 +2434,7 @@ const Pass = struct {
             => |items| try self.rewriteCallsInExprSpan(items, done),
             .record => |fields| try self.rewriteCallsInFieldExprSpan(fields, done),
             .tag => |tag| try self.rewriteCallsInExprSpan(tag.payloads, done),
+            .static_data_candidate => |candidate| try self.rewriteCallsInExpr(candidate.runtime_expr, done),
             .nominal,
             .dbg,
             .expect,
@@ -3057,6 +3068,7 @@ const Cloner = struct {
                 return .{ .expr = try self.addExpr(.{ .ty = expr.ty, .data = .{ .local = local } }) };
             },
             .fn_ref => |fn_ref| return try self.callableValueFromRef(expr.ty, fn_ref),
+            .static_data_candidate => |candidate| return try self.cloneExprValue(candidate.runtime_expr),
             .tag => |tag| {
                 const payload_exprs = try GuardedList.dupe(self.pass.allocator, Ast.ExprId, self.pass.program.exprSpan(tag.payloads));
                 defer self.pass.allocator.free(payload_exprs);
@@ -3224,6 +3236,7 @@ const Cloner = struct {
                 const value = itemFromValue(tuple, access.elem_index) orelse break :blk false;
                 break :blk (try self.pass.shapeFromValue(value)) != null;
             },
+            .static_data_candidate => |candidate| try self.exprHasKnownShape(candidate.runtime_expr),
             .comptime_branch_taken => |taken| try self.exprHasKnownShape(taken.body),
             .comptime_exhaustiveness_failed => false,
             else => false,
@@ -3306,6 +3319,7 @@ const Cloner = struct {
             .bytes_lit,
             => true,
             .fn_ref => |fn_ref| self.captureOperandSpanCanSubstitute(fn_ref.captures),
+            .static_data_candidate => |candidate| self.exprCanSubstitute(candidate.runtime_expr),
             .field_access => |field| self.exprCanSubstitute(field.receiver),
             .tuple_access => |access| self.exprCanSubstitute(access.tuple),
             else => false,
@@ -3360,6 +3374,10 @@ const Cloner = struct {
             .tag => |tag| .{ .tag = .{
                 .name = tag.name,
                 .payloads = try self.cloneExprSpan(tag.payloads),
+            } },
+            .static_data_candidate => |candidate| .{ .static_data_candidate = .{
+                .static_data = candidate.static_data,
+                .runtime_expr = try self.cloneExpr(candidate.runtime_expr),
             } },
             .nominal => |backing| .{ .nominal = try self.cloneExpr(backing) },
             .let_ => |let_| try self.cloneLet(let_),
@@ -4633,6 +4651,7 @@ const Cloner = struct {
                 const receiver = self.peekKnownValue(access.tuple) orelse break :blk null;
                 break :blk itemFromValue(receiver, access.elem_index);
             },
+            .static_data_candidate => |candidate| self.peekKnownValue(candidate.runtime_expr),
             else => null,
         };
     }
@@ -5914,6 +5933,7 @@ fn exprContainsReturn(program: *const Ast.Program, expr_id: Ast.ExprId) bool {
             return false;
         },
         .tag => |tag| exprSpanContainsReturn(program, tag.payloads),
+        .static_data_candidate => |candidate| exprContainsReturn(program, candidate.runtime_expr),
         .nominal,
         .dbg,
         .expect,
@@ -6029,6 +6049,7 @@ fn localUseCountInExpr(program: *const Ast.Program, local: Ast.LocalId, expr_id:
             break :blk count;
         },
         .tag => |tag| localUseCountInExprSpan(program, local, tag.payloads),
+        .static_data_candidate => |candidate| localUseCountInExpr(program, local, candidate.runtime_expr),
         .nominal,
         .dbg,
         .expect,
@@ -6170,6 +6191,7 @@ fn exprHasNoObservableEffect(program: *const Ast.Program, fn_effect_free: []cons
             break :blk true;
         },
         .tag => |tag| exprSpanHasNoObservableEffect(program, fn_effect_free, tag.payloads, allow_control),
+        .static_data_candidate => |candidate| exprHasNoObservableEffect(program, fn_effect_free, candidate.runtime_expr, allow_control),
         .nominal => |child| exprHasNoObservableEffect(program, fn_effect_free, child, allow_control),
         .field_access => |field| exprHasNoObservableEffect(program, fn_effect_free, field.receiver, allow_control),
         .tuple_access => |access| exprHasNoObservableEffect(program, fn_effect_free, access.tuple, allow_control),
@@ -6313,6 +6335,7 @@ fn scanLocalUseInExpr(program: *const Ast.Program, local: Ast.LocalId, expr_id: 
             }
         },
         .tag => |tag| scanLocalUseInExprSpan(program, local, tag.payloads, scan),
+        .static_data_candidate => |candidate| scanLocalUseInExpr(program, local, candidate.runtime_expr, scan),
         .nominal => |child| scanLocalUseInExpr(program, local, child, scan),
         .return_ => |ret| {
             scanLocalUseInExpr(program, local, ret.value, scan);

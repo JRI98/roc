@@ -72,6 +72,10 @@ pub const Options = struct {
     /// Whether inline expects should be lowered at all. Optimized runtime builds
     /// omit them before their conditions can affect control-flow decisions.
     inline_expects: InlineExpectMode = .run,
+    /// Restore stored constants as readonly static-data candidates when their
+    /// ConstStore shape may require runtime storage.
+    static_data_literals: bool = false,
+    target_usize: base.target.TargetUsize = base.target.TargetUsize.native,
 };
 
 /// Deterministic counters used by specialization-shape tests.
@@ -477,6 +481,12 @@ const ConstExprAddress = struct {
     mono_ty: u32,
 };
 
+const StaticDataUse = struct {
+    module: checked.ModuleId,
+    node: checked.ConstNodeId,
+    checked_type: checked.CheckedTypeId,
+};
+
 /// Key for a memoized structural-derivation helper def. `value_ty` is the type
 /// being derived over; `result_ty` is the derivation's auxiliary type (the
 /// produced Str for inspect, the Bool for equality, the Hasher for hashing).
@@ -566,6 +576,8 @@ const Builder = struct {
     loaded_specialization_shards: []const LoadedSpecializationShard,
     counters: ?*SpecializationCounters,
     inline_expects: InlineExpectMode,
+    static_data_literals: bool,
+    target_usize: base.target.TargetUsize,
     symbols: Common.SymbolGen = .{},
     type_cache: std.AutoHashMap(CheckedTypeAddress, Type.TypeId),
     generated_iter_types: std.AutoHashMap([32]u8, Type.TypeId),
@@ -586,6 +598,7 @@ const Builder = struct {
     lowered_nested_by_fn: std.AutoHashMap(Ast.FnId, Ast.SpecId),
     nested_site_cache: std.AutoHashMap(NestedSiteAddress, names.ProcSiteId),
     const_expr_cache: std.AutoHashMap(ConstExprAddress, Ast.ExprId),
+    static_data_ids: std.AutoHashMap(StaticDataUse, Common.StaticDataId),
     inspect_defs: std.AutoHashMap(GeneratedHelperDefAddress, GeneratedHelperDefEntry),
     equality_defs: std.AutoHashMap(GeneratedHelperDefAddress, GeneratedHelperDefEntry),
     hash_defs: std.AutoHashMap(GeneratedHelperDefAddress, GeneratedHelperDefEntry),
@@ -627,6 +640,8 @@ const Builder = struct {
             .loaded_specialization_shards = options.loaded_specialization_shards,
             .counters = options.specialization_counters,
             .inline_expects = options.inline_expects,
+            .static_data_literals = options.static_data_literals,
+            .target_usize = options.target_usize,
             .type_cache = std.AutoHashMap(CheckedTypeAddress, Type.TypeId).init(allocator),
             .generated_iter_types = std.AutoHashMap([32]u8, Type.TypeId).init(allocator),
             .generated_iter_depths = std.AutoHashMap([32]u8, u32).init(allocator),
@@ -636,6 +651,7 @@ const Builder = struct {
             .lowered_nested_by_fn = std.AutoHashMap(Ast.FnId, Ast.SpecId).init(allocator),
             .nested_site_cache = std.AutoHashMap(NestedSiteAddress, names.ProcSiteId).init(allocator),
             .const_expr_cache = std.AutoHashMap(ConstExprAddress, Ast.ExprId).init(allocator),
+            .static_data_ids = std.AutoHashMap(StaticDataUse, Common.StaticDataId).init(allocator),
             .inspect_defs = std.AutoHashMap(GeneratedHelperDefAddress, GeneratedHelperDefEntry).init(allocator),
             .equality_defs = std.AutoHashMap(GeneratedHelperDefAddress, GeneratedHelperDefEntry).init(allocator),
             .hash_defs = std.AutoHashMap(GeneratedHelperDefAddress, GeneratedHelperDefEntry).init(allocator),
@@ -671,6 +687,7 @@ const Builder = struct {
         self.hash_defs.deinit();
         self.equality_defs.deinit();
         self.inspect_defs.deinit();
+        self.static_data_ids.deinit();
         self.const_expr_cache.deinit();
         self.nested_site_cache.deinit();
         self.lowered_nested_by_fn.deinit();
@@ -1002,9 +1019,9 @@ const Builder = struct {
 
     fn lowerStaticDataRequest(self: *Builder, request: Common.StaticDataRequest) Allocator.Error!void {
         const type_view = moduleView(self.root_view);
-        const ret_ty = try self.lowerType(type_view, request.data.checked_type);
-        const const_node = self.providedConstNode(request.data);
-        const body = try self.restoreConstNodeAtType(const_node.module, type_view, const_node.id, ret_ty);
+        const ret_ty = try self.lowerType(type_view, request.checked_type);
+        const const_node = self.constNode(request.const_ref, request.node);
+        const body = try self.restoreConstNodeAtTypeWithStaticRoot(const_node.module, type_view, const_node.id, ret_ty, request.const_ref);
         const def = try self.program.addDef(.{
             .symbol = self.symbols.fresh(),
             .fn_def = null,
@@ -1013,7 +1030,7 @@ const Builder = struct {
             .ret = ret_ty,
         });
         try self.program.addLayoutRequest(.{
-            .checked_type = request.data.checked_type,
+            .checked_type = request.checked_type,
             .ty = ret_ty,
             .def = def,
         });
@@ -1240,7 +1257,7 @@ const Builder = struct {
         const template = view.callable_eval_templates.templates[raw];
         const root = view.compile_time_roots.root(template.root);
         return switch (root.payload) {
-            .fn_value => |fn_id| try self.restoreConstFnExpr(view, view, fn_id, mono_fn_ty),
+            .fn_value => |fn_id| try self.restoreConstFnExpr(view, view, fn_id, mono_fn_ty, null),
             .pending => try self.lowerPendingCallableEvalBindingValue(view, template, root, mono_fn_ty),
             else => Common.invariant("callable eval binding root did not output a callable value"),
         };
@@ -2573,15 +2590,88 @@ const Builder = struct {
         return try self.program.types.addDeclaredFields(entries);
     }
 
-    fn providedConstNode(self: *Builder, data: checked.ProvidedDataExport) ConstNode {
-        const view = self.moduleForId(checked.constModuleId(data.const_ref));
-        const template = view.const_templates.get(data.const_ref);
+    fn constNode(self: *Builder, const_ref: checked.ConstRef, node: ?checked.ConstNodeId) ConstNode {
+        const view = self.moduleForId(checked.constModuleId(const_ref));
+        if (node) |id| return .{ .module = view, .id = id };
+        const template = view.const_templates.get(const_ref);
         return switch (template.state) {
             .stored_const => |stored| .{ .module = view, .id = stored.node },
             .reserved,
             .eval_template,
             => Common.invariant("static data request const was not stored before Monotype lowering"),
         };
+    }
+
+    fn staticDataValue(
+        self: *Builder,
+        const_ref: checked.ConstRef,
+        node: ?checked.ConstNodeId,
+        checked_type: checked.CheckedTypeId,
+    ) Allocator.Error!Common.StaticDataId {
+        const const_node = self.constNode(const_ref, node);
+        const gop = try self.static_data_ids.getOrPut(.{
+            .module = const_node.module.key,
+            .node = const_node.id,
+            .checked_type = checked_type,
+        });
+        if (!gop.found_existing) {
+            gop.value_ptr.* = try self.program.addStaticDataValue(.{
+                .const_ref = const_ref,
+                .node = node,
+                .checked_type = checked_type,
+            });
+        }
+        return gop.value_ptr.*;
+    }
+
+    fn staticDataCandidateExpr(
+        self: *Builder,
+        ty: Type.TypeId,
+        static_data: Common.StaticDataId,
+        runtime_expr: Ast.ExprId,
+    ) Allocator.Error!Ast.ExprId {
+        return try self.program.addExpr(.{
+            .ty = ty,
+            .data = .{ .static_data_candidate = .{
+                .static_data = static_data,
+                .runtime_expr = runtime_expr,
+            } },
+        });
+    }
+
+    const BareFnCandidate = enum {
+        disallow,
+        allow,
+    };
+
+    fn constNodeMayUseStaticDataCandidate(self: *Builder, view: ModuleView, node: checked.ConstNodeId, bare_fn: BareFnCandidate) bool {
+        return self.constValueMayUseStaticDataCandidate(view, view.const_store.get(node), bare_fn);
+    }
+
+    fn constValueMayUseStaticDataCandidate(self: *Builder, view: ModuleView, value: checked.ConstValue, bare_fn: BareFnCandidate) bool {
+        return switch (value) {
+            .pending => Common.invariant("pending ConstStore node reached static data selection"),
+            .zst,
+            .scalar,
+            .crash,
+            => false,
+            .str => |str| self.constStrNeedsStaticData(view, str),
+            .fn_value => bare_fn == .allow,
+            .list => |items| items.len != 0,
+            .box => true,
+            .tuple,
+            .record,
+            .tag,
+            => true,
+            .nominal => |nominal| self.constValueMayUseStaticDataCandidate(view, view.const_store.get(nominal.backing), .allow),
+        };
+    }
+
+    fn constStrNeedsStaticData(self: *Builder, view: ModuleView, str: check.ConstStore.ConstStr) bool {
+        const str_bytes = view.const_store.strBytes(str);
+        const backing = view.const_store.strData(str.data);
+        const roc_str_size = self.target_usize.size() * 3;
+        return backing.len >= roc_str_size or str_bytes.len >= roc_str_size;
     }
 
     fn lookupMethodTarget(
@@ -3166,6 +3256,7 @@ const Builder = struct {
         store_view: ModuleView,
         fn_view: ModuleView,
         fn_value: check.ConstStore.ConstFn,
+        static_data_const_ref: ?checked.ConstRef,
     ) Allocator.Error!std.ArrayList(RestoredConstSourceCapture) {
         var capture_count: usize = 0;
         for (fn_value.captures) |capture| {
@@ -3198,7 +3289,10 @@ const Builder = struct {
         var out_index: usize = 0;
         for (fn_value.captures) |capture| {
             if (!capture.id.isCanonical()) continue;
-            out.items[out_index].value = try fn_ctx.restoreConstNodeAtType(store_view, fn_view, capture.value, out.items[out_index].ty);
+            out.items[out_index].value = if (static_data_const_ref) |const_ref|
+                try fn_ctx.restoredStaticDataCandidateNode(store_view, fn_view, capture.value, out.items[out_index].ty, const_ref, checkedBinderType(fn_view, capture.id.binder()), .allow)
+            else
+                try fn_ctx.restoreConstNodeAtType(store_view, fn_view, capture.value, out.items[out_index].ty);
             out_index += 1;
         }
 
@@ -3352,6 +3446,7 @@ const Builder = struct {
                 }
                 return false;
             },
+            .static_data_candidate => |candidate| return try self.exprDependsOnFreeLocalInner(candidate.runtime_expr, target, bound, active_fns),
             .nominal,
             .dbg,
             .expect,
@@ -3686,15 +3781,16 @@ const Builder = struct {
         type_view: ModuleView,
         fn_id: checked.ConstFnId,
         ty: Type.TypeId,
+        static_data_const_ref: ?checked.ConstRef,
     ) Allocator.Error!Ast.ExprId {
         const raw = @intFromEnum(fn_id);
         if (raw >= store_view.const_store.fns.items.len) Common.invariant("ConstStore function id is out of range");
         const fn_value = store_view.const_store.getFn(@enumFromInt(raw));
         if (fn_value.fn_def == .parser_runtime) {
-            return try self.restoreConstParserRuntimeFnExpr(store_view, fn_value, ty);
+            return try self.restoreConstParserRuntimeFnExpr(store_view, fn_value, ty, static_data_const_ref);
         }
         if (fn_value.fn_def == .encoder_for_runtime) {
-            return try self.restoreConstEncoderForRuntimeFnExpr(store_view, fn_value, ty);
+            return try self.restoreConstEncoderForRuntimeFnExpr(store_view, fn_value, ty, static_data_const_ref);
         }
         if (fn_value.captures.len == 0) {
             const template = try self.restoredConstFnTemplateToMono(store_view, fn_id, fn_value, ty);
@@ -3767,7 +3863,10 @@ const Builder = struct {
             initialized += 1;
         }
         for (fn_value.captures, 0..) |capture, index| {
-            captures[index].value = try fn_ctx.restoreConstNodeAtType(store_view, fn_view, capture.value, captures[index].ty);
+            captures[index].value = if (static_data_const_ref) |const_ref|
+                try fn_ctx.restoredStaticDataCandidateNode(store_view, fn_view, capture.value, captures[index].ty, const_ref, checkedBinderType(fn_view, constCaptureBinder(capture.id)), .allow)
+            else
+                try fn_ctx.restoreConstNodeAtType(store_view, fn_view, capture.value, captures[index].ty);
         }
         var template = try self.constFnTemplateToMono(fn_value, ty);
         switch (template.fn_def) {
@@ -3827,6 +3926,7 @@ const Builder = struct {
         store_view: ModuleView,
         fn_value: check.ConstStore.ConstFn,
         ty: Type.TypeId,
+        static_data_const_ref: ?checked.ConstRef,
     ) Allocator.Error!Ast.ExprId {
         const runtime = switch (fn_value.fn_def) {
             .parser_runtime => |runtime| runtime,
@@ -3845,7 +3945,7 @@ const Builder = struct {
         defer fn_ctx.deinit();
         fn_ctx.current_fn_key = fn_value.source_fn_key;
 
-        var source_captures = try self.bindConstSourceCaptures(&fn_ctx, store_view, fn_view, fn_value);
+        var source_captures = try self.bindConstSourceCaptures(&fn_ctx, store_view, fn_view, fn_value, static_data_const_ref);
         defer self.releaseConstSourceCaptures(&fn_ctx, &source_captures);
 
         const expr = fn_view.bodies.expr(runtime.expr);
@@ -3878,7 +3978,10 @@ const Builder = struct {
             fn_ctx.setLocalCaptureId(local, parserEncodingCaptureId());
             encoding_let = .{
                 .local = local,
-                .value = try fn_ctx.restoreConstNodeAtType(store_view, fn_view, node, arg_tys[0]),
+                .value = if (static_data_const_ref) |const_ref|
+                    try fn_ctx.restoreConstNodeAtTypeWithStaticRoot(store_view, fn_view, node, arg_tys[0], const_ref)
+                else
+                    try fn_ctx.restoreConstNodeAtType(store_view, fn_view, node, arg_tys[0]),
             };
             break :blk try fn_ctx.localExpr(local, arg_tys[0]);
         } else try fn_ctx.lowerDispatchOperandAtType(plan_args[0], arg_tys[0]);
@@ -3935,6 +4038,7 @@ const Builder = struct {
         store_view: ModuleView,
         fn_value: check.ConstStore.ConstFn,
         ty: Type.TypeId,
+        static_data_const_ref: ?checked.ConstRef,
     ) Allocator.Error!Ast.ExprId {
         const runtime = switch (fn_value.fn_def) {
             .encoder_for_runtime => |runtime| runtime,
@@ -3953,7 +4057,7 @@ const Builder = struct {
         defer fn_ctx.deinit();
         fn_ctx.current_fn_key = fn_value.source_fn_key;
 
-        var source_captures = try self.bindConstSourceCaptures(&fn_ctx, store_view, fn_view, fn_value);
+        var source_captures = try self.bindConstSourceCaptures(&fn_ctx, store_view, fn_view, fn_value, static_data_const_ref);
         defer self.releaseConstSourceCaptures(&fn_ctx, &source_captures);
 
         const expr = fn_view.bodies.expr(runtime.expr);
@@ -3988,7 +4092,10 @@ const Builder = struct {
             fn_ctx.setLocalCaptureId(local, encoderForEncodingCaptureId());
             encoding_let = .{
                 .local = local,
-                .value = try fn_ctx.restoreConstNodeAtType(store_view, fn_view, node, arg_tys[0]),
+                .value = if (static_data_const_ref) |const_ref|
+                    try fn_ctx.restoreConstNodeAtTypeWithStaticRoot(store_view, fn_view, node, arg_tys[0], const_ref)
+                else
+                    try fn_ctx.restoreConstNodeAtType(store_view, fn_view, node, arg_tys[0]),
             };
             break :blk try fn_ctx.localExpr(local, arg_tys[0]);
         } else try fn_ctx.lowerDispatchOperandAtType(plan_args[0], arg_tys[0]);
@@ -4072,26 +4179,39 @@ const Builder = struct {
         node: checked.ConstNodeId,
         ty: Type.TypeId,
     ) Allocator.Error!Ast.ExprId {
+        return try self.restoreConstNodeAtTypeWithStaticRoot(store_view, type_view, node, ty, null);
+    }
+
+    fn restoreConstNodeAtTypeWithStaticRoot(
+        self: *Builder,
+        store_view: ModuleView,
+        type_view: ModuleView,
+        node: checked.ConstNodeId,
+        ty: Type.TypeId,
+        static_data_const_ref: ?checked.ConstRef,
+    ) Allocator.Error!Ast.ExprId {
         const address = ConstExprAddress{
             .store_module_bytes = store_view.key.bytes,
             .type_module_bytes = type_view.key.bytes,
             .node = @intFromEnum(node),
             .mono_ty = @intFromEnum(ty),
         };
-        if (self.const_expr_cache.get(address)) |existing| return existing;
+        if (static_data_const_ref == null) {
+            if (self.const_expr_cache.get(address)) |existing| return existing;
+        }
 
         const value = store_view.const_store.get(node);
         switch (value) {
             .fn_value => |fn_id| {
-                const expr = try self.restoreConstFnExpr(store_view, type_view, fn_id, ty);
-                try self.const_expr_cache.put(address, expr);
+                const expr = try self.restoreConstFnExpr(store_view, type_view, fn_id, ty, static_data_const_ref);
+                if (static_data_const_ref == null) try self.const_expr_cache.put(address, expr);
                 return expr;
             },
             else => {},
         }
-        const data = try self.restoreConstData(store_view, type_view, value, ty);
+        const data = try self.restoreConstData(store_view, type_view, value, ty, static_data_const_ref);
         const expr = try self.program.addExpr(.{ .ty = ty, .data = data });
-        try self.const_expr_cache.put(address, expr);
+        if (static_data_const_ref == null) try self.const_expr_cache.put(address, expr);
         return expr;
     }
 
@@ -4101,6 +4221,7 @@ const Builder = struct {
         type_view: ModuleView,
         value: checked.ConstValue,
         ty: Type.TypeId,
+        static_data_const_ref: ?checked.ConstRef,
     ) Allocator.Error!Ast.ExprData {
         return switch (value) {
             .pending => Common.invariant("pending ConstStore node reached Monotype restore"),
@@ -4116,21 +4237,21 @@ const Builder = struct {
                 str.offset,
                 str.len,
             ) },
-            .list => |items| .{ .list = try self.restoreConstList(store_view, type_view, ty, items) },
+            .list => |items| .{ .list = try self.restoreConstList(store_view, type_view, ty, items, static_data_const_ref) },
             .box => |payload| blk: {
-                const child = try self.restoreConstNodeAtType(store_view, type_view, payload, self.constBoxPayloadType(ty));
+                const child = try self.restoreConstNodeAtTypeWithStaticRoot(store_view, type_view, payload, self.constBoxPayloadType(ty), static_data_const_ref);
                 break :blk .{ .low_level = .{
                     .op = .box_box,
                     .args = try self.program.addExprSpan(&.{child}),
                 } };
             },
-            .tuple => |items| .{ .tuple = try self.restoreConstTuple(store_view, type_view, ty, items) },
-            .record => |items| .{ .record = try self.restoreConstRecord(store_view, type_view, ty, items) },
+            .tuple => |items| .{ .tuple = try self.restoreConstTuple(store_view, type_view, ty, items, static_data_const_ref) },
+            .record => |items| .{ .record = try self.restoreConstRecord(store_view, type_view, ty, items, static_data_const_ref) },
             .tag => |tag| .{ .tag = .{
                 .name = try self.program.names.internTagLabel(tag.tag_name),
-                .payloads = try self.restoreConstTagPayloads(store_view, type_view, ty, tag),
+                .payloads = try self.restoreConstTagPayloads(store_view, type_view, ty, tag, static_data_const_ref),
             } },
-            .nominal => |nominal| .{ .nominal = try self.restoreConstNodeAtType(store_view, type_view, nominal.backing, self.namedBackingType(ty) orelse ty) },
+            .nominal => |nominal| .{ .nominal = try self.restoreConstNodeAtTypeWithStaticRoot(store_view, type_view, nominal.backing, self.namedBackingType(ty) orelse ty, static_data_const_ref) },
             .fn_value => Common.invariant("ConstStore function value must be restored as an expression"),
         };
     }
@@ -4141,12 +4262,13 @@ const Builder = struct {
         type_view: ModuleView,
         ty: Type.TypeId,
         items: []const checked.ConstNodeId,
+        static_data_const_ref: ?checked.ConstRef,
     ) Allocator.Error!Ast.Span(Ast.ExprId) {
         const elem_ty = self.constListElemType(ty);
         const lowered = try self.allocator.alloc(Ast.ExprId, items.len);
         defer self.allocator.free(lowered);
         for (items, 0..) |item, index| {
-            lowered[index] = try self.restoreConstNodeAtType(store_view, type_view, item, elem_ty);
+            lowered[index] = try self.restoreConstNodeAtTypeWithStaticRoot(store_view, type_view, item, elem_ty, static_data_const_ref);
         }
         return try self.program.addExprSpan(lowered);
     }
@@ -4157,6 +4279,7 @@ const Builder = struct {
         type_view: ModuleView,
         ty: Type.TypeId,
         items: []const checked.ConstNodeId,
+        static_data_const_ref: ?checked.ConstRef,
     ) Allocator.Error!Ast.Span(Ast.ExprId) {
         const item_span = self.tupleItemSpan(ty);
         const item_count: usize = @intCast(item_span.len);
@@ -4166,7 +4289,7 @@ const Builder = struct {
         for (items, 0..) |item, index| {
             const item_tys = self.program.types.span(item_span);
             const item_ty = GuardedList.at(item_tys, index);
-            lowered[index] = try self.restoreConstNodeAtType(store_view, type_view, item, item_ty);
+            lowered[index] = try self.restoreConstNodeAtTypeWithStaticRoot(store_view, type_view, item, item_ty, static_data_const_ref);
         }
         return try self.program.addExprSpan(lowered);
     }
@@ -4177,6 +4300,7 @@ const Builder = struct {
         type_view: ModuleView,
         ty: Type.TypeId,
         items: []const checked.ConstNodeId,
+        static_data_const_ref: ?checked.ConstRef,
     ) Allocator.Error!Ast.Span(Ast.FieldExpr) {
         const field_span = self.recordFieldsSpan(ty);
         const field_count: usize = @intCast(field_span.len);
@@ -4188,7 +4312,7 @@ const Builder = struct {
             const field = GuardedList.at(fields, index);
             lowered[index] = .{
                 .name = field.name,
-                .value = try self.restoreConstNodeAtType(store_view, type_view, item, field.ty),
+                .value = try self.restoreConstNodeAtTypeWithStaticRoot(store_view, type_view, item, field.ty, static_data_const_ref),
             };
         }
         return try self.program.addFieldExprSpan(lowered);
@@ -4200,6 +4324,7 @@ const Builder = struct {
         type_view: ModuleView,
         ty: Type.TypeId,
         tag: anytype,
+        static_data_const_ref: ?checked.ConstRef,
     ) Allocator.Error!Ast.Span(Ast.ExprId) {
         const mono_tag_name = try self.program.names.internTagLabel(tag.tag_name);
         const payload_span = self.tagPayloadSpan(ty, mono_tag_name);
@@ -4210,7 +4335,7 @@ const Builder = struct {
         for (tag.payloads, 0..) |payload, index| {
             const payload_tys = self.program.types.span(payload_span);
             const payload_ty = GuardedList.at(payload_tys, index);
-            lowered[index] = try self.restoreConstNodeAtType(store_view, type_view, payload, payload_ty);
+            lowered[index] = try self.restoreConstNodeAtTypeWithStaticRoot(store_view, type_view, payload, payload_ty, static_data_const_ref);
         }
         return try self.program.addExprSpan(lowered);
     }
@@ -4872,6 +4997,11 @@ const DraftReturn = struct {
     target: DraftTypeCell,
 };
 
+const DraftStaticDataCandidate = struct {
+    static_data: Common.StaticDataId,
+    runtime_expr: DraftExprId,
+};
+
 const DraftExpr = struct {
     ty: DraftTypeCell,
     data: DraftExprData,
@@ -4893,6 +5023,7 @@ const DraftExprData = union(enum(u8)) {
     dec_lit: builtins.dec.RocDec,
     str_lit: DraftStringLiteralId,
     bytes_lit: DraftStringLiteralId,
+    static_data_candidate: DraftStaticDataCandidate,
     list: DraftSpan(DraftExprId),
     tuple: DraftSpan(DraftExprId),
     record: DraftSpan(DraftFieldExpr),
@@ -5775,6 +5906,10 @@ const BodyDraftStore = struct {
             .dec_lit => |value| .{ .dec_lit = value },
             .str_lit => |literal| .{ .str_lit = ids.stringLiteral(literal) },
             .bytes_lit => |literal| .{ .bytes_lit = ids.stringLiteral(literal) },
+            .static_data_candidate => |candidate| .{ .static_data_candidate = .{
+                .static_data = candidate.static_data,
+                .runtime_expr = ids.expr(candidate.runtime_expr),
+            } },
             .list => |span| .{ .list = ids.exprSpan(span) },
             .tuple => |span| .{ .tuple = ids.exprSpan(span) },
             .record => |span| .{ .record = ids.fieldExprSpan(span) },
@@ -7241,6 +7376,7 @@ const BodyContext = struct {
                 }
                 return false;
             },
+            .static_data_candidate => |candidate| return try self.exprDependsOnFreeLocalInner(candidate.runtime_expr, target, bound),
             .nominal,
             .dbg,
             .expect,
@@ -8391,7 +8527,15 @@ const BodyContext = struct {
                 defer self.builder.program.current_region = saved_region;
                 self.builder.program.current_loc = try self.sourceLocFor(source_region);
                 self.builder.program.current_region = source_region;
-                break :blk try self.restoreConstNodeAtType(self.view, self.view, stored.node, ty);
+                break :blk try self.restoredStaticDataCandidateNode(
+                    self.view,
+                    self.view,
+                    stored.node,
+                    ty,
+                    entry.const_ref,
+                    entry.checked_type,
+                    .disallow,
+                );
             },
             .eval_template => |eval| try self.lowerConstEvalTemplateUse(self.view, eval, ty, source_region, entry.root),
             .reserved => Common.invariant("reserved hoisted const template reached Monotype"),
@@ -8869,7 +9013,7 @@ const BodyContext = struct {
         const template = view.callable_eval_templates.templates[raw];
         const root = view.compile_time_roots.root(template.root);
         return switch (root.payload) {
-            .fn_value => |fn_id| try self.restoreConstFn(view, fn_id, mono_fn_ty),
+            .fn_value => |fn_id| try self.restoreConstFn(view, fn_id, mono_fn_ty, null),
             .pending => try self.lowerPendingCallableEvalBindingValue(view, template, root, mono_fn_ty),
             else => Common.invariant("callable eval binding root did not output a callable value"),
         };
@@ -16153,7 +16297,15 @@ const BodyContext = struct {
         const store_view = self.builder.moduleForId(checked.constModuleId(const_use.const_ref));
         const template = store_view.const_templates.get(const_use.const_ref);
         return switch (template.state) {
-            .stored_const => |stored| try self.restoreConstNodeAtType(store_view, self.view, stored.node, ty),
+            .stored_const => |stored| try self.restoredStaticDataCandidateNode(
+                store_view,
+                self.view,
+                stored.node,
+                ty,
+                const_use.const_ref,
+                requested_ty,
+                .disallow,
+            ),
             .reserved => Common.invariant("reserved checked const template reached Monotype"),
             .eval_template => |eval| try self.lowerConstEvalTemplateUse(store_view, eval, ty, null, null),
         };
@@ -16260,15 +16412,50 @@ const BodyContext = struct {
         node: checked.ConstNodeId,
         ty: Type.TypeId,
     ) Allocator.Error!DraftExprId {
+        return try self.restoreConstNodeAtTypeWithStaticRoot(store_view, type_view, node, ty, null);
+    }
+
+    fn restoreConstNodeAtTypeWithStaticRoot(
+        self: *BodyContext,
+        store_view: ModuleView,
+        type_view: ModuleView,
+        node: checked.ConstNodeId,
+        ty: Type.TypeId,
+        static_data_const_ref: ?checked.ConstRef,
+    ) Allocator.Error!DraftExprId {
         const value = store_view.const_store.get(node);
         switch (value) {
             .fn_value => |fn_id| {
-                return try self.restoreConstFn(store_view, fn_id, ty);
+                return try self.restoreConstFn(store_view, fn_id, ty, static_data_const_ref);
             },
             else => {},
         }
-        const data = try self.restoreConstData(store_view, type_view, value, ty);
+        const data = try self.restoreConstData(store_view, type_view, value, ty, static_data_const_ref);
         return try self.addExpr(.{ .ty = ty, .data = data });
+    }
+
+    fn restoredStaticDataCandidateNode(
+        self: *BodyContext,
+        store_view: ModuleView,
+        type_view: ModuleView,
+        node: checked.ConstNodeId,
+        ty: Type.TypeId,
+        const_ref: checked.ConstRef,
+        checked_type: checked.CheckedTypeId,
+        bare_fn: Builder.BareFnCandidate,
+    ) Allocator.Error!DraftExprId {
+        if (!moduleBytesEqual(checked.constModuleId(const_ref).bytes, store_view.key.bytes)) {
+            Common.invariant("static-data const context referenced a different ConstStore module");
+        }
+        const runtime_expr = try self.restoreConstNodeAtTypeWithStaticRoot(store_view, type_view, node, ty, const_ref);
+        if (self.builder.static_data_literals and self.builder.constNodeMayUseStaticDataCandidate(store_view, node, bare_fn)) {
+            const id = try self.builder.staticDataValue(const_ref, node, checked_type);
+            return try self.addExpr(.{ .ty = ty, .data = .{ .static_data_candidate = .{
+                .static_data = id,
+                .runtime_expr = runtime_expr,
+            } } });
+        }
+        return runtime_expr;
     }
 
     fn restoreConstData(
@@ -16277,6 +16464,7 @@ const BodyContext = struct {
         type_view: ModuleView,
         value: checked.ConstValue,
         ty: Type.TypeId,
+        static_data_const_ref: ?checked.ConstRef,
     ) Allocator.Error!BodyExprData {
         return switch (value) {
             .pending => Common.invariant("pending ConstStore node reached Monotype restore"),
@@ -16292,21 +16480,21 @@ const BodyContext = struct {
                 str.offset,
                 str.len,
             ) },
-            .list => |items| .{ .list = try self.restoreConstList(store_view, type_view, ty, items) },
+            .list => |items| .{ .list = try self.restoreConstList(store_view, type_view, ty, items, static_data_const_ref) },
             .box => |payload| blk: {
-                const child = try self.restoreConstNodeAtType(store_view, type_view, payload, self.constBoxPayloadType(ty));
+                const child = try self.restoreConstNodeAtTypeWithStaticRoot(store_view, type_view, payload, self.constBoxPayloadType(ty), static_data_const_ref);
                 break :blk .{ .low_level = .{
                     .op = .box_box,
                     .args = try self.addExprSpan(&.{child}),
                 } };
             },
-            .tuple => |items| .{ .tuple = try self.restoreConstTuple(store_view, type_view, ty, items) },
-            .record => |items| .{ .record = try self.restoreConstRecord(store_view, type_view, ty, items) },
+            .tuple => |items| .{ .tuple = try self.restoreConstTuple(store_view, type_view, ty, items, static_data_const_ref) },
+            .record => |items| .{ .record = try self.restoreConstRecord(store_view, type_view, ty, items, static_data_const_ref) },
             .tag => |tag| .{ .tag = .{
                 .name = try self.builder.program.names.internTagLabel(tag.tag_name),
-                .payloads = try self.restoreConstTagPayloads(store_view, type_view, ty, tag),
+                .payloads = try self.restoreConstTagPayloads(store_view, type_view, ty, tag, static_data_const_ref),
             } },
-            .nominal => |nominal| .{ .nominal = try self.restoreConstNodeAtType(store_view, type_view, nominal.backing, self.builder.namedBackingType(ty) orelse ty) },
+            .nominal => |nominal| .{ .nominal = try self.restoreConstNodeAtTypeWithStaticRoot(store_view, type_view, nominal.backing, self.builder.namedBackingType(ty) orelse ty, static_data_const_ref) },
             .fn_value => Common.invariant("ConstStore function value must be restored as an expression"),
         };
     }
@@ -16317,12 +16505,13 @@ const BodyContext = struct {
         type_view: ModuleView,
         ty: Type.TypeId,
         items: []const checked.ConstNodeId,
+        static_data_const_ref: ?checked.ConstRef,
     ) Allocator.Error!DraftSpan(DraftExprId) {
         const elem_ty = self.constListElemType(ty);
         const lowered = try self.allocator.alloc(DraftExprId, items.len);
         defer self.allocator.free(lowered);
         for (items, 0..) |item, index| {
-            lowered[index] = try self.restoreConstNodeAtType(store_view, type_view, item, elem_ty);
+            lowered[index] = try self.restoreConstNodeAtTypeWithStaticRoot(store_view, type_view, item, elem_ty, static_data_const_ref);
         }
         return try self.addExprSpan(lowered);
     }
@@ -16333,6 +16522,7 @@ const BodyContext = struct {
         type_view: ModuleView,
         ty: Type.TypeId,
         items: []const checked.ConstNodeId,
+        static_data_const_ref: ?checked.ConstRef,
     ) Allocator.Error!DraftSpan(DraftExprId) {
         const item_span = self.builder.tupleItemSpan(ty);
         const item_count: usize = @intCast(item_span.len);
@@ -16342,7 +16532,7 @@ const BodyContext = struct {
         for (items, 0..) |item, index| {
             const item_tys = self.builder.program.types.span(item_span);
             const item_ty = GuardedList.at(item_tys, index);
-            lowered[index] = try self.restoreConstNodeAtType(store_view, type_view, item, item_ty);
+            lowered[index] = try self.restoreConstNodeAtTypeWithStaticRoot(store_view, type_view, item, item_ty, static_data_const_ref);
         }
         return try self.addExprSpan(lowered);
     }
@@ -16353,6 +16543,7 @@ const BodyContext = struct {
         type_view: ModuleView,
         ty: Type.TypeId,
         items: []const checked.ConstNodeId,
+        static_data_const_ref: ?checked.ConstRef,
     ) Allocator.Error!DraftSpan(DraftFieldExpr) {
         const field_span = self.builder.recordFieldsSpan(ty);
         const field_count: usize = @intCast(field_span.len);
@@ -16364,7 +16555,7 @@ const BodyContext = struct {
             const field = GuardedList.at(fields, index);
             lowered[index] = .{
                 .name = field.name,
-                .value = try self.restoreConstNodeAtType(store_view, type_view, item, field.ty),
+                .value = try self.restoreConstNodeAtTypeWithStaticRoot(store_view, type_view, item, field.ty, static_data_const_ref),
             };
         }
         return try self.addFieldExprSpan(lowered);
@@ -16376,6 +16567,7 @@ const BodyContext = struct {
         type_view: ModuleView,
         ty: Type.TypeId,
         tag: anytype,
+        static_data_const_ref: ?checked.ConstRef,
     ) Allocator.Error!DraftSpan(DraftExprId) {
         const mono_tag_name = try self.builder.program.names.internTagLabel(tag.tag_name);
         const payload_span = self.builder.tagPayloadSpan(ty, mono_tag_name);
@@ -16386,7 +16578,7 @@ const BodyContext = struct {
         for (tag.payloads, 0..) |payload, index| {
             const payload_tys = self.builder.program.types.span(payload_span);
             const payload_ty = GuardedList.at(payload_tys, index);
-            lowered[index] = try self.restoreConstNodeAtType(store_view, type_view, payload, payload_ty);
+            lowered[index] = try self.restoreConstNodeAtTypeWithStaticRoot(store_view, type_view, payload, payload_ty, static_data_const_ref);
         }
         return try self.addExprSpan(lowered);
     }
@@ -16414,19 +16606,20 @@ const BodyContext = struct {
         store_view: ModuleView,
         fn_id: checked.ConstFnId,
         ty: Type.TypeId,
+        static_data_const_ref: ?checked.ConstRef,
     ) Allocator.Error!DraftExprId {
         const raw = @intFromEnum(fn_id);
         if (raw >= store_view.const_store.fns.items.len) Common.invariant("ConstStore function id is out of range");
         const fn_value = store_view.const_store.getFn(@enumFromInt(raw));
         if (fn_value.fn_def == .parser_runtime) {
-            return try self.restoreConstParserRuntimeFn(store_view, fn_value, ty);
+            return try self.restoreConstParserRuntimeFn(store_view, fn_value, ty, static_data_const_ref);
         }
         if (fn_value.fn_def == .encoder_for_runtime) {
-            return try self.restoreConstEncoderForRuntimeFn(store_view, fn_value, ty);
+            return try self.restoreConstEncoderForRuntimeFn(store_view, fn_value, ty, static_data_const_ref);
         }
         const template = try self.builder.restoredConstFnTemplateToMono(store_view, fn_id, fn_value, ty);
         if (fn_value.captures.len != 0) {
-            return try self.restoreCapturingConstFn(store_view, fn_id, fn_value, template, ty);
+            return try self.restoreCapturingConstFn(store_view, fn_id, fn_value, template, ty, static_data_const_ref);
         }
         const mono_fn_id = try self.restoreConstFnTemplate(fn_value, template);
         return try self.addExpr(.{
@@ -16459,6 +16652,7 @@ const BodyContext = struct {
         fn_value: check.ConstStore.ConstFn,
         template: Ast.FnTemplate,
         ty: Type.TypeId,
+        static_data_const_ref: ?checked.ConstRef,
     ) Allocator.Error!DraftExprId {
         const fn_view = self.builder.moduleForConstFnDef(fn_value.fn_def);
         var fn_ctx = try BodyContext.init(self.allocator, self.builder, fn_view, ownerTemplateForConstFnDef(fn_value.fn_def), self.graph, self.draft);
@@ -16516,7 +16710,10 @@ const BodyContext = struct {
             initialized += 1;
         }
         for (fn_value.captures, 0..) |capture, index| {
-            captures[index].value = try fn_ctx.restoreConstNodeAtType(store_view, fn_view, capture.value, captures[index].ty);
+            captures[index].value = if (static_data_const_ref) |const_ref|
+                try fn_ctx.restoredStaticDataCandidateNode(store_view, fn_view, capture.value, captures[index].ty, const_ref, checkedBinderType(fn_view, constCaptureBinder(capture.id)), .allow)
+            else
+                try fn_ctx.restoreConstNodeAtType(store_view, fn_view, capture.value, captures[index].ty);
         }
 
         var capture_template = template;
@@ -16574,6 +16771,7 @@ const BodyContext = struct {
         store_view: ModuleView,
         fn_value: check.ConstStore.ConstFn,
         ty: Type.TypeId,
+        static_data_const_ref: ?checked.ConstRef,
     ) Allocator.Error!DraftExprId {
         const runtime = switch (fn_value.fn_def) {
             .parser_runtime => |runtime| runtime,
@@ -16615,7 +16813,10 @@ const BodyContext = struct {
             fn_ctx.setLocalCaptureId(local, parserEncodingCaptureId());
             encoding_let = .{
                 .local = local,
-                .value = try fn_ctx.restoreConstNodeAtType(store_view, fn_view, node, arg_tys[0]),
+                .value = if (static_data_const_ref) |const_ref|
+                    try fn_ctx.restoreConstNodeAtTypeWithStaticRoot(store_view, fn_view, node, arg_tys[0], const_ref)
+                else
+                    try fn_ctx.restoreConstNodeAtType(store_view, fn_view, node, arg_tys[0]),
             };
             break :blk try fn_ctx.localExpr(local, arg_tys[0]);
         } else try fn_ctx.lowerDispatchOperandAtType(plan_args[0], arg_tys[0]);
@@ -16667,6 +16868,7 @@ const BodyContext = struct {
         store_view: ModuleView,
         fn_value: check.ConstStore.ConstFn,
         ty: Type.TypeId,
+        static_data_const_ref: ?checked.ConstRef,
     ) Allocator.Error!DraftExprId {
         const runtime = switch (fn_value.fn_def) {
             .encoder_for_runtime => |runtime| runtime,
@@ -16710,7 +16912,10 @@ const BodyContext = struct {
             fn_ctx.setLocalCaptureId(local, encoderForEncodingCaptureId());
             encoding_let = .{
                 .local = local,
-                .value = try fn_ctx.restoreConstNodeAtType(store_view, fn_view, node, arg_tys[0]),
+                .value = if (static_data_const_ref) |const_ref|
+                    try fn_ctx.restoreConstNodeAtTypeWithStaticRoot(store_view, fn_view, node, arg_tys[0], const_ref)
+                else
+                    try fn_ctx.restoreConstNodeAtType(store_view, fn_view, node, arg_tys[0]),
             };
             break :blk try fn_ctx.localExpr(local, arg_tys[0]);
         } else try fn_ctx.lowerDispatchOperandAtType(plan_args[0], arg_tys[0]);

@@ -267,6 +267,12 @@ fn loadDevProgram(
             },
         }
     }
+    for (view.data_relocations) |record| {
+        const name = try view.symbolName(record.symbol);
+        if (resolveShimFunction(name)) |target_addr| {
+            try ensureFunctionStub(gpa, &function_stubs, name, target_addr);
+        }
+    }
 
     const stub_size = try jumpStubSize();
     if (function_stubs.items.len > view.function_stubs.len / stub_size) {
@@ -294,6 +300,7 @@ fn loadDevProgram(
         &relocation_context,
         RelocationContext.resolve,
     );
+    try applyDataRelocations(view, &relocation_context);
     try finishDirectImageRelocation(view);
 
     return .{
@@ -320,6 +327,34 @@ fn createDevProgram(
 
     program.* = try loadDevProgram(gpa, view, generation, descriptor_offset, descriptor);
     return program;
+}
+
+fn applyDataRelocations(
+    view: *const RunImage.ProgramView,
+    relocation_context: *const RelocationContext,
+) LoadDevProgramError!void {
+    for (view.data_relocations) |record| {
+        if ((try record.relocationKind()) != .linked_data_abs64) return error.InvalidDevRunImage;
+        const name = try view.symbolName(record.symbol);
+        const target_addr = RelocationContext.resolve(relocation_context, name) orelse return error.UnresolvedSymbol;
+        const value = try relocatedDataAddress(target_addr, record.addend);
+        if (record.data_offset > std.math.maxInt(usize)) return error.InvalidDevRunImage;
+        const offset: usize = @intCast(record.data_offset);
+        if (offset > view.data.len or @sizeOf(usize) > view.data.len - offset) return error.InvalidDevRunImage;
+        std.mem.writeInt(usize, view.data[offset..][0..@sizeOf(usize)], value, .little);
+    }
+}
+
+fn relocatedDataAddress(base_addr: usize, addend: i64) RunImage.ImageError!usize {
+    if (addend >= 0) {
+        const positive: usize = @intCast(addend);
+        if (positive > std.math.maxInt(usize) - base_addr) return error.InvalidDevRunImage;
+        return base_addr + positive;
+    }
+    if (addend == std.math.minInt(i64)) return error.InvalidDevRunImage;
+    const negative: usize = @intCast(-addend);
+    if (negative > base_addr) return error.InvalidDevRunImage;
+    return base_addr - negative;
 }
 
 fn destroyDevProgram(gpa: Allocator, program: *DevProgram) void {
@@ -771,4 +806,57 @@ test "loaded dev program borrows direct shared image metadata" {
     try std.testing.expect(program.code.ptr == view.code.ptr);
     try std.testing.expectEqual(@as(u32, 0), program.entrypoints[0].ordinal);
     try std.testing.expectEqual(@as(u64, 0), program.entrypoints[0].code_offset);
+}
+
+test "data relocations patch data pointers" {
+    var data = [_]u8{0} ** (@sizeOf(usize) + 4);
+    const source_name = "roc__source";
+    const target_name = "roc__target";
+    const symbol_names = source_name ++ target_name;
+    const data_symbols = [_]RunImage.DataSymbol{
+        .{
+            .name = .{ .offset = 0, .len = source_name.len },
+            .data_offset = 0,
+            .len = @sizeOf(usize),
+            .symbol_offset = 0,
+            .alignment = @alignOf(usize),
+        },
+        .{
+            .name = .{ .offset = source_name.len, .len = target_name.len },
+            .data_offset = @sizeOf(usize),
+            .len = data.len - @sizeOf(usize),
+            .symbol_offset = 1,
+            .alignment = 1,
+        },
+    };
+    const data_relocations = [_]RunImage.DataRelocationRecord{
+        .{
+            .data_offset = 0,
+            .symbol = .{ .offset = source_name.len, .len = target_name.len },
+            .addend = 2,
+            .kind = @intFromEnum(RunImage.RelocationKind.linked_data_abs64),
+        },
+    };
+    const view = RunImage.ProgramView{
+        .executable = &.{},
+        .code = &.{},
+        .function_stubs = &.{},
+        .entrypoints = &.{},
+        .relocations = &.{},
+        .data_relocations = &data_relocations,
+        .symbol_names = symbol_names,
+        .data = &data,
+        .data_symbols = &data_symbols,
+        .page_size = 4096,
+    };
+    const relocation_context = RelocationContext{
+        .view = &view,
+        .function_stubs = &.{},
+        .code_base = 0,
+    };
+
+    try applyDataRelocations(&view, &relocation_context);
+
+    const expected = @intFromPtr(data[0..].ptr) + @sizeOf(usize) + 1 + 2;
+    try std.testing.expectEqual(expected, std.mem.readInt(usize, data[0..@sizeOf(usize)], .little));
 }

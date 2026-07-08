@@ -821,6 +821,8 @@ pub fn LirCodeGen(comptime target: RocTarget) type {
 
         /// Readonly data symbols for non-SSO strings in object-file output.
         static_strings: []const StaticStringData.Entry,
+        /// Owned names for generated internal static-data relocation targets.
+        static_data_symbol_names: std.ArrayList([]u8),
 
         /// Map from LIR local id to value location (register or stack slot)
         local_locations: std.AutoHashMap(u32, ValueLocation),
@@ -1204,6 +1206,7 @@ pub fn LirCodeGen(comptime target: RocTarget) type {
                 .store = store,
                 .layout_store = layout_store_opt,
                 .static_strings = static_strings,
+                .static_data_symbol_names = .empty,
                 .local_locations = std.AutoHashMap(u32, ValueLocation).init(allocator),
                 .join_points = std.AutoHashMap(u32, usize).init(allocator),
                 .stmt_locations = std.AutoHashMap(u32, usize).init(allocator),
@@ -1239,6 +1242,8 @@ pub fn LirCodeGen(comptime target: RocTarget) type {
         /// Clean up resources
         pub fn deinit(self: *Self) void {
             self.codegen.deinit();
+            self.clearStaticDataSymbolNames();
+            self.static_data_symbol_names.deinit(self.allocator);
             self.local_locations.deinit();
             self.join_points.deinit();
             self.stmt_locations.deinit();
@@ -1273,6 +1278,7 @@ pub fn LirCodeGen(comptime target: RocTarget) type {
         /// Reset the code generator for generating a new expression
         pub fn reset(self: *Self) void {
             self.codegen.reset();
+            self.clearStaticDataSymbolNames();
             self.local_locations.clearRetainingCapacity();
             self.join_points.clearRetainingCapacity();
             self.stmt_locations.clearRetainingCapacity();
@@ -1298,6 +1304,13 @@ pub fn LirCodeGen(comptime target: RocTarget) type {
             self.loop_continue_targets.clearRetainingCapacity();
             self.loop_break_patch_starts.clearRetainingCapacity();
             self.loop_break_patches.clearRetainingCapacity();
+        }
+
+        fn clearStaticDataSymbolNames(self: *Self) void {
+            for (self.static_data_symbol_names.items) |name| {
+                self.allocator.free(name);
+            }
+            self.static_data_symbol_names.clearRetainingCapacity();
         }
 
         fn cloneJoinPointJumpsMap(
@@ -12492,6 +12505,13 @@ pub fn LirCodeGen(comptime target: RocTarget) type {
             }
         }
 
+        fn emitStaticDataAddress(self: *Self, dst_reg: GeneralReg, id: lir.LIR.StaticDataId) Allocator.Error!void {
+            const symbol_name = try lir.Program.staticDataSymbolName(self.allocator, id);
+            errdefer self.allocator.free(symbol_name);
+            try self.static_data_symbol_names.append(self.allocator, symbol_name);
+            try self.codegen.emitLoadDataAddress(dst_reg, symbol_name);
+        }
+
         fn emitHotReloadEnterForHostCallable(self: *Self) Allocator.Error!?i32 {
             if (!self.enable_hot_reload) return null;
 
@@ -15623,10 +15643,11 @@ pub fn LirCodeGen(comptime target: RocTarget) type {
                                 .str_literal => |str_idx| try self.generateStrLiteral(str_idx),
                                 .bytes_literal => |bytes_idx| try self.generateBytesLiteral(bytes_idx),
                                 .null_ptr => .{ .immediate_i64 = 0 },
-                                .static_data => std.debug.panic(
-                                    "Dev/codegen invariant violated: no lowering stage emits static-data literals",
-                                    .{},
-                                ),
+                                .static_data => |id| blk: {
+                                    const reg = try self.allocTempGeneral();
+                                    try self.emitStaticDataAddress(reg, id);
+                                    break :blk .{ .general_reg = reg };
+                                },
                                 .proc_ref => |proc_id| blk: {
                                     const proc = self.proc_registry.get(@intFromEnum(proc_id)) orelse unreachable;
                                     const reg = try self.allocTempGeneral();

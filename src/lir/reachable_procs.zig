@@ -34,6 +34,8 @@ const Pass = struct {
     old_stmt_to_new: []?LIR.CFStmtId,
     visited_stmts: []bool,
     visited_plans: []bool,
+    reachable_static_data: []bool,
+    old_static_data_to_new: []?LIR.StaticDataId,
     proc_queue: std.ArrayList(LIR.LirProcSpecId),
     stmt_stack: std.ArrayList(LIR.CFStmtId),
 
@@ -42,6 +44,7 @@ const Pass = struct {
         const proc_count = result.store.procSpecCount();
         const stmt_count = result.store.cfStmtCount();
         const plan_count = result.const_plans.items.len;
+        const static_data_count = result.static_data_values.items.len;
 
         const reachable = try allocator.alloc(bool, proc_count);
         errdefer allocator.free(reachable);
@@ -67,6 +70,14 @@ const Pass = struct {
         errdefer allocator.free(visited_plans);
         @memset(visited_plans, false);
 
+        const reachable_static_data = try allocator.alloc(bool, static_data_count);
+        errdefer allocator.free(reachable_static_data);
+        @memset(reachable_static_data, false);
+
+        const old_static_data_to_new = try allocator.alloc(?LIR.StaticDataId, static_data_count);
+        errdefer allocator.free(old_static_data_to_new);
+        @memset(old_static_data_to_new, null);
+
         return .{
             .result = result,
             .store = &result.store,
@@ -77,6 +88,8 @@ const Pass = struct {
             .old_stmt_to_new = old_stmt_to_new,
             .visited_stmts = visited_stmts,
             .visited_plans = visited_plans,
+            .reachable_static_data = reachable_static_data,
+            .old_static_data_to_new = old_static_data_to_new,
             .proc_queue = .empty,
             .stmt_stack = .empty,
         };
@@ -85,6 +98,8 @@ const Pass = struct {
     fn deinit(self: *Pass) void {
         self.stmt_stack.deinit(self.allocator);
         self.proc_queue.deinit(self.allocator);
+        self.allocator.free(self.old_static_data_to_new);
+        self.allocator.free(self.reachable_static_data);
         self.allocator.free(self.visited_plans);
         self.allocator.free(self.visited_stmts);
         self.allocator.free(self.old_stmt_to_new);
@@ -108,6 +123,7 @@ const Pass = struct {
         try self.drainProcQueue();
         self.assignCompactProcIds();
         self.assignCompactStmtIds();
+        self.assignCompactStaticDataIds();
         try self.remapReachableProcBodies();
         self.remapReachableProcStmtRefs();
         self.remapRootProcs();
@@ -117,6 +133,7 @@ const Pass = struct {
         self.remapProcDebugNames();
         self.compactProcSpecs();
         self.compactCFStmts();
+        self.compactStaticDataValues();
         self.verifyReachableProcRefs();
     }
 
@@ -258,10 +275,12 @@ const Pass = struct {
         }
     }
 
-    fn markStaticData(_: *Pass, _: LIR.StaticDataId) Allocator.Error!void {
-        // No lowering stage emits static-data literals, so the LIR program
-        // carries no static-data value table for this reference to index.
-        reachableProcInvariant("static data literal reached reachable-proc marking without a static data table");
+    fn markStaticData(self: *Pass, id: LIR.StaticDataId) Allocator.Error!void {
+        const index = @intFromEnum(id);
+        if (index >= self.result.static_data_values.items.len) reachableProcInvariant("static data reference exceeds static_data_values len");
+        if (self.reachable_static_data[index]) return;
+        self.reachable_static_data[index] = true;
+        try self.markConstPlan(self.result.static_data_values.items[index].plan);
     }
 
     fn markFnSet(self: *Pass, set_id: LirProgram.FnSetId) Allocator.Error!void {
@@ -297,13 +316,26 @@ const Pass = struct {
         }
     }
 
+    fn assignCompactStaticDataIds(self: *Pass) void {
+        var next: u32 = 0;
+        for (self.reachable_static_data, 0..) |is_reachable, old_index| {
+            if (!is_reachable) continue;
+            self.old_static_data_to_new[old_index] = @enumFromInt(next);
+            next += 1;
+        }
+    }
+
     fn remapReachableProcBodies(self: *Pass) Allocator.Error!void {
         @memset(self.visited_stmts, false);
         for (0..self.store.procSpecCount()) |index| {
             if (!self.reachable[index]) continue;
             const proc = self.store.getProcSpec(@enumFromInt(@as(u32, @intCast(index))));
-            const body = proc.body orelse continue;
-            try self.remapStmtProcRefs(body);
+            if (proc.body) |body| try self.remapStmtProcRefs(body);
+            const join_points = self.store.getJoinPointSpan(proc.join_points);
+            for (0..join_points.len) |join_index| {
+                const join_point = GuardedList.at(join_points, join_index);
+                try self.remapStmtProcRefs(join_point.body);
+            }
         }
     }
 
@@ -317,7 +349,11 @@ const Pass = struct {
             const stmt = self.store.getCFStmtPtr(stmt_id);
             switch (stmt.*) {
                 .assign_literal => |*s| {
-                    if (s.value == .proc_ref) s.value.proc_ref = self.remapProc(s.value.proc_ref);
+                    switch (s.value) {
+                        .proc_ref => s.value.proc_ref = self.remapProc(s.value.proc_ref),
+                        .static_data => s.value.static_data = self.remapStaticData(s.value.static_data),
+                        else => {},
+                    }
                     const next = s.next;
                     s.next = self.remapStmt(next);
                     try self.pushStmt(next);
@@ -499,6 +535,16 @@ const Pass = struct {
         self.store.compactCFStmts(self.reachable_stmts);
     }
 
+    fn compactStaticDataValues(self: *Pass) void {
+        var write: usize = 0;
+        for (self.result.static_data_values.items, 0..) |value, old_index| {
+            if (!self.reachable_static_data[old_index]) continue;
+            self.result.static_data_values.items[write] = value;
+            write += 1;
+        }
+        self.result.static_data_values.shrinkRetainingCapacity(write);
+    }
+
     fn verifyReachableProcRefs(self: *Pass) void {
         const proc_count = self.store.procSpecCount();
         const stmt_count = self.store.cfStmtCount();
@@ -537,6 +583,12 @@ const Pass = struct {
         return self.old_to_new[index];
     }
 
+    fn remapStaticData(self: *Pass, old: LIR.StaticDataId) LIR.StaticDataId {
+        const index = @intFromEnum(old);
+        if (index >= self.old_static_data_to_new.len) reachableProcInvariant("static data reference exceeds old static_data_values len");
+        return self.old_static_data_to_new[index] orelse reachableProcInvariant("reachable static data edge pointed at pruned static data");
+    }
+
     fn remapStmt(self: *Pass, old: LIR.CFStmtId) LIR.CFStmtId {
         const index = @intFromEnum(old);
         if (index >= self.old_stmt_to_new.len) reachableProcInvariant("stmt reference exceeds old cf_stmts len");
@@ -547,10 +599,10 @@ const Pass = struct {
         if (@intFromEnum(proc) >= proc_count) reachableProcInvariant("stmt proc reference exceeds compact proc_specs len");
     }
 
-    fn verifyStaticDataRef(_: *Pass, _: LIR.StaticDataId) void {
-        // No lowering stage emits static-data literals, so any reference here
-        // has nothing to resolve against.
-        reachableProcInvariant("stmt static data reference has no static data table to resolve against");
+    fn verifyStaticDataRef(self: *Pass, id: LIR.StaticDataId) void {
+        if (@intFromEnum(id) >= self.result.static_data_values.items.len) {
+            reachableProcInvariant("stmt static data reference exceeds compact static_data_values len");
+        }
     }
 
     fn verifyStmtRef(_: *Pass, stmt: LIR.CFStmtId, stmt_count: usize) void {
@@ -701,186 +753,188 @@ test "reachable proc pass compacts proc specs and remaps root ids" {
     try std.testing.expectEqual(@as(u32, 0), @intFromEnum(call.proc));
 }
 
-// Ported pending iterator redesign: this test builds the static-data value table that the LIR program no longer carries.
-// test "reachable proc pass marks static data callable plans" {
-//     var result = try LirProgram.Result.init(std.testing.allocator, base.target.TargetUsize.native);
-//     defer result.deinit();
-//
-//     const value = try result.store.addLocal(.{ .layout_idx = .zst });
-//     const callable_body = try result.store.addCFStmt(.{ .ret = .{ .value = value } });
-//     const callable_proc = try result.store.addProcSpec(.{
-//         .name = result.store.freshSyntheticSymbol(),
-//         .args = LIR.LocalSpan.empty(),
-//         .body = callable_body,
-//         .ret_layout = .zst,
-//     });
-//
-//     const erased_entries = try std.testing.allocator.alloc(LirProgram.ErasedFn, 1);
-//     erased_entries[0] = .{
-//         .entry = callable_proc,
-//         .template = .{
-//             .fn_def = .{
-//                 .checked_generated = .{
-//                     .proc_base = undefined, // Reachability tests only need the callable entry proc, not checked metadata.
-//                     .template = undefined, // Reachability tests only need the callable entry proc, not checked metadata.
-//                 },
-//             },
-//             .source_fn_ty = undefined, // Reachability tests only need the callable entry proc, not checked metadata.
-//             .source_fn_key = .{},
-//         },
-//     };
-//     const erased_set: LirProgram.ErasedFnsId = @enumFromInt(@as(u32, @intCast(result.erased_fns.items.len)));
-//     try result.erased_fns.append(std.testing.allocator, .{
-//         .layout = .zst,
-//         .entries = erased_entries,
-//     });
-//
-//     const plan: LirProgram.ConstPlanId = @enumFromInt(@as(u32, @intCast(result.const_plans.items.len)));
-//     try result.const_plans.append(std.testing.allocator, .{ .erased_fn = erased_set });
-//     const static_data: LIR.StaticDataId = @enumFromInt(@as(u32, @intCast(result.static_data_values.items.len)));
-//     try result.static_data_values.append(std.testing.allocator, .{
-//         .const_ref = .{
-//             .artifact = .{},
-//             .owner = .{
-//                 .top_level_binding = .{
-//                     .module_idx = 0,
-//                     .pattern = undefined, // Reachability tests do not inspect checked const owner metadata.
-//                 },
-//             },
-//             .template = undefined, // Reachability tests do not inspect checked const owner metadata.
-//             .source_scheme = .{},
-//         },
-//         .checked_type = undefined, // Reachability tests do not inspect checked const type metadata.
-//         .layout_idx = .zst,
-//         .plan = plan,
-//     });
-//
-//     const root_ret = try result.store.addCFStmt(.{ .ret = .{ .value = value } });
-//     const root_body = try result.store.addCFStmt(.{ .assign_literal = .{
-//         .target = value,
-//         .value = .{ .static_data = static_data },
-//         .next = root_ret,
-//     } });
-//     const root_proc = try result.store.addProcSpec(.{
-//         .name = result.store.freshSyntheticSymbol(),
-//         .args = LIR.LocalSpan.empty(),
-//         .body = root_body,
-//         .ret_layout = .zst,
-//     });
-//     try result.root_procs.append(std.testing.allocator, root_proc);
-//
-//     try run(&result);
-//
-//     try std.testing.expectEqual(@as(usize, 2), result.store.proc_specs.items.len);
-//     try std.testing.expectEqual(@as(usize, 1), result.erased_fns.items[@intFromEnum(erased_set)].entries.len);
-//     try std.testing.expectEqual(@as(u32, 0), @intFromEnum(result.erased_fns.items[@intFromEnum(erased_set)].entries[0].entry));
-//     try std.testing.expectEqual(@as(u32, 1), @intFromEnum(result.root_procs.items[0]));
-// }
+test "reachable proc pass marks static data callable plans" {
+    var result = try LirProgram.Result.init(std.testing.allocator, base.target.TargetUsize.native);
+    defer result.deinit();
 
-// Ported pending iterator redesign: this test drives plan reachability through the static-data value table that the LIR program no longer carries.
-// test "reachable proc pass marks finite callable capture plans" {
-//     var result = try LirProgram.Result.init(std.testing.allocator, base.target.TargetUsize.native);
-//     defer result.deinit();
-//
-//     const value = try result.store.addLocal(.{ .layout_idx = .zst });
-//     const callable_body = try result.store.addCFStmt(.{ .ret = .{ .value = value } });
-//     const callable_proc = try result.store.addProcSpec(.{
-//         .name = result.store.freshSyntheticSymbol(),
-//         .args = LIR.LocalSpan.empty(),
-//         .body = callable_body,
-//         .ret_layout = .zst,
-//     });
-//
-//     const erased_entries = try std.testing.allocator.alloc(LirProgram.ErasedFn, 1);
-//     erased_entries[0] = .{
-//         .entry = callable_proc,
-//         .template = .{
-//             .fn_def = .{
-//                 .checked_generated = .{
-//                     .proc_base = undefined, // Reachability tests only need the callable entry proc, not checked metadata.
-//                     .template = undefined, // Reachability tests only need the callable entry proc, not checked metadata.
-//                 },
-//             },
-//             .source_fn_ty = undefined, // Reachability tests only need the callable entry proc, not checked metadata.
-//             .source_fn_key = .{},
-//         },
-//     };
-//     const erased_set: LirProgram.ErasedFnsId = @enumFromInt(@as(u32, @intCast(result.erased_fns.items.len)));
-//     try result.erased_fns.append(std.testing.allocator, .{
-//         .layout = .zst,
-//         .entries = erased_entries,
-//     });
-//
-//     const erased_plan: LirProgram.ConstPlanId = @enumFromInt(@as(u32, @intCast(result.const_plans.items.len)));
-//     try result.const_plans.append(std.testing.allocator, .{ .erased_fn = erased_set });
-//
-//     const finite_captures = try std.testing.allocator.alloc(LirProgram.CaptureSlot, 1);
-//     finite_captures[0] = .{
-//         .id = .{ .generated = 0 },
-//         .slot = 0,
-//         .ty = undefined, // Reachability tests do not inspect checked capture types.
-//         .plan = erased_plan,
-//     };
-//     const finite_variants = try std.testing.allocator.alloc(LirProgram.FnVariant, 1);
-//     finite_variants[0] = .{
-//         .id = undefined, // Reachability tests do not inspect callable variant metadata ids.
-//         .discriminant = 0,
-//         .variant_index = 0,
-//         .payload_layout = .zst,
-//         .template = .{
-//             .fn_def = .{ .checked_generated = .{
-//                 .proc_base = @enumFromInt(1),
-//                 .template = @enumFromInt(1),
-//             } },
-//             .source_fn_ty = @enumFromInt(1),
-//             .source_fn_key = .{},
-//         },
-//         .captures = finite_captures,
-//     };
-//     const fn_set: LirProgram.FnSetId = @enumFromInt(@as(u32, @intCast(result.fn_sets.items.len)));
-//     try result.fn_sets.append(std.testing.allocator, .{
-//         .layout = .zst,
-//         .variants = finite_variants,
-//     });
-//
-//     const finite_plan: LirProgram.ConstPlanId = @enumFromInt(@as(u32, @intCast(result.const_plans.items.len)));
-//     try result.const_plans.append(std.testing.allocator, .{ .fn_value = fn_set });
-//     const static_data: LIR.StaticDataId = @enumFromInt(@as(u32, @intCast(result.static_data_values.items.len)));
-//     try result.static_data_values.append(std.testing.allocator, .{
-//         .const_ref = .{
-//             .artifact = .{},
-//             .owner = .{
-//                 .top_level_binding = .{
-//                     .module_idx = 0,
-//                     .pattern = undefined, // Reachability tests do not inspect checked const owner metadata.
-//                 },
-//             },
-//             .template = undefined, // Reachability tests do not inspect checked const owner metadata.
-//             .source_scheme = .{},
-//         },
-//         .checked_type = undefined, // Reachability tests do not inspect checked const type metadata.
-//         .layout_idx = .zst,
-//         .plan = finite_plan,
-//     });
-//
-//     const root_ret = try result.store.addCFStmt(.{ .ret = .{ .value = value } });
-//     const root_body = try result.store.addCFStmt(.{ .assign_literal = .{
-//         .target = value,
-//         .value = .{ .static_data = static_data },
-//         .next = root_ret,
-//     } });
-//     const root_proc = try result.store.addProcSpec(.{
-//         .name = result.store.freshSyntheticSymbol(),
-//         .args = LIR.LocalSpan.empty(),
-//         .body = root_body,
-//         .ret_layout = .zst,
-//     });
-//     try result.root_procs.append(std.testing.allocator, root_proc);
-//
-//     try run(&result);
-//
-//     try std.testing.expectEqual(@as(usize, 2), result.store.proc_specs.items.len);
-//     try std.testing.expectEqual(@as(usize, 1), result.erased_fns.items[@intFromEnum(erased_set)].entries.len);
-//     try std.testing.expectEqual(@as(u32, 0), @intFromEnum(result.erased_fns.items[@intFromEnum(erased_set)].entries[0].entry));
-//     try std.testing.expectEqual(@as(u32, 1), @intFromEnum(result.root_procs.items[0]));
-// }
+    const value = try result.store.addLocal(.{ .layout_idx = .zst });
+    const callable_body = try result.store.addCFStmt(.{ .ret = .{ .value = value } });
+    const callable_proc = try result.store.addProcSpec(.{
+        .name = result.store.freshSyntheticSymbol(),
+        .args = LIR.LocalSpan.empty(),
+        .body = callable_body,
+        .ret_layout = .zst,
+    });
+
+    const erased_entries = try std.testing.allocator.alloc(LirProgram.ErasedFn, 1);
+    erased_entries[0] = .{
+        .entry = callable_proc,
+        .template = .{
+            .fn_def = .{
+                .checked_generated = .{
+                    .proc_base = undefined, // Reachability tests only need the callable entry proc, not checked metadata.
+                    .template = undefined, // Reachability tests only need the callable entry proc, not checked metadata.
+                },
+            },
+            .source_fn_ty = undefined, // Reachability tests only need the callable entry proc, not checked metadata.
+            .source_fn_key = .{},
+        },
+    };
+    const erased_set: LirProgram.ErasedFnsId = @enumFromInt(@as(u32, @intCast(result.erased_fns.items.len)));
+    try result.erased_fns.append(std.testing.allocator, .{
+        .layout = .zst,
+        .entries = erased_entries,
+    });
+
+    const plan: LirProgram.ConstPlanId = @enumFromInt(@as(u32, @intCast(result.const_plans.items.len)));
+    try result.const_plans.append(std.testing.allocator, .{ .erased_fn = erased_set });
+    const static_data: LIR.StaticDataId = @enumFromInt(@as(u32, @intCast(result.static_data_values.items.len)));
+    try result.static_data_values.append(std.testing.allocator, .{
+        .const_ref = .{
+            .artifact = .{},
+            .owner = .{
+                .top_level_binding = .{
+                    .module_idx = 0,
+                    .pattern = undefined, // Reachability tests do not inspect checked const owner metadata.
+                },
+            },
+            .template = undefined, // Reachability tests do not inspect checked const owner metadata.
+            .source_scheme = .{},
+        },
+        .node = null,
+        .checked_type = undefined, // Reachability tests do not inspect checked const type metadata.
+        .layout_idx = .zst,
+        .plan = plan,
+    });
+
+    const root_ret = try result.store.addCFStmt(.{ .ret = .{ .value = value } });
+    const root_body = try result.store.addCFStmt(.{ .assign_literal = .{
+        .target = value,
+        .value = .{ .static_data = static_data },
+        .next = root_ret,
+    } });
+    const root_proc = try result.store.addProcSpec(.{
+        .name = result.store.freshSyntheticSymbol(),
+        .args = LIR.LocalSpan.empty(),
+        .body = root_body,
+        .ret_layout = .zst,
+    });
+    try result.root_procs.append(std.testing.allocator, root_proc);
+
+    try run(&result);
+
+    try std.testing.expectEqual(@as(usize, 2), result.store.procSpecCount());
+    try std.testing.expectEqual(@as(usize, 1), result.static_data_values.items.len);
+    try std.testing.expectEqual(@as(usize, 1), result.erased_fns.items[@intFromEnum(erased_set)].entries.len);
+    try std.testing.expectEqual(@as(u32, 0), @intFromEnum(result.erased_fns.items[@intFromEnum(erased_set)].entries[0].entry));
+    try std.testing.expectEqual(@as(u32, 1), @intFromEnum(result.root_procs.items[0]));
+}
+
+test "reachable proc pass marks finite callable capture plans" {
+    var result = try LirProgram.Result.init(std.testing.allocator, base.target.TargetUsize.native);
+    defer result.deinit();
+
+    const value = try result.store.addLocal(.{ .layout_idx = .zst });
+    const callable_body = try result.store.addCFStmt(.{ .ret = .{ .value = value } });
+    const callable_proc = try result.store.addProcSpec(.{
+        .name = result.store.freshSyntheticSymbol(),
+        .args = LIR.LocalSpan.empty(),
+        .body = callable_body,
+        .ret_layout = .zst,
+    });
+
+    const erased_entries = try std.testing.allocator.alloc(LirProgram.ErasedFn, 1);
+    erased_entries[0] = .{
+        .entry = callable_proc,
+        .template = .{
+            .fn_def = .{
+                .checked_generated = .{
+                    .proc_base = undefined, // Reachability tests only need the callable entry proc, not checked metadata.
+                    .template = undefined, // Reachability tests only need the callable entry proc, not checked metadata.
+                },
+            },
+            .source_fn_ty = undefined, // Reachability tests only need the callable entry proc, not checked metadata.
+            .source_fn_key = .{},
+        },
+    };
+    const erased_set: LirProgram.ErasedFnsId = @enumFromInt(@as(u32, @intCast(result.erased_fns.items.len)));
+    try result.erased_fns.append(std.testing.allocator, .{
+        .layout = .zst,
+        .entries = erased_entries,
+    });
+
+    const erased_plan: LirProgram.ConstPlanId = @enumFromInt(@as(u32, @intCast(result.const_plans.items.len)));
+    try result.const_plans.append(std.testing.allocator, .{ .erased_fn = erased_set });
+
+    const finite_captures = try std.testing.allocator.alloc(LirProgram.CaptureSlot, 1);
+    finite_captures[0] = .{
+        .id = .{ .generated = 0 },
+        .slot = 0,
+        .ty = undefined, // Reachability tests do not inspect checked capture types.
+        .plan = erased_plan,
+    };
+    const finite_variants = try std.testing.allocator.alloc(LirProgram.FnVariant, 1);
+    finite_variants[0] = .{
+        .id = undefined, // Reachability tests do not inspect callable variant metadata ids.
+        .discriminant = 0,
+        .variant_index = 0,
+        .payload_layout = .zst,
+        .template = .{
+            .fn_def = .{ .checked_generated = .{
+                .proc_base = @enumFromInt(1),
+                .template = @enumFromInt(1),
+            } },
+            .source_fn_ty = @enumFromInt(1),
+            .source_fn_key = .{},
+        },
+        .captures = finite_captures,
+    };
+    const fn_set: LirProgram.FnSetId = @enumFromInt(@as(u32, @intCast(result.fn_sets.items.len)));
+    try result.fn_sets.append(std.testing.allocator, .{
+        .layout = .zst,
+        .variants = finite_variants,
+    });
+
+    const finite_plan: LirProgram.ConstPlanId = @enumFromInt(@as(u32, @intCast(result.const_plans.items.len)));
+    try result.const_plans.append(std.testing.allocator, .{ .fn_value = fn_set });
+    const static_data: LIR.StaticDataId = @enumFromInt(@as(u32, @intCast(result.static_data_values.items.len)));
+    try result.static_data_values.append(std.testing.allocator, .{
+        .const_ref = .{
+            .artifact = .{},
+            .owner = .{
+                .top_level_binding = .{
+                    .module_idx = 0,
+                    .pattern = undefined, // Reachability tests do not inspect checked const owner metadata.
+                },
+            },
+            .template = undefined, // Reachability tests do not inspect checked const owner metadata.
+            .source_scheme = .{},
+        },
+        .node = null,
+        .checked_type = undefined, // Reachability tests do not inspect checked const type metadata.
+        .layout_idx = .zst,
+        .plan = finite_plan,
+    });
+
+    const root_ret = try result.store.addCFStmt(.{ .ret = .{ .value = value } });
+    const root_body = try result.store.addCFStmt(.{ .assign_literal = .{
+        .target = value,
+        .value = .{ .static_data = static_data },
+        .next = root_ret,
+    } });
+    const root_proc = try result.store.addProcSpec(.{
+        .name = result.store.freshSyntheticSymbol(),
+        .args = LIR.LocalSpan.empty(),
+        .body = root_body,
+        .ret_layout = .zst,
+    });
+    try result.root_procs.append(std.testing.allocator, root_proc);
+
+    try run(&result);
+
+    try std.testing.expectEqual(@as(usize, 2), result.store.procSpecCount());
+    try std.testing.expectEqual(@as(usize, 1), result.static_data_values.items.len);
+    try std.testing.expectEqual(@as(usize, 1), result.erased_fns.items[@intFromEnum(erased_set)].entries.len);
+    try std.testing.expectEqual(@as(u32, 0), @intFromEnum(result.erased_fns.items[@intFromEnum(erased_set)].entries[0].entry));
+    try std.testing.expectEqual(@as(u32, 1), @intFromEnum(result.root_procs.items[0]));
+}

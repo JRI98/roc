@@ -9,6 +9,7 @@ const std = @import("std");
 const Relocation = @import("Relocation.zig").Relocation;
 const DataRelocationKind = @import("Relocation.zig").DataRelocationKind;
 const StaticDataExport = @import("StaticDataExport.zig").StaticDataExport;
+const StaticDataRelocation = @import("StaticDataExport.zig").StaticDataRelocation;
 
 const Allocator = std.mem.Allocator;
 
@@ -16,7 +17,7 @@ const Allocator = std.mem.Allocator;
 pub const MAGIC: u32 = 0x56454452;
 
 /// Version of the shared-memory dev run image format.
-pub const FORMAT_VERSION: u32 = 2;
+pub const FORMAT_VERSION: u32 = 3;
 
 /// Maximum bytes needed for one host jump stub on the supported dev-shim hosts.
 pub const max_jump_stub_size = 20;
@@ -61,6 +62,7 @@ pub const Header = extern struct {
     function_stubs: ArrayRef,
     entrypoints: ArrayRef,
     relocations: ArrayRef,
+    data_relocations: ArrayRef,
     symbol_names: ArrayRef,
     data: ArrayRef,
     data_symbols: ArrayRef,
@@ -111,6 +113,22 @@ pub const DataSymbol = extern struct {
     _padding: u32 = 0,
 };
 
+/// Pointer relocation from one readonly data symbol to another image symbol.
+pub const DataRelocationRecord = extern struct {
+    data_offset: u64,
+    symbol: StringRef,
+    addend: i64,
+    kind: u8,
+    _padding: [7]u8 = [_]u8{0} ** 7,
+
+    pub fn relocationKind(self: DataRelocationRecord) ImageError!RelocationKind {
+        return switch (self.kind) {
+            @intFromEnum(RelocationKind.linked_data_abs64) => .linked_data_abs64,
+            else => error.InvalidDevRunImage,
+        };
+    }
+};
+
 /// Entrypoint metadata provided by codegen before the image is serialized.
 pub const EntrypointInput = struct {
     ordinal: u32,
@@ -124,6 +142,7 @@ pub const ProgramView = struct {
     function_stubs: []u8,
     entrypoints: []const Entrypoint,
     relocations: []const RelocationRecord,
+    data_relocations: []const DataRelocationRecord,
     symbol_names: []const u8,
     data: []u8,
     data_symbols: []const DataSymbol,
@@ -159,6 +178,8 @@ pub fn writeToSharedMemory(
 
     var relocation_records = std.ArrayList(RelocationRecord).empty;
     defer relocation_records.deinit(scratch);
+    var data_relocation_records = std.ArrayList(DataRelocationRecord).empty;
+    defer data_relocation_records.deinit(scratch);
 
     for (relocations) |relocation| {
         switch (relocation) {
@@ -191,7 +212,6 @@ pub fn writeToSharedMemory(
 
     var max_data_alignment: usize = 1;
     for (data_exports) |data_export| {
-        if (data_export.relocations.len != 0) return error.UnsupportedStaticDataRelocation;
         const alignment = if (data_export.alignment == 0) 1 else data_export.alignment;
         if (!std.math.isPowerOfTwo(alignment)) return error.InvalidStaticDataAlignment;
         max_data_alignment = @max(max_data_alignment, alignment);
@@ -211,9 +231,23 @@ pub fn writeToSharedMemory(
             .symbol_offset = data_export.symbol_offset,
             .alignment = alignment,
         });
+
+        for (data_export.relocations) |relocation| {
+            if (relocation.offset > std.math.maxInt(usize)) return error.InvalidDevRunImage;
+            const relocation_offset: usize = @intCast(relocation.offset);
+            if (relocation_offset > data_export.bytes.len or @sizeOf(usize) > data_export.bytes.len - relocation_offset) {
+                return error.InvalidDevRunImage;
+            }
+            try data_relocation_records.append(scratch, .{
+                .data_offset = @intCast(data_offset + relocation_offset),
+                .symbol = try appendStringRef(scratch, &symbol_names, relocation.target_symbol_name),
+                .addend = relocation.addend,
+                .kind = @intFromEnum(RelocationKind.linked_data_abs64),
+            });
+        }
     }
 
-    const function_stub_count = try countReservedFunctionStubs(scratch, relocations, &data_symbol_names);
+    const function_stub_count = try countReservedFunctionStubs(scratch, relocations, data_exports, &data_symbol_names);
     const function_stub_len = try mulNoOverflow(function_stub_count, max_jump_stub_size);
 
     const header = try image_allocator.create(Header);
@@ -229,6 +263,9 @@ pub fn writeToSharedMemory(
 
     const relocation_copy = try image_allocator.alloc(RelocationRecord, relocation_records.items.len);
     @memcpy(relocation_copy, relocation_records.items);
+
+    const data_relocation_copy = try image_allocator.alloc(DataRelocationRecord, data_relocation_records.items.len);
+    @memcpy(data_relocation_copy, data_relocation_records.items);
 
     const symbol_names_copy = try image_allocator.alloc(u8, symbol_names.items.len);
     @memcpy(symbol_names_copy, symbol_names.items);
@@ -264,6 +301,7 @@ pub fn writeToSharedMemory(
         bytesOf(header),
         bytesOfSlice(entrypoints),
         bytesOfSlice(relocation_copy),
+        bytesOfSlice(data_relocation_copy),
         symbol_names_copy,
         bytesOfSlice(data_symbols_copy),
         executable,
@@ -280,6 +318,7 @@ pub fn writeToSharedMemory(
         .function_stubs = try arrayRef(base_ptr, function_stubs),
         .entrypoints = try arrayRef(base_ptr, bytesOfSlice(entrypoints)),
         .relocations = try arrayRef(base_ptr, bytesOfSlice(relocation_copy)),
+        .data_relocations = try arrayRef(base_ptr, bytesOfSlice(data_relocation_copy)),
         .symbol_names = try arrayRef(base_ptr, symbol_names_copy),
         .data = try arrayRef(base_ptr, data_copy),
         .data_symbols = try arrayRef(base_ptr, bytesOfSlice(data_symbols_copy)),
@@ -329,14 +368,23 @@ pub fn requiredCapacityFromOffset(
 
     var data_len: usize = 0;
     var max_data_alignment: usize = 1;
+    var data_relocation_count: usize = 0;
     for (data_exports) |data_export| {
-        if (data_export.relocations.len != 0) return error.UnsupportedStaticDataRelocation;
         const alignment = if (data_export.alignment == 0) 1 else data_export.alignment;
         if (!std.math.isPowerOfTwo(alignment)) return error.InvalidStaticDataAlignment;
         max_data_alignment = @max(max_data_alignment, alignment);
         data_len = std.mem.alignForward(usize, data_len, alignment);
         data_len = try addNoOverflow(data_len, data_export.bytes.len);
         symbol_names_len = try addNoOverflow(symbol_names_len, data_export.symbol_name.len);
+        data_relocation_count = try addNoOverflow(data_relocation_count, data_export.relocations.len);
+        for (data_export.relocations) |relocation| {
+            if (relocation.offset > std.math.maxInt(usize)) return error.InvalidDevRunImage;
+            const relocation_offset: usize = @intCast(relocation.offset);
+            if (relocation_offset > data_export.bytes.len or @sizeOf(usize) > data_export.bytes.len - relocation_offset) {
+                return error.InvalidDevRunImage;
+            }
+            symbol_names_len = try addNoOverflow(symbol_names_len, relocation.target_symbol_name.len);
+        }
     }
 
     const function_stub_count = try countReservedFunctionStubsNoAlloc(relocations, data_exports);
@@ -346,6 +394,7 @@ pub fn requiredCapacityFromOffset(
     capacity = try addAllocationCapacity(capacity, @alignOf(Header), @sizeOf(Header));
     capacity = try addAllocationCapacity(capacity, @alignOf(Entrypoint), try mulNoOverflow(entrypoint_inputs.len, @sizeOf(Entrypoint)));
     capacity = try addAllocationCapacity(capacity, @alignOf(RelocationRecord), try mulNoOverflow(relocation_count, @sizeOf(RelocationRecord)));
+    capacity = try addAllocationCapacity(capacity, @alignOf(DataRelocationRecord), try mulNoOverflow(data_relocation_count, @sizeOf(DataRelocationRecord)));
     capacity = try addAllocationCapacity(capacity, @alignOf(u8), symbol_names_len);
     capacity = try addAllocationCapacity(capacity, @alignOf(DataSymbol), try mulNoOverflow(data_exports.len, @sizeOf(DataSymbol)));
     capacity = try addAllocationCapacity(capacity, page_size, code.len);
@@ -371,6 +420,7 @@ pub fn viewMappedImage(header: *const Header, base_ptr: [*]align(1) u8, mapped_s
         .function_stubs = try bytesFromRef(base_ptr, image_size, header.function_stubs),
         .entrypoints = try sliceFromRef(Entrypoint, base_ptr, image_size, header.entrypoints),
         .relocations = try sliceFromRef(RelocationRecord, base_ptr, image_size, header.relocations),
+        .data_relocations = try sliceFromRef(DataRelocationRecord, base_ptr, image_size, header.data_relocations),
         .symbol_names = try bytesFromRef(base_ptr, image_size, header.symbol_names),
         .data = try bytesFromRef(base_ptr, image_size, header.data),
         .data_symbols = try sliceFromRef(DataSymbol, base_ptr, image_size, header.data_symbols),
@@ -399,6 +449,7 @@ fn appendStringRef(scratch: Allocator, symbol_names: *std.ArrayList(u8), name: [
 fn countReservedFunctionStubs(
     scratch: Allocator,
     relocations: []const Relocation,
+    data_exports: []const StaticDataExport,
     data_symbol_names: *const std.StringHashMapUnmanaged(void),
 ) WriteError!usize {
     var stub_names = std.StringHashMapUnmanaged(void){};
@@ -411,6 +462,12 @@ fn countReservedFunctionStubs(
             .local_data, .jmp_to_return => return error.UnsupportedDevRunRelocation,
         };
         try stub_names.put(scratch, name, {});
+    }
+    for (data_exports) |data_export| {
+        for (data_export.relocations) |relocation| {
+            if (data_symbol_names.contains(relocation.target_symbol_name)) continue;
+            try stub_names.put(scratch, relocation.target_symbol_name, {});
+        }
     }
 
     return stub_names.count();
@@ -439,7 +496,42 @@ fn countReservedFunctionStubsNoAlloc(
             count = try addNoOverflow(count, 1);
         }
     }
+    for (data_exports) |data_export| {
+        for (data_export.relocations) |relocation| {
+            if (dataExportNamesContain(data_exports, relocation.target_symbol_name)) continue;
+            if (relocationNameSeenInCode(relocations, data_exports, relocation.target_symbol_name)) continue;
+            if (relocationNameSeenInDataBefore(data_exports, data_export, relocation.target_symbol_name)) continue;
+            count = try addNoOverflow(count, 1);
+        }
+    }
     return count;
+}
+
+fn relocationNameSeenInCode(relocations: []const Relocation, data_exports: []const StaticDataExport, name: []const u8) bool {
+    for (relocations) |relocation| {
+        const previous_name = switch (relocation) {
+            .linked_function => |function| function.name,
+            .linked_data => |data| if (dataExportNamesContain(data_exports, data.name)) continue else data.name,
+            .local_data, .jmp_to_return => continue,
+        };
+        if (std.mem.eql(u8, previous_name, name)) return true;
+    }
+    return false;
+}
+
+fn relocationNameSeenInDataBefore(
+    data_exports: []const StaticDataExport,
+    current: StaticDataExport,
+    name: []const u8,
+) bool {
+    for (data_exports) |data_export| {
+        if (std.mem.eql(u8, data_export.symbol_name, current.symbol_name)) return false;
+        for (data_export.relocations) |relocation| {
+            if (dataExportNamesContain(data_exports, relocation.target_symbol_name)) continue;
+            if (std.mem.eql(u8, relocation.target_symbol_name, name)) return true;
+        }
+    }
+    return false;
 }
 
 fn dataExportNamesContain(data_exports: []const StaticDataExport, name: []const u8) bool {
@@ -546,13 +638,31 @@ test "writeToSharedMemory serializes only executable image sections" {
         .{ .linked_function = .{ .offset = 1, .name = "roc_alloc" } },
         .{ .linked_data = .{ .offset = 2, .name = "roc__answer", .kind = .rel32 } },
     };
-    const data_bytes = [_]u8{ 1, 2, 3, 4 };
+    const data_bytes = [_]u8{ 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16 };
+    const target_data_bytes = [_]u8{42};
+    const data_relocations = [_]StaticDataRelocation{
+        .{
+            .offset = 0,
+            .target_symbol_name = "roc__target",
+            .addend = 4,
+        },
+        .{
+            .offset = @sizeOf(usize),
+            .target_symbol_name = "roc_external",
+        },
+    };
     const data_exports = [_]StaticDataExport{
         .{
             .symbol_name = "roc__static",
             .bytes = &data_bytes,
             .symbol_offset = 1,
             .alignment = 8,
+            .relocations = &data_relocations,
+        },
+        .{
+            .symbol_name = "roc__target",
+            .bytes = &target_data_bytes,
+            .alignment = 1,
         },
     };
     const capacity = try requiredCapacity(page_size, &code, &entrypoint_inputs, &relocations, &data_exports);
@@ -582,7 +692,7 @@ test "writeToSharedMemory serializes only executable image sections" {
     const view = try viewMappedImage(header, image_bytes.ptr, @intCast(header.image_size));
 
     try std.testing.expectEqual(page_size, view.page_size);
-    try std.testing.expectEqual(@as(usize, 2 * max_jump_stub_size), view.function_stubs.len);
+    try std.testing.expectEqual(@as(usize, 3 * max_jump_stub_size), view.function_stubs.len);
     try std.testing.expectEqual(@as(usize, 0), @intFromPtr(view.executable.ptr) % page_size);
     try std.testing.expectEqualSlices(u8, &code, view.code);
     try std.testing.expectEqual(@as(usize, entrypoint_inputs.len), view.entrypoints.len);
@@ -599,11 +709,25 @@ test "writeToSharedMemory serializes only executable image sections" {
     try std.testing.expectEqual(@as(u64, 2), view.relocations[1].code_offset);
     try std.testing.expectEqualStrings("roc__answer", try view.symbolName(view.relocations[1].symbol));
 
-    try std.testing.expectEqualSlices(u8, &data_bytes, view.data);
+    try std.testing.expectEqualSlices(u8, &data_bytes, view.data[0..data_bytes.len]);
+    try std.testing.expectEqualSlices(u8, &target_data_bytes, view.data[data_bytes.len..][0..target_data_bytes.len]);
     try std.testing.expectEqual(@as(usize, data_exports.len), view.data_symbols.len);
     try std.testing.expectEqualStrings("roc__static", try view.dataSymbolName(view.data_symbols[0]));
     try std.testing.expectEqual(@as(u64, 0), view.data_symbols[0].data_offset);
     try std.testing.expectEqual(@as(u64, data_bytes.len), view.data_symbols[0].len);
     try std.testing.expectEqual(@as(u64, 1), view.data_symbols[0].symbol_offset);
     try std.testing.expectEqual(@as(u32, 8), view.data_symbols[0].alignment);
+    try std.testing.expectEqualStrings("roc__target", try view.dataSymbolName(view.data_symbols[1]));
+    try std.testing.expectEqual(@as(u64, data_bytes.len), view.data_symbols[1].data_offset);
+    try std.testing.expectEqual(@as(u64, target_data_bytes.len), view.data_symbols[1].len);
+
+    try std.testing.expectEqual(@as(usize, data_relocations.len), view.data_relocations.len);
+    try std.testing.expectEqual(RelocationKind.linked_data_abs64, try view.data_relocations[0].relocationKind());
+    try std.testing.expectEqual(@as(u64, 0), view.data_relocations[0].data_offset);
+    try std.testing.expectEqual(@as(i64, 4), view.data_relocations[0].addend);
+    try std.testing.expectEqualStrings("roc__target", try view.symbolName(view.data_relocations[0].symbol));
+    try std.testing.expectEqual(RelocationKind.linked_data_abs64, try view.data_relocations[1].relocationKind());
+    try std.testing.expectEqual(@as(u64, @sizeOf(usize)), view.data_relocations[1].data_offset);
+    try std.testing.expectEqual(@as(i64, 0), view.data_relocations[1].addend);
+    try std.testing.expectEqualStrings("roc_external", try view.symbolName(view.data_relocations[1].symbol));
 }

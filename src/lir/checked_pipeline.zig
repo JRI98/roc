@@ -214,6 +214,8 @@ pub fn lowerCheckedModulesToLir(
         .{
             .proc_debug_names = target.proc_debug_names,
             .specialization_cache = target.monotype_cache,
+            .static_data_literals = target.checked_module_state == .complete and roots.include_static_data_exports,
+            .target_usize = target.target_usize,
             .inline_expects = switch (target.inline_expects) {
                 .run => .run,
                 .omit => .omit,
@@ -391,7 +393,10 @@ fn collectStaticDataRequests(
         switch (provided) {
             .data => |data| {
                 if (try checkedTypeContainsFunction(allocator, root.checked_types.view(), data.checked_type)) {
-                    try requests.append(allocator, .{ .data = data });
+                    try requests.append(allocator, .{
+                        .const_ref = data.const_ref,
+                        .checked_type = data.checked_type,
+                    });
                 }
             },
             .procedure => {},

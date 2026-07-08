@@ -433,6 +433,7 @@ const Solver = struct {
                     _ = try self.expectExpr(payload, expected_payload_ty);
                 }
             },
+            .static_data_candidate => |candidate| _ = try self.expectExpr(candidate.runtime_expr, expected),
             .nominal => |backing| {
                 if (try self.namedBacking(expected)) |backing_ty| {
                     if (self.hasBuiltinOwner(expected, .fields) or self.hasBuiltinOwner(expected, .field)) {
@@ -683,6 +684,11 @@ const Solver = struct {
                     _ = try self.inferExpr(payload);
                 }
             },
+            .static_data_candidate => |candidate| {
+                _ = try self.exprSlot(expr_id);
+                self.expr_done[index] = true;
+                try self.inferGeneratedOpaqueBacking(candidate.runtime_expr);
+            },
             .nominal => |backing| {
                 _ = try self.exprSlot(expr_id);
                 self.expr_done[index] = true;
@@ -841,6 +847,7 @@ const Solver = struct {
             .tag,
             .nominal,
             .let_,
+            .static_data_candidate,
             => {},
             else => return,
         }
@@ -872,6 +879,7 @@ const Solver = struct {
                     try self.expectExprAtTypeEvenIfDone(payload, self.program.types.spanItem(payload_tys, i));
                 }
             },
+            .static_data_candidate => |candidate| try self.expectExprAtTypeEvenIfDone(candidate.runtime_expr, expected),
             .nominal => |backing| {
                 const backing_ty = try self.namedBacking(expected) orelse expected;
                 try self.expectExprAtTypeEvenIfDone(backing, backing_ty);

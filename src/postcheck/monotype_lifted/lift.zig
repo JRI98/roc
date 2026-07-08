@@ -50,6 +50,7 @@ pub fn run(
     var stmt_locs = owned.stmt_locs.takeArrayList();
     var stmt_regions = owned.stmt_regions.takeArrayList();
     var local_names = owned.local_names.takeArrayList();
+    var static_data_values = owned.static_data_values.takeArrayList();
 
     var program = Ast.Program.init(
         allocator,
@@ -78,6 +79,7 @@ pub fn run(
         stmt_locs,
         stmt_regions,
         local_names,
+        static_data_values,
         comptime_sites,
         owned.next_symbol,
     );
@@ -106,6 +108,7 @@ pub fn run(
     stmt_locs = undefined;
     stmt_regions = undefined;
     local_names = undefined;
+    static_data_values = undefined;
     comptime_sites = undefined;
     program.runtime_schema_requests = Ast.ProgramList(Ast.RuntimeSchemaRequest, "runtime_schema_requests").fromArrayList(runtime_schema_requests);
     runtime_schema_requests = undefined;
@@ -158,6 +161,7 @@ fn movedMonoView(source: *const Mono.Program, moved: *const Ast.Program) Mono.Pr
         .roots = source_view.roots,
         .layout_requests = source_view.layout_requests,
         .runtime_schema_requests = moved_view.runtime_schema_requests,
+        .static_data_values = moved_view.static_data_values,
         .comptime_sites = moved_view.comptime_sites,
         .source_files = moved_view.source_files,
         .expr_locs = moved_view.expr_locs,
@@ -571,6 +575,7 @@ const Lifter = struct {
             => |items| try self.rewriteExprSpan(items),
             .record => |fields| try self.rewriteFieldExprSpan(fields),
             .tag => |tag| try self.rewriteExprSpan(tag.payloads),
+            .static_data_candidate => |candidate| try self.rewriteExpr(candidate.runtime_expr),
             .nominal,
             .dbg,
             .expect,
@@ -1285,6 +1290,7 @@ const CaptureSet = struct {
                 const payloads = input.exprSpan(tag.payloads);
                 for (0..payloads.len) |payload_index| try self.collectExpr(GuardedList.at(payloads, payload_index), bound);
             },
+            .static_data_candidate => |candidate| try self.collectExpr(candidate.runtime_expr, bound),
             .nominal,
             .dbg,
             .expect,
