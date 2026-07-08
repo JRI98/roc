@@ -368,6 +368,7 @@ pub fn addNumericLiteral(
         .flags = .{
             .is_negative = parsed.is_negative,
             .had_decimal_point = parsed.had_decimal_point,
+            .is_materialized = parsed.is_materialized,
         },
     });
     return idx;

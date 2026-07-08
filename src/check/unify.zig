@@ -2695,6 +2695,7 @@ fn mergeFromNumeralLiteralInfo(
     merged.is_fractional = a_info.is_fractional or b_info.is_fractional;
     merged.fits_dec = mergeFitsDec(a_info.fits_dec, b_info.fits_dec);
     merged.frac_requirements = mergeFracRequirements(a_info, b_info);
+    merged.can_materialize_numeral = a_info.can_materialize_numeral and b_info.can_materialize_numeral;
     return merged;
 }
 

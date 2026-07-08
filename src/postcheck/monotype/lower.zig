@@ -16563,6 +16563,9 @@ const BodyContext = struct {
         literal: can.ModuleEnv.NumeralLiteral,
         ty: Type.TypeId,
     ) Allocator.Error!DraftExprId {
+        if (!literal.isMaterialized()) {
+            Common.invariant("checked from_numeral argument literal was not materialized");
+        }
         const field_span = switch (self.builder.shapeContent(ty)) {
             .record => |span| span,
             else => Common.invariant("Numeral Literal payload was not a record"),

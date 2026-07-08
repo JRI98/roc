@@ -4727,9 +4727,9 @@ fn recordedNumeralLiteralForExpr(self: *const Self, expr_idx: CIR.Expr.Idx) Modu
 
 fn exactNumeralInfoForExpr(self: *const Self, expr_idx: CIR.Expr.Idx, region: Region) Allocator.Error!types_mod.NumeralInfo {
     const literal = self.recordedNumeralLiteralForExpr(expr_idx);
-    const fits_dec = numeralLiteralFitsDec(self.cir, literal);
+    const fits_dec = if (literal.isMaterialized()) numeralLiteralFitsDec(self.cir, literal) else false;
     const is_fractional = literal.after_decimal_digit_count != 0 or literal.hadDecimalPoint();
-    return types_mod.NumeralInfo.fromExact(literal.isNegative(), is_fractional, fits_dec, region);
+    return types_mod.NumeralInfo.fromExact(literal.isNegative(), is_fractional, fits_dec, literal.isMaterialized(), region);
 }
 
 fn numeralLiteralFitsDec(
@@ -4744,7 +4744,7 @@ fn numeralLiteralFitsDec(
     const after = base256BytesToU128(module_env.numeralDigitsAfter(literal)) orelse return false;
 
     const before_scaled = checkedMulU128(before, @intCast(builtins.dec.RocDec.one_point_zero_i128)) orelse return false;
-    const after_scale = pow10U128(decimal_places - after_count);
+    const after_scale = pow10U128(@intCast(decimal_places - after_count));
     const after_scaled = checkedMulU128(after, after_scale) orelse return false;
     const magnitude = checkedAddU128(before_scaled, after_scaled) orelse return false;
 
@@ -17461,7 +17461,13 @@ fn tryCommitNumeralCandidate(
 /// future kinds fill in their own arm (compiler-enforced).
 fn literalInfoAcceptsBuiltinNumKind(lit: StaticDispatchConstraint.LiteralInfo, num_kind: CIR.NumKind) bool {
     return switch (lit) {
-        .numeral => |info| validateBuiltinFromNumeralLiteral(num_kind, info) == null,
+        .numeral => |info| if (!info.can_materialize_numeral and
+            num_kind == .dec and
+            !info.is_fractional and
+            !info.explicit_suffix)
+            true
+        else
+            validateBuiltinFromNumeralLiteral(num_kind, info) == null,
         // A string or interpolation literal can never be represented by a builtin
         // numeric type; its sole candidate (Str) is not a builtin num kind.
         .quote, .interpolation => false,
@@ -18085,6 +18091,13 @@ fn checkStaticDispatchConstraints(self: *Self, env: *Env, is_numeric_default_pas
                         );
                         continue;
                     };
+                    if (constraint.fn_name.eql(self.cir.idents.from_numeral) and
+                        !self.nominalIsBuiltinNumberType(nominal_type))
+                    {
+                        if (try self.reportUnmaterializableNumeralLiteral(deferred_constraint.var_, constraint, env)) {
+                            continue;
+                        }
+                    }
                     if (constraint.fn_name.eql(self.cir.idents.is_eq)) {
                         self.rewriteEqBinopAsMethodEq(constraint);
                     }
@@ -18377,6 +18390,11 @@ fn checkStaticDispatchConstraints(self: *Self, env: *Env, is_numeric_default_pas
                     const method_is_this_module = method_lookup.is_this_module;
                     const method_binding = method_lookup.binding;
                     const def_idx = method_binding.def_idx;
+                    if (constraint.fn_name.eql(self.cir.idents.from_numeral)) {
+                        if (try self.reportUnmaterializableNumeralLiteral(deferred_constraint.var_, constraint, env)) {
+                            continue;
+                        }
+                    }
                     if (constraint.fn_name.eql(self.cir.idents.is_eq)) {
                         self.rewriteEqBinopAsMethodEq(constraint);
                     }
@@ -19819,6 +19837,13 @@ fn validateBuiltinFromNumeralLiteral(
     num_kind: CIR.NumKind,
     num_literal: types_mod.NumeralInfo,
 ) ?BuiltinFromNumeralLiteralProblem {
+    if (!num_literal.can_materialize_numeral) {
+        return switch (num_kind) {
+            .num_unbound, .int_unbound => null,
+            else => .out_of_range,
+        };
+    }
+
     return switch (num_kind) {
         .u8 => validateUnsignedFromNumeralLiteral(u8, num_literal),
         .u16 => validateUnsignedFromNumeralLiteral(u16, num_literal),
@@ -19895,6 +19920,8 @@ fn validateSignedFromNumeralLiteral(
 fn validateDecFromNumeralLiteral(
     num_literal: types_mod.NumeralInfo,
 ) ?BuiltinFromNumeralLiteralProblem {
+    if (!num_literal.can_materialize_numeral) return .out_of_range;
+
     if (num_literal.fits_dec) |fits| {
         return if (fits) null else .out_of_range;
     }
@@ -19953,6 +19980,28 @@ fn reportInvalidBuiltinFromNumeralInfo(
     } });
 
     try self.unifyWith(dispatcher_var, .err, env);
+    return true;
+}
+
+fn reportUnmaterializableNumeralLiteral(
+    self: *Self,
+    dispatcher_var: Var,
+    constraint: StaticDispatchConstraint,
+    env: *Env,
+) Allocator.Error!bool {
+    const num_literal = constraint.origin.numeralInfo() orelse return false;
+    if (num_literal.can_materialize_numeral) return false;
+
+    const expected_snapshot = try self.snapshots.snapshotVarForError(self.types, &self.type_writer, dispatcher_var);
+    _ = try self.problems.appendProblem(self.gpa, .{ .invalid_numeric_literal = .{
+        .literal_var = dispatcher_var,
+        .expected_type = expected_snapshot,
+        .is_fractional = num_literal.is_fractional,
+        .region = num_literal.region,
+    } });
+
+    try self.unifyWith(dispatcher_var, .err, env);
+    try self.markConstraintFunctionAsError(constraint, env);
     return true;
 }
 
