@@ -5813,6 +5813,23 @@ pub fn LirCodeGen(comptime target: RocTarget) type {
             return .{ .immediate_i128 = val };
         }
 
+        fn generateStaticDataLiteral(self: *Self, id: lir.LIR.StaticDataId, target_layout: layout.Idx) Allocator.Error!ValueLocation {
+            const runtime_layout = self.runtimeRepresentationLayoutIdx(target_layout);
+            const size = self.getLayoutSize(runtime_layout);
+            if (size == 0) return .{ .immediate_i64 = 0 };
+
+            const slot = self.codegen.allocStackSlot(size);
+            const src_reg = try self.allocTempGeneral();
+            defer self.codegen.freeGeneral(src_reg);
+            try self.emitStaticDataAddress(src_reg, id);
+
+            const temp_reg = try self.allocTempGeneral();
+            defer self.codegen.freeGeneral(temp_reg);
+            try self.copyChunked(temp_reg, src_reg, 0, frame_ptr, slot, size);
+
+            return self.stackLocationForLayout(runtime_layout, slot);
+        }
+
         /// Generate code for a local lookup.
         fn generateLookup(self: *Self, local: LocalId) Allocator.Error!ValueLocation {
             const layout_idx = self.localLayout(local);
@@ -15643,11 +15660,7 @@ pub fn LirCodeGen(comptime target: RocTarget) type {
                                 .str_literal => |str_idx| try self.generateStrLiteral(str_idx),
                                 .bytes_literal => |bytes_idx| try self.generateBytesLiteral(bytes_idx),
                                 .null_ptr => .{ .immediate_i64 = 0 },
-                                .static_data => |id| blk: {
-                                    const reg = try self.allocTempGeneral();
-                                    try self.emitStaticDataAddress(reg, id);
-                                    break :blk .{ .general_reg = reg };
-                                },
+                                .static_data => |id| try self.generateStaticDataLiteral(id, self.localLayout(assign.target)),
                                 .proc_ref => |proc_id| blk: {
                                     const proc = self.proc_registry.get(@intFromEnum(proc_id)) orelse unreachable;
                                     const reg = try self.allocTempGeneral();
