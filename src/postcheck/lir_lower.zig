@@ -431,7 +431,6 @@ const Lowerer = struct {
     fn lirStaticDataFor(
         self: *Lowerer,
         id: Common.StaticDataId,
-        ty: Type.TypeId,
         layout_idx: layout.Idx,
         plan: LirProgram.ConstPlanId,
     ) Common.LowerError!LIR.StaticDataId {
@@ -449,7 +448,6 @@ const Lowerer = struct {
             .plan = plan,
         });
         self.static_data_map[raw] = result_id;
-        _ = ty;
         return result_id;
     }
 
@@ -989,7 +987,7 @@ const Lowerer = struct {
         if (self.constPlanNeedsStaticData(plan, layout_idx)) {
             return try self.result.store.addCFStmt(.{ .assign_literal = .{
                 .target = target,
-                .value = .{ .static_data = try self.lirStaticDataFor(candidate.static_data, ty, layout_idx, plan) },
+                .value = .{ .static_data = try self.lirStaticDataFor(candidate.static_data, layout_idx, plan) },
                 .next = next,
             } });
         }
