@@ -694,6 +694,7 @@ pub fn compileProgram(
     return compileProgramWithOptions(allocator, io, source_kind, source, imports, .{});
 }
 
+/// Parse, canonicalize, type-check, and lower with allocation-test options.
 pub fn compileAllocationProgram(
     allocator: Allocator,
     io: std.Io,
