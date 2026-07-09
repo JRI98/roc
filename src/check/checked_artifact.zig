@@ -2686,8 +2686,12 @@ pub const CheckedFunctionType = struct {
     kind: CheckedFunctionKind,
     args: []const CheckedTypeId = &.{},
     ret: CheckedTypeId,
-    needs_instantiation: bool,
 };
+
+test "checked function payloads do not carry instantiation stamps" {
+    try std.testing.expect(!@hasField(CheckedFunctionType, "needs_instantiation"));
+    try std.testing.expect(!@hasField(StoredFunction, "needs_instantiation"));
+}
 
 /// Public `CheckedBuiltinNominal` declaration.
 pub const CheckedBuiltinNominal = enum {
@@ -2955,7 +2959,6 @@ pub const StoredFunction = struct {
     kind: CheckedFunctionKind,
     args: CheckedTypeRange = .{},
     ret: CheckedTypeId,
-    needs_instantiation: bool,
 };
 
 /// POD form of `CheckedTagUnionType`: `tags` is a range into `tag_pool`.
@@ -3038,7 +3041,6 @@ fn reconstructCheckedTypePayload(pool_owner: anytype, stored: StoredCheckedTypeP
             .kind = f.kind,
             .args = pool_owner.typeIdPool()[f.args.start .. f.args.start + f.args.len],
             .ret = f.ret,
-            .needs_instantiation = f.needs_instantiation,
         } },
         .tag_union => |tu| .{ .tag_union = .{
             .tags = pool_owner.tagPool()[tu.tags.start .. tu.tags.start + tu.tags.len],
@@ -3670,7 +3672,6 @@ pub const CheckedTypeStore = struct {
                     .kind = f.kind,
                     .args = args,
                     .ret = f.ret,
-                    .needs_instantiation = f.needs_instantiation,
                 } };
             },
             .tag_union => |tu| blk: {
@@ -3899,7 +3900,6 @@ pub const CheckedTypeStore = struct {
             .kind = finalized_kind,
             .args = args_range,
             .ret = ret,
-            .needs_instantiation = false,
         } });
         errdefer {
             _ = self.payloads.pop();
@@ -4250,7 +4250,6 @@ pub const CheckedTypeStore = struct {
                 .kind = f.kind,
                 .args = try allocator.dupe(CheckedTypeId, f.args),
                 .ret = f.ret,
-                .needs_instantiation = f.needs_instantiation,
             } },
             .tag_union => |tu| blk: {
                 const tags = try allocator.alloc(CheckedTagBuild, tu.tags.len);
@@ -4434,8 +4433,6 @@ pub const CheckedTypeStore = struct {
             .kind = finalizedFunctionKind(function.kind),
             .args = args,
             .ret = ret,
-            .needs_instantiation = try self.checkedTypeSliceContainsIdentityVariables(allocator, args) or
-                try self.checkedTypeContainsIdentityVariables(allocator, ret),
         } };
     }
 
@@ -4847,16 +4844,10 @@ fn appendCheckedTypeRootFromDeclarationAnno(
                 declaration_formals,
                 func.ret,
             );
-            const args_need_instantiation = try checkedTypeIdsContainIdentityVariables(allocator, store, args);
-            const needs_instantiation = if (args_need_instantiation)
-                true
-            else
-                try checkedTypeContainsIdentityVariablesPayloads(allocator, store, ret);
             break :blk try appendExplicitCheckedTypePayload(allocator, names, store, .{ .function = .{
                 .kind = if (func.effectful) .effectful else .pure,
                 .args = args,
                 .ret = ret,
-                .needs_instantiation = needs_instantiation,
             } });
         },
         .parens => |parens| try appendCheckedTypeRootFromDeclarationAnno(
@@ -6601,15 +6592,10 @@ fn copyCheckedFunctionType(
 ) Allocator.Error!CheckedFunctionType {
     const args = try copyCheckedTypeRange(allocator, module, names, imports, store, active, module.typeStoreConst().sliceVars(func.args));
     const ret = try appendCheckedTypeRoot(allocator, module, names, imports, store, active, func.ret);
-    // Recompute from the copied checked args/ret: a function needs
-    // instantiation exactly when it carries identity variables. (The source
-    // store-side flag is not consulted; it no longer exists.)
     return .{
         .kind = finalizedFunctionKind(kind),
         .args = args,
         .ret = ret,
-        .needs_instantiation = try store.checkedTypeSliceContainsIdentityVariables(allocator, args) or
-            try store.checkedTypeContainsIdentityVariables(allocator, ret),
     };
 }
 
@@ -17707,13 +17693,10 @@ const PlatformAppRelationTypeResolver = struct {
                 const args = try self.mergeRootSlices(platform_fn.args, app_fn.args);
                 errdefer self.allocator.free(args);
                 const ret = try self.merge(platform_fn.ret, app_fn.ret, .value);
-                const needs_instantiation = try self.typeSliceContainsIdentityVariables(args) or
-                    try self.typeContainsIdentityVariables(ret);
                 break :blk .{ .function = .{
                     .kind = finalizedFunctionKind(platform_fn.kind),
                     .args = args,
                     .ret = ret,
-                    .needs_instantiation = needs_instantiation,
                 } };
             },
             .alias => |platform_alias| try self.mergeAliasPayload(platform_alias, app_root, app_payload),
@@ -17900,13 +17883,10 @@ const PlatformAppRelationTypeResolver = struct {
                 const args = try self.finalizeRootSlice(function.args);
                 errdefer self.allocator.free(args);
                 const ret = try self.finalize(function.ret, .value);
-                const needs_instantiation = try self.typeSliceContainsIdentityVariables(args) or
-                    try self.typeContainsIdentityVariables(ret);
                 break :blk .{ .function = .{
                     .kind = finalizedFunctionKind(function.kind),
                     .args = args,
                     .ret = ret,
-                    .needs_instantiation = needs_instantiation,
                 } };
             },
             .alias => |alias| blk: {
@@ -26852,7 +26832,6 @@ pub const CheckedTypeProjector = struct {
                 .kind = finalizedFunctionKind(function.kind),
                 .args = try self.projectCheckedTypeViewIds(source, source_names, function.args, active),
                 .ret = try self.projectCheckedTypeViewRootInner(source, source_names, function.ret, active),
-                .needs_instantiation = function.needs_instantiation,
             } },
             .tag_union => |tag_union| .{ .tag_union = .{
                 .tags = try self.projectCheckedTypeViewTags(source, source_names, tag_union.tags, active),
@@ -27095,7 +27074,6 @@ pub const CheckedTypeProjector = struct {
             .kind = finalizedFunctionKind(function.kind),
             .args = args,
             .ret = try self.projectImportedCheckedType(imported, function.ret),
-            .needs_instantiation = function.needs_instantiation,
         };
     }
 
@@ -27415,7 +27393,6 @@ const CheckedTypeStoreImportProjector = struct {
                 .kind = finalizedFunctionKind(function.kind),
                 .args = try self.projectIds(function.args),
                 .ret = try self.project(function.ret),
-                .needs_instantiation = function.needs_instantiation,
             } },
             .tag_union => |tag_union| .{ .tag_union = .{
                 .tags = try self.projectTags(tag_union.tags),
@@ -30361,8 +30338,8 @@ test "SERIALIZED_VERSION_HASH golden value" {
     // change, bump `serialized_layout_version` and replace the golden bytes below with
     // the ones this assertion prints.
     const golden: [32]u8 = .{
-        0x5A, 0x12, 0x9F, 0x89, 0x49, 0x51, 0x20, 0x6E, 0x70, 0x58, 0xEF, 0xCC, 0xC6, 0x44, 0x13, 0xD2,
-        0xBB, 0xC0, 0xB5, 0x3A, 0x29, 0xDC, 0xE0, 0x04, 0xE9, 0xAF, 0xD0, 0x86, 0x9D, 0x12, 0xB9, 0x2A,
+        0xC0, 0xD4, 0xD8, 0x78, 0xAC, 0x02, 0x3F, 0xFD, 0xD1, 0xA4, 0xBA, 0x9D, 0x93, 0x05, 0xFC, 0xEF,
+        0xF5, 0xEE, 0x10, 0xAD, 0x69, 0x61, 0x4B, 0x38, 0xB4, 0xF1, 0x17, 0x23, 0x9F, 0xCA, 0x51, 0xBB,
     };
     try std.testing.expectEqualSlices(u8, &golden, &CheckedModuleArtifact.SERIALIZED_VERSION_HASH);
 }
