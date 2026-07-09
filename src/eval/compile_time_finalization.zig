@@ -968,7 +968,11 @@ fn lowerDevEvalAndFinishRoots(
         allocator.free(jobs);
     }
 
-    var executable = try backend.ExecutableMemory.initWithEntryOffset(codegen.getGeneratedCode(), 0);
+    var executable = try backend.ExecutableMemory.initWithEntryOffsetAndUnwindInfo(
+        codegen.getGeneratedCode(),
+        0,
+        codegen.getUnwindFunctions(),
+    );
     defer executable.deinit();
 
     var progress = DevProgressReporter.init(options, jobs[0..jobs_len]);

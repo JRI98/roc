@@ -518,9 +518,10 @@ fn runGlueSpecDev(
             proc.ret_layout,
         ) catch return error.OutOfMemory;
 
-        var executable = backend.ExecutableMemory.initWithEntryOffset(
+        var executable = backend.ExecutableMemory.initWithEntryOffsetAndUnwindInfo(
             codegen.getGeneratedCode(),
             entrypoint.offset,
+            codegen.getUnwindFunctions(),
         ) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
             else => return error.CompilationFailed,

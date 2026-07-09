@@ -109,11 +109,8 @@ allocation_call_count: u32 = 0,
 longjmp_on_crash: bool = true,
 
 pub fn init(allocator: std.mem.Allocator) RuntimeHostEnv {
-    // The allocation_tracker grows from inside rocAllocFn, which on Windows
-    // is invoked from JIT'd dev-backend code. Stack-capturing allocators
-    // (testing.allocator) crash inside walkStackWindows when unwinding
-    // through JIT memory that lacks Windows unwind data, so the tracker
-    // uses a non-tracing allocator regardless of what was passed in.
+    // Runtime byte leak checking is handled by allocation_tracker itself, so
+    // keep the tracker's backing allocations out of the caller's leak reports.
     return .{
         .allocator = allocator,
         .allocation_tracker = std.AutoHashMap(usize, AllocationInfo).init(runtime_bytes_allocator),
@@ -325,12 +322,9 @@ fn rocReallocFn(ops: *RocOps, ptr: *anyopaque, new_length: usize, alignment: usi
     return @ptrCast(new_base_ptr);
 }
 
-// Use a non-tracing allocator for Roc runtime bytes. On Windows the
-// dev-backend JIT emits code without unwind data, so a stack-capturing
-// allocator (e.g. DebugAllocator/testing.allocator) crashes inside
-// walkStackWindows when an alloc happens from JIT'd code. RuntimeHostEnv
-// owns its own allocation_tracker for leak detection, so we don't need the
-// underlying allocator to track.
+// Use a non-tracing allocator for Roc runtime bytes. RuntimeHostEnv owns the
+// allocation_tracker that powers these tests' leak checks, so the underlying
+// allocator does not need to track the same bytes a second time.
 const runtime_bytes_allocator: std.mem.Allocator = if (@import("builtin").target.os.tag == .freestanding)
     std.heap.wasm_allocator
 else

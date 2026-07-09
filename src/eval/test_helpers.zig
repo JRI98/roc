@@ -57,6 +57,7 @@ pub const TestHelperError = Allocator.Error || std.DynLib.Error || std.Io.File.O
     Internal,
     UnsupportedTarget,
     UnsupportedPlatform,
+    UnwindRegistrationFailed,
     SysctlFailed,
     CreateFileMappingFailed,
     OpenFileMappingFailed,
@@ -2067,9 +2068,10 @@ pub fn devEvalBoolRoots(
                 root.arg_layouts,
                 root.ret_layout,
             );
-            var executable = try ExecutableMemory.initWithEntryOffset(
+            var executable = try ExecutableMemory.initWithEntryOffsetAndUnwindInfo(
                 codegen.getGeneratedCode(),
                 entrypoint.offset,
+                codegen.getUnwindFunctions(),
             );
             defer executable.deinit();
 
@@ -2300,9 +2302,10 @@ pub fn devEvaluatorStrWithStats(allocator: Allocator, lowered: *const LoweredPro
             arg_layouts,
             proc.ret_layout,
         );
-        var exec_mem = try ExecutableMemory.initWithEntryOffset(
+        var exec_mem = try ExecutableMemory.initWithEntryOffsetAndUnwindInfo(
             codegen.getGeneratedCode(),
             entrypoint.offset,
+            codegen.getUnwindFunctions(),
         );
         defer exec_mem.deinit();
 
