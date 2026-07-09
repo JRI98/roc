@@ -916,6 +916,21 @@ pre>code {
   }
 }
 
+#search-type-ahead .type-ahead-link.type-ahead-langref {
+  font-family: var(--font-sans);
+}
+
+#search-type-ahead .type-ahead-link.type-ahead-langref,
+#search-type-ahead .type-ahead-link.type-ahead-langref .type-ahead-langref-context {
+  color: var(--text-color);
+}
+
+#search-type-ahead .type-ahead-link.type-ahead-langref .type-ahead-langref-title {
+  color: var(--text-color);
+  font-family: var(--font-sans);
+  font-weight: var(--weight-bold);
+}
+
 #search-type-ahead li {
   box-sizing: border-box;
   position: relative;
