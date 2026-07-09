@@ -2210,7 +2210,7 @@ const TypeTable = struct {
             defer self.open_ctx = prev_ctx;
 
             break :open_blk try self.convertCheckedType(lookup.artifact, decl.backing);
-        } else try self.convertCheckedType(artifact, nominal.backing);
+        } else glueInvariant("nominal glue conversion could not find declaration backing", .{});
 
         return switch (backing_repr) {
             .record => |rec| blk: {
@@ -3684,7 +3684,10 @@ fn functionPayloadForRoot(
     return switch (checkedTypePayload(artifact, checked_type)) {
         .function => |func| func,
         .alias => |alias| functionPayloadForRoot(artifact, alias.backing),
-        .nominal => |nominal| functionPayloadForRoot(artifact, nominal.backing),
+        .nominal => |nominal| if (artifact.checked_types.nominalBackingTemplateForPayload(nominal)) |backing|
+            functionPayloadForRoot(artifact, backing)
+        else
+            null,
         else => null,
     };
 }
@@ -3749,7 +3752,10 @@ fn collectRecordFieldsForRoot(
 ) Allocator.Error!bool {
     switch (checkedTypePayload(artifact, checked_type)) {
         .alias => |alias| return try collectRecordFieldsForRoot(gpa, artifact, alias.backing, fields),
-        .nominal => |nominal| return try collectRecordFieldsForRoot(gpa, artifact, nominal.backing, fields),
+        .nominal => |nominal| {
+            const backing = artifact.checked_types.nominalBackingTemplateForPayload(nominal) orelse return false;
+            return try collectRecordFieldsForRoot(gpa, artifact, backing, fields);
+        },
         .record => |record| {
             try appendRecordRowFields(gpa, artifact, record.fields, record.ext, fields);
             return true;

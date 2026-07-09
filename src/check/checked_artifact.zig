@@ -2076,7 +2076,9 @@ const PlatformRelationSubstitutionCollector = struct {
                 if (platform_nominal.is_opaque) {
                     checkedArtifactInvariant("platform relation substitution expected nominal-compatible resolved payload", .{});
                 }
-                const platform_backing = try self.nominalBacking(platform_nominal);
+                const platform_backing = (try self.nominalBacking(platform_nominal)) orelse {
+                    checkedArtifactInvariant("platform relation substitution expected nominal-compatible resolved payload", .{});
+                };
                 return try self.collect(platform_backing, resolved_root, context);
             },
         };
@@ -2093,20 +2095,22 @@ const PlatformRelationSubstitutionCollector = struct {
         try self.collectSlices(platform_nominal.args, resolved_nominal.args);
         try self.collectSlices(platform_nominal.padding_field_types, resolved_nominal.padding_field_types);
         if (platform_nominal.is_opaque) return;
-        const platform_backing = try self.nominalBacking(platform_nominal);
-        const resolved_backing = try self.nominalBacking(resolved_nominal);
+        const platform_backing = (try self.nominalBacking(platform_nominal)) orelse return;
+        const resolved_backing = (try self.nominalBacking(resolved_nominal)) orelse {
+            checkedArtifactInvariant("platform relation substitution resolved nominal missing declaration backing", .{});
+        };
         return try self.collect(platform_backing, resolved_backing, .value);
     }
 
     fn nominalBacking(
         self: *PlatformRelationSubstitutionCollector,
         nominal: CheckedNominalType,
-    ) Allocator.Error!CheckedTypeId {
-        return (try self.store.ensureInstantiatedNominalBackingRootForPayload(
+    ) Allocator.Error!?CheckedTypeId {
+        return try self.store.ensureInstantiatedNominalBackingRootForPayload(
             self.allocator,
             self.names,
             nominal,
-        )) orelse checkedArtifactInvariant("platform relation substitution opened a nominal without backing", .{});
+        );
     }
 
     fn collectRecord(
@@ -17244,7 +17248,11 @@ const PlatformRequirementTypeCompatibilityChecker = struct {
             .nominal => |nominal| nominal,
             else => {
                 if (expected_nominal.is_opaque) return false;
-                const expected_backing = try self.nominalBacking(expected_nominal);
+                const expected_backing = (try self.store.ensureInstantiatedNominalBackingRootForPayload(
+                    self.allocator,
+                    self.names,
+                    expected_nominal,
+                )) orelse return false;
                 return try self.compatible(expected_backing, actual);
             },
         };
@@ -17259,24 +17267,21 @@ const PlatformRequirementTypeCompatibilityChecker = struct {
             if (!try self.compatible(expected_arg, actual_arg)) return false;
         }
         if (expected_nominal.is_opaque) return true;
-        const expected_backing = try self.nominalBacking(expected_nominal);
-        const actual_backing = try self.nominalBacking(actual_nominal);
+        const expected_backing = (try self.store.ensureInstantiatedNominalBackingRootForPayload(
+            self.allocator,
+            self.names,
+            expected_nominal,
+        )) orelse return true;
+        const actual_backing = (try self.store.ensureInstantiatedNominalBackingRootForPayload(
+            self.allocator,
+            self.names,
+            actual_nominal,
+        )) orelse return true;
         if (try self.compatible(expected_backing, actual_backing)) return true;
         return canonicalTypeKeyEql(
             self.store.roots.items[@intFromEnum(expected)].key,
             self.store.roots.items[@intFromEnum(actual)].key,
         );
-    }
-
-    fn nominalBacking(
-        self: *PlatformRequirementTypeCompatibilityChecker,
-        nominal: CheckedNominalType,
-    ) Allocator.Error!CheckedTypeId {
-        return (try self.store.ensureInstantiatedNominalBackingRootForPayload(
-            self.allocator,
-            self.names,
-            nominal,
-        )) orelse checkedArtifactInvariant("platform requirement compatibility opened a nominal without backing", .{});
     }
 
     fn compatibleRecord(
@@ -27157,10 +27162,57 @@ pub const CheckedTypeProjector = struct {
         try self.active.put(key, reserved);
         errdefer _ = self.active.remove(key);
 
-        const payload = try self.projectImportedCheckedTypePayload(imported, imported.checked_types.payload(@enumFromInt(index)));
+        const source_payload = imported.checked_types.payload(@enumFromInt(index));
+        const payload = try self.projectImportedCheckedTypePayload(imported, source_payload);
         try self.target.checked_types.fillSyntheticTypeRoot(self.allocator, reserved, payload);
         _ = self.active.remove(key);
+        switch (source_payload) {
+            .nominal => |nominal| try self.ensureProjectedImportedNominalDeclaration(imported, nominal),
+            else => {},
+        }
         return reserved;
+    }
+
+    fn ensureProjectedImportedNominalDeclaration(
+        self: *CheckedTypeProjector,
+        imported: ImportedModuleView,
+        nominal: CheckedNominalType,
+    ) Allocator.Error!void {
+        const target_key = canonical.NominalTypeKey{
+            .module = try self.remapModuleIdentity(imported, nominal.origin_module),
+            .type_name = try self.remapTypeName(imported, nominal.name),
+            .source_decl = nominal.source_decl,
+        };
+        if (self.target.checked_types.nominalDeclaration(target_key) != null) return;
+
+        const owner_decl = imported.checked_types.nominalDeclaration(checkedNominalTypeKey(nominal)) orelse {
+            if (imported.checked_types.nominalBackingTemplateForPayload(nominal) == null) return;
+            checkedArtifactInvariant("imported checked type projection could not find declaration backing", .{});
+        };
+        const owner_key = ProjectedCheckedTypeKey{
+            .artifact = imported.key.bytes,
+            .ty = @intFromEnum(owner_decl.declaration_root),
+        };
+        if (self.active.contains(owner_key)) return;
+
+        const local_root = try self.projectImportedCheckedType(imported, owner_decl.declaration_root);
+        const local_backing = try self.projectImportedCheckedType(imported, owner_decl.backing);
+
+        const owner_fields = owner_decl.declaredRecordFields(&imported.checked_types);
+        const local_fields = if (owner_fields.len == 0) &[_]CheckedNominalRecordField{} else blk: {
+            const out = try self.allocator.alloc(CheckedNominalRecordField, owner_fields.len);
+            errdefer self.allocator.free(out);
+            for (owner_fields, out) |owner_field, *local_field| {
+                local_field.* = switch (owner_field) {
+                    .named => |label| .{ .named = try self.remapRecordField(imported, label) },
+                    .padding => |ty| .{ .padding = try self.projectImportedCheckedType(imported, ty) },
+                };
+            }
+            break :blk out;
+        };
+        defer if (local_fields.len != 0) self.allocator.free(local_fields);
+
+        try appendCheckedNominalDeclarationFromPayload(self.allocator, &self.target.checked_types, local_root, local_backing, local_fields);
     }
 
     fn projectImportedCheckedTypePayload(
@@ -27477,10 +27529,52 @@ const CheckedTypeStoreImportProjector = struct {
         try self.active.put(ty, reserved);
         errdefer _ = self.active.remove(ty);
 
-        const payload = try self.projectPayload(self.imported.checked_types.payload(@enumFromInt(index)));
+        const source_payload = self.imported.checked_types.payload(@enumFromInt(index));
+        const payload = try self.projectPayload(source_payload);
         try self.target_store.fillSyntheticTypeRoot(self.allocator, reserved, payload);
         _ = self.active.remove(ty);
+        switch (source_payload) {
+            .nominal => |nominal| try self.ensureProjectedNominalDeclaration(nominal),
+            else => {},
+        }
         return reserved;
+    }
+
+    fn ensureProjectedNominalDeclaration(
+        self: *CheckedTypeStoreImportProjector,
+        nominal: CheckedNominalType,
+    ) Allocator.Error!void {
+        const target_key = canonical.NominalTypeKey{
+            .module = try self.remapModuleIdentity(nominal.origin_module),
+            .type_name = try self.remapTypeName(nominal.name),
+            .source_decl = nominal.source_decl,
+        };
+        if (self.target_store.nominalDeclaration(target_key) != null) return;
+
+        const owner_decl = self.imported.checked_types.nominalDeclaration(checkedNominalTypeKey(nominal)) orelse {
+            if (self.imported.checked_types.nominalBackingTemplateForPayload(nominal) == null) return;
+            checkedArtifactInvariant("imported nominal projection could not find declaration backing", .{});
+        };
+        if (self.active.contains(owner_decl.declaration_root)) return;
+
+        const local_root = try self.project(owner_decl.declaration_root);
+        const local_backing = try self.project(owner_decl.backing);
+
+        const owner_fields = owner_decl.declaredRecordFields(&self.imported.checked_types);
+        const local_fields = if (owner_fields.len == 0) &[_]CheckedNominalRecordField{} else blk: {
+            const out = try self.allocator.alloc(CheckedNominalRecordField, owner_fields.len);
+            errdefer self.allocator.free(out);
+            for (owner_fields, out) |owner_field, *local_field| {
+                local_field.* = switch (owner_field) {
+                    .named => |label| .{ .named = try self.remapRecordField(label) },
+                    .padding => |ty| .{ .padding = try self.project(ty) },
+                };
+            }
+            break :blk out;
+        };
+        defer if (local_fields.len != 0) self.allocator.free(local_fields);
+
+        try appendCheckedNominalDeclarationFromPayload(self.allocator, self.target_store, local_root, local_backing, local_fields);
     }
 
     fn projectPayload(

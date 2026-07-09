@@ -37,6 +37,10 @@ const TypeKey = struct {
     checked_type: CheckedArtifact.CheckedTypeId,
 };
 
+fn checkedArtifactLayoutInvariant(comptime message: []const u8, args: anytype) noreturn {
+    std.debug.panic("checked artifact layout invariant violated: " ++ message, args);
+}
+
 const BuildState = struct {
     graph: Graph = .{},
     refs_by_type: std.AutoHashMap(TypeKey, GraphRef),
@@ -241,11 +245,10 @@ pub const Resolver = struct {
         }
 
         // Self-contained artifacts embed every imported/builtin declaration
-        // they use, so resolve the declaration locally. Builtins with a
-        // dedicated layout ref were handled above; anything still without a
-        // declaration falls back to the payload backing.
+        // they use. Builtins with a dedicated layout ref were handled above;
+        // any remaining nominal must have explicit declaration data.
         const lookup = self.nominalDeclarationFor(artifact, nominal) orelse
-            return try self.buildNominalBackingFallback(artifact, checked_type, nominal, parent_context, build_state);
+            checkedArtifactLayoutInvariant("nominal layout resolution could not find declaration backing", .{});
         const decl = lookup.declaration;
 
         // Resolve the application's args to their concrete identities (chasing
@@ -339,42 +342,6 @@ pub const Resolver = struct {
         switch (backing_ref) {
             .canonical => {
                 // `internGraph` validates every reserved node, even when the caller returns a canonical ref.
-                build_state.graph.setNode(placeholder, .{ .nominal = backing_ref });
-                if (caching_enabled) try build_state.refs_by_type.put(key, backing_ref);
-                return backing_ref;
-            },
-            .local => |backing_node| {
-                if (backing_node == placeholder) unreachable;
-                build_state.graph.setNode(placeholder, build_state.graph.getNode(backing_node));
-                return placeholder_ref;
-            },
-        }
-    }
-
-    /// Fallback for nominals without any resolvable declaration (builtin dict/
-    /// set/crypto types): resolve the payload backing directly.
-    fn buildNominalBackingFallback(
-        self: *Resolver,
-        artifact: *const CheckedArtifact.CheckedModuleArtifact,
-        checked_type: CheckedArtifact.CheckedTypeId,
-        nominal: CheckedArtifact.CheckedNominalType,
-        parent_context: ParentContext,
-        build_state: *BuildState,
-    ) Error!GraphRef {
-        const caching_enabled = build_state.template_bindings.count() == 0;
-        const key = TypeKey{ .artifact_key = artifact.key, .checked_type = checked_type };
-        if (caching_enabled) {
-            if (build_state.refs_by_type.get(key)) |cached| return cached;
-            if (self.canonical_cache.get(key)) |cached| return .{ .canonical = cached };
-        }
-
-        const placeholder = try build_state.graph.reserveNode(self.allocator);
-        const placeholder_ref = GraphRef{ .local = placeholder };
-        if (caching_enabled) try build_state.refs_by_type.put(key, placeholder_ref);
-
-        const backing_ref = try self.buildRefForType(artifact, nominal.backing, parent_context, build_state);
-        switch (backing_ref) {
-            .canonical => {
                 build_state.graph.setNode(placeholder, .{ .nominal = backing_ref });
                 if (caching_enabled) try build_state.refs_by_type.put(key, backing_ref);
                 return backing_ref;

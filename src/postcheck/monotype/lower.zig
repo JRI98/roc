@@ -2505,31 +2505,11 @@ const Builder = struct {
     /// span feeds layout selection only; the lowered row stays lexicographic.
     fn declaredOrderForNominal(self: *Builder, view: ModuleView, nominal: checked.CheckedNominalType) Allocator.Error!Type.Span {
         const lookup = self.nominalDeclarationFor(view, nominal) orelse return Type.Span.empty();
-        const source_decl = lookup.declaration.source_statement;
-        // Read declared field order from the declaration's record annotation,
-        // which preserves source order (the checked row and every lowered row
-        // sort lexicographically). `lookup.view` is the declaring module, so this
-        // is correct across module boundaries.
-        const module_env = lookup.view.module_env;
-        const anno_idx = switch (module_env.store.getStatement(@enumFromInt(source_decl))) {
-            .s_nominal_decl => |decl| decl.anno,
-            else => return Type.Span.empty(),
-        };
-        // The backing record may be wrapped in parentheses; unwrap before reading
-        // its fields (the backing type itself already handles parens).
-        var record_anno = anno_idx;
-        const record = while (true) {
-            switch (module_env.store.getTypeAnno(record_anno)) {
-                .parens => |parens| record_anno = parens.anno,
-                .record => |record| break record,
-                else => return Type.Span.empty(),
-            }
-        };
-        const fields = module_env.store.sliceAnnoRecordFields(record.fields);
+        const fields = lookup.declaration.declaredRecordFields(lookup.view.types);
         if (fields.len == 0) return Type.Span.empty();
         // Unnamed fields are layout padding; their resolved checked types ride on
         // the declaration in declared order and are pulled sequentially as each
-        // unnamed field is encountered while walking the declared annotation.
+        // unnamed field is encountered while walking the declared field rows.
         // Padding types come from the lookup, which for an instantiated nominal
         // (box-payload capability) carries the *instance's* substituted padding
         // types — so a type-parameterized padding field (`_ : a`) reserves the
@@ -2539,17 +2519,17 @@ const Builder = struct {
         var padding_cursor: usize = 0;
         const entries = try self.allocator.alloc(Type.DeclaredField, fields.len);
         defer self.allocator.free(entries);
-        for (fields, 0..) |field_idx, i| {
-            const field = module_env.store.getAnnoRecordField(field_idx);
-            if (field.is_unnamed) {
-                if (padding_cursor >= padding_types.len) {
-                    Common.invariant("nominal declaration had more unnamed fields than recorded padding types");
-                }
-                const checked_ty = padding_types[padding_cursor];
-                padding_cursor += 1;
-                entries[i] = .{ .padding = try self.lowerType(padding_view, checked_ty) };
-            } else {
-                entries[i] = .{ .named = try self.program.names.internRecordFieldLabel(module_env.getIdentText(field.name)) };
+        for (fields, 0..) |field, i| {
+            switch (field) {
+                .named => |label| entries[i] = .{ .named = try self.recordFieldName(lookup.view, label) },
+                .padding => {
+                    if (padding_cursor >= padding_types.len) {
+                        Common.invariant("nominal declaration had more unnamed fields than recorded padding types");
+                    }
+                    const checked_ty = padding_types[padding_cursor];
+                    padding_cursor += 1;
+                    entries[i] = .{ .padding = try self.lowerType(padding_view, checked_ty) };
+                },
             }
         }
         return try self.program.types.addDeclaredFields(entries);
@@ -8159,38 +8139,23 @@ const BodyContext = struct {
         nominal: checked.CheckedNominalType,
     ) Allocator.Error![]const InstDeclaredField {
         const lookup = self.builder.nominalDeclarationFor(self.view, nominal) orelse return &.{};
-        const source_decl = lookup.declaration.source_statement;
-        const module_env = lookup.view.module_env;
-        const anno_idx = switch (module_env.store.getStatement(@enumFromInt(source_decl))) {
-            .s_nominal_decl => |decl| decl.anno,
-            else => return &.{},
-        };
-
-        var record_anno = anno_idx;
-        const record = while (true) {
-            switch (module_env.store.getTypeAnno(record_anno)) {
-                .parens => |parens| record_anno = parens.anno,
-                .record => |record| break record,
-                else => return &.{},
-            }
-        };
-        const fields = module_env.store.sliceAnnoRecordFields(record.fields);
+        const fields = lookup.declaration.declaredRecordFields(lookup.view.types);
         if (fields.len == 0) return &.{};
 
         const entries = try self.graph.arena().alloc(InstDeclaredField, fields.len);
         const padding_types = lookup.padding_field_tys;
         var padding_cursor: usize = 0;
-        for (fields, 0..) |field_idx, index| {
-            const field = module_env.store.getAnnoRecordField(field_idx);
-            if (field.is_unnamed) {
-                if (padding_cursor >= padding_types.len) {
-                    Common.invariant("nominal declaration had more unnamed fields than recorded padding types");
-                }
-                const checked_ty = padding_types[padding_cursor];
-                padding_cursor += 1;
-                entries[index] = .{ .padding = try self.instNode(self.checkedTypeInCurrentView(lookup.view, checked_ty)) };
-            } else {
-                entries[index] = .{ .named = try self.builder.program.names.internRecordFieldLabel(module_env.getIdentText(field.name)) };
+        for (fields, 0..) |field, index| {
+            switch (field) {
+                .named => |label| entries[index] = .{ .named = try self.builder.recordFieldName(lookup.view, label) },
+                .padding => {
+                    if (padding_cursor >= padding_types.len) {
+                        Common.invariant("nominal declaration had more unnamed fields than recorded padding types");
+                    }
+                    const checked_ty = padding_types[padding_cursor];
+                    padding_cursor += 1;
+                    entries[index] = .{ .padding = try self.instNode(self.checkedTypeInCurrentView(lookup.view, checked_ty)) };
+                },
             }
         }
         return entries;
