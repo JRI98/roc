@@ -2897,20 +2897,6 @@ fn checkedNominalTypeKey(nominal: CheckedNominalType) canonical.NominalTypeKey {
     };
 }
 
-fn instantiatedNominalBackingForPayload(
-    allocator: Allocator,
-    names: *const canonical.CanonicalNameStore,
-    store: *CheckedTypeStore,
-    nominal: CheckedNominalType,
-    comptime context: []const u8,
-) Allocator.Error!CheckedTypeId {
-    return (try store.ensureInstantiatedNominalBackingRootForPayload(
-        allocator,
-        names,
-        nominal,
-    )) orelse checkedArtifactInvariant(context ++ " opened a nominal without backing", .{});
-}
-
 fn builtinNominalHasDeclarationBacking(builtin_nominal: CheckedBuiltinNominal) bool {
     return switch (builtinRuntimeEncoding(builtin_nominal)) {
         .primitive,
@@ -30181,6 +30167,7 @@ test "CheckedTypeStore: POD round-trip preserves payloads, tags, var names, rang
     const nominal_owner: ModuleId = .{ .bytes = [_]u8{0xB2} ** 32 };
     const nominal_args = try gpa.dupe(CheckedTypeId, &.{c});
     const nominal_padding = try gpa.dupe(CheckedTypeId, &.{a});
+    const nominal_declaration_id: CheckedNominalDeclarationId = @enumFromInt(@as(u32, @intCast(store.nominal_declarations.items.len)));
     const nominal_stored = try store.commitPayload(gpa, .{ .nominal = .{
         .name = @enumFromInt(14),
         .origin_module = @enumFromInt(15),
@@ -30188,7 +30175,7 @@ test "CheckedTypeStore: POD round-trip preserves payloads, tags, var names, rang
         .source_decl = 16,
         .builtin = null,
         .is_opaque = true,
-        .representation = .{ .local_declaration = @enumFromInt(0) },
+        .representation = .{ .local_declaration = nominal_declaration_id },
         .args = nominal_args,
         .padding_field_types = nominal_padding,
     } });
@@ -30212,7 +30199,7 @@ test "CheckedTypeStore: POD round-trip preserves payloads, tags, var names, rang
     const field_name: canonical.RecordFieldLabelId = @enumFromInt(4);
     const rf = try store.appendNominalRecordFields(gpa, &.{ .{ .named = field_name }, .{ .padding = a } });
     try store.nominal_declarations.append(gpa, .{
-        .id = @enumFromInt(@as(u32, @intCast(store.nominal_declarations.items.len))),
+        .id = nominal_declaration_id,
         .nominal = .{ .module = @as(canonical.ModuleIdentityId, @enumFromInt(15)), .type_name = @as(canonical.TypeNameId, @enumFromInt(14)), .source_decl = 16 },
         .source_statement = 16,
         .declaration_root = d,

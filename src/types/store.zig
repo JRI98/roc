@@ -50,7 +50,6 @@ const Alias = types.Alias;
 const FlatType = types.FlatType;
 const NominalType = types.NominalType;
 const NominalDecl = types.NominalDecl;
-const Record = types.Record;
 const StaticDispatchConstraint = types.StaticDispatchConstraint;
 const SourceDecl = types.SourceDecl;
 
