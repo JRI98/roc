@@ -212,8 +212,8 @@ local_processing_ptrns: std.AutoHashMapUnmanaged(CIR.Pattern.Idx, LocalDefProces
 /// encountered while checking, in solve order. The settled-state occurs sweep
 /// checks these alongside the top-level defs: a local binding's cyclic type
 /// may never be reachable from the enclosing def's root type, and checking
-/// earlier would be premature (an anonymous cycle can still become valid by
-/// lifting into a nominal while the surrounding expression is checked).
+/// earlier would be premature because later constraints in the same statement
+/// can still determine the root's final graph.
 local_binding_roots: std.ArrayListUnmanaged(CIR.Pattern.Idx) = .empty,
 /// The name of the enclosing function, if known.
 /// Used to provide better error messages when type checking lambda arguments.
@@ -3374,21 +3374,12 @@ fn checkForInfiniteType(self: *Self, comptime Idx: anytype, idx: Idx) std.mem.Al
             // This is fine - no cycle, or valid recursion through a nominal type
         },
         .recursive_anonymous => {
-            // Anonymous recursion (recursive type not through a nominal
-            // type) is a surface rule enforced at OBSERVABLE roots:
-            // top-level defs and checked expression roots. A local binding's
-            // generalized scheme may legitimately hold an anonymous cycle
-            // that every use site resolves by lifting into a nominal type
-            // (e.g. a local recursive closure whose instantiations always
-            // unify with `Iter`). If a local binding has no lookup sites,
-            // however, there is no instantiation site that can lift the
-            // anonymous cycle into a nominal type. Report that local root
-            // directly instead of letting it be masked by an unused-variable
-            // diagnostic.
-            if (comptime Idx == CIR.Pattern.Idx) {
-                if (self.localBindingHasLookup(idx)) return;
-            }
-
+            // Anonymous recursion (a recursive type not routed through a
+            // nominal) is always disallowed, at every binding root — top-level
+            // defs, checked expression roots, and local bindings alike. A
+            // recursive type must go through a nominal to be valid. The
+            // `.recursive_anonymous` vs `.infinite` classification only selects
+            // a clearer error message; it never permits the type.
             std.debug.assert(self.occurs_scratch.err_var != null);
             const err_var = self.occurs_scratch.err_var.?;
 
@@ -3414,13 +3405,6 @@ fn checkForInfiniteType(self: *Self, comptime Idx: anytype, idx: Idx) std.mem.Al
             try self.types.setVarContent(var_, .err);
         },
     }
-}
-
-fn localBindingHasLookup(self: *const Self, pattern_idx: CIR.Pattern.Idx) bool {
-    for (self.value_lookup_tracking.items) |entry| {
-        if (entry.pattern_idx == pattern_idx) return true;
-    }
-    return false;
 }
 
 /// The settled-state occurs sweep: check every binding root — top-level defs
@@ -3704,7 +3688,6 @@ fn tryResolveStructuralRecordFieldDispatch(
     const published_constraint_func = Func{
         .args = published_constraint_args,
         .ret = constraint_fn.ret,
-        .needs_instantiation = false,
     };
     const published_constraint_fn_var = try self.freshFromContent(.{ .structure = .{
         .fn_unbound = published_constraint_func,
@@ -4782,7 +4765,6 @@ fn mkFlexWithFromNumeralConstraint(
             .fn_unbound = types_mod.Func{
                 .args = try self.types.appendVars(&.{arg_var}),
                 .ret = ret_var,
-                .needs_instantiation = false,
             },
         },
     };
@@ -4863,7 +4845,6 @@ fn mkFlexWithFromQuoteConstraint(
             .fn_unbound = types_mod.Func{
                 .args = try self.types.appendVars(&.{arg_var}),
                 .ret = ret_var,
-                .needs_instantiation = false,
             },
         },
     };
@@ -12738,7 +12719,6 @@ fn checkExpr(self: *Self, expr_idx: CIR.Expr.Idx, env: *Env, expected: Expected)
                         const published_constraint_func = Func{
                             .args = try self.types.appendVars(published_constraint_args),
                             .ret = expr_var,
-                            .needs_instantiation = false,
                         };
                         const published_constraint_flat: FlatType = if (mb_func_info) |info|
                             if (info.is_effectful)
@@ -12840,7 +12820,6 @@ fn checkExpr(self: *Self, expr_idx: CIR.Expr.Idx, env: *Env, expected: Expected)
             const step_fn_var = try self.freshFromContent(.{ .structure = .{ .fn_unbound = Func{
                 .args = empty_args,
                 .ret = step_ret_var,
-                .needs_instantiation = false,
             } } }, env, expr_region);
 
             if (did_err) {
@@ -13381,7 +13360,6 @@ fn validateToInspectMethodVar(
     const expected_fn_var = try self.freshFromContent(.{ .structure = .{ .fn_unbound = Func{
         .args = args_range,
         .ret = str_var,
-        .needs_instantiation = false,
     } } }, env, region);
 
     const result = try self.unifyInContext(method_var, expected_fn_var, env, .{ .method_type = .{
@@ -14259,11 +14237,8 @@ fn checkBlockStatements(self: *Self, statements: CIR.Statement.Span, env: *Env, 
 
                 // This statement is a binding root whose type may never be
                 // reachable from the enclosing def's root type. Record it for
-                // the settled-state occurs sweep — checking immediately would
-                // be premature: an anonymous cycle can still become valid by
-                // lifting into a nominal type when the surrounding expression
-                // is checked (e.g. a recursive closure whose result is later
-                // unified with Iter).
+                // the settled-state occurs sweep after this statement's
+                // constraints have fully determined the root graph.
                 try self.local_binding_roots.append(self.gpa, decl_stmt.pattern);
             },
             .s_var => |var_stmt| {
@@ -15689,7 +15664,6 @@ fn reportMissingNominalMethodForBinopConstraint(
     const constraint_fn_var = try self.freshFromContent(.{ .structure = .{ .fn_unbound = Func{
         .args = args_range,
         .ret = ret_var,
-        .needs_instantiation = false,
     } } }, env, region);
 
     const constraint = StaticDispatchConstraint{
@@ -15749,7 +15723,6 @@ fn mkBinopConstraint(
     const constraint_fn_var = try self.freshFromContent(.{ .structure = .{ .fn_unbound = Func{
         .args = args_range,
         .ret = ret_var,
-        .needs_instantiation = false,
     } } }, env, region);
 
     // Create the static dispatch constraint
@@ -15832,7 +15805,6 @@ fn mkUnaryOp(
     const constraint_fn_var = try self.freshFromContent(.{ .structure = .{ .fn_unbound = Func{
         .args = args_range,
         .ret = ret_var,
-        .needs_instantiation = false,
     } } }, env, region);
 
     // Create the static dispatch constraint
@@ -16016,7 +15988,6 @@ fn mkReceiverDispatchConstraint(
     const constraint_fn_var = try self.freshFromContent(.{ .structure = .{ .fn_unbound = Func{
         .args = args_range,
         .ret = ret_var,
-        .needs_instantiation = false,
     } } }, env, region);
 
     const constraint = StaticDispatchConstraint{
@@ -16052,7 +16023,6 @@ fn mkTypeMethodCallConstraint(
     const constraint_fn_var = try self.freshFromContent(.{ .structure = .{ .fn_unbound = Func{
         .args = args_range,
         .ret = ret_var,
-        .needs_instantiation = false,
     } } }, env, region);
 
     const constraint = StaticDispatchConstraint{
@@ -16089,7 +16059,6 @@ fn mkInterpolationConstraint(
     const constraint_fn_var = try self.freshFromContent(.{ .structure = .{ .fn_unbound = Func{
         .args = args_range,
         .ret = ret_var,
-        .needs_instantiation = false,
     } } }, env, region);
 
     const constraint = StaticDispatchConstraint{
