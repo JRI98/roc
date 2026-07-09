@@ -347,6 +347,7 @@ const CustomCase = enum {
     default_platform_build_arm64glibc,
     default_platform_build_wasm32,
     default_platform_wasm32_archive_reproducible,
+    rocci_dev_wasm_static_data_build,
     macos_output_basename_reproducible,
     default_platform_crash_x64musl,
     default_platform_crash_arm64musl,
@@ -823,6 +824,7 @@ const subcommand_cases = [_]CliCase{
     .{ .id = 0, .suite = .subcommands, .name = "issue 9519: one lifted function id per monotype specialization across a file split", .body = .{ .command = .{ .args = &.{ "test", "--no-cache" }, .roc_file = "test/cli/issue_9519_split/Main.roc", .exit = .success, .contains = &.{.{ .stream = .stdout, .text = "passed" }}, .not_contains = &.{ .{ .stream = .stderr, .text = "assigned two lifted function ids" }, .{ .stream = .stderr, .text = "postcheck invariant violated" }, .{ .stream = .stderr, .text = "panic" } } } } },
     .{ .id = 0, .suite = .subcommands, .name = "issue 9717: spec-constr record cloning reaches target validation on LLVM speed backend", .backend = .speed, .body = .{ .command = .{ .args = &.{ "build", "--opt=speed", "--no-cache" }, .roc_file = "test/cli/Issue9717SpecConstrSpanInvalidation.roc", .exit = .failure, .contains = &.{.{ .stream = .stderr, .text = "MISSING TARGET FILE" }}, .not_contains = &.{ .{ .stream = .stderr, .text = "Segmentation fault" }, .{ .stream = .stderr, .text = "SIGSEGV" }, .{ .stream = .stderr, .text = "panic" } } } } },
     .{ .id = 0, .suite = .subcommands, .name = "issue 9801: spec-constr call-pattern collection survives program.fns reallocation on LLVM size backend", .backend = .size, .body = .{ .command = .{ .args = &.{ "build", "--target=wasm32", "--opt=size", "--no-cache" }, .roc_file = "test/wasm/issue_9801_spec_constr_realloc/app.roc", .exit = .not_panic, .not_contains = &.{ .{ .stream = .stderr, .text = "index out of bounds" }, .{ .stream = .stderr, .text = "Segmentation fault" }, .{ .stream = .stderr, .text = "SIGSEGV" }, .{ .stream = .stderr, .text = "panic" } } } } },
+    .{ .id = 0, .suite = .subcommands, .name = "dev wasm build merges static data exports", .backend = .dev, .body = .{ .custom = .rocci_dev_wasm_static_data_build } },
     .{ .id = 0, .suite = .subcommands, .name = "direct LIR callable calls survive variant table growth on LLVM speed backend", .backend = .speed, .body = .{ .command = .{ .args = &.{ "build", "--opt=speed", "--no-cache" }, .roc_file = "test/cli/direct_lir_callable_variant_span_invalidation.roc", .exit = .success, .contains = &.{.{ .stream = .stdout, .text = "successfully building" }}, .not_contains = &.{ .{ .stream = .stderr, .text = "direct LIR reachability referenced a missing function spec" }, .{ .stream = .stderr, .text = "postcheck invariant violated" }, .{ .stream = .stderr, .text = "panic" } } } } },
     .{ .id = 0, .suite = .subcommands, .name = "issue 9815: roc check reports discarded Iter.collect polymorphic output without panic", .body = .{ .command = .{ .args = &.{ "check", "--no-cache" }, .roc_file = "test/cli/issue_9815_iter_collect_polymorphic_where.roc", .exit = .failure, .stderr_min_len = 1, .contains = &.{ .{ .stream = .stderr, .text = "MISSING METHOD" }, .{ .stream = .stderr, .text = "from_iter" } }, .not_contains = &.{ .{ .stream = .stderr, .text = "checked artifact invariant violated" }, .{ .stream = .stderr, .text = "unresolved `where`-clause method dispatch on a polymorphic value" }, .{ .stream = .stderr, .text = "dispatch plan had no method owner" }, .{ .stream = .stderr, .text = "panic" } } } } },
     .{ .id = 0, .suite = .subcommands, .name = "issue 9815: roc run turns discarded user where-clause error into ordinary crash", .body = .{ .command = .{ .args = &.{"--no-cache"}, .roc_file = "test/cli/issue_9815_discarded_user_where_clause_output.roc", .exit = .failure, .contains = &.{ .{ .stream = .stderr, .text = "MISSING METHOD" }, .{ .stream = .stderr, .text = "from_thing" }, .{ .stream = .stderr, .text = "Roc application crashed with this message:" } }, .not_contains = &.{ .{ .stream = .stderr, .text = "unresolved `where`-clause method dispatch on a polymorphic value" }, .{ .stream = .stderr, .text = "dispatch plan had no method owner" }, .{ .stream = .stderr, .text = "panic" } } } } },
@@ -1949,6 +1951,7 @@ fn runCustomCase(
         .default_platform_build_arm64glibc => customDefaultPlatformBuild(io, allocator, &env, &timer, timeout_ms, .arm64glibc),
         .default_platform_build_wasm32 => customDefaultPlatformBuild(io, allocator, &env, &timer, timeout_ms, .wasm32),
         .default_platform_wasm32_archive_reproducible => customDefaultPlatformWasm32ArchiveReproducible(io, allocator, &env, &timer, timeout_ms),
+        .rocci_dev_wasm_static_data_build => customRocciDevWasmStaticDataBuild(io, allocator, &env, &timer, timeout_ms),
         .macos_output_basename_reproducible => customMacosOutputBasenameReproducible(io, allocator, &env, &timer, timeout_ms),
         .default_platform_crash_x64musl => customDefaultPlatformDebugBacktrace(io, allocator, &env, &timer, timeout_ms, .x64musl, .crash),
         .default_platform_crash_arm64musl => customDefaultPlatformDebugBacktrace(io, allocator, &env, &timer, timeout_ms, .arm64musl, .crash),
@@ -4149,6 +4152,42 @@ fn customDefaultPlatformWasm32ArchiveReproducible(
         if (!std.mem.eql(u8, first, second)) {
             return customFailure(allocator, timer, "default wasm {s} archive bytes were not reproducible", .{opt});
         }
+    }
+
+    return null;
+}
+
+fn customRocciDevWasmStaticDataBuild(
+    io: std.Io,
+    allocator: Allocator,
+    env: *const CaseEnv,
+    timer: *harness.Timer,
+    timeout_ms: u64,
+) ?TestResult {
+    const output_path = std.fs.path.join(allocator, &.{ env.dirs.work_dir, "rocci_bird_dev.wasm" }) catch |err|
+        return customInfraFailure(allocator, timer, "failed to allocate Rocci dev wasm output path: {}", .{err});
+    const out_arg = outputArg(allocator, output_path) catch |err|
+        return customInfraFailure(allocator, timer, "failed to allocate Rocci dev wasm output arg: {}", .{err});
+
+    if (runRocAndCheck(io, allocator, env, timer, timeout_ms, .{
+        .args = &.{ "build", "--opt=dev", "--target=wasm32", "--no-cache", out_arg },
+        .roc_file = "test/cli/rocci_bird_postcheck_panic/main.roc",
+        .contains = &.{.{ .stream = .stdout, .text = "successfully building" }},
+        .not_contains = &.{
+            .{ .stream = .stderr, .text = "UnexpectedUndefinedSymbol" },
+            .{ .stream = .stderr, .text = "panic" },
+        },
+    })) |failure| return failure;
+
+    var file = std.Io.Dir.cwd().openFile(io, output_path, .{ .mode = .read_only }) catch |err|
+        return customInfraFailure(allocator, timer, "failed to open Rocci dev wasm output: {}", .{err});
+    defer file.close(io);
+
+    var magic: [4]u8 = undefined;
+    const bytes_read = file.readPositionalAll(io, &magic, 0) catch |err|
+        return customInfraFailure(allocator, timer, "failed to read Rocci dev wasm magic: {}", .{err});
+    if (bytes_read != magic.len or !std.mem.eql(u8, magic[0..], &.{ 0, 'a', 's', 'm' })) {
+        return customFailure(allocator, timer, "Rocci dev wasm output had invalid wasm magic", .{});
     }
 
     return null;

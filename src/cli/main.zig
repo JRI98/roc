@@ -7394,6 +7394,7 @@ fn writeDevWasmObject(
     build_cache_dir: []const u8,
     lowered: *const lir.CheckedPipeline.LoweredProgram,
     entrypoints: []const backend.Entrypoint,
+    static_data_exports: []const backend.StaticDataExport,
 ) CliMainError![]const u8 {
     if (entrypoints.len == 0) {
         if (builtin.mode == .Debug) {
@@ -7463,6 +7464,7 @@ fn writeDevWasmObject(
     for (entrypoints) |entry| {
         _ = try codegen.module.findDefinedFunctionSymbolExact(entry.symbol_name);
     }
+    try mergeStaticDataWasmModule(ctx, &codegen.module, static_data_exports, .relocatable_object);
     try codegen.module.verifyNoLinkObjectContract();
 
     const wasm_bytes = try codegen.module.encodeRelocatable(ctx.gpa);
@@ -7488,6 +7490,7 @@ fn rocBuildWasmSurgical(
     targets_config: roc_target.TargetsConfig,
     lowered: *const lir.CheckedPipeline.LoweredProgram,
     entrypoints: []const backend.Entrypoint,
+    static_data_exports: []const backend.StaticDataExport,
 ) CliMainError!void {
     if (entrypoints.len == 0) {
         if (builtin.mode == .Debug) {
@@ -7501,7 +7504,7 @@ fn rocBuildWasmSurgical(
     if (link_type == .archive) {
         // Archives package whatever inputs the platform declared (possibly
         // just the app); no platform wasm file is required.
-        const obj_path = try writeDevWasmObject(ctx, build_cache_dir, lowered, entrypoints);
+        const obj_path = try writeDevWasmObject(ctx, build_cache_dir, lowered, entrypoints, static_data_exports);
         try writeArchiveOutput(ctx, .wasm32, final_output_path, link_inputs, &.{obj_path});
         return;
     }
@@ -7515,7 +7518,7 @@ fn rocBuildWasmSurgical(
     defer freeOwnedWasmInputs(ctx, &owned_inputs);
 
     if (link_inputs.wasm != null) {
-        const obj_path = try writeDevWasmObject(ctx, build_cache_dir, lowered, entrypoints);
+        const obj_path = try writeDevWasmObject(ctx, build_cache_dir, lowered, entrypoints, static_data_exports);
         const object_files = try ctx.arena.alloc([]const u8, 1);
         object_files[0] = obj_path;
         const wasm_exports = try collectWasmPlatformExports(ctx, link_inputs, &owned_inputs);
@@ -7620,6 +7623,7 @@ fn rocBuildWasmSurgical(
     }
 
     try codegen.flushPendingBodies();
+    try mergeStaticDataWasmModule(ctx, &codegen.module, static_data_exports, .final_link);
     try codegen.module.linkHostToAppCalls(host_to_app_map.items);
 
     const memory_config = configuredWasmMemory(args, link_inputs.wasm);
@@ -7907,7 +7911,7 @@ fn validateWasmStaticFunctionRelocations(
     }
 }
 
-fn mergeLlvmStaticDataWasmModule(
+fn mergeStaticDataWasmModule(
     ctx: *CliCtx,
     module: *backend.wasm.WasmModule,
     static_data_exports: []const backend.StaticDataExport,
@@ -7947,7 +7951,7 @@ fn writeCombinedLlvmWasmObject(
     var app_merge = try wasm_module.mergeModuleForObject(&app_module);
     app_merge.deinit();
 
-    try mergeLlvmStaticDataWasmModule(ctx, &wasm_module, static_data_exports, .relocatable_object);
+    try mergeStaticDataWasmModule(ctx, &wasm_module, static_data_exports, .relocatable_object);
     try wasm_module.verifyNoLinkObjectContract();
 
     const wasm_bytes = try wasm_module.encodeRelocatable(ctx.gpa);
@@ -8062,7 +8066,7 @@ fn rocBuildWasmLlvm(
     var app_merge = try wasm_module.mergeModule(&app_module);
     app_merge.deinit();
 
-    try mergeLlvmStaticDataWasmModule(ctx, &wasm_module, static_data_exports, .final_link);
+    try mergeStaticDataWasmModule(ctx, &wasm_module, static_data_exports, .final_link);
 
     var host_to_app_map: std.ArrayList(backend.wasm.WasmModule.HostToAppEntry) = .empty;
     defer host_to_app_map.deinit(ctx.gpa);
@@ -8615,6 +8619,17 @@ fn rocBuildNative(ctx: *CliCtx, args: cli_args.BuildArgs) CliMainError!void {
     const entrypoints = try nativeBuildEntrypoints(ctx, root_artifact, &lowered);
     defer ctx.gpa.free(entrypoints);
 
+    const static_data_exports = try compile.static_data_exports.buildProvidedDataExports(
+        ctx.gpa,
+        .{
+            .root = check.CheckedArtifact.loweringViewWithRelations(root_artifact, relation_artifacts),
+            .imports = imported_artifacts,
+        },
+        &lowered,
+        target,
+    );
+    defer compile.static_data_exports.deinitProvidedDataExports(ctx.gpa, static_data_exports);
+
     if (target_arch == .wasm32) {
         reporter.begin("Code Generation");
         try rocBuildWasmSurgical(
@@ -8628,6 +8643,7 @@ fn rocBuildNative(ctx: *CliCtx, args: cli_args.BuildArgs) CliMainError!void {
             resolved_targets_config,
             &lowered,
             entrypoints,
+            static_data_exports,
         );
         reporter.end();
 
@@ -8646,17 +8662,6 @@ fn rocBuildNative(ctx: *CliCtx, args: cli_args.BuildArgs) CliMainError!void {
     }
 
     reporter.begin("Code Generation");
-    const static_data_exports = try compile.static_data_exports.buildProvidedDataExports(
-        ctx.gpa,
-        .{
-            .root = check.CheckedArtifact.loweringViewWithRelations(root_artifact, relation_artifacts),
-            .imports = imported_artifacts,
-        },
-        &lowered,
-        target,
-    );
-    defer compile.static_data_exports.deinitProvidedDataExports(ctx.gpa, static_data_exports);
-
     if (entrypoints.len == 0 and static_data_exports.len == 0) {
         if (builtin.mode == .Debug) {
             std.debug.panic("native build invariant violated: no exported platform entrypoints or data symbols", .{});
