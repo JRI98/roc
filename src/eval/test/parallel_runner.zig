@@ -132,6 +132,7 @@ pub const TestCase = struct {
     pub const AllocationExpectation = struct {
         output: []const u8,
         max_allocations: u32,
+        optimized: bool = false,
     };
 
     pub const Skip = packed struct {
@@ -678,8 +679,11 @@ fn runSingleTest(io: std.Io, allocator: std.mem.Allocator, tc: TestCase, timeout
                     .typecheck_ns = compiled.resources.typecheck_ns,
                 };
             },
-            .allocations_at_most => blk: {
-                var compiled = helpers.compileProgram(allocator, io, tc.source_kind, tc.source, tc.imports) catch {
+            .allocations_at_most => |expected| blk: {
+                var compiled = (if (expected.optimized)
+                    helpers.compileAllocationProgram(allocator, io, tc.source_kind, tc.source, tc.imports)
+                else
+                    helpers.compileProgram(allocator, io, tc.source_kind, tc.source, tc.imports)) catch {
                     return .{
                         .status = .fail,
                         .message = "INVALID_SYNTAX — skipped allocation test has parse/check/lower errors",
@@ -829,7 +833,10 @@ fn runAllocationTest(
     expected: TestCase.AllocationExpectation,
     skip: TestCase.Skip,
 ) RunnerError!TestOutcome {
-    var compiled = try helpers.compileProgram(allocator, io, source_kind, src, imports);
+    var compiled = if (expected.optimized)
+        try helpers.compileAllocationProgram(allocator, io, source_kind, src, imports)
+    else
+        try helpers.compileProgram(allocator, io, source_kind, src, imports);
     defer compiled.deinit(allocator);
 
     const timings = EvalTimings{

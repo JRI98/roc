@@ -1079,7 +1079,10 @@ const Pass = struct {
             // separately for it.
             // A peeled body iterates the shared base directly; scalarize its base
             // loop with the same whole-body clone the branch-chosen shape uses.
-            if (self.peeled[index] or try self.bodyHasBranchChosenIterLoop(body)) {
+            if (self.peeled[index] or
+                try self.bodyHasBranchChosenIterLoop(body) or
+                try self.bodyHasLocalIterLoop(body))
+            {
                 try self.cloneFnBodyInPlace(fn_id, body);
                 continue;
             }
@@ -1102,6 +1105,17 @@ const Pass = struct {
         try self.collectBranchBoundLocals(body, &branch_bound);
         if (branch_bound.count() == 0) return false;
         return self.loopConsumesBranchBoundLocal(body, &branch_bound);
+    }
+
+    /// Whether a function body holds a `for` loop over an iterator local whose
+    /// value is bound in the same body to a direct construction call, such as
+    /// `xs.iter().append(a).append(b)`.
+    fn bodyHasLocalIterLoop(self: *Pass, body: Ast.ExprId) Allocator.Error!bool {
+        var construction_bound = std.AutoHashMap(Ast.LocalId, usize).init(self.allocator);
+        defer construction_bound.deinit();
+        try self.collectConstructionBoundLocals(body, &construction_bound);
+        if (construction_bound.count() == 0) return false;
+        return self.iteratorLoopConsumesConstructionBoundLocal(body, &construction_bound);
     }
 
     /// Record every local bound (in a block statement or a `let` expression) to
@@ -1171,6 +1185,180 @@ const Pass = struct {
             .if_, .match_ => try out.put(local, {}),
             else => {},
         }
+    }
+
+    /// Record every local bound to a direct construction call.
+    fn collectConstructionBoundLocals(
+        self: *Pass,
+        expr_id: Ast.ExprId,
+        out: *std.AutoHashMap(Ast.LocalId, usize),
+    ) Allocator.Error!void {
+        const expr = self.program.getExpr(expr_id);
+        switch (expr.data) {
+            .let_ => |let_| {
+                try self.noteConstructionBoundBinding(let_.bind, let_.value, out);
+                try self.collectConstructionBoundLocals(let_.value, out);
+                try self.collectConstructionBoundLocals(let_.rest, out);
+            },
+            .block => |block| {
+                const statements = self.program.stmtSpan(block.statements);
+                for (0..statements.len) |index| {
+                    const stmt_id = GuardedList.at(statements, index);
+                    switch (self.program.getStmt(stmt_id)) {
+                        .let_ => |let_| {
+                            try self.noteConstructionBoundBinding(let_.pat, let_.value, out);
+                            try self.collectConstructionBoundLocals(let_.value, out);
+                        },
+                        .expr, .expect, .dbg => |value| try self.collectConstructionBoundLocals(value, out),
+                        .return_ => |ret| try self.collectConstructionBoundLocals(ret.value, out),
+                        else => {},
+                    }
+                }
+                try self.collectConstructionBoundLocals(block.final_expr, out);
+            },
+            .loop_ => |loop| {
+                const initial_values = self.program.exprSpan(loop.initial_values);
+                for (0..initial_values.len) |index| try self.collectConstructionBoundLocals(GuardedList.at(initial_values, index), out);
+                try self.collectConstructionBoundLocals(loop.body, out);
+            },
+            .if_ => |if_| {
+                const branches = self.program.ifBranchSpan(if_.branches);
+                for (0..branches.len) |index| try self.collectConstructionBoundLocals(GuardedList.at(branches, index).body, out);
+                try self.collectConstructionBoundLocals(if_.final_else, out);
+            },
+            .match_ => |match| {
+                const branches = self.program.branchSpan(match.branches);
+                for (0..branches.len) |index| try self.collectConstructionBoundLocals(GuardedList.at(branches, index).body, out);
+            },
+            .nominal, .dbg, .expect => |child| try self.collectConstructionBoundLocals(child, out),
+            .static_data_candidate => |candidate| try self.collectConstructionBoundLocals(candidate.runtime_expr, out),
+            .return_ => |ret| try self.collectConstructionBoundLocals(ret.value, out),
+            .comptime_branch_taken => |taken| try self.collectConstructionBoundLocals(taken.body, out),
+            else => {},
+        }
+    }
+
+    fn noteConstructionBoundBinding(
+        self: *Pass,
+        pat_id: Ast.PatId,
+        value_id: Ast.ExprId,
+        out: *std.AutoHashMap(Ast.LocalId, usize),
+    ) Allocator.Error!void {
+        const local = switch (self.program.getPat(pat_id).data) {
+            .bind => |local| local,
+            else => return,
+        };
+        if (!self.localHasIteratorNamedType(local)) return;
+        var budget: usize = 64;
+        const depth = self.iteratorConstructionDepth(value_id, out, &budget);
+        if (depth == 0) return;
+        try out.put(local, depth);
+    }
+
+    /// Whether a recognized lowered iterator loop consumes one of the locals
+    /// bound to a direct iterator construction in the same body.
+    fn iteratorLoopConsumesConstructionBoundLocal(
+        self: *Pass,
+        expr_id: Ast.ExprId,
+        set: *std.AutoHashMap(Ast.LocalId, usize),
+    ) Common.LowerError!bool {
+        const expr = self.program.getExpr(expr_id);
+        switch (expr.data) {
+            .loop_ => |loop| {
+                if (try self.matchIteratorLoopParts(expr_id)) |parts| {
+                    if (set.get(parts.source_local)) |depth| {
+                        if (depth >= 2 and self.localHasIteratorNamedType(parts.source_local)) return true;
+                    }
+                }
+                return self.iteratorLoopConsumesConstructionBoundLocal(loop.body, set);
+            },
+            .let_ => |let_| {
+                return (try self.iteratorLoopConsumesConstructionBoundLocal(let_.value, set)) or
+                    (try self.iteratorLoopConsumesConstructionBoundLocal(let_.rest, set));
+            },
+            .block => |block| {
+                const statements = self.program.stmtSpan(block.statements);
+                for (0..statements.len) |index| {
+                    const stmt_id = GuardedList.at(statements, index);
+                    const found = switch (self.program.getStmt(stmt_id)) {
+                        .let_ => |let_| try self.iteratorLoopConsumesConstructionBoundLocal(let_.value, set),
+                        .expr, .expect, .dbg => |value| try self.iteratorLoopConsumesConstructionBoundLocal(value, set),
+                        .return_ => |ret| try self.iteratorLoopConsumesConstructionBoundLocal(ret.value, set),
+                        else => false,
+                    };
+                    if (found) return true;
+                }
+                return self.iteratorLoopConsumesConstructionBoundLocal(block.final_expr, set);
+            },
+            .if_ => |if_| {
+                const branches = self.program.ifBranchSpan(if_.branches);
+                for (0..branches.len) |index| {
+                    if (try self.iteratorLoopConsumesConstructionBoundLocal(GuardedList.at(branches, index).body, set)) return true;
+                }
+                return self.iteratorLoopConsumesConstructionBoundLocal(if_.final_else, set);
+            },
+            .match_ => |match| {
+                const branches = self.program.branchSpan(match.branches);
+                for (0..branches.len) |index| {
+                    if (try self.iteratorLoopConsumesConstructionBoundLocal(GuardedList.at(branches, index).body, set)) return true;
+                }
+                return false;
+            },
+            .nominal, .dbg, .expect => |child| return self.iteratorLoopConsumesConstructionBoundLocal(child, set),
+            .static_data_candidate => |candidate| return self.iteratorLoopConsumesConstructionBoundLocal(candidate.runtime_expr, set),
+            .return_ => |ret| return self.iteratorLoopConsumesConstructionBoundLocal(ret.value, set),
+            .comptime_branch_taken => |taken| return self.iteratorLoopConsumesConstructionBoundLocal(taken.body, set),
+            else => return false,
+        }
+    }
+
+    fn localHasIteratorNamedType(self: *Pass, local: Ast.LocalId) bool {
+        const ty = self.program.getLocal(local).ty;
+        return self.typeIsIteratorNamed(ty);
+    }
+
+    fn typeIsIteratorNamed(self: *Pass, ty: Type.TypeId) bool {
+        return switch (self.program.types.get(ty)) {
+            .named => |named| blk: {
+                const type_name = self.program.names.typeNameText(named.def.type_name);
+                break :blk named.def.generated != null or std.mem.eql(u8, type_name, "Builtin.Iter");
+            },
+            else => false,
+        };
+    }
+
+    fn iteratorConstructionDepth(
+        self: *Pass,
+        expr_id: Ast.ExprId,
+        known_depths: *std.AutoHashMap(Ast.LocalId, usize),
+        budget: *usize,
+    ) usize {
+        if (budget.* == 0) return 0;
+        budget.* -= 1;
+
+        const expr = self.program.getExpr(expr_id);
+        return switch (expr.data) {
+            .local => |local| known_depths.get(local) orelse 0,
+            .call_proc => |call| blk: {
+                if (Ast.localDirectCallee(call) == null) break :blk 0;
+                if (!self.typeIsIteratorNamed(expr.ty)) break :blk 0;
+
+                var inner_depth: usize = 0;
+                const args = self.program.exprSpan(call.args);
+                for (0..args.len) |index| {
+                    inner_depth = @max(inner_depth, self.iteratorConstructionDepth(GuardedList.at(args, index), known_depths, budget));
+                }
+                break :blk inner_depth + 1;
+            },
+            .nominal => |backing| self.iteratorConstructionDepth(backing, known_depths, budget),
+            .block => |block| blk: {
+                if (self.program.stmtSpan(block.statements).len != 0) break :blk 0;
+                break :blk self.iteratorConstructionDepth(block.final_expr, known_depths, budget);
+            },
+            .static_data_candidate => |candidate| self.iteratorConstructionDepth(candidate.runtime_expr, known_depths, budget),
+            .comptime_branch_taken => |taken| self.iteratorConstructionDepth(taken.body, known_depths, budget),
+            else => 0,
+        };
     }
 
     /// Whether some loop's first carried value is an identity-style construction
@@ -2629,7 +2817,7 @@ const Pass = struct {
                     .tag => |expr_tag| expr_tag,
                     else => return false,
                 };
-                if (!sameType(self.program, expr.ty, tag.ty) or expr_tag.name != tag.name) return false;
+                if (!sameType(self.program, expr.ty, tag.ty) or !self.program.names.tagLabelTextEql(expr_tag.name, tag.name)) return false;
                 const payloads = self.program.exprSpan(expr_tag.payloads);
                 if (payloads.len != tag.payloads.len) Common.invariant("tag call pattern arity differed from tag expression arity");
                 for (tag.payloads, payloads) |payload_shape, payload| {
@@ -2645,7 +2833,7 @@ const Pass = struct {
                 };
                 if (!sameType(self.program, expr.ty, record.ty) or fields.len != record.fields.len) return false;
                 for (record.fields, fields) |field_shape, field| {
-                    if (field_shape.name != field.name) return false;
+                    if (!self.program.names.recordFieldLabelTextEql(field_shape.name, field.name)) return false;
                     if (!try self.appendExistingExprsForShape(field_shape.shape, field.value, out)) return false;
                 }
                 return true;
@@ -3124,7 +3312,7 @@ const Cloner = struct {
             },
             .field_access => |field| {
                 const receiver = try self.cloneExprValue(field.receiver);
-                if (fieldFromValue(receiver, field.field)) |value| return value;
+                if (fieldFromValue(self.pass.program, receiver, field.field)) |value| return value;
                 return .{ .expr = try self.addExpr(.{ .ty = expr.ty, .data = .{ .field_access = .{
                     .receiver = try self.materialize(receiver),
                     .field = field.field,
@@ -3227,7 +3415,7 @@ const Cloner = struct {
             .field_access => |field| blk: {
                 const receiver_local = localExpr(self.pass.program, field.receiver) orelse break :blk false;
                 const receiver = self.subst.get(receiver_local) orelse break :blk false;
-                const value = fieldFromValue(receiver, field.field) orelse break :blk false;
+                const value = fieldFromValue(self.pass.program, receiver, field.field) orelse break :blk false;
                 break :blk (try self.pass.shapeFromValue(value)) != null;
             },
             .tuple_access => |access| blk: {
@@ -4130,7 +4318,7 @@ const Cloner = struct {
                     else => Common.invariant("record call pattern matched a non-record value"),
                 };
                 for (record.fields, record_value.fields) |field_shape, field| {
-                    if (field_shape.name != field.name) Common.invariant("record call-pattern field order changed after matching");
+                    if (!self.pass.program.names.recordFieldLabelTextEql(field_shape.name, field.name)) Common.invariant("record call-pattern field order changed after matching");
                     try self.appendExprsFromValue(field_shape.shape, field.value, out);
                 }
             },
@@ -4193,7 +4381,7 @@ const Cloner = struct {
                     .tag => |value_tag| value_tag,
                     else => return try self.demoteLoopSlotLeaf(tag.ty, value, out),
                 };
-                if (value_tag.name != tag.name or
+                if (!self.pass.program.names.tagLabelTextEql(value_tag.name, tag.name) or
                     !sameType(self.pass.program, tag.ty, value_tag.ty) or
                     value_tag.payloads.len != tag.payloads.len)
                 {
@@ -4217,7 +4405,7 @@ const Cloner = struct {
                             const fields = try self.pass.arena.allocator().alloc(FieldShape, record.fields.len);
                             var demoted = false;
                             for (record.fields, value_record.fields, 0..) |field_shape, field_value, index| {
-                                if (field_shape.name != field_value.name) return try self.demoteLoopSlotLeaf(record.ty, value, out);
+                                if (!self.pass.program.names.recordFieldLabelTextEql(field_shape.name, field_value.name)) return try self.demoteLoopSlotLeaf(record.ty, value, out);
                                 const supplied = try self.supplyLoopSlotLeaves(field_shape.shape, field_value.value, out);
                                 fields[index] = .{ .name = field_shape.name, .shape = supplied.shape };
                                 demoted = demoted or supplied.demoted;
@@ -4330,7 +4518,7 @@ const Cloner = struct {
 
     fn cloneFieldAccess(self: *Cloner, ty: Type.TypeId, field: anytype) Common.LowerError!Ast.ExprId {
         const receiver = try self.cloneExprValue(field.receiver);
-        if (fieldFromValue(receiver, field.field)) |value| return try self.materialize(value);
+        if (fieldFromValue(self.pass.program, receiver, field.field)) |value| return try self.materialize(value);
         return try self.addExpr(.{ .ty = ty, .data = .{ .field_access = .{
             .receiver = try self.materialize(receiver),
             .field = field.field,
@@ -4433,46 +4621,82 @@ const Cloner = struct {
                 return prepared;
             },
             .record => |fields_span| {
-                const record = recordFromValue(value) orelse return null;
                 const fields = self.pass.program.recordDestructSpan(fields_span);
-                const prepared_fields = try self.pass.arena.allocator().alloc(FieldValue, record.fields.len);
-                for (record.fields, 0..) |field, index| {
-                    if (recordPatField(fields, field.name)) |field_pat| {
-                        const prepared = (try self.bindPatToMatchValue(field_pat, field.value, body, unsafe_count)) orelse return null;
-                        prepared_fields[index] = .{
-                            .name = field.name,
-                            .value = prepared,
-                        };
-                    } else {
-                        prepared_fields[index] = .{
-                            .name = field.name,
-                            .value = try self.makeReusableForMatch(field.value),
-                        };
-                    }
+                switch (value) {
+                    .record => |record| {
+                        const prepared_fields = try self.pass.arena.allocator().alloc(FieldValue, record.fields.len);
+                        for (record.fields, 0..) |field, index| {
+                            if (recordPatField(self.pass.program, fields, field.name)) |field_pat| {
+                                const prepared = (try self.bindPatToMatchValue(field_pat, field.value, body, unsafe_count)) orelse return null;
+                                prepared_fields[index] = .{
+                                    .name = field.name,
+                                    .value = prepared,
+                                };
+                            } else {
+                                prepared_fields[index] = .{
+                                    .name = field.name,
+                                    .value = try self.makeReusableForMatch(field.value),
+                                };
+                            }
+                        }
+                        return Value{ .record = .{
+                            .ty = record.ty,
+                            .fields = prepared_fields,
+                        } };
+                    },
+                    .nominal => |nominal| return try self.bindPatToMatchValue(pat_id, nominal.backing.*, body, unsafe_count),
+                    .expr => |receiver| {
+                        if (!canReadFieldsFromExpr(self.pass.program, receiver)) return null;
+                        for (0..fields.len) |index| {
+                            const field = GuardedList.at(fields, index);
+                            const field_ty = self.pass.program.getPat(field.pattern).ty;
+                            const field_expr = try self.addExpr(.{ .ty = field_ty, .data = .{ .field_access = .{
+                                .receiver = receiver,
+                                .field = field.name,
+                            } } });
+                            _ = (try self.bindPatToMatchValue(field.pattern, .{ .expr = field_expr }, body, unsafe_count)) orelse return null;
+                        }
+                        return value;
+                    },
+                    else => return null,
                 }
-                return Value{ .record = .{
-                    .ty = record.ty,
-                    .fields = prepared_fields,
-                } };
             },
             .tuple => |items_span| {
-                const tuple = tupleFromValue(value) orelse return null;
                 const pats = self.pass.program.patSpan(items_span);
-                if (pats.len != tuple.items.len) return null;
-                const items = try self.pass.arena.allocator().alloc(Value, tuple.items.len);
-                for (0..pats.len) |index| {
-                    const child_pat = GuardedList.at(pats, index);
-                    const child_value = tuple.items[index];
-                    items[index] = (try self.bindPatToMatchValue(child_pat, child_value, body, unsafe_count)) orelse return null;
+                switch (value) {
+                    .tuple => |tuple| {
+                        if (pats.len != tuple.items.len) return null;
+                        const items = try self.pass.arena.allocator().alloc(Value, tuple.items.len);
+                        for (0..pats.len) |index| {
+                            const child_pat = GuardedList.at(pats, index);
+                            const child_value = tuple.items[index];
+                            items[index] = (try self.bindPatToMatchValue(child_pat, child_value, body, unsafe_count)) orelse return null;
+                        }
+                        return Value{ .tuple = .{
+                            .ty = tuple.ty,
+                            .items = items,
+                        } };
+                    },
+                    .nominal => |nominal| return try self.bindPatToMatchValue(pat_id, nominal.backing.*, body, unsafe_count),
+                    .expr => |receiver| {
+                        if (!canReadFieldsFromExpr(self.pass.program, receiver)) return null;
+                        for (0..pats.len) |index| {
+                            const child_pat = GuardedList.at(pats, index);
+                            const item_ty = self.pass.program.getPat(child_pat).ty;
+                            const item_expr = try self.addExpr(.{ .ty = item_ty, .data = .{ .tuple_access = .{
+                                .tuple = receiver,
+                                .elem_index = @as(u32, @intCast(index)),
+                            } } });
+                            _ = (try self.bindPatToMatchValue(child_pat, .{ .expr = item_expr }, body, unsafe_count)) orelse return null;
+                        }
+                        return value;
+                    },
+                    else => return null,
                 }
-                return Value{ .tuple = .{
-                    .ty = tuple.ty,
-                    .items = items,
-                } };
             },
             .tag => |tag_pat| {
                 const tag = tagFromValue(value) orelse return null;
-                if (tag.name != tag_pat.name) return null;
+                if (!self.pass.program.names.tagLabelTextEql(tag.name, tag_pat.name)) return null;
                 const pats = self.pass.program.patSpan(tag_pat.payloads);
                 if (pats.len != tag.payloads.len) return null;
                 const payloads = try self.pass.arena.allocator().alloc(Value, tag.payloads.len);
@@ -4645,7 +4869,7 @@ const Cloner = struct {
             },
             .field_access => |field| blk: {
                 const receiver = self.peekKnownValue(field.receiver) orelse break :blk null;
-                break :blk fieldFromValue(receiver, field.field);
+                break :blk fieldFromValue(self.pass.program, receiver, field.field);
             },
             .tuple_access => |access| blk: {
                 const receiver = self.peekKnownValue(access.tuple) orelse break :blk null;
@@ -5208,29 +5432,63 @@ const Cloner = struct {
                 return true;
             },
             .record => |fields_span| {
-                const record = recordFromValue(value) orelse return false;
                 const fields = self.pass.program.recordDestructSpan(fields_span);
-                for (0..fields.len) |index| {
-                    const field = GuardedList.at(fields, index);
-                    const field_value = fieldFromRecord(record, field.name) orelse return false;
-                    if (!try self.bindPatToValue(field.pattern, field_value)) return false;
+                switch (value) {
+                    .record, .nominal => {
+                        const record = recordFromValue(value) orelse return false;
+                        for (0..fields.len) |index| {
+                            const field = GuardedList.at(fields, index);
+                            const field_value = fieldFromRecord(self.pass.program, record, field.name) orelse return false;
+                            if (!try self.bindPatToValue(field.pattern, field_value)) return false;
+                        }
+                    },
+                    .expr => |receiver| {
+                        if (!canReadFieldsFromExpr(self.pass.program, receiver)) return false;
+                        for (0..fields.len) |index| {
+                            const field = GuardedList.at(fields, index);
+                            const field_ty = self.pass.program.getPat(field.pattern).ty;
+                            const field_expr = try self.addExpr(.{ .ty = field_ty, .data = .{ .field_access = .{
+                                .receiver = receiver,
+                                .field = field.name,
+                            } } });
+                            if (!try self.bindPatToValue(field.pattern, .{ .expr = field_expr })) return false;
+                        }
+                    },
+                    else => return false,
                 }
                 return true;
             },
             .tuple => |items_span| {
-                const tuple = tupleFromValue(value) orelse return false;
                 const pats = self.pass.program.patSpan(items_span);
-                if (pats.len != tuple.items.len) return false;
-                for (0..pats.len) |index| {
-                    const child_pat = GuardedList.at(pats, index);
-                    const child_value = tuple.items[index];
-                    if (!try self.bindPatToValue(child_pat, child_value)) return false;
+                switch (value) {
+                    .tuple, .nominal => {
+                        const tuple = tupleFromValue(value) orelse return false;
+                        if (pats.len != tuple.items.len) return false;
+                        for (0..pats.len) |index| {
+                            const child_pat = GuardedList.at(pats, index);
+                            const child_value = tuple.items[index];
+                            if (!try self.bindPatToValue(child_pat, child_value)) return false;
+                        }
+                    },
+                    .expr => |receiver| {
+                        if (!canReadFieldsFromExpr(self.pass.program, receiver)) return false;
+                        for (0..pats.len) |index| {
+                            const child_pat = GuardedList.at(pats, index);
+                            const item_ty = self.pass.program.getPat(child_pat).ty;
+                            const item_expr = try self.addExpr(.{ .ty = item_ty, .data = .{ .tuple_access = .{
+                                .tuple = receiver,
+                                .elem_index = @as(u32, @intCast(index)),
+                            } } });
+                            if (!try self.bindPatToValue(child_pat, .{ .expr = item_expr })) return false;
+                        }
+                    },
+                    else => return false,
                 }
                 return true;
             },
             .tag => |tag_pat| {
                 const tag = tagFromValue(value) orelse return false;
-                if (tag.name != tag_pat.name) return false;
+                if (!self.pass.program.names.tagLabelTextEql(tag.name, tag_pat.name)) return false;
                 const pats = self.pass.program.patSpan(tag_pat.payloads);
                 if (pats.len != tag.payloads.len) return false;
                 for (0..pats.len) |index| {
@@ -6571,7 +6829,12 @@ fn shapeEql(program: *const Ast.Program, lhs: Shape, rhs: Shape) bool {
         .any => |lhs_ty| sameType(program, lhs_ty, rhs.any),
         .tag => |lhs_tag| blk: {
             const rhs_tag = rhs.tag;
-            if (!sameType(program, lhs_tag.ty, rhs_tag.ty) or lhs_tag.name != rhs_tag.name or lhs_tag.payloads.len != rhs_tag.payloads.len) break :blk false;
+            if (!sameType(program, lhs_tag.ty, rhs_tag.ty) or
+                !program.names.tagLabelTextEql(lhs_tag.name, rhs_tag.name) or
+                lhs_tag.payloads.len != rhs_tag.payloads.len)
+            {
+                break :blk false;
+            }
             for (lhs_tag.payloads, rhs_tag.payloads) |lhs_payload, rhs_payload| {
                 if (!shapeEql(program, lhs_payload, rhs_payload)) break :blk false;
             }
@@ -6581,7 +6844,11 @@ fn shapeEql(program: *const Ast.Program, lhs: Shape, rhs: Shape) bool {
             const rhs_record = rhs.record;
             if (!sameType(program, lhs_record.ty, rhs_record.ty) or lhs_record.fields.len != rhs_record.fields.len) break :blk false;
             for (lhs_record.fields, rhs_record.fields) |lhs_field, rhs_field| {
-                if (lhs_field.name != rhs_field.name or !shapeEql(program, lhs_field.shape, rhs_field.shape)) break :blk false;
+                if (!program.names.recordFieldLabelTextEql(lhs_field.name, rhs_field.name) or
+                    !shapeEql(program, lhs_field.shape, rhs_field.shape))
+                {
+                    break :blk false;
+                }
             }
             break :blk true;
         },
@@ -6621,7 +6888,12 @@ fn shapeMatchesValue(program: *const Ast.Program, shape: Shape, value: Value) bo
                 .tag => |value_tag| value_tag,
                 else => break :blk false,
             };
-            if (!sameType(program, tag.ty, value_tag.ty) or tag.name != value_tag.name or tag.payloads.len != value_tag.payloads.len) break :blk false;
+            if (!sameType(program, tag.ty, value_tag.ty) or
+                !program.names.tagLabelTextEql(tag.name, value_tag.name) or
+                tag.payloads.len != value_tag.payloads.len)
+            {
+                break :blk false;
+            }
             for (tag.payloads, value_tag.payloads) |payload_shape, payload_value| {
                 if (!shapeMatchesValue(program, payload_shape, payload_value)) break :blk false;
             }
@@ -6634,7 +6906,11 @@ fn shapeMatchesValue(program: *const Ast.Program, shape: Shape, value: Value) bo
             };
             if (!sameType(program, record.ty, value_record.ty) or record.fields.len != value_record.fields.len) break :blk false;
             for (record.fields, value_record.fields) |field_shape, field_value| {
-                if (field_shape.name != field_value.name or !shapeMatchesValue(program, field_shape.shape, field_value.value)) break :blk false;
+                if (!program.names.recordFieldLabelTextEql(field_shape.name, field_value.name) or
+                    !shapeMatchesValue(program, field_shape.shape, field_value.value))
+                {
+                    break :blk false;
+                }
             }
             break :blk true;
         },
@@ -6682,22 +6958,22 @@ fn callableTargetMatches(program: *const Ast.Program, expected: Ast.FnId, actual
     return Mono.fnTemplateIdentityEql(expected_source, actual_source);
 }
 
-fn fieldFromValue(value: Value, name: names.RecordFieldNameId) ?Value {
+fn fieldFromValue(program: *const Ast.Program, value: Value, name: names.RecordFieldNameId) ?Value {
     const record = recordFromValue(value) orelse return null;
-    return fieldFromRecord(record, name);
+    return fieldFromRecord(program, record, name);
 }
 
-fn fieldFromRecord(record: RecordValue, name: names.RecordFieldNameId) ?Value {
+fn fieldFromRecord(program: *const Ast.Program, record: RecordValue, name: names.RecordFieldNameId) ?Value {
     for (record.fields) |field| {
-        if (field.name == name) return field.value;
+        if (program.names.recordFieldLabelTextEql(field.name, name)) return field.value;
     }
     return null;
 }
 
-fn recordPatField(fields: anytype, name: names.RecordFieldNameId) ?Ast.PatId {
+fn recordPatField(program: *const Ast.Program, fields: anytype, name: names.RecordFieldNameId) ?Ast.PatId {
     for (0..fields.len) |index| {
         const field = GuardedList.at(fields, index);
-        if (field.name == name) return field.pattern;
+        if (program.names.recordFieldLabelTextEql(field.name, name)) return field.pattern;
     }
     return null;
 }

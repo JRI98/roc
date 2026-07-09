@@ -111,6 +111,26 @@ pub const tests = [_]TestCase{
         .expected = .{ .allocations_at_most = .{ .output = "ok", .max_allocations = 0 } },
     },
     .{
+        .name = "iter alloc: list append append for-loop only allocates base list",
+        .source =
+        \\{
+        \\    base_points = [
+        \\        { x: 11.I64, y: 2.I64 }, { x: 13, y: 3 },
+        \\        { x: 3, y: 5 }, { x: 11, y: 6 },
+        \\        { x: 9, y: 8 }, { x: 5, y: 9 },
+        \\        { x: 7, y: 10 }, { x: 5, y: 12 },
+        \\    ].iter()
+        \\    collision_points = base_points.append({ x: 2, y: 1 }).append({ x: 7, y: 1 })
+        \\    var sum = 0.I64
+        \\    for { x, y } in collision_points {
+        \\        sum = sum + x + y
+        \\    }
+        \\    if sum == 130 { "ok" } else { "bad" }
+        \\}
+        ,
+        .expected = .{ .allocations_at_most = .{ .output = "ok", .max_allocations = 1, .optimized = true } },
+    },
+    .{
         .name = "iter alloc: range map for-loop is zero-alloc",
         .source =
         \\{

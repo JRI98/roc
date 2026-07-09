@@ -5115,10 +5115,39 @@ test "iterdiff: tier-one map collect matches hand-written loop shape" {
     try std.testing.expectEqual(@as(usize, 0), try reachableProcShapeFieldTotal(allocator, iter, "list_reserve_count"));
     try std.testing.expect(try reachableProcShapeFieldTotal(allocator, loop, "list_reserve_count") >= 1);
 
-    // Adapter carried box (Slice E): only the map-over-list pipeline
-    // re-materializes its nested iterator at loop exit.
+    // The adapter and list loop both carry their state as scalar values, so no
+    // boxed iterator state remains reachable.
     try std.testing.expectEqual(@as(usize, 0), try reachableProcShapeFieldTotal(allocator, loop, "box_box_count"));
-    try std.testing.expect(try reachableProcShapeFieldTotal(allocator, iter, "box_box_count") >= 1);
+    try std.testing.expectEqual(@as(usize, 0), try reachableProcShapeFieldTotal(allocator, iter, "box_box_count"));
+}
+
+test "iter alloc static: list append append for-loop has no boxed iterator state" {
+    const allocator = std.testing.allocator;
+    const source =
+        \\module [main]
+        \\
+        \\main : U64 -> Str
+        \\main = |_seed| {
+        \\    base_points = [
+        \\        { x: 11.I64, y: 2.I64 }, { x: 13, y: 3 },
+        \\        { x: 3, y: 5 }, { x: 11, y: 6 },
+        \\        { x: 9, y: 8 }, { x: 5, y: 9 },
+        \\        { x: 7, y: 10 }, { x: 5, y: 12 },
+        \\    ].iter()
+        \\    collision_points = base_points.append({ x: 2, y: 1 }).append({ x: 7, y: 1 })
+        \\    var $sum = 0.I64
+        \\    for { x, y } in collision_points {
+        \\        $sum = $sum + x + y
+        \\    }
+        \\    if $sum == 130 { "ok" } else { "bad" }
+        \\}
+    ;
+
+    var optimized = try lowerModuleWithOptions(allocator, source, .wrappers, .{ .tag_reachability = true });
+    defer optimized.deinit(allocator);
+
+    try expectReachableProcShapeFieldEqual(allocator, &optimized.lowered, "box_box_count", 0);
+    try expectNoReachableErasedCallableLowering(allocator, &optimized.lowered);
 }
 
 // Slice H aliasing guard (refcount-exactness for opportunistic mutation).

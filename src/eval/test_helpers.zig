@@ -691,16 +691,40 @@ pub fn compileProgram(
     source: []const u8,
     imports: []const ModuleSource,
 ) TestHelperError!CompiledProgram {
+    return compileProgramWithOptions(allocator, io, source_kind, source, imports, .{});
+}
+
+pub fn compileAllocationProgram(
+    allocator: Allocator,
+    io: std.Io,
+    source_kind: SourceKind,
+    source: []const u8,
+    imports: []const ModuleSource,
+) TestHelperError!CompiledProgram {
+    return compileProgramWithOptions(allocator, io, source_kind, source, imports, .{
+        .inline_mode = .wrappers,
+        .tag_reachability = true,
+    });
+}
+
+fn compileProgramWithOptions(
+    allocator: Allocator,
+    io: std.Io,
+    source_kind: SourceKind,
+    source: []const u8,
+    imports: []const ModuleSource,
+    options: LowerToLirOptions,
+) TestHelperError!CompiledProgram {
     var resources = try parseAndCanonicalizeProgramWrapped(allocator, source_kind, source, imports, false);
     errdefer cleanupParseAndCanonical(allocator, resources);
 
-    const lowered = try lowerParsedProgramToLir(allocator, io, &resources, .native);
+    const lowered = try lowerParsedProgramToLirWithOptions(allocator, io, &resources, .native, options);
     errdefer {
         var owned = lowered;
         owned.deinit(allocator);
     }
 
-    const wasm_lowered = try lowerParsedProgramToLir(allocator, io, &resources, .u32);
+    const wasm_lowered = try lowerParsedProgramToLirWithOptions(allocator, io, &resources, .u32, options);
     errdefer {
         var owned = wasm_lowered;
         owned.deinit(allocator);
@@ -1410,8 +1434,23 @@ fn lowerParsedProgramToLir(
     resources: *ParsedResources,
     target_usize: base.target.TargetUsize,
 ) TestHelperError!LoweredProgram {
+    return lowerParsedProgramToLirWithOptions(allocator, io, resources, target_usize, .{});
+}
+
+const LowerToLirOptions = struct {
+    inline_mode: lir.CheckedPipeline.InlineMode = .none,
+    tag_reachability: bool = false,
+};
+
+fn lowerParsedProgramToLirWithOptions(
+    allocator: Allocator,
+    io: std.Io,
+    resources: *ParsedResources,
+    target_usize: base.target.TargetUsize,
+    options: LowerToLirOptions,
+) TestHelperError!LoweredProgram {
     if (resources.borrowed_builtin_artifact == null) {
-        return lowerCheckedModuleSetToLir(allocator, io, &resources.checked_artifact, resources.import_artifacts, target_usize);
+        return lowerCheckedModuleSetToLirWithOptions(allocator, io, &resources.checked_artifact, resources.import_artifacts, target_usize, options);
     }
 
     const borrowed = resources.borrowed_builtin_artifact.?;
@@ -1422,7 +1461,7 @@ fn lowerParsedProgramToLir(
     for (resources.import_artifacts, 0..) |*module, i| {
         import_views[i + 1] = check.CheckedArtifact.importedView(module);
     }
-    return lowerCheckedRootWithViews(allocator, io, &resources.checked_artifact, import_views, target_usize);
+    return lowerCheckedRootWithViews(allocator, io, &resources.checked_artifact, import_views, target_usize, options);
 }
 
 /// Lower already-published checked modules to a LIR image.
@@ -1433,12 +1472,23 @@ pub fn lowerCheckedModuleSetToLir(
     import_modules: []check.CheckedArtifact.CheckedModuleArtifact,
     target_usize: base.target.TargetUsize,
 ) TestHelperError!LoweredProgram {
+    return lowerCheckedModuleSetToLirWithOptions(allocator, io, root_module, import_modules, target_usize, .{});
+}
+
+fn lowerCheckedModuleSetToLirWithOptions(
+    allocator: Allocator,
+    io: std.Io,
+    root_module: *check.CheckedArtifact.CheckedModuleArtifact,
+    import_modules: []check.CheckedArtifact.CheckedModuleArtifact,
+    target_usize: base.target.TargetUsize,
+    options: LowerToLirOptions,
+) TestHelperError!LoweredProgram {
     const import_views = try allocator.alloc(check.CheckedArtifact.ImportedModuleView, import_modules.len);
     defer allocator.free(import_views);
     for (import_modules, 0..) |*module, i| {
         import_views[i] = check.CheckedArtifact.importedView(module);
     }
-    return lowerCheckedRootWithViews(allocator, io, root_module, import_views, target_usize);
+    return lowerCheckedRootWithViews(allocator, io, root_module, import_views, target_usize, options);
 }
 
 fn lowerCheckedRootWithViews(
@@ -1447,6 +1497,7 @@ fn lowerCheckedRootWithViews(
     root_module: *check.CheckedArtifact.CheckedModuleArtifact,
     import_views: []const check.CheckedArtifact.ImportedModuleView,
     target_usize: base.target.TargetUsize,
+    options: LowerToLirOptions,
 ) TestHelperError!LoweredProgram {
     const page_size = try SharedMemoryAllocator.getSystemPageSize();
     var shm = try SharedMemoryAllocator.createWithMinSize(io, EVAL_SHARED_MEMORY_SIZE, EVAL_SHARED_MEMORY_MIN_SIZE, page_size);
@@ -1464,10 +1515,12 @@ fn lowerCheckedRootWithViews(
         .{ .requests = root_module.root_requests.runtime_requests },
         .{
             .target_usize = target_usize,
+            .inline_mode = options.inline_mode,
             // Match optimized builds so every backend exercises the in-place
             // List.map path; the copy path is still covered by shared-list,
             // slice, and layout-mismatch cases.
             .list_in_place_map = true,
+            .tag_reachability = options.tag_reachability,
         },
     );
 
