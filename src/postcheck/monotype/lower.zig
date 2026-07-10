@@ -1230,7 +1230,7 @@ const Builder = struct {
         fn_ty: Type.TypeId,
         evidence: []const SpecEvidence,
     ) Allocator.Error!Ast.DefId {
-        return try self.lowerTemplateWithMonoFor(template_ref, source_fn_ty, source_fn_key, fn_ty, evidence, null, null, null, null);
+        return try self.lowerTemplateWithMonoFor(template_ref, source_fn_ty, source_fn_key, fn_ty, evidence, null, null, null, null, null);
     }
 
     /// Specializations of one template family are deduplicated by structural
@@ -1247,6 +1247,7 @@ const Builder = struct {
         fn_ty: Type.TypeId,
         evidence: []const SpecEvidence,
         requester: ?*InstGraph,
+        requester_fn_node: ?NodeId,
         reserved_fn_id: ?Ast.FnId,
         source_region_override: ?base.Region,
         current_entry_root: ?EntryRoot,
@@ -1388,6 +1389,7 @@ const Builder = struct {
                         null,
                         null,
                         null,
+                        null,
                     );
                     const adapter_template = Ast.FnTemplate{
                         .fn_def = .{ .checked_generated = template_ref },
@@ -1515,11 +1517,13 @@ const Builder = struct {
         const draft_end = draft.end(self);
         try self.drainSpecRequests(graph);
         if (requester) |requester_graph| {
+            const live_requester_fn_node = requester_fn_node orelse
+                Common.invariant("deferred Monotype specialization lost its requester function type node");
             try graph.drainDirty();
             const requester_fn_ty = if (body_uses_generated_evidence) body_fn_ty else live_fn_ty;
             const solved_requester_fn_ty = try graph.sealType(requester_fn_ty);
             try requester_graph.unify(
-                try requester_graph.importMono(fn_ty),
+                live_requester_fn_node,
                 try requester_graph.importMono(solved_requester_fn_ty),
             );
             try self.drainRequesterGraph(requester_graph);
@@ -2666,6 +2670,7 @@ const Builder = struct {
         // body sections before the active draft has sealed.
         if (self.active_graph) |graph| {
             var request_template = fn_template;
+            const requester_fn_node = try graph.importMono(request_template.mono_fn_ty);
             request_template.mono_fn_ty = try self.stableSpecializationRequestType(graph, fn_template.mono_fn_ty);
             const reserved = try self.reserveTemplateWithMonoFor(
                 template_ref,
@@ -2682,6 +2687,7 @@ const Builder = struct {
                     .template_ref = template_ref,
                     .source_fn_ty = request_template.source_fn_ty,
                     .source_fn_key = request_template.source_fn_key,
+                    .requester_fn_node = requester_fn_node,
                     .fn_ty = request_template.mono_fn_ty,
                     .source_region_override = null,
                     .current_entry_root = null,
@@ -2770,6 +2776,7 @@ const Builder = struct {
             .nested => Common.invariant("nested function specialization must be lowered through nested function lowering"),
         };
         var request_template = fn_template;
+        const requester_fn_node = try source_ctx.graph.importMono(request_template.mono_fn_ty);
         request_template.mono_fn_ty = try self.stableSpecializationRequestType(source_ctx.graph, fn_template.mono_fn_ty);
         const reserved = try self.reserveTemplateWithMonoFor(
             template_ref,
@@ -2786,6 +2793,7 @@ const Builder = struct {
                 .template_ref = template_ref,
                 .source_fn_ty = request_template.source_fn_ty,
                 .source_fn_key = request_template.source_fn_key,
+                .requester_fn_node = requester_fn_node,
                 .fn_ty = request_template.mono_fn_ty,
                 .source_region_override = source_ctx.source_region_override,
                 .current_entry_root = source_ctx.current_entry_root,
@@ -3029,6 +3037,7 @@ const Builder = struct {
                 // evidence to its reservation entry.
                 &.{},
                 graph,
+                request.requester_fn_node,
                 request.fn_id,
                 request.source_region_override,
                 request.current_entry_root,
