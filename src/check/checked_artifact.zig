@@ -3564,6 +3564,15 @@ const CheckedTypePublication = struct {
 };
 
 /// Public `CheckedTypeStore` declaration.
+///
+/// Recursive types are stored as cyclic `CheckedTypeId` graphs with no implicit
+/// tree structure, so every traversal of a store root must guard against cycles.
+/// New `CheckedTypeId` traversals must be expressed through `checked_traverse.zig`
+/// (`BoolPredicateTraversal`, `ReserveThenFillTraversal`, or `DigestTraversal`),
+/// which own the visited/active memo and guarantee the memo is written before a
+/// root is descended. Hand-rolled visited/active sets are prohibited: they make
+/// "read the memo but forget the write" compile cleanly and only fail on
+/// recursive inputs.
 pub const CheckedTypeStore = struct {
     /// Transient projection state (never serialized): non-null while a
     /// nominal use's backing template is being projected. Nested template
@@ -17646,12 +17655,37 @@ const PlatformAppRelationMergeInput = struct {
     context: PlatformAppRelationMergeContext,
 };
 
+/// How a reserved merge/finalize root is completed once its subtree resolves.
+const PlatformAppRelationFillMode = enum {
+    /// Fresh reserved root: compute and store its payload.
+    store,
+    /// A content-addressed match already exists: recompute the payload only for
+    /// its substitution side effects, then discard it.
+    discard,
+    /// The result normalized to an existing empty or deduplicated root: complete
+    /// without touching it.
+    skip,
+};
+
+const PlatformAppRelationMergeTraversal = checked_traverse.ReserveThenFillTraversal(
+    PlatformAppRelationMergeInput,
+    CheckedTypeId,
+    PlatformAppRelationTypeResolver,
+);
+
+const PlatformAppRelationFinalizeTraversal = checked_traverse.ReserveThenFillTraversal(
+    PlatformAppRelationFinalizeInput,
+    CheckedTypeId,
+    PlatformAppRelationTypeResolver,
+);
+
 const PlatformAppRelationTypeResolver = struct {
     allocator: Allocator,
     names: *const canonical.CanonicalNameStore,
     store: *CheckedTypeStore,
-    finalizing: std.AutoHashMap(PlatformAppRelationFinalizeInput, CheckedTypeId),
-    merging: std.AutoHashMap(PlatformAppRelationMergeInput, CheckedTypeId),
+    merge_traversal: PlatformAppRelationMergeTraversal,
+    finalize_traversal: PlatformAppRelationFinalizeTraversal,
+    fill_mode: PlatformAppRelationFillMode,
     substitutions: std.AutoHashMap(CheckedTypeId, CheckedTypeId),
     substitution_formals: std.ArrayList(CheckedTypeId),
     substitution_actuals: std.ArrayList(CheckedTypeId),
@@ -17665,20 +17699,52 @@ const PlatformAppRelationTypeResolver = struct {
             .allocator = allocator,
             .names = names,
             .store = store,
-            .finalizing = std.AutoHashMap(PlatformAppRelationFinalizeInput, CheckedTypeId).init(allocator),
-            .merging = std.AutoHashMap(PlatformAppRelationMergeInput, CheckedTypeId).init(allocator),
+            .merge_traversal = PlatformAppRelationMergeTraversal.init(allocator, undefined),
+            .finalize_traversal = PlatformAppRelationFinalizeTraversal.init(allocator, undefined),
+            .fill_mode = .store,
             .substitutions = std.AutoHashMap(CheckedTypeId, CheckedTypeId).init(allocator),
             .substitution_formals = .empty,
             .substitution_actuals = .empty,
         };
     }
 
+    /// Point the reserve-then-fill traversals at this resolver's stable address.
+    /// The traversals are reached only through `merge` and `finalize`, which call
+    /// this on entry, so the context pointer is always current before a visit.
+    fn bindTraversals(self: *PlatformAppRelationTypeResolver) void {
+        self.merge_traversal.context = self;
+        self.finalize_traversal.context = self;
+    }
+
     fn deinit(self: *PlatformAppRelationTypeResolver) void {
         self.substitution_actuals.deinit(self.allocator);
         self.substitution_formals.deinit(self.allocator);
         self.substitutions.deinit();
-        self.merging.deinit();
-        self.finalizing.deinit();
+        self.merge_traversal.deinit();
+        self.finalize_traversal.deinit();
+    }
+
+    /// Reserve-hook for the merge and finalize reserve-then-fill traversals.
+    pub fn reserve(self: *PlatformAppRelationTypeResolver, key: anytype) Allocator.Error!CheckedTypeId {
+        return switch (@TypeOf(key)) {
+            PlatformAppRelationMergeInput => try self.reserveMerge(key),
+            PlatformAppRelationFinalizeInput => try self.reserveFinalize(key),
+            else => @compileError("unexpected platform-relation reserve key type"),
+        };
+    }
+
+    /// Fill-hook for the merge and finalize reserve-then-fill traversals.
+    pub fn fill(
+        self: *PlatformAppRelationTypeResolver,
+        _: anytype,
+        key: anytype,
+        reserved: CheckedTypeId,
+    ) Allocator.Error!void {
+        return switch (@TypeOf(key)) {
+            PlatformAppRelationMergeInput => try self.fillMerge(key, reserved),
+            PlatformAppRelationFinalizeInput => try self.fillFinalize(key, reserved),
+            else => @compileError("unexpected platform-relation fill key type"),
+        };
     }
 
     fn toRelationSubstitutions(self: *const PlatformAppRelationTypeResolver, allocator: Allocator) Allocator.Error!PlatformRelationTypeSubstitutions {
@@ -17739,6 +17805,7 @@ const PlatformAppRelationTypeResolver = struct {
         app_root: CheckedTypeId,
         context: PlatformAppRelationMergeContext,
     ) Allocator.Error!CheckedTypeId {
+        self.bindTraversals();
         if (self.substitutions.get(platform_root)) |replacement| {
             const merged = try self.mergeSubstitutedPlatformRoot(replacement, app_root, context);
             if (context == .value) {
@@ -17813,12 +17880,23 @@ const PlatformAppRelationTypeResolver = struct {
             .app_root = @intFromEnum(app_root),
             .context = context,
         };
-        if (self.merging.get(merge_input)) |existing| return existing;
+        return try self.merge_traversal.visit(merge_input);
+    }
+
+    fn reserveMerge(
+        self: *PlatformAppRelationTypeResolver,
+        merge_input: PlatformAppRelationMergeInput,
+    ) Allocator.Error!CheckedTypeId {
+        const platform_root: CheckedTypeId = @enumFromInt(merge_input.platform_root);
+        const app_root: CheckedTypeId = @enumFromInt(merge_input.app_root);
+        const context = merge_input.context;
 
         if (try platformAppRelationMergeResultIsEmptyRecord(self.allocator, self.names, self.store, platform_root, app_root, context, &self.substitutions)) {
+            self.fill_mode = .skip;
             return try self.emptyRecordRoot();
         }
         if (try platformAppRelationMergeResultIsEmptyTagUnion(self.allocator, self.names, self.store, platform_root, app_root, context, &self.substitutions)) {
+            self.fill_mode = .skip;
             return try self.emptyTagUnionRoot();
         }
 
@@ -17832,22 +17910,32 @@ const PlatformAppRelationTypeResolver = struct {
             &self.substitutions,
         );
         if (self.store.rootForKey(result_key)) |existing| {
-            try self.merging.put(merge_input, existing);
-            defer _ = self.merging.remove(merge_input);
-
-            var learned_payload = try self.mergePayload(platform_root, platform_payload, app_root, app_payload);
-            deinitCheckedTypePayloadBuild(self.allocator, &learned_payload);
+            self.fill_mode = .discard;
             return existing;
         }
+        self.fill_mode = .store;
+        return try self.store.reserveSyntheticTypeRoot(self.allocator, result_key);
+    }
 
-        const target = try self.store.reserveSyntheticTypeRoot(self.allocator, result_key);
-        try self.merging.put(merge_input, target);
-        errdefer _ = self.merging.remove(merge_input);
+    fn fillMerge(
+        self: *PlatformAppRelationTypeResolver,
+        merge_input: PlatformAppRelationMergeInput,
+        reserved: CheckedTypeId,
+    ) Allocator.Error!void {
+        const mode = self.fill_mode;
+        if (mode == .skip) return;
 
-        const result_payload = try self.mergePayload(platform_root, platform_payload, app_root, app_payload);
-        try self.store.fillSyntheticTypeRoot(self.allocator, target, result_payload);
-        _ = self.merging.remove(merge_input);
-        return target;
+        const platform_root: CheckedTypeId = @enumFromInt(merge_input.platform_root);
+        const app_root: CheckedTypeId = @enumFromInt(merge_input.app_root);
+        const platform_payload = self.payload(platform_root);
+        const app_payload = self.payload(app_root);
+
+        var result_payload = try self.mergePayload(platform_root, platform_payload, app_root, app_payload);
+        if (mode == .discard) {
+            deinitCheckedTypePayloadBuild(self.allocator, &result_payload);
+            return;
+        }
+        try self.store.fillSyntheticTypeRoot(self.allocator, reserved, result_payload);
     }
 
     fn mergePayload(
@@ -18012,6 +18100,7 @@ const PlatformAppRelationTypeResolver = struct {
         root: CheckedTypeId,
         context: PlatformAppRelationMergeContext,
     ) Allocator.Error!CheckedTypeId {
+        self.bindTraversals();
         if (self.substitutions.get(root)) |replacement| return try self.finalize(replacement, context);
         const root_payload = self.payload(root);
         if (checkedTypePayloadIsIdentity(root_payload)) {
@@ -18030,12 +18119,22 @@ const PlatformAppRelationTypeResolver = struct {
             .root = @intFromEnum(root),
             .context = context,
         };
-        if (self.finalizing.get(finalize_input)) |existing| return existing;
+        return try self.finalize_traversal.visit(finalize_input);
+    }
+
+    fn reserveFinalize(
+        self: *PlatformAppRelationTypeResolver,
+        finalize_input: PlatformAppRelationFinalizeInput,
+    ) Allocator.Error!CheckedTypeId {
+        const root: CheckedTypeId = @enumFromInt(finalize_input.root);
+        const context = finalize_input.context;
 
         if (try platformAppRelationFinalizeResultIsEmptyRecord(self.allocator, self.names, self.store, root, context, &self.substitutions)) {
+            self.fill_mode = .skip;
             return try self.emptyRecordRoot();
         }
         if (try platformAppRelationFinalizeResultIsEmptyTagUnion(self.allocator, self.names, self.store, root, context, &self.substitutions)) {
+            self.fill_mode = .skip;
             return try self.emptyTagUnionRoot();
         }
 
@@ -18047,16 +18146,23 @@ const PlatformAppRelationTypeResolver = struct {
             context,
             &self.substitutions,
         );
-        if (self.store.rootForKey(result_key)) |existing| return existing;
+        if (self.store.rootForKey(result_key)) |existing| {
+            self.fill_mode = .skip;
+            return existing;
+        }
+        self.fill_mode = .store;
+        return try self.store.reserveSyntheticTypeRoot(self.allocator, result_key);
+    }
 
-        const target = try self.store.reserveSyntheticTypeRoot(self.allocator, result_key);
-        try self.finalizing.put(finalize_input, target);
-        errdefer _ = self.finalizing.remove(finalize_input);
-
-        const result_payload = try self.finalizePayload(root_payload);
-        try self.store.fillSyntheticTypeRoot(self.allocator, target, result_payload);
-        _ = self.finalizing.remove(finalize_input);
-        return target;
+    fn fillFinalize(
+        self: *PlatformAppRelationTypeResolver,
+        finalize_input: PlatformAppRelationFinalizeInput,
+        reserved: CheckedTypeId,
+    ) Allocator.Error!void {
+        if (self.fill_mode == .skip) return;
+        const root: CheckedTypeId = @enumFromInt(finalize_input.root);
+        const result_payload = try self.finalizePayload(self.payload(root));
+        try self.store.fillSyntheticTypeRoot(self.allocator, reserved, result_payload);
     }
 
     fn finalizePayload(
@@ -18565,14 +18671,8 @@ const PlatformAppRelationTypeResolver = struct {
     }
 
     fn pendingRootContainsIdentityVariables(self: *const PlatformAppRelationTypeResolver, root: CheckedTypeId) bool {
-        var merge_it = self.merging.valueIterator();
-        while (merge_it.next()) |active_root| {
-            if (active_root.* == root) return false;
-        }
-        var finalize_it = self.finalizing.valueIterator();
-        while (finalize_it.next()) |active_root| {
-            if (active_root.* == root) return false;
-        }
+        if (self.merge_traversal.hasReservedResult(root)) return false;
+        if (self.finalize_traversal.hasReservedResult(root)) return false;
         return true;
     }
 
@@ -29846,8 +29946,8 @@ test "platform app relation identity scan tolerates active pending root" {
         .root = @intFromEnum(root),
         .context = .value,
     };
-    try resolver.finalizing.put(finalize_input, root);
-    defer _ = resolver.finalizing.remove(finalize_input);
+    try resolver.finalize_traversal.active.put(finalize_input, root);
+    defer _ = resolver.finalize_traversal.active.remove(finalize_input);
 
     try std.testing.expect(!try resolver.typeContainsIdentityVariables(root));
 }
