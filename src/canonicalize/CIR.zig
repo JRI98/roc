@@ -408,6 +408,7 @@ pub const WhereClause = union(enum) {
         method_name: base.Ident.Idx,
         args: TypeAnno.Span,
         ret: TypeAnno.Idx,
+        effectful: bool,
     },
     w_alias: struct {
         var_: TypeAnno.Idx,
@@ -433,6 +434,7 @@ pub const WhereClause = union(enum) {
 
                 const method_name_str = cir.getIdent(method.method_name);
                 try tree.pushStringPair("name", method_name_str);
+                if (method.effectful) try tree.pushBoolPair("effectful", true);
 
                 const attrs = tree.beginNode();
 

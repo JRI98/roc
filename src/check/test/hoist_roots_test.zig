@@ -200,6 +200,20 @@ test "hoist roots selected for direct closed static dispatch function body" {
     try expectExprTag(&test_env, roots[0].expr, .e_dispatch_call);
 }
 
+test "hoist roots are not selected for static dispatch requiring where evidence" {
+    var test_env = try TestEnv.init("Test",
+        \\f : a -> _ where [a.f : {}]
+        \\f = |_| {
+        \\    A : a
+        \\    A.f
+        \\}
+    );
+    defer test_env.deinit();
+
+    try test_env.assertNoErrors();
+    try std.testing.expectEqual(@as(usize, 0), test_env.checker.selectedHoistedRoots().len);
+}
+
 test "hoist roots are not selected for ordinary call with runtime argument" {
     var test_env = try TestEnv.init("Test",
         \\add_one = |n| n + 1.I64

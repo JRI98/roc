@@ -43,6 +43,23 @@ test "where clause - basic method constraint infers correctly" {
     try test_env_b.assertDefType("main", "Str");
 }
 
+test "where clause - effectful method constraint preserves callable kind" {
+    const source =
+        \\helper! : a => {} where [a.run! : () => {}]
+        \\helper! = |_| {
+        \\  A : a
+        \\  A.run!()
+        \\}
+    ;
+    var test_env = try TestEnv.init("EffectfulWhere", source);
+    defer test_env.deinit();
+
+    try test_env.assertDefType(
+        "helper!",
+        "a => {} where [a.run! : ({}) => {}]",
+    );
+}
+
 test "where clause - polymorphic return type" {
     const source_a =
         \\A := [Val(Str)].{

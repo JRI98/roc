@@ -141,6 +141,7 @@ pub const Tag = enum {
     ty_malformed,
     // Where clause
     where_method,
+    where_method_effectful,
     where_alias,
     where_malformed,
     // Patterns
