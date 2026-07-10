@@ -299,7 +299,11 @@ checking_binding_rhs_pattern: ?CIR.Pattern.Idx = null,
 /// The outer RHS expression of the currently checked `_ = ...` discard binding,
 /// if any. Nested instantiations inside that RHS use this as their error target:
 /// the value is explicitly discarded, so no caller can later pin return-only
-/// where-clause obligations created by the RHS.
+/// where-clause obligations created by the RHS. This is lexical context of the
+/// consuming binding, stamped onto ambiguity candidates created inside it; a
+/// constraint's own creation-time provenance cannot carry it, because whether
+/// the result is discarded is a property of the binding that consumes the
+/// expression, not of the expression itself.
 discarded_binding_rhs_expr: ?CIR.Expr.Idx = null,
 /// Tracks whether static exhaustiveness diagnostics are compile-time candidates.
 exhaustiveness_context: ExhaustivenessContext.Context = .{},
@@ -392,8 +396,9 @@ ambiguity_candidates: std.ArrayListUnmanaged(AmbiguityCandidate),
 ambiguity_candidates_def_start: usize = 0,
 /// Ambiguity verdicts produced by the local judgment, applied (problem
 /// reports + runtime-error poisoning) in one batch at end of check so that
-/// problem order and CIR mutation timing match the settled-state contract the
-/// old end-of-check sweeps established.
+/// problem order and CIR mutation timing follow the settled-state contract:
+/// nothing is reported or poisoned until every constraint has reached its
+/// final state.
 ambiguity_verdicts: std.ArrayListUnmanaged(AmbiguityVerdict),
 /// Cursor into `checked_lambda_params` marking the currently-processing
 /// top-level def's first lambda, so a generalization event's pinnable set
@@ -5469,8 +5474,8 @@ fn checkFileInternal(self: *Self, skip_numeric_defaults: bool) std.mem.Allocator
     // bindings stay open to pinning by later defs and the final constraint
     // fixpoint, so they can only be judged here, at the settled state), then
     // apply every verdict — problem reports plus runtime-error poisoning — in
-    // one batch so problem order and CIR mutation keep the settled-state
-    // contract the sweeps they replace established.
+    // one batch so problem order and CIR mutation timing stay deterministic
+    // against the settled end state.
     try self.judgeResidualAmbiguityCandidates();
     try self.applyAmbiguityVerdicts();
 
@@ -6723,10 +6728,9 @@ fn finishAmbiguityPinnableSets(
 }
 
 /// The introducing dispatch expression recorded in a constraint's provenance,
-/// or null for a synthetic constraint with no source expression. This replaces
-/// the `constraint_expr_by_fn_var` side table: provenance is set at creation and
-/// copied verbatim by instantiation and unification, so it travels with the
-/// constraint instead of alongside it in a var-keyed map.
+/// or null for a synthetic constraint with no source expression. Provenance is
+/// set at creation and copied verbatim by instantiation and unification, so it
+/// travels with the constraint instead of alongside it in a var-keyed map.
 fn constraintIntroExpr(constraint: StaticDispatchConstraint) ?CIR.Expr.Idx {
     const raw = constraint.provenance.intro_expr.get() orelse return null;
     return @enumFromInt(raw);
