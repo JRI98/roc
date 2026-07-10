@@ -14321,6 +14321,11 @@ fn checkBlockStatements(self: *Self, statements: CIR.Statement.Span, env: *Env, 
 
                 const empty_rec = try self.freshFromContent(.{ .structure = .empty_record }, env, stmt_region);
                 _ = try self.unify(stmt_var, empty_rec, env);
+
+                // Uninitialized `var` statements are binding roots too; their
+                // type is determined by later reassignments rather than an
+                // initializer, but it can still become cyclic.
+                try self.local_binding_roots.append(self.gpa, var_stmt.pattern_idx);
             },
             .s_reassign => |reassign| {
                 self.markCurrentHoistRuntimeDependency();

@@ -1275,6 +1275,18 @@ const TypeTable = struct {
         checked_type: CheckedArtifact.CheckedTypeId,
     };
 
+    const BoundRecordField = struct {
+        artifact: *const CheckedArtifact.CheckedModuleArtifact,
+        field: CheckedArtifact.CheckedRecordField,
+    };
+
+    const HostedFunctionTypeMetadata = struct {
+        arg_fields: []const CollectedModuleTypeInfo.CollectedRecordFieldInfo,
+        ret_fields: []const CollectedModuleTypeInfo.CollectedRecordFieldInfo,
+        arg_type_ids: []const u64,
+        ret_type_id: u64,
+    };
+
     const OpenMemoKey = struct {
         ctx: u32,
         artifact_key: CheckedArtifact.CheckedModuleArtifactKey,
@@ -1370,6 +1382,366 @@ const TypeTable = struct {
             cur = bound;
         }
         return cur;
+    }
+
+    fn bindNominalFormals(
+        self: *TypeTable,
+        artifact: *const CheckedArtifact.CheckedModuleArtifact,
+        nominal: CheckedArtifact.CheckedNominalType,
+        lookup: NominalDeclarationLookup,
+        saved: []?BoundSource,
+        bound_formals: []bool,
+    ) Allocator.Error!void {
+        const formals = lookup.declaration.formalArgs(&lookup.artifact.checked_types);
+        if (formals.len != nominal.args.len) glueInvariant("nominal application arity disagreed with its declaration in glue metadata opening", .{});
+
+        for (formals, nominal.args, saved, bound_formals) |formal, arg, *slot, *is_bound| {
+            const fkey = TypeTableKey{ .artifact_key = lookup.artifact.key, .checked_type = formal };
+            const resolved = self.substituteFormal(artifact, arg);
+            if (checkedArtifactKeysEqual(resolved.artifact.key, fkey.artifact_key) and resolved.checked_type == fkey.checked_type) {
+                is_bound.* = false;
+                continue;
+            }
+            is_bound.* = true;
+            slot.* = self.template_bindings.get(fkey);
+            try self.template_bindings.put(fkey, .{ .artifact = resolved.artifact, .checked_type = resolved.checked_type });
+        }
+    }
+
+    fn restoreNominalFormals(
+        self: *TypeTable,
+        lookup: NominalDeclarationLookup,
+        saved: []const ?BoundSource,
+        bound_formals: []const bool,
+    ) void {
+        const formals = lookup.declaration.formalArgs(&lookup.artifact.checked_types);
+        for (formals, saved, bound_formals) |formal, slot, is_bound| {
+            if (!is_bound) continue;
+            const fkey = TypeTableKey{ .artifact_key = lookup.artifact.key, .checked_type = formal };
+            if (slot) |prev| {
+                self.template_bindings.put(fkey, prev) catch unreachable;
+            } else {
+                _ = self.template_bindings.remove(fkey);
+            }
+        }
+    }
+
+    fn collectHostedFunctionMetadata(
+        self: *TypeTable,
+        artifact: *const CheckedArtifact.CheckedModuleArtifact,
+        checked_type: CheckedArtifact.CheckedTypeId,
+    ) Allocator.Error!?HostedFunctionTypeMetadata {
+        const src = self.substituteFormal(artifact, checked_type);
+        return switch (checkedTypePayload(src.artifact, src.checked_type)) {
+            .function => |func| try self.metadataForFunctionPayload(src.artifact, func),
+            .alias => |alias| try self.collectHostedFunctionMetadata(src.artifact, alias.backing),
+            .nominal => |nominal| blk: {
+                const lookup = self.nominalDeclarationFor(src.artifact, nominal) orelse break :blk null;
+                const saved = try self.gpa.alloc(?BoundSource, nominal.args.len);
+                defer self.gpa.free(saved);
+                const bound_formals = try self.gpa.alloc(bool, nominal.args.len);
+                defer self.gpa.free(bound_formals);
+                try self.bindNominalFormals(src.artifact, nominal, lookup, saved, bound_formals);
+                defer self.restoreNominalFormals(lookup, saved, bound_formals);
+                break :blk try self.collectHostedFunctionMetadata(lookup.artifact, lookup.declaration.backing);
+            },
+            else => null,
+        };
+    }
+
+    fn metadataForFunctionPayload(
+        self: *TypeTable,
+        artifact: *const CheckedArtifact.CheckedModuleArtifact,
+        func: CheckedArtifact.CheckedFunctionType,
+    ) Allocator.Error!HostedFunctionTypeMetadata {
+        const ret_fields = try self.extractRecordFieldsBound(artifact, func.ret);
+        errdefer self.freeRecordFieldInfo(ret_fields);
+
+        var arg_fields: []const CollectedModuleTypeInfo.CollectedRecordFieldInfo = &.{};
+        errdefer self.freeRecordFieldInfo(arg_fields);
+        if (func.args.len == 1) {
+            arg_fields = try self.extractRecordFieldsBound(artifact, func.args[0]);
+        }
+
+        const ret_type_id = try self.getOrInsert(artifact, func.ret);
+        var arg_type_ids: []const u64 = &.{};
+        errdefer if (arg_type_ids.len > 0) self.gpa.free(arg_type_ids);
+        if (func.args.len > 0) {
+            const ids = try self.gpa.alloc(u64, func.args.len);
+            for (func.args, 0..) |arg, i| {
+                ids[i] = try self.getOrInsert(artifact, arg);
+            }
+            arg_type_ids = ids;
+        }
+
+        return .{
+            .arg_fields = arg_fields,
+            .ret_fields = ret_fields,
+            .arg_type_ids = arg_type_ids,
+            .ret_type_id = ret_type_id,
+        };
+    }
+
+    fn freeRecordFieldInfo(self: *TypeTable, fields: []const CollectedModuleTypeInfo.CollectedRecordFieldInfo) void {
+        for (fields) |field| {
+            self.gpa.free(field.name);
+            self.gpa.free(field.type_str);
+        }
+        if (fields.len > 0) self.gpa.free(fields);
+    }
+
+    fn extractRecordFieldsBound(
+        self: *TypeTable,
+        artifact: *const CheckedArtifact.CheckedModuleArtifact,
+        checked_type: CheckedArtifact.CheckedTypeId,
+    ) Allocator.Error![]const CollectedModuleTypeInfo.CollectedRecordFieldInfo {
+        var fields = std.ArrayList(BoundRecordField).empty;
+        defer fields.deinit(self.gpa);
+        if (!(try self.collectRecordFieldsForRootBound(artifact, checked_type, &fields))) {
+            return &[_]CollectedModuleTypeInfo.CollectedRecordFieldInfo{};
+        }
+
+        var indices = try self.gpa.alloc(usize, fields.items.len);
+        defer self.gpa.free(indices);
+        for (0..fields.items.len) |i| indices[i] = i;
+
+        const SortCtx = struct {
+            fields: []const BoundRecordField,
+
+            pub fn lessThan(ctx: @This(), a: usize, b: usize) bool {
+                return std.mem.lessThan(
+                    u8,
+                    ctx.fields[a].artifact.canonical_names.recordFieldLabelText(ctx.fields[a].field.name),
+                    ctx.fields[b].artifact.canonical_names.recordFieldLabelText(ctx.fields[b].field.name),
+                );
+            }
+        };
+        std.mem.sort(usize, indices, SortCtx{ .fields = fields.items }, SortCtx.lessThan);
+
+        var result_list = std.ArrayList(CollectedModuleTypeInfo.CollectedRecordFieldInfo).empty;
+        errdefer {
+            for (result_list.items) |item| {
+                self.gpa.free(item.name);
+                self.gpa.free(item.type_str);
+            }
+            result_list.deinit(self.gpa);
+        }
+        for (indices) |idx| {
+            const entry = fields.items[idx];
+            const field = entry.field;
+            const name = try self.gpa.dupe(u8, entry.artifact.canonical_names.recordFieldLabelText(field.name));
+            errdefer self.gpa.free(name);
+            const type_str = try self.typeStringAllocBound(entry.artifact, field.ty);
+            errdefer self.gpa.free(type_str);
+            try result_list.append(self.gpa, .{
+                .name = name,
+                .type_str = type_str,
+            });
+        }
+        return result_list.toOwnedSlice(self.gpa);
+    }
+
+    fn collectRecordFieldsForRootBound(
+        self: *TypeTable,
+        artifact: *const CheckedArtifact.CheckedModuleArtifact,
+        checked_type: CheckedArtifact.CheckedTypeId,
+        fields: *std.ArrayList(BoundRecordField),
+    ) Allocator.Error!bool {
+        const src = self.substituteFormal(artifact, checked_type);
+        switch (checkedTypePayload(src.artifact, src.checked_type)) {
+            .alias => |alias| return try self.collectRecordFieldsForRootBound(src.artifact, alias.backing, fields),
+            .nominal => |nominal| {
+                const lookup = self.nominalDeclarationFor(src.artifact, nominal) orelse return false;
+                const saved = try self.gpa.alloc(?BoundSource, nominal.args.len);
+                defer self.gpa.free(saved);
+                const bound_formals = try self.gpa.alloc(bool, nominal.args.len);
+                defer self.gpa.free(bound_formals);
+                try self.bindNominalFormals(src.artifact, nominal, lookup, saved, bound_formals);
+                defer self.restoreNominalFormals(lookup, saved, bound_formals);
+                return try self.collectRecordFieldsForRootBound(lookup.artifact, lookup.declaration.backing, fields);
+            },
+            .record => |record| {
+                for (record.fields) |field| try fields.append(self.gpa, .{ .artifact = src.artifact, .field = field });
+                return try self.collectRecordFieldsForRootBound(src.artifact, record.ext, fields);
+            },
+            .record_unbound => |unbound| {
+                for (unbound) |field| try fields.append(self.gpa, .{ .artifact = src.artifact, .field = field });
+                return true;
+            },
+            .empty_record => return true,
+            else => return false,
+        }
+    }
+
+    fn typeStringAllocBound(
+        self: *TypeTable,
+        artifact: *const CheckedArtifact.CheckedModuleArtifact,
+        checked_type: CheckedArtifact.CheckedTypeId,
+    ) Allocator.Error![]const u8 {
+        var buf = std.ArrayList(u8).empty;
+        errdefer buf.deinit(self.gpa);
+        var active = std.AutoHashMap(TypeTableKey, void).init(self.gpa);
+        defer active.deinit();
+        try self.writeTypeStringBound(artifact, checked_type, &buf, &active);
+        return buf.toOwnedSlice(self.gpa);
+    }
+
+    fn writeTypeStringBound(
+        self: *TypeTable,
+        artifact: *const CheckedArtifact.CheckedModuleArtifact,
+        checked_type: CheckedArtifact.CheckedTypeId,
+        buf: *std.ArrayList(u8),
+        active: *std.AutoHashMap(TypeTableKey, void),
+    ) Allocator.Error!void {
+        const src = self.substituteFormal(artifact, checked_type);
+        const key = TypeTableKey{ .artifact_key = src.artifact.key, .checked_type = src.checked_type };
+        if (active.contains(key)) {
+            try buf.appendSlice(self.gpa, "<cycle>");
+            return;
+        }
+        try active.put(key, {});
+        defer _ = active.remove(key);
+
+        switch (checkedTypePayload(src.artifact, src.checked_type)) {
+            .pending => glueInvariant("pending checked type reached glue bound type string", .{}),
+            .flex => try buf.appendSlice(self.gpa, "flex"),
+            .rigid => try buf.appendSlice(self.gpa, "rigid"),
+            .alias => |alias| try self.writeTypeStringBound(src.artifact, alias.backing, buf, active),
+            .record => |record| try self.writeRecordTypeStringBound(src.artifact, record.fields, record.ext, buf, active),
+            .record_unbound => |fields| try self.writeRecordTypeStringBound(src.artifact, fields, null, buf, active),
+            .tuple => |items| try self.writeTupleTypeStringBound(src.artifact, items, buf, active),
+            .nominal => |nominal| try self.writeNominalTypeStringBound(src.artifact, nominal, buf, active),
+            .function => |func| try self.writeFunctionTypeStringBound(src.artifact, func, buf, active),
+            .empty_record => try buf.appendSlice(self.gpa, "{}"),
+            .tag_union => |tag_union| try self.writeTagUnionTypeStringBound(src.artifact, tag_union.tags, tag_union.ext, buf, active),
+            .empty_tag_union => try buf.appendSlice(self.gpa, "[]"),
+        }
+    }
+
+    fn writeNominalTypeStringBound(
+        self: *TypeTable,
+        artifact: *const CheckedArtifact.CheckedModuleArtifact,
+        nominal: CheckedArtifact.CheckedNominalType,
+        buf: *std.ArrayList(u8),
+        active: *std.AutoHashMap(TypeTableKey, void),
+    ) Allocator.Error!void {
+        const name = TypeTable.getTypeDisplayName(artifact.canonical_names.typeNameText(nominal.name));
+        try buf.appendSlice(self.gpa, name);
+        if (nominal.args.len == 0) return;
+        try buf.append(self.gpa, '(');
+        for (nominal.args, 0..) |arg, i| {
+            if (i > 0) try buf.appendSlice(self.gpa, ", ");
+            try self.writeTypeStringBound(artifact, arg, buf, active);
+        }
+        try buf.append(self.gpa, ')');
+    }
+
+    fn writeFunctionTypeStringBound(
+        self: *TypeTable,
+        artifact: *const CheckedArtifact.CheckedModuleArtifact,
+        func: CheckedArtifact.CheckedFunctionType,
+        buf: *std.ArrayList(u8),
+        active: *std.AutoHashMap(TypeTableKey, void),
+    ) Allocator.Error!void {
+        if (func.args.len == 0) {
+            try buf.appendSlice(self.gpa, "{}");
+        } else {
+            for (func.args, 0..) |arg, i| {
+                if (i > 0) try buf.appendSlice(self.gpa, ", ");
+                try self.writeTypeStringBound(artifact, arg, buf, active);
+            }
+        }
+        try buf.appendSlice(self.gpa, if (func.kind == .effectful) " => " else " -> ");
+        try self.writeTypeStringBound(artifact, func.ret, buf, active);
+    }
+
+    fn writeRecordTypeStringBound(
+        self: *TypeTable,
+        artifact: *const CheckedArtifact.CheckedModuleArtifact,
+        fields: []const CheckedArtifact.CheckedRecordField,
+        ext: ?CheckedArtifact.CheckedTypeId,
+        buf: *std.ArrayList(u8),
+        active: *std.AutoHashMap(TypeTableKey, void),
+    ) Allocator.Error!void {
+        var all_fields = std.ArrayList(BoundRecordField).empty;
+        defer all_fields.deinit(self.gpa);
+        for (fields) |field| try all_fields.append(self.gpa, .{ .artifact = artifact, .field = field });
+        if (ext) |ext_id| _ = try self.collectRecordFieldsForRootBound(artifact, ext_id, &all_fields);
+
+        if (all_fields.items.len == 0) {
+            try buf.appendSlice(self.gpa, "{}");
+            return;
+        }
+
+        var indices = try self.gpa.alloc(usize, all_fields.items.len);
+        defer self.gpa.free(indices);
+        for (0..all_fields.items.len) |i| indices[i] = i;
+        const SortCtx = struct {
+            fields: []const BoundRecordField,
+
+            pub fn lessThan(ctx: @This(), a: usize, b: usize) bool {
+                return std.mem.lessThan(
+                    u8,
+                    ctx.fields[a].artifact.canonical_names.recordFieldLabelText(ctx.fields[a].field.name),
+                    ctx.fields[b].artifact.canonical_names.recordFieldLabelText(ctx.fields[b].field.name),
+                );
+            }
+        };
+        std.mem.sort(usize, indices, SortCtx{ .fields = all_fields.items }, SortCtx.lessThan);
+
+        try buf.appendSlice(self.gpa, "{ ");
+        for (indices, 0..) |src_idx, i| {
+            if (i > 0) try buf.appendSlice(self.gpa, ", ");
+            const field = all_fields.items[src_idx];
+            try buf.appendSlice(self.gpa, field.artifact.canonical_names.recordFieldLabelText(field.field.name));
+            try buf.appendSlice(self.gpa, " : ");
+            try self.writeTypeStringBound(field.artifact, field.field.ty, buf, active);
+        }
+        try buf.appendSlice(self.gpa, " }");
+    }
+
+    fn writeTupleTypeStringBound(
+        self: *TypeTable,
+        artifact: *const CheckedArtifact.CheckedModuleArtifact,
+        items: []const CheckedArtifact.CheckedTypeId,
+        buf: *std.ArrayList(u8),
+        active: *std.AutoHashMap(TypeTableKey, void),
+    ) Allocator.Error!void {
+        try buf.append(self.gpa, '(');
+        for (items, 0..) |item, i| {
+            if (i > 0) try buf.appendSlice(self.gpa, ", ");
+            try self.writeTypeStringBound(artifact, item, buf, active);
+        }
+        try buf.append(self.gpa, ')');
+    }
+
+    fn writeTagUnionTypeStringBound(
+        self: *TypeTable,
+        artifact: *const CheckedArtifact.CheckedModuleArtifact,
+        tags: []const CheckedArtifact.CheckedTag,
+        ext: CheckedArtifact.CheckedTypeId,
+        buf: *std.ArrayList(u8),
+        active: *std.AutoHashMap(TypeTableKey, void),
+    ) Allocator.Error!void {
+        var all_tags = std.ArrayList(CheckedArtifact.CheckedTag).empty;
+        defer all_tags.deinit(self.gpa);
+        try appendTagRowTags(self.gpa, artifact, tags, ext, &all_tags);
+
+        try buf.append(self.gpa, '[');
+        for (all_tags.items, 0..) |tag, i| {
+            if (i > 0) try buf.appendSlice(self.gpa, ", ");
+            try buf.appendSlice(self.gpa, artifact.canonical_names.tagLabelText(tag.name));
+            const tag_args = tag.argsSlice(&artifact.checked_types);
+            if (tag_args.len > 0) {
+                try buf.append(self.gpa, '(');
+                for (tag_args, 0..) |arg, arg_i| {
+                    if (arg_i > 0) try buf.appendSlice(self.gpa, ", ");
+                    try self.writeTypeStringBound(artifact, arg, buf, active);
+                }
+                try buf.append(self.gpa, ')');
+            }
+        }
+        try buf.append(self.gpa, ']');
     }
 
     /// If a checked type is a non-builtin nominal application with a resolvable
@@ -3677,98 +4049,6 @@ fn writeTagUnionTypeString(
     try buf.append(gpa, ']');
 }
 
-fn functionPayloadForRoot(
-    artifact: *const CheckedArtifact.CheckedModuleArtifact,
-    checked_type: CheckedArtifact.CheckedTypeId,
-) ?CheckedArtifact.CheckedFunctionType {
-    return switch (checkedTypePayload(artifact, checked_type)) {
-        .function => |func| func,
-        .alias => |alias| functionPayloadForRoot(artifact, alias.backing),
-        .nominal => |nominal| if (artifact.checked_types.nominalBackingTemplateForPayload(nominal)) |backing|
-            functionPayloadForRoot(artifact, backing)
-        else
-            null,
-        else => null,
-    };
-}
-
-/// Extract record fields from artifact-owned checked type payloads.
-fn extractRecordFields(
-    gpa: std.mem.Allocator,
-    artifact: *const CheckedArtifact.CheckedModuleArtifact,
-    checked_type: CheckedArtifact.CheckedTypeId,
-) Allocator.Error![]const CollectedModuleTypeInfo.CollectedRecordFieldInfo {
-    var fields = std.ArrayList(CheckedArtifact.CheckedRecordField).empty;
-    defer fields.deinit(gpa);
-    if (!(try collectRecordFieldsForRoot(gpa, artifact, checked_type, &fields))) {
-        return &[_]CollectedModuleTypeInfo.CollectedRecordFieldInfo{};
-    }
-
-    var indices = try gpa.alloc(usize, fields.items.len);
-    defer gpa.free(indices);
-    for (0..fields.items.len) |i| indices[i] = i;
-
-    const SortCtx = struct {
-        fields: []const CheckedArtifact.CheckedRecordField,
-        names: *const CanonicalNameStore,
-
-        pub fn lessThan(ctx: @This(), a: usize, b: usize) bool {
-            return std.mem.lessThan(
-                u8,
-                ctx.names.recordFieldLabelText(ctx.fields[a].name),
-                ctx.names.recordFieldLabelText(ctx.fields[b].name),
-            );
-        }
-    };
-    std.mem.sort(usize, indices, SortCtx{ .fields = fields.items, .names = &artifact.canonical_names }, SortCtx.lessThan);
-
-    var result_list = std.ArrayList(CollectedModuleTypeInfo.CollectedRecordFieldInfo).empty;
-    errdefer {
-        for (result_list.items) |item| {
-            gpa.free(item.name);
-            gpa.free(item.type_str);
-        }
-        result_list.deinit(gpa);
-    }
-    for (indices) |idx| {
-        const field = fields.items[idx];
-        const name = try gpa.dupe(u8, artifact.canonical_names.recordFieldLabelText(field.name));
-        errdefer gpa.free(name);
-        const type_str = try typeStringAlloc(gpa, artifact, field.ty);
-        errdefer gpa.free(type_str);
-        try result_list.append(gpa, .{
-            .name = name,
-            .type_str = type_str,
-        });
-    }
-    return result_list.toOwnedSlice(gpa);
-}
-
-fn collectRecordFieldsForRoot(
-    gpa: std.mem.Allocator,
-    artifact: *const CheckedArtifact.CheckedModuleArtifact,
-    checked_type: CheckedArtifact.CheckedTypeId,
-    fields: *std.ArrayList(CheckedArtifact.CheckedRecordField),
-) Allocator.Error!bool {
-    switch (checkedTypePayload(artifact, checked_type)) {
-        .alias => |alias| return try collectRecordFieldsForRoot(gpa, artifact, alias.backing, fields),
-        .nominal => |nominal| {
-            const backing = artifact.checked_types.nominalBackingTemplateForPayload(nominal) orelse return false;
-            return try collectRecordFieldsForRoot(gpa, artifact, backing, fields);
-        },
-        .record => |record| {
-            try appendRecordRowFields(gpa, artifact, record.fields, record.ext, fields);
-            return true;
-        },
-        .record_unbound => |unbound| {
-            try fields.appendSlice(gpa, unbound);
-            return true;
-        },
-        .empty_record => return true,
-        else => return false,
-    }
-}
-
 /// Collect type information from a published checked artifact.
 fn collectModuleTypeInfo(
     gpa: Allocator,
@@ -3863,19 +4143,11 @@ fn collectModuleTypeInfo(
             errdefer if (arg_type_ids.len > 0) gpa.free(arg_type_ids);
             var ret_type_id: u64 = 0;
 
-            if (functionPayloadForRoot(artifact, checked_type)) |func| {
-                ret_fields = try extractRecordFields(gpa, artifact, func.ret);
-                if (func.args.len == 1) {
-                    arg_fields = try extractRecordFields(gpa, artifact, func.args[0]);
-                }
-                ret_type_id = try type_table.getOrInsert(artifact, func.ret);
-                if (func.args.len > 0) {
-                    const ids = try gpa.alloc(u64, func.args.len);
-                    for (func.args, 0..) |arg, i| {
-                        ids[i] = try type_table.getOrInsert(artifact, arg);
-                    }
-                    arg_type_ids = ids;
-                }
+            if (try type_table.collectHostedFunctionMetadata(artifact, checked_type)) |metadata| {
+                ret_fields = metadata.ret_fields;
+                arg_fields = metadata.arg_fields;
+                ret_type_id = metadata.ret_type_id;
+                arg_type_ids = metadata.arg_type_ids;
             } else {
                 ret_type_id = try type_table.insertUnit();
             }

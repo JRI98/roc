@@ -23116,9 +23116,9 @@ const BodyContext = struct {
         const initial_iterator = try self.lowerIteratorDispatch(plan.iter, null, null);
         const iterator_ty = try self.exprType(initial_iterator);
         try self.constrainTypeToMono(plan.iterator_ty, iterator_ty);
-        try self.constrainTypeToMono(step.one_rest.ty, iterator_ty);
-        try self.constrainTypeToMono(step.skip_rest.ty, iterator_ty);
-        const item_ty = try self.lowerTypeView(step.one_item.ty);
+        try self.constrainTypeToMono(plan.iterator_ty, step.one_rest.ty);
+        try self.constrainTypeToMono(plan.iterator_ty, step.skip_rest.ty);
+        const item_ty = step.one_item.ty;
         try self.constrainTypeToMono(plan.item_ty, item_ty);
         const step_expected_ty = try self.lowerTypeView(plan.step_ty);
         const iterator_local = try self.addLocal(self.builder.symbols.fresh(), iterator_ty);
@@ -23398,7 +23398,7 @@ const BodyContext = struct {
         for (carries) |carry| try self.saveBinder(carry.binder, &saved);
         defer self.restoreBinders(saved.items);
 
-        const item_ty = try self.lowerTypeView(step.one_item.ty);
+        const item_ty = step.one_item.ty;
         const rest_local = try self.addLocal(self.builder.symbols.fresh(), iterator_ty);
         const item_local: ?DraftLocalId = if (self.patternNeedsExplicitBinding(for_.pattern))
             try self.addLocal(self.builder.symbols.fresh(), item_ty)
@@ -23540,8 +23540,8 @@ const BodyContext = struct {
             try self.bindPat(local, item_ty)
         else
             try self.lowerPatternAtType(item_pattern, item_ty);
-        const item_field = try self.iteratorRecordDestruct(step.one_item.name, item_pat);
-        const rest_field = try self.iteratorRecordDestruct(step.one_rest.name, try self.bindPat(rest_local, iterator_ty));
+        const item_field = self.iteratorRecordDestruct(step.one_item.name, item_pat);
+        const rest_field = self.iteratorRecordDestruct(step.one_rest.name, try self.bindPat(rest_local, iterator_ty));
         const fields = [_]DraftRecordDestruct{ item_field, rest_field };
         return try self.addPatWithTypeCell(
             try self.lowerTypeCell(step.one_payload_ty),
@@ -23555,7 +23555,7 @@ const BodyContext = struct {
         iterator_ty: Type.TypeId,
         rest_local: DraftLocalId,
     ) Allocator.Error!DraftPatId {
-        const rest_field = try self.iteratorRecordDestruct(step.skip_rest.name, try self.bindPat(rest_local, iterator_ty));
+        const rest_field = self.iteratorRecordDestruct(step.skip_rest.name, try self.bindPat(rest_local, iterator_ty));
         const fields = [_]DraftRecordDestruct{rest_field};
         return try self.addPatWithTypeCell(
             try self.lowerTypeCell(step.skip_payload_ty),
@@ -23564,12 +23564,12 @@ const BodyContext = struct {
     }
 
     fn iteratorRecordDestruct(
-        self: *BodyContext,
+        _: *BodyContext,
         field: names.RecordFieldNameId,
         pattern: DraftPatId,
-    ) Allocator.Error!DraftRecordDestruct {
+    ) DraftRecordDestruct {
         return .{
-            .name = try self.builder.recordFieldName(self.view, field),
+            .name = field,
             .pattern = pattern,
         };
     }
@@ -23869,9 +23869,9 @@ const BodyContext = struct {
         skip_tag: names.TagNameId,
         one_payload_ty: checked.CheckedTypeId,
         skip_payload_ty: checked.CheckedTypeId,
-        one_item: checked.CheckedRecordField,
-        one_rest: checked.CheckedRecordField,
-        skip_rest: checked.CheckedRecordField,
+        one_item: Type.Field,
+        one_rest: Type.Field,
+        skip_rest: Type.Field,
     };
 
     fn iteratorStepShape(self: *BodyContext, step_ty: checked.CheckedTypeId) Allocator.Error!IterStepShape {
@@ -23938,6 +23938,9 @@ const BodyContext = struct {
         const one_payload = one_payload_ty orelse Common.invariant("iterator step type was missing One");
         const skip_payload = skip_payload_ty orelse Common.invariant("iterator step type was missing Skip");
 
+        const one_payload_mono = try self.lowerTypeView(one_payload);
+        const skip_payload_mono = try self.lowerTypeView(skip_payload);
+
         return .{
             .step_ty = step_ty,
             .done_tag = done_tag orelse Common.invariant("iterator step type was missing Done"),
@@ -23945,9 +23948,9 @@ const BodyContext = struct {
             .skip_tag = skip_tag orelse Common.invariant("iterator step type was missing Skip"),
             .one_payload_ty = one_payload,
             .skip_payload_ty = skip_payload,
-            .one_item = checkedRecordFieldByName(self.view, one_payload, "item"),
-            .one_rest = checkedRecordFieldByName(self.view, one_payload, "rest"),
-            .skip_rest = checkedRecordFieldByName(self.view, skip_payload, "rest"),
+            .one_item = self.recordFieldByText(one_payload_mono, "item"),
+            .one_rest = self.recordFieldByText(one_payload_mono, "rest"),
+            .skip_rest = self.recordFieldByText(skip_payload_mono, "rest"),
         };
     }
 
@@ -25393,37 +25396,6 @@ fn resolvedPayload(view: ModuleView, ty: checked.CheckedTypeId) ResolvedPayload 
         }
     }
     Common.invariant("checked type alias chain was cyclic");
-}
-
-fn checkedRecordFieldByName(
-    view: ModuleView,
-    checked_ty: checked.CheckedTypeId,
-    field_name: []const u8,
-) checked.CheckedRecordField {
-    var current = checked_ty;
-    var remaining = view.types.payloadCount();
-    while (remaining > 0) : (remaining -= 1) {
-        switch (checkedPayload(view, current)) {
-            .alias => |alias| current = alias.backing,
-            .nominal => |nominal| current = view.types.nominalBackingTemplateForPayload(nominal) orelse
-                Common.invariant("checked record field lookup reached a nominal without backing"),
-            .empty_record => break,
-            .record_unbound => |fields| {
-                for (fields) |field| {
-                    if (Ident.textEql(view.names.recordFieldLabelText(field.name), field_name)) return field;
-                }
-                break;
-            },
-            .record => |record| {
-                for (record.fields) |field| {
-                    if (Ident.textEql(view.names.recordFieldLabelText(field.name), field_name)) return field;
-                }
-                current = record.ext;
-            },
-            else => Common.invariant("expected checked record field lookup reached a non-record checked type"),
-        }
-    }
-    Common.invariant("expected checked record field was absent");
 }
 
 fn branchCount(branches: anytype) usize {

@@ -35,12 +35,12 @@ const BuildState = struct {
     refs_by_var: std.AutoHashMap(ModuleVarKey, GraphRef),
     depends_on_unresolved_type_params: bool = false,
 
-    /// Formal root var -> the actual arg's already-built layout ref, bound
-    /// while building a nominal declaration's backing template (the explicit
-    /// opening operation of issue #9983). Vars visited while any binding is
-    /// active are template vars shared across instantiations, so the
-    /// var-keyed caches are bypassed for them.
-    template_bindings: std.AutoHashMap(ModuleVarKey, GraphRef),
+    /// Formal root var -> the actual arg var, bound while building a nominal
+    /// declaration's backing template (the explicit opening operation of issue
+    /// #9983). The arg layout is resolved lazily in the context where the
+    /// formal is used; a formal used under `Box`/`List` must see the
+    /// heap-container context instead of an eager ordinary layout.
+    template_bindings: std.AutoHashMap(ModuleVarKey, BoundArg),
     /// Stack of in-progress declaration openings; a template's recursive
     /// reference (same declaration, same arg layout refs) closes onto the
     /// open's placeholder instead of re-entering.
@@ -50,8 +50,13 @@ const BuildState = struct {
         module_idx: u32,
         origin_module: base.ModuleIdentity.Idx,
         statement: u32,
-        arg_refs: []const GraphRef,
+        arg_keys: []const ModuleVarKey,
         placeholder: GraphRef,
+    };
+
+    const BoundArg = struct {
+        module_idx: u32,
+        var_: Var,
     };
 
     fn init(allocator: std.mem.Allocator) BuildState {
@@ -65,8 +70,25 @@ const BuildState = struct {
         self.graph.deinit(allocator);
         self.refs_by_var.deinit();
         self.template_bindings.deinit();
-        for (self.active_opens.items) |open| allocator.free(open.arg_refs);
+        for (self.active_opens.items) |open| allocator.free(open.arg_keys);
         self.active_opens.deinit(allocator);
+    }
+
+    fn resolvedKey(
+        self: *const BuildState,
+        resolver: *const Resolver,
+        module_idx: u32,
+        unresolved_var: Var,
+        type_scope: *const TypeScope,
+        caller_module_idx: ?u32,
+    ) ModuleVarKey {
+        const input = resolver.resolveInput(module_idx, unresolved_var, type_scope, caller_module_idx);
+        var current = ModuleVarKey{ .module_idx = input.module_idx, .var_ = input.resolved.var_ };
+        while (self.template_bindings.count() != 0) {
+            const bound = self.template_bindings.get(current) orelse break;
+            current = .{ .module_idx = bound.module_idx, .var_ = bound.var_ };
+        }
+        return current;
     }
 };
 
@@ -171,8 +193,16 @@ pub const Resolver = struct {
             if (build_state.refs_by_var.get(cache_key)) |cached| return cached;
             if (self.canonical_cache.get(cache_key)) |cached| return .{ .canonical = cached };
         } else if (build_state.template_bindings.get(cache_key)) |bound| {
-            // A declaration formal: its layout is the actual arg's layout.
-            return bound;
+            // A declaration formal: resolve the actual arg in this use
+            // context, not in the nominal application's outer context.
+            return self.buildRefForVar(
+                bound.module_idx,
+                bound.var_,
+                type_scope,
+                null,
+                parent_context,
+                build_state,
+            );
         }
 
         switch (current.desc.content) {
@@ -297,33 +327,30 @@ pub const Resolver = struct {
         // checking and never reach layout.
         std.debug.assert(decl.isValid());
 
-        // Build the arg layout refs first (ordinary positions under the
-        // current scopes/bindings).
         const args = ts.sliceNominalArgs(nominal_type);
-        const arg_refs = try self.allocator.alloc(GraphRef, args.len);
-        var arg_refs_owned = true;
-        defer if (arg_refs_owned) self.allocator.free(arg_refs);
-        for (args, arg_refs) |arg_var, *arg_ref| {
-            arg_ref.* = try self.buildRefForVar(
+        const arg_keys = try self.allocator.alloc(ModuleVarKey, args.len);
+        var arg_keys_owned = true;
+        defer if (arg_keys_owned) self.allocator.free(arg_keys);
+        for (args, arg_keys) |arg_var, *arg_key| {
+            arg_key.* = build_state.resolvedKey(
+                self,
                 module_idx,
                 arg_var,
                 type_scope,
                 caller_module_idx,
-                .ordinary,
-                build_state,
             );
         }
 
         const statement = nominal_type.sourceDecl().statement;
 
         // A recursive template reference denotes an in-progress opening of
-        // the same declaration with the same arg layouts: close the cycle on
+        // the same declaration with the same resolved args: close the cycle on
         // that opening's placeholder.
         for (build_state.active_opens.items) |open| {
             if (open.module_idx == module_idx and
                 open.origin_module == nominal_type.origin_module and
                 open.statement == statement and
-                graphRefsEqual(open.arg_refs, arg_refs))
+                moduleVarKeysEqual(open.arg_keys, arg_keys))
             {
                 return open.placeholder;
             }
@@ -348,29 +375,41 @@ pub const Resolver = struct {
             .module_idx = module_idx,
             .origin_module = nominal_type.origin_module,
             .statement = statement,
-            .arg_refs = arg_refs,
+            .arg_keys = arg_keys,
             .placeholder = placeholder_ref,
         });
-        arg_refs_owned = false; // now owned by the active open
+        arg_keys_owned = false; // now owned by the active open
         defer {
             const popped = build_state.active_opens.pop().?;
-            self.allocator.free(popped.arg_refs);
+            self.allocator.free(popped.arg_keys);
         }
 
-        // Bind the declaration's formals to the arg layout refs, saving any
+        // Bind the declaration's formals to the arg vars, saving any
         // outer bindings for the same formals (re-entrant openings of one
         // declaration with different args restore them on the way out).
         const formals = ts.sliceVars(decl.formals);
         std.debug.assert(formals.len == args.len);
-        const saved_bindings = try self.allocator.alloc(?GraphRef, formals.len);
+        const saved_bindings = try self.allocator.alloc(?BuildState.BoundArg, formals.len);
         defer self.allocator.free(saved_bindings);
-        for (formals, arg_refs, saved_bindings) |formal_var, arg_ref, *saved| {
+        const bound_formals = try self.allocator.alloc(bool, formals.len);
+        defer self.allocator.free(bound_formals);
+        for (formals, args, saved_bindings, bound_formals) |formal_var, arg_var, *saved, *bound| {
             const formal_key = ModuleVarKey{ .module_idx = module_idx, .var_ = ts.resolveVar(formal_var).var_ };
+            const resolved_arg_key = build_state.resolvedKey(self, module_idx, arg_var, type_scope, caller_module_idx);
+            if (resolved_arg_key.module_idx == formal_key.module_idx and resolved_arg_key.var_ == formal_key.var_) {
+                bound.* = false;
+                continue;
+            }
+            bound.* = true;
             saved.* = build_state.template_bindings.get(formal_key);
-            try build_state.template_bindings.put(formal_key, arg_ref);
+            try build_state.template_bindings.put(formal_key, .{
+                .module_idx = resolved_arg_key.module_idx,
+                .var_ = resolved_arg_key.var_,
+            });
         }
         defer {
-            for (formals, saved_bindings) |formal_var, saved| {
+            for (formals, saved_bindings, bound_formals) |formal_var, saved, bound| {
+                if (!bound) continue;
                 const formal_key = ModuleVarKey{ .module_idx = module_idx, .var_ = ts.resolveVar(formal_var).var_ };
                 if (saved) |prev| {
                     build_state.template_bindings.put(formal_key, prev) catch unreachable;
@@ -930,10 +969,10 @@ pub const Resolver = struct {
     }
 };
 
-fn graphRefsEqual(a: []const GraphRef, b: []const GraphRef) bool {
+fn moduleVarKeysEqual(a: []const ModuleVarKey, b: []const ModuleVarKey) bool {
     if (a.len != b.len) return false;
     for (a, b) |lhs, rhs| {
-        if (!std.meta.eql(lhs, rhs)) return false;
+        if (lhs.module_idx != rhs.module_idx or lhs.var_ != rhs.var_) return false;
     }
     return true;
 }
