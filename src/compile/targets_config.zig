@@ -11,6 +11,7 @@ const std = @import("std");
 const base = @import("base");
 const builtins = @import("builtins");
 const check = @import("check");
+const CoreCtx = @import("ctx").CoreCtx;
 const parse = @import("parse");
 const roc_target = @import("roc_target");
 
@@ -101,6 +102,16 @@ pub const TargetLinkSpec = struct {
     output: OutputKind,
     items: []const LinkItem,
     wasm: ?WasmTargetConfig = null,
+
+    fn hasDeclaredTargetFiles(self: TargetLinkSpec) bool {
+        for (self.items) |item| {
+            switch (item) {
+                .file_path => return true,
+                .app, .win_gui => {},
+            }
+        }
+        return false;
+    }
 };
 
 fn freeLinkSpec(allocator: Allocator, spec: TargetLinkSpec) void {
@@ -201,6 +212,68 @@ pub const TargetsConfig = struct {
         diagnostic: *TargetConfigResolveDiagnostic,
     ) error{TargetConfigInvalid}!void {
         try resolveLinkTypeCheckedConstants(allocator, checked_module, @constCast(self.targets), diagnostic);
+    }
+
+    pub fn validateDeclaredTargetFilesExist(
+        self: TargetsConfig,
+        allocator: Allocator,
+        filesystem: CoreCtx,
+        platform_dir: []const u8,
+        target: RocTarget,
+    ) Allocator.Error!TargetFileValidation {
+        var issues = std.ArrayList(TargetFileValidationIssue).empty;
+        errdefer {
+            for (issues.items) |issue| issue.deinit(allocator);
+            issues.deinit(allocator);
+        }
+
+        const spec = self.getLinkSpec(target) orelse {
+            return .{ .issues = try issues.toOwnedSlice(allocator) };
+        };
+
+        if (!spec.hasDeclaredTargetFiles()) return .{ .issues = try issues.toOwnedSlice(allocator) };
+
+        const inputs_dir = self.inputs_dir orelse "targets";
+        const inputs_dir_path = try std.fs.path.join(allocator, &.{ platform_dir, inputs_dir });
+        var inputs_dir_path_owned = true;
+        defer if (inputs_dir_path_owned) allocator.free(inputs_dir_path);
+
+        if (!filesystem.fileExists(inputs_dir_path)) {
+            try issues.append(allocator, .{
+                .missing_inputs_directory = .{
+                    .inputs_dir = inputs_dir,
+                    .expected_path = inputs_dir_path,
+                },
+            });
+            inputs_dir_path_owned = false;
+            return .{ .issues = try issues.toOwnedSlice(allocator) };
+        }
+
+        const target_name = @tagName(spec.target);
+        for (spec.items) |item| {
+            switch (item) {
+                .file_path => |path| {
+                    const full_path = try std.fs.path.join(allocator, &.{ platform_dir, inputs_dir, target_name, path });
+                    var full_path_owned = true;
+                    defer if (full_path_owned) allocator.free(full_path);
+
+                    if (!filesystem.fileExists(full_path)) {
+                        try issues.append(allocator, .{
+                            .missing_target_file = .{
+                                .target = spec.target,
+                                .output = spec.output,
+                                .file_path = path,
+                                .expected_full_path = full_path,
+                            },
+                        });
+                        full_path_owned = false;
+                    }
+                },
+                .app, .win_gui => {},
+            }
+        }
+
+        return .{ .issues = try issues.toOwnedSlice(allocator) };
     }
 
     /// Create a TargetsConfig from a parsed AST.
@@ -489,6 +562,51 @@ pub const TargetsConfig = struct {
     fn freeTargetSpecs(allocator: Allocator, specs: []const TargetLinkSpec) void {
         for (specs) |spec| freeLinkSpec(allocator, spec);
         allocator.free(specs);
+    }
+};
+
+/// Result of checking that every declared target file exists on disk.
+pub const TargetFileValidation = struct {
+    issues: []TargetFileValidationIssue,
+
+    pub fn deinit(self: TargetFileValidation, allocator: Allocator) void {
+        for (self.issues) |issue| issue.deinit(allocator);
+        allocator.free(self.issues);
+    }
+
+    pub fn hasErrors(self: TargetFileValidation) bool {
+        return self.issues.len > 0;
+    }
+
+    pub fn hasMissingInputsDirectory(self: TargetFileValidation) bool {
+        for (self.issues) |issue| {
+            switch (issue) {
+                .missing_inputs_directory => return true,
+                .missing_target_file => {},
+            }
+        }
+        return false;
+    }
+};
+
+/// A file-system issue found while validating declared target files.
+pub const TargetFileValidationIssue = union(enum) {
+    missing_inputs_directory: struct {
+        inputs_dir: []const u8,
+        expected_path: []const u8,
+    },
+    missing_target_file: struct {
+        target: RocTarget,
+        output: OutputKind,
+        file_path: []const u8,
+        expected_full_path: []const u8,
+    },
+
+    fn deinit(self: TargetFileValidationIssue, allocator: Allocator) void {
+        switch (self) {
+            .missing_inputs_directory => |issue| allocator.free(issue.expected_path),
+            .missing_target_file => |issue| allocator.free(issue.expected_full_path),
+        }
     }
 };
 
@@ -878,4 +996,84 @@ test "fromAST captures punned wasm identifier config" {
     try testing.expectEqualStrings("maximum_memory", wasm.maximum_memory_ident.?);
     try testing.expectEqualStrings("initial_stack_size", wasm.initial_stack_size_ident.?);
     try testing.expectEqualStrings("global_base", wasm.global_base_ident.?);
+}
+
+test "validateDeclaredTargetFilesExist checks selected target files" {
+    const allocator = testing.allocator;
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDir(testing.io, "targets", .default_dir);
+    try tmp.dir.createDir(testing.io, "targets/x64mac", .default_dir);
+    try tmp.dir.createDir(testing.io, "targets/wasm32", .default_dir);
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = "targets/x64mac/libhost.a", .data = "" });
+
+    const platform_dir = try tmp.dir.realPathFileAlloc(testing.io, ".", allocator);
+    defer allocator.free(platform_dir);
+    const filesystem = CoreCtx.default(allocator, allocator, testing.io);
+
+    const x64_items: []const LinkItem = &.{ .{ .file_path = "libhost.a" }, .app };
+    const wasm_items: []const LinkItem = &.{ .{ .file_path = "host.wasm" }, .app };
+    const specs: []const TargetLinkSpec = &.{
+        .{ .target = .x64mac, .output = .shared, .items = x64_items },
+        .{ .target = .wasm32, .output = .shared, .items = wasm_items },
+    };
+    const config = TargetsConfig{
+        .inputs_dir = "targets",
+        .targets = specs,
+    };
+
+    const x64_validation = try config.validateDeclaredTargetFilesExist(allocator, filesystem, platform_dir, .x64mac);
+    defer x64_validation.deinit(allocator);
+
+    try testing.expectEqual(@as(usize, 0), x64_validation.issues.len);
+
+    const wasm_validation = try config.validateDeclaredTargetFilesExist(allocator, filesystem, platform_dir, .wasm32);
+    defer wasm_validation.deinit(allocator);
+
+    try testing.expectEqual(@as(usize, 1), wasm_validation.issues.len);
+    switch (wasm_validation.issues[0]) {
+        .missing_target_file => |issue| {
+            try testing.expectEqual(RocTarget.wasm32, issue.target);
+            try testing.expectEqual(OutputKind.shared, issue.output);
+            try testing.expectEqualStrings("host.wasm", issue.file_path);
+            const expected_path = try std.fs.path.join(allocator, &.{ platform_dir, "targets", "wasm32", "host.wasm" });
+            defer allocator.free(expected_path);
+            try testing.expectEqualStrings(expected_path, issue.expected_full_path);
+        },
+        else => return error.UnexpectedResult,
+    }
+}
+
+test "validateDeclaredTargetFilesExist uses default targets directory" {
+    const allocator = testing.allocator;
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const platform_dir = try tmp.dir.realPathFileAlloc(testing.io, ".", allocator);
+    defer allocator.free(platform_dir);
+    const filesystem = CoreCtx.default(allocator, allocator, testing.io);
+
+    const items: []const LinkItem = &.{ .{ .file_path = "libhost.a" }, .app };
+    const specs: []const TargetLinkSpec = &.{
+        .{ .target = .x64mac, .output = .exe, .items = items },
+    };
+    const config = TargetsConfig{
+        .inputs_dir = null,
+        .targets = specs,
+    };
+
+    const validation = try config.validateDeclaredTargetFilesExist(allocator, filesystem, platform_dir, .x64mac);
+    defer validation.deinit(allocator);
+
+    try testing.expectEqual(@as(usize, 1), validation.issues.len);
+    switch (validation.issues[0]) {
+        .missing_inputs_directory => |issue| {
+            try testing.expectEqualStrings("targets", issue.inputs_dir);
+            try testing.expect(std.mem.endsWith(u8, issue.expected_path, "targets"));
+        },
+        else => return error.UnexpectedResult,
+    }
 }
