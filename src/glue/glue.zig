@@ -255,7 +255,11 @@ fn rocGlueInner(gpa: Allocator, stderr: *std.Io.Writer, stdout: *std.Io.Writer, 
         if (mod.is_platform_sibling or mod.is_platform_main) {
             const artifact = mod.semantic.checked_artifact orelse continue;
             type_table.clearVarMap();
-            if (try collectModuleTypeInfo(gpa, artifact, mod.name, hosted_indices, &hosted_symbols, &type_table)) |mod_info| {
+            const collected = collectModuleTypeInfo(gpa, artifact, mod.name, hosted_indices, &hosted_symbols, &type_table) catch |err| switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                error.UnresolvedByValue => return reportUnresolvedTypeVariable(stderr, &type_table),
+            };
+            if (collected) |mod_info| {
                 var owned_mod_info = mod_info;
                 errdefer owned_mod_info.deinit(gpa);
                 try collected_modules.append(gpa, owned_mod_info);
@@ -294,7 +298,10 @@ fn rocGlueInner(gpa: Allocator, stderr: *std.Io.Writer, stdout: *std.Io.Writer, 
         for (artifact.platform_required_declarations.declarations) |declaration| {
             const name = artifact.canonical_names.exportNameText(declaration.platform_name);
             const checked_type = platformRequiredEntrypointCheckedType(artifact, declaration);
-            const type_id = try type_table.getOrInsert(artifact, checked_type);
+            const type_id = type_table.getOrInsert(artifact, checked_type) catch |err| switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                error.UnresolvedByValue => return reportUnresolvedTypeVariable(stderr, &type_table),
+            };
             try entrypoint_type_ids.put(name, type_id);
         }
 
@@ -304,7 +311,10 @@ fn rocGlueInner(gpa: Allocator, stderr: *std.Io.Writer, stdout: *std.Io.Writer, 
                 glueInvariant("provided entry has no top-level value", .{});
             const scheme = artifact.checked_types.schemeForKey(top_level.source_scheme) orelse
                 glueInvariant("provided entry has no checked type scheme", .{});
-            const type_id = try type_table.getOrInsert(artifact, scheme.root);
+            const type_id = type_table.getOrInsert(artifact, scheme.root) catch |err| switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                error.UnresolvedByValue => return reportUnresolvedTypeVariable(stderr, &type_table),
+            };
             const ffi_symbol = artifact.canonical_names.externalSymbolNameText(provides_entry.ffi_symbol);
             try provides_type_ids.put(ffi_symbol, type_id);
         }
@@ -573,6 +583,16 @@ fn checkedArtifactKeysEqual(
     b: CheckedArtifact.CheckedModuleArtifactKey,
 ) bool {
     return std.mem.eql(u8, &a.bytes, &b.bytes);
+}
+
+/// Report the type table's recorded unresolved-type-variable error to stderr and
+/// map it to a compilation failure, so `roc glue` exits nonzero with a message
+/// naming the offending type instead of crashing on a missing committed layout.
+fn reportUnresolvedTypeVariable(stderr: *std.Io.Writer, type_table: *const TypeTable) GlueError {
+    const message = type_table.unresolved_error orelse
+        "a glue-visible type has no committed memory layout because it holds an unresolved type variable by value";
+    stderr.print("Error: {s}\n", .{message}) catch {};
+    return error.CompilationFailed;
 }
 
 fn glueInvariant(comptime message: []const u8, args: anytype) noreturn {
@@ -1233,6 +1253,12 @@ const TypeTableKey = struct {
 };
 
 /// Builds a type table from artifact-owned checked type payloads.
+/// Error set for building the glue type table: allocation failures plus a
+/// glue-visible type whose committed memory layout cannot be determined because
+/// it still holds an unresolved (flex/rigid) type variable by value. The latter
+/// is a user-facing glue error, not an internal invariant.
+const TypeTableError = Allocator.Error || error{UnresolvedByValue};
+
 const TypeTable = struct {
     entries: std.ArrayList(CollectedTypeInfo),
     var_map: std.AutoHashMap(TypeTableKey, u64),
@@ -1266,6 +1292,11 @@ const TypeTable = struct {
     /// Lookup from checked artifact key to artifact. Borrowed; not owned by the
     /// type table.
     artifacts_by_key: *const ArtifactKeyMap,
+    /// User-facing message for the first glue-visible type found to have no
+    /// committed memory layout because it holds an unresolved (flex/rigid) type
+    /// variable by value. Set alongside `error.UnresolvedByValue`; owned here
+    /// and freed in `deinit`.
+    unresolved_error: ?[]const u8 = null,
 
     /// A checked type resolved through the active formal bindings: the artifact
     /// and checked type to actually convert (an application argument for a
@@ -1328,6 +1359,7 @@ const TypeTable = struct {
     }
 
     fn deinit(self: *TypeTable) void {
+        if (self.unresolved_error) |msg| self.gpa.free(msg);
         for (self.entries.items) |entry| {
             self.freeEntry(entry);
         }
@@ -1430,7 +1462,7 @@ const TypeTable = struct {
         self: *TypeTable,
         artifact: *const CheckedArtifact.CheckedModuleArtifact,
         checked_type: CheckedArtifact.CheckedTypeId,
-    ) Allocator.Error!?HostedFunctionTypeMetadata {
+    ) TypeTableError!?HostedFunctionTypeMetadata {
         const src = self.substituteFormal(artifact, checked_type);
         return switch (checkedTypePayload(src.artifact, src.checked_type)) {
             .function => |func| try self.metadataForFunctionPayload(src.artifact, func),
@@ -1453,7 +1485,7 @@ const TypeTable = struct {
         self: *TypeTable,
         artifact: *const CheckedArtifact.CheckedModuleArtifact,
         func: CheckedArtifact.CheckedFunctionType,
-    ) Allocator.Error!HostedFunctionTypeMetadata {
+    ) TypeTableError!HostedFunctionTypeMetadata {
         const ret_fields = try self.extractRecordFieldsBound(artifact, func.ret);
         errdefer self.freeRecordFieldInfo(ret_fields);
 
@@ -1871,15 +1903,38 @@ const TypeTable = struct {
         };
     }
 
+    /// Record the user-facing glue error for a glue-visible type that holds an
+    /// unresolved (flex/rigid) type variable by value, naming the type and its
+    /// declaring module. Keeps the first message; the whole glue run aborts on
+    /// the first such type, so later ones are never inspected.
+    fn recordUnresolvedByValue(
+        self: *TypeTable,
+        artifact: *const CheckedArtifact.CheckedModuleArtifact,
+        checked_type: CheckedArtifact.CheckedTypeId,
+    ) Allocator.Error!void {
+        if (self.unresolved_error != null) return;
+        const type_name = try self.typeStringAllocBound(artifact, checked_type);
+        defer self.gpa.free(type_name);
+        const module_name = artifact.moduleEnvConst().module_name;
+        self.unresolved_error = try std.fmt.allocPrint(
+            self.gpa,
+            "The type `{s}` from module `{s}` still has an unresolved type variable, so it has no committed memory layout and glue cannot generate bindings for it. Give the type a concrete layout (for example, box the value across the host boundary) so its size is known.",
+            .{ type_name, module_name },
+        );
+    }
+
     fn layoutFactsForCheckedType(
         self: *TypeTable,
         artifact: *const CheckedArtifact.CheckedModuleArtifact,
         checked_type: CheckedArtifact.CheckedTypeId,
-    ) Allocator.Error!CollectedLayoutFacts {
+    ) TypeTableError!CollectedLayoutFacts {
         const layout_idx = if (self.template_bindings.count() == 0)
             self.layout_resolver.resolve(artifact, checked_type) catch |err| switch (err) {
                 error.OutOfMemory => return error.OutOfMemory,
-                error.UnresolvedByValue => glueInvariant("type with no committed layout reached glue type table", .{}),
+                error.UnresolvedByValue => {
+                    try self.recordUnresolvedByValue(artifact, checked_type);
+                    return error.UnresolvedByValue;
+                },
             }
         else layout_with_bindings: {
             // Under a backing opening, layout facts for backing subtypes must
@@ -1898,7 +1953,10 @@ const TypeTable = struct {
             }
             break :layout_with_bindings self.layout_resolver.resolveWithFormalBindings(artifact, checked_type, bindings.items) catch |err| switch (err) {
                 error.OutOfMemory => return error.OutOfMemory,
-                error.UnresolvedByValue => glueInvariant("type with no committed layout reached glue type table", .{}),
+                error.UnresolvedByValue => {
+                    try self.recordUnresolvedByValue(artifact, checked_type);
+                    return error.UnresolvedByValue;
+                },
             };
         };
         return self.layoutFactsForIdx(layout_idx);
@@ -1911,7 +1969,7 @@ const TypeTable = struct {
         self: *TypeTable,
         artifact_in: *const CheckedArtifact.CheckedModuleArtifact,
         checked_type_in: CheckedArtifact.CheckedTypeId,
-    ) Allocator.Error!u64 {
+    ) TypeTableError!u64 {
         const src = self.substituteFormal(artifact_in, checked_type_in);
         const artifact = src.artifact;
         const checked_type = src.checked_type;
@@ -2451,7 +2509,7 @@ const TypeTable = struct {
         self: *TypeTable,
         artifact: *const CheckedArtifact.CheckedModuleArtifact,
         checked_type: CheckedArtifact.CheckedTypeId,
-    ) Allocator.Error!CollectedTypeRepr {
+    ) TypeTableError!CollectedTypeRepr {
         const payload = checkedTypePayload(artifact, checked_type);
         return switch (payload) {
             .pending => glueInvariant("pending checked type reached glue type table", .{}),
@@ -2472,7 +2530,7 @@ const TypeTable = struct {
         self: *TypeTable,
         artifact: *const CheckedArtifact.CheckedModuleArtifact,
         backing: CheckedArtifact.CheckedTypeId,
-    ) Allocator.Error!CollectedTypeRepr {
+    ) TypeTableError!CollectedTypeRepr {
         return self.convertCheckedType(artifact, backing);
     }
 
@@ -2481,7 +2539,7 @@ const TypeTable = struct {
         artifact: *const CheckedArtifact.CheckedModuleArtifact,
         checked_type: CheckedArtifact.CheckedTypeId,
         nominal: CheckedArtifact.CheckedNominalType,
-    ) Allocator.Error!CollectedTypeRepr {
+    ) TypeTableError!CollectedTypeRepr {
         const display_name = TypeTable.getTypeDisplayName(artifact.canonical_names.typeNameText(nominal.name));
         const nominal_layout = try self.layoutFactsForCheckedType(artifact, checked_type);
 
@@ -2818,7 +2876,7 @@ const TypeTable = struct {
         checked_type: CheckedArtifact.CheckedTypeId,
         fields: []const CheckedArtifact.CheckedRecordField,
         ext: ?CheckedArtifact.CheckedTypeId,
-    ) Allocator.Error!CollectedTypeRepr {
+    ) TypeTableError!CollectedTypeRepr {
         var all_fields = std.ArrayList(CheckedArtifact.CheckedRecordField).empty;
         defer all_fields.deinit(self.gpa);
         try appendRecordRowFields(self.gpa, artifact, fields, ext, &all_fields);
@@ -2831,7 +2889,7 @@ const TypeTable = struct {
         artifact: *const CheckedArtifact.CheckedModuleArtifact,
         checked_type: CheckedArtifact.CheckedTypeId,
         fields: []const CheckedArtifact.CheckedRecordField,
-    ) Allocator.Error!CollectedTypeRepr {
+    ) TypeTableError!CollectedTypeRepr {
         if (fields.len == 0) return .{ .unit = self.layoutFactsForIdx(.zst) };
         const record_layout = try self.layoutFactsForCheckedType(artifact, checked_type);
 
@@ -2881,7 +2939,7 @@ const TypeTable = struct {
         artifact: *const CheckedArtifact.CheckedModuleArtifact,
         checked_type: CheckedArtifact.CheckedTypeId,
         elems: []const CheckedArtifact.CheckedTypeId,
-    ) Allocator.Error!CollectedTypeRepr {
+    ) TypeTableError!CollectedTypeRepr {
         if (elems.len == 0) return .{ .unit = self.layoutFactsForIdx(.zst) };
         const tuple_layout = try self.layoutFactsForCheckedType(artifact, checked_type);
 
@@ -2933,7 +2991,7 @@ const TypeTable = struct {
         checked_type: CheckedArtifact.CheckedTypeId,
         tags: []const CheckedArtifact.CheckedTag,
         ext: CheckedArtifact.CheckedTypeId,
-    ) Allocator.Error!CollectedTypeRepr {
+    ) TypeTableError!CollectedTypeRepr {
         var all_tags = std.ArrayList(CheckedArtifact.CheckedTag).empty;
         defer all_tags.deinit(self.gpa);
         try appendTagRowTags(self.gpa, artifact, tags, ext, &all_tags);
@@ -3020,7 +3078,7 @@ const TypeTable = struct {
         artifact: *const CheckedArtifact.CheckedModuleArtifact,
         checked_type: CheckedArtifact.CheckedTypeId,
         func: CheckedArtifact.CheckedFunctionType,
-    ) Allocator.Error!CollectedTypeRepr {
+    ) TypeTableError!CollectedTypeRepr {
         const arg_ids = try self.gpa.alloc(u64, func.args.len);
         for (func.args, 0..) |arg, i| {
             arg_ids[i] = try self.getOrInsert(artifact, arg);
@@ -4057,7 +4115,7 @@ fn collectModuleTypeInfo(
     hosted_indices: []const HostedProcGlobalIndex,
     hosted_symbols: *const std.StringHashMap([]const u8),
     type_table: *TypeTable,
-) Allocator.Error!?CollectedModuleTypeInfo {
+) TypeTableError!?CollectedModuleTypeInfo {
     var main_type_str: []const u8 = try gpa.dupe(u8, "");
     errdefer gpa.free(main_type_str);
     for (artifact.checked_types.nominal_declarations.items) |declaration| {
