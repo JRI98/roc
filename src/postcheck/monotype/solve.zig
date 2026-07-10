@@ -24,6 +24,15 @@ const names = check.CheckedNames;
 const static_dispatch = check.StaticDispatchRegistry;
 const Ident = base.Ident;
 
+/// A compile-time entry root qualified by the checked module that owns it.
+/// `ComptimeRootId`s are module-local, so a root that travels across template
+/// requests must carry its owning module to stay comparable: the same integer
+/// id names unrelated roots in different modules.
+pub const EntryRoot = struct {
+    module: checked.ModuleId,
+    root: checked.ComptimeRootId,
+};
+
 /// A procedure template body request deferred to the end of the requesting
 /// specialization, when that specialization's types are final. Requesting at
 /// final types keeps specialization keys stable: two requests whose types
@@ -31,12 +40,11 @@ const Ident = base.Ident;
 pub const DeferredTemplate = struct {
     fn_id: Ast.FnId,
     template_ref: names.ProcTemplate,
-    module: checked.ModuleId,
     source_fn_ty: checked.CheckedTypeId,
     source_fn_key: names.TypeDigest,
     fn_ty: Type.TypeId,
     source_region_override: ?base.Region,
-    current_entry_root: ?checked.ComptimeRootId,
+    current_entry_root: ?EntryRoot,
 };
 
 /// Identity of a node in a specialization's instantiation graph.
@@ -676,6 +684,21 @@ pub const InstGraph = struct {
                     }
                     if (right_named.kind == .alias) {
                         try self.unifyThroughBacking(right, right_content, left, pending);
+                        return;
+                    }
+                    if (isPublicMintedIteratorPair(left_named, right_named)) {
+                        if (left_named.args.len == 0 or right_named.args.len == 0) {
+                            Common.invariant("minted/public iterator pair reached Monotype instantiation without a public item argument");
+                        }
+                        try pending.append(self.allocator, .{
+                            .left = left_named.args[0],
+                            .right = right_named.args[0],
+                        });
+                        if (left_named.def.iterator_representation == .minted) {
+                            try self.union_(left, right);
+                        } else {
+                            try self.union_(right, left);
+                        }
                         return;
                     }
                     if (isForcedDynamicIteratorPair(left_named, right_named)) {
@@ -2026,11 +2049,14 @@ pub const GraphTypeFinals = struct {
 };
 
 fn materializeUnresolved(variable: InstVariable) Type.Content {
-    if (variable.numeric_default_phase) |phase| switch (phase) {
-        .mono_specialization => return .{ .primitive = .dec },
-        .mono_specialization_str => return .{ .primitive = .str },
-        .checking_finalized => Common.invariant("checking-finalized numeric variable reached Monotype unresolved"),
-    };
+    if (variable.numeric_default_phase) |phase| {
+        const target = checked.literal_defaulting.defaultTargetForPhase(phase) orelse
+            Common.invariant("checking-finalized numeric variable reached Monotype unresolved");
+        return switch (target) {
+            .dec => .{ .primitive = .dec },
+            .str => .{ .primitive = .str },
+        };
+    }
     if (variable.row_default) |row_default| switch (row_default) {
         .empty_record => return .{ .record = Type.Span.empty() },
         .empty_tag_union => return .{ .tag_union = Type.Span.empty() },
@@ -2283,6 +2309,19 @@ fn isForcedDynamicIteratorPair(left: InstNamed, right: InstNamed) bool {
     if (!isIteratorLikeOwnerPair(left.builtin_owner, right.builtin_owner)) return false;
     return (left.def.iterator_representation == .forced_dynamic) !=
         (right.def.iterator_representation == .forced_dynamic);
+}
+
+fn isPublicMintedIteratorPair(left: InstNamed, right: InstNamed) bool {
+    if (left.kind != right.kind) return false;
+    if (left.def.module != right.def.module or
+        left.def.type_name != right.def.type_name or
+        left.def.source_decl != right.def.source_decl)
+    {
+        return false;
+    }
+    if (!isIteratorLikeOwnerPair(left.builtin_owner, right.builtin_owner)) return false;
+    return (left.def.iterator_representation == .minted and right.def.iterator_representation == .none) or
+        (left.def.iterator_representation == .none and right.def.iterator_representation == .minted);
 }
 
 fn isIteratorLikeOwnerPair(left: ?static_dispatch.BuiltinOwner, right: ?static_dispatch.BuiltinOwner) bool {
@@ -2579,6 +2618,71 @@ test "unconstrained checked graph node seals to empty tag union" {
     const sealed = try graph.sealNode(node);
     const content = type_store.get(sealed);
     try std.testing.expectEqual(Type.Span.empty(), content.tag_union);
+}
+
+test "minted iterator unification with its public type preserves the minted backing" {
+    const gpa = std.testing.allocator;
+
+    var type_store = Type.Store.init(gpa);
+    defer type_store.deinit();
+
+    var name_store = names.NameStore.init(gpa);
+    defer name_store.deinit();
+
+    var unsolved_monos = std.AutoHashMap(Type.TypeId, void).init(gpa);
+    defer unsolved_monos.deinit();
+
+    const graph = try InstGraph.create(gpa, &type_store, &name_store, &unsolved_monos);
+    defer graph.destroy();
+
+    const module_identity = try name_store.internModuleIdentity(&([_]u8{0xA7} ** 32));
+    const type_name = try name_store.internTypeName("Builtin.Iter");
+    const named_type: Type.NamedType = .{ .module = .{}, .ty = testCheckedTypeId(5) };
+    const public_def: Type.TypeDef = .{
+        .module = module_identity,
+        .type_name = type_name,
+        .source_decl = 62,
+    };
+    var minted_def = public_def;
+    minted_def.generated = .{ .bytes = [_]u8{0x5A} ** 32 };
+    minted_def.iterator_representation = .minted;
+    minted_def.iterator_depth = 1;
+
+    const item = try graph.newNode(.{ .primitive = .u64 });
+    const public_backing = try graph.newNode(.empty_record);
+    const minted_backing = try graph.newNode(.empty_record);
+    const public_args = try graph.arena().alloc(NodeId, 1);
+    public_args[0] = item;
+    const minted_args = try graph.arena().alloc(NodeId, 1);
+    minted_args[0] = item;
+
+    const public_iter = try graph.newNode(.{ .named = .{
+        .named_type = named_type,
+        .def = public_def,
+        .kind = .@"opaque",
+        .builtin_owner = .iter,
+        .args = public_args,
+        .backing = .{ .node = public_backing, .use = .inspectable },
+    } });
+    const minted_iter = try graph.newNode(.{ .named = .{
+        .named_type = named_type,
+        .def = minted_def,
+        .kind = .@"opaque",
+        .builtin_owner = .iter,
+        .args = minted_args,
+        .backing = .{ .node = minted_backing, .use = .inspectable },
+    } });
+
+    try graph.unify(public_iter, minted_iter);
+
+    try std.testing.expectEqual(graph.find(public_iter), graph.find(minted_iter));
+    const unified = switch (graph.content(minted_iter)) {
+        .named => |named| named,
+        else => return error.TestUnexpectedResult,
+    };
+    try std.testing.expectEqual(Type.IteratorRepresentation.minted, unified.def.iterator_representation);
+    try std.testing.expectEqual(minted_backing, unified.backing.?.node);
+    try std.testing.expect(graph.find(public_backing) != graph.find(minted_backing));
 }
 
 test "issue 9647: unresolved tag row extension absorbs rest without allocating a rest node" {

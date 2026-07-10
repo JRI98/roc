@@ -1439,6 +1439,7 @@ pub const PackageEnv = struct {
             self.resolver,
             self.additional_known_modules.items,
             &.{},
+            false,
         );
 
         self.total_canonicalize_ns += readStageTimer(self.roc_ctx.std_io, &canonicalize_timer);
@@ -1717,6 +1718,7 @@ pub const PackageEnv = struct {
         resolver: ?ImportResolver,
         additional_known_modules: []const KnownModule,
         pre_resolved_imports: []const messages.CanonicalizeImport,
+        validate_as_explicit_roots: bool,
     ) Allocator.Error!void {
         const gpa = roc_ctx.gpa;
 
@@ -1853,7 +1855,11 @@ pub const PackageEnv = struct {
         });
         czer.source_dir = root_dir;
         try czer.canonicalizeFile();
-        try czer.validateForChecking();
+        if (validate_as_explicit_roots) {
+            try czer.validateForExplicitRoots();
+        } else {
+            try czer.validateForChecking();
+        }
         czer.deinit();
     }
 

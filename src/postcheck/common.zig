@@ -23,6 +23,7 @@ pub const RootRequests = struct {
     requests: []const checked.RootRequest = &.{},
     layout_requests: []const checked.CheckedTypeId = &.{},
     static_data_requests: []const StaticDataRequest = &.{},
+    test_plan_metadata: []const RootTestPlanMetadata = &.{},
 };
 
 /// Checked const data that must produce a runtime layout and callable entries.
@@ -34,6 +35,30 @@ pub const StaticDataRequest = struct {
 
 /// Stage-local readonly static-data value id.
 pub const StaticDataId = enum(u32) { _ };
+
+/// Optional command-level test-plan metadata for a checked root request.
+pub const RootTestPlanMetadata = struct {
+    root_order: u32,
+    result_index: u32,
+    module_index: u32,
+    root_index: u32,
+};
+
+/// Return the command-level test-plan metadata for a checked root request.
+pub fn testPlanMetadataForRoot(
+    roots: RootRequests,
+    root: checked.RootRequest,
+) ?lir_core.RootMetadata.RootMetadata.TestPlanMetadata {
+    for (roots.test_plan_metadata) |metadata| {
+        if (metadata.root_order != root.order) continue;
+        return .{
+            .result_index = metadata.result_index,
+            .module_index = metadata.module_index,
+            .root_index = metadata.root_index,
+        };
+    }
+    return null;
+}
 
 /// Target settings carried through post-check lowering.
 pub const Target = struct {

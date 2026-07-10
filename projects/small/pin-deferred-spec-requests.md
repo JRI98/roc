@@ -196,7 +196,7 @@ tree:
   phantom-carrying request (exercises the deleted `moduleBytesEqual`
   condition).
 - Debug-build corpus check: the item-3 counter asserts zero
-  defaulted-while-checked-concrete rows across `zig build snapshot` and the
+  defaulted-while-checked-concrete rows across `zig build run-snapshot-tool` and the
   CLI suite.
 
 ## Related projects

@@ -1096,6 +1096,16 @@ CheckedModuleId =
   + direct_import_checked_module_ids
 ```
 
+The cache id is not merely the module's source bytes plus recursive import
+ids. Source bytes are only one input. The id also includes the compiler build
+hash, the module identity, the checking context identity, and the ordered direct
+import checked module ids. The checking context identity includes import-name
+hashes, resolved import ids, platform requirement context, platform/app
+relation identity, and explicit root requests. Any additional checked tables
+stored in the checked module cache must be deterministic output of those
+checked inputs and the checked modules they name. Such tables are serialized
+data, not new cache-id inputs.
+
 `module_identity` includes the module's name. Canonicalization output is not
 a function of source bytes alone — a type module's main type takes its name
 from the module's file name — so no key or identity derived from module
@@ -1110,6 +1120,22 @@ runtime behavior or performance of the compiled program, except for debug
 information. Compiling one large module and compiling the same code split across
 imports must produce the same reachable specializations, callable
 representations, layout decisions, ARC statements, and backend behavior.
+
+Checked modules store the target-independent lowering visibility selected by
+checking. This includes the complete checked module id set needed by later
+post-check stages for the module's explicit roots, checked type roots, checked
+type schemes, public API dependencies, type-owner dependencies, and
+platform/app relation closures. The set is duplicate-free and stable. It is
+serialized as relocatable sorted POD slices, with binary-search lookup where a
+map is needed; mutable hash maps may be used only while constructing the checked
+module and must not be the persisted representation.
+
+On a cache hit, the coordinator consumes this lowering visibility directly to
+materialize imported checked module views. It must not rebuild the same set by
+walking checked bodies, checked type roots, checked type schemes, public API
+dependency lists, or platform/app relation closure data. Recomputing that
+visibility during post-check lowering is a producer-boundary bug: the checked
+module cache already owns this target-independent checked information.
 
 The compiler does not cache Monotype IR, Monotype Lifted IR, Lambda Solved IR,
 Lambda Mono decisions, LIR, or any callable/layout representation derived from
@@ -1150,6 +1176,81 @@ cache format or the specific checked-data selection version must be bumped. A
 cache hit with a matching key and version is consumed as already-checked output;
 the compiler must not pay an extra pass to rediscover whether the cached output
 is complete for the checked module.
+
+## Def Checking Order
+
+Type checking processes a module's top-level defs as binding groups: the SCC
+condensation of the name-reference graph, in deterministic topological order
+(groups ordered by their first member's source position among independent
+groups; members within a group in source order). The graph covers every name
+reference in a def's expression tree — nested lambda bodies and blocks
+included — plus statically-resolvable type-qualified method-call targets. It
+is transient checking input computed from canonicalization output when
+checking starts and freed with the checker; a checked module never stores it.
+
+Because groups are checked in dependency order, a name reference between
+groups always points at an already-checked def. There is no re-entrant
+`checkDef` from inside an expression walk, and no code path exists for a name
+reference to an unchecked def outside the current group (it is a debug
+invariant violation).
+
+Annotated schemes come before any body. A pre-pass declares a standalone
+generalized scheme from every eligible annotation (a simple `.assign` binding
+whose annotation has no `_` hole): the annotation's type is generated once in
+place, deep-copied into disjoint orphan vars, generalized, and the annotation
+nodes are reset so the def's own body check generates them again exactly as
+always. A reference to an annotated def — by name or by dispatch — before or
+while its body checks instantiates this standalone scheme, exactly like a
+reference to an imported scheme copy; the def itself still checks with its
+annotation generated in its body's frame, sharing vars with the scheme the
+checked module outputs, which checked dispatch-evidence resolution relies on.
+
+The recursion rule is the ML binding-group rule. A recursive group gets one
+shared rank frame: members' patterns are ranked in it first, an in-group
+reference to an unannotated member unifies monomorphically with the member's
+in-flight type (call-site constraints flow into the inferred scheme), unannotated
+members' top-level lambdas stay in the frame instead of generalizing on their
+own, and the whole group generalizes at the frame's boundary. References to
+annotated members instantiate the pre-declared scheme, preserving sound
+polymorphic recursion for annotated defs. The same rule applies to
+block-local `s_decl` functions: each local function decl is a binding group
+of one with its own rank frame, and annotated (type-var-free) locals
+pre-declare their scheme. There is no deferred post-generalization validation
+of recursive references anywhere; the monomorphic rule leaves nothing to
+validate afterwards. A consequence is that an unannotated recursive def
+used at two incompatible types within its own group is a type error — the
+old deferral silently accepted such programs unsoundly.
+
+Static-dispatch dependencies are inherently dynamic (`|a| a.foo()` dispatches
+on an inferred type), so they cannot be in the name graph. When a deferred
+static-dispatch constraint resolves to an unchecked, unannotated local def
+mid-body, the target is only *recorded* (`pending_dispatch_targets`, owned by
+the discovering group) and the constraint re-deferred; the constraint's vars
+are pinned at the group's boundary rank so no inner lambda can generalize
+them first. At the group's generalization boundary — a singleton def's RHS
+frame or a recursive group's shared frame, where no mid-body state is pending
+— the driver checks each target's group in its own nested frame (together
+with any unchecked topological prefix), re-runs dispatch, and interleaves
+boundary literal defaulting to a fixpoint before generalizing. Group checks
+nest only at such boundaries.
+
+Group suspension and merge need no dedicated machinery: a suspended group's
+members are `.processed` with still-live, not-yet-generalized vars, so a
+dispatch back-edge from a nested group links to them monomorphically and rank
+adjustment keeps the shared structure at the suspended group's rank, where it
+generalizes when that group's boundary completes. A group therefore never
+generalizes while one of its deferred dispatch constraints into an unchecked
+group is outstanding, and a suspended group is never re-entered — both are
+asserted in
+debug builds (`group_stack`, group states, and the pending-target
+stack-suffix discipline).
+
+Deferred early-return / `?` constraints record the lambda that created them,
+and each lambda's end drains exactly its own entries; a drain cannot touch
+another lambda's constraints, by construction. Rank bookkeeping is therefore
+strictly stack-shaped: unification only ever runs while the frame owning its
+vars is active, and `addVarToRank`'s debug guard is a regression tripwire
+rather than a reachable condition.
 
 ## Checked Boundary
 
@@ -1225,6 +1326,19 @@ as:
 - opaque, nominal, alias, row, and builtin ownership data
 
 Those data must remain target-independent and representation-free.
+
+Named checked types carry explicit owner identity. The source-origin module
+identity remains the source identity used for `TypeDef`, diagnostics, source
+locations, and name-store interning. Alias and nominal checked payloads also
+carry the checked module id that owns the declaration or representation
+authority. For local named types, that id is the current checked module id; for
+imports, checked type copying preserves the imported owner id; for builtins, it
+is the builtin checked module id.
+
+Monotype and runtime lowering consume the owner checked module id directly as a
+checked module address. If a checked type mentions an owner checked module id
+that is not present in lowering visibility, the checked module producer is
+incomplete.
 
 ### Compile-Time Constants and Hoisted Roots
 
@@ -2041,6 +2155,16 @@ declaration template. Box payload capabilities remain separate explicit
 representation authorities; their backing roots come from the capability entry
 in checked module data instead of from declaration template lookup.
 
+Named type ownership is already decided before Monotype lowering starts. A
+checked alias or nominal payload names its owner checked module id explicitly,
+and the lowering input includes every checked module id recorded in checked
+lowering visibility. Monotype may build a stage-local lookup table from those
+ids to module views for speed, but that lookup is only an address table over
+explicit checked data. The source-origin identity remains part of the lowered
+type definition identity; the owner checked module id is the module address used
+to find checked declarations, representation authorities, method owners, and
+type-store entries.
+
 This solves two classes of bugs:
 
 - generic nominal backings cannot accidentally swap, lose, or default one
@@ -2258,7 +2382,7 @@ Monotype IR has no:
 - source `for` node
 - source row variable requiring closure
 - uninstantiated checked type variable
-- pending owner search
+- missing checked owner address
 
 `FnDef` is the checked identity for a checked, imported, nested, hosted,
 promoted, or checked-stage generated function. It does not contain a capture
@@ -4123,6 +4247,164 @@ signaling overhead, not the reporting period. Roots that exceed the threshold
 are reported, then the worker waits interruptibly until the next per-root report
 deadline or finalization stop.
 
+## Optimized Test Execution
+
+`roc test --opt=size` and `roc test --opt=speed` use one command-level test
+plan for all discovered test roots in the app and its imports. The plan is
+explicit compiler data. It owns the stable source-order display order, the
+checked module owner for each root, the source region used for reporting, the
+checked cache id for the root's result, the generated test symbol for uncached
+roots, the cached or uncached execution decision, and the result slot. Later
+stages consume this plan directly; they never reconstruct test identity from
+source paths, symbol names, module traversal order, filesystem order, package
+cache paths, or backend output.
+
+Optimized test execution performs at most one LLVM shared-library link for the
+whole command for the selected optimization mode and native target. It must not
+link one shared library per checked module. The per-module checked cache
+boundary remains intact, but cache boundaries are not native link/load
+boundaries for optimized tests. Cached test results are merged into the command
+result stream before reporting; uncached test roots are compiled into the single
+test library and written back to their original checked-module cache entries
+after execution.
+
+The command-level plan is built after checking has produced all checked modules
+and before any optimized test backend code is generated:
+
+```text
+checked modules
+  -> command-level test plan
+  -> cached-result admission for plan entries
+  -> one command-level lowering batch containing every uncached test root
+  -> ARC insertion for each checked-module lowering result
+  -> per-module LLVM bitcode with exported test entrypoints
+  -> one merged LLVM module/object
+  -> one native shared library
+  -> parallel test-root calls
+  -> deterministic transcript and result merge by test-plan order
+  -> checked cache writes for fresh test results
+  -> final timing summary
+```
+
+The user-visible per-test transcript is deterministic. It contains `dbg`
+output, failed-expect output, crash diagnostics, and per-test status or failure
+rendering. It ends before the final aggregate timing summary. That boundary is
+the byte-for-byte contract: for the same source code and the same renderer
+configuration, captured stdout bytes and captured stderr bytes in this
+transcript are independently byte-for-byte identical regardless of selected
+optimization mode, backend, worker count, core count, scheduling, test
+completion order, or whether a result was read from cache. The selected
+optimization mode is not checked source input and is not a renderer configuration;
+it must never change test output data or rendered transcript bytes. A different
+per-test transcript under `--opt=size` and `--opt=speed` is a compiler/backend
+bug, not a cache-key distinction. Changing color mode, verbosity, terminal
+width, or another renderer setting may change only the rendering chosen from
+the same structured transcript data. Determinism tests compare each stream's
+transcript bytes directly; they do not normalize source snippets, whitespace,
+ANSI escapes, or cache labels inside the transcript. The final aggregate
+summary is a run epilogue and is outside the byte-for-byte transcript
+guarantee; it may include elapsed time and cache/timing annotations for this
+invocation. Cache-hit labels such as `(cached)` belong only in that epilogue,
+never in the per-test transcript.
+
+The command-level lowering batch may name roots from multiple checked modules.
+Each per-module lowering request is built with explicit imported checked-module
+views and relation views owned by that checked module. The batch is the
+command-level data that ties those per-module lowering outputs back to one test
+plan. Each lowered test root carries root metadata that identifies its
+test-plan slot and the original checked module root order. LIR results do not
+use symbol text as identity. Symbol text is only the exported backend name
+needed to locate the entrypoint in the loaded test library.
+
+Every optimized test entrypoint uses the compiler-internal test ABI, not the
+public host symbol ABI. The entrypoint receives `RocOps`, a pointer to a
+test-invocation context, the return buffer, and the argument buffer. The
+invocation context stores mutable observation output produced by generated test
+code that cannot live in `RocOps`; currently this includes the `expect_err`
+source region. The LLVM backend must not use a shared exported global such as
+`roc_expect_err_region` for optimized tests, because a command-level test
+library runs multiple roots in parallel.
+
+After the single library is loaded, test roots run on a worker pool. Each root
+call owns its `RuntimeHostEnv`, `RocOps`, allocation tracker, crash boundary,
+argument buffer, return buffer, test-invocation context, and result slot. The
+loaded code and immutable static data are shared across workers. Mutable
+observation state is per invocation. Generated test code must be reentrant with
+respect to test-root calls: a root call must not write process-global state
+except through explicitly thread-safe runtime services or the invocation data
+passed to that root.
+
+Workers never write test output, diagnostics, stdout, stderr, or cache files
+directly. They send structured transcript events and final root status data to a
+command-level output coordinator. Each event carries the test-plan slot, the
+logical stream, the event kind, and structured payload data. Final root status
+data carries the source region, failure detail, and visibility data needed to
+render per-test status or failure reports. The coordinator is the only writer for
+user-visible test transcript output.
+
+The coordinator owns `next_to_print` and per-entry buffers. Events for
+`next_to_print` are rendered and written immediately, so a slow earliest test
+can show `dbg` output in real time. Events for later tests are buffered in that
+test's own entry. When `next_to_print` finishes, the coordinator advances
+through the longest contiguous prefix of already-finished entries, flushing each
+entry's buffered transcript and result before moving to the next entry. If a
+running buffered test becomes `next_to_print`, its buffered prefix is flushed
+and later events from that test are written live. This produces sequential
+plan-order output while still allowing parallel execution. If a buffered
+transcript is too large to keep in memory, the coordinator may spill it to a
+command-owned temporary file in the command's isolated temp directory; it must
+not write transcript spill files into user source directories.
+
+Worker completion order is never user-visible. Results are merged by the
+command-level test-plan order: checked module source order first, then checked
+test root source order within each module. Cached results and freshly-run
+results use the same ordering path. Diagnostics, `dbg`, `expect` failures,
+`expect_err` regions, crashes, and backend compiler errors stay attached to
+their test-plan entries until rendering and cache writes replay the plan order.
+
+Checked test-result cache entries use the same checked module cache identity
+as `roc check`. There is no second test-result cache key.
+The test-result bundle may carry its own payload format and compiler-version
+admission data, but those fields decide whether the decoded bundle can be used;
+they do not extend the checked module cache identity. The result cache key does not
+include selected optimization mode, backend, worker count, color mode,
+verbosity, terminal width, terminal style, elapsed time, final summary text,
+test-run completion order, test-root identity, or test-root order. Test-root
+identity and order are explicit checked module data and payload shape, not
+additional cache-key inputs. Cache reads validate that a decoded test-result
+bundle matches the current checked module's test-root shape and cache format
+before admitting it, but this is payload validation rather than a new source of
+identity.
+
+Cached test results store structured, pre-render data: the result, ordered
+transcript events, source regions, failure data, and raw or structured Roc
+payloads needed to render `dbg`, failed expects, crashes, and per-test
+status/failure reports.
+This cache format predates terminal rendering. It stores enough information to
+render the current stdout/stderr transcript just in time, under the current
+renderer choices, but it does not store terminal bytes, ANSI escapes, color
+mode, verbosity, terminal width, elapsed time, cache-hit labels, or final
+summary text. A cached result is represented to the output coordinator as an
+already-finished plan entry containing the same structured transcript events
+and test status data that a fresh run would have sent. Checked test status data,
+including passes, failed expects, and Roc runtime crashes, may be cached.
+Compiler backend failures while building or linking the command-level image are
+not checked test status data and are not written as successful test-result cache
+entries.
+
+If compiling or linking the command-level test library fails, each uncached root
+in the plan receives a backend compiler-error result at its original source
+region. If one root crashes while running, that root records a failed result
+from its own invocation state. Other roots continue unless the process receives
+a hard fault that escapes the crash boundary.
+
+The interpreter and dev backend may consume the same command-level test plan,
+but they are not allowed to change the result contract. The interpreter may run
+roots serially. The dev backend may compile one callable batch and then execute
+roots through the same per-invocation state model. Backend choice changes only
+how entrypoints are produced, not how tests are identified, ordered, cached, or
+reported.
+
 `ConstStore` uses node ids so stored constants can preserve sharing without
 duplicating large values. Multiple fields may reference the same `ConstNodeId`.
 Stored constants are acyclic. Roc source cannot define recursive non-function
@@ -4732,7 +5014,7 @@ The post-check pipeline must not contain:
   patching lowering paths
 - checked-module runtime payloads, value conversion plans, callable-set
   descriptors, or erased ABI decisions
-- owner discovery by method-registry intersection
+- method-registry intersection used as an ownership source
 - backend reference-counting decisions
 - mode, lifetime, or RC-signature data stored in checked modules, LirImage,
   or any structure that outlives ARC insertion

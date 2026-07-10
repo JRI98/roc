@@ -8,6 +8,8 @@
 const std = @import("std");
 
 pub const types = @import("types.zig");
+pub const numeral = @import("numeral.zig");
+pub const literal_defaulting = @import("literal_defaulting.zig");
 pub const store = @import("store.zig");
 pub const instantiate = @import("instantiate.zig");
 pub const generalize = @import("generalize.zig");
@@ -44,8 +46,6 @@ pub const StaticDispatchConstraint = types.StaticDispatchConstraint;
 pub const TwoStaticDispatchConstraints = types.TwoStaticDispatchConstraints;
 pub const Int = types.Int;
 pub const Frac = types.Frac;
-pub const IntRequirements = types.IntRequirements;
-pub const FracRequirements = types.FracRequirements;
 
 pub const Slot = store.Slot;
 pub const ResolvedVarDesc = store.ResolvedVarDesc;
@@ -58,4 +58,6 @@ pub const Polarity = types.Polarity;
 test {
     std.testing.refAllDecls(@import("test/test_rigid_instantiation.zig"));
     std.testing.refAllDecls(@import("generalize.zig"));
+    std.testing.refAllDecls(@import("numeral.zig"));
+    std.testing.refAllDecls(@import("literal_defaulting.zig"));
 }

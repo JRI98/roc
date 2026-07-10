@@ -147,7 +147,10 @@ platform "pf"
 		pa1: "pa1",
 		pa2: "pa2",
 	}
-	provides { "roc_not implemented": pr1, "roc_not implemented": pr2 }
+	provides {
+		"roc_not implemented": pr1,
+		"roc_not implemented": pr2,
+	}
 ~~~
 # CANONICALIZE
 ~~~clojure

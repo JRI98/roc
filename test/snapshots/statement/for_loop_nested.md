@@ -109,12 +109,12 @@ NO CHANGE
 						(e-block
 							(s-reassign
 								(p-assign (ident "result_"))
-								(e-dispatch-call (method "plus") (constraint-fn-var 509)
+								(e-dispatch-call (method "plus") (constraint-fn-var 518)
 									(receiver
 										(e-lookup-local
 											(p-assign (ident "result_"))))
 									(args
-										(e-dispatch-call (method "times") (constraint-fn-var 507)
+										(e-dispatch-call (method "times") (constraint-fn-var 516)
 											(receiver
 												(e-lookup-local
 													(p-assign (ident "i"))))

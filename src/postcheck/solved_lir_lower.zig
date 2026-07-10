@@ -129,6 +129,11 @@ pub const Options = struct {
     list_in_place_map: bool = false,
     /// Preserve source-level procedure names in LIR for runtime diagnostics.
     proc_debug_names: bool = false,
+    /// Build ConstStore materialization plans for requested layouts.
+    /// Static-data exports require this; layout-only consumers such as glue do not.
+    layout_request_const_plans: bool = true,
+    /// Optional command-level test-plan metadata keyed by checked root order.
+    test_plan_metadata: []const Common.RootTestPlanMetadata = &.{},
 };
 
 /// Lower Lambda Solved directly into LIR.
@@ -301,6 +306,7 @@ const Lowerer = struct {
     inline_expects: InlineExpectMode,
     list_in_place_map: bool,
     proc_debug_names: bool,
+    layout_request_const_plans: bool,
     /// Match sites statically resolved by `foldListMapCanReuseMatch`,
     /// recorded (Debug only) so the Lambda Mono verifier replays them.
     folded_map_matches: std.ArrayList(Lifted.Program.FoldedMatch),
@@ -317,6 +323,7 @@ const Lowerer = struct {
     mono_const_type_map: std.AutoHashMap(MonoType.TypeId, const_store.ConstTypeId),
     callable_source_fn_map: std.AutoHashMap(Type.TypeId, SolvedType.TypeVarId),
     static_data_map: []?LIR.StaticDataId,
+    root_requests: Common.RootRequests,
     symbols: Common.SymbolGen,
     local_map: []?LIR.LocalId,
     typed_local_map: std.AutoHashMap(TypedLiftedLocal, LIR.LocalId),
@@ -375,6 +382,8 @@ const Lowerer = struct {
             .inline_expects = options.inline_expects,
             .list_in_place_map = options.list_in_place_map,
             .proc_debug_names = options.proc_debug_names,
+            .layout_request_const_plans = options.layout_request_const_plans,
+            .root_requests = .{ .test_plan_metadata = options.test_plan_metadata },
             .folded_map_matches = .empty,
             .source_symbols = std.AutoHashMap(Common.Symbol, Lifted.FnId).init(allocator),
             .capture_types = CaptureTypeMap.initContext(allocator, .{}),
@@ -1236,7 +1245,9 @@ const Lowerer = struct {
             const entry = self.fn_entries.items[@intFromEnum(root.fn_id)];
             const proc = try self.markReachableFn(root.fn_id);
             try self.result.root_procs.append(self.allocator, proc);
-            try self.result.root_metadata.append(self.allocator, RootMetadata.fromCheckedRoot(root.request));
+            var metadata = RootMetadata.fromCheckedRoot(root.request);
+            metadata.test_plan = Common.testPlanMetadataForRoot(self.root_requests, root.request);
+            try self.result.root_metadata.append(self.allocator, metadata);
             if (root.request.abi == .compile_time) {
                 try self.result.const_roots.append(self.allocator, .{
                     .root_order = root.request.order,
@@ -1253,9 +1264,18 @@ const Lowerer = struct {
                 .ty = self.types.typeDigest(&self.solved.lifted.names, request.ty),
                 .checked_type = request.checked_type,
                 .layout_idx = try self.layoutOfType(request.ty),
-                .plan = try self.constPlanOfType(request.ty),
+                .plan = if (self.layout_request_const_plans)
+                    try self.constPlanOfType(request.ty)
+                else
+                    try self.layoutOnlyConstPlan(),
             });
         }
+    }
+
+    fn layoutOnlyConstPlan(self: *Lowerer) Common.LowerError!LirProgram.ConstPlanId {
+        const id: LirProgram.ConstPlanId = @enumFromInt(@as(u32, @intCast(self.result.const_plans.items.len)));
+        try self.result.const_plans.append(self.allocator, .layout_only);
+        return id;
     }
 
     fn constPlanOfType(self: *Lowerer, ty: Type.TypeId) Common.LowerError!LirProgram.ConstPlanId {
@@ -1301,6 +1321,7 @@ const Lowerer = struct {
         if (self.result.layouts.layoutSize(layout_data) == 0) return false;
         return switch (self.result.const_plans.items[@intFromEnum(plan_id)]) {
             .pending => Common.invariant("pending const plan reached static-data selection"),
+            .layout_only => Common.invariant("layout-only const plan reached static-data selection"),
             .zst,
             .scalar,
             => false,

@@ -368,6 +368,7 @@ pub fn addNumericLiteral(
         .flags = .{
             .is_negative = parsed.is_negative,
             .had_decimal_point = parsed.had_decimal_point,
+            .is_materialized = parsed.is_materialized,
         },
     });
     return idx;
@@ -434,8 +435,6 @@ pub fn addHeader(store: *NodeStore, header: AST.Header) std.mem.Allocator.Error!
             node.data.lhs = @intFromEnum(app.provides);
             node.data.rhs = @intFromEnum(app.packages);
             node.region = app.region;
-
-            try store.extra_data.append(store.gpa, @intFromEnum(app.platform_idx));
         },
         .module => |mod| {
             node.tag = .module_header;
@@ -738,6 +737,7 @@ pub fn addPattern(store: *NodeStore, pattern: AST.Pattern) std.mem.Allocator.Err
             try store.extra_data.append(store.gpa, t.qualifiers.span.start);
             try store.extra_data.append(store.gpa, t.qualifiers.span.len);
             try store.extra_data.append(store.gpa, @intFromBool(t.backing_value));
+            try store.extra_data.append(store.gpa, @intFromBool(t.has_args));
 
             node.tag = .tag_patt;
             node.region = t.region;
@@ -1763,6 +1763,7 @@ pub fn getPattern(store: *const NodeStore, pattern_idx: AST.Pattern.Idx) AST.Pat
             const qualifiers_start = store.extra_data.items[ed_start + 1];
             const qualifiers_len = store.extra_data.items[ed_start + 2];
             const backing_value = store.extra_data.items[ed_start + 3] != 0;
+            const has_args = store.extra_data.items[ed_start + 4] != 0;
 
             return .{ .tag = .{
                 .tag_tok = node.main_token,
@@ -1775,6 +1776,7 @@ pub fn getPattern(store: *const NodeStore, pattern_idx: AST.Pattern.Idx) AST.Pat
                     .len = qualifiers_len,
                 } },
                 .backing_value = backing_value,
+                .has_args = has_args,
                 .region = node.region,
             } };
         },

@@ -375,9 +375,10 @@ fn runDev(allocator: std.mem.Allocator, lowered: *const LoweredProgram) BackendE
             arg_layouts,
             proc.ret_layout,
         );
-        var exec_mem = try ExecutableMemory.initWithEntryOffset(
+        var exec_mem = try ExecutableMemory.initWithEntryOffsetAndUnwindInfo(
             codegen.getGeneratedCode(),
             entrypoint.offset,
+            codegen.getUnwindFunctions(),
         );
         defer exec_mem.deinit();
 

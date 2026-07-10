@@ -241,13 +241,12 @@ const Builder = struct {
     /// A mixed-kind set (both numeral and quote literal-origin constraints,
     /// reachable only via a flex/flex merge the checker reports as a type
     /// error, so it never survives to key generation) deterministically picks
-    /// `numeral`. The precedence is enforced by
-    /// `StaticDispatchConstraint.dominantLiteralKind`, the single source of
-    /// truth shared with `varLiteralKind` (Check.zig) and
-    /// `numericDefaultPhaseForConstraints` (checked_artifact.zig).
+    /// `numeral` — the defaulting oracle (src/types/literal_defaulting.zig)
+    /// owns that precedence, so this key builder cannot disagree with the
+    /// checker's defaulting.
     fn flexLiteralDefaultKind(self: *Builder, flex: types.Flex) ?LiteralKind {
         const constraints = self.store.sliceStaticDispatchConstraints(flex.constraints);
-        const kind = types.StaticDispatchConstraint.dominantLiteralKind(constraints);
+        const kind = types.literal_defaulting.dominantKind(constraints);
         var has_other = false;
         for (constraints) |constraint| {
             switch (constraint.origin) {
@@ -263,9 +262,9 @@ const Builder = struct {
 
     fn writeLiteralDefault(self: *Builder, kind: LiteralKind) void {
         self.writeTag("nominal");
-        switch (kind) {
-            .numeral => self.writeIdent(builtinDecTypeIdent(self.idents)),
-            .quote, .interpolation => self.writeIdent(builtinStrTypeIdent(self.idents)),
+        switch (types.literal_defaulting.defaultTargetForKind(kind)) {
+            .dec => self.writeIdent(builtinDecTypeIdent(self.idents)),
+            .str => self.writeIdent(builtinStrTypeIdent(self.idents)),
         }
         self.writeIdent(builtinModuleIdent(self.idents));
         self.writeOptionalU32(null);
@@ -553,10 +552,7 @@ const Builder = struct {
             const maybe_num_literal = constraint.origin.numeralInfo();
             self.writeBool(maybe_num_literal != null);
             if (maybe_num_literal) |num_literal| {
-                self.hasher.update(&num_literal.bytes);
-                self.writeBool(num_literal.is_u128);
-                self.writeBool(num_literal.is_negative);
-                self.writeBool(num_literal.is_fractional);
+                self.hasher.update(&num_literal.keyBytes());
             }
         }
     }
@@ -680,7 +676,7 @@ test "concrete keys default open literal flex vars per kind (numeral -> Dec, quo
     const numeral_constraints = try store.appendStaticDispatchConstraints(&.{.{
         .fn_name = from_numeral_ident,
         .fn_var = numeral_fn_var,
-        .origin = .{ .from_literal = .{ .numeral = types.NumeralInfo.fromI128(1, false, false, base.Region.zero()) } },
+        .origin = .{ .from_literal = .{ .numeral = types.NumeralInfo.testOnlyInt(1, false, base.Region.zero()) } },
     }});
     const numeral_var = try store.freshFromContent(.{
         .flex = types.Flex.init().withConstraints(numeral_constraints),

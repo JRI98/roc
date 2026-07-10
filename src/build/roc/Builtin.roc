@@ -1541,7 +1541,7 @@ Builtin :: [].{
 			skip_record_field = |encoding, state| Json.skip_json_value(encoding, state)
 
 			missing_record_field : JsonEncoding, Str, JsonState -> Json.ParseErr
-			missing_record_field = |_, field, _| MissingRequiredField(Str.concat("Missing required field: ", field))
+			missing_record_field = |_, field, _| MissingRequiredField(field)
 
 			missing_optional_field : JsonEncoding, Str, JsonState -> [Missing, ..]
 			missing_optional_field = |_, _, _| Missing

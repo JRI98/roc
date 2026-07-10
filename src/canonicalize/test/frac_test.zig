@@ -74,7 +74,7 @@ test "fractional literal - scientific notation large (near f64 max)" {
             const literal = test_env.module_env.numeralLiteralForNode(ModuleEnv.nodeIdxFrom(canonical_expr.get_idx())) orelse return error.MissingNumeralLiteral;
             try testing.expect(literal.isFractional());
             try testing.expect(!literal.isNegative());
-            try testing.expectEqual(@as(u32, 0), literal.after_decimal_digit_count);
+            try testing.expectEqual(@as(u64, 0), literal.after_decimal_digit_count);
         },
         else => {
             try testing.expect(false); // Should be exact from_numeral
@@ -95,7 +95,7 @@ test "fractional literal - scientific notation at f32 boundary" {
             const literal = test_env.module_env.numeralLiteralForNode(ModuleEnv.nodeIdxFrom(canonical_expr.get_idx())) orelse return error.MissingNumeralLiteral;
             try testing.expect(literal.isFractional());
             try testing.expect(!literal.isNegative());
-            try testing.expectEqual(@as(u32, 0), literal.after_decimal_digit_count);
+            try testing.expectEqual(@as(u64, 0), literal.after_decimal_digit_count);
         },
         else => {
             try testing.expect(false); // Should be exact from_numeral
@@ -158,6 +158,10 @@ test "fractional literal - positive zero" {
 }
 
 test "fractional literal - very small scientific notation" {
+    // 1e-40 needs 40 fractional decimal places — beyond Dec's 18 — so it must
+    // NOT take a compact dec fast path (which cannot represent it); it keeps
+    // its exact digits and converts at a concrete float type, or fails Dec fit
+    // validation with a proper error.
     const source = "1e-40";
     var test_env = try TestEnv.init(source);
     defer test_env.deinit();
@@ -166,12 +170,14 @@ test "fractional literal - very small scientific notation" {
     const expr = test_env.getCanonicalExpr(canonical_expr.get_idx());
 
     switch (expr) {
-        .e_dec_small => |dec| {
-            try testing.expectEqual(@as(i16, 1), dec.value.numerator);
-            try testing.expectEqual(@as(u8, 40), dec.value.denominator_power_of_ten);
+        .e_num_from_numeral => {
+            const literal = test_env.module_env.numeralLiteralForNode(ModuleEnv.nodeIdxFrom(canonical_expr.get_idx())) orelse return error.MissingNumeralLiteral;
+            try testing.expectEqual(@as(u32, 40), literal.after_decimal_digit_count);
+            try testing.expectEqualSlices(u8, &.{1}, test_env.module_env.numeralDigitsAfter(literal));
+            try testing.expectEqualSlices(u8, &.{}, test_env.module_env.numeralDigitsBefore(literal));
         },
         else => {
-            try testing.expect(false); // Should be exact small decimal
+            try testing.expect(false); // Must keep exact digits, not a compact dec payload
         },
     }
 }

@@ -156,6 +156,7 @@ pub const MonoLlvmCodeGen = struct {
     builder: ?*LlvmBuilder = null,
     wip: ?*LlvmBuilder.WipFunction = null,
     roc_ops_arg: ?LlvmBuilder.Value = null,
+    test_context_arg: ?LlvmBuilder.Value = null,
     ret_ptr_arg: ?LlvmBuilder.Value = null,
     args_ptr_arg: ?LlvmBuilder.Value = null,
     capture_ptr_arg: ?LlvmBuilder.Value = null,
@@ -202,7 +203,6 @@ pub const MonoLlvmCodeGen = struct {
     current_debug_file: u32 = SourceLoc.no_file,
     /// Debug type metadata per layout index, memoized per module build.
     debug_types: std.AutoHashMap(u32, LlvmBuilder.Metadata),
-    expect_err_region_global: ?LlvmBuilder.Value = null,
 
     /// Errors reported while building LLVM IR.
     pub const Error = error{
@@ -221,9 +221,6 @@ pub const MonoLlvmCodeGen = struct {
             self.allocator.free(self.bitcode);
         }
     };
-
-    /// Backwards-compatible alias for entrypoint module generation.
-    pub const ModuleBitcodeResult = GenerateResult;
 
     const BuiltinSymbolMode = enum {
         bitcode,
@@ -377,7 +374,6 @@ pub const MonoLlvmCodeGen = struct {
         self.current_subprogram = .none;
         self.current_debug_file = SourceLoc.no_file;
         self.debug_types.clearRetainingCapacity();
-        self.expect_err_region_global = null;
     }
 
     fn clearStaticBytes(self: *MonoLlvmCodeGen) void {
@@ -439,7 +435,7 @@ pub const MonoLlvmCodeGen = struct {
         hosted_symbols: []const []const u8,
         image: ?[]const u8,
         default_run_start: bool,
-    ) Error!ModuleBitcodeResult {
+    ) Error!GenerateResult {
         self.reset();
 
         var builder = try self.createBuilder(module_name);
@@ -607,7 +603,7 @@ pub const MonoLlvmCodeGen = struct {
         self: *MonoLlvmCodeGen,
         module_name: []const u8,
         entrypoints: []const Entrypoint,
-    ) Error!ModuleBitcodeResult {
+    ) Error!GenerateResult {
         self.reset();
 
         var builder = try self.createBuilder(module_name);
@@ -1224,6 +1220,7 @@ pub const MonoLlvmCodeGen = struct {
 
         const outer_wip = self.wip;
         const outer_roc_ops = self.roc_ops_arg;
+        const outer_test_context = self.test_context_arg;
         const outer_ret = self.ret_ptr_arg;
         const outer_args = self.args_ptr_arg;
         const outer_capture = self.capture_ptr_arg;
@@ -1232,6 +1229,7 @@ pub const MonoLlvmCodeGen = struct {
         defer {
             self.wip = outer_wip;
             self.roc_ops_arg = outer_roc_ops;
+            self.test_context_arg = outer_test_context;
             self.ret_ptr_arg = outer_ret;
             self.args_ptr_arg = outer_args;
             self.capture_ptr_arg = outer_capture;
@@ -1243,6 +1241,7 @@ pub const MonoLlvmCodeGen = struct {
         defer wip.deinit();
         self.wip = &wip;
         self.roc_ops_arg = wip.arg(0);
+        self.test_context_arg = null;
         self.ret_ptr_arg = null;
         self.args_ptr_arg = null;
         self.capture_ptr_arg = null;
@@ -1266,7 +1265,7 @@ pub const MonoLlvmCodeGen = struct {
         else if (self.host_call_mode == .extern_symbols)
             &.{ ptr_ty, ptr_ty }
         else
-            &.{ ptr_ty, ptr_ty, ptr_ty };
+            &.{ ptr_ty, ptr_ty, ptr_ty, ptr_ty };
         const fn_ty = builder.fnType(.void, params, .normal) catch return error.OutOfMemory;
         const name = try self.procFunctionName(builder, proc_id, proc);
         const func = builder.addFunction(fn_ty, name, .default) catch return error.OutOfMemory;
@@ -1337,6 +1336,7 @@ pub const MonoLlvmCodeGen = struct {
 
         const outer_wip = self.wip;
         const outer_roc_ops = self.roc_ops_arg;
+        const outer_test_context = self.test_context_arg;
         const outer_ret = self.ret_ptr_arg;
         const outer_args = self.args_ptr_arg;
         const outer_capture = self.capture_ptr_arg;
@@ -1346,6 +1346,7 @@ pub const MonoLlvmCodeGen = struct {
         defer {
             self.wip = outer_wip;
             self.roc_ops_arg = outer_roc_ops;
+            self.test_context_arg = outer_test_context;
             self.ret_ptr_arg = outer_ret;
             self.args_ptr_arg = outer_args;
             self.capture_ptr_arg = outer_capture;
@@ -1414,14 +1415,23 @@ pub const MonoLlvmCodeGen = struct {
             // ignores; feed those calls a null constant.
             const ptr_ty = builder.ptrType(.default) catch return error.OutOfMemory;
             self.roc_ops_arg = builder.nullValue(ptr_ty) catch return error.OutOfMemory;
+            self.test_context_arg = null;
             self.ret_ptr_arg = wip.arg(0);
             self.args_ptr_arg = wip.arg(1);
             self.capture_ptr_arg = null;
         } else {
             self.roc_ops_arg = wip.arg(0);
-            self.ret_ptr_arg = wip.arg(1);
-            self.args_ptr_arg = wip.arg(2);
-            self.capture_ptr_arg = if (proc.abi == .erased_callable) wip.arg(3) else null;
+            if (proc.abi == .erased_callable) {
+                self.test_context_arg = null;
+                self.ret_ptr_arg = wip.arg(1);
+                self.args_ptr_arg = wip.arg(2);
+                self.capture_ptr_arg = wip.arg(3);
+            } else {
+                self.test_context_arg = wip.arg(1);
+                self.ret_ptr_arg = wip.arg(2);
+                self.args_ptr_arg = wip.arg(3);
+                self.capture_ptr_arg = null;
+            }
         }
         self.current_ret_layout = proc.ret_layout;
 
@@ -1535,9 +1545,11 @@ pub const MonoLlvmCodeGen = struct {
 
         const outer_wip = self.wip;
         const outer_roc_ops = self.roc_ops_arg;
+        const outer_test_context = self.test_context_arg;
         defer {
             self.wip = outer_wip;
             self.roc_ops_arg = outer_roc_ops;
+            self.test_context_arg = outer_test_context;
         }
 
         var wip = LlvmBuilder.WipFunction.init(builder, .{ .function = wrapper, .strip = true }) catch return error.OutOfMemory;
@@ -1555,6 +1567,7 @@ pub const MonoLlvmCodeGen = struct {
             break :blk wip.call(.normal, .ccc, .none, get_ops_ty, get_ops.toValue(builder), &.{}, "") catch return error.OutOfMemory;
         } else builder.nullValue(ptr_ty) catch return error.OutOfMemory;
         self.roc_ops_arg = ops_value;
+        self.test_context_arg = null;
 
         var param_cursor: u32 = 0;
         const ret_slot = if (ret_is_indirect) blk: {
@@ -1655,7 +1668,7 @@ pub const MonoLlvmCodeGen = struct {
         const builder = self.builder orelse return error.CompilationFailed;
         const proc_fn = self.proc_registry.get(@intFromEnum(entry_proc)) orelse return error.CompilationFailed;
         const ptr_ty = builder.ptrType(.default) catch return error.OutOfMemory;
-        const wrapper_ty = builder.fnType(.void, &.{ ptr_ty, ptr_ty, ptr_ty }, .normal) catch return error.OutOfMemory;
+        const wrapper_ty = builder.fnType(.void, &.{ ptr_ty, ptr_ty, ptr_ty, ptr_ty }, .normal) catch return error.OutOfMemory;
         const wrapper_name = try self.exportedFunctionName(builder, symbol_name);
         const wrapper = builder.addFunction(wrapper_ty, wrapper_name, .default) catch return error.OutOfMemory;
         wrapper.setLinkage(.external, builder);
@@ -1667,9 +1680,11 @@ pub const MonoLlvmCodeGen = struct {
 
         const outer_wip = self.wip;
         const outer_roc_ops = self.roc_ops_arg;
+        const outer_test_context = self.test_context_arg;
         defer {
             self.wip = outer_wip;
             self.roc_ops_arg = outer_roc_ops;
+            self.test_context_arg = outer_test_context;
         }
 
         var wip = LlvmBuilder.WipFunction.init(builder, .{ .function = wrapper, .strip = builder.strip }) catch return error.OutOfMemory;
@@ -1680,13 +1695,15 @@ pub const MonoLlvmCodeGen = struct {
         wip.cursor = .{ .block = entry };
 
         const roc_ops = wip.arg(0);
-        const ret_ptr = wip.arg(1);
-        const args_ptr = wip.arg(2);
+        const test_context = wip.arg(1);
+        const ret_ptr = wip.arg(2);
+        const args_ptr = wip.arg(3);
         self.roc_ops_arg = roc_ops;
+        self.test_context_arg = test_context;
 
         const args_buf = try self.allocArgBuffer(arg_layouts, true);
         try self.copyEntrypointArgsToInternalBuffer(args_ptr, args_buf, arg_layouts);
-        _ = try self.callFunctionIndex(proc_fn, &.{ roc_ops, ret_ptr, args_buf }, false);
+        _ = try self.callFunctionIndex(proc_fn, &.{ roc_ops, test_context, ret_ptr, args_buf }, false);
         _ = wip.retVoid() catch return error.OutOfMemory;
         try self.finishCurrentWipFunction();
     }
@@ -2306,12 +2323,12 @@ pub const MonoLlvmCodeGen = struct {
                 const region_start = builder.intValue(.i32, expect_err_stmt.region.start.offset) catch return error.OutOfMemory;
                 const region_end = builder.intValue(.i32, expect_err_stmt.region.end.offset) catch return error.OutOfMemory;
 
-                const region_global = try self.expectErrRegionGlobal();
+                const context = self.testInvocationContext();
                 const flag = builder.intValue(.i32, 1) catch return error.OutOfMemory;
                 const align4 = LlvmBuilder.Alignment.fromByteUnits(4);
-                _ = wip.store(.normal, flag, region_global, align4) catch return error.OutOfMemory;
-                _ = wip.store(.normal, region_start, try self.offsetPtr(region_global, 4), align4) catch return error.OutOfMemory;
-                _ = wip.store(.normal, region_end, try self.offsetPtr(region_global, 8), align4) catch return error.OutOfMemory;
+                _ = wip.store(.normal, flag, context, align4) catch return error.OutOfMemory;
+                _ = wip.store(.normal, region_start, try self.offsetPtr(context, 4), align4) catch return error.OutOfMemory;
+                _ = wip.store(.normal, region_end, try self.offsetPtr(context, 8), align4) catch return error.OutOfMemory;
 
                 try self.callBuiltinVoid(
                     "roc_builtins_expect_err_str",
@@ -2440,8 +2457,10 @@ pub const MonoLlvmCodeGen = struct {
         const func = self.proc_registry.get(@intFromEnum(proc_id)) orelse return error.CompilationFailed;
         if (self.host_call_mode == .extern_symbols) {
             _ = try self.callFunctionIndex(func, &.{ self.slot(target).ptr, args_buf }, is_cold);
-        } else {
+        } else if (proc.abi == .erased_callable) {
             _ = try self.callFunctionIndex(func, &.{ self.rocOps(), self.slot(target).ptr, args_buf }, is_cold);
+        } else {
+            _ = try self.callFunctionIndex(func, &.{ self.rocOps(), self.testInvocationContext(), self.slot(target).ptr, args_buf }, is_cold);
         }
     }
 
@@ -5026,23 +5045,6 @@ pub const MonoLlvmCodeGen = struct {
         }
     }
 
-    /// Exported global the test harness reads back after an expect_err
-    /// unwind: [0] = set flag, [1] = region start offset, [2] = region end
-    /// offset. Exported (rather than carried through the host's crash
-    /// callback) because LLVM test roots run from a dlopen'd shared library,
-    /// whose linked-in builtins cannot share state with the host process.
-    fn expectErrRegionGlobal(self: *MonoLlvmCodeGen) Error!LlvmBuilder.Value {
-        if (self.expect_err_region_global) |value| return value;
-        const builder = self.builder orelse return error.CompilationFailed;
-        const arr_ty = builder.arrayType(3, .i32) catch return error.OutOfMemory;
-        const name = builder.strtabString("roc_expect_err_region") catch return error.OutOfMemory;
-        const variable = builder.addVariable(name, arr_ty, .default) catch return error.OutOfMemory;
-        variable.setInitializer(builder.zeroInitConst(arr_ty) catch return error.OutOfMemory, builder) catch return error.OutOfMemory;
-        const value = variable.toValue(builder);
-        self.expect_err_region_global = value;
-        return value;
-    }
-
     fn staticBytes(self: *MonoLlvmCodeGen, bytes: []const u8) Error!LlvmBuilder.Value {
         const builder = self.builder orelse return error.CompilationFailed;
         const actual = if (bytes.len == 0) "\x00" else bytes;
@@ -7168,6 +7170,7 @@ pub const MonoLlvmCodeGen = struct {
 
         const outer_wip = self.wip;
         const outer_roc_ops = self.roc_ops_arg;
+        const outer_test_context = self.test_context_arg;
         const outer_ret = self.ret_ptr_arg;
         const outer_args = self.args_ptr_arg;
         const outer_capture = self.capture_ptr_arg;
@@ -7176,6 +7179,7 @@ pub const MonoLlvmCodeGen = struct {
         defer {
             self.wip = outer_wip;
             self.roc_ops_arg = outer_roc_ops;
+            self.test_context_arg = outer_test_context;
             self.ret_ptr_arg = outer_ret;
             self.args_ptr_arg = outer_args;
             self.capture_ptr_arg = outer_capture;
@@ -7186,6 +7190,7 @@ pub const MonoLlvmCodeGen = struct {
         var wip = LlvmBuilder.WipFunction.init(builder, .{ .function = func, .strip = true }) catch return error.OutOfMemory;
         defer wip.deinit();
         self.wip = &wip;
+        self.test_context_arg = null;
         self.ret_ptr_arg = null;
         self.args_ptr_arg = null;
         self.capture_ptr_arg = null;
@@ -7566,6 +7571,10 @@ pub const MonoLlvmCodeGen = struct {
 
     fn rocOps(self: *MonoLlvmCodeGen) LlvmBuilder.Value {
         return self.roc_ops_arg orelse unreachable;
+    }
+
+    fn testInvocationContext(self: *MonoLlvmCodeGen) LlvmBuilder.Value {
+        return self.test_context_arg orelse unreachable;
     }
 
     fn layouts(self: *MonoLlvmCodeGen) *const layout.Store {

@@ -843,10 +843,18 @@ fn processMultiFileSnapshot(allocator: Allocator, dir_path: []const u8, config: 
 
 fn processSnapshotContent(
     allocator: Allocator,
-    content: Content,
+    input_content: Content,
     output_path: []const u8,
     config: *const Config,
 ) SnapshotError!bool {
+    var content = input_content;
+    const decoded_source = if (content.meta.source_escapes)
+        try decodeSourceEscapes(allocator, content.source)
+    else
+        null;
+    defer if (decoded_source) |source| allocator.free(source);
+    if (decoded_source) |source| content.source = source;
+
     var success = true;
     log("Generating snapshot for: {s}", .{output_path});
 
@@ -1246,7 +1254,17 @@ fn processSnapshotContent(
         };
         defer md_file.close(app_io);
 
-        try md_file.writeStreamingAll(app_io, md_buffer_unmanaged.items);
+        if (content.meta.source_escapes) {
+            var remaining = md_buffer_unmanaged.items;
+            while (std.mem.findScalar(u8, remaining, '\r')) |index| {
+                try md_file.writeStreamingAll(app_io, remaining[0..index]);
+                try md_file.writeStreamingAll(app_io, "\\r");
+                remaining = remaining[index + 1 ..];
+            }
+            try md_file.writeStreamingAll(app_io, remaining);
+        } else {
+            try md_file.writeStreamingAll(app_io, md_buffer_unmanaged.items);
+        }
 
         if (html_buffer_unmanaged) |*buf| {
             writeHtmlFile(allocator, output_path, buf) catch |err| {
@@ -1596,12 +1614,14 @@ const Meta = struct {
     node_type: NodeType,
     filename: ?[]const u8 = null,
     skip: bool = false,
+    source_escapes: bool = false,
     include_canonicalize_diagnostics: bool = false,
     include_module_validation_diagnostics: bool = false,
 
     const DESC_START: []const u8 = "description=";
     const TYPE_START: []const u8 = "type=";
     const SKIP_START: []const u8 = "skip=";
+    const SOURCE_ESCAPES_START: []const u8 = "source_escapes=";
     const CANONICALIZE_DIAGNOSTICS_START: []const u8 = "canonicalize_diagnostics=";
     const MODULE_VALIDATION_DIAGNOSTICS_START: []const u8 = "module_validation_diagnostics=";
 
@@ -1611,6 +1631,7 @@ const Meta = struct {
         var node_type: NodeType = .file;
         var filename: ?[]const u8 = null;
         var skip: bool = false;
+        var source_escapes: bool = false;
         var include_canonicalize_diagnostics: bool = false;
         var include_module_validation_diagnostics: bool = false;
         while (true) {
@@ -1628,6 +1649,8 @@ const Meta = struct {
                 }
             } else if (std.mem.startsWith(u8, line, SKIP_START)) {
                 skip = std.mem.eql(u8, line[(SKIP_START.len)..], "true");
+            } else if (std.mem.startsWith(u8, line, SOURCE_ESCAPES_START)) {
+                source_escapes = std.mem.eql(u8, line[(SOURCE_ESCAPES_START.len)..], "true");
             } else if (std.mem.startsWith(u8, line, CANONICALIZE_DIAGNOSTICS_START)) {
                 include_canonicalize_diagnostics = std.mem.eql(u8, line[(CANONICALIZE_DIAGNOSTICS_START.len)..], "true");
             } else if (std.mem.startsWith(u8, line, MODULE_VALIDATION_DIAGNOSTICS_START)) {
@@ -1640,6 +1663,7 @@ const Meta = struct {
             .node_type = node_type,
             .filename = filename,
             .skip = skip,
+            .source_escapes = source_escapes,
             .include_canonicalize_diagnostics = include_canonicalize_diagnostics,
             .include_module_validation_diagnostics = include_module_validation_diagnostics,
         };
@@ -1658,6 +1682,11 @@ const Meta = struct {
         if (self.skip) {
             try writer.writeAll("\n");
             try writer.writeAll(SKIP_START);
+            try writer.writeAll("true");
+        }
+        if (self.source_escapes) {
+            try writer.writeAll("\n");
+            try writer.writeAll(SOURCE_ESCAPES_START);
             try writer.writeAll("true");
         }
         if (self.include_canonicalize_diagnostics) {
@@ -1718,6 +1747,25 @@ const Meta = struct {
         try std.testing.expectError(Error.InvalidNodeType, meta);
     }
 };
+
+fn decodeSourceEscapes(allocator: Allocator, source: []const u8) Allocator.Error![]u8 {
+    const decoded = try allocator.alloc(u8, source.len);
+    var source_index: usize = 0;
+    var decoded_len: usize = 0;
+
+    while (source_index < source.len) {
+        if (source[source_index] == '\\' and source_index + 1 < source.len and source[source_index + 1] == 'r') {
+            decoded[decoded_len] = '\r';
+            source_index += 2;
+        } else {
+            decoded[decoded_len] = source[source_index];
+            source_index += 1;
+        }
+        decoded_len += 1;
+    }
+
+    return allocator.realloc(decoded, decoded_len);
+}
 
 /// Content of a snapshot file, references the Metadata and Source sections etc
 pub const Content = struct {
@@ -3488,9 +3536,9 @@ fn processDocsSnapshot(
     }
 
     for (modules) |mod| {
-        // Docs show the alias the root uses for a package, not its internal
-        // identity name (full URL or absolute path).
-        const display_pkg_name = build_env.rootAliasForPackage(mod.package_name) orelse mod.package_name;
+        // Docs show display names (root alias, or "app"/"module" for the
+        // root itself), never internal identity keys (URLs, absolute paths).
+        const display_pkg_name = build_env.displayNameForPackage(mod.package_name);
         var mod_docs = docs_mod.extract.extractModuleDocs(allocator, mod.semantic.env, display_pkg_name, mod.path) catch |err| {
             std.log.err("Failed to extract docs from module {s}: {}", .{ mod.name, err });
             continue;
@@ -4417,6 +4465,7 @@ fn compileSnapshotReplInspectedModule(
                 .indices = bm.builtin_indices,
                 .artifact = &bm.checked_artifact,
             },
+            null,
         );
     }
     return eval_mod.test_helpers.compileInspectedProgram(allocator, app_io, .module, source, &.{});

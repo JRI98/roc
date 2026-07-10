@@ -27,8 +27,8 @@ UNUSED VARIABLE - record_field_name_cannot_be_var.md:3:8:3:10
  │                ‾‾‾‾‾‾                                                      │
  └─────────────────────────────────── record_field_name_cannot_be_var.md:1:15 ┘
 
-    Names that start with $ are reassignable variables declared with the `var`
-    keyword, so they cannot be used as record field names.
+    Names that start with `$` are reassignable variables declared with the
+    `var` keyword, so they cannot be used as record field names.
 
 
 ┌───────────────────────────┐
@@ -39,8 +39,8 @@ UNUSED VARIABLE - record_field_name_cannot_be_var.md:3:8:3:10
  │         ‾‾                                                                 │
  └──────────────────────────────────── record_field_name_cannot_be_var.md:3:8 ┘
 
-    Names that start with $ are reassignable variables declared with the `var`
-    keyword, so they cannot be used as record field names.
+    Names that start with `$` are reassignable variables declared with the
+    `var` keyword, so they cannot be used as record field names.
 
 
 ┌───────────────────────────┐
@@ -51,8 +51,8 @@ UNUSED VARIABLE - record_field_name_cannot_be_var.md:3:8:3:10
  │        ‾‾                                                                  │
  └──────────────────────────────────── record_field_name_cannot_be_var.md:5:7 ┘
 
-    Names that start with $ are reassignable variables declared with the `var`
-    keyword, so they cannot be used as record field names.
+    Names that start with `$` are reassignable variables declared with the
+    `var` keyword, so they cannot be used as record field names.
 
 
 ┌─────────────────┐

@@ -324,10 +324,10 @@ fn cleanMergedBuiltinDefinitions(module: *bindings.Module, app_defs: *const std.
     }
 }
 
-/// `LLVMProtectedVisibility`: the symbol stays exported (so the harness can look
-/// up entry points and `roc_expect_err_region`) but is non-preemptible, so
-/// intra-image references compile to direct PC-relative accesses instead of
-/// GOT/PLT slots needing a runtime relocation.
+/// `LLVMProtectedVisibility`: the symbol stays exported so the harness can look
+/// up entry points, but is non-preemptible, so intra-image references compile to
+/// direct PC-relative accesses instead of GOT/PLT slots needing a runtime
+/// relocation.
 const llvm_protected_visibility: c_int = 2;
 
 /// Make every definition in the merged module non-preemptible so the in-process
@@ -396,14 +396,50 @@ fn emitMergedBitcodeToObjectFile(
     options: CompileOptions,
     output_path: [:0]const u8,
 ) Error!void {
+    try emitMergedBitcodeModulesToObjectFile(allocator, io, &.{bitcode}, options, output_path);
+}
+
+fn parseBitcodeModule(
+    context: *bindings.Context,
+    bitcode: []const u32,
+    name: [*:0]const u8,
+) Error!*bindings.Module {
     // Convert u32 slice to u8 slice for the bindings
     const bitcode_bytes: []const u8 = @as([*]const u8, @ptrCast(bitcode.ptr))[0 .. bitcode.len * 4];
 
+    const mem_buf = bindings.MemoryBuffer.createMemoryBufferWithMemoryRange(
+        bitcode_bytes.ptr,
+        bitcode_bytes.len,
+        name,
+        bindings.Bool.False,
+    );
+
+    var module: *bindings.Module = undefined;
+    if (context.parseBitcodeInContext2(mem_buf, &module).toBool()) {
+        mem_buf.dispose();
+        return Error.BitcodeParseError;
+    }
+    // Note: mem_buf is consumed by parseBitcodeInContext2
+    return module;
+}
+
+fn emitMergedBitcodeModulesToObjectFile(
+    allocator: Allocator,
+    io: std.Io,
+    bitcodes: []const []const u32,
+    options: CompileOptions,
+    output_path: [:0]const u8,
+) Error!void {
+    if (bitcodes.len == 0) return Error.CompilationFailed;
+
     if (comptime build_options.llvm_keep_bitcode.len != 0) {
-        std.Io.Dir.cwd().writeFile(io, .{
-            .sub_path = build_options.llvm_keep_bitcode,
-            .data = bitcode_bytes,
-        }) catch {};
+        if (bitcodes.len == 1) {
+            const bitcode_bytes: []const u8 = @as([*]const u8, @ptrCast(bitcodes[0].ptr))[0 .. bitcodes[0].len * 4];
+            std.Io.Dir.cwd().writeFile(io, .{
+                .sub_path = build_options.llvm_keep_bitcode,
+                .data = bitcode_bytes,
+            }) catch {};
+        }
     }
 
     // Initialize all targets
@@ -413,22 +449,18 @@ fn emitMergedBitcodeToObjectFile(
     const context = bindings.Context.create();
     defer context.dispose();
 
-    // Create memory buffer from bitcode
-    const mem_buf = bindings.MemoryBuffer.createMemoryBufferWithMemoryRange(
-        bitcode_bytes.ptr,
-        bitcode_bytes.len,
-        "roc_bitcode",
-        bindings.Bool.False,
-    );
-
-    // Parse bitcode into module
-    var module: *bindings.Module = undefined;
-    if (context.parseBitcodeInContext2(mem_buf, &module).toBool()) {
-        mem_buf.dispose();
-        return Error.BitcodeParseError;
-    }
+    var module = try parseBitcodeModule(context, bitcodes[0], "roc_bitcode_0");
     defer module.dispose();
-    // Note: mem_buf is consumed by parseBitcodeInContext2
+
+    for (bitcodes[1..], 1..) |bitcode, index| {
+        var name_buf: [64]u8 = undefined;
+        const name = std.fmt.bufPrintZ(&name_buf, "roc_bitcode_{d}", .{index}) catch return Error.OutOfMemory;
+        const next_module = try parseBitcodeModule(context, bitcode, name.ptr);
+        if (module.link(next_module).toBool()) {
+            return Error.ModuleLinkFailed;
+        }
+        // Note: next_module is now invalid - do NOT dispose it.
+    }
 
     const triple, const dispose_triple = blk: {
         if (options.use_module_target_triple) {
@@ -617,6 +649,14 @@ pub fn compileToObject(allocator: Allocator, io: std.Io, bitcode: []const u32, o
 /// Compile LLVM bitcode to a native shared library and return its path.
 /// Caller owns the returned path and is responsible for deleting the file.
 pub fn compileToSharedLibrary(allocator: Allocator, io: std.Io, bitcode: []const u32, options: CompileOptions) Error![:0]const u8 {
+    return compileBitcodeModulesToSharedLibrary(allocator, io, &.{bitcode}, options);
+}
+
+/// Compile LLVM bitcode modules to one native shared library and return its path.
+/// The modules are linked together before Roc builtins are merged, so the final
+/// native link sees one object and one copy of the builtin definitions.
+/// Caller owns the returned path and is responsible for deleting the file.
+pub fn compileBitcodeModulesToSharedLibrary(allocator: Allocator, io: std.Io, bitcodes: []const []const u32, options: CompileOptions) Error![:0]const u8 {
     const object_path = createTempPath(allocator, io, objectExtension()) catch return Error.TempFileError;
     defer {
         std.Io.Dir.cwd().deleteFile(io, std.mem.sliceTo(object_path, 0)) catch {};
@@ -638,7 +678,7 @@ pub fn compileToSharedLibrary(allocator: Allocator, io: std.Io, bitcode: []const
     };
     pic_options.lower_memory_intrinsics_to_loops = pic_options.no_target_libcalls;
 
-    try emitMergedBitcodeToObjectFile(allocator, io, bitcode, pic_options, object_path);
+    try emitMergedBitcodeModulesToObjectFile(allocator, io, bitcodes, pic_options, object_path);
 
     if (comptime build_options.llvm_keep_object.len != 0) {
         std.Io.Dir.cwd().copyFile(
@@ -651,6 +691,7 @@ pub fn compileToSharedLibrary(allocator: Allocator, io: std.Io, bitcode: []const
     }
 
     try linkSharedLibrary(allocator, io, object_path, shared_lib_path);
+    recordSharedLibraryLinkForTest(allocator, io);
 
     if (comptime build_options.llvm_keep_dylib.len != 0) {
         std.Io.Dir.cwd().copyFile(
@@ -663,6 +704,29 @@ pub fn compileToSharedLibrary(allocator: Allocator, io: std.Io, bitcode: []const
     }
 
     return shared_lib_path;
+}
+
+fn recordSharedLibraryLinkForTest(allocator: Allocator, io: std.Io) void {
+    const path_key = allocator.dupeZ(u8, "ROC_TEST_LLVM_SHARED_LINK_COUNT_FILE") catch return;
+    defer allocator.free(path_key);
+
+    const path_z = std.c.getenv(path_key) orelse return;
+    const path = allocator.dupe(u8, path_z[0..std.mem.len(path_z)]) catch return;
+    defer allocator.free(path);
+
+    const existing_owned = std.Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(1024 * 1024)) catch |err| switch (err) {
+        error.FileNotFound => null,
+        else => return,
+    };
+    defer if (existing_owned) |bytes| allocator.free(bytes);
+    const existing = existing_owned orelse "";
+
+    var contents = std.ArrayList(u8).empty;
+    defer contents.deinit(allocator);
+    contents.appendSlice(allocator, existing) catch return;
+    contents.appendSlice(allocator, "1\n") catch return;
+
+    std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = contents.items }) catch {};
 }
 
 fn linkSharedLibrary(

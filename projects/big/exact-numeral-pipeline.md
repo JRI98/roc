@@ -111,13 +111,14 @@ checking; decide the default in one module; produce bits exactly once.
    text. Canonicalization stores this payload; checking never converts it
    to a concrete representation.
 2. **One defaulting oracle**: a module owning "given this literal group's
-   constraints, what type does it default to?" — the logic now smeared
-   across `dominantLiteralKind` + the six sites above. Migration: every
-   current site calls the oracle first (behavior-preserving); then the
-   sites collapse — `flexLiteralDefaultKind` and
-   `numericDefaultPhaseForConstraints` become thin calls or disappear, and
-   the "MUST agree" comment is deleted because there is nothing left to
-   agree.
+   constraints, what type does it default to?" — the logic previously
+   smeared across `dominantLiteralKind` + the six sites above. LANDED as
+   src/types/literal_defaulting.zig: it owns the kind precedence, the
+   default targets, the candidate order, and the mono default-phase
+   classification. `dominantLiteralKind` and the "MUST agree" comment are
+   deleted; `flexLiteralDefaultKind` and `numericDefaultPhaseForFlex` are
+   thin calls into the oracle; the decision machinery is one engine
+   (`runLiteralDefaultingRounds`) invoked from `finalizeTypes` (see 5).
 3. **Range/fit validation from exact facts**: one function `fits(exact,
    target_type) -> bool` computed on limbs (digit-count prefilter + u128
    checked arithmetic, per 9760). It runs whenever the concrete type
@@ -137,8 +138,17 @@ checking; decide the default in one module; produce bits exactly once.
    `numeralLiteralDecimalText`.
 5. **Ordering interaction**: static-dispatch plan finalization requires a
    single type-finalization point; defaulting must be complete before
-   dispatch plans freeze, so the oracle runs as part of that finalization
-   point, not scattered across generalization boundaries.
+   dispatch plans freeze. LANDED as `Check.finalizeTypes` — every checking
+   entry point (module check and both REPL flavors) finalizes literal
+   defaults and runs the final-type validations through that one function.
+   The per-def `defaultLiteralsAtGeneralizationBoundary` invocations remain
+   by design: they run the SAME engine under the SAME oracle, but must
+   fire before a def's ranks are promoted to generalized (the
+   let-polymorphism filter and the LITERAL DEFAULTED leak warning read
+   pre-promotion ranks and per-boundary signature reachability, which no
+   post-generalization pass can reconstruct). "One decision point" means
+   one policy and one engine; the boundary calls are rank-constrained
+   invocations of it, not a second decision-maker.
 
 Unrepresentable literals become check-time errors at step 3; lowering-time
 panics for representability are deleted, not relocated.

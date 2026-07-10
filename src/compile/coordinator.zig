@@ -429,6 +429,7 @@ pub const ModuleState = struct {
     module_role: ModuleEnv.ModuleRole = .user,
     /// Top-level names that package metadata requires as compile-time roots.
     explicit_root_ident_names: []const []const u8 = &.{},
+    validate_as_explicit_roots: bool = false,
     /// Owned semantic module payload. Earlier phases populate only `module_env`;
     /// type checking later fills in the checked artifact.
     semantic: ?OwnedSemanticModuleData = null,
@@ -713,13 +714,6 @@ pub const PackageState = struct {
         self.root_file_state = state;
     }
 
-    pub fn urlId(self: *const PackageState) ?[]const u8 {
-        if (self.url) |url| {
-            return url.urlId();
-        }
-        return null;
-    }
-
     /// Ensure a module exists, creating it if necessary
     pub fn ensureModule(self: *PackageState, gpa: Allocator, name: []const u8, path: []const u8) Allocator.Error!ModuleId {
         if (self.module_names.get(name)) |id| {
@@ -905,6 +899,9 @@ pub const Coordinator = struct {
     /// compiling an app. This is role metadata; package identity itself still
     /// comes from package_identity.zig.
     app_package_name: ?[]const u8,
+    /// True when the build's root is not an app, recorded explicitly so the
+    /// hosted transform never has to guess whether an app exists.
+    app_package_absent: bool,
 
     /// Shared read-only builtin modules
     builtin_modules: *const BuiltinModules,
@@ -1012,6 +1009,7 @@ pub const Coordinator = struct {
             .worker_oom = std.atomic.Value(bool).init(false),
             .total_remaining = 0,
             .app_package_name = null,
+            .app_package_absent = false,
             .builtin_modules = builtin_modules,
             .roc_ctx = roc_ctx,
             .compiler_version = compiler_version,
@@ -1120,6 +1118,14 @@ pub const Coordinator = struct {
         self.app_package_name = package_name;
     }
 
+    /// Record that this build has no app package (its root is a platform,
+    /// package, or plain module). The hosted transform consumes this as
+    /// explicit data: with no app to exclude, every module takes the
+    /// transform.
+    pub fn markNoAppPackage(self: *Coordinator) void {
+        self.app_package_absent = true;
+    }
+
     /// Set the I/O / core context implementation. Callers must supply a fully
     /// initialised `CoreCtx` — it must not create a replacement
     /// `CoreCtx.default(...)` here because the existing context may have been
@@ -1209,10 +1215,6 @@ pub const Coordinator = struct {
         entry_path: []const u8,
         /// Optional override for the app module's `source_dir_override`.
         source_dir_override: ?[]const u8 = null,
-        /// Use the synthetic app identity for compiler-generated default-app roots.
-        synthetic_root_identity: bool = false,
-        /// Use the synthetic platform identity for compiler-generated default platforms.
-        synthetic_platform_identity: bool = false,
     };
 
     pub const AppDiscoveryError = error{
@@ -1249,9 +1251,9 @@ pub const Coordinator = struct {
         const app_identity = try package_identity.packageIdentityFor(
             self.gpa,
             self.roc_ctx,
-            if (opts.synthetic_root_identity) .synthetic_app else .{ .local_path = opts.entry_path },
+            .{ .local_path = opts.entry_path },
         );
-        defer self.gpa.free(@constCast(app_identity));
+        defer self.gpa.free(app_identity);
 
         const app_pkg = try self.ensurePackage(app_identity, app_dir);
         self.markAppPackage(app_pkg.name);
@@ -1275,9 +1277,7 @@ pub const Coordinator = struct {
             const platform_main_path = try std.fs.path.join(arena, &.{ app_dir, header_info.platform_spec });
             const platform_dir = std.fs.path.dirname(platform_main_path) orelse return error.InvalidPlatformPath;
 
-            try self.registerPlatformPackageWithOptions(app_pkg, platform_dir, platform_main_path, header_info.platform_qualifier, null, .{
-                .synthetic_identity = opts.synthetic_platform_identity,
-            });
+            try self.registerPlatformPackageWithUrl(app_pkg, platform_dir, platform_main_path, header_info.platform_qualifier, null);
         }
 
         for (header_info.non_platform_packages) |entry| {
@@ -1292,22 +1292,8 @@ pub const Coordinator = struct {
         try self.enqueueParseTask(app_pkg.name, app_module_id);
     }
 
-    const PlatformIdentityOptions = struct {
-        synthetic_identity: bool = false,
-    };
-
     /// Register the platform package, wire the app's shorthand for it, ensure
     /// the platform's main module, and enqueue its parse task.
-    pub fn registerPlatformPackage(
-        self: *Coordinator,
-        app_pkg: *PackageState,
-        platform_dir: []const u8,
-        platform_main_path: []const u8,
-        qualifier: ?[]const u8,
-    ) package_identity.PackageIdentityError!void {
-        return self.registerPlatformPackageWithOptions(app_pkg, platform_dir, platform_main_path, qualifier, null, .{});
-    }
-
     pub fn registerPlatformPackageWithUrl(
         self: *Coordinator,
         app_pkg: *PackageState,
@@ -1316,29 +1302,15 @@ pub const Coordinator = struct {
         qualifier: ?[]const u8,
         url: ?package_source.UrlSourceView,
     ) package_identity.PackageIdentityError!void {
-        return self.registerPlatformPackageWithOptions(app_pkg, platform_dir, platform_main_path, qualifier, url, .{});
-    }
-
-    fn registerPlatformPackageWithOptions(
-        self: *Coordinator,
-        app_pkg: *PackageState,
-        platform_dir: []const u8,
-        platform_main_path: []const u8,
-        qualifier: ?[]const u8,
-        url: ?package_source.UrlSourceView,
-        options: PlatformIdentityOptions,
-    ) package_identity.PackageIdentityError!void {
         const platform_identity = try package_identity.packageIdentityFor(
             self.gpa,
             self.roc_ctx,
-            if (options.synthetic_identity)
-                .synthetic_platform
-            else if (url) |url_view|
+            if (url) |url_view|
                 .{ .url = url_view.url }
             else
                 .{ .local_path = platform_main_path },
         );
-        defer self.gpa.free(@constCast(platform_identity));
+        defer self.gpa.free(platform_identity);
 
         const pf_pkg = try self.ensurePackageWithUrl(platform_identity, platform_dir, url);
         self.markPlatformPackage(pf_pkg.name);
@@ -1381,11 +1353,9 @@ pub const Coordinator = struct {
         shorthand_on_app: ?[]const u8,
         url: ?package_source.UrlSourceView,
     ) package_identity.PackageIdentityError!*PackageState {
-        const identity = if (url) |url_view|
-            try package_identity.packageIdentityFor(self.gpa, self.roc_ctx, .{ .url = url_view.url })
-        else
-            try self.gpa.dupe(u8, package_identity_value);
-        defer self.gpa.free(@constCast(identity));
+        // For URL packages the resolved URL is the identity; `ensurePackageWithUrl`
+        // dupes whichever identity it stores, so no temporary copy is needed.
+        const identity = if (url) |url_view| url_view.url else package_identity_value;
 
         const pkg = try self.ensurePackageWithUrl(identity, package_root_dir, url);
         if (app_pkg) |a| {
@@ -1407,7 +1377,7 @@ pub const Coordinator = struct {
         shorthand_on_app: ?[]const u8,
     ) package_identity.PackageIdentityError!*PackageState {
         const identity = try package_identity.packageIdentityFor(self.gpa, self.roc_ctx, .{ .local_path = package_root_file });
-        defer self.gpa.free(@constCast(identity));
+        defer self.gpa.free(identity);
         return self.registerInlinePackage(identity, package_root_dir, app_pkg, shorthand_on_app);
     }
 
@@ -1629,13 +1599,10 @@ pub const Coordinator = struct {
 
         try appendImportedArtifactViewIfMissing(&views, allocator, root_artifact.key, &self.builtin_modules.checked_artifact);
 
-        for (root_artifact.direct_import_artifact_keys) |key| {
+        for (root_artifact.lowering_visibility.module_ids) |key| {
+            if (rootRelationContainsArtifact(root_artifact, key)) continue;
             try self.appendPublicApiDependencyViewByKey(&views, allocator, root_artifact, key);
         }
-        for (root_artifact.public_api_dependencies.artifacts) |key| {
-            try self.appendPublicApiDependencyViewByKey(&views, allocator, root_artifact, key);
-        }
-        try self.appendRelationClosureDependencyViews(&views, allocator, root_artifact);
 
         return try views.toOwnedSlice(allocator);
     }
@@ -1712,424 +1679,6 @@ pub const Coordinator = struct {
         return false;
     }
 
-    fn appendRelationClosureDependencyViews(
-        self: *Coordinator,
-        views: *std.ArrayList(CheckedArtifact.ImportedModuleView),
-        allocator: Allocator,
-        root_artifact: *const CheckedArtifact.CheckedModuleArtifact,
-    ) Allocator.Error!void {
-        var relation_views = std.ArrayList(CheckedArtifact.ImportedModuleView).empty;
-        defer relation_views.deinit(allocator);
-
-        for (root_artifact.platform_required_bindings.bindings) |binding| {
-            const relation_artifact = self.checkedArtifactByKey(binding.app_value.artifact) orelse {
-                if (builtin.mode == .Debug) {
-                    std.debug.panic("compile.coordinator invariant violated: platform relation references unavailable app artifact", .{});
-                }
-                unreachable;
-            };
-            try appendImportedArtifactViewIfMissing(&relation_views, allocator, root_artifact.key, relation_artifact);
-        }
-
-        var dependency_collector = RelationLoweringDependencyCollector.init(
-            self,
-            allocator,
-            root_artifact.key,
-            CheckedArtifact.importedView(root_artifact),
-            relation_views.items,
-            views,
-        );
-        defer dependency_collector.deinit();
-
-        for (root_artifact.platform_required_bindings.bindings) |binding| {
-            const relation_view = relationViewByKey(relation_views.items, binding.app_value.artifact) orelse {
-                if (builtin.mode == .Debug) {
-                    std.debug.panic("compile.coordinator invariant violated: platform relation view was not collected", .{});
-                }
-                unreachable;
-            };
-            try dependency_collector.appendPlatformRelationDependency(
-                relation_view,
-                binding,
-                root_artifact.platform_required_bindings.relationClosure(binding),
-            );
-        }
-    }
-
-    const RelationLoweringDependencyCollector = struct {
-        coordinator: *Coordinator,
-        allocator: Allocator,
-        root_key: CheckedArtifact.CheckedModuleArtifactKey,
-        root_view: ?CheckedArtifact.ImportedModuleView,
-        relation_artifacts: []const CheckedArtifact.ImportedModuleView,
-        views: *std.ArrayList(CheckedArtifact.ImportedModuleView),
-        visited_public_api: std.AutoHashMap(CheckedArtifact.CheckedModuleArtifactKey, void),
-        visited_templates: std.AutoHashMap(canonical.ProcedureTemplateRef, void),
-        visited_consts: std.AutoHashMap(CheckedArtifact.ConstRef, void),
-        visited_callable_eval_templates: std.AutoHashMap(CheckedArtifact.ArtifactCallableEvalTemplateRef, void),
-
-        fn init(
-            coordinator: *Coordinator,
-            allocator: Allocator,
-            root_key: CheckedArtifact.CheckedModuleArtifactKey,
-            root_view: ?CheckedArtifact.ImportedModuleView,
-            relation_artifacts: []const CheckedArtifact.ImportedModuleView,
-            views: *std.ArrayList(CheckedArtifact.ImportedModuleView),
-        ) RelationLoweringDependencyCollector {
-            return .{
-                .coordinator = coordinator,
-                .allocator = allocator,
-                .root_key = root_key,
-                .root_view = root_view,
-                .relation_artifacts = relation_artifacts,
-                .views = views,
-                .visited_public_api = std.AutoHashMap(CheckedArtifact.CheckedModuleArtifactKey, void).init(allocator),
-                .visited_templates = std.AutoHashMap(canonical.ProcedureTemplateRef, void).init(allocator),
-                .visited_consts = std.AutoHashMap(CheckedArtifact.ConstRef, void).init(allocator),
-                .visited_callable_eval_templates = std.AutoHashMap(CheckedArtifact.ArtifactCallableEvalTemplateRef, void).init(allocator),
-            };
-        }
-
-        fn deinit(self: *RelationLoweringDependencyCollector) void {
-            self.visited_callable_eval_templates.deinit();
-            self.visited_consts.deinit();
-            self.visited_templates.deinit();
-            self.visited_public_api.deinit();
-        }
-
-        fn appendPlatformRelationDependency(
-            self: *RelationLoweringDependencyCollector,
-            relation_artifact: CheckedArtifact.ImportedModuleView,
-            binding: CheckedArtifact.PlatformRequiredBinding,
-            binding_relation_closure: CheckedArtifact.ImportedTemplateClosureView,
-        ) Allocator.Error!void {
-            try self.appendClosure(binding_relation_closure);
-            try self.appendRelationArtifactExportedValueClosure(relation_artifact, binding);
-        }
-
-        fn appendClosure(
-            self: *RelationLoweringDependencyCollector,
-            closure: CheckedArtifact.ImportedTemplateClosureView,
-        ) Allocator.Error!void {
-            for (closure.checked_bodies) |value| try self.appendArtifactKey(value.artifact);
-            for (closure.checked_type_roots) |value| try self.appendArtifactKey(value.artifact);
-            for (closure.checked_type_schemes) |value| try self.appendArtifactKey(value.artifact);
-            for (closure.checked_callable_bodies) |value| try self.appendArtifactKey(value.artifact);
-            for (closure.checked_const_bodies) |value| try self.appendArtifactKey(value.artifact);
-            for (closure.checked_procedure_templates) |value| try self.appendProcedureTemplateRef(value);
-            for (closure.callable_eval_templates) |value| try self.appendCallableEvalTemplateRef(value);
-            for (closure.const_templates) |value| try self.appendConstRef(value);
-            for (closure.nested_proc_sites) |value| try self.appendArtifactKey(value.artifact);
-            for (closure.resolved_value_refs) |value| try self.appendArtifactKey(value.artifact);
-            for (closure.static_dispatch_plans) |value| try self.appendArtifactKey(value.artifact);
-            for (closure.interface_capabilities) |value| try self.appendArtifactKey(value.artifact);
-        }
-
-        fn appendArtifactKey(
-            self: *RelationLoweringDependencyCollector,
-            key: CheckedArtifact.CheckedModuleArtifactKey,
-        ) Allocator.Error!void {
-            if (checkedArtifactKeyEql(key, self.root_key)) return;
-
-            const view = self.viewForKey(key);
-            if (!self.relationArtifactContainsKey(key)) {
-                try self.appendViewIfMissing(view);
-            }
-            try self.appendPublicApiDependenciesForView(view);
-        }
-
-        fn appendViewIfMissing(
-            self: *RelationLoweringDependencyCollector,
-            view: CheckedArtifact.ImportedModuleView,
-        ) Allocator.Error!void {
-            if (checkedArtifactKeyEql(view.key, self.root_key)) return;
-            if (self.relationArtifactContainsKey(view.key)) return;
-            if (importedArtifactViewExists(self.views.items, view.key)) return;
-            try self.views.append(self.allocator, view);
-        }
-
-        fn appendPublicApiDependenciesForView(
-            self: *RelationLoweringDependencyCollector,
-            view: CheckedArtifact.ImportedModuleView,
-        ) Allocator.Error!void {
-            const entry = try self.visited_public_api.getOrPut(view.key);
-            if (entry.found_existing) return;
-            entry.value_ptr.* = {};
-
-            for (view.public_api_dependencies.artifacts) |dependency_key| {
-                try self.appendArtifactKey(dependency_key);
-            }
-        }
-
-        fn appendProcedureTemplateRef(
-            self: *RelationLoweringDependencyCollector,
-            template_ref: canonical.ProcedureTemplateRef,
-        ) Allocator.Error!void {
-            const key = checkedArtifactKeyFromArtifactRef(template_ref.artifact);
-            try self.appendArtifactKey(key);
-
-            const entry = try self.visited_templates.getOrPut(template_ref);
-            if (entry.found_existing) return;
-            entry.value_ptr.* = {};
-
-            const view = self.viewForKey(key);
-            const index: usize = @intFromEnum(template_ref.template);
-            if (index >= view.checked_procedure_templates.templates.len) {
-                coordinatorInvariant("relation lowering dependency referenced missing checked procedure template", .{});
-            }
-            const template = view.checked_procedure_templates.get(template_ref.template);
-            if (template.proc_base != template_ref.proc_base) {
-                coordinatorInvariant("relation lowering dependency procedure template ref disagreed with template row", .{});
-            }
-            try self.appendResolvedValueRefs(view, template.resolved_value_refs);
-        }
-
-        fn appendCallableEvalTemplateRef(
-            self: *RelationLoweringDependencyCollector,
-            template_ref: CheckedArtifact.ArtifactCallableEvalTemplateRef,
-        ) Allocator.Error!void {
-            try self.appendArtifactKey(template_ref.artifact);
-
-            const entry = try self.visited_callable_eval_templates.getOrPut(template_ref);
-            if (entry.found_existing) return;
-            entry.value_ptr.* = {};
-
-            const view = self.viewForKey(template_ref.artifact);
-            const index: usize = @intFromEnum(template_ref.template);
-            if (index >= view.callable_eval_templates.templates.len) {
-                coordinatorInvariant("relation lowering dependency referenced missing callable-eval template", .{});
-            }
-            const template = view.callable_eval_templates.templates[index];
-            const wrapper = view.entry_wrappers.lookupByRoot(template.root) orelse {
-                coordinatorInvariant("relation lowering dependency callable-eval template had no entry wrapper", .{});
-            };
-            try self.appendProcedureTemplateRef(wrapper.template);
-        }
-
-        fn appendConstRef(
-            self: *RelationLoweringDependencyCollector,
-            const_ref: CheckedArtifact.ConstRef,
-        ) Allocator.Error!void {
-            try self.appendArtifactKey(const_ref.artifact);
-
-            const entry = try self.visited_consts.getOrPut(const_ref);
-            if (entry.found_existing) return;
-            entry.value_ptr.* = {};
-
-            const view = self.viewForKey(const_ref.artifact);
-            const template = view.const_templates.get(const_ref);
-            switch (template.state) {
-                .eval_template => |eval_template| {
-                    try self.appendResolvedValueRefs(view, eval_template.resolved_value_refs);
-                    try self.appendProcedureTemplateRef(eval_template.entry_template);
-                },
-                .stored_const => {},
-                .reserved => coordinatorInvariant("relation lowering dependency reached unsealed const template", .{}),
-            }
-        }
-
-        fn appendResolvedValueRefs(
-            self: *RelationLoweringDependencyCollector,
-            view: CheckedArtifact.ImportedModuleView,
-            table: CheckedArtifact.ResolvedValueRefTableRef,
-        ) Allocator.Error!void {
-            const end = table.start + table.len;
-            if (end > view.resolved_value_refs.template_refs.len) {
-                coordinatorInvariant("relation lowering dependency resolved-ref span was outside table", .{});
-            }
-            for (view.resolved_value_refs.template_refs[table.start..end]) |ref_id| {
-                const raw = @intFromEnum(ref_id);
-                if (raw >= view.resolved_value_refs.records.len) {
-                    coordinatorInvariant("relation lowering dependency resolved-ref id was outside table", .{});
-                }
-                try self.appendResolvedValueRef(view, view.resolved_value_refs.records[raw].ref);
-            }
-        }
-
-        fn appendResolvedValueRef(
-            self: *RelationLoweringDependencyCollector,
-            view: CheckedArtifact.ImportedModuleView,
-            ref: CheckedArtifact.ResolvedValueRef,
-        ) Allocator.Error!void {
-            switch (ref) {
-                .top_level_const,
-                .imported_const,
-                => |const_use| try self.appendConstRef(const_use.const_ref),
-                .selected_hoisted_const => |selected| try self.appendConstRef(selected.const_use.const_ref),
-                .top_level_proc,
-                .imported_proc,
-                .hosted_proc,
-                .promoted_top_level_proc,
-                => |procedure| try self.appendProcedureUse(procedure),
-                .platform_required_const => |required| {
-                    try self.appendConstRef(required.const_use.const_ref);
-                    try self.appendPlatformRequiredBindingClosure(view, required.binding);
-                },
-                .platform_required_proc => |required| {
-                    try self.appendProcedureUse(required.procedure);
-                    try self.appendPlatformRequiredBindingClosure(view, required.binding);
-                },
-                .local_param,
-                .local_value,
-                .local_mutable_version,
-                .pattern_binder,
-                .local_proc,
-                .platform_required_declaration,
-                => {},
-            }
-        }
-
-        fn appendProcedureUse(
-            self: *RelationLoweringDependencyCollector,
-            procedure: CheckedArtifact.ProcedureUseTemplate,
-        ) Allocator.Error!void {
-            switch (procedure.binding) {
-                .top_level => |top_level| try self.appendTopLevelProcedureBinding(top_level),
-                .imported => |imported| try self.appendImportedProcedureBinding(imported),
-                .hosted => |hosted| try self.appendProcedureTemplateRef(hosted.template),
-                .platform_required => |required| try self.appendArtifactKey(required.artifact),
-            }
-        }
-
-        fn appendTopLevelProcedureBinding(
-            self: *RelationLoweringDependencyCollector,
-            binding_ref: CheckedArtifact.ArtifactTopLevelProcedureBindingRef,
-        ) Allocator.Error!void {
-            try self.appendArtifactKey(binding_ref.artifact);
-            const view = self.viewForKey(binding_ref.artifact);
-            const binding = view.top_level_procedure_bindings.get(binding_ref.binding);
-            try self.appendProcedureBindingBody(binding_ref.artifact, binding.body);
-        }
-
-        fn appendProcedureBindingBody(
-            self: *RelationLoweringDependencyCollector,
-            owner_key: CheckedArtifact.CheckedModuleArtifactKey,
-            body: CheckedArtifact.ProcedureBindingBody,
-        ) Allocator.Error!void {
-            switch (body) {
-                .direct_template => |direct| try self.appendCallableProcedureTemplateRef(direct.template),
-                .callable_eval_template => |template| try self.appendCallableEvalTemplateRef(.{
-                    .artifact = owner_key,
-                    .template = template,
-                }),
-            }
-        }
-
-        fn appendCallableProcedureTemplateRef(
-            self: *RelationLoweringDependencyCollector,
-            template: canonical.CallableProcedureTemplateRef,
-        ) Allocator.Error!void {
-            switch (template) {
-                .checked => |checked| try self.appendProcedureTemplateRef(checked),
-                .synthetic => |synthetic| try self.appendProcedureTemplateRef(synthetic.template),
-                .lifted => coordinatorInvariant("relation lowering dependency reached lifted procedure template before mono", .{}),
-            }
-        }
-
-        fn appendImportedProcedureBinding(
-            self: *RelationLoweringDependencyCollector,
-            binding_ref: CheckedArtifact.ImportedProcedureBindingRef,
-        ) Allocator.Error!void {
-            try self.appendArtifactKey(binding_ref.artifact);
-            const view = self.viewForKey(binding_ref.artifact);
-            for (view.exported_procedure_bindings.bindings) |binding| {
-                if (binding.binding.def != binding_ref.def or binding.binding.pattern != binding_ref.pattern) continue;
-                try self.appendClosure(view.exported_procedure_bindings.rowClosure(binding));
-                try self.appendImportedProcedureBindingBody(binding_ref.artifact, binding.body);
-                return;
-            }
-            coordinatorInvariant("relation lowering dependency imported procedure had no exported binding closure", .{});
-        }
-
-        fn appendImportedProcedureBindingBody(
-            self: *RelationLoweringDependencyCollector,
-            owner_key: CheckedArtifact.CheckedModuleArtifactKey,
-            body: CheckedArtifact.ImportedProcedureBindingBody,
-        ) Allocator.Error!void {
-            switch (body) {
-                .direct_template => |direct| try self.appendCallableProcedureTemplateRef(direct.template),
-                .callable_eval_template => |template| try self.appendCallableEvalTemplateRef(.{
-                    .artifact = owner_key,
-                    .template = template,
-                }),
-            }
-        }
-
-        fn appendPlatformRequiredBindingClosure(
-            self: *RelationLoweringDependencyCollector,
-            view: CheckedArtifact.ImportedModuleView,
-            binding_id: CheckedArtifact.PlatformRequiredBindingId,
-        ) Allocator.Error!void {
-            const binding = view.platform_required_bindings.lookupByBindingId(@intFromEnum(binding_id)) orelse {
-                coordinatorInvariant("relation lowering dependency referenced missing platform-required binding", .{});
-            };
-            try self.appendClosure(view.platform_required_bindings.relationClosure(binding));
-        }
-
-        fn appendRelationArtifactExportedValueClosure(
-            self: *RelationLoweringDependencyCollector,
-            relation_artifact: CheckedArtifact.ImportedModuleView,
-            binding: CheckedArtifact.PlatformRequiredBinding,
-        ) Allocator.Error!void {
-            switch (binding.value_use) {
-                .procedure_value => {
-                    var found = false;
-                    for (relation_artifact.exported_procedure_bindings.bindings) |exported| {
-                        if (exported.binding.pattern != binding.app_value.pattern) continue;
-                        found = true;
-                        try self.appendClosure(relation_artifact.exported_procedure_bindings.rowClosure(exported));
-                        try self.appendImportedProcedureBindingBody(relation_artifact.key, exported.body);
-                        for (relation_artifact.exported_procedure_templates.templates) |template| {
-                            if (template.def != exported.binding.def) continue;
-                            try self.appendClosure(relation_artifact.exported_procedure_templates.rowClosure(template));
-                            try self.appendProcedureTemplateRef(template.template);
-                        }
-                    }
-                    if (!found) {
-                        coordinatorInvariant("relation lowering dependency could not find exported app procedure binding", .{});
-                    }
-                },
-                .const_value => |const_use| {
-                    var found = false;
-                    for (relation_artifact.exported_const_templates.templates) |template| {
-                        if (template.pattern != binding.app_value.pattern) continue;
-                        if (!std.meta.eql(template.const_ref, const_use.const_use.const_ref)) continue;
-                        found = true;
-                        try self.appendClosure(relation_artifact.exported_const_templates.rowClosure(template));
-                        try self.appendConstRef(template.const_ref);
-                    }
-                    if (!found) {
-                        coordinatorInvariant("relation lowering dependency could not find exported app const template", .{});
-                    }
-                },
-            }
-        }
-
-        fn viewForKey(
-            self: *RelationLoweringDependencyCollector,
-            key: CheckedArtifact.CheckedModuleArtifactKey,
-        ) CheckedArtifact.ImportedModuleView {
-            if (self.root_view) |view| {
-                if (checkedArtifactKeyEql(view.key, key)) return view;
-            }
-            if (relationViewByKey(self.relation_artifacts, key)) |view| return view;
-            for (self.views.items) |view| {
-                if (checkedArtifactKeyEql(view.key, key)) return view;
-            }
-            const artifact = self.coordinator.checkedArtifactByKey(key) orelse {
-                coordinatorInvariant("relation lowering dependency referenced unavailable checked module", .{});
-            };
-            return CheckedArtifact.importedView(artifact);
-        }
-
-        fn relationArtifactContainsKey(
-            self: *const RelationLoweringDependencyCollector,
-            key: CheckedArtifact.CheckedModuleArtifactKey,
-        ) bool {
-            return relationViewByKey(self.relation_artifacts, key) != null;
-        }
-    };
-
     fn relationViewByKey(
         relation_views: []const CheckedArtifact.ImportedModuleView,
         key: CheckedArtifact.CheckedModuleArtifactKey,
@@ -2182,10 +1731,6 @@ pub const Coordinator = struct {
         };
     }
 
-    fn checkedArtifactKeyFromArtifactRef(ref: canonical.ArtifactRef) CheckedArtifact.CheckedModuleArtifactKey {
-        return .{ .bytes = ref.bytes };
-    }
-
     fn checkedArtifactKeyEql(
         a: CheckedArtifact.CheckedModuleArtifactKey,
         b: CheckedArtifact.CheckedModuleArtifactKey,
@@ -2217,9 +1762,6 @@ pub const Coordinator = struct {
             unreachable;
         };
         try appendImportedArtifactViewIfMissing(views, allocator, root_artifact.key, artifact);
-        for (artifact.public_api_dependencies.artifacts) |dependency_key| {
-            try self.appendPublicApiDependencyViewByKey(views, allocator, root_artifact, dependency_key);
-        }
     }
 
     fn importedArtifactViewExists(
@@ -2232,33 +1774,23 @@ pub const Coordinator = struct {
         return false;
     }
 
-    fn appendTypeOwnerAvailableArtifactClosure(
+    fn appendAvailableArtifactViewByKey(
         self: *Coordinator,
         views: *std.ArrayList(check.CheckedArtifact.ImportedModuleView),
         allocator: Allocator,
-        seed: *const check.CheckedArtifact.CheckedModuleArtifact,
+        key: check.CheckedArtifact.CheckedModuleArtifactKey,
     ) Allocator.Error!void {
-        var pending = std.ArrayList(*const check.CheckedArtifact.CheckedModuleArtifact).empty;
-        defer pending.deinit(allocator);
-        var seen = std.AutoHashMap(check.CheckedArtifact.CheckedModuleArtifactKey, void).init(allocator);
-        defer seen.deinit();
+        if (importedArtifactViewExists(views.items, key)) return;
+        const artifact = if (checkedArtifactKeyEql(key, self.builtin_modules.checked_artifact.key))
+            &self.builtin_modules.checked_artifact
+        else
+            self.checkedArtifactByKey(key) orelse {
+                coordinatorInvariant("compile.coordinator missing lowering visibility checked artifact", .{});
+            };
 
-        try pending.append(allocator, seed);
-        while (pending.pop()) |artifact| {
-            const entry = try seen.getOrPut(artifact.key);
-            if (entry.found_existing) continue;
-            entry.value_ptr.* = {};
-
-            if (!importedArtifactViewExists(views.items, artifact.key)) {
-                try views.append(allocator, check.CheckedArtifact.importedView(artifact));
-            }
-
-            for (artifact.public_api_dependencies.type_owner_artifacts) |dependency_key| {
-                const dependency = self.checkedArtifactByKey(dependency_key) orelse {
-                    coordinatorInvariant("compile.coordinator missing type-owner dependency checked artifact", .{});
-                };
-                try pending.append(allocator, dependency);
-            }
+        try views.append(allocator, check.CheckedArtifact.importedView(artifact));
+        for (artifact.lowering_visibility.module_ids) |dependency_key| {
+            try self.appendAvailableArtifactViewByKey(views, allocator, dependency_key);
         }
     }
 
@@ -2473,7 +2005,12 @@ pub const Coordinator = struct {
     }
 
     pub fn appRootCheckedArtifact(self: *Coordinator) *const check.CheckedArtifact.CheckedModuleArtifact {
-        const app_package_name = self.app_package_name orelse package_identity.synthetic_app_identity;
+        const app_package_name = self.app_package_name orelse {
+            if (builtin.mode == .Debug) {
+                std.debug.panic("compile.coordinator.appRootCheckedArtifact called before markAppPackage", .{});
+            }
+            unreachable;
+        };
         return self.rootCheckedArtifact(app_package_name);
     }
 
@@ -2568,28 +2105,27 @@ pub const Coordinator = struct {
             const root_key = if (mod.checkedArtifact()) |current| current.key else CheckedArtifact.CheckedModuleArtifactKey{};
             for (publication.relation_artifacts) |relation_artifact| {
                 if (checkedArtifactKeyEql(relation_artifact.key, root_key)) continue;
-                const relation_checked_artifact = self.checkedArtifactByKey(relation_artifact.key) orelse {
-                    coordinatorInvariant("platform/app relation publication references unavailable checked module", .{});
-                };
-                try self.appendTypeOwnerAvailableArtifactClosure(&extended_available, self.gpa, relation_checked_artifact);
+                try self.appendAvailableArtifactViewByKey(&extended_available, self.gpa, relation_artifact.key);
             }
-
-            var dependency_collector = RelationLoweringDependencyCollector.init(
-                self,
-                self.gpa,
-                root_key,
-                null,
-                publication.relation_artifacts,
-                &extended_available,
-            );
-            defer dependency_collector.deinit();
 
             for (relation.bindings, 0..) |binding_input, i| {
                 const relation_view = relationViewByKey(publication.relation_artifacts, binding_input.app_value.artifact) orelse {
                     coordinatorInvariant("platform/app relation publication missing relation checked module view", .{});
                 };
                 const binding = platformRequiredBindingFromRelationInput(relation, binding_input, i);
-                try dependency_collector.appendPlatformRelationDependency(relation_view, binding, relationInputClosure(binding_input));
+                var dependency_keys = std.ArrayList(CheckedArtifact.CheckedModuleArtifactKey).empty;
+                defer dependency_keys.deinit(self.gpa);
+                try CheckedArtifact.appendPlatformRelationDependencyArtifactKeysFromView(
+                    self.gpa,
+                    &dependency_keys,
+                    relation_view,
+                    binding,
+                    relationInputClosure(binding_input),
+                );
+                for (dependency_keys.items) |key| {
+                    if (checkedArtifactKeyEql(key, root_key)) continue;
+                    try self.appendAvailableArtifactViewByKey(&extended_available, self.gpa, key);
+                }
             }
 
             relation_available_artifacts = try extended_available.toOwnedSlice(self.gpa);
@@ -3659,8 +3195,15 @@ pub const Coordinator = struct {
             if (can.BuiltinLowLevel.isBuiltinModule(env)) {
                 try can.BuiltinLowLevel.apply(env);
             } else if (self.enable_hosted_transform) {
-                // The app package doesn't need hosted lambdas.
-                if (self.app_package_name == null or !std.mem.eql(u8, result.package_name, self.app_package_name.?)) {
+                // Only the platform package provides hosted functions, so only
+                // its modules' annotation-only declarations become hosted
+                // lambdas. Regular package/module dependencies may legitimately
+                // contain annotation-only (unimplemented) declarations; turning
+                // those into hosted lambdas would incorrectly make the
+                // effectful-function-name check flag them as effects.
+                const is_platform_pkg = self.platform_root_package_name != null and
+                    std.mem.eql(u8, result.package_name, self.platform_root_package_name.?);
+                if (is_platform_pkg) {
                     if (can.HostedCompiler.replaceAnnoOnlyWithHosted(env)) |modified_defs| {
                         var defs = modified_defs;
                         defs.deinit(env.gpa);
@@ -4314,6 +3857,7 @@ pub const Coordinator = struct {
                     std.debug.panic("compile.coordinator.tryUnblock missing cached AST for {s}", .{mod.name}),
                 .depth = mod.depth,
                 .imported_modules = imported_modules,
+                .validate_as_explicit_roots = mod.validate_as_explicit_roots,
             },
         });
     }
@@ -4694,6 +4238,7 @@ pub const Coordinator = struct {
             null, // Coordinator handles import resolution separately
             known_modules.items,
             task.imported_modules,
+            task.validate_as_explicit_roots,
         );
 
         const canonicalize_ns = readStageTimer(self.roc_ctx.std_io, &canonicalize_timer);
@@ -5074,6 +4619,68 @@ fn writeCacheKeyPurityFixture(tmp_dir: *std.testing.TmpDir, sub_dir: []const u8)
         \\main! = |_args| {
         \\    Echo.line!("done")
         \\    Ok({})
+        \\}
+        },
+        .{ .rel = "app/.roc_echo_platform/main.roc", .data =
+        \\platform ""
+        \\    requires {} { main! : List(Str) => Try({}, [Exit(I8), ..]) }
+        \\    exposes [Echo]
+        \\    packages {}
+        \\    provides { "roc_main": main_for_host! }
+        \\    hosted { "roc_echo_line": Echo.line! }
+        \\
+        \\import Echo
+        \\
+        \\main_for_host! : List(Str) => I8
+        \\main_for_host! = |args|
+        \\    match main!(args) {
+        \\        Ok({}) => 0
+        \\        Err(Exit(code)) => code
+        \\        Err(other) => {
+        \\            Echo.line!("Program exited with error: ${Str.inspect(other)}")
+        \\            1
+        \\        }
+        \\    }
+        },
+        .{ .rel = "app/.roc_echo_platform/Echo.roc", .data =
+        \\Echo := [].{
+        \\    line! : Str => {}
+        \\}
+        },
+    };
+    for (files) |file| {
+        var rel_buf: [256]u8 = undefined;
+        var rel_writer = std.Io.Writer.fixed(&rel_buf);
+        try rel_writer.print("{s}/{s}", .{ sub_dir, file.rel });
+        try tmp_dir.dir.writeFile(std.testing.io, .{ .sub_path = rel_writer.buffered(), .data = file.data });
+    }
+}
+
+fn writeIssue9883Fixture(tmp_dir: *std.testing.TmpDir, sub_dir: []const u8) (std.Io.Dir.CreateDirPathError || std.Io.Dir.WriteFileError || std.Io.Writer.Error)!void {
+    var path_buf: [256]u8 = undefined;
+    var writer = std.Io.Writer.fixed(&path_buf);
+    try writer.print("{s}/app/.roc_echo_platform", .{sub_dir});
+    try tmp_dir.dir.createDirPath(std.testing.io, writer.buffered());
+
+    const files = [_]struct { rel: []const u8, data: []const u8 }{
+        .{ .rel = "app/main.roc", .data =
+        \\app [main!] { pf: platform "./.roc_echo_platform/main.roc" }
+        \\
+        \\import Bar
+        \\
+        \\foo : Str -> Try(U64, Bar.SomeErrors)
+        \\foo = |_| {
+        \\    Ok(0)
+        \\}
+        \\
+        \\main! = |_args| {
+        \\    _ = foo("hello")
+        \\    Ok({})
+        \\}
+        },
+        .{ .rel = "app/Bar.roc", .data =
+        \\Bar :: {}.{
+        \\    SomeErrors : [ErrorA, ErrorB, ErrorC, ErrorD, ErrorE, ErrorF]
         \\}
         },
         .{ .rel = "app/.roc_echo_platform/main.roc", .data =
@@ -5528,7 +5135,7 @@ fn overwriteFilesUnderDir(allocator: Allocator, absolute_dir: []const u8, conten
     return overwritten;
 }
 
-fn corruptCheckedModuleEnvIdentBytesLen(allocator: Allocator, checked_module_cache_dir: []const u8) CorruptCheckedModuleCacheError!usize {
+fn corruptCheckedModuleEnvIdentBytesLens(allocator: Allocator, checked_module_cache_dir: []const u8) CorruptCheckedModuleCacheError!usize {
     const env_ident_bytes_len_offset =
         checked_module_cache_header_len +
         @offsetOf(ModuleEnv.Serialized, "common") +
@@ -5557,6 +5164,7 @@ fn corruptCheckedModuleEnvIdentBytesLen(allocator: Allocator, checked_module_cac
         corrupted += 1;
     }
 
+    if (corrupted == 0) return error.FileNotFound;
     return corrupted;
 }
 
@@ -5598,6 +5206,29 @@ test "Coordinator checked module cache hits on second compile" {
     try std.testing.expectEqual(@as(u64, 0), first.cache.store_failures);
 
     const second = try compileAppWithCheckedModuleCache(allocator, cache_dir, "test/str/app_message.roc");
+    try std.testing.expect(second.build.cache_hits > 0);
+    try std.testing.expect(second.build.modules_compiled < first.build.modules_compiled);
+    try std.testing.expect(second.cache.hits > 0);
+}
+
+test "Coordinator checked module cache restores imported alias Try error on hit" {
+    const allocator = std.testing.allocator;
+
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    try tmp_dir.dir.createDirPath(std.testing.io, "cache");
+    const cache_dir = try tmp_dir.dir.realPathFileAlloc(std.testing.io, "cache", allocator);
+    defer allocator.free(cache_dir);
+
+    try writeIssue9883Fixture(&tmp_dir, "issue_9883");
+    const app_path = try tmp_dir.dir.realPathFileAlloc(std.testing.io, "issue_9883/app/main.roc", allocator);
+    defer allocator.free(app_path);
+
+    const first = try compileAppWithCheckedModuleCache(allocator, cache_dir, app_path);
+    try std.testing.expectEqual(@as(u32, 0), first.build.cache_hits);
+    try std.testing.expect(first.cache.stores > 0);
+
+    const second = try compileAppWithCheckedModuleCache(allocator, cache_dir, app_path);
     try std.testing.expect(second.build.cache_hits > 0);
     try std.testing.expect(second.build.modules_compiled < first.build.modules_compiled);
     try std.testing.expect(second.cache.hits > 0);
@@ -5733,7 +5364,7 @@ test "Coordinator corrupt checked module cache env relocations compile from sour
     const config = CacheConfig{ .cache_dir = cache_dir };
     const checked_module_cache_dir = try config.getCheckedArtifactCacheDir(allocator);
     defer allocator.free(checked_module_cache_dir);
-    const corrupted = try corruptCheckedModuleEnvIdentBytesLen(allocator, checked_module_cache_dir);
+    const corrupted = try corruptCheckedModuleEnvIdentBytesLens(allocator, checked_module_cache_dir);
     try std.testing.expect(corrupted > 0);
 
     const second = try compileAppWithCheckedModuleCache(allocator, cache_dir, "test/str/app_message.roc");

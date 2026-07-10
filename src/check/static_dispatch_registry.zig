@@ -225,6 +225,7 @@ pub const MethodRegistry = struct {
                 unreachable;
             };
             const def_idx = entry.value.def_idx;
+            var referenced_callable_var: ?Var = null;
             const target_kind: MethodTargetKind = if (generatedStructuralTargetForMethodBinding(module, entry.value, entry.key.methodIdent())) |generated|
                 generated
             else if (local_templates.templateForDef(def_idx)) |template| blk: {
@@ -242,13 +243,17 @@ pub const MethodRegistry = struct {
                 } };
             } else if (localProcedureTargetForMethodBinding(module, checked_bodies, entry.value)) |local|
                 .{ .local_proc = local }
-            else
-                // Associated values without arguments are checked field access,
-                // not static-dispatch call targets. The method registry is a
-                // procedure-target table for Monotype static dispatch lowering,
-                // so only procedure-backed entries belong here.
+            else if (referencedProcedureTargetForMethodBinding(module, local_templates, checked_bodies, entry.value)) |referenced| blk: {
+                referenced_callable_var = referenced.callable_var;
+                break :blk referenced.kind;
+            } else
+                // Associated values that do not resolve to a procedure are
+                // checked field access, not static-dispatch call targets. The
+                // method registry is a procedure-target table for Monotype
+                // static dispatch lowering, so only procedure-backed entries
+                // belong here.
                 continue;
-            const callable_var = methodTargetCallableVar(module, def_idx, entry.value, target_kind);
+            const callable_var = referenced_callable_var orelse methodTargetCallableVar(module, def_idx, entry.value, target_kind);
 
             try entries.append(allocator, .{
                 .key = .{
@@ -416,6 +421,84 @@ fn localProcedureExpr(module: TypedCIR.Module, expr_idx: CIR.Expr.Idx) bool {
         .e_lambda, .e_closure => true,
         else => false,
     };
+}
+
+const ReferencedProcedureTarget = struct {
+    kind: MethodTargetKind,
+    callable_var: Var,
+};
+
+/// Resolve a function-typed associated value bound by reference
+/// (`method = top_level_fn`) to the referenced procedure. The reference chain
+/// is followed through top-level defs and associated declarations until it
+/// reaches a procedure-backed binding; a chain that never reaches one is an
+/// associated value, not a call target, and resolves to null.
+fn referencedProcedureTargetForMethodBinding(
+    module: TypedCIR.Module,
+    local_templates: *const ProcedureTemplateLookup,
+    checked_bodies: anytype,
+    binding: ModuleEnv.MethodBinding,
+) ?ReferencedProcedureTarget {
+    const module_env = module.moduleEnvConst();
+    var expr_idx = methodBindingExpr(module, binding) orelse return null;
+    // Each hop follows one value binding, and a chain can visit each binding
+    // at most once before repeating, so the node count bounds the walk.
+    var remaining: usize = module.nodeCount();
+    while (remaining > 0) : (remaining -= 1) {
+        const pattern_idx = switch (module.expr(expr_idx).data) {
+            .e_lookup_local => |lookup| lookup.pattern_idx,
+            else => return null,
+        };
+        if (defForBoundPattern(module_env, pattern_idx)) |target_def_idx| {
+            if (local_templates.templateForDef(target_def_idx)) |template| {
+                return .{
+                    .kind = .{ .procedure = .{
+                        .proc = .{ .artifact = template.artifact, .proc_base = template.proc_base },
+                        .template = template,
+                    } },
+                    .callable_var = module.defType(target_def_idx),
+                };
+            }
+            expr_idx = module_env.store.getDef(target_def_idx).expr;
+            continue;
+        }
+        if (statementDeclForBoundPattern(module, pattern_idx)) |decl| {
+            if (localProcedureExpr(module, decl.expr)) {
+                const expr = checked_bodies.exprIdForSource(decl.expr) orelse return null;
+                const binder = checked_bodies.patternBinderForSource(decl.pattern) orelse return null;
+                return .{
+                    .kind = .{ .local_proc = .{ .binder = binder, .expr = expr } },
+                    .callable_var = module.exprType(decl.expr),
+                };
+            }
+            expr_idx = decl.expr;
+            continue;
+        }
+        return null;
+    }
+    return null;
+}
+
+fn defForBoundPattern(module_env: *const ModuleEnv, pattern_idx: CIR.Pattern.Idx) ?CIR.Def.Idx {
+    for (module_env.store.sliceDefs(module_env.global_value_defs)) |def_idx| {
+        if (module_env.store.getDef(def_idx).pattern == pattern_idx) return def_idx;
+    }
+    return null;
+}
+
+const BoundDecl = struct { pattern: CIR.Pattern.Idx, expr: CIR.Expr.Idx };
+
+fn statementDeclForBoundPattern(module: TypedCIR.Module, pattern_idx: CIR.Pattern.Idx) ?BoundDecl {
+    var raw_node: u32 = 0;
+    while (raw_node < module.nodeCount()) : (raw_node += 1) {
+        if (module.nodeTag(@enumFromInt(raw_node)) != .statement_decl) continue;
+        const decl = switch (module.getStatement(@enumFromInt(raw_node))) {
+            .s_decl => |decl| decl,
+            else => continue,
+        };
+        if (decl.pattern == pattern_idx) return .{ .pattern = decl.pattern, .expr = decl.expr };
+    }
+    return null;
 }
 
 fn methodOwnerForRegistryEntry(
@@ -953,6 +1036,13 @@ pub const StaticDispatchPlanTable = struct {
         checked_types: anytype,
         checked_bodies: anytype,
         build_data: *PlanTableBuildData,
+        /// Answers whether a checked literal expression's target type is a
+        /// CONCRETE builtin numeric (such literals convert at monotype
+        /// lowering and need no runtime dispatch plan; still-open defaultable
+        /// targets keep a plan for potential custom instantiations).
+        /// Duck-typed to avoid a circular import with the checked artifact's
+        /// type-store view.
+        numeral_targets: anytype,
     ) Allocator.Error!StaticDispatchPlanTable {
         var plans = std.ArrayList(StaticDispatchCallPlan).empty;
         errdefer plans.deinit(allocator);
@@ -1103,17 +1193,7 @@ pub const StaticDispatchPlanTable = struct {
                 checked_bodies.numeralConversionExprAtRawNode(numeral_plan.node_idx) orelse
                 continue;
             switch (checked_bodies.expr(checked_expr).data) {
-                .num_from_numeral,
-                .typed_num_from_numeral,
-                => {},
-                .num,
-                .typed_int,
-                .frac_f32,
-                .frac_f64,
-                .dec,
-                .dec_small,
-                .typed_frac,
-                => continue,
+                .numeral => {},
                 else => {
                     if (@import("builtin").mode == .Debug) {
                         std.debug.panic(
@@ -1124,6 +1204,16 @@ pub const StaticDispatchPlanTable = struct {
                     unreachable;
                 },
             }
+            // Concrete builtin-targeted literals get their bits at monotype
+            // lowering; non-builtin (custom `from_numeral`) targets need a
+            // plan, and so does a literal whose target is still an OPEN
+            // defaultable variable — a generalized literal can be
+            // instantiated at a custom from_numeral type later (issue: a
+            // generic `|x| x.plus(1)` called with a custom number type
+            // panicked lowering with a plan-less from_numeral call). When
+            // every instantiation lands on a builtin, the recorded plan is
+            // simply never consulted.
+            if (numeral_targets.literalTargetIsConcreteBuiltin(checked_expr)) continue;
             const literal = module_env.numeralLiteralForNode(node) orelse {
                 if (@import("builtin").mode == .Debug) {
                     std.debug.panic(
@@ -1133,6 +1223,15 @@ pub const StaticDispatchPlanTable = struct {
                 }
                 unreachable;
             };
+            if (!literal.isMaterialized()) {
+                if (@import("builtin").mode == .Debug) {
+                    std.debug.panic(
+                        "checked static dispatch invariant violated: runtime from_numeral plan {d} has an unmaterialized literal",
+                        .{numeral_plan.node_idx},
+                    );
+                }
+                unreachable;
+            }
             var args = [_]StaticDispatchOperand{.{ .generated_numeral = literal }};
             const ar = try pushOperands(StaticDispatchOperand, &operand_pool, allocator, &args);
 

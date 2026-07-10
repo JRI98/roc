@@ -350,6 +350,13 @@ pub const Literal = union(enum) {
     float: u64, // stored as bits
     decimal: i128, // stored as i128 (Dec representation)
     str: StringLiteral.Idx,
+    /// A literal whose exact digits live in the module env's numeral table,
+    /// identified by an id `NumeralKeyInterner` assigns per distinct digit
+    /// spelling: branches repeating the same spelling compare equal (so the
+    /// duplicate-branch warning fires), while spelling variants of one value
+    /// (`1.5` vs `1.50`) stay distinct — sound for usefulness, since a
+    /// literal never covers another pattern.
+    exact_numeral: u32,
 
     pub fn eql(a: Literal, b: Literal) bool {
         const tag_a = std.meta.activeTag(a);
@@ -366,6 +373,7 @@ pub const Literal = union(enum) {
             // StringLiteral.Store deduplicates strings, so identical strings
             // receive the same index. Direct index comparison is correct.
             .str => |as| as == b.str,
+            .exact_numeral => |an| an == b.exact_numeral,
         };
     }
 };
@@ -494,6 +502,62 @@ pub const UnresolvedRows = struct {
     overall_region: Region,
 };
 
+/// Assigns each exact-path numeral literal pattern a value-identity id from
+/// its recorded digit facts: identical spellings intern to the same id, so
+/// `Literal.eql` detects duplicate branches without carrying digit slices.
+/// Identity is the verbatim digit string (`1.5` ≠ `1.50`), matching
+/// `NumeralInfo.keyBytes`' deliberate no-normalization design. A pattern with
+/// no recorded digits gets a fresh unique id — the conservative pre-interner
+/// occurrence identity.
+pub const NumeralKeyInterner = struct {
+    module_env: *const Can.ModuleEnv,
+    map: std.StringHashMapUnmanaged(u32) = .empty,
+    next_id: u32 = 0,
+
+    /// `allocator` must be the same arena the surrounding check uses: interned
+    /// key bytes live in it until the check completes, and are never freed
+    /// individually.
+    fn idFor(
+        self: *NumeralKeyInterner,
+        allocator: std.mem.Allocator,
+        pattern_idx: CirPattern.Idx,
+    ) error{OutOfMemory}!u32 {
+        const literal = self.module_env.numeralLiteralForNode(Can.ModuleEnv.nodeIdxFrom(pattern_idx)) orelse
+            return self.freshId();
+        const exact = self.module_env.exactNumeral(literal);
+
+        // Unambiguous key: length-prefixed `before` digits, then `after`
+        // digits, then scale and sign/fractional flags.
+        var key: std.ArrayList(u8) = .empty;
+        try key.ensureTotalCapacity(allocator, 4 + exact.before.len + exact.after.len + 5);
+        key.appendSliceAssumeCapacity(&u32LeBytes(@intCast(exact.before.len)));
+        key.appendSliceAssumeCapacity(exact.before);
+        key.appendSliceAssumeCapacity(exact.after);
+        key.appendSliceAssumeCapacity(&u32LeBytes(exact.scale));
+        key.appendAssumeCapacity(@as(u8, @intFromBool(exact.is_negative)) |
+            (@as(u8, @intFromBool(exact.is_fractional)) << 1));
+
+        const entry = try self.map.getOrPut(allocator, key.items);
+        if (!entry.found_existing) entry.value_ptr.* = self.freshId();
+        return entry.value_ptr.*;
+    }
+
+    fn freshId(self: *NumeralKeyInterner) u32 {
+        const id = self.next_id;
+        self.next_id += 1;
+        return id;
+    }
+
+    fn u32LeBytes(value: u32) [4]u8 {
+        return .{
+            @truncate(value),
+            @truncate(value >> 8),
+            @truncate(value >> 16),
+            @truncate(value >> 24),
+        };
+    }
+};
+
 /// Convert a CIR pattern to an unresolved pattern for exhaustiveness checking.
 ///
 /// This extracts the structure of the pattern. Tag patterns are left with just
@@ -501,6 +565,7 @@ pub const UnresolvedRows = struct {
 pub fn convertPattern(
     allocator: std.mem.Allocator,
     store: *const NodeStore,
+    numeral_keys: *NumeralKeyInterner,
     pattern_idx: CirPattern.Idx,
 ) error{OutOfMemory}!UnresolvedPattern {
     const pattern = store.getPattern(pattern_idx);
@@ -510,14 +575,14 @@ pub fn convertPattern(
         .assign, .underscore => .anything,
 
         // As patterns: convert the inner pattern
-        .as => |p| convertPattern(allocator, store, p.pattern),
+        .as => |p| convertPattern(allocator, store, numeral_keys, p.pattern),
 
         // Tag application: unknown union type, will be resolved later
         .applied_tag => |p| {
             const arg_indices = store.slicePatterns(p.args);
             const args = try allocator.alloc(UnresolvedPattern, arg_indices.len);
             for (arg_indices, 0..) |arg_idx, i| {
-                args[i] = try convertPattern(allocator, store, arg_idx);
+                args[i] = try convertPattern(allocator, store, numeral_keys, arg_idx);
             }
             return .{ .ctor = .{
                 .tag_name = p.name,
@@ -530,7 +595,7 @@ pub fn convertPattern(
             const elem_indices = store.slicePatterns(p.patterns);
             const elements = try allocator.alloc(UnresolvedPattern, elem_indices.len);
             for (elem_indices, 0..) |elem_idx, i| {
-                elements[i] = try convertPattern(allocator, store, elem_idx);
+                elements[i] = try convertPattern(allocator, store, numeral_keys, elem_idx);
             }
 
             const arity: ListArity = if (p.rest_info) |rest| blk: {
@@ -559,7 +624,7 @@ pub fn convertPattern(
                 const destruct = store.getRecordDestruct(destruct_idx);
                 field_names[i] = destruct.label;
                 const sub_pattern_idx = destruct.kind.toPatternIdx();
-                args[i] = try convertPattern(allocator, store, sub_pattern_idx);
+                args[i] = try convertPattern(allocator, store, numeral_keys, sub_pattern_idx);
             }
 
             const alternatives = try allocator.alloc(CtorInfo, 1);
@@ -584,7 +649,7 @@ pub fn convertPattern(
             const elem_indices = store.slicePatterns(p.patterns);
             const args = try allocator.alloc(UnresolvedPattern, elem_indices.len);
             for (elem_indices, 0..) |elem_idx, i| {
-                args[i] = try convertPattern(allocator, store, elem_idx);
+                args[i] = try convertPattern(allocator, store, numeral_keys, elem_idx);
             }
 
             const alternatives = try allocator.alloc(CtorInfo, 1);
@@ -612,6 +677,10 @@ pub fn convertPattern(
             }
         },
 
+        .num_from_numeral_literal => {
+            return .{ .literal = .{ .exact_numeral = try numeral_keys.idFor(allocator, pattern_idx) } };
+        },
+
         // Decimal literals
         .small_dec_literal => |p| {
             return .{ .literal = .{ .decimal = p.value.toRocDec().num } };
@@ -637,8 +706,8 @@ pub fn convertPattern(
         },
 
         // Nominal patterns: convert the backing pattern
-        .nominal => |p| convertPattern(allocator, store, p.backing_pattern),
-        .nominal_external => |p| convertPattern(allocator, store, p.backing_pattern),
+        .nominal => |p| convertPattern(allocator, store, numeral_keys, p.backing_pattern),
+        .nominal_external => |p| convertPattern(allocator, store, numeral_keys, p.backing_pattern),
 
         // Runtime errors match anything since we won't reach them
         .runtime_error => .anything,
@@ -652,6 +721,7 @@ pub fn convertPattern(
 pub fn convertMatchBranches(
     allocator: std.mem.Allocator,
     store: *const NodeStore,
+    numeral_keys: *NumeralKeyInterner,
     branches_span: CIR.Expr.Match.Branch.Span,
     overall_region: Region,
 ) error{OutOfMemory}!UnresolvedRows {
@@ -683,7 +753,7 @@ pub fn convertMatchBranches(
             const bp = store.getMatchBranchPattern(bp_idx);
             const pattern_region = store.getPatternRegion(bp.pattern);
 
-            const converted = try convertPattern(allocator, store, bp.pattern);
+            const converted = try convertPattern(allocator, store, numeral_keys, bp.pattern);
 
             // If any branch has a guard, wrap all patterns in a Guard constructor
             const final_pattern = if (any_has_guard) blk: {
@@ -3953,6 +4023,7 @@ pub const CheckResult = struct {
 pub fn checkMatch(
     allocator: std.mem.Allocator,
     type_store: *TypeStore,
+    module_env: *const Can.ModuleEnv,
     node_store: *const NodeStore,
     builtin_idents: BuiltinIdents,
     branches_span: CIR.Expr.Match.Branch.Span,
@@ -3967,9 +4038,11 @@ pub fn checkMatch(
     const arena_alloc = arena.allocator();
 
     // Phase 1: Convert CIR patterns to sketched (unresolved) patterns
+    var numeral_keys = NumeralKeyInterner{ .module_env = module_env };
     const sketched = try convertMatchBranches(
         arena_alloc,
         node_store,
+        &numeral_keys,
         branches_span,
         overall_region,
     );
@@ -4059,6 +4132,7 @@ pub fn checkMatch(
 pub fn checkDestructure(
     allocator: std.mem.Allocator,
     type_store: *TypeStore,
+    module_env: *const Can.ModuleEnv,
     node_store: *const NodeStore,
     builtin_idents: BuiltinIdents,
     pattern_idx: CirPattern.Idx,
@@ -4070,7 +4144,8 @@ pub fn checkDestructure(
     defer arena.deinit();
     const arena_alloc = arena.allocator();
 
-    const converted = try convertPattern(arena_alloc, node_store, pattern_idx);
+    var numeral_keys = NumeralKeyInterner{ .module_env = module_env };
+    const converted = try convertPattern(arena_alloc, node_store, &numeral_keys, pattern_idx);
     const pattern_slice = try arena_alloc.alloc(UnresolvedPattern, 1);
     pattern_slice[0] = converted;
 
@@ -4222,6 +4297,9 @@ fn formatPatternInto(
                 try writer.writeAll(text);
                 try writer.writeAll("\"");
             },
+            // The exact digits live outside this reporter's reach; the region
+            // highlight carries the literal's spelling.
+            .exact_numeral => try writer.writeAll("<numeric literal>"),
         },
 
         .ctor => |c| {

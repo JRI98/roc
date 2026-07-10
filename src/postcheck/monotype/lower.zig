@@ -22,10 +22,12 @@ const InstBacking = solve.InstBacking;
 const InstDeclaredField = solve.InstDeclaredField;
 const InstVariable = solve.InstVariable;
 const GraphTypeFinals = solve.GraphTypeFinals;
+const EntryRoot = solve.EntryRoot;
 
 const Allocator = std.mem.Allocator;
 const checked = check.CheckedModule;
 const ExhaustivenessContext = check.ExhaustivenessContext;
+const exact_numeral = checked.exact_numeral;
 const names = check.CheckedNames;
 const static_dispatch = check.StaticDispatchRegistry;
 const Ident = base.Ident;
@@ -940,7 +942,7 @@ const Builder = struct {
         nominal: checked.CheckedNominalType,
     ) ?static_dispatch.BuiltinOwner {
         if (builtinOwner(nominal.builtin)) |owner| return owner;
-        const source_view = self.moduleForDigest(self.moduleDigestForOrigin(view, nominal.origin_module));
+        const source_view = self.moduleForDigest(moduleDigestFromId(nominal.owner_module));
         if (source_view.module_env.module_role != .builtin) return null;
         const name_text = view.names.typeNameText(nominal.name);
         if (Ident.textEql(name_text, "Iter")) return .iter;
@@ -948,44 +950,12 @@ const Builder = struct {
         return null;
     }
 
-    fn declaredModuleForAlias(self: *Builder, view: ModuleView, alias: checked.CheckedAliasType) names.CheckedModuleDigest {
-        return self.moduleDigestForOrigin(view, alias.origin_module);
+    fn declaredModuleForAlias(_: *Builder, _: ModuleView, alias: checked.CheckedAliasType) names.CheckedModuleDigest {
+        return moduleDigestFromId(alias.owner_module);
     }
 
-    fn declaredModuleForNominal(self: *Builder, view: ModuleView, nominal: checked.CheckedNominalType) names.CheckedModuleDigest {
-        return switch (nominal.representation) {
-            .imported_declaration => |imported| moduleDigestFromId(checked.importedNominalDeclarationModuleId(imported)),
-            .imported_box_payload_capability => |imported| moduleDigestFromId(checked.importedBoxPayloadCapabilityModuleId(imported)),
-            .builtin,
-            .local_declaration,
-            .local_box_payload_capability,
-            .opaque_without_backing,
-            => self.moduleDigestForOrigin(view, nominal.origin_module),
-        };
-    }
-
-    /// Resolve a named type's declaring module by 32-byte content identity —
-    /// an exact comparison against each candidate view's module identity
-    /// hash. Byte-identical module content reached through several checked
-    /// modules is interchangeable as a declaring module; the first match wins.
-    fn moduleDigestForOrigin(self: *Builder, view: ModuleView, origin_module: names.ModuleIdentityId) names.CheckedModuleDigest {
-        const origin_hash = view.names.moduleIdentityBytes(origin_module);
-        if (moduleViewIdentityMatches(view, origin_hash)) return moduleDigestFromId(view.key);
-
-        const root = moduleView(self.root_view);
-        if (moduleViewIdentityMatches(root, origin_hash)) return moduleDigestFromId(root.key);
-
-        for (self.modules.imports) |imported| {
-            const imported_view = moduleView(imported);
-            if (moduleViewIdentityMatches(imported_view, origin_hash)) return moduleDigestFromId(imported_view.key);
-        }
-
-        for (self.modules.root.relation_modules) |relation| {
-            const relation_view = moduleView(relation);
-            if (moduleViewIdentityMatches(relation_view, origin_hash)) return moduleDigestFromId(relation_view.key);
-        }
-
-        Common.invariant("checked named type origin module was not available to Monotype lowering");
+    fn declaredModuleForNominal(_: *Builder, _: ModuleView, nominal: checked.CheckedNominalType) names.CheckedModuleDigest {
+        return moduleDigestFromId(nominal.owner_module);
     }
 
     fn lowerRoot(self: *Builder, request: checked.RootRequest) Allocator.Error!void {
@@ -1229,7 +1199,7 @@ const Builder = struct {
                     view.types.rootKey(source_fn_ty),
                     mono_fn_ty,
                 );
-                const fn_id = try self.lowerFnTemplateDef(view, fn_template, &.{});
+                const fn_id = try self.lowerFnTemplateDef(fn_template, &.{});
                 break :blk try self.program.addExpr(.{
                     .ty = self.program.fnSource(fn_id).mono_fn_ty,
                     .data = .{ .fn_def = .{ .fn_id = fn_id } },
@@ -1252,7 +1222,7 @@ const Builder = struct {
         const template = view.callable_eval_templates.templates[raw];
         const root = view.compile_time_roots.root(template.root);
         return switch (root.payload) {
-            .fn_value => |fn_id| try self.restoreConstFnExpr(view, view, fn_id, mono_fn_ty, null),
+            .fn_value => |fn_id| try self.restoreConstFnExpr(view, fn_id, mono_fn_ty, null),
             .pending => try self.lowerPendingCallableEvalBindingValue(view, template, root, mono_fn_ty),
             else => Common.invariant("callable eval binding root did not output a callable value"),
         };
@@ -1312,19 +1282,18 @@ const Builder = struct {
         source_fn_ty: checked.CheckedTypeId,
     ) Allocator.Error!Ast.DefId {
         const fn_ty = try self.lowerType(source_ty_view, source_fn_ty);
-        return try self.lowerTemplateWithMono(template_ref, source_ty_view, source_fn_ty, source_ty_view.types.rootKey(source_fn_ty), fn_ty, &.{});
+        return try self.lowerTemplateWithMono(template_ref, source_fn_ty, source_ty_view.types.rootKey(source_fn_ty), fn_ty, &.{});
     }
 
     fn lowerTemplateWithMono(
         self: *Builder,
         template_ref: names.ProcTemplate,
-        source_ty_view: ModuleView,
         source_fn_ty: checked.CheckedTypeId,
         source_fn_key: names.TypeDigest,
         fn_ty: Type.TypeId,
         evidence: []const SpecEvidence,
     ) Allocator.Error!Ast.DefId {
-        return try self.lowerTemplateWithMonoFor(template_ref, source_ty_view, source_fn_ty, source_fn_key, fn_ty, evidence, null, null, null, null);
+        return try self.lowerTemplateWithMonoFor(template_ref, source_fn_ty, source_fn_key, fn_ty, evidence, null, null, null, null);
     }
 
     /// Specializations of one template family are deduplicated by structural
@@ -1336,7 +1305,6 @@ const Builder = struct {
     fn lowerTemplateWithMonoFor(
         self: *Builder,
         template_ref: names.ProcTemplate,
-        source_ty_view: ModuleView,
         source_fn_ty: checked.CheckedTypeId,
         source_fn_key: names.TypeDigest,
         fn_ty: Type.TypeId,
@@ -1344,7 +1312,7 @@ const Builder = struct {
         requester: ?*InstGraph,
         reserved_fn_id: ?Ast.FnId,
         source_region_override: ?base.Region,
-        current_entry_root: ?checked.ComptimeRootId,
+        current_entry_root: ?EntryRoot,
     ) Allocator.Error!Ast.DefId {
         self.count("template_requests");
         var reserved_def: ?Ast.DefId = null;
@@ -1456,17 +1424,71 @@ const Builder = struct {
 
         switch (template.target) {
             .hosted => {
+                // The host is compiled against the declared hosted signature,
+                // so that exact type is the only one the extern boundary may
+                // use. A use site can still widen a (closed) tag-union row in
+                // the result through ordinary unification (e.g. `?` re-wraps
+                // the hosted error into the caller's wider error union); such
+                // requests get a generated Roc adapter that calls the
+                // declared-type boundary and re-tags the result, instead of a
+                // hosted spec whose layout would not match the host ABI.
+                const declared_source_fn_ty = template.checked_fn_root;
+                const declared_source_fn_key = view.types.rootKey(declared_source_fn_ty);
+                const declared_mono_fn_ty = try self.lowerType(view, declared_source_fn_ty);
+                const hosted_fn_template = self.fnDefForTemplate(
+                    view,
+                    template_ref,
+                    declared_source_fn_ty,
+                    declared_source_fn_key,
+                    lower_fn_ty,
+                );
                 const fn_data = self.functionShape(lower_fn_ty, "hosted procedure template root type was not a function");
                 const args = try self.typedLocalsForArgs(self.program.types.span(fn_data.args));
+                if (self.hostedUseNeedsTryAdapter(declared_mono_fn_ty, lower_fn_ty)) {
+                    const source_def = try self.lowerTemplateWithMonoFor(
+                        template_ref,
+                        declared_source_fn_ty,
+                        declared_source_fn_key,
+                        declared_mono_fn_ty,
+                        &.{},
+                        null,
+                        null,
+                        null,
+                        null,
+                    );
+                    const adapter_template = Ast.FnTemplate{
+                        .fn_def = .{ .checked_generated = template_ref },
+                        .source_fn_ty = source_fn_ty,
+                        .source_fn_key = source_fn_key,
+                        .mono_fn_ty = lower_fn_ty,
+                    };
+                    const body = try self.hostedTryAdapterBody(
+                        args,
+                        self.defFnId(source_def),
+                        declared_mono_fn_ty,
+                        lower_fn_ty,
+                    );
+                    self.program.setDef(reservation.def, .{
+                        .symbol = reservation.symbol,
+                        .fn_def = adapter_template,
+                        .fn_id = reservation.fn_id,
+                        .args = args,
+                        .body = .{ .roc = body },
+                        .ret = fn_data.ret,
+                    });
+                    self.program.setFnSource(reservation.fn_id, adapter_template);
+                    try self.markTemplateReady(reservation.fn_id, lower_fn_ty);
+                    return reservation.def;
+                }
                 self.program.setDef(reservation.def, .{
                     .symbol = reservation.symbol,
-                    .fn_def = fn_template,
+                    .fn_def = hosted_fn_template,
                     .fn_id = reservation.fn_id,
                     .args = args,
                     .body = .hosted,
                     .ret = fn_data.ret,
                 });
-                self.program.setFnSource(reservation.fn_id, fn_template);
+                self.program.setFnSource(reservation.fn_id, hosted_fn_template);
                 try self.markTemplateReady(reservation.fn_id, lower_fn_ty);
                 return reservation.def;
             },
@@ -1539,9 +1561,6 @@ const Builder = struct {
         body_ctx.current_fn_key = root_fn_key;
         defer body_ctx.deinit();
         const public_constraint_fn_ty = try body_ctx.publicOpaqueFunctionUnificationType(lower_fn_ty);
-        if (moduleBytesEqual(source_ty_view.key.bytes, view.key.bytes)) {
-            try body_ctx.constrainKnownType(source_fn_ty, public_constraint_fn_ty);
-        }
         try body_ctx.constrainTypeToMono(template.checked_fn_root, public_constraint_fn_ty);
 
         // The requested function type becomes a view of this specialization's
@@ -1958,10 +1977,11 @@ const Builder = struct {
 
     fn lowerCheckedTypeVariable(variable: checked.CheckedTypeVariable) Type.Content {
         if (variable.numeric_default_phase) |phase| {
-            return switch (phase) {
-                .mono_specialization => .{ .primitive = .dec },
-                .mono_specialization_str => .{ .primitive = .str },
-                .checking_finalized => Common.invariant("checking-finalized numeric variable reached Monotype unresolved"),
+            const target = checked.literal_defaulting.defaultTargetForPhase(phase) orelse
+                Common.invariant("checking-finalized numeric variable reached Monotype unresolved");
+            return switch (target) {
+                .dec => .{ .primitive = .dec },
+                .str => .{ .primitive = .str },
             };
         }
         if (variable.row_default) |row_default| {
@@ -1973,18 +1993,41 @@ const Builder = struct {
         return .{ .tag_union = .empty() };
     }
 
-    fn typeIsDec(self: *Builder, ty: Type.TypeId) bool {
-        return switch (self.shapeContent(ty)) {
-            .primitive => |primitive| primitive == .dec,
-            else => false,
-        };
-    }
-
     fn namedBackingType(self: *Builder, ty: Type.TypeId) ?Type.TypeId {
         return switch (self.program.types.get(ty)) {
             .named => |named| if (named.backing) |backing| backing.ty else null,
             else => null,
         };
+    }
+
+    const NominalConstructionLayer = struct {
+        named: Type.TypeId,
+        backing: Type.TypeId,
+    };
+
+    /// The nominal construction layer of `ty`: the nominal or opaque named
+    /// type reached after unwrapping transparent alias layers, paired with
+    /// its declared backing type. Constructor expressions and patterns
+    /// (tags, records, tuples) created at such a type must be typed at the
+    /// backing and wrapped in an explicit `.nominal` node per layer, so that
+    /// "the value is `.nominal`-wrapped" holds exactly when the type is
+    /// nominal, independent of whether the source construction was written
+    /// qualified. Returns null when `ty` is structural, an alias of a
+    /// structural type, or a named type whose backing is not present.
+    fn nominalConstructionLayer(self: *Builder, ty: Type.TypeId) ?NominalConstructionLayer {
+        var current = ty;
+        while (true) {
+            switch (self.program.types.get(current)) {
+                .named => |named| {
+                    const backing = named.backing orelse return null;
+                    switch (named.kind) {
+                        .alias => current = backing.ty,
+                        .nominal, .@"opaque" => return .{ .named = current, .backing = backing.ty },
+                    }
+                },
+                else => return null,
+            }
+        }
     }
 
     fn shapeContent(self: *Builder, ty: Type.TypeId) Type.Content {
@@ -2516,7 +2559,7 @@ const Builder = struct {
                 break :blk .{ .view = sv, .declaration = decl, .padding_field_tys = capability.paddingFieldTys(sv.interface_capabilities) };
             },
             .builtin => blk: {
-                const source_view = self.moduleForDigest(self.moduleDigestForOrigin(view, nominal.origin_module));
+                const source_view = self.moduleForId(nominal.owner_module);
                 const source_decl = nominal.source_decl orelse break :blk null;
                 for (source_view.types.nominal_declarations) |decl| {
                     if (decl.source_statement != source_decl) continue;
@@ -2725,7 +2768,7 @@ const Builder = struct {
                 break :blk self.fnDefForProcedureBindingBody(app_view, binding.body, source_fn_ty, source_fn_key, mono_fn_ty);
             },
         };
-        return try self.lowerFnTemplateCallTarget(source_ty_view, fn_template, &.{});
+        return try self.lowerFnTemplateCallTarget(fn_template, &.{});
     }
 
     /// Lower (or defer) a procedure template body and return the Monotype
@@ -2733,7 +2776,7 @@ const Builder = struct {
     /// request reserves an id and defers the body; outside one (root and
     /// wrapper paths, whose types come from the builder-global cache without
     /// body evidence), the body lowers now.
-    fn lowerFnTemplateCallTarget(self: *Builder, source_ty_view: ModuleView, fn_template: Ast.FnTemplate, evidence: []const SpecEvidence) Allocator.Error!Ast.FnSlot {
+    fn lowerFnTemplateCallTarget(self: *Builder, fn_template: Ast.FnTemplate, evidence: []const SpecEvidence) Allocator.Error!Ast.FnSlot {
         const template_ref = switch (fn_template.fn_def) {
             .local_template,
             .imported_template,
@@ -2763,10 +2806,10 @@ const Builder = struct {
                 graph,
             );
             if (reserved.needs_lowering) {
+                try self.pinDeferredTemplateRequestToCheckedRoot(graph, template_ref, request_template.mono_fn_ty);
                 try graph.deferred_templates.append(self.allocator, .{
                     .fn_id = reserved.localFnId(),
                     .template_ref = template_ref,
-                    .module = source_ty_view.key,
                     .source_fn_ty = request_template.source_fn_ty,
                     .source_fn_key = request_template.source_fn_key,
                     .fn_ty = request_template.mono_fn_ty,
@@ -2776,18 +2819,49 @@ const Builder = struct {
             }
             return reserved.target;
         }
-        const def = try self.lowerTemplateWithMono(template_ref, source_ty_view, fn_template.source_fn_ty, fn_template.source_fn_key, fn_template.mono_fn_ty, evidence);
+        const def = try self.lowerTemplateWithMono(template_ref, fn_template.source_fn_ty, fn_template.source_fn_key, fn_template.mono_fn_ty, evidence);
         return .{ .local = self.defFnId(def) };
     }
 
-    fn lowerFnTemplateDef(self: *Builder, source_ty_view: ModuleView, fn_template: Ast.FnTemplate, evidence: []const SpecEvidence) Allocator.Error!Ast.FnId {
+    /// A deferred template request seals from the requester's graph node
+    /// behind its request type, and value flow alone cannot reach
+    /// type-level-only positions such as phantom nominal type arguments.
+    /// Instantiating the requested template's checked function root into the
+    /// requester's graph at request creation delivers those checked root nodes
+    /// before sealing, so a row that still takes its `row_default` at seal
+    /// time is genuinely unconstrained rather than starved. Each request pins
+    /// a fresh instantiation: the checked root is generalized, and two
+    /// requests of one template at different types must not share
+    /// instantiated nodes.
+    fn pinDeferredTemplateRequestToCheckedRoot(
+        self: *Builder,
+        requester: *InstGraph,
+        template_ref: names.ProcTemplate,
+        fn_ty: Type.TypeId,
+    ) Allocator.Error!void {
+        // A request type without a graph view is a sealed snapshot (generated
+        // opaque evidence); sealing cannot default anything inside it.
+        if (requester.monoViewNode(fn_ty) == null) return;
+        const view = self.moduleForDigest(names.procTemplateModuleDigest(template_ref));
+        const template = view.templates.get(template_ref.template);
+        var draft = BodyDraftStore.init(self.allocator);
+        defer draft.deinit();
+        var ctx = BodyContext.initTypeOnly(self.allocator, self, view, .{
+            .proc_base = undefined, // type-only context; type lowering does not read the owner template
+            .template = undefined, // type-only context; type lowering does not read the owner template
+        }, requester, &draft);
+        defer ctx.deinit();
+        try ctx.constrainTypeToMono(template.checked_fn_root, fn_ty);
+    }
+
+    fn lowerFnTemplateDef(self: *Builder, fn_template: Ast.FnTemplate, evidence: []const SpecEvidence) Allocator.Error!Ast.FnId {
         return localFnIdFromSlot(
-            try self.lowerFnTemplateCallTarget(source_ty_view, fn_template, evidence),
+            try self.lowerFnTemplateCallTarget(fn_template, evidence),
             "Monotype function value lowering requires a local function definition",
         );
     }
 
-    fn lowerRestoredConstFnTemplate(self: *Builder, type_view: ModuleView, fn_template: Ast.FnTemplate) Allocator.Error!Ast.FnId {
+    fn lowerRestoredConstFnTemplate(self: *Builder, fn_template: Ast.FnTemplate) Allocator.Error!Ast.FnId {
         switch (fn_template.fn_def) {
             .nested => {
                 const fn_view = self.moduleForConstFnDef(fn_template.fn_def);
@@ -2807,7 +2881,7 @@ const Builder = struct {
                 _ = try self.sealActiveBodyDraft(graph, &body_draft, draft, draft_end, null, null);
                 return fn_id;
             },
-            else => return try self.lowerFnTemplateDef(type_view, fn_template, &.{}),
+            else => return try self.lowerFnTemplateDef(fn_template, &.{}),
         }
     }
 
@@ -2836,10 +2910,10 @@ const Builder = struct {
             source_ctx.graph,
         );
         if (reserved.needs_lowering) {
+            try self.pinDeferredTemplateRequestToCheckedRoot(source_ctx.graph, template_ref, request_template.mono_fn_ty);
             try source_ctx.graph.deferred_templates.append(self.allocator, .{
                 .fn_id = reserved.localFnId(),
                 .template_ref = template_ref,
-                .module = source_ctx.view.key,
                 .source_fn_ty = request_template.source_fn_ty,
                 .source_fn_key = request_template.source_fn_key,
                 .fn_ty = request_template.mono_fn_ty,
@@ -3079,7 +3153,6 @@ const Builder = struct {
                 Common.invariant("deferred template queue length changed while draining");
             _ = try self.lowerTemplateWithMonoFor(
                 request.template_ref,
-                self.moduleForId(request.module),
                 request.source_fn_ty,
                 request.source_fn_key,
                 request.fn_ty,
@@ -3758,7 +3831,6 @@ const Builder = struct {
     fn restoreConstFnExpr(
         self: *Builder,
         store_view: ModuleView,
-        type_view: ModuleView,
         fn_id: checked.ConstFnId,
         ty: Type.TypeId,
         static_data_const_locator: ?checked.ConstLocator,
@@ -3774,7 +3846,7 @@ const Builder = struct {
         }
         if (fn_value.captures.len == 0) {
             const template = try self.restoredConstFnTemplateToMono(store_view, fn_id, fn_value, ty);
-            const mono_fn_id = try self.lowerRestoredConstFnTemplate(type_view, template);
+            const mono_fn_id = try self.lowerRestoredConstFnTemplate(template);
             return try self.program.addExpr(.{
                 .ty = self.program.fnSource(mono_fn_id).mono_fn_ty,
                 .data = .{ .fn_def = .{ .fn_id = mono_fn_id } },
@@ -4183,7 +4255,19 @@ const Builder = struct {
         const value = store_view.const_store.get(node);
         switch (value) {
             .fn_value => |fn_id| {
-                const expr = try self.restoreConstFnExpr(store_view, type_view, fn_id, ty, static_data_const_locator);
+                const expr = try self.restoreConstFnExpr(store_view, fn_id, ty, static_data_const_locator);
+                if (static_data_const_locator == null) try self.const_expr_cache.put(address, expr);
+                return expr;
+            },
+            .tag, .record, .tuple => if (self.nominalConstructionLayer(ty)) |layer| {
+                const backing_expr = try self.restoreConstNodeAtType(store_view, type_view, node, layer.backing);
+                const expr = try self.program.addExpr(.{ .ty = layer.named, .data = .{ .nominal = backing_expr } });
+                if (static_data_const_locator == null) try self.const_expr_cache.put(address, expr);
+                return expr;
+            },
+            .nominal => |nominal| if (self.nominalConstructionLayer(ty)) |layer| {
+                const backing_expr = try self.restoreConstNodeAtType(store_view, type_view, nominal.backing, layer.backing);
+                const expr = try self.program.addExpr(.{ .ty = layer.named, .data = .{ .nominal = backing_expr } });
                 if (static_data_const_locator == null) try self.const_expr_cache.put(address, expr);
                 return expr;
             },
@@ -4442,10 +4526,10 @@ const Builder = struct {
         const callable_mono_ty = try graph.sealNode(callable_node);
         const callee_def = try self.lowerTemplateWithMono(
             template,
-            lookup.view,
             lookup.target.callable_ty,
             lookup.view.types.rootKey(lookup.target.callable_ty),
             callable_mono_ty,
+            &.{},
         );
 
         const args = [_]Ast.ExprId{value};
@@ -4722,6 +4806,294 @@ const Builder = struct {
                 .final_else = else_expr,
             } },
         });
+    }
+
+    const BuilderTryInfo = struct {
+        ok_ty: Type.TypeId,
+        err_ty: Type.TypeId,
+        ok_tag: Type.Tag,
+        err_tag: Type.Tag,
+    };
+
+    /// Whether a hosted specialization request differs from the declared host
+    /// ABI only by a widened `Try` error row. Such requests get a generated
+    /// Roc adapter that calls the declared-type boundary and re-tags the
+    /// error into the wider row.
+    fn hostedUseNeedsTryAdapter(self: *Builder, declared_fn_ty: Type.TypeId, requested_fn_ty: Type.TypeId) bool {
+        if (self.sameMonoType(declared_fn_ty, requested_fn_ty)) return false;
+
+        const declared = self.functionShape(declared_fn_ty, "hosted declared type was not a function");
+        const requested = self.functionShape(requested_fn_ty, "hosted requested type was not a function");
+        if (self.sameMonoType(declared.ret, requested.ret)) return false;
+
+        const declared_try = self.tryInfoOrNull(declared.ret) orelse return false;
+        const requested_try = self.tryInfoOrNull(requested.ret) orelse return false;
+        if (!self.sameMonoType(declared_try.ok_ty, requested_try.ok_ty)) return false;
+        if (!self.errorRowIsIncludedIn(declared_try.err_ty, requested_try.err_ty)) return false;
+
+        const declared_args = self.program.types.span(declared.args);
+        const requested_args = self.program.types.span(requested.args);
+        if (declared_args.len != requested_args.len) {
+            Common.invariant("hosted function use changed arity from the declared ABI");
+        }
+        for (0..declared_args.len) |index| {
+            const declared_arg = GuardedList.at(declared_args, index);
+            const requested_arg = GuardedList.at(requested_args, index);
+            if (!self.sameMonoType(declared_arg, requested_arg)) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    fn hostedTryAdapterBody(
+        self: *Builder,
+        args: Ast.Span(Ast.TypedLocal),
+        source_fn: Ast.FnId,
+        source_fn_ty: Type.TypeId,
+        target_fn_ty: Type.TypeId,
+    ) Allocator.Error!Ast.ExprId {
+        const source = self.functionShape(source_fn_ty, "hosted source adapter type was not a function");
+        const target = self.functionShape(target_fn_ty, "hosted target adapter type was not a function");
+        const source_args = self.program.types.span(source.args);
+        const target_args = self.program.types.span(target.args);
+        const adapter_args = self.program.typedLocalSpan(args);
+        if (source_args.len != target_args.len or source_args.len != GuardedList.borrowLen(adapter_args)) {
+            Common.invariant("hosted Try adapter arity differed from its function types");
+        }
+
+        const call_args = try self.allocator.alloc(Ast.ExprId, GuardedList.borrowLen(adapter_args));
+        defer self.allocator.free(call_args);
+        for (0..GuardedList.borrowLen(adapter_args)) |index| {
+            const arg = GuardedList.at(adapter_args, index);
+            const source_arg_ty = GuardedList.at(source_args, index);
+            const target_arg_ty = GuardedList.at(target_args, index);
+            if (!self.sameMonoType(arg.ty, source_arg_ty) or !self.sameMonoType(arg.ty, target_arg_ty)) {
+                Common.invariant("hosted Try adapter argument type differed from source or target function type");
+            }
+            call_args[index] = try self.localExpr(arg.local, arg.ty);
+        }
+
+        const source_call = try self.program.addExpr(.{
+            .ty = source.ret,
+            .data = .{ .call_proc = .{
+                .callee = Ast.localProcCallee(source_fn),
+                .args = try self.program.addExprSpan(call_args),
+            } },
+        });
+        return try self.tryReturnInjectionExpr(source_call, source.ret, target.ret);
+    }
+
+    fn tryReturnInjectionExpr(
+        self: *Builder,
+        source_expr: Ast.ExprId,
+        source_try_ty: Type.TypeId,
+        target_try_ty: Type.TypeId,
+    ) Allocator.Error!Ast.ExprId {
+        if (self.sameMonoType(source_try_ty, target_try_ty)) return source_expr;
+
+        const source_info = self.tryInfo(source_try_ty);
+        const target_info = self.tryInfo(target_try_ty);
+        if (!self.sameMonoType(source_info.ok_ty, target_info.ok_ty)) {
+            Common.invariant("Try adapter changed Ok type");
+        }
+        if (!self.errorRowIsIncludedIn(source_info.err_ty, target_info.err_ty)) {
+            Common.invariant("Try adapter error row was not included in target row");
+        }
+
+        const ok_local = try self.program.addLocal(self.symbols.fresh(), source_info.ok_ty);
+        const ok_payload_pat = try self.bindPat(ok_local, source_info.ok_ty);
+        const ok_pat = try self.program.addPat(.{ .ty = source_try_ty, .data = .{ .tag = .{
+            .name = source_info.ok_tag.name,
+            .payloads = try self.program.addPatSpan(&[_]Ast.PatId{ok_payload_pat}),
+        } } });
+        const ok_value = try self.localExpr(ok_local, source_info.ok_ty);
+        const ok_body = try self.tryOkExpr(target_try_ty, ok_value);
+
+        const err_local = try self.program.addLocal(self.symbols.fresh(), source_info.err_ty);
+        const err_payload_pat = try self.bindPat(err_local, source_info.err_ty);
+        const err_pat = try self.program.addPat(.{ .ty = source_try_ty, .data = .{ .tag = .{
+            .name = source_info.err_tag.name,
+            .payloads = try self.program.addPatSpan(&[_]Ast.PatId{err_payload_pat}),
+        } } });
+        const err_value = try self.localExpr(err_local, source_info.err_ty);
+        const injected_err = try self.errorRowInjectionExpr(err_value, source_info.err_ty, target_info.err_ty);
+        const err_body = try self.tryErrExpr(target_try_ty, injected_err);
+
+        const branches = [_]Ast.Branch{
+            .{ .pat = ok_pat, .body = ok_body },
+            .{ .pat = err_pat, .body = err_body },
+        };
+        return try self.program.addExpr(.{ .ty = target_try_ty, .data = .{ .match_ = .{
+            .scrutinee = source_expr,
+            .branches = try self.program.addBranchSpan(&branches),
+        } } });
+    }
+
+    fn errorRowInjectionExpr(
+        self: *Builder,
+        source_expr: Ast.ExprId,
+        source_err_ty: Type.TypeId,
+        target_err_ty: Type.TypeId,
+    ) Allocator.Error!Ast.ExprId {
+        if (self.sameMonoType(source_err_ty, target_err_ty)) return source_expr;
+
+        const source_tags = self.tagUnionTags(source_err_ty);
+        if (source_tags.len == 0) {
+            Common.invariant("cannot inject an empty error row into a different error row");
+        }
+
+        const branches = try self.allocator.alloc(Ast.Branch, source_tags.len);
+        defer self.allocator.free(branches);
+        for (0..source_tags.len) |index| {
+            const source_tag = GuardedList.at(source_tags, index);
+            const source_payload_tys = self.program.types.span(source_tag.payloads);
+            const target_tag = self.tagByName(target_err_ty, source_tag.name);
+            const target_payload_tys = self.program.types.span(target_tag.payloads);
+            if (source_payload_tys.len != target_payload_tys.len) {
+                Common.invariant("Try adapter error tag payload arity differed in target row");
+            }
+
+            const payload_pats = try self.allocator.alloc(Ast.PatId, source_payload_tys.len);
+            defer self.allocator.free(payload_pats);
+            const payload_exprs = try self.allocator.alloc(Ast.ExprId, source_payload_tys.len);
+            defer self.allocator.free(payload_exprs);
+            for (0..source_payload_tys.len) |payload_index| {
+                const source_payload_ty = GuardedList.at(source_payload_tys, payload_index);
+                const target_payload_ty = GuardedList.at(target_payload_tys, payload_index);
+                if (!self.sameMonoType(source_payload_ty, target_payload_ty)) {
+                    Common.invariant("Try adapter error tag payload type differed in target row");
+                }
+                const local = try self.program.addLocal(self.symbols.fresh(), source_payload_ty);
+                payload_pats[payload_index] = try self.bindPat(local, source_payload_ty);
+                payload_exprs[payload_index] = try self.localExpr(local, source_payload_ty);
+            }
+
+            const pat = try self.program.addPat(.{ .ty = source_err_ty, .data = .{ .tag = .{
+                .name = source_tag.name,
+                .payloads = try self.program.addPatSpan(payload_pats),
+            } } });
+            const body = try self.tagValueExpr(target_err_ty, target_tag, payload_exprs);
+            branches[index] = .{ .pat = pat, .body = body };
+        }
+
+        return try self.program.addExpr(.{ .ty = target_err_ty, .data = .{ .match_ = .{
+            .scrutinee = source_expr,
+            .branches = try self.program.addBranchSpan(branches),
+        } } });
+    }
+
+    fn tryOkExpr(self: *Builder, try_ty: Type.TypeId, value_expr: Ast.ExprId) Allocator.Error!Ast.ExprId {
+        const info = self.tryInfo(try_ty);
+        return try self.tagValueExpr(try_ty, info.ok_tag, &[_]Ast.ExprId{value_expr});
+    }
+
+    fn tryErrExpr(self: *Builder, try_ty: Type.TypeId, err_expr: Ast.ExprId) Allocator.Error!Ast.ExprId {
+        const info = self.tryInfo(try_ty);
+        return try self.tagValueExpr(try_ty, info.err_tag, &[_]Ast.ExprId{err_expr});
+    }
+
+    fn tagValueExpr(
+        self: *Builder,
+        ty: Type.TypeId,
+        tag: Type.Tag,
+        payloads: []const Ast.ExprId,
+    ) Allocator.Error!Ast.ExprId {
+        const backing_ty = self.nominalExprBackingType(ty) orelse ty;
+        const tag_expr = try self.program.addExpr(.{
+            .ty = backing_ty,
+            .data = .{ .tag = .{
+                .name = tag.name,
+                .payloads = try self.program.addExprSpan(payloads),
+            } },
+        });
+        if (self.nominalExprBackingType(ty) != null) {
+            return try self.program.addExpr(.{ .ty = ty, .data = .{ .nominal = tag_expr } });
+        }
+        return tag_expr;
+    }
+
+    fn tryInfo(self: *Builder, try_ty: Type.TypeId) BuilderTryInfo {
+        return self.tryInfoOrNull(try_ty) orelse Common.invariant("expected a named Try type");
+    }
+
+    fn tryInfoOrNull(self: *Builder, try_ty: Type.TypeId) ?BuilderTryInfo {
+        const backing_ty = self.namedBackingType(try_ty) orelse return null;
+        const ok_tag = self.tagByTextOrNull(backing_ty, "Ok") orelse return null;
+        const err_tag = self.tagByTextOrNull(backing_ty, "Err") orelse return null;
+        const ok_payloads = self.program.types.span(ok_tag.payloads);
+        const err_payloads = self.program.types.span(err_tag.payloads);
+        if (ok_payloads.len != 1 or err_payloads.len != 1) return null;
+        return .{
+            .ok_ty = GuardedList.at(ok_payloads, 0),
+            .err_ty = GuardedList.at(err_payloads, 0),
+            .ok_tag = ok_tag,
+            .err_tag = err_tag,
+        };
+    }
+
+    fn errorRowIsIncludedIn(self: *Builder, source_err_ty: Type.TypeId, target_err_ty: Type.TypeId) bool {
+        if (self.sameMonoType(source_err_ty, target_err_ty)) return true;
+        const source_tags = self.tagUnionTags(source_err_ty);
+        for (0..source_tags.len) |index| {
+            const source_tag = GuardedList.at(source_tags, index);
+            const target_tag = self.tagByNameOrNull(target_err_ty, source_tag.name) orelse return false;
+            const source_payloads = self.program.types.span(source_tag.payloads);
+            const target_payloads = self.program.types.span(target_tag.payloads);
+            if (source_payloads.len != target_payloads.len) return false;
+            for (0..source_payloads.len) |payload_index| {
+                const source_payload = GuardedList.at(source_payloads, payload_index);
+                const target_payload = GuardedList.at(target_payloads, payload_index);
+                if (!self.sameMonoType(source_payload, target_payload)) return false;
+            }
+        }
+        return true;
+    }
+
+    fn tagByName(self: *Builder, ty: Type.TypeId, name: names.TagNameId) Type.Tag {
+        return self.tagByNameOrNull(ty, name) orelse Common.invariant("tag operation referenced tag absent from Monotype type");
+    }
+
+    fn tagByNameOrNull(self: *Builder, ty: Type.TypeId, name: names.TagNameId) ?Type.Tag {
+        const tags = self.tagUnionTags(ty);
+        for (0..tags.len) |index| {
+            const tag = GuardedList.at(tags, index);
+            if (tag.name == name) return tag;
+        }
+        return null;
+    }
+
+    fn tagByTextOrNull(self: *Builder, ty: Type.TypeId, text: []const u8) ?Type.Tag {
+        const tags = self.tagUnionTags(ty);
+        for (0..tags.len) |index| {
+            const tag = GuardedList.at(tags, index);
+            if (std.mem.eql(u8, self.program.names.tagLabelText(tag.name), text)) return tag;
+        }
+        return null;
+    }
+
+    fn tagUnionTags(self: *Builder, ty: Type.TypeId) Type.StoreSpanBorrow(Type.Tag, "tags") {
+        return switch (self.shapeContent(ty)) {
+            .tag_union => |tags| self.program.types.tagSpan(tags),
+            else => Common.invariant("tag operation expected tag-union type"),
+        };
+    }
+
+    fn nominalExprBackingType(self: *Builder, ty: Type.TypeId) ?Type.TypeId {
+        return switch (self.program.types.get(ty)) {
+            .named => |named| if (named.kind != .alias) blk: {
+                const backing = named.backing orelse break :blk null;
+                break :blk backing.ty;
+            } else null,
+            else => null,
+        };
+    }
+
+    fn sameMonoType(self: *Builder, a: Type.TypeId, b: Type.TypeId) bool {
+        if (a == b) return true;
+        const a_digest = self.program.types.typeDigest(&self.program.names, a);
+        const b_digest = self.program.types.typeDigest(&self.program.names, b);
+        return std.mem.eql(u8, a_digest.bytes[0..], b_digest.bytes[0..]);
     }
 };
 
@@ -6282,8 +6654,10 @@ const BodyContext = struct {
     source_region_override: ?base.Region = null,
     /// The specific compile-time entry root currently being lowered. Hoisted
     /// constants only count as "own" roots for this exact entry, not for every
-    /// specialization of the same procedure template.
-    current_entry_root: ?checked.ComptimeRootId = null,
+    /// specialization of the same procedure template. Module-qualified because
+    /// the root id travels through template requests into other modules'
+    /// body contexts, where the same integer names an unrelated root.
+    current_entry_root: ?EntryRoot = null,
     /// Evidence for the current callable's dispatch requirements (innermost
     /// vector plus lexical parents for nested local functions). Body contexts
     /// created for the same specialization (dispatch call contexts, nested
@@ -6297,8 +6671,16 @@ const BodyContext = struct {
 
     const PatternLiteralGuard = struct {
         local: DraftLocalId,
-        conversion: checked.CheckedExprId,
         ty: Type.TypeId,
+        check: union(enum) {
+            /// Compare against the literal's `from_numeral`/`from_quote`
+            /// conversion result.
+            conversion: checked.CheckedExprId,
+            /// The literal's value is unrepresentable at the scrutinee's
+            /// concrete type, so the branch can never match (checking reports
+            /// these; an I8 can never equal 300).
+            never,
+        },
     };
 
     const ParserPrecomputedRecord = struct {
@@ -6468,9 +6850,24 @@ const BodyContext = struct {
         graph: *InstGraph,
         draft: *BodyDraftStore,
     ) Allocator.Error!BodyContext {
+        var ctx = initTypeOnly(allocator, builder, view, owner_template, graph, draft);
         const string_literals = try allocator.alloc(?DraftStringLiteralId, view.bodies.stringLiteralCount());
-        errdefer allocator.free(string_literals);
         @memset(string_literals, null);
+        ctx.string_literals = string_literals;
+        return ctx;
+    }
+
+    /// Context for instantiating checked types into `graph` without lowering
+    /// any expressions: the module's string-literal table is never touched,
+    /// so it is not materialized. Expression lowering must use `init`.
+    fn initTypeOnly(
+        allocator: Allocator,
+        builder: *Builder,
+        view: ModuleView,
+        owner_template: names.ProcTemplate,
+        graph: *InstGraph,
+        draft: *BodyDraftStore,
+    ) BodyContext {
         return .{
             .allocator = allocator,
             .builder = builder,
@@ -6488,7 +6885,7 @@ const BodyContext = struct {
             .graph = graph,
             .draft = draft,
             .node_map = std.AutoHashMap(CheckedTypeAddress, NodeId).init(allocator),
-            .string_literals = string_literals,
+            .string_literals = &[_]?DraftStringLiteralId{},
             .loop_contexts = .empty,
             .pattern_literal_guards = .empty,
             .equality_expansion_stack = std.AutoHashMap(Type.TypeId, void).init(allocator),
@@ -6548,6 +6945,20 @@ const BodyContext = struct {
             self.builder.program.current_loc,
             self.builder.program.current_region,
         );
+    }
+
+    /// Add a structural constructor expression (tag, record, or tuple),
+    /// typing it at the nominal construction backing and wrapping it in one
+    /// explicit `.nominal` node per nominal layer of `ty`. This keeps
+    /// nominal construction explicit in the IR even when the checked
+    /// expression was an unqualified constructor promoted to a nominal type
+    /// during unification.
+    fn addConstructorExpr(self: *BodyContext, ty: Type.TypeId, data: BodyExprData) Allocator.Error!DraftExprId {
+        if (self.builder.nominalConstructionLayer(ty)) |layer| {
+            const backing_expr = try self.addConstructorExpr(layer.backing, data);
+            return try self.addExpr(.{ .ty = layer.named, .data = .{ .nominal = backing_expr } });
+        }
+        return try self.addExpr(.{ .ty = ty, .data = data });
     }
 
     fn addPat(self: *BodyContext, pat: BodyPat) Allocator.Error!DraftPatId {
@@ -8154,7 +8565,7 @@ const BodyContext = struct {
                 const root = self.view.compile_time_roots.root(wrapper.root);
                 const saved_entry_root = self.current_entry_root;
                 defer self.current_entry_root = saved_entry_root;
-                self.current_entry_root = wrapper.root;
+                self.current_entry_root = .{ .module = self.view.key, .root = wrapper.root };
                 const saved_source_region_override = self.source_region_override;
                 defer self.source_region_override = saved_source_region_override;
                 self.source_region_override = switch (root.kind) {
@@ -8482,8 +8893,8 @@ const BodyContext = struct {
     }
 
     fn loweringOwnHoistedConstRoot(self: *BodyContext, entry: checked.HoistedConstEntry) bool {
-        if (self.current_entry_root) |root| {
-            return entry.root == root;
+        if (self.current_entry_root) |entry_root| {
+            return moduleBytesEqual(entry_root.module.bytes, self.view.key.bytes) and entry.root == entry_root.root;
         }
         return false;
     }
@@ -8514,7 +8925,7 @@ const BodyContext = struct {
                     .disallow,
                 );
             },
-            .eval_template => |eval| try self.lowerConstEvalTemplateUse(self.view, eval, ty, source_region, entry.root),
+            .eval_template => |eval| try self.lowerConstEvalTemplateUse(self.view, eval, ty, source_region, .{ .module = self.view.key, .root = entry.root }),
             .reserved => Common.invariant("reserved hoisted const template reached Monotype"),
         };
     }
@@ -8596,20 +9007,9 @@ const BodyContext = struct {
             .anno_only,
             => Common.invariant("non-runtime checked expression reached Monotype lowering"),
             .runtime_error => return try self.runtimeCrashExpr(ty, "runtime error"),
-            .num => |num| self.lowerIntLiteral(num.value, ty),
-            .typed_int => |num| self.lowerIntLiteral(num.value, ty),
-            .frac_f32 => |frac| self.lowerFracLiteral(.{ .f32 = frac.value }, ty),
-            .frac_f64 => |frac| self.lowerFracLiteral(.{ .f64 = frac.value }, ty),
-            .dec => |dec| self.lowerFracLiteral(.{ .dec = dec.value }, ty),
-            .dec_small => Common.invariant("small decimal literal reached Monotype after numeric finalization"),
-            .num_from_numeral => |plan| {
+            .numeral => |numeral| {
                 if (try self.restoredNumeralConst(expr_id, ty)) |restored| return restored;
-                return try self.lowerNumeralFold(expr.ty, plan, ty);
-            },
-            .typed_frac => Common.invariant("typed fractional integer literal reached Monotype after numeric finalization"),
-            .typed_num_from_numeral => |plan| {
-                if (try self.restoredNumeralConst(expr_id, ty)) |restored| return restored;
-                return try self.lowerNumeralFold(expr.ty, plan, ty);
+                return try self.lowerNumeralExpr(expr.ty, numeral, ty);
             },
             .str_from_quote => |quote| {
                 if (try self.restoredNumeralConst(expr_id, ty)) |restored| return restored;
@@ -8618,23 +9018,28 @@ const BodyContext = struct {
             .str_segment => |str| .{ .str_lit = try self.lowerStringLiteral(str) },
             .bytes_literal => |str| .{ .bytes_lit = try self.lowerStringLiteral(str) },
             .empty_list => .{ .list = .empty() },
-            .empty_record => .{ .record = .empty() },
+            .empty_record => return try self.addConstructorExpr(ty, .{ .record = .empty() }),
             .str => |segments| try self.lowerStr(segments),
             .lookup_local => |lookup| return try self.lowerLookupExprAtType(expr.ty, lookup.resolved, ty),
             .lookup_external => |resolved| return try self.lowerLookupExprAtType(expr.ty, resolved, ty),
             .lookup_required => |resolved| return try self.lowerLookupExprAtType(expr.ty, resolved, ty),
             .list => |items| .{ .list = try self.lowerListExpr(items, ty) },
-            .tuple => |items| .{ .tuple = try self.lowerExprSpanAtTypes(items, self.builder.tupleItemTypes(ty)) },
+            .tuple => |items| return try self.addConstructorExpr(ty, .{ .tuple = try self.lowerExprSpanAtTypes(items, self.builder.tupleItemTypes(ty)) }),
             .record => |record| return try self.lowerRecordExpr(record, ty),
-            .tag => |tag| blk: {
+            .tag => |tag| {
                 const name = try self.builder.tagName(self.view, tag.name);
-                break :blk .{ .tag = .{
+                return try self.addConstructorExpr(ty, .{ .tag = .{
                     .name = name,
                     .payloads = try self.lowerExprSpanAtTypes(tag.args, self.builder.tagPayloadTypes(ty, name)),
-                } };
+                } });
             },
-            .zero_argument_tag => |tag| .{ .tag = .{ .name = try self.builder.tagName(self.view, tag.name), .payloads = .empty() } },
-            .nominal => |nominal| .{ .nominal = try self.lowerExprAtType(nominal.backing_expr, self.builder.namedBackingType(ty) orelse ty) },
+            .zero_argument_tag => |tag| return try self.addConstructorExpr(ty, .{ .tag = .{ .name = try self.builder.tagName(self.view, tag.name), .payloads = .empty() } }),
+            .nominal => |nominal| {
+                if (self.builder.nominalConstructionLayer(ty)) |layer| {
+                    return try self.addExpr(.{ .ty = layer.named, .data = .{ .nominal = try self.lowerExprAtType(nominal.backing_expr, layer.backing) } });
+                }
+                return try self.addExpr(.{ .ty = ty, .data = .{ .nominal = try self.lowerExprAtType(nominal.backing_expr, self.builder.namedBackingType(ty) orelse ty) } });
+            },
             .closure => |closure| try self.lowerClosure(expr_id, closure, ty),
             .lambda => blk: {
                 break :blk try self.lowerLambdaExpr(
@@ -8919,7 +9324,7 @@ const BodyContext = struct {
                     if (binding.binding.def == imported.def and binding.binding.pattern == imported.pattern) {
                         const binding_source = schemeRoot(view, binding.source_scheme, "imported procedure binding source scheme was not output");
                         const fn_template = self.builder.fnDefForImportedBindingBody(view, binding.body, binding_source, view.types.rootKey(binding_source), mono_fn_ty);
-                        const fn_id = try self.builder.lowerFnTemplateDef(view, fn_template, evidence);
+                        const fn_id = try self.builder.lowerFnTemplateDef(fn_template, evidence);
                         break :blk try self.addExpr(.{
                             .ty = mono_fn_ty,
                             .data = .{ .fn_def = .{ .fn_id = draftFinalFn(fn_id) } },
@@ -8962,7 +9367,7 @@ const BodyContext = struct {
                     view.types.rootKey(source_fn_ty),
                     mono_fn_ty,
                 );
-                const fn_id = try self.builder.lowerFnTemplateDef(view, fn_template, evidence);
+                const fn_id = try self.builder.lowerFnTemplateDef(fn_template, evidence);
                 break :blk try self.addExpr(.{
                     .ty = self.builder.program.fnSource(fn_id).mono_fn_ty,
                     .data = .{ .fn_def = .{ .fn_id = draftFinalFn(fn_id) } },
@@ -10058,156 +10463,143 @@ const BodyContext = struct {
             .erased,
             .zst,
             => ty,
-            .named => |named| blk: {
-                if (self.isGeneratedIteratorEvidenceType(ty)) {
-                    break :blk try self.publicIteratorUnificationType(ty, named, cache);
-                }
-                if (self.isGeneratedOpaqueEvidenceType(ty)) {
-                    break :blk try self.publicOpaqueEvidenceNamedType(named);
-                }
-
-                var changed = false;
-                const args = try GuardedList.dupe(self.allocator, Type.TypeId, self.builder.program.types.span(named.args));
-                defer self.allocator.free(args);
-                const public_args = try self.allocator.alloc(Type.TypeId, args.len);
-                defer self.allocator.free(public_args);
-                for (args, 0..) |arg, index| {
-                    public_args[index] = try self.publicOpaqueUnificationTypeInner(arg, cache);
-                    if (public_args[index] != arg) changed = true;
-                }
-
-                const public_backing: ?Type.NamedBacking = if (named.backing) |backing| backing: {
-                    const public_ty = try self.publicOpaqueUnificationTypeInner(backing.ty, cache);
-                    if (public_ty != backing.ty) changed = true;
-                    break :backing .{ .ty = public_ty, .use = backing.use };
-                } else null;
-
-                const declared_order = try GuardedList.dupe(self.allocator, Type.DeclaredField, self.builder.program.types.declaredFieldSpan(named.declared_order));
-                defer self.allocator.free(declared_order);
-                var public_declared = try self.allocator.alloc(Type.DeclaredField, declared_order.len);
-                defer self.allocator.free(public_declared);
-                for (declared_order, 0..) |field, index| {
-                    public_declared[index] = switch (field) {
-                        .named => |name| .{ .named = name },
-                        .padding => |padding| padding: {
-                            const public_padding = try self.publicOpaqueUnificationTypeInner(padding, cache);
-                            if (public_padding != padding) changed = true;
-                            break :padding .{ .padding = public_padding };
-                        },
-                    };
-                }
-
-                if (!changed) break :blk ty;
-                const out = try self.builder.program.types.add(.{ .named = .{
-                    .named_type = named.named_type,
-                    .def = named.def,
-                    .kind = named.kind,
-                    .builtin_owner = named.builtin_owner,
-                    .args = try self.builder.program.types.addSpan(public_args),
-                    .backing = public_backing,
-                    .declared_order = try self.builder.program.types.addDeclaredFields(public_declared),
-                } });
-                try cache.put(ty, out);
-                break :blk out;
-            },
-            .record => |fields_span| blk: {
-                const fields = try GuardedList.dupe(self.allocator, Type.Field, self.builder.program.types.fieldSpan(fields_span));
-                defer self.allocator.free(fields);
-                var changed = false;
-                const public_fields = try self.allocator.alloc(Type.Field, fields.len);
-                defer self.allocator.free(public_fields);
-                for (fields, 0..) |field, index| {
-                    const public_ty = try self.publicOpaqueUnificationTypeInner(field.ty, cache);
-                    public_fields[index] = .{ .name = field.name, .ty = public_ty };
-                    if (public_ty != field.ty) changed = true;
-                }
-                if (!changed) break :blk ty;
-                const out = try self.builder.program.types.add(.{
-                    .record = try self.builder.program.types.addRecordFields(&self.builder.program.names, public_fields),
-                });
-                try cache.put(ty, out);
-                break :blk out;
-            },
-            .tuple => |items_span| blk: {
-                const items = try GuardedList.dupe(self.allocator, Type.TypeId, self.builder.program.types.span(items_span));
-                defer self.allocator.free(items);
-                var changed = false;
-                const public_items = try self.allocator.alloc(Type.TypeId, items.len);
-                defer self.allocator.free(public_items);
-                for (items, 0..) |item, index| {
-                    public_items[index] = try self.publicOpaqueUnificationTypeInner(item, cache);
-                    if (public_items[index] != item) changed = true;
-                }
-                if (!changed) break :blk ty;
-                const out = try self.builder.program.types.add(.{
-                    .tuple = try self.builder.program.types.addSpan(public_items),
-                });
-                try cache.put(ty, out);
-                break :blk out;
-            },
-            .tag_union => |tags_span| blk: {
-                const tags = try GuardedList.dupe(self.allocator, Type.Tag, self.builder.program.types.tagSpan(tags_span));
-                defer self.allocator.free(tags);
-                var changed = false;
-                const public_tags = try self.allocator.alloc(Type.Tag, tags.len);
-                defer self.allocator.free(public_tags);
-                for (tags, 0..) |tag, tag_index| {
-                    const payloads = try GuardedList.dupe(self.allocator, Type.TypeId, self.builder.program.types.span(tag.payloads));
-                    defer self.allocator.free(payloads);
-                    const public_payloads = try self.allocator.alloc(Type.TypeId, payloads.len);
-                    defer self.allocator.free(public_payloads);
-                    for (payloads, 0..) |payload, payload_index| {
-                        public_payloads[payload_index] = try self.publicOpaqueUnificationTypeInner(payload, cache);
-                        if (public_payloads[payload_index] != payload) changed = true;
-                    }
-                    public_tags[tag_index] = .{
-                        .name = tag.name,
-                        .checked_name = tag.checked_name,
-                        .payloads = try self.builder.program.types.addSpan(public_payloads),
-                    };
-                }
-                if (!changed) break :blk ty;
-                const out = try self.builder.program.types.add(.{
-                    .tag_union = try self.builder.program.types.addTagVariants(&self.builder.program.names, public_tags),
-                });
-                try cache.put(ty, out);
-                break :blk out;
-            },
-            .list => |elem| blk: {
-                const public_elem = try self.publicOpaqueUnificationTypeInner(elem, cache);
-                if (public_elem == elem) break :blk ty;
-                const out = try self.builder.program.types.add(.{ .list = public_elem });
-                try cache.put(ty, out);
-                break :blk out;
-            },
-            .box => |elem| blk: {
-                const public_elem = try self.publicOpaqueUnificationTypeInner(elem, cache);
-                if (public_elem == elem) break :blk ty;
-                const out = try self.builder.program.types.add(.{ .box = public_elem });
-                try cache.put(ty, out);
-                break :blk out;
-            },
-            .func => |function| blk: {
-                const args = try GuardedList.dupe(self.allocator, Type.TypeId, self.builder.program.types.span(function.args));
-                defer self.allocator.free(args);
-                var changed = false;
-                const public_args = try self.allocator.alloc(Type.TypeId, args.len);
-                defer self.allocator.free(public_args);
-                for (args, 0..) |arg, index| {
-                    public_args[index] = try self.publicOpaqueUnificationTypeInner(arg, cache);
-                    if (public_args[index] != arg) changed = true;
-                }
-                const public_ret = try self.publicOpaqueUnificationTypeInner(function.ret, cache);
-                if (public_ret != function.ret) changed = true;
-                if (!changed) break :blk ty;
-                const out = try self.builder.program.types.add(.{ .func = .{
-                    .args = try self.builder.program.types.addSpan(public_args),
-                    .ret = public_ret,
-                } });
-                try cache.put(ty, out);
-                break :blk out;
-            },
+            .named => |named| if (self.isGeneratedIteratorEvidenceType(ty))
+                try self.publicIteratorUnificationType(ty, named, cache)
+            else if (self.isGeneratedOpaqueEvidenceType(ty))
+                try self.publicOpaqueEvidenceNamedType(named)
+            else
+                try self.clonePublicOpaqueUnificationType(ty, cache),
+            else => try self.clonePublicOpaqueUnificationType(ty, cache),
         };
+    }
+
+    fn clonePublicOpaqueUnificationType(
+        self: *BodyContext,
+        ty: Type.TypeId,
+        cache: *std.AutoHashMap(Type.TypeId, Type.TypeId),
+    ) Allocator.Error!Type.TypeId {
+        const Context = struct {
+            body: *BodyContext,
+            source: Type.TypeId,
+            cache: *std.AutoHashMap(Type.TypeId, Type.TypeId),
+
+            fn fill(ctx: @This(), public_ty: Type.TypeId) Allocator.Error!Type.Content {
+                try ctx.cache.put(ctx.source, public_ty);
+                return try ctx.body.clonePublicOpaqueUnificationContent(ctx.source, ctx.cache);
+            }
+        };
+        return try self.builder.program.types.addRecursive(Context{
+            .body = self,
+            .source = ty,
+            .cache = cache,
+        }, Context.fill);
+    }
+
+    fn clonePublicOpaqueUnificationContent(
+        self: *BodyContext,
+        ty: Type.TypeId,
+        cache: *std.AutoHashMap(Type.TypeId, Type.TypeId),
+    ) Allocator.Error!Type.Content {
+        return switch (self.builder.program.types.get(ty)) {
+            .primitive => |primitive| .{ .primitive = primitive },
+            .erased => |digest| .{ .erased = digest },
+            .zst => .zst,
+            .list => |elem| .{ .list = try self.publicOpaqueUnificationTypeInner(elem, cache) },
+            .box => |elem| .{ .box = try self.publicOpaqueUnificationTypeInner(elem, cache) },
+            .tuple => |items| .{ .tuple = try self.publicOpaqueUnificationTypeSpan(items, cache) },
+            .func => |function| .{ .func = .{
+                .args = try self.publicOpaqueUnificationTypeSpan(function.args, cache),
+                .ret = try self.publicOpaqueUnificationTypeInner(function.ret, cache),
+            } },
+            .record => |fields| .{ .record = try self.publicOpaqueUnificationFieldSpan(fields, cache) },
+            .tag_union => |tags| .{ .tag_union = try self.publicOpaqueUnificationTagSpan(tags, cache) },
+            .named => |named| .{ .named = .{
+                .named_type = named.named_type,
+                .def = named.def,
+                .kind = named.kind,
+                .builtin_owner = named.builtin_owner,
+                .args = try self.publicOpaqueUnificationTypeSpan(named.args, cache),
+                .backing = if (named.backing) |backing| .{
+                    .ty = try self.publicOpaqueUnificationTypeInner(backing.ty, cache),
+                    .use = backing.use,
+                } else null,
+                .declared_order = try self.publicOpaqueUnificationDeclaredFieldSpan(named.declared_order, cache),
+            } },
+        };
+    }
+
+    fn publicOpaqueUnificationTypeSpan(
+        self: *BodyContext,
+        span: Type.Span,
+        cache: *std.AutoHashMap(Type.TypeId, Type.TypeId),
+    ) Allocator.Error!Type.Span {
+        const items = try GuardedList.dupe(self.allocator, Type.TypeId, self.builder.program.types.span(span));
+        defer self.allocator.free(items);
+        if (items.len == 0) return .empty();
+        const public_items = try self.allocator.alloc(Type.TypeId, items.len);
+        defer self.allocator.free(public_items);
+        for (items, 0..) |item, index| {
+            public_items[index] = try self.publicOpaqueUnificationTypeInner(item, cache);
+        }
+        return try self.builder.program.types.addSpan(public_items);
+    }
+
+    fn publicOpaqueUnificationFieldSpan(
+        self: *BodyContext,
+        span: Type.Span,
+        cache: *std.AutoHashMap(Type.TypeId, Type.TypeId),
+    ) Allocator.Error!Type.Span {
+        const fields = try GuardedList.dupe(self.allocator, Type.Field, self.builder.program.types.fieldSpan(span));
+        defer self.allocator.free(fields);
+        if (fields.len == 0) return .empty();
+        const public_fields = try self.allocator.alloc(Type.Field, fields.len);
+        defer self.allocator.free(public_fields);
+        for (fields, 0..) |field, index| {
+            public_fields[index] = .{
+                .name = field.name,
+                .ty = try self.publicOpaqueUnificationTypeInner(field.ty, cache),
+            };
+        }
+        return try self.builder.program.types.addRecordFields(&self.builder.program.names, public_fields);
+    }
+
+    fn publicOpaqueUnificationTagSpan(
+        self: *BodyContext,
+        span: Type.Span,
+        cache: *std.AutoHashMap(Type.TypeId, Type.TypeId),
+    ) Allocator.Error!Type.Span {
+        const tags = try GuardedList.dupe(self.allocator, Type.Tag, self.builder.program.types.tagSpan(span));
+        defer self.allocator.free(tags);
+        if (tags.len == 0) return .empty();
+        const public_tags = try self.allocator.alloc(Type.Tag, tags.len);
+        defer self.allocator.free(public_tags);
+        for (tags, 0..) |tag, index| {
+            public_tags[index] = .{
+                .name = tag.name,
+                .checked_name = tag.checked_name,
+                .payloads = try self.publicOpaqueUnificationTypeSpan(tag.payloads, cache),
+            };
+        }
+        return try self.builder.program.types.addTagVariants(&self.builder.program.names, public_tags);
+    }
+
+    fn publicOpaqueUnificationDeclaredFieldSpan(
+        self: *BodyContext,
+        span: Type.Span,
+        cache: *std.AutoHashMap(Type.TypeId, Type.TypeId),
+    ) Allocator.Error!Type.Span {
+        const fields = try GuardedList.dupe(self.allocator, Type.DeclaredField, self.builder.program.types.declaredFieldSpan(span));
+        defer self.allocator.free(fields);
+        if (fields.len == 0) return .empty();
+        const public_fields = try self.allocator.alloc(Type.DeclaredField, fields.len);
+        defer self.allocator.free(public_fields);
+        for (fields, 0..) |field, index| {
+            public_fields[index] = switch (field) {
+                .named => |name| .{ .named = name },
+                .padding => |padding| .{ .padding = try self.publicOpaqueUnificationTypeInner(padding, cache) },
+            };
+        }
+        return try self.builder.program.types.addDeclaredFields(public_fields);
     }
 
     fn publicIteratorUnificationType(
@@ -16418,7 +16810,7 @@ const BodyContext = struct {
         eval: checked.ConstEvalTemplate,
         ty: Type.TypeId,
         source_region_override: ?base.Region,
-        current_entry_root: ?checked.ComptimeRootId,
+        current_entry_root: ?EntryRoot,
     ) Allocator.Error!DraftExprId {
         const body = store_view.checked_const_bodies.get(eval.body);
         const entry_template = store_view.templates.get(eval.entry_template.template);
@@ -16498,6 +16890,14 @@ const BodyContext = struct {
         switch (value) {
             .fn_value => |fn_id| {
                 return try self.restoreConstFn(store_view, fn_id, ty, static_data_const_locator);
+            },
+            .tag, .record, .tuple => if (self.builder.nominalConstructionLayer(ty)) |layer| {
+                const backing_expr = try self.restoreConstNodeAtType(store_view, type_view, node, layer.backing);
+                return try self.addExpr(.{ .ty = layer.named, .data = .{ .nominal = backing_expr } });
+            },
+            .nominal => |nominal| if (self.builder.nominalConstructionLayer(ty)) |layer| {
+                const backing_expr = try self.restoreConstNodeAtType(store_view, type_view, nominal.backing, layer.backing);
+                return try self.addExpr(.{ .ty = layer.named, .data = .{ .nominal = backing_expr } });
             },
             else => {},
         }
@@ -17887,7 +18287,7 @@ const BodyContext = struct {
                 .value = value,
             };
         }
-        const record_expr = try self.addExpr(.{ .ty = ty, .data = .{ .record = try self.addFieldExprSpan(lowered) } });
+        const record_expr = try self.addConstructorExpr(ty, .{ .record = try self.addFieldExprSpan(lowered) });
         if (base_record) |base_value| {
             return try self.addExpr(.{ .ty = ty, .data = .{ .let_ = .{
                 .bind = try self.bindPat(base_local orelse Common.invariant("record update lowered base without a base local"), base_ty),
@@ -18229,7 +18629,7 @@ const BodyContext = struct {
     ) Allocator.Error!DraftExprId {
         const expr = self.view.bodies.expr(expr_id);
         const plan = switch (expr.data) {
-            .num_from_numeral, .typed_num_from_numeral => |plan| plan,
+            .numeral => |numeral| numeral.plan,
             .str_from_quote => |quote| quote.plan,
             else => Common.invariant("literal conversion root did not point at a conversion expression"),
         };
@@ -18256,54 +18656,89 @@ const BodyContext = struct {
         };
     }
 
-    /// Fold a `from_numeral` conversion into a constant at its concrete target
-    /// type. Compile-time finalization only registers a constant for literals
-    /// whose type is already concrete at Check time; a literal inside a generic
-    /// body (e.g. the `1` in `Iter.exclusive_range`'s `start.add_try(1)`) is
-    /// typed by the abstract `num` var and only gains a concrete type here, after
-    /// monomorphization. Rather than emit a runtime `num_from_numeral` low-level
-    /// op — which the compiled backends deliberately reject — we evaluate the
-    /// conversion at the stage that owns monomorphic types, reusing the exact
-    /// decimal-text + parse behavior the finalization/interpreter path uses so
-    /// the constant is identical regardless of where the literal is monomorphized.
-    fn lowerNumeralFold(
+    /// Produce a numeric literal's constant — the ONE place in the compiler
+    /// that turns a literal's exact digits into a bit pattern, always for
+    /// the instantiated Monotype primitive. A custom numeric target keeps its
+    /// real user-defined `from_numeral` dispatch call instead.
+    fn lowerNumeralExpr(
         self: *BodyContext,
         checked_ret_ty: checked.CheckedTypeId,
-        maybe_plan: ?static_dispatch.StaticDispatchPlanId,
+        numeral: checked.CheckedNumeralData,
         target_ty: Type.TypeId,
     ) Allocator.Error!DraftExprId {
-        // Only the builtin numeric types implement `from_numeral` as the
-        // `num_from_numeral` low-level op that compiled backends reject. A custom
-        // numeric type carries a user-defined `from_numeral` body that lowers to
-        // an ordinary call the backends handle, so it must keep going through the
-        // real dispatch rather than being folded.
         const primitive = switch (self.builder.shapeContent(target_ty)) {
             .primitive => |p| p,
-            else => return try self.lowerNumeralCall(checked_ret_ty, maybe_plan, target_ty),
+            else => return try self.lowerNumeralCall(checked_ret_ty, numeral.plan, target_ty),
         };
-
-        const plan_id = maybe_plan orelse Common.invariant("checked from_numeral expression reached Monotype without a dispatch plan");
-        const plan = self.view.static_dispatch_plans.plans[@intFromEnum(plan_id)];
-        const plan_args = plan.argsSlice(self.view.static_dispatch_plans);
-        if (plan_args.len != 1) Common.invariant("from_numeral plan did not carry exactly one operand");
-        const literal = switch (plan_args[0]) {
-            .generated_numeral => |lit| lit,
-            else => Common.invariant("from_numeral plan operand was not a generated numeral"),
-        };
-
-        const text = try checked.numeralLiteralDecimalText(self.allocator, self.view.module_env, literal);
-        defer self.allocator.free(text);
-
-        const folded = foldNumeralPrimitive(primitive, text);
-
-        // A value that does not fit its concrete target (e.g. a literal forced to
-        // a too-narrow type after monomorphization) matches the existing generic
-        // from_numeral behavior: a runtime crash on the conversion's Err branch.
-        const data = folded orelse blk: {
+        const data = (try self.numeralBits(numeral.literal, primitive)) orelse blk: {
+            // A value that does not fit its concrete integer or Dec target (a
+            // literal forced to an unrepresentable type after monomorphization;
+            // checking reports these, so this is unreachable for error-free
+            // programs) matches the generic from_numeral behavior: a runtime
+            // crash on the conversion's Err branch.
             const msg = try self.addStringLiteral("invalid numeric literal");
             break :blk BodyExprData{ .crash = msg };
         };
         return try self.addExpr(.{ .ty = target_ty, .data = data });
+    }
+
+    /// A numeric literal's scalar constant at a builtin numeric primitive —
+    /// the payload both the expression and pattern lowerers map into their
+    /// own IR node flavor.
+    const NumeralScalarBits = union(enum) {
+        int: can.CIR.IntValue,
+        f32: f32,
+        f64: f64,
+        dec: builtins.dec.RocDec,
+    };
+
+    /// The literal's bit pattern at a builtin primitive, from its exact
+    /// digits — the ONE place that turns digits into bits: integers by limb
+    /// assembly with a fit check, Dec by exact scale shift, floats by
+    /// correctly-rounded decimal→binary conversion (total: out-of-range
+    /// rounds toward ±inf). Null when an integer or Dec target cannot
+    /// represent the exact value; each caller maps null to its own failure
+    /// mode (expression: runtime crash node; pattern: never-matching branch).
+    /// Checking reports every such literal, so null is unreachable for
+    /// error-free programs.
+    fn numeralScalarBits(
+        self: *BodyContext,
+        literal: can.ModuleEnv.NumeralLiteral,
+        primitive: Type.Primitive,
+    ) Allocator.Error!?NumeralScalarBits {
+        const exact = self.view.module_env.exactNumeral(literal);
+        return switch (primitive) {
+            .u8, .u16, .u32, .u64, .u128, .i8, .i16, .i32, .i64, .i128 => blk: {
+                const bits = exact_numeral.intBits(exact, numeralTargetFromPrimitive(primitive)) orelse break :blk null;
+                break :blk switch (bits) {
+                    .i128 => |value| .{ .int = .{ .bytes = @bitCast(value), .kind = .i128 } },
+                    .u128 => |value| .{ .int = .{ .bytes = @bitCast(value), .kind = .u128 } },
+                };
+            },
+            .f32 => .{ .f32 = try exact_numeral.floatBits(f32, self.allocator, exact) },
+            .f64 => .{ .f64 = try exact_numeral.floatBits(f64, self.allocator, exact) },
+            .dec => blk: {
+                const num = (try exact_numeral.decBits(self.allocator, exact)) orelse break :blk null;
+                break :blk .{ .dec = .{ .num = num } };
+            },
+            .bool, .str => Common.invariant("numeric literal instantiated at a non-numeric Monotype primitive"),
+        };
+    }
+
+    /// The expression flavor of `numeralScalarBits`; null passes through for
+    /// the caller's crash-node mapping.
+    fn numeralBits(
+        self: *BodyContext,
+        literal: can.ModuleEnv.NumeralLiteral,
+        primitive: Type.Primitive,
+    ) Allocator.Error!?BodyExprData {
+        const bits = (try self.numeralScalarBits(literal, primitive)) orelse return null;
+        return switch (bits) {
+            .int => |value| .{ .int_lit = value },
+            .f32 => |value| .{ .frac_f32_lit = value },
+            .f64 => |value| .{ .frac_f64_lit = value },
+            .dec => |value| .{ .dec_lit = value },
+        };
     }
 
     /// Materialize a string literal as the `Str` argument of a `from_quote`
@@ -18349,6 +18784,9 @@ const BodyContext = struct {
         literal: can.ModuleEnv.NumeralLiteral,
         ty: Type.TypeId,
     ) Allocator.Error!DraftExprId {
+        if (!literal.isMaterialized()) {
+            Common.invariant("checked from_numeral argument literal was not materialized");
+        }
         const field_span = switch (self.builder.shapeContent(ty)) {
             .record => |span| span,
             else => Common.invariant("Numeral Literal payload was not a record"),
@@ -22410,11 +22848,7 @@ const BodyContext = struct {
             .applied_tag,
             .nominal,
             .tuple,
-            .num_literal,
-            .small_dec_literal,
-            .dec_literal,
-            .frac_f32_literal,
-            .frac_f64_literal,
+            .numeral_literal,
             .str_literal,
             .str_interpolation,
             .underscore,
@@ -22444,11 +22878,7 @@ const BodyContext = struct {
                 .record_destructure => .record,
                 .list => .list,
                 .applied_tag,
-                .num_literal,
-                .small_dec_literal,
-                .dec_literal,
-                .frac_f32_literal,
-                .frac_f64_literal,
+                .numeral_literal,
                 .str_literal,
                 .str_interpolation,
                 => .can_miss,
@@ -22466,11 +22896,7 @@ const BodyContext = struct {
                 .record_destructure,
                 .list,
                 .tuple,
-                .num_literal,
-                .small_dec_literal,
-                .dec_literal,
-                .frac_f32_literal,
-                .frac_f64_literal,
+                .numeral_literal,
                 .str_literal,
                 .str_interpolation,
                 .underscore,
@@ -22490,11 +22916,7 @@ const BodyContext = struct {
                 .nominal,
                 .record_destructure,
                 .list,
-                .num_literal,
-                .small_dec_literal,
-                .dec_literal,
-                .frac_f32_literal,
-                .frac_f64_literal,
+                .numeral_literal,
                 .str_literal,
                 .str_interpolation,
                 .underscore,
@@ -22514,11 +22936,7 @@ const BodyContext = struct {
                 .nominal,
                 .record_destructure,
                 .list,
-                .num_literal,
-                .small_dec_literal,
-                .dec_literal,
-                .frac_f32_literal,
-                .frac_f64_literal,
+                .numeral_literal,
                 .str_literal,
                 .str_interpolation,
                 .underscore,
@@ -22538,11 +22956,7 @@ const BodyContext = struct {
                 .nominal,
                 .list,
                 .tuple,
-                .num_literal,
-                .small_dec_literal,
-                .dec_literal,
-                .frac_f32_literal,
-                .frac_f64_literal,
+                .numeral_literal,
                 .str_literal,
                 .str_interpolation,
                 .underscore,
@@ -22564,11 +22978,7 @@ const BodyContext = struct {
                 .nominal,
                 .list,
                 .tuple,
-                .num_literal,
-                .small_dec_literal,
-                .dec_literal,
-                .frac_f32_literal,
-                .frac_f64_literal,
+                .numeral_literal,
                 .str_literal,
                 .str_interpolation,
                 .underscore,
@@ -22588,11 +22998,7 @@ const BodyContext = struct {
                 .nominal,
                 .record_destructure,
                 .tuple,
-                .num_literal,
-                .small_dec_literal,
-                .dec_literal,
-                .frac_f32_literal,
-                .frac_f64_literal,
+                .numeral_literal,
                 .str_literal,
                 .str_interpolation,
                 .underscore,
@@ -22612,11 +23018,7 @@ const BodyContext = struct {
                 .nominal,
                 .record_destructure,
                 .tuple,
-                .num_literal,
-                .small_dec_literal,
-                .dec_literal,
-                .frac_f32_literal,
-                .frac_f64_literal,
+                .numeral_literal,
                 .str_literal,
                 .str_interpolation,
                 .underscore,
@@ -22636,11 +23038,7 @@ const BodyContext = struct {
                 .nominal,
                 .record_destructure,
                 .tuple,
-                .num_literal,
-                .small_dec_literal,
-                .dec_literal,
-                .frac_f32_literal,
-                .frac_f64_literal,
+                .numeral_literal,
                 .str_literal,
                 .str_interpolation,
                 .underscore,
@@ -22852,11 +23250,7 @@ const BodyContext = struct {
                 }
             },
             .pending,
-            .num_literal,
-            .small_dec_literal,
-            .dec_literal,
-            .frac_f32_literal,
-            .frac_f64_literal,
+            .numeral_literal,
             .str_literal,
             .underscore,
             .runtime_error,
@@ -22916,11 +23310,7 @@ const BodyContext = struct {
                 }
             },
             .pending,
-            .num_literal,
-            .small_dec_literal,
-            .dec_literal,
-            .frac_f32_literal,
-            .frac_f64_literal,
+            .numeral_literal,
             .str_literal,
             .underscore,
             .runtime_error,
@@ -22961,9 +23351,25 @@ const BodyContext = struct {
                     .local = local,
                 } };
             },
-            .applied_tag => |tag| try self.lowerTagPatternCollectingLists(tag, ty, checks_out),
-            .nominal => |nominal| .{ .nominal = try self.lowerPatternAtTypeCollectingLists(nominal.backing_pattern, self.builder.namedBackingType(ty) orelse ty, checks_out) },
-            .record_destructure => |destructs| try self.lowerRecordPatternCollectingLists(destructs, ty, checks_out),
+            .applied_tag => |tag| blk: {
+                if (self.builder.nominalConstructionLayer(ty)) |layer| {
+                    break :blk .{ .nominal = try self.lowerConstructorPatWrapped(pattern_id, layer.backing, checks_out) };
+                }
+                break :blk try self.lowerTagPatternCollectingLists(tag, ty, checks_out);
+            },
+            .nominal => |nominal| blk: {
+                const backing_ty = if (self.builder.nominalConstructionLayer(ty)) |layer|
+                    layer.backing
+                else
+                    self.builder.namedBackingType(ty) orelse ty;
+                break :blk .{ .nominal = try self.lowerPatternAtTypeCollectingLists(nominal.backing_pattern, backing_ty, checks_out) };
+            },
+            .record_destructure => |destructs| blk: {
+                if (self.builder.nominalConstructionLayer(ty)) |layer| {
+                    break :blk .{ .nominal = try self.lowerConstructorPatWrapped(pattern_id, layer.backing, checks_out) };
+                }
+                break :blk try self.lowerRecordPatternCollectingLists(destructs, ty, checks_out);
+            },
             .list => |list| blk: {
                 const local = try self.addLocal(self.builder.symbols.fresh(), ty);
                 try checks_out.append(self.allocator, .{
@@ -22974,21 +23380,16 @@ const BodyContext = struct {
                 });
                 break :blk .{ .bind = local };
             },
-            .tuple => |items| .{ .tuple = try self.lowerPatternSpanAtTypesCollectingLists(items, self.builder.tupleItemTypes(ty), checks_out) },
-            .num_literal => |num| if (num.conversion) |conversion|
+            .tuple => |items| blk: {
+                if (self.builder.nominalConstructionLayer(ty)) |layer| {
+                    break :blk .{ .nominal = try self.lowerConstructorPatWrapped(pattern_id, layer.backing, checks_out) };
+                }
+                break :blk .{ .tuple = try self.lowerPatternSpanAtTypesCollectingLists(items, self.builder.tupleItemTypes(ty), checks_out) };
+            },
+            .numeral_literal => |num| if (num.conversion) |conversion|
                 try self.bindLiteralGuardPattern(conversion, ty)
             else
-                self.lowerNumPattern(num.value, ty),
-            .small_dec_literal => |dec| if (dec.conversion) |conversion|
-                try self.bindLiteralGuardPattern(conversion, ty)
-            else
-                Common.invariant("small decimal pattern reached Monotype after numeric finalization"),
-            .dec_literal => |dec| if (dec.conversion) |conversion|
-                try self.bindLiteralGuardPattern(conversion, ty)
-            else
-                .{ .dec_lit = dec.value },
-            .frac_f32_literal => |value| .{ .frac_f32_lit = value },
-            .frac_f64_literal => |value| .{ .frac_f64_lit = value },
+                try self.numeralPatBits(num.literal, ty),
             .str_literal => |str| if (str.conversion) |conversion|
                 try self.bindLiteralGuardPattern(conversion, ty)
             else
@@ -23028,13 +23429,15 @@ const BodyContext = struct {
     fn lowerPatternSpanAtTypesCollectingLists(
         self: *BodyContext,
         checked_patterns: []const checked.CheckedPatternId,
-        tys: []const Type.TypeId,
+        tys: anytype,
         checks_out: *std.ArrayList(CollectedListPattern),
     ) Allocator.Error!DraftSpan(DraftPatId) {
-        if (checked_patterns.len != tys.len) Common.invariant("pattern arity differs from concrete checked type");
+        if (checked_patterns.len != GuardedList.borrowLen(tys)) Common.invariant("pattern arity differs from concrete checked type");
+        const stable_tys = try GuardedList.dupe(self.allocator, Type.TypeId, tys);
+        defer self.allocator.free(stable_tys);
         const lowered = try self.allocator.alloc(DraftPatId, checked_patterns.len);
         defer self.allocator.free(lowered);
-        for (checked_patterns, tys, 0..) |child, child_ty, i| {
+        for (checked_patterns, stable_tys, 0..) |child, child_ty, i| {
             lowered[i] = try self.lowerPatternAtTypeCollectingLists(child, child_ty, checks_out);
         }
         return try self.addPatSpan(lowered);
@@ -23187,11 +23590,7 @@ const BodyContext = struct {
             .applied_tag,
             .nominal,
             .tuple,
-            .num_literal,
-            .small_dec_literal,
-            .dec_literal,
-            .frac_f32_literal,
-            .frac_f64_literal,
+            .numeral_literal,
             .str_literal,
             .str_interpolation,
             .underscore,
@@ -23575,11 +23974,7 @@ const BodyContext = struct {
                 }
             },
             .pending,
-            .num_literal,
-            .small_dec_literal,
-            .dec_literal,
-            .frac_f32_literal,
-            .frac_f64_literal,
+            .numeral_literal,
             .str_literal,
             .underscore,
             .runtime_error,
@@ -24260,15 +24655,7 @@ const BodyContext = struct {
             .for_ => |for_| try self.lowerDivergentExprForEffectDataAtType(for_.expr, ty),
             .run_low_level => |low_level| try self.lowerFirstDivergentExprForEffectDataAtType(low_level.args, ty),
             .pending,
-            .num,
-            .frac_f32,
-            .frac_f64,
-            .dec,
-            .dec_small,
-            .num_from_numeral,
-            .typed_int,
-            .typed_frac,
-            .typed_num_from_numeral,
+            .numeral,
             .str_from_quote,
             .str_segment,
             .bytes_literal,
@@ -24427,15 +24814,7 @@ const BodyContext = struct {
             .for_ => |for_| self.checkedExprDivergesInLoweredRuntime(for_.expr),
             .run_low_level => |low_level| self.checkedAnyExprDivergesInLoweredRuntime(low_level.args),
             .pending,
-            .num,
-            .frac_f32,
-            .frac_f64,
-            .dec,
-            .dec_small,
-            .num_from_numeral,
-            .typed_int,
-            .typed_frac,
-            .typed_num_from_numeral,
+            .numeral,
             .str_from_quote,
             .str_segment,
             .bytes_literal,
@@ -25183,15 +25562,7 @@ const BodyContext = struct {
             .closure,
             .hosted_lambda,
             .pending,
-            .num,
-            .frac_f32,
-            .frac_f64,
-            .dec,
-            .dec_small,
-            .num_from_numeral,
-            .typed_int,
-            .typed_frac,
-            .typed_num_from_numeral,
+            .numeral,
             .str_from_quote,
             .str_segment,
             .bytes_literal,
@@ -25620,32 +25991,40 @@ const BodyContext = struct {
                     .local = local,
                 } };
             },
-            .applied_tag => |tag| try self.lowerTagPattern(tag, ty),
+            .applied_tag => |tag| blk: {
+                if (self.builder.nominalConstructionLayer(ty)) |layer| {
+                    break :blk .{ .nominal = try self.lowerConstructorPatWrapped(pattern_id, layer.backing, null) };
+                }
+                break :blk try self.lowerTagPattern(tag, ty);
+            },
             .nominal => |nominal| blk: {
-                const backing_ty = self.builder.namedBackingType(ty) orelse ty;
+                const backing_ty = if (self.builder.nominalConstructionLayer(ty)) |layer|
+                    layer.backing
+                else
+                    self.builder.namedBackingType(ty) orelse ty;
                 break :blk .{ .nominal = try self.lowerPatternAtTypeCell(
                     nominal.backing_pattern,
                     try self.draftTypeCellPreservingGenerated(backing_ty),
                     backing_ty,
                 ) };
             },
-            .record_destructure => |destructs| try self.lowerRecordPattern(destructs, ty),
+            .record_destructure => |destructs| blk: {
+                if (self.builder.nominalConstructionLayer(ty)) |layer| {
+                    break :blk .{ .nominal = try self.lowerConstructorPatWrapped(pattern_id, layer.backing, null) };
+                }
+                break :blk try self.lowerRecordPattern(destructs, ty);
+            },
             .list => |list| try self.lowerListPattern(list, ty),
-            .tuple => |items| .{ .tuple = try self.lowerTuplePattern(items, ty) },
-            .num_literal => |num| if (num.conversion) |conversion|
+            .tuple => |items| blk: {
+                if (self.builder.nominalConstructionLayer(ty)) |layer| {
+                    break :blk .{ .nominal = try self.lowerConstructorPatWrapped(pattern_id, layer.backing, null) };
+                }
+                break :blk .{ .tuple = try self.lowerTuplePattern(items, ty) };
+            },
+            .numeral_literal => |num| if (num.conversion) |conversion|
                 try self.bindLiteralGuardPattern(conversion, ty)
             else
-                self.lowerNumPattern(num.value, ty),
-            .small_dec_literal => |dec| if (dec.conversion) |conversion|
-                try self.bindLiteralGuardPattern(conversion, ty)
-            else
-                Common.invariant("small decimal pattern reached Monotype after numeric finalization"),
-            .dec_literal => |dec| if (dec.conversion) |conversion|
-                try self.bindLiteralGuardPattern(conversion, ty)
-            else
-                .{ .dec_lit = dec.value },
-            .frac_f32_literal => |value| .{ .frac_f32_lit = value },
-            .frac_f64_literal => |value| .{ .frac_f64_lit = value },
+                try self.numeralPatBits(num.literal, ty),
             .str_literal => |str| if (str.conversion) |conversion|
                 try self.bindLiteralGuardPattern(conversion, ty)
             else
@@ -25728,6 +26107,41 @@ const BodyContext = struct {
         } };
     }
 
+    /// Lower a structural constructor pattern (tag, record destructure, or
+    /// tuple) whose type is nominal: the structural pattern is typed at the
+    /// nominal construction backing and wrapped in one explicit `.nominal`
+    /// pattern per nominal layer of the type, mirroring constructor
+    /// expression lowering so pattern and value representations always
+    /// align.
+    fn lowerConstructorPatWrapped(
+        self: *BodyContext,
+        pattern_id: checked.CheckedPatternId,
+        ty: Type.TypeId,
+        checks_out: ?*std.ArrayList(CollectedListPattern),
+    ) Allocator.Error!DraftPatId {
+        if (self.builder.nominalConstructionLayer(ty)) |layer| {
+            const backing_pat = try self.lowerConstructorPatWrapped(pattern_id, layer.backing, checks_out);
+            return try self.addPat(.{ .ty = layer.named, .data = .{ .nominal = backing_pat } });
+        }
+        const pattern = self.view.bodies.pattern(pattern_id);
+        const data: BodyPatData = switch (pattern.data) {
+            .applied_tag => |tag| if (checks_out) |checks|
+                try self.lowerTagPatternCollectingLists(tag, ty, checks)
+            else
+                try self.lowerTagPattern(tag, ty),
+            .record_destructure => |destructs| if (checks_out) |checks|
+                try self.lowerRecordPatternCollectingLists(destructs, ty, checks)
+            else
+                try self.lowerRecordPattern(destructs, ty),
+            .tuple => |items| if (checks_out) |checks|
+                BodyPatData{ .tuple = try self.lowerPatternSpanAtTypesCollectingLists(items, self.builder.tupleItemTypes(ty), checks) }
+            else
+                BodyPatData{ .tuple = try self.lowerTuplePattern(items, ty) },
+            else => Common.invariant("nominal constructor pattern lowering reached a non-constructor checked pattern"),
+        };
+        return try self.addPat(.{ .ty = ty, .data = data });
+    }
+
     fn lowerRecordPattern(self: *BodyContext, destructs: []const checked.CheckedRecordDestruct, ty: Type.TypeId) Allocator.Error!BodyPatData {
         var lowered = std.ArrayList(DraftRecordDestruct).empty;
         defer lowered.deinit(self.allocator);
@@ -25770,18 +26184,37 @@ const BodyContext = struct {
         const local = try self.addLocal(self.builder.symbols.fresh(), ty);
         try self.pattern_literal_guards.append(self.allocator, .{
             .local = local,
-            .conversion = conversion,
             .ty = ty,
+            .check = .{ .conversion = conversion },
+        });
+        return .{ .bind = local };
+    }
+
+    /// Lower a literal pattern whose value its concrete type cannot represent
+    /// to a fresh bind guarded by a constant-false condition: the branch
+    /// falls through to the next one, exactly as if the scrutinee had been
+    /// compared against the unrepresentable value.
+    fn bindNeverMatchPattern(self: *BodyContext, ty: Type.TypeId) Allocator.Error!BodyPatData {
+        const local = try self.addLocal(self.builder.symbols.fresh(), ty);
+        try self.pattern_literal_guards.append(self.allocator, .{
+            .local = local,
+            .ty = ty,
+            .check = .never,
         });
         return .{ .bind = local };
     }
 
     /// Compare a bound match value against a literal's converted constant,
     /// dispatching to the type's `is_eq` method when it has one and falling
-    /// back to structural equality otherwise, mirroring `==`.
+    /// back to structural equality otherwise, mirroring `==`. A never-match
+    /// guard is the constant `false` instead.
     fn lowerPatternLiteralEq(self: *BodyContext, entry: PatternLiteralGuard) Allocator.Error!DraftExprId {
+        const conversion = switch (entry.check) {
+            .conversion => |conversion| conversion,
+            .never => return try self.boolLiteral(false, try self.builder.primitiveType(.bool)),
+        };
         const scrutinee = try self.localExpr(entry.local, entry.ty);
-        const expected = try self.lowerExpr(entry.conversion);
+        const expected = try self.lowerExpr(conversion);
         if (methodOwnerFromType(&self.builder.program.types, entry.ty)) |owner| {
             if (self.builder.lookupMethodTargetByName(owner, "is_eq")) |lookup| {
                 var target_ctx = try self.methodTargetContext(lookup);
@@ -25846,45 +26279,33 @@ const BodyContext = struct {
         return cond;
     }
 
-    fn lowerNumPattern(self: *BodyContext, value: can.CIR.IntValue, ty: Type.TypeId) BodyPatData {
-        return if (self.builder.typeIsDec(ty))
-            .{ .dec_lit = intValueToDec(value) }
-        else
-            .{ .int_lit = value };
-    }
-
-    fn lowerIntLiteral(self: *BodyContext, value: can.CIR.IntValue, ty: Type.TypeId) BodyExprData {
-        return switch (self.builder.shapeContent(ty)) {
-            .primitive => |primitive| switch (primitive) {
-                .f32 => .{ .frac_f32_lit = @floatCast(intValueToF64(value)) },
-                .f64 => .{ .frac_f64_lit = intValueToF64(value) },
-                .dec => .{ .dec_lit = intValueToDec(value) },
-                else => .{ .int_lit = value },
-            },
-            else => .{ .int_lit = value },
+    /// The pattern flavor of `numeralScalarBits`: an unrepresentable value
+    /// lowers to a never-matching branch instead of an expression crash node
+    /// (checking reports it; the arm falls through, since e.g. an I8 can
+    /// never equal 300).
+    fn numeralPatBits(self: *BodyContext, literal: can.ModuleEnv.NumeralLiteral, ty: Type.TypeId) Allocator.Error!BodyPatData {
+        const primitive = switch (self.builder.shapeContent(ty)) {
+            .primitive => |p| p,
+            else => Common.invariant("numeric literal pattern at a non-primitive Monotype type without a conversion"),
         };
-    }
-
-    /// Lower a fractional literal to the constant form its instantiated
-    /// monotype demands. The checked stage finalizes a fractional literal's
-    /// value to one numeric representation, but a generalized literal can be
-    /// instantiated at a different fractional primitive than its finalized
-    /// default (for example, a literal finalized to `Dec` that this
-    /// specialization unifies to `F64`). The constant kind must follow the
-    /// instantiated type so backends store bits the destination layout
-    /// expects, mirroring `lowerIntLiteral`.
-    fn lowerFracLiteral(self: *BodyContext, value: FracLiteralValue, ty: Type.TypeId) BodyExprData {
-        return switch (self.builder.shapeContent(ty)) {
-            .primitive => |primitive| switch (primitive) {
-                .f32 => .{ .frac_f32_lit = value.asF32() },
-                .f64 => .{ .frac_f64_lit = value.asF64() },
-                .dec => .{ .dec_lit = value.asDec() },
-                else => Common.invariant("fractional literal instantiated to a non-fractional Monotype primitive"),
-            },
-            else => Common.invariant("fractional literal instantiated to a non-primitive Monotype type"),
+        const bits = (try self.numeralScalarBits(literal, primitive)) orelse
+            return try self.bindNeverMatchPattern(ty);
+        return switch (bits) {
+            .int => |value| .{ .int_lit = value },
+            .f32 => |value| .{ .frac_f32_lit = value },
+            .f64 => |value| .{ .frac_f64_lit = value },
+            .dec => |value| .{ .dec_lit = value },
         };
     }
 };
+
+/// The exact-numeral target for a numeric Monotype primitive.
+fn numeralTargetFromPrimitive(primitive: Type.Primitive) exact_numeral.Target {
+    return switch (primitive) {
+        .bool, .str => Common.invariant("non-numeric Monotype primitive has no numeral target"),
+        inline else => |p| @field(exact_numeral.Target, @tagName(p)),
+    };
+}
 
 test "monotype sameType keeps failed alias alternatives out of recursion stack" {
     var program = Ast.Program.init(std.testing.allocator);
@@ -26315,40 +26736,6 @@ const HashDeriver = struct {
     }
 };
 
-/// A fractional literal value in its checked-stage representation, used to
-/// re-derive the constant kind the instantiated Monotype primitive requires.
-const FracLiteralValue = union(enum) {
-    f32: f32,
-    f64: f64,
-    dec: builtins.dec.RocDec,
-
-    fn asF64(self: FracLiteralValue) f64 {
-        return switch (self) {
-            .f32 => |v| @floatCast(v),
-            .f64 => |v| v,
-            .dec => |v| v.toF64(),
-        };
-    }
-
-    fn asF32(self: FracLiteralValue) f32 {
-        return switch (self) {
-            .f32 => |v| v,
-            .f64 => |v| @floatCast(v),
-            .dec => |v| @floatCast(v.toF64()),
-        };
-    }
-
-    fn asDec(self: FracLiteralValue) builtins.dec.RocDec {
-        return switch (self) {
-            .f32 => |v| builtins.dec.RocDec.fromF64(@floatCast(v)) orelse
-                Common.invariant("f32 fractional literal could not be represented as Dec at its instantiated type"),
-            .f64 => |v| builtins.dec.RocDec.fromF64(v) orelse
-                Common.invariant("f64 fractional literal could not be represented as Dec at its instantiated type"),
-            .dec => |v| v,
-        };
-    }
-};
-
 /// Record a local's source-level name from its pattern binder. An `assign`
 /// pattern's region is exactly the identifier token's span, so the name is
 /// the source text at that region. Binders from other pattern forms (`as`)
@@ -26438,40 +26825,6 @@ fn restoreScalarBody(scalar: checked.ConstScalar) BodyExprData {
         .f64_bits => |bits| .{ .frac_f64_lit = @bitCast(bits) },
         .dec_bits => |bits| .{ .dec_lit = .{ .num = bits } },
     };
-}
-
-/// Parse a numeral's decimal text into a constant literal of the
-/// concrete numeric `primitive`, mirroring the interpreter's `parseNumeralPayload`
-/// (`std.fmt.parseInt`/`parseFloat`/`RocDec.fromNonemptySlice`). Returns null
-/// when the value does not fit the target representation (out of range, or a
-/// fractional text parsed as an integer), so the caller can lower the Err branch.
-fn foldNumeralPrimitive(primitive: Type.Primitive, text: []const u8) ?BodyExprData {
-    return switch (primitive) {
-        .u8 => foldUnsignedNumeral(u8, text),
-        .u16 => foldUnsignedNumeral(u16, text),
-        .u32 => foldUnsignedNumeral(u32, text),
-        .u64 => foldUnsignedNumeral(u64, text),
-        .u128 => foldUnsignedNumeral(u128, text),
-        .i8 => foldSignedNumeral(i8, text),
-        .i16 => foldSignedNumeral(i16, text),
-        .i32 => foldSignedNumeral(i32, text),
-        .i64 => foldSignedNumeral(i64, text),
-        .i128 => foldSignedNumeral(i128, text),
-        .f32 => if (std.fmt.parseFloat(f32, text)) |v| .{ .frac_f32_lit = v } else |_| null,
-        .f64 => if (std.fmt.parseFloat(f64, text)) |v| .{ .frac_f64_lit = v } else |_| null,
-        .dec => if (builtins.dec.RocDec.fromNonemptySlice(text)) |d| .{ .dec_lit = .{ .num = d.num } } else null,
-        .bool, .str => Common.invariant("from_numeral target was a non-numeric primitive"),
-    };
-}
-
-fn foldUnsignedNumeral(comptime T: type, text: []const u8) ?BodyExprData {
-    const value = std.fmt.parseInt(T, text, 10) catch return null;
-    return .{ .int_lit = unsignedIntLiteral(value) };
-}
-
-fn foldSignedNumeral(comptime T: type, text: []const u8) ?BodyExprData {
-    const value = std.fmt.parseInt(T, text, 10) catch return null;
-    return .{ .int_lit = signedIntLiteral(value) };
 }
 
 fn signedIntLiteral(value: anytype) can.CIR.IntValue {
@@ -26812,29 +27165,6 @@ fn checkedRecordFieldByName(
         }
     }
     Common.invariant("expected checked record field was absent");
-}
-
-fn intValueToDec(value: can.CIR.IntValue) builtins.dec.RocDec {
-    const whole = switch (value.kind) {
-        .i128 => @as(i128, @bitCast(value.bytes)),
-        .u128 => blk: {
-            const unsigned = @as(u128, @bitCast(value.bytes));
-            if (unsigned > @as(u128, @intCast(std.math.maxInt(i128)))) {
-                Common.invariant("integer pattern solved as Dec exceeded Dec whole-number range");
-            }
-            break :blk @as(i128, @intCast(unsigned));
-        },
-    };
-    return builtins.dec.RocDec.fromWholeInt(whole) orelse {
-        Common.invariant("integer pattern solved as Dec exceeded Dec range");
-    };
-}
-
-fn intValueToF64(value: can.CIR.IntValue) f64 {
-    return switch (value.kind) {
-        .i128 => builtins.compiler_rt_128.i128_to_f64(@as(i128, @bitCast(value.bytes))),
-        .u128 => builtins.compiler_rt_128.u128_to_f64(@as(u128, @bitCast(value.bytes))),
-    };
 }
 
 fn branchCount(branches: anytype) usize {

@@ -170,7 +170,6 @@ pub const LowLevel = enum(u16) {
     num_bitwise_not,
 
     // Numeric parsing operations
-    num_from_numeral,
     u8_from_str,
     i8_from_str,
     u16_from_str,
@@ -613,7 +612,6 @@ pub const LowLevel = enum(u16) {
             return .{
                 .may_retain_or_release = true,
                 .result_shares_args = mask,
-                .result_unique = true,
             };
         }
 
@@ -622,7 +620,6 @@ pub const LowLevel = enum(u16) {
                 .may_retain_or_release = mask != 0,
                 .retain_args = mask,
                 .result_shares_args = mask,
-                .result_unique = true,
             };
         }
 
@@ -639,7 +636,6 @@ pub const LowLevel = enum(u16) {
                 .may_allocate = true,
                 .may_retain_or_release = true,
                 .result_shares_args = mask,
-                .result_unique = true,
             };
         }
 
@@ -677,10 +673,12 @@ pub const LowLevel = enum(u16) {
             => RcEffect.runtimeUniqueness(argMask(&.{0})),
 
             .str_drop_prefix,
-            .str_drop_prefix_caseless_ascii,
             .str_drop_suffix,
-            .str_find_first,
             => RcEffect.retainsSharingArgs(argMask(&.{0})),
+
+            .str_drop_prefix_caseless_ascii,
+            .str_find_first,
+            => RcEffect.retainsOrReleasesSharingArgs(argMask(&.{0})),
 
             .str_from_utf8 => RcEffect.retainsOrReleasesSharingArgs(argMask(&.{0})),
 
@@ -866,7 +864,6 @@ pub const LowLevel = enum(u16) {
             .num_bitwise_or,
             .num_bitwise_xor,
             .num_bitwise_not,
-            .num_from_numeral,
             .u8_from_str,
             .i8_from_str,
             .u16_from_str,

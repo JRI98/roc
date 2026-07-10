@@ -11,10 +11,10 @@ lowering.
 
 The shipping iterator goal is complete.
 
-- The authoritative Rocci Bird `--opt=size --target=wasm32` cart is 35,175
+- The authoritative Rocci Bird `--opt=size --target=wasm32` cart is 34,067
   bytes with idiomatic iterators.
-- The equivalent direct-list cart is 35,133 bytes.
-- The iterator premium is 42 bytes.
+- The equivalent direct-list cart is 34,029 bytes.
+- The iterator premium is 38 bytes.
 - The iterator cart boots with the same `OK 191` result as the direct-list cart.
 - The iterator chain and constant base list perform zero runtime heap
   allocations on the cart gate.
@@ -24,7 +24,7 @@ The shipping iterator goal is complete.
   through the forced-dynamic tier. The committed cart is 541,756 bytes with a
   600,000-byte regression ceiling.
 
-The remaining 24,520-byte gap to the 10,655-byte Rust cart is general runtime,
+The remaining 23,412-byte gap to the 10,655-byte Rust cart is general runtime,
 standard-library, platform, ARC, and code-generation cost. It is not iterator
 representation overhead.
 
@@ -223,7 +223,7 @@ These remain rejected.
    Allocation claims require allocation counters or static LIR shape evidence.
 7. **A second iterator-only fusion representation.** The implemented general
    SpecConstr pass already supplies optimized scalarization, and the measured
-   cart premium is only 42 bytes. More iterator-specific machinery requires a
+   cart premium is only 38 bytes. More iterator-specific machinery requires a
    new measured deficiency.
 
 ## Acceptance Gates
@@ -244,7 +244,7 @@ The durable focused gates are:
   `concat` returns `ok`, balances allocations/deallocations, and remains below
   600,000 bytes;
 - Rocci Bird iterator and direct-list carts: equal `OK 191` behavior and the
-  measured 42-byte premium.
+  measured 38-byte premium.
 
 Focused implementation work must run the smallest relevant subsets first.
 Whole-tree CI is a final integration gate, not the inner edit/test loop.
@@ -291,10 +291,14 @@ Non-debug size output also strips the final `target_features` custom section.
 That metadata was 392 bytes in both carts and did not affect executable code or
 data. The two changes reduce each cart by 1,717 bytes in total:
 
-| cart | before broader audit | current | change |
+| cart | before broader audit | post-audit | change |
 |---|---:|---:|---:|
 | iterator | 36,892 | 35,175 | -1,717 |
 | direct list | 36,850 | 35,133 | -1,717 |
+
+After the later merge from main, fresh cleared-cache measurements were 34,067
+bytes for the iterator cart and 34,029 bytes for the direct-list cart. The
+iterator premium is now 38 bytes.
 
 A minimal application on the same platform measured about 3.1 KB after
 metadata stripping, so the remaining gap is not an unavoidable 26 KB host
@@ -316,7 +320,7 @@ and a cart-size benefit.
 Per-chain minting, explicit forced-dynamic representation, SpecConstr loop
 scalarization, and constant-list static storage jointly deliver the iterator
 goal. Explicit final exports and metadata stripping reduce general cart cost
-without changing the current 42-byte iterator premium. Further work toward
+without changing the current 38-byte iterator premium. Further work toward
 Rust's total cart size belongs to separately justified ARC, runtime,
 standard-library, platform, and code-generation efforts, not to a new iterator
 representation or fusion campaign.

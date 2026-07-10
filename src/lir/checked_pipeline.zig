@@ -39,6 +39,7 @@ pub const RootRequestSet = struct {
     requests: []const checked.RootRequest = &.{},
     layout_requests: []const checked.CheckedTypeId = &.{},
     include_static_data_exports: bool = false,
+    test_plan_metadata: []const postcheck.Common.RootTestPlanMetadata = &.{},
 };
 
 /// Target settings and checked module state for the checked-to-LIR pipeline.
@@ -56,6 +57,10 @@ pub const TargetConfig = struct {
     proc_debug_names: bool = false,
     /// Control Monotype specialization cache reads and writes.
     monotype_cache: MonotypeCacheControl = .{},
+    /// Build ConstStore materialization plans for requested layouts.
+    /// Disable this only for consumers that read requested layout metadata and
+    /// never materialize requested-layout values.
+    layout_request_const_plans: bool = true,
     /// Delete LIR switch edges whose tag discriminants are unreachable. This
     /// is enabled for optimized builds and kept off for dev and compile-time
     /// evaluation.
@@ -252,6 +257,8 @@ pub fn lowerCheckedModulesToLir(
         .inline_expects = target.inline_expects,
         .list_in_place_map = target.list_in_place_map,
         .proc_debug_names = target.proc_debug_names,
+        .layout_request_const_plans = target.layout_request_const_plans,
+        .test_plan_metadata = roots.test_plan_metadata,
     });
     solved_owned = false;
     solved = undefined;
@@ -321,6 +328,7 @@ fn rootRequests(
         .requests = roots.requests,
         .layout_requests = layout_requests,
         .static_data_requests = static_data_requests,
+        .test_plan_metadata = roots.test_plan_metadata,
     };
 }
 

@@ -456,6 +456,7 @@ const Lowerer = struct {
         if (self.result.layouts.layoutSize(layout_data) == 0) return false;
         return switch (self.result.const_plans.items[@intFromEnum(plan_id)]) {
             .pending => Common.invariant("pending const plan reached static-data selection"),
+            .layout_only => Common.invariant("layout-only const plan reached static-data selection"),
             .zst,
             .scalar,
             => false,

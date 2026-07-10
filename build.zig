@@ -2288,6 +2288,7 @@ pub fn build(b: *std.Build) void {
     const run_snapshot_tool_step = b.step("run-snapshot-tool", "Run the snapshot tool to update snapshot files");
     const echo_wasm_step = b.step("build-echo-wasm", "Build the echo platform to zig-out/lib/echo.wasm");
     const echo_wasm_archive_step = b.step("build-echo-wasm-archive", "Build echo.wasm and zstd-compress it to zig-out/lib/echo.wasm.zst");
+    const build_glue_release_step = b.step("build-glue-release", "Build release-ready glue package and specs");
 
     const build_test_hosts_step = b.step("build-test-hosts", "Build test platform host libraries");
     const build_release_step = b.step("build-release", "Build optimized release binary for distribution");
@@ -2327,6 +2328,13 @@ pub fn build(b: *std.Build) void {
     const test_progress_interval_ms = b.option(u64, "test-progress-interval-ms", "Print non-TTY parallel test progress every N milliseconds; 0 disables it") orelse 0;
     const eval_no_fork = b.option(bool, "eval-no-fork", "Run eval tests in-process instead of through fork isolation") orelse false;
     const eval_time_worker = b.option(bool, "eval-time-worker", "Print eval worker startup timing instrumentation") orelse false;
+    const glue_release_tag = b.option([]const u8, "glue-release-tag", "Nightly release tag used in generated glue package URLs");
+    const enable_valgrind = b.option(bool, "valgrind", "Emit Valgrind client request support") orelse false;
+    if (enable_valgrind and (builtin.target.os.tag != .linux or target.result.os.tag != .linux)) {
+        std.log.err("-Dvalgrind=true requires a Linux build host and Linux target", .{});
+        std.process.exit(1);
+    }
+    const valgrind_support = if (enable_valgrind) true else null;
     if (shared_memory_size) |size| {
         if (size == 0) {
             std.log.err("-Dshared-memory-size must be greater than 0", .{});
@@ -2449,7 +2457,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
-    const roc_modules = modules.RocModules.create(b, build_options, zstd);
+    const roc_modules = modules.RocModules.create(b, build_options, zstd, valgrind_support);
 
     // Build-time compiler for builtin .roc modules
     //
@@ -2689,7 +2697,7 @@ pub fn build(b: *std.Build) void {
     llvm_codegen_module.addImport("roc_target", roc_modules.roc_target);
     llvm_codegen_module.addImport("vendor_llvm_ir", roc_modules.vendor_llvm_ir);
 
-    const roc_exe = addMainExe(b, roc_modules, target, optimize, strip, omit_frame_pointer, use_system_llvm, user_llvm_path, flag_enable_tracy, zstd, compiled_builtins_module, write_compiled_builtins, llvm_codegen_module, flag_enable_tracy, true) orelse return;
+    const roc_exe = addMainExe(b, roc_modules, target, optimize, strip, omit_frame_pointer, use_system_llvm, user_llvm_path, flag_enable_tracy, zstd, compiled_builtins_module, write_compiled_builtins, llvm_codegen_module, flag_enable_tracy, true, valgrind_support) orelse return;
     roc_modules.addAll(roc_exe);
     _ = install_and_run(b, no_bin, roc_exe, build_roc_step, run_roc_step, run_args);
 
@@ -2729,6 +2737,7 @@ pub fn build(b: *std.Build) void {
             llvm_codegen_module,
             null, // No tracy
             false,
+            valgrind_support,
         );
         if (release_exe) |exe| {
             roc_modules.addAll(exe);
@@ -2774,6 +2783,7 @@ pub fn build(b: *std.Build) void {
                     .{ .name = "test_harness", .module = createTestHarnessModule(b, roc_modules) },
                     .{ .name = "collections", .module = roc_modules.collections },
                     .{ .name = "backend", .module = roc_modules.backend },
+                    .{ .name = "bytebox", .module = bytebox.module("bytebox") },
                 },
             }),
         });
@@ -3135,6 +3145,7 @@ pub fn build(b: *std.Build) void {
             .target = target,
             .optimize = optimize,
             .link_libc = true,
+            .valgrind = valgrind_support,
         }),
     });
     configureBackend(snapshot_exe, target);
@@ -3441,6 +3452,38 @@ pub fn build(b: *std.Build) void {
         // Ensure the wasm is built before the test runs.
         run_echo_wasm_test.step.dependOn(&echo_wasm_install.step);
         run_test_echo_wasm_step.dependOn(&run_echo_wasm_test.step);
+    }
+
+    {
+        const glue_release_exe = b.addExecutable(.{
+            .name = "glue_release",
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("src/build/glue_release.zig"),
+                .target = target,
+                .optimize = optimize,
+            }),
+        });
+        configureBackend(glue_release_exe, target);
+
+        const glue_package_cmd = b.addRunArtifact(roc_exe);
+        glue_package_cmd.setCwd(b.path("src/glue/platform"));
+        glue_package_cmd.addArgs(&.{ "bundle", "--output-dir" });
+        const glue_package_dir = glue_package_cmd.addOutputDirectoryArg("glue-package");
+        glue_package_cmd.addArg("main.roc");
+
+        const glue_release_cmd = b.addRunArtifact(glue_release_exe);
+        glue_release_cmd.addArg(glue_release_tag orelse "nightly-local");
+        glue_release_cmd.addDirectoryArg(glue_package_dir);
+        const glue_release_dir = glue_release_cmd.addOutputDirectoryArg("glue-release");
+
+        const glue_release_install = b.addInstallDirectory(.{
+            .source_dir = glue_release_dir,
+            .install_dir = .prefix,
+            .install_subdir = "glue-release",
+        });
+        const clean_glue_release_install = RemoveDirTreeStep.create(b, b.getInstallPath(.prefix, "glue-release"));
+        glue_release_install.step.dependOn(&clean_glue_release_install.step);
+        build_glue_release_step.dependOn(&glue_release_install.step);
     }
 
     // Build playground integration tests - now enabled for all optimization modes.
@@ -4532,6 +4575,33 @@ pub fn build(b: *std.Build) void {
         run_watch_cli_test_step.dependOn(&run_watch_test.step);
     }
 
+    // MiniCI output-filter tests. MiniCI is a standalone host build tool that
+    // only imports `std`, so it needs no module wiring.
+    {
+        const minici_test = b.addTest(.{
+            .name = "minici_test",
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("src/build/minici.zig"),
+                .target = b.graph.host,
+                .optimize = .Debug,
+            }),
+            .filters = test_filters,
+        });
+        build_test_zig_step.dependOn(&minici_test.step);
+
+        const run_minici_test = b.addRunArtifact(minici_test);
+        if (run_args.len != 0) {
+            run_minici_test.addArgs(run_args);
+        }
+        tests_summary.addRun(&run_minici_test.step);
+
+        const run_minici_test_step = b.step(
+            "run-test-zig-minici",
+            "Run MiniCI output-filter Zig tests",
+        );
+        run_minici_test_step.dependOn(&run_minici_test.step);
+    }
+
     // Add check for forbidden patterns in type checker code
     const check_patterns = CheckTypeCheckerPatternsStep.create(b);
     run_check_type_checker_patterns_step.dependOn(&check_patterns.step);
@@ -5404,6 +5474,7 @@ fn addMainExe(
     llvm_codegen_module: *std.Build.Module,
     flag_enable_tracy: ?[]const u8,
     add_machine_code_shim_test: bool,
+    valgrind_support: ?bool,
 ) ?*Step.Compile {
     const exe = b.addExecutable(.{
         .name = "roc",
@@ -5414,6 +5485,7 @@ fn addMainExe(
             .strip = strip,
             .omit_frame_pointer = omit_frame_pointer,
             .link_libc = true,
+            .valgrind = valgrind_support,
         }),
     });
     // The in-process interpreter (used by `--opt=interpreter`) recurses Zig stack

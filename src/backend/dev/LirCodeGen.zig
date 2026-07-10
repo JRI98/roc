@@ -81,6 +81,7 @@ const strWithAsciiUppercased = builtins.str.strWithAsciiUppercased;
 const strFromUtf8Lossy = builtins.str.fromUtf8Lossy;
 
 const Relocation = @import("Relocation.zig").Relocation;
+const coff = @import("object/coff.zig");
 
 const StaticStringData = @import("StaticStringData.zig");
 
@@ -851,6 +852,9 @@ pub fn LirCodeGen(comptime target: RocTarget) type {
         /// Registry of compiled RC helpers keyed by canonical RC helper identity.
         compiled_rc_helpers: std.AutoHashMap(u64, usize),
 
+        /// Generated callable ranges with Windows unwind metadata.
+        unwind_functions: std.ArrayListUnmanaged(coff.FunctionInfo),
+
         /// Worklist of RC helpers awaiting compilation. RC helpers are compiled
         /// iteratively from this worklist (never via recursion): a helper body
         /// references its child helpers through pending refs and schedules them
@@ -1213,6 +1217,7 @@ pub fn LirCodeGen(comptime target: RocTarget) type {
                 .line_entries = .empty,
                 .proc_registry = std.AutoHashMap(u32, CompiledProc).init(allocator),
                 .compiled_rc_helpers = std.AutoHashMap(u64, usize).init(allocator),
+                .unwind_functions = .empty,
                 .rc_helper_worklist = std.ArrayList(RcHelperVariant).empty,
                 .rc_helper_scheduled = std.AutoHashMap(u64, void).init(allocator),
                 .pending_rc_addrs = std.ArrayList(PendingRcRef).empty,
@@ -1250,6 +1255,7 @@ pub fn LirCodeGen(comptime target: RocTarget) type {
             self.line_entries.deinit(self.allocator);
             self.proc_registry.deinit();
             self.compiled_rc_helpers.deinit();
+            self.unwind_functions.deinit(self.allocator);
             self.rc_helper_worklist.deinit(self.allocator);
             self.rc_helper_scheduled.deinit();
             self.pending_rc_addrs.deinit(self.allocator);
@@ -1284,6 +1290,7 @@ pub fn LirCodeGen(comptime target: RocTarget) type {
             self.stmt_locations.clearRetainingCapacity();
             self.proc_registry.clearRetainingCapacity();
             self.compiled_rc_helpers.clearRetainingCapacity();
+            self.unwind_functions.clearRetainingCapacity();
             self.rc_helper_worklist.clearRetainingCapacity();
             self.rc_helper_scheduled.clearRetainingCapacity();
             self.pending_rc_addrs.clearRetainingCapacity();
@@ -1337,6 +1344,31 @@ pub fn LirCodeGen(comptime target: RocTarget) type {
                 list.deinit(self.allocator);
             }
             map.deinit();
+        }
+
+        fn recordUnwindFunction(
+            self: *Self,
+            start_offset: usize,
+            end_offset: usize,
+            prologue_size: u32,
+            stack_alloc: u32,
+            frame_size: u32,
+            callee_saved_mask: u32,
+            epilogue_offset: u32,
+            uses_frame_pointer: bool,
+        ) Allocator.Error!void {
+            if (start_offset == end_offset) return;
+            try self.unwind_functions.append(self.allocator, .{
+                .start_offset = @intCast(start_offset),
+                .end_offset = @intCast(end_offset),
+                .prologue_size = prologue_size,
+                .frame_reg_offset = 0,
+                .uses_frame_pointer = uses_frame_pointer,
+                .stack_alloc = stack_alloc,
+                .frame_size = frame_size,
+                .callee_saved_mask = callee_saved_mask,
+                .epilogue_offset = epilogue_offset,
+            });
         }
 
         const StmtEnvSnapshot = struct {
@@ -1494,15 +1526,21 @@ pub fn LirCodeGen(comptime target: RocTarget) type {
             self.codegen.emit.buf.shrinkRetainingCapacity(body_start);
 
             const prologue_start = self.codegen.currentOffset();
+            var root_stack_alloc: u32 = 0;
+            var root_frame_size: u32 = 0;
             if (comptime target.toCpuArch() == .x86_64) {
                 const actual_locals_x86: u32 = @intCast(-self.codegen.stack_offset - CodeGen.CALLEE_SAVED_AREA_SIZE);
                 try self.codegen.emitPrologueWithAlloc(actual_locals_x86);
+                root_stack_alloc = actual_locals_x86;
+                root_frame_size = actual_locals_x86;
             } else {
                 const actual_locals: u32 = @intCast(self.codegen.stack_offset - 16 - CodeGen.CALLEE_SAVED_AREA_SIZE);
                 var frame_builder = CodeGen.DeferredFrameBuilder.init();
                 frame_builder.setCalleeSavedMask(self.codegen.callee_saved_used);
                 frame_builder.setStackSize(actual_locals);
                 _ = try frame_builder.emitPrologue(&self.codegen.emit);
+                root_stack_alloc = actual_locals;
+                root_frame_size = frame_builder.actual_stack_alloc;
             }
             const prologue_size = self.codegen.currentOffset() - prologue_start;
 
@@ -1518,6 +1556,7 @@ pub fn LirCodeGen(comptime target: RocTarget) type {
             self.shiftNestedCompiledRcHelperOffsets(body_start, body_end, prologue_size, std.math.maxInt(u64));
             self.shiftPendingCalls(body_start, body_end, prologue_size);
             self.shiftPendingProcAddrs(body_start, body_end, prologue_size);
+            self.shiftPendingRcRefs(body_start, body_end, prologue_size);
             self.repatchInternalCalls(body_start, body_end, prologue_size, body_start);
             self.repatchInternalAddrPatches(body_start, body_end, prologue_size, body_start);
 
@@ -1526,6 +1565,17 @@ pub fn LirCodeGen(comptime target: RocTarget) type {
             for (self.early_return_patches.items) |patch| {
                 self.codegen.patchJump(patch + prologue_size, final_epilogue);
             }
+            try self.recordUnwindFunction(
+                prologue_start,
+                self.codegen.currentOffset(),
+                @intCast(prologue_size),
+                root_stack_alloc,
+                root_frame_size,
+                self.codegen.callee_saved_used,
+                @intCast(final_epilogue - prologue_start),
+                true,
+            );
+            try self.maybeDrainRcHelpers();
 
             const all_code = self.codegen.getCode();
             const code_copy = self.allocator.dupe(u8, all_code) catch return error.OutOfMemory;
@@ -4281,9 +4331,6 @@ pub fn LirCodeGen(comptime target: RocTarget) type {
                 // folded to a constant during Monotype lowering, so the op must
                 // never reach a backend. Reaching here is an invariant failure,
                 // not a missing feature.
-                .num_from_numeral => {
-                    std.debug.panic("num_from_numeral reached the dev backend; it must be folded to a constant during Monotype lowering", .{});
-                },
                 // Unimplemented ops
                 .num_log,
                 .num_round,
@@ -10003,6 +10050,14 @@ pub fn LirCodeGen(comptime target: RocTarget) type {
                     entry.value_ptr.* = offset + prologue_size;
                 }
             }
+
+            for (self.unwind_functions.items) |*function| {
+                const start_offset: usize = function.start_offset;
+                if (start_offset > body_start and start_offset < body_end) {
+                    function.start_offset += @intCast(prologue_size);
+                    function.end_offset += @intCast(prologue_size);
+                }
+            }
         }
 
         fn emitInternalCodeAddress(self: *Self, target_offset: usize, dst_reg: GeneralReg) Allocator.Error!void {
@@ -10199,8 +10254,6 @@ pub fn LirCodeGen(comptime target: RocTarget) type {
                     try self.emitCallRcHelperFromStackSlots(helper, ptr_slot, null, roc_ops_slot);
                 },
             }
-
-            try self.maybeDrainRcHelpers();
         }
 
         fn emitExplicitRcHelperCallForValue(
@@ -10260,7 +10313,6 @@ pub fn LirCodeGen(comptime target: RocTarget) type {
             const callback_reg = try self.allocTempGeneral();
             try self.emitPendingRcAddr(helper, callback_reg);
             try self.scheduleRcHelper(helper);
-            try self.maybeDrainRcHelpers();
             return callback_reg;
         }
 
@@ -10841,6 +10893,12 @@ pub fn LirCodeGen(comptime target: RocTarget) type {
             self.codegen.patchJump(early_return_patch, body_epilogue_offset);
             const body_end = self.codegen.currentOffset();
 
+            var helper_prologue_size: u32 = 0;
+            var helper_stack_alloc: u32 = 0;
+            var helper_frame_size: u32 = 0;
+            var helper_callee_saved_mask: u32 = 0;
+            var helper_epilogue_offset: u32 = 0;
+
             const final_offset = if (comptime target.toCpuArch() == .x86_64) blk: {
                 const body_bytes = self.allocator.dupe(u8, self.codegen.emit.buf.items[body_start..body_end]) catch return error.OutOfMemory;
                 defer self.allocator.free(body_bytes);
@@ -10851,6 +10909,11 @@ pub fn LirCodeGen(comptime target: RocTarget) type {
                 const actual_locals_x86: u32 = @intCast(-self.codegen.stack_offset - CodeGen.CALLEE_SAVED_AREA_SIZE);
                 try self.codegen.emitPrologueWithAlloc(actual_locals_x86);
                 const prologue_size = self.codegen.currentOffset() - prologue_start;
+                helper_prologue_size = @intCast(prologue_size);
+                helper_stack_alloc = actual_locals_x86;
+                helper_frame_size = actual_locals_x86;
+                helper_callee_saved_mask = self.codegen.callee_saved_used;
+                helper_epilogue_offset = @intCast(body_epilogue_offset - body_start + prologue_size);
 
                 self.codegen.emit.buf.appendSlice(self.allocator, body_bytes) catch return error.OutOfMemory;
 
@@ -10876,6 +10939,11 @@ pub fn LirCodeGen(comptime target: RocTarget) type {
                 frame_builder.setStackSize(actual_locals);
                 _ = try frame_builder.emitPrologue(&self.codegen.emit);
                 const prologue_size = self.codegen.currentOffset() - prologue_start;
+                helper_prologue_size = @intCast(prologue_size);
+                helper_stack_alloc = actual_locals;
+                helper_frame_size = frame_builder.actual_stack_alloc;
+                helper_callee_saved_mask = self.codegen.callee_saved_used;
+                helper_epilogue_offset = @intCast(body_epilogue_offset - body_start + prologue_size);
 
                 self.codegen.emit.buf.appendSlice(self.allocator, body_bytes) catch return error.OutOfMemory;
 
@@ -10893,6 +10961,16 @@ pub fn LirCodeGen(comptime target: RocTarget) type {
             if (self.compiled_rc_helpers.getPtr(cache_key)) |entry| {
                 entry.* = final_offset;
             }
+            try self.recordUnwindFunction(
+                final_offset,
+                self.codegen.currentOffset(),
+                helper_prologue_size,
+                helper_stack_alloc,
+                helper_frame_size,
+                helper_callee_saved_mask,
+                helper_epilogue_offset,
+                true,
+            );
 
             self.codegen.stack_offset = saved_stack_offset;
             self.codegen.callee_saved_used = saved_callee_saved_used;
@@ -11829,7 +11907,6 @@ pub fn LirCodeGen(comptime target: RocTarget) type {
                         const helper = RcHelperVariant{ .key = helper_key, .atomicity = .atomic };
                         try self.emitPendingRcAddr(helper, on_drop_reg);
                         try self.scheduleRcHelper(helper);
-                        try self.maybeDrainRcHelpers();
                     }
                 },
                 .interpreter_context_drop => {
@@ -14277,6 +14354,7 @@ pub fn LirCodeGen(comptime target: RocTarget) type {
                 self.shiftNestedCompiledRcHelperOffsets(body_start, body_end, prologue_size, std.math.maxInt(u64));
                 self.shiftPendingCalls(body_start, body_end, prologue_size);
                 self.shiftPendingProcAddrs(body_start, body_end, prologue_size);
+                self.shiftPendingRcRefs(body_start, body_end, prologue_size);
 
                 // Re-patch internal calls/addr whose targets are outside the shifted body
                 self.repatchInternalCalls(body_start, body_end, prologue_size, body_start);
@@ -14304,6 +14382,16 @@ pub fn LirCodeGen(comptime target: RocTarget) type {
                     entry.epilogue_offset = @intCast(final_epilogue - prologue_start);
                     entry.uses_frame_pointer = true;
                 }
+                try self.recordUnwindFunction(
+                    prologue_start,
+                    self.codegen.currentOffset(),
+                    @intCast(prologue_size),
+                    actual_locals_x86,
+                    actual_locals_x86,
+                    self.codegen.callee_saved_used,
+                    @intCast(final_epilogue - prologue_start),
+                    true,
+                );
             } else {
                 // aarch64: Prepend prologue to generated body
                 // Since body was generated without prologue, we need to prepend it.
@@ -14340,6 +14428,7 @@ pub fn LirCodeGen(comptime target: RocTarget) type {
                 self.shiftNestedCompiledRcHelperOffsets(body_start, body_end, prologue_size, std.math.maxInt(u64));
                 self.shiftPendingCalls(body_start, body_end, prologue_size);
                 self.shiftPendingProcAddrs(body_start, body_end, prologue_size);
+                self.shiftPendingRcRefs(body_start, body_end, prologue_size);
 
                 // Re-patch internal calls/addr whose targets are outside the shifted body
                 self.repatchInternalCalls(body_start, body_end, prologue_size, body_start);
@@ -14367,6 +14456,16 @@ pub fn LirCodeGen(comptime target: RocTarget) type {
                     entry.epilogue_offset = @intCast(final_epilogue - prologue_start);
                     entry.uses_frame_pointer = true;
                 }
+                try self.recordUnwindFunction(
+                    prologue_start,
+                    self.codegen.currentOffset(),
+                    @intCast(prologue_size),
+                    actual_locals,
+                    frame_size,
+                    self.codegen.callee_saved_used,
+                    @intCast(final_epilogue - prologue_start),
+                    true,
+                );
             }
 
             // Restore state
@@ -14400,6 +14499,8 @@ pub fn LirCodeGen(comptime target: RocTarget) type {
             self.loop_break_patch_starts = try saved_loop_break_patch_starts.clone(self.allocator);
             self.loop_break_patches.deinit(self.allocator);
             self.loop_break_patches = try saved_loop_break_patches.clone(self.allocator);
+
+            try self.maybeDrainRcHelpers();
         }
 
         fn requireProcBody(proc: LirProcSpec) lir.LIR.CFStmtId {
@@ -17109,6 +17210,7 @@ pub fn LirCodeGen(comptime target: RocTarget) type {
                 self.shiftNestedCompiledRcHelperOffsets(body_start, body_end, prologue_size_val, std.math.maxInt(u64));
                 self.shiftPendingCalls(body_start, body_end, prologue_size_val);
                 self.shiftPendingProcAddrs(body_start, body_end, prologue_size_val);
+                self.shiftPendingRcRefs(body_start, body_end, prologue_size_val);
                 self.repatchInternalCalls(body_start, body_end, prologue_size_val, body_start);
                 self.repatchInternalAddrPatches(body_start, body_end, prologue_size_val, body_start);
 
@@ -17201,6 +17303,7 @@ pub fn LirCodeGen(comptime target: RocTarget) type {
                 self.shiftNestedCompiledRcHelperOffsets(body_start, body_end, prologue_size_x86, std.math.maxInt(u64));
                 self.shiftPendingCalls(body_start, body_end, prologue_size_x86);
                 self.shiftPendingProcAddrs(body_start, body_end, prologue_size_x86);
+                self.shiftPendingRcRefs(body_start, body_end, prologue_size_x86);
                 self.repatchInternalCalls(body_start, body_end, prologue_size_x86, body_start);
                 self.repatchInternalAddrPatches(body_start, body_end, prologue_size_x86, body_start);
 
@@ -17220,6 +17323,17 @@ pub fn LirCodeGen(comptime target: RocTarget) type {
             }
 
             const func_end = self.codegen.currentOffset();
+            try self.recordUnwindFunction(
+                func_start,
+                func_end,
+                prologue_size,
+                stack_alloc,
+                frame_size,
+                callee_saved_mask,
+                epilogue_offset,
+                true,
+            );
+            try self.maybeDrainRcHelpers();
 
             return ExportedSymbol{
                 .name = "",
@@ -17884,6 +17998,11 @@ pub fn LirCodeGen(comptime target: RocTarget) type {
             return self.codegen.getCode();
         }
 
+        /// Get generated callable ranges for dynamic unwind registration.
+        pub fn getUnwindFunctions(self: *const Self) []const coff.FunctionInfo {
+            return self.unwind_functions.items;
+        }
+
         /// Get relocations for the generated code buffer.
         pub fn getRelocations(self: *Self) []const Relocation {
             return self.codegen.relocations.items;
@@ -18113,6 +18232,7 @@ fn addBinaryLowLevelProc(
 
 fn compileRoot(store: *LirStore, layout_store: *layout.Store, root_proc: lir.LIR.LirProcSpecId, ret_layout: layout.Idx) Allocator.Error!struct {
     code: []const u8,
+    unwind_functions: []const coff.FunctionInfo,
     entry_offset: usize,
 } {
     const allocator = std.testing.allocator;
@@ -18121,15 +18241,18 @@ fn compileRoot(store: *LirStore, layout_store: *layout.Store, root_proc: lir.LIR
     try codegen.compileAllProcSpecs(store.getProcSpecs());
 
     const result = try codegen.generateCode(root_proc, ret_layout, 1);
-    return .{ .code = result.code, .entry_offset = result.entry_offset };
+    errdefer allocator.free(result.code);
+    const unwind_functions = try allocator.dupe(coff.FunctionInfo, codegen.getUnwindFunctions());
+    return .{ .code = result.code, .unwind_functions = unwind_functions, .entry_offset = result.entry_offset };
 }
 
-fn runRootI64(store: *LirStore, layout_store: *layout.Store, root_proc: lir.LIR.LirProcSpecId) (Allocator.Error || error{ EmptyCode, MmapFailed, VirtualAllocFailed, MprotectFailed, VirtualProtectFailed, UnsupportedPlatform })!i64 {
+fn runRootI64(store: *LirStore, layout_store: *layout.Store, root_proc: lir.LIR.LirProcSpecId) (Allocator.Error || error{ EmptyCode, MmapFailed, VirtualAllocFailed, MprotectFailed, VirtualProtectFailed, UnsupportedPlatform, UnwindRegistrationFailed })!i64 {
     const allocator = std.testing.allocator;
     const compiled = try compileRoot(store, layout_store, root_proc, .i64);
     defer allocator.free(compiled.code);
+    defer allocator.free(compiled.unwind_functions);
 
-    var executable = try ExecutableMemory.initWithEntryOffset(compiled.code, compiled.entry_offset);
+    var executable = try ExecutableMemory.initWithEntryOffsetAndUnwindInfo(compiled.code, compiled.entry_offset, compiled.unwind_functions);
     defer executable.deinit();
 
     var test_ops = TestRocOps.init(allocator);
@@ -18139,12 +18262,13 @@ fn runRootI64(store: *LirStore, layout_store: *layout.Store, root_proc: lir.LIR.
     return out;
 }
 
-fn runRootU64(store: *LirStore, layout_store: *layout.Store, root_proc: lir.LIR.LirProcSpecId, ret_layout: layout.Idx) (Allocator.Error || error{ EmptyCode, MmapFailed, VirtualAllocFailed, MprotectFailed, VirtualProtectFailed, UnsupportedPlatform })!u64 {
+fn runRootU64(store: *LirStore, layout_store: *layout.Store, root_proc: lir.LIR.LirProcSpecId, ret_layout: layout.Idx) (Allocator.Error || error{ EmptyCode, MmapFailed, VirtualAllocFailed, MprotectFailed, VirtualProtectFailed, UnsupportedPlatform, UnwindRegistrationFailed })!u64 {
     const allocator = std.testing.allocator;
     const compiled = try compileRoot(store, layout_store, root_proc, ret_layout);
     defer allocator.free(compiled.code);
+    defer allocator.free(compiled.unwind_functions);
 
-    var executable = try ExecutableMemory.initWithEntryOffset(compiled.code, compiled.entry_offset);
+    var executable = try ExecutableMemory.initWithEntryOffsetAndUnwindInfo(compiled.code, compiled.entry_offset, compiled.unwind_functions);
     defer executable.deinit();
 
     var test_ops = TestRocOps.init(allocator);
@@ -18154,12 +18278,13 @@ fn runRootU64(store: *LirStore, layout_store: *layout.Store, root_proc: lir.LIR.
     return out;
 }
 
-fn runRootU8(store: *LirStore, layout_store: *layout.Store, root_proc: lir.LIR.LirProcSpecId, ret_layout: layout.Idx) (Allocator.Error || error{ EmptyCode, MmapFailed, VirtualAllocFailed, MprotectFailed, VirtualProtectFailed, UnsupportedPlatform })!u8 {
+fn runRootU8(store: *LirStore, layout_store: *layout.Store, root_proc: lir.LIR.LirProcSpecId, ret_layout: layout.Idx) (Allocator.Error || error{ EmptyCode, MmapFailed, VirtualAllocFailed, MprotectFailed, VirtualProtectFailed, UnsupportedPlatform, UnwindRegistrationFailed })!u8 {
     const allocator = std.testing.allocator;
     const compiled = try compileRoot(store, layout_store, root_proc, ret_layout);
     defer allocator.free(compiled.code);
+    defer allocator.free(compiled.unwind_functions);
 
-    var executable = try ExecutableMemory.initWithEntryOffset(compiled.code, compiled.entry_offset);
+    var executable = try ExecutableMemory.initWithEntryOffsetAndUnwindInfo(compiled.code, compiled.entry_offset, compiled.unwind_functions);
     defer executable.deinit();
 
     var test_ops = TestRocOps.init(allocator);

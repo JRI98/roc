@@ -61,6 +61,7 @@ const ipc = @import("ipc");
 const fmt = @import("fmt");
 const eval = @import("eval");
 const lir = @import("lir");
+const postcheck = @import("postcheck");
 const GuardedList = lir.LirStore.GuardedList;
 const echo_platform = @import("echo_platform");
 const lsp = @import("lsp");
@@ -141,6 +142,7 @@ const cache_config_mod = compile.config;
 const backend = @import("backend");
 const layout = @import("layout");
 const docs = @import("docs");
+const bump = @import("bump");
 const RocTarget = @import("target.zig").RocTarget;
 
 const CliMainError =
@@ -940,8 +942,8 @@ pub fn main(init: std.process.Init) Allocator.Error!void {
         if (use_debug_allocator) {
             // Under Valgrind, use libc's malloc instead: Valgrind can't see the
             // debug allocator's sub-allocations (it carves them out of mmap'd
-            // pages) but tracks every malloc/free. Debug builds carry the client
-            // requests, so this auto-switches with no flag.
+            // pages) but tracks every malloc/free. Builds with Valgrind support
+            // carry the client requests, so this can auto-switch under Valgrind.
             if (builtin.link_libc and std.valgrind.runningOnValgrind() != 0) {
                 break :gpa .{ std.heap.c_allocator, false };
             }
@@ -1000,7 +1002,7 @@ pub fn main(init: std.process.Init) Allocator.Error!void {
 
 fn parsedArgsStartBackgroundCleanup(args: cli_args.CliArgs) bool {
     return switch (args) {
-        .run, .build, .check, .test_cmd, .docs, .glue, .experimental_lsp => true,
+        .run, .build, .check, .test_cmd, .docs, .bump, .glue, .experimental_lsp => true,
         .fmt, .bundle, .unbundle, .repl, .version, .help, .licenses, .problem => false,
     };
 }
@@ -1066,6 +1068,7 @@ fn mainArgs(gpa: Allocator, arena: Allocator, args: []const []const u8, std_io: 
         .fmt => .fmt,
         .bundle => .bundle,
         .unbundle => .unbundle,
+        .bump => .bump,
         else => .unknown,
     };
 
@@ -1128,6 +1131,12 @@ fn mainArgs(gpa: Allocator, arena: Allocator, args: []const []const u8, std_io: 
         .glue => |glue_args| try rocGlue(&ctx, glue_args),
         .version => ctx.io.stdout().print("Roc compiler version {s}\n", .{build_options.compiler_version}),
         .docs => |docs_args| rocDocs(&ctx, docs_args),
+        .bump => |bump_args| rocBump(&ctx, bump_args) catch |err| switch (err) {
+            error.CliError => {
+                // Problems already recorded in context, render them below
+            },
+            else => return err,
+        },
         .experimental_lsp => |lsp_args| try lsp.runWithStdIo(gpa, std_io, .{
             .transport = lsp_args.debug_io,
             .build = lsp_args.debug_build,
@@ -5472,8 +5481,8 @@ fn lowerLirWithCoordinator(
 
     // Run global package version resolution: downloads every (transitive)
     // URL dependency, solves versions, and yields the final package graph.
-    // Resolution still receives a logical absolute path; package identities
-    // are canonicalized separately by compile.package_identity.
+    // Resolution works on logical absolute paths; canonical (realpath)
+    // forms are used only for package identity, via compile.package_identity.
     const roc_file_abs = std.fs.path.resolve(ctx.arena, &.{roc_file_path}) catch
         try ctx.arena.dupe(u8, roc_file_path);
     var resolved = try resolvePackages(ctx, roc_file_abs, resolution_config);
@@ -5539,7 +5548,7 @@ fn lowerLirWithCoordinator(
     {
         // Record notes for packages whose declared dependency versions were
         // bumped by solving, so errors inside them can explain the bump.
-        const bump_notes = try compile.package_identity.versionBumpNotesForPackageKeys(&resolved, package_keys, ctx.gpa);
+        const bump_notes = try compile.package_resolution.versionBumpNotes(&resolved, package_keys.identities, ctx.gpa);
         defer ctx.gpa.free(bump_notes);
         for (bump_notes) |note| {
             const gop = try coord.version_notes.getOrPut(note.package_identity);
@@ -6039,11 +6048,19 @@ fn resolveUrlBundle(ctx: *CliCtx, url: []const u8) (CliError || error{OutOfMemor
     const download = unbundle.download;
 
     // 1. Validate URL and extract hash
-    const parsed_url = download.validateUrl(url) catch {
-        return ctx.fail(.{ .invalid_url = .{
+    const parsed_url = download.validateUrl(url) catch |err| switch (err) {
+        error.InvalidVersion => return ctx.fail(.{ .invalid_url = .{
+            .url = url,
+            .reason = "This URL uses the reserved version 0.0.0, which means \"no version\". The lowest publishable version is 0.0.1.",
+        } }),
+        error.AmbiguousVersion => return ctx.fail(.{ .invalid_url = .{
+            .url = url,
+            .reason = "This URL contains more than one version number. A package URL must contain exactly one MAJOR.MINOR.PATCH version before its hash.",
+        } }),
+        else => return ctx.fail(.{ .invalid_url = .{
             .url = url,
             .reason = "Invalid URL format or missing hash. URLs must end with a base58-encoded BLAKE3 hash filename (e.g., '<hash>.tar.zst').",
-        } });
+        } }),
     };
     const base58_hash = parsed_url.hash;
 
@@ -8220,6 +8237,7 @@ fn rocBuildLlvm(ctx: *CliCtx, args: cli_args.BuildArgs) CliMainError!void {
     };
 
     build_env.setTarget(target);
+    build_env.setValidateTargetFilesForSelectedTarget(true);
     reporter.begin("Type Checking");
     build_env.compileDiscovered() catch |err| {
         reporter.fail();
@@ -8557,6 +8575,7 @@ fn rocBuildNative(ctx: *CliCtx, args: cli_args.BuildArgs) CliMainError!void {
     };
 
     build_env.setTarget(target);
+    build_env.setValidateTargetFilesForSelectedTarget(true);
     reporter.begin("Type Checking");
     build_env.compileDiscovered() catch |err| {
         reporter.fail();
@@ -8901,6 +8920,7 @@ fn rocBuildEmbedded(ctx: *CliCtx, args: cli_args.BuildArgs) CliMainError!void {
     };
 
     build_env.setTarget(target);
+    build_env.setValidateTargetFilesForSelectedTarget(true);
     reporter.begin("Type Checking");
     build_env.compileDiscovered() catch |err| {
         reporter.fail();
@@ -9078,10 +9098,29 @@ const CliTestFailureDetailVisibility = enum(u8) {
     verbose_only = 1,
 };
 
+const CliTestTranscriptEventKind = enum(u8) {
+    dbg = 0,
+    expect_failed = 1,
+    crashed = 2,
+    crash_diagnostic = 3,
+};
+
+const CliTestTranscriptStream = enum(u8) {
+    stdout = 0,
+    stderr = 1,
+};
+
+const CliTestTranscriptEvent = struct {
+    stream: CliTestTranscriptStream,
+    kind: CliTestTranscriptEventKind,
+    payload: []const u8,
+};
+
 const CliTestResultItem = struct {
     result: CliTestResult,
     order: u32,
     region: base.Region,
+    transcript: []const CliTestTranscriptEvent = &.{},
     failure_detail: ?[]const u8,
     failure_detail_visibility: CliTestFailureDetailVisibility = .always,
 };
@@ -9101,7 +9140,90 @@ const CliTestRunSummary = struct {
     cached_modules: u32 = 0,
 };
 
-const cli_test_cache_magic = "ROC_TEST_RESULTS_V4";
+const CliTestPlanEntry = struct {
+    module_index: u32,
+    root_index: u32,
+    root_order: u32,
+    result_index: u32,
+    region: base.Region,
+    symbol_name: [:0]const u8,
+};
+
+const CliTestPlanModule = struct {
+    module: BuildEnv.CompiledModuleInfo,
+    artifact: *const check.CheckedArtifact.CheckedModuleArtifact,
+    test_roots: []check.CheckedArtifact.RootRequest,
+    first_entry_index: u32,
+    entry_count: u32,
+    cached_results: ?[]CliTestResultItem = null,
+    cached_summary: CliTestRunSummary = .{},
+
+    fn releaseCachedResults(self: *CliTestPlanModule) []CliTestResultItem {
+        const results = self.cached_results orelse {
+            if (builtin.mode == .Debug) {
+                std.debug.panic("CLI test invariant violated: cached results were released from an uncached plan module", .{});
+            }
+            unreachable;
+        };
+        self.cached_results = null;
+        return results;
+    }
+};
+
+const CliTestPlan = struct {
+    modules: []CliTestPlanModule,
+    entries: []CliTestPlanEntry,
+
+    fn deinit(self: *CliTestPlan, allocator: Allocator) void {
+        for (self.modules) |*module| {
+            allocator.free(module.test_roots);
+            if (module.cached_results) |results| {
+                deinitCliTestResultItems(allocator, results);
+            }
+        }
+        allocator.free(self.modules);
+        deinitCliTestPlanEntries(allocator, self.entries);
+    }
+};
+
+const CliCachedModuleTestResults = struct {
+    results: []CliTestResultItem,
+    summary: CliTestRunSummary,
+};
+
+fn deinitCliTestResultItemPayload(allocator: Allocator, result: CliTestResultItem) void {
+    deinitCliTestTranscriptEvents(allocator, result.transcript);
+    if (result.failure_detail) |message| allocator.free(message);
+}
+
+fn deinitCliTestResultItemPayloads(allocator: Allocator, results: []const CliTestResultItem) void {
+    for (results) |result| deinitCliTestResultItemPayload(allocator, result);
+}
+
+fn deinitCliTestResultItems(allocator: Allocator, results: []const CliTestResultItem) void {
+    deinitCliTestResultItemPayloads(allocator, results);
+    allocator.free(@constCast(results));
+}
+
+fn deinitCliTestTranscriptEventPayloads(allocator: Allocator, events: []const CliTestTranscriptEvent) void {
+    for (events) |event| {
+        allocator.free(event.payload);
+    }
+}
+
+fn deinitCliTestTranscriptEvents(allocator: Allocator, events: []const CliTestTranscriptEvent) void {
+    deinitCliTestTranscriptEventPayloads(allocator, events);
+    if (events.len > 0) allocator.free(@constCast(events));
+}
+
+fn deinitCliTestPlanEntries(allocator: Allocator, entries: []const CliTestPlanEntry) void {
+    for (entries) |entry| {
+        allocator.free(entry.symbol_name);
+    }
+    allocator.free(@constCast(entries));
+}
+
+const cli_test_cache_magic = "ROC_TEST_RESULTS_V6";
 
 fn appendU32(bytes: *std.ArrayList(u8), allocator: std.mem.Allocator, value: u32) Allocator.Error!void {
     var buf: [4]u8 = undefined;
@@ -9116,14 +9238,23 @@ fn readU32(bytes: []const u8, offset: *usize) ?u32 {
     return value;
 }
 
+fn readU8(bytes: []const u8, offset: *usize) ?u8 {
+    if (offset.* >= bytes.len) return null;
+    const value = bytes[offset.*];
+    offset.* += 1;
+    return value;
+}
+
+fn cliTestTranscriptEventPayload(event: CliTestTranscriptEvent) []const u8 {
+    return event.payload;
+}
+
 fn cliTestCacheKey(
     artifact: *const check.CheckedArtifact.CheckedModuleArtifact,
-    opt: cli_args.OptLevel,
 ) [32]u8 {
     var hasher = std.crypto.hash.sha2.Sha256.init(.{});
     hasher.update(cli_test_cache_magic);
     hasher.update(build_options.compiler_version);
-    hasher.update(@tagName(opt));
     hasher.update(&artifact.key.bytes);
     var out: [32]u8 = undefined;
     hasher.final(&out);
@@ -9146,7 +9277,6 @@ fn storeCliTestResultsInCache(
     ctx: *CliCtx,
     cache_manager: ?*CacheManager,
     artifact: *const check.CheckedArtifact.CheckedModuleArtifact,
-    opt: cli_args.OptLevel,
     results: []const CliTestResultItem,
 ) (Allocator.Error || error{NoHomeDirectory})!void {
     const manager = cache_manager orelse return;
@@ -9165,6 +9295,14 @@ fn storeCliTestResultsInCache(
             .failed => 1,
             .compiler_error => 2,
         });
+        try appendU32(&bytes, ctx.gpa, @intCast(result.transcript.len));
+        for (result.transcript) |event| {
+            try bytes.append(ctx.gpa, @intFromEnum(event.kind));
+            try bytes.append(ctx.gpa, @intFromEnum(event.stream));
+            const payload = cliTestTranscriptEventPayload(event);
+            try appendU32(&bytes, ctx.gpa, @intCast(payload.len));
+            try bytes.appendSlice(ctx.gpa, payload);
+        }
         if (result.failure_detail) |message| {
             try bytes.append(ctx.gpa, 1);
             try bytes.append(ctx.gpa, @intFromEnum(result.failure_detail_visibility));
@@ -9177,23 +9315,71 @@ fn storeCliTestResultsInCache(
 
     const entries_dir = try manager.config.getTestCacheDir(ctx.gpa);
     defer ctx.gpa.free(entries_dir);
-    manager.storeRawBytes(cliTestCacheKey(artifact, opt), bytes.items, entries_dir);
+    manager.storeRawBytes(cliTestCacheKey(artifact), bytes.items, entries_dir);
 }
 
-fn appendCachedCliTestResults(
+fn loadCliTestTranscriptEvents(
+    allocator: Allocator,
+    data: []const u8,
+    offset: *usize,
+) Allocator.Error!?[]CliTestTranscriptEvent {
+    const count = readU32(data, offset) orelse return null;
+    if (count == 0) return &.{};
+
+    var events = std.ArrayList(CliTestTranscriptEvent).empty;
+    var events_owned = false;
+    defer {
+        if (!events_owned) {
+            for (events.items) |event| allocator.free(event.payload);
+            events.deinit(allocator);
+        }
+    }
+
+    for (0..@as(usize, @intCast(count))) |_| {
+        const kind_raw = readU8(data, offset) orelse return null;
+        const kind: CliTestTranscriptEventKind = switch (kind_raw) {
+            0 => .dbg,
+            1 => .expect_failed,
+            2 => .crashed,
+            3 => .crash_diagnostic,
+            else => return null,
+        };
+        const stream_raw = readU8(data, offset) orelse return null;
+        const stream: CliTestTranscriptStream = switch (stream_raw) {
+            0 => .stdout,
+            1 => .stderr,
+            else => return null,
+        };
+        const payload_len = readU32(data, offset) orelse return null;
+        const payload_len_usize: usize = @intCast(payload_len);
+        if (offset.* + payload_len_usize > data.len) return null;
+        const payload = try allocator.dupe(u8, data[offset.*..][0..payload_len_usize]);
+        offset.* += payload_len_usize;
+        errdefer allocator.free(payload);
+        try events.append(allocator, .{
+            .stream = stream,
+            .kind = kind,
+            .payload = payload,
+        });
+    }
+
+    const owned = try events.toOwnedSlice(allocator);
+    events_owned = true;
+    return owned;
+}
+
+fn loadCachedCliTestResults(
     ctx: *CliCtx,
     cache_manager: ?*CacheManager,
     artifact: *const check.CheckedArtifact.CheckedModuleArtifact,
     module: BuildEnv.CompiledModuleInfo,
-    opt: cli_args.OptLevel,
     test_roots: []const check.CheckedArtifact.RootRequest,
-    module_results: *std.ArrayList(CliModuleTestResult),
-) (Allocator.Error || error{NoHomeDirectory})!?CliTestRunSummary {
+) (Allocator.Error || error{NoHomeDirectory})!?CliCachedModuleTestResults {
     const manager = cache_manager orelse return null;
 
     const entries_dir = try manager.config.getTestCacheDir(ctx.gpa);
     defer ctx.gpa.free(entries_dir);
-    const data = manager.loadRawBytes(cliTestCacheKey(artifact, opt), entries_dir) orelse return null;
+    const data = manager.loadRawBytes(cliTestCacheKey(artifact), entries_dir) orelse return null;
     defer ctx.gpa.free(data);
 
     var offset: usize = 0;
@@ -9208,28 +9394,31 @@ fn appendCachedCliTestResults(
     var results_owned_by_module = false;
     defer {
         if (!results_owned_by_module) {
-            for (results.items) |result| {
-                if (result.failure_detail) |message| ctx.gpa.free(message);
-            }
+            deinitCliTestResultItemPayloads(ctx.gpa, results.items);
             results.deinit(ctx.gpa);
         }
     }
 
-    for (0..@as(usize, @intCast(count))) |_| {
+    for (0..@as(usize, @intCast(count))) |root_index| {
         const order = readU32(data, &offset) orelse return null;
-        if (offset + 2 > data.len) return null;
-        const result_tag = data[offset];
-        offset += 1;
-        const has_message = data[offset];
-        offset += 1;
+        const root = test_roots[root_index];
+        if (order != root.order) return null;
+
+        const result_tag = readU8(data, &offset) orelse return null;
         const result: CliTestResult = switch (result_tag) {
             0 => .passed,
             1 => .failed,
-            2 => .compiler_error,
+            2 => return null,
             else => return null,
         };
+        const transcript = (try loadCliTestTranscriptEvents(ctx.gpa, data, &offset)) orelse return null;
+        var transcript_owned_by_result = false;
+        defer {
+            if (!transcript_owned_by_result) deinitCliTestTranscriptEvents(ctx.gpa, transcript);
+        }
 
-        const root = testRootByOrder(test_roots, order);
+        const has_message = readU8(data, &offset) orelse return null;
+
         const region = testRootRegion(module.semantic.env, root);
 
         var visibility: CliTestFailureDetailVisibility = .always;
@@ -9253,9 +9442,11 @@ fn appendCachedCliTestResults(
             .result = result,
             .order = order,
             .region = region,
+            .transcript = transcript,
             .failure_detail = message,
             .failure_detail_visibility = visibility,
         });
+        transcript_owned_by_result = true;
     }
     if (offset != data.len) return null;
 
@@ -9263,19 +9454,13 @@ fn appendCachedCliTestResults(
     summary.cached_modules = 1;
     const owned_results = try results.toOwnedSlice(ctx.gpa);
     errdefer {
-        for (owned_results) |result| {
-            if (result.failure_detail) |message| ctx.gpa.free(message);
-        }
-        ctx.gpa.free(owned_results);
+        deinitCliTestResultItems(ctx.gpa, owned_results);
     }
-    try module_results.append(ctx.gpa, .{
-        .env = module.semantic.env,
-        .path = module.path,
-        .results = owned_results,
-        .cached = true,
-    });
     results_owned_by_module = true;
-    return summary;
+    return .{
+        .results = owned_results,
+        .summary = summary,
+    };
 }
 
 fn collectTestRootRequests(
@@ -9291,6 +9476,80 @@ fn collectTestRootRequests(
     }
 
     return try roots.toOwnedSlice(allocator);
+}
+
+fn buildCliTestPlan(
+    ctx: *CliCtx,
+    modules: []const BuildEnv.CompiledModuleInfo,
+) Allocator.Error!CliTestPlan {
+    var planned_modules = std.ArrayList(CliTestPlanModule).empty;
+    var entries = std.ArrayList(CliTestPlanEntry).empty;
+    errdefer {
+        for (planned_modules.items) |*module| {
+            ctx.gpa.free(module.test_roots);
+            if (module.cached_results) |results| {
+                deinitCliTestResultItems(ctx.gpa, results);
+            }
+        }
+        planned_modules.deinit(ctx.gpa);
+        for (entries.items) |entry| {
+            ctx.gpa.free(entry.symbol_name);
+        }
+        entries.deinit(ctx.gpa);
+    }
+
+    for (modules, 0..) |module, module_index| {
+        const artifact = module.semantic.checked_artifact orelse continue;
+        const test_roots = try collectTestRootRequests(ctx.gpa, artifact);
+        errdefer ctx.gpa.free(test_roots);
+        if (test_roots.len == 0) {
+            ctx.gpa.free(test_roots);
+            continue;
+        }
+
+        const first_entry_index: u32 = @intCast(entries.items.len);
+        for (test_roots, 0..) |root, root_index| {
+            const result_index: u32 = @intCast(entries.items.len);
+            const symbol_name = try std.fmt.allocPrintSentinel(ctx.gpa, "roc_test_expect_{d}", .{result_index}, 0);
+            entries.append(ctx.gpa, .{
+                .module_index = @intCast(module_index),
+                .root_index = @intCast(root_index),
+                .root_order = root.order,
+                .result_index = result_index,
+                .region = testRootRegion(module.semantic.env, root),
+                .symbol_name = symbol_name,
+            }) catch |err| {
+                ctx.gpa.free(symbol_name);
+                return err;
+            };
+        }
+
+        try planned_modules.append(ctx.gpa, .{
+            .module = module,
+            .artifact = artifact,
+            .test_roots = test_roots,
+            .first_entry_index = first_entry_index,
+            .entry_count = @intCast(test_roots.len),
+        });
+    }
+
+    const owned_modules = try planned_modules.toOwnedSlice(ctx.gpa);
+    errdefer {
+        for (owned_modules) |*module| {
+            ctx.gpa.free(module.test_roots);
+            if (module.cached_results) |results| {
+                deinitCliTestResultItems(ctx.gpa, results);
+            }
+        }
+        ctx.gpa.free(owned_modules);
+    }
+    const owned_entries = try entries.toOwnedSlice(ctx.gpa);
+    errdefer deinitCliTestPlanEntries(ctx.gpa, owned_entries);
+
+    return .{
+        .modules = owned_modules,
+        .entries = owned_entries,
+    };
 }
 
 fn testRootRegion(
@@ -9548,19 +9807,6 @@ fn buildExpectFailureDetail(
     };
 }
 
-fn testRootByOrder(
-    roots: []const check.CheckedArtifact.RootRequest,
-    order: u32,
-) check.CheckedArtifact.RootRequest {
-    for (roots) |root| {
-        if (root.order == order) return root;
-    }
-    if (builtin.mode == .Debug) {
-        std.debug.panic("CLI test invariant violated: lowered test root order {d} was not in the explicit test root set", .{order});
-    }
-    unreachable;
-}
-
 const CliTestExecutionMode = enum {
     interpreter,
     dev,
@@ -9628,6 +9874,8 @@ fn inlineExpectModeForOpt(opt: cli_args.OptLevel) lir.CheckedPipeline.InlineExpe
 const CliTestRootRun = struct {
     root: check.CheckedArtifact.RootRequest,
     env: *const ModuleEnv,
+    path: []const u8,
+    result_index: u32,
     root_proc: lir.LirProcSpecId,
     region: base.Region,
     arg_layouts: []const layout.Idx,
@@ -9635,25 +9883,34 @@ const CliTestRootRun = struct {
     symbol_name: [:0]const u8,
 };
 
+const CliLoweredTestModule = struct {
+    planned_index: usize,
+    lowered: lir.CheckedPipeline.LoweredProgram,
+    root_runs: []CliTestRootRun,
+
+    fn deinit(self: *CliLoweredTestModule, allocator: Allocator) void {
+        deinitCliTestRootRuns(allocator, self.root_runs);
+        self.lowered.deinit();
+    }
+};
+
 fn deinitCliTestRootRuns(allocator: Allocator, runs: []CliTestRootRun) void {
     for (runs) |run| {
         allocator.free(run.arg_layouts);
-        allocator.free(run.symbol_name);
     }
     allocator.free(runs);
 }
 
 fn collectCliTestRootRuns(
     ctx: *CliCtx,
-    module: BuildEnv.CompiledModuleInfo,
-    test_roots: []const check.CheckedArtifact.RootRequest,
+    planned: *const CliTestPlanModule,
+    plan_entries: []const CliTestPlanEntry,
     lowered: *const lir.CheckedPipeline.LoweredProgram,
 ) Allocator.Error![]CliTestRootRun {
     var runs = std.ArrayList(CliTestRootRun).empty;
     errdefer {
         for (runs.items) |run| {
             ctx.gpa.free(run.arg_layouts);
-            ctx.gpa.free(run.symbol_name);
         }
         runs.deinit(ctx.gpa);
     }
@@ -9669,28 +9926,66 @@ fn collectCliTestRootRuns(
 
     for (root_procs, root_metadata) |root_proc, metadata| {
         if (metadata.kind != .test_expect) continue;
-        const root = testRootByOrder(test_roots, metadata.order);
+        const test_plan = metadata.test_plan orelse {
+            if (builtin.mode == .Debug) {
+                std.debug.panic("CLI test invariant violated: lowered test root metadata is missing its explicit test-plan slot", .{});
+            }
+            unreachable;
+        };
+        if (test_plan.root_index >= planned.test_roots.len or test_plan.result_index >= plan_entries.len) {
+            if (builtin.mode == .Debug) {
+                std.debug.panic(
+                    "CLI test invariant violated: lowered test-plan slot root/result ({d}/{d}) is outside module roots/results ({d}/{d})",
+                    .{ test_plan.root_index, test_plan.result_index, planned.test_roots.len, plan_entries.len },
+                );
+            }
+            unreachable;
+        }
+        const root_index: usize = @intCast(test_plan.root_index);
+        const root = planned.test_roots[root_index];
+        const plan_entry = plan_entries[@intCast(test_plan.result_index)];
+        if (builtin.mode == .Debug and
+            (metadata.order != root.order or
+                plan_entry.result_index != test_plan.result_index or
+                plan_entry.module_index != test_plan.module_index or
+                plan_entry.root_index != test_plan.root_index or
+                plan_entry.root_order != root.order))
+        {
+            std.debug.panic(
+                "CLI test invariant violated: explicit plan metadata ({d}/{d}/{d}/{d}) differs from plan entry/root ({d}/{d}/{d}/{d})",
+                .{
+                    test_plan.result_index,
+                    test_plan.module_index,
+                    test_plan.root_index,
+                    metadata.order,
+                    plan_entry.result_index,
+                    plan_entry.module_index,
+                    plan_entry.root_index,
+                    root.order,
+                },
+            );
+        }
         const proc = lowered.lir_result.store.getProcSpec(root_proc);
         const arg_layouts = try argLayoutsForProc(ctx.gpa, &lowered.lir_result.store, root_proc);
         errdefer ctx.gpa.free(arg_layouts);
-        const symbol_name = try std.fmt.allocPrintSentinel(ctx.gpa, "roc_test_expect_{d}", .{root.order}, 0);
-        errdefer ctx.gpa.free(symbol_name);
         try runs.append(ctx.gpa, .{
             .root = root,
-            .env = module.semantic.env,
+            .env = planned.module.semantic.env,
+            .path = planned.module.path,
+            .result_index = plan_entry.result_index,
             .root_proc = root_proc,
-            .region = testRootRegion(module.semantic.env, root),
+            .region = testRootRegion(planned.module.semantic.env, root),
             .arg_layouts = arg_layouts,
             .ret_layout = proc.ret_layout,
-            .symbol_name = symbol_name,
+            .symbol_name = plan_entry.symbol_name,
         });
     }
 
-    if (runs.items.len != test_roots.len) {
+    if (runs.items.len != planned.test_roots.len) {
         if (builtin.mode == .Debug) {
             std.debug.panic(
                 "CLI test invariant violated: lowered {d} test roots for {d} checked test roots",
-                .{ runs.items.len, test_roots.len },
+                .{ runs.items.len, planned.test_roots.len },
             );
         }
         unreachable;
@@ -9721,6 +10016,7 @@ fn appendFailedCliTestResult(
     results: *std.ArrayList(CliTestResultItem),
     run: CliTestRootRun,
     result: CliTestResult,
+    transcript: []CliTestTranscriptEvent,
     message: []const u8,
     visibility: CliTestFailureDetailVisibility,
 ) Allocator.Error!void {
@@ -9729,10 +10025,189 @@ fn appendFailedCliTestResult(
         .result = result,
         .order = run.root.order,
         .region = run.region,
+        .transcript = transcript,
         .failure_detail = message,
         .failure_detail_visibility = visibility,
     });
 }
+
+fn copyCliTestTranscriptEventsFromEval(
+    allocator: Allocator,
+    events: []const eval.test_helpers.BoolRootEvent,
+) Allocator.Error![]CliTestTranscriptEvent {
+    if (events.len == 0) return &.{};
+
+    const EventParts = struct {
+        stream: CliTestTranscriptStream,
+        kind: CliTestTranscriptEventKind,
+        payload: []const u8,
+    };
+    const copied = try allocator.alloc(CliTestTranscriptEvent, events.len);
+    var copied_len: usize = 0;
+    errdefer {
+        for (copied[0..copied_len]) |event| allocator.free(event.payload);
+        allocator.free(copied);
+    }
+
+    for (events, 0..) |event, index| {
+        const parts: EventParts = switch (event) {
+            .dbg => |message| .{ .stream = .stderr, .kind = .dbg, .payload = message },
+            .expect_failed => |message| .{ .stream = .stderr, .kind = .expect_failed, .payload = message },
+            .crashed => |message| .{ .stream = .stderr, .kind = .crashed, .payload = message },
+        };
+        copied[index] = .{
+            .stream = parts.stream,
+            .kind = parts.kind,
+            .payload = try allocator.dupe(u8, parts.payload),
+        };
+        copied_len += 1;
+    }
+
+    return copied;
+}
+
+fn copyCliTestTranscriptEvents(
+    allocator: Allocator,
+    events: []const CliTestTranscriptEvent,
+) Allocator.Error![]CliTestTranscriptEvent {
+    if (events.len == 0) return &.{};
+
+    const copied = try allocator.alloc(CliTestTranscriptEvent, events.len);
+    var copied_len: usize = 0;
+    errdefer {
+        for (copied[0..copied_len]) |event| allocator.free(event.payload);
+        allocator.free(copied);
+    }
+
+    for (events, 0..) |event, index| {
+        copied[index] = .{
+            .stream = event.stream,
+            .kind = event.kind,
+            .payload = try allocator.dupe(u8, event.payload),
+        };
+        copied_len += 1;
+    }
+
+    return copied;
+}
+
+fn appendCliTestTranscriptEvent(
+    allocator: Allocator,
+    events: []const CliTestTranscriptEvent,
+    stream: CliTestTranscriptStream,
+    kind: CliTestTranscriptEventKind,
+    payload: []const u8,
+) Allocator.Error![]const CliTestTranscriptEvent {
+    const extended = try allocator.alloc(CliTestTranscriptEvent, events.len + 1);
+    errdefer allocator.free(extended);
+    @memcpy(extended[0..events.len], events);
+
+    const owned_payload = try allocator.dupe(u8, payload);
+    errdefer allocator.free(owned_payload);
+    extended[events.len] = .{
+        .stream = stream,
+        .kind = kind,
+        .payload = owned_payload,
+    };
+
+    if (events.len > 0) allocator.free(@constCast(events));
+    return extended;
+}
+
+fn copyCliTestResultItem(
+    allocator: Allocator,
+    result: CliTestResultItem,
+) Allocator.Error!CliTestResultItem {
+    const transcript = try copyCliTestTranscriptEvents(allocator, result.transcript);
+    errdefer deinitCliTestTranscriptEvents(allocator, transcript);
+    const failure_detail = if (result.failure_detail) |message|
+        try allocator.dupe(u8, message)
+    else
+        null;
+    errdefer if (failure_detail) |message| allocator.free(message);
+
+    return .{
+        .result = result.result,
+        .order = result.order,
+        .region = result.region,
+        .transcript = transcript,
+        .failure_detail = failure_detail,
+        .failure_detail_visibility = result.failure_detail_visibility,
+    };
+}
+
+const CliInterpreterTestHostEnv = struct {
+    allocator: Allocator,
+    echo_env: echo_platform.EchoEnv,
+    events: std.ArrayList(CliTestTranscriptEvent) = .empty,
+
+    fn init(allocator: Allocator, std_io: std.Io) CliInterpreterTestHostEnv {
+        return .{
+            .allocator = allocator,
+            .echo_env = .{ .std_io = std_io },
+        };
+    }
+
+    fn deinit(self: *CliInterpreterTestHostEnv) void {
+        self.resetObservation();
+        self.events.deinit(self.allocator);
+    }
+
+    fn resetObservation(self: *CliInterpreterTestHostEnv) void {
+        deinitCliTestTranscriptEvents(self.allocator, self.events.items);
+        self.events.clearRetainingCapacity();
+        self.echo_env.inline_expect_failed = false;
+    }
+
+    fn takeTranscript(self: *CliInterpreterTestHostEnv) Allocator.Error![]CliTestTranscriptEvent {
+        if (self.events.items.len == 0) return &.{};
+        return try self.events.toOwnedSlice(self.allocator);
+    }
+
+    fn installCallbacks(_: *CliInterpreterTestHostEnv, roc_ops: *echo_platform.host_abi.RocOps) void {
+        roc_ops.roc_dbg = &rocDbg;
+        roc_ops.roc_expect_failed = &rocExpectFailed;
+        roc_ops.roc_crashed = &rocCrashed;
+    }
+
+    fn fromOps(ops: *echo_platform.host_abi.RocOps) *CliInterpreterTestHostEnv {
+        const echo_env: *echo_platform.EchoEnv = @ptrCast(@alignCast(ops.env));
+        return @alignCast(@fieldParentPtr("echo_env", echo_env));
+    }
+
+    fn appendEvent(
+        self: *CliInterpreterTestHostEnv,
+        stream: CliTestTranscriptStream,
+        kind: CliTestTranscriptEventKind,
+        bytes: []const u8,
+    ) void {
+        const payload = self.allocator.dupe(u8, bytes) catch {
+            std.debug.panic("CLI interpreter test host failed to allocate transcript payload", .{});
+        };
+        self.events.append(self.allocator, .{
+            .stream = stream,
+            .kind = kind,
+            .payload = payload,
+        }) catch {
+            self.allocator.free(payload);
+            std.debug.panic("CLI interpreter test host failed to append transcript event", .{});
+        };
+    }
+
+    fn rocDbg(ops: *echo_platform.host_abi.RocOps, bytes: [*]const u8, len: usize) callconv(.c) void {
+        fromOps(ops).appendEvent(.stderr, .dbg, bytes[0..len]);
+    }
+
+    fn rocExpectFailed(ops: *echo_platform.host_abi.RocOps, bytes: [*]const u8, len: usize) callconv(.c) void {
+        const self = fromOps(ops);
+        self.echo_env.inline_expect_failed = true;
+        self.appendEvent(.stderr, .expect_failed, bytes[0..len]);
+    }
+
+    fn rocCrashed(ops: *echo_platform.host_abi.RocOps, bytes: [*]const u8, len: usize) callconv(.c) void {
+        fromOps(ops).appendEvent(.stderr, .crashed, bytes[0..len]);
+    }
+};
 
 fn runInterpreterTestRoots(
     ctx: *CliCtx,
@@ -9742,8 +10217,10 @@ fn runInterpreterTestRoots(
     summary: *CliTestRunSummary,
 ) Allocator.Error!void {
     var hosted_fn_array = [_]echo_platform.host_abi.HostedFn{echo_platform.host_abi.hostedFn(&echo_platform.echoHostedFn)};
-    var echo_env_test = echo_platform.EchoEnv{ .std_io = ctx.io.std_io };
-    var roc_ops = echo_platform.makeDefaultRocOps(&echo_env_test, &hosted_fn_array);
+    var host_env = CliInterpreterTestHostEnv.init(ctx.gpa, ctx.io.std_io);
+    defer host_env.deinit();
+    var roc_ops = echo_platform.makeDefaultRocOps(&host_env.echo_env, &hosted_fn_array);
+    host_env.installCallbacks(&roc_ops);
     echo_platform.g_roc_ops = &roc_ops;
     var interpreter = try eval.LirInterpreter.init(
         ctx.gpa,
@@ -9754,11 +10231,14 @@ fn runInterpreterTestRoots(
     defer interpreter.deinit();
 
     for (root_runs) |run| {
+        host_env.resetObservation();
         const eval_result = interpreter.eval(.{
             .proc_id = run.root_proc,
             .arg_layouts = run.arg_layouts,
             .ret_layout = run.ret_layout,
         }) catch |err| {
+            var transcript: []const CliTestTranscriptEvent = try host_env.takeTranscript();
+            errdefer deinitCliTestTranscriptEvents(ctx.gpa, transcript);
             summary.failed += 1;
             // When a `?` operator failed the expect, point the report's
             // source snippet at the `?` itself.
@@ -9767,16 +10247,32 @@ fn runInterpreterTestRoots(
                 else => run.region,
             };
             const message = try interpreterTestFailureMessage(ctx.gpa, &interpreter, err);
-            errdefer ctx.gpa.free(message);
+            var message_owned = true;
+            errdefer if (message_owned) ctx.gpa.free(message);
+            const failure_detail: ?[]const u8 = switch (err) {
+                error.Crash => blk: {
+                    transcript = try appendCliTestTranscriptEvent(ctx.gpa, transcript, .stderr, .crash_diagnostic, message);
+                    ctx.gpa.free(message);
+                    message_owned = false;
+                    break :blk null;
+                },
+                else => blk: {
+                    message_owned = false;
+                    break :blk message;
+                },
+            };
             try results.append(ctx.gpa, .{
                 .result = .failed,
                 .order = run.root.order,
                 .region = failure_region,
-                .failure_detail = message,
+                .transcript = transcript,
+                .failure_detail = failure_detail,
                 .failure_detail_visibility = .always,
             });
             continue;
         };
+        const transcript = try host_env.takeTranscript();
+        errdefer deinitCliTestTranscriptEvents(ctx.gpa, transcript);
 
         const passed = switch (eval_result) {
             .value => |value| blk: {
@@ -9788,7 +10284,7 @@ fn runInterpreterTestRoots(
 
         if (passed) {
             summary.passed += 1;
-            try results.append(ctx.gpa, .{ .result = .passed, .order = run.root.order, .region = run.region, .failure_detail = null });
+            try results.append(ctx.gpa, .{ .result = .passed, .order = run.root.order, .region = run.region, .transcript = transcript, .failure_detail = null });
         } else {
             summary.failed += 1;
             const detail = try buildExpectFailureDetail(ctx.gpa, run.env, run.root);
@@ -9797,6 +10293,7 @@ fn runInterpreterTestRoots(
                 results,
                 run,
                 .failed,
+                transcript,
                 detail.message,
                 detail.visibility,
             );
@@ -9819,10 +10316,85 @@ fn appendCompilerErrorsForRuns(
             results,
             run,
             .compiler_error,
+            &.{},
             try std.fmt.allocPrint(ctx.gpa, "{s} test backend failed: {s}", .{ mode.displayName(), @errorName(err) }),
             .always,
         );
     }
+}
+
+fn addCliTestResultToSummary(summary: *CliTestRunSummary, result: CliTestResult) void {
+    switch (result) {
+        .passed => summary.passed += 1,
+        .failed => summary.failed += 1,
+        .compiler_error => summary.compiler_errors += 1,
+    }
+}
+
+fn cliTestResultItemFromEval(
+    ctx: *CliCtx,
+    run: CliTestRootRun,
+    eval_result: eval.test_helpers.BoolRootEvalResult,
+) Allocator.Error!CliTestResultItem {
+    var transcript: []const CliTestTranscriptEvent = try copyCliTestTranscriptEventsFromEval(ctx.gpa, eval_result.events);
+    errdefer deinitCliTestTranscriptEvents(ctx.gpa, transcript);
+
+    switch (eval_result.outcome) {
+        .passed => |passed| {
+            if (passed) {
+                return .{ .result = .passed, .order = run.root.order, .region = run.region, .transcript = transcript, .failure_detail = null };
+            } else {
+                const detail = try buildExpectFailureDetail(ctx.gpa, run.env, run.root);
+                return .{
+                    .result = .failed,
+                    .order = run.root.order,
+                    .region = run.region,
+                    .transcript = transcript,
+                    .failure_detail = detail.message,
+                    .failure_detail_visibility = detail.visibility,
+                };
+            }
+        },
+        .crashed => |message| {
+            const crash_transcript = try appendCliTestTranscriptEvent(ctx.gpa, transcript, .stderr, .crash_diagnostic, message);
+            transcript = &.{};
+            return .{
+                .result = .failed,
+                .order = run.root.order,
+                .region = run.region,
+                .transcript = crash_transcript,
+                .failure_detail = null,
+                .failure_detail_visibility = .always,
+            };
+        },
+        .expect_err => |failure| {
+            // Point the report's source snippet at the `?` expression
+            // whose Err failed the expect.
+            const message = try ctx.gpa.dupe(u8, failure.message);
+            errdefer ctx.gpa.free(message);
+            return .{
+                .result = .failed,
+                .order = run.root.order,
+                .region = base.Region.from_raw_offsets(failure.region_start, failure.region_end),
+                .transcript = transcript,
+                .failure_detail = message,
+                .failure_detail_visibility = .always,
+            };
+        },
+    }
+}
+
+fn appendEvalResultForRun(
+    ctx: *CliCtx,
+    run: CliTestRootRun,
+    eval_result: eval.test_helpers.BoolRootEvalResult,
+    results: *std.ArrayList(CliTestResultItem),
+    summary: *CliTestRunSummary,
+) Allocator.Error!void {
+    const result = try cliTestResultItemFromEval(ctx, run, eval_result);
+    errdefer deinitCliTestResultItemPayload(ctx.gpa, result);
+    addCliTestResultToSummary(summary, result.result);
+    try results.append(ctx.gpa, result);
 }
 
 fn runCompiledTestRoots(
@@ -9877,90 +10449,52 @@ fn runCompiledTestRoots(
     defer eval.test_helpers.deinitBoolRootEvalResults(ctx.gpa, eval_results);
 
     for (root_runs, eval_results) |run, eval_result| {
-        switch (eval_result) {
-            .passed => |passed| {
-                if (passed) {
-                    summary.passed += 1;
-                    try results.append(ctx.gpa, .{ .result = .passed, .order = run.root.order, .region = run.region, .failure_detail = null });
-                } else {
-                    summary.failed += 1;
-                    const detail = try buildExpectFailureDetail(ctx.gpa, run.env, run.root);
-                    try appendFailedCliTestResult(
-                        ctx,
-                        results,
-                        run,
-                        .failed,
-                        detail.message,
-                        detail.visibility,
-                    );
-                }
-            },
-            .crashed => |message| {
-                summary.failed += 1;
-                try appendFailedCliTestResult(
-                    ctx,
-                    results,
-                    run,
-                    .failed,
-                    try ctx.gpa.dupe(u8, message),
-                    .always,
-                );
-            },
-            .expect_err => |failure| {
-                summary.failed += 1;
-                // Point the report's source snippet at the `?` expression
-                // whose Err failed the expect.
-                const message = try ctx.gpa.dupe(u8, failure.message);
-                errdefer ctx.gpa.free(message);
-                try results.append(ctx.gpa, .{
-                    .result = .failed,
-                    .order = run.root.order,
-                    .region = base.Region.from_raw_offsets(failure.region_start, failure.region_end),
-                    .failure_detail = message,
-                    .failure_detail_visibility = .always,
-                });
-            },
-        }
+        try appendEvalResultForRun(ctx, run, eval_result, results, summary);
     }
 }
 
-fn runCheckedArtifactTests(
+fn lowerPlannedTestModule(
     ctx: *CliCtx,
     build_env: *BuildEnv,
-    module: BuildEnv.CompiledModuleInfo,
+    planned_index: usize,
+    planned: *const CliTestPlanModule,
+    plan_entries: []const CliTestPlanEntry,
     opt: cli_args.OptLevel,
-    cache_manager: ?*CacheManager,
-    module_results: *std.ArrayList(CliModuleTestResult),
-) (Allocator.Error || error{NoHomeDirectory})!CliTestRunSummary {
-    const artifact = module.semantic.checked_artifact orelse return .{};
-    const test_roots = try collectTestRootRequests(ctx.gpa, artifact);
-    defer ctx.gpa.free(test_roots);
-    if (test_roots.len == 0) return .{};
-
-    if (try appendCachedCliTestResults(
-        ctx,
-        cache_manager,
-        artifact,
-        module,
-        opt,
-        test_roots,
-        module_results,
-    )) |cached_summary| {
-        return cached_summary;
-    }
-
-    const imported_artifacts = try build_env.collectImportedArtifactViews(ctx.gpa, artifact);
+) Allocator.Error!CliLoweredTestModule {
+    const imported_artifacts = try build_env.collectImportedArtifactViews(ctx.gpa, planned.artifact);
     defer ctx.gpa.free(imported_artifacts);
-    const relation_artifacts = try build_env.collectRelationArtifactViews(ctx.gpa, artifact);
+    const relation_artifacts = try build_env.collectRelationArtifactViews(ctx.gpa, planned.artifact);
     defer ctx.gpa.free(relation_artifacts);
+
+    const root_plan_metadata = try ctx.gpa.alloc(postcheck.Common.RootTestPlanMetadata, planned.test_roots.len);
+    defer ctx.gpa.free(root_plan_metadata);
+    for (planned.test_roots, 0..) |root, root_index| {
+        const entry_index: usize = @intCast(planned.first_entry_index + @as(u32, @intCast(root_index)));
+        const plan_entry = plan_entries[entry_index];
+        if (builtin.mode == .Debug and (plan_entry.root_index != root_index or plan_entry.root_order != root.order)) {
+            std.debug.panic(
+                "CLI test invariant violated: plan entry root index/order ({d}/{d}) differs from lowered root ({d}/{d})",
+                .{ plan_entry.root_index, plan_entry.root_order, root_index, root.order },
+            );
+        }
+        root_plan_metadata[root_index] = .{
+            .root_order = root.order,
+            .result_index = plan_entry.result_index,
+            .module_index = plan_entry.module_index,
+            .root_index = plan_entry.root_index,
+        };
+    }
 
     var lowered = try lir.CheckedPipeline.lowerCheckedModulesToLir(
         ctx.gpa,
         .{
-            .root = check.CheckedArtifact.loweringViewWithRelations(artifact, relation_artifacts),
+            .root = check.CheckedArtifact.loweringViewWithRelations(planned.artifact, relation_artifacts),
             .imports = imported_artifacts,
         },
-        .{ .requests = test_roots },
+        .{
+            .requests = planned.test_roots,
+            .test_plan_metadata = root_plan_metadata,
+        },
         .{
             .target_usize = base.target.TargetUsize.native,
             .inline_mode = postCheckInlineModeForOpt(opt),
@@ -9968,28 +10502,48 @@ fn runCheckedArtifactTests(
             .tag_reachability = tagReachabilityForOpt(opt),
         },
     );
-    defer lowered.deinit();
+    errdefer lowered.deinit();
 
-    const root_runs = try collectCliTestRootRuns(ctx, module, test_roots, &lowered);
-    defer deinitCliTestRootRuns(ctx.gpa, root_runs);
+    const root_runs = try collectCliTestRootRuns(ctx, planned, plan_entries, &lowered);
+    errdefer deinitCliTestRootRuns(ctx.gpa, root_runs);
+
+    return .{
+        .planned_index = planned_index,
+        .lowered = lowered,
+        .root_runs = root_runs,
+    };
+}
+
+fn runCheckedArtifactTests(
+    ctx: *CliCtx,
+    build_env: *BuildEnv,
+    planned: *const CliTestPlanModule,
+    plan_entries: []const CliTestPlanEntry,
+    opt: cli_args.OptLevel,
+    cache_manager: ?*CacheManager,
+    module_results: *std.ArrayList(CliModuleTestResult),
+) (Allocator.Error || error{NoHomeDirectory})!CliTestRunSummary {
+    const module = planned.module;
+    const artifact = planned.artifact;
+    var lowered_module = try lowerPlannedTestModule(ctx, build_env, 0, planned, plan_entries, opt);
+    defer lowered_module.deinit(ctx.gpa);
 
     var results = std.ArrayList(CliTestResultItem).empty;
     errdefer {
-        for (results.items) |result| {
-            if (result.failure_detail) |message| ctx.gpa.free(message);
-        }
+        deinitCliTestResultItemPayloads(ctx.gpa, results.items);
         results.deinit(ctx.gpa);
     }
 
     var summary = CliTestRunSummary{};
     const mode = cliTestExecutionMode(opt);
     switch (mode) {
-        .interpreter => try runInterpreterTestRoots(ctx, &lowered, root_runs, &results, &summary),
-        .dev, .llvm_size, .llvm_speed => try runCompiledTestRoots(ctx, mode, &lowered, root_runs, &results, &summary),
+        .interpreter => try runInterpreterTestRoots(ctx, &lowered_module.lowered, lowered_module.root_runs, &results, &summary),
+        .dev => try runCompiledTestRoots(ctx, mode, &lowered_module.lowered, lowered_module.root_runs, &results, &summary),
+        .llvm_size, .llvm_speed => unreachable,
     }
     summary.modules_with_tests = 1;
 
-    try storeCliTestResultsInCache(ctx, cache_manager, artifact, opt, results.items);
+    try storeCliTestResultsInCache(ctx, cache_manager, artifact, results.items);
 
     try module_results.append(ctx.gpa, .{
         .env = module.semantic.env,
@@ -10000,6 +10554,247 @@ fn runCheckedArtifactTests(
     results.deinit(ctx.gpa);
 
     return summary;
+}
+
+fn deinitFreshResultSlots(allocator: Allocator, slots: []?[]CliTestResultItem) void {
+    for (slots) |maybe_results| {
+        if (maybe_results) |results| {
+            deinitCliTestResultItems(allocator, results);
+        }
+    }
+    allocator.free(slots);
+}
+
+fn runLlvmLoweredTestModulesOnce(
+    ctx: *CliCtx,
+    mode: CliTestExecutionMode,
+    lowered_modules: []const CliLoweredTestModule,
+    fresh_results: []?[]CliTestResultItem,
+    summaries: []CliTestRunSummary,
+    max_workers: ?usize,
+    live_output: ?*CliOptimizedLiveTestOutput,
+) ReportRenderError!void {
+    if (lowered_modules.len == 0) return;
+
+    var bool_modules = std.ArrayList(eval.test_helpers.BoolRootModule).empty;
+    defer {
+        for (bool_modules.items) |module| {
+            ctx.gpa.free(@constCast(module.roots));
+        }
+        bool_modules.deinit(ctx.gpa);
+    }
+
+    var live_runs = std.ArrayList(CliTestRootRun).empty;
+    defer live_runs.deinit(ctx.gpa);
+
+    for (lowered_modules) |*lowered_module| {
+        const bool_roots = try ctx.gpa.alloc(eval.test_helpers.BoolRoot, lowered_module.root_runs.len);
+        errdefer ctx.gpa.free(bool_roots);
+        for (lowered_module.root_runs, 0..) |run, root_index| {
+            bool_roots[root_index] = .{
+                .symbol_name = run.symbol_name,
+                .proc = run.root_proc,
+                .arg_layouts = run.arg_layouts,
+                .ret_layout = run.ret_layout,
+            };
+            if (live_output != null) {
+                try live_runs.append(ctx.gpa, run);
+            }
+        }
+
+        try bool_modules.append(ctx.gpa, .{
+            .store = &lowered_module.lowered.lir_result.store,
+            .layouts = &lowered_module.lowered.lir_result.layouts,
+            .roots = bool_roots,
+        });
+    }
+
+    var completion_callback: ?eval.test_helpers.BoolRootCompletionCallback = null;
+    var event_callback: ?eval.test_helpers.BoolRootEventCallback = null;
+    if (live_output) |live| {
+        live.setRuns(live_runs.items);
+        completion_callback = .{
+            .context = live,
+            .complete = &CliOptimizedLiveTestOutput.completionCallback,
+        };
+        event_callback = .{
+            .context = live,
+            .notify = &CliOptimizedLiveTestOutput.eventCallback,
+        };
+    }
+    defer if (live_output) |live| live.clearRuns();
+
+    const eval_results = eval.test_helpers.llvmEvalBoolRootModulesWithMaxWorkersAndCallbacks(
+        ctx.gpa,
+        bool_modules.items,
+        switch (mode) {
+            .llvm_size => .size,
+            .llvm_speed => .speed,
+            .interpreter, .dev => unreachable,
+        },
+        max_workers,
+        completion_callback,
+        event_callback,
+    ) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => {
+            for (lowered_modules) |*lowered_module| {
+                var results = std.ArrayList(CliTestResultItem).empty;
+                errdefer {
+                    deinitCliTestResultItemPayloads(ctx.gpa, results.items);
+                    results.deinit(ctx.gpa);
+                }
+
+                try appendCompilerErrorsForRuns(
+                    ctx,
+                    mode,
+                    err,
+                    lowered_module.root_runs,
+                    &results,
+                    &summaries[lowered_module.planned_index],
+                );
+                summaries[lowered_module.planned_index].modules_with_tests = 1;
+                const owned_results = try results.toOwnedSlice(ctx.gpa);
+                fresh_results[lowered_module.planned_index] = owned_results;
+                if (live_output) |live| {
+                    for (lowered_module.root_runs, owned_results) |run, result| {
+                        live.publishCopiedEntry(@intCast(run.result_index), run.env, run.path, result);
+                    }
+                    try live.checkError();
+                }
+            }
+            return;
+        },
+    };
+    defer eval.test_helpers.deinitBoolRootEvalResults(ctx.gpa, eval_results);
+    if (live_output) |live| try live.checkError();
+
+    var eval_index: usize = 0;
+    for (lowered_modules) |*lowered_module| {
+        var results = std.ArrayList(CliTestResultItem).empty;
+        errdefer {
+            deinitCliTestResultItemPayloads(ctx.gpa, results.items);
+            results.deinit(ctx.gpa);
+        }
+
+        for (lowered_module.root_runs) |run| {
+            try appendEvalResultForRun(
+                ctx,
+                run,
+                eval_results[eval_index],
+                &results,
+                &summaries[lowered_module.planned_index],
+            );
+            eval_index += 1;
+        }
+        summaries[lowered_module.planned_index].modules_with_tests = 1;
+        fresh_results[lowered_module.planned_index] = try results.toOwnedSlice(ctx.gpa);
+    }
+}
+
+fn appendPlannedModuleResult(
+    ctx: *CliCtx,
+    module_results: *std.ArrayList(CliModuleTestResult),
+    planned: *const CliTestPlanModule,
+    results: []CliTestResultItem,
+    cached: bool,
+) Allocator.Error!void {
+    var results_owned_by_module = false;
+    errdefer if (!results_owned_by_module) deinitCliTestResultItems(ctx.gpa, results);
+    try module_results.append(ctx.gpa, .{
+        .env = planned.module.semantic.env,
+        .path = planned.module.path,
+        .results = results,
+        .cached = cached,
+    });
+    results_owned_by_module = true;
+}
+
+fn runOptimizedTestPlan(
+    ctx: *CliCtx,
+    build_env: *BuildEnv,
+    test_plan: *CliTestPlan,
+    opt: cli_args.OptLevel,
+    max_workers: ?usize,
+    cache_manager: ?*CacheManager,
+    module_results: *std.ArrayList(CliModuleTestResult),
+    total: *CliTestRunSummary,
+    live_output: ?*CliOptimizedLiveTestOutput,
+) (ReportRenderError || error{NoHomeDirectory})!void {
+    const mode = cliTestExecutionMode(opt);
+    switch (mode) {
+        .llvm_size, .llvm_speed => {},
+        .interpreter, .dev => unreachable,
+    }
+
+    const summaries = try ctx.gpa.alloc(CliTestRunSummary, test_plan.modules.len);
+    defer ctx.gpa.free(summaries);
+    for (summaries) |*summary| {
+        summary.* = .{};
+    }
+
+    const fresh_results = try ctx.gpa.alloc(?[]CliTestResultItem, test_plan.modules.len);
+    defer deinitFreshResultSlots(ctx.gpa, fresh_results);
+    for (fresh_results) |*slot| {
+        slot.* = null;
+    }
+
+    var lowered_modules = std.ArrayList(CliLoweredTestModule).empty;
+    defer {
+        for (lowered_modules.items) |*lowered_module| {
+            lowered_module.deinit(ctx.gpa);
+        }
+        lowered_modules.deinit(ctx.gpa);
+    }
+
+    for (test_plan.modules, 0..) |*planned, planned_index| {
+        if (planned.cached_results != null) {
+            summaries[planned_index] = planned.cached_summary;
+            if (live_output) |live| {
+                for (planned.cached_results.?, 0..) |result, root_index| {
+                    live.publishCopiedEntry(
+                        @intCast(planned.first_entry_index + @as(u32, @intCast(root_index))),
+                        planned.module.semantic.env,
+                        planned.module.path,
+                        result,
+                    );
+                }
+                try live.checkError();
+            }
+            continue;
+        }
+
+        try lowered_modules.append(
+            ctx.gpa,
+            try lowerPlannedTestModule(ctx, build_env, planned_index, planned, test_plan.entries, opt),
+        );
+    }
+
+    try runLlvmLoweredTestModulesOnce(ctx, mode, lowered_modules.items, fresh_results, summaries, max_workers, live_output);
+
+    for (lowered_modules.items) |*lowered_module| {
+        const planned = &test_plan.modules[lowered_module.planned_index];
+        if (summaries[lowered_module.planned_index].compiler_errors == 0) {
+            try storeCliTestResultsInCache(ctx, cache_manager, planned.artifact, fresh_results[lowered_module.planned_index].?);
+        }
+    }
+
+    for (test_plan.modules, 0..) |*planned, planned_index| {
+        const cached = planned.cached_results != null;
+        const results = if (cached) planned.releaseCachedResults() else fresh: {
+            const owned = fresh_results[planned_index].?;
+            fresh_results[planned_index] = null;
+            break :fresh owned;
+        };
+        try appendPlannedModuleResult(ctx, module_results, planned, results, cached);
+
+        const summary = summaries[planned_index];
+        total.passed += summary.passed;
+        total.failed += summary.failed;
+        total.compiler_errors += summary.compiler_errors;
+        total.modules_with_tests += summary.modules_with_tests;
+        total.cached_modules += summary.cached_modules;
+    }
 }
 
 const watch_debounce_ms = 25;
@@ -11105,32 +11900,99 @@ fn rocTest(ctx: *CliCtx, args: cli_args.TestArgs, arg0: []const u8) RocTestError
     const modules = try build_env.getCompiledModules(ctx.gpa);
     defer ctx.gpa.free(modules);
 
+    const report_config = try testReportingConfig(ctx);
+
     var module_results = std.ArrayList(CliModuleTestResult).empty;
     defer {
         for (module_results.items) |module_result| {
-            for (module_result.results) |result| {
-                if (result.failure_detail) |message| ctx.gpa.free(message);
-            }
-            ctx.gpa.free(module_result.results);
+            deinitCliTestResultItems(ctx.gpa, module_result.results);
         }
         module_results.deinit(ctx.gpa);
     }
 
+    var test_plan = try buildCliTestPlan(ctx, modules);
+    defer test_plan.deinit(ctx.gpa);
+
+    for (test_plan.modules) |*planned| {
+        if (try loadCachedCliTestResults(
+            ctx,
+            if (args.no_cache) null else build_env.cache_manager,
+            planned.artifact,
+            planned.module,
+            planned.test_roots,
+        )) |cached| {
+            planned.cached_results = cached.results;
+            planned.cached_summary = cached.summary;
+        }
+    }
+
     var total = CliTestRunSummary{};
-    for (modules) |module| {
-        const summary = try runCheckedArtifactTests(
+    const test_mode = cliTestExecutionMode(args.opt);
+    const use_live_optimized_output = switch (test_mode) {
+        .llvm_size, .llvm_speed => true,
+        .interpreter, .dev => false,
+    };
+
+    var live_coordinator: ?CliTestTranscriptCoordinator = null;
+    defer if (live_coordinator) |*coordinator| coordinator.deinit();
+    var live_output: ?CliOptimizedLiveTestOutput = null;
+    defer if (live_output) |*output| output.deinit();
+
+    if (use_live_optimized_output) {
+        const spill_temp_dir = createUniqueTempDir(ctx) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return error.WriteFailed,
+        };
+        live_coordinator = try CliTestTranscriptCoordinator.init(
+            ctx.gpa,
+            ctx.io.std_io,
+            stdout,
+            stderr,
+            args.verbose,
+            report_config,
+            .{
+                .entry_count = test_plan.entries.len,
+                .spill_dir = spill_temp_dir,
+                .delete_spill_dir_on_deinit = true,
+            },
+        );
+        live_output = try CliOptimizedLiveTestOutput.init(ctx, &live_coordinator.?, test_plan.entries.len);
+    }
+
+    switch (test_mode) {
+        .llvm_size, .llvm_speed => try runOptimizedTestPlan(
             ctx,
             &build_env,
-            module,
+            &test_plan,
             args.opt,
+            args.max_threads,
             if (args.no_cache) null else build_env.cache_manager,
             &module_results,
-        );
-        total.passed += summary.passed;
-        total.failed += summary.failed;
-        total.compiler_errors += summary.compiler_errors;
-        total.modules_with_tests += summary.modules_with_tests;
-        total.cached_modules += summary.cached_modules;
+            &total,
+            if (live_output) |*output| output else null,
+        ),
+        .interpreter, .dev => {
+            for (test_plan.modules) |*planned| {
+                const summary = if (planned.cached_results != null) cached: {
+                    const results = planned.releaseCachedResults();
+                    try appendPlannedModuleResult(ctx, &module_results, planned, results, true);
+                    break :cached planned.cached_summary;
+                } else try runCheckedArtifactTests(
+                    ctx,
+                    &build_env,
+                    planned,
+                    test_plan.entries,
+                    args.opt,
+                    if (args.no_cache) null else build_env.cache_manager,
+                    &module_results,
+                );
+                total.passed += summary.passed;
+                total.failed += summary.failed;
+                total.compiler_errors += summary.compiler_errors;
+                total.modules_with_tests += summary.modules_with_tests;
+                total.cached_modules += summary.cached_modules;
+            }
+        },
     }
 
     // Calculate elapsed time
@@ -11149,27 +12011,778 @@ fn rocTest(ctx: *CliCtx, args: cli_args.TestArgs, arg0: []const u8) RocTestError
     var stderr_body = std.Io.Writer.Allocating.init(ctx.gpa);
     defer stderr_body.deinit();
 
-    try renderTestResultBodies(
-        ctx.gpa,
-        &stdout_body.writer,
-        &stderr_body.writer,
-        module_results.items,
-        args.verbose,
-    );
+    if (!use_live_optimized_output) {
+        try renderTestResultBodies(
+            ctx.gpa,
+            &stdout_body.writer,
+            &stderr_body.writer,
+            module_results.items,
+            args.verbose,
+            report_config,
+        );
+    }
 
     // Report results
     if (total.failed == 0 and total.compiler_errors == 0) {
-        try stdout.print("All ({}) tests passed in {d:.1} ms.{s}\n", .{ total.passed, elapsed_ms, cached_suffix });
         try stdout.writeAll(stdout_body.written());
+        try stderr.writeAll(stderr_body.written());
+        try stdout.print("All ({}) tests passed in {d:.1} ms.{s}\n", .{ total.passed, elapsed_ms, cached_suffix });
         return;
     }
 
     const total_tests = total.passed + total.failed + total.compiler_errors;
-    try stderr.print("Ran {} tests{s} in {d:.1}ms:\n    " ++ ansi_term.green ++ "{}" ++ ansi_term.reset ++ " passed\n    " ++ ansi_term.red ++ "{}" ++ ansi_term.reset ++ " failed\n    " ++ ansi_term.yellow ++ "{}" ++ ansi_term.reset ++ " compiler errors\n", .{ total_tests, cached_suffix, elapsed_ms, total.passed, total.failed, total.compiler_errors });
     try stdout.writeAll(stdout_body.written());
     try stderr.writeAll(stderr_body.written());
+    try stderr.print("Ran {} tests{s} in {d:.1}ms:\n    " ++ ansi_term.green ++ "{}" ++ ansi_term.reset ++ " passed\n    " ++ ansi_term.red ++ "{}" ++ ansi_term.reset ++ " failed\n    " ++ ansi_term.yellow ++ "{}" ++ ansi_term.reset ++ " compiler errors\n", .{ total_tests, cached_suffix, elapsed_ms, total.passed, total.failed, total.compiler_errors });
 
     return error.TestsFailed;
+}
+
+fn testReportingConfig(ctx: *CliCtx) Allocator.Error!reporting.ReportingConfig {
+    var config = ctx.terminalReportConfig();
+    config.is_tty = std.Io.File.stderr().isTty(ctx.io.std_io) catch false;
+
+    if (try envVarNonEmpty(ctx.gpa, "NO_COLOR")) {
+        config.color_preference = .never;
+    } else if (try envVarEquals(ctx.gpa, "ROC_HIGH_CONTRAST", "1")) {
+        config.color_preference = .high_contrast;
+    } else if (try envVarNonEmpty(ctx.gpa, "FORCE_COLOR")) {
+        config.color_preference = .always;
+    }
+
+    return config;
+}
+
+fn renderCliTestTranscriptEvents(
+    stdout_body: *std.Io.Writer,
+    stderr_body: *std.Io.Writer,
+    events: []const CliTestTranscriptEvent,
+) ReportRenderError!void {
+    for (events) |event| {
+        try renderCliTestTranscriptEvent(stdout_body, stderr_body, event);
+    }
+}
+
+fn renderCliTestTranscriptEvent(
+    stdout_body: *std.Io.Writer,
+    stderr_body: *std.Io.Writer,
+    event: CliTestTranscriptEvent,
+) ReportRenderError!void {
+    const writer = switch (event.stream) {
+        .stdout => stdout_body,
+        .stderr => stderr_body,
+    };
+    switch (event.kind) {
+        .dbg => try writer.print("[dbg] {s}\n", .{event.payload}),
+        .expect_failed => try writer.print("Expect failed: {s}\n", .{event.payload}),
+        .crashed => {},
+        .crash_diagnostic => try writer.print("Roc application crashed with this message:\n\n\t{s}\n\n", .{event.payload}),
+    }
+}
+
+fn cliTestTranscriptEventEncodedSize(event: CliTestTranscriptEvent) usize {
+    return 1 + 1 + 4 + event.payload.len;
+}
+
+fn appendCliTestTranscriptEventRecord(
+    bytes: *std.ArrayList(u8),
+    allocator: Allocator,
+    event: CliTestTranscriptEvent,
+) Allocator.Error!void {
+    try bytes.append(allocator, @intFromEnum(event.kind));
+    try bytes.append(allocator, @intFromEnum(event.stream));
+    try appendU32(bytes, allocator, @intCast(event.payload.len));
+    try bytes.appendSlice(allocator, event.payload);
+}
+
+fn renderCliTestTranscriptEventRecords(
+    stdout_body: *std.Io.Writer,
+    stderr_body: *std.Io.Writer,
+    bytes: []const u8,
+) ReportRenderError!usize {
+    var offset: usize = 0;
+    var count: usize = 0;
+    while (offset < bytes.len) {
+        const kind_raw = readU8(bytes, &offset) orelse return error.WriteFailed;
+        const kind: CliTestTranscriptEventKind = switch (kind_raw) {
+            0 => .dbg,
+            1 => .expect_failed,
+            2 => .crashed,
+            3 => .crash_diagnostic,
+            else => return error.WriteFailed,
+        };
+        const stream_raw = readU8(bytes, &offset) orelse return error.WriteFailed;
+        const stream: CliTestTranscriptStream = switch (stream_raw) {
+            0 => .stdout,
+            1 => .stderr,
+            else => return error.WriteFailed,
+        };
+        const payload_len = readU32(bytes, &offset) orelse return error.WriteFailed;
+        const payload_len_usize: usize = @intCast(payload_len);
+        if (offset + payload_len_usize > bytes.len) return error.WriteFailed;
+        const payload = bytes[offset..][0..payload_len_usize];
+        offset += payload_len_usize;
+
+        try renderCliTestTranscriptEvent(stdout_body, stderr_body, .{
+            .stream = stream,
+            .kind = kind,
+            .payload = payload,
+        });
+        count += 1;
+    }
+    return count;
+}
+
+const CliTestRenderEntry = struct {
+    env: *const ModuleEnv,
+    path: []const u8,
+    result: *const CliTestResultItem,
+};
+
+const cli_test_transcript_spill_threshold_bytes: usize = 1024 * 1024;
+
+const CliTestTranscriptCoordinatorOptions = struct {
+    entry_count: usize,
+    spill_dir: ?[]const u8 = null,
+    delete_spill_dir_on_deinit: bool = false,
+    spill_threshold_bytes: usize = cli_test_transcript_spill_threshold_bytes,
+};
+
+const CliTestBufferedTranscript = struct {
+    events: std.ArrayList(CliTestTranscriptEvent) = .empty,
+    memory_bytes: usize = 0,
+    spill_path: ?[]u8 = null,
+
+    fn deinit(self: *CliTestBufferedTranscript, allocator: Allocator, io: std.Io) void {
+        deinitCliTestTranscriptEventPayloads(allocator, self.events.items);
+        self.events.deinit(allocator);
+        if (self.spill_path) |path| {
+            std.Io.Dir.cwd().deleteFile(io, path) catch {};
+            allocator.free(path);
+        }
+    }
+
+    fn shouldSpill(
+        self: *const CliTestBufferedTranscript,
+        event_size: usize,
+        spill_dir: ?[]const u8,
+        threshold: usize,
+    ) bool {
+        if (spill_dir == null) return false;
+        if (self.spill_path != null) return true;
+        if (event_size > threshold) return true;
+        return self.memory_bytes > threshold - event_size;
+    }
+
+    fn appendInMemory(
+        self: *CliTestBufferedTranscript,
+        allocator: Allocator,
+        event: CliTestTranscriptEvent,
+        event_size: usize,
+    ) Allocator.Error!void {
+        const payload = try allocator.dupe(u8, event.payload);
+        errdefer allocator.free(payload);
+        try self.events.append(allocator, .{
+            .stream = event.stream,
+            .kind = event.kind,
+            .payload = payload,
+        });
+        self.memory_bytes += event_size;
+    }
+
+    fn createSpillPath(
+        allocator: Allocator,
+        spill_dir: []const u8,
+        result_index: usize,
+    ) Allocator.Error![]u8 {
+        const filename = try std.fmt.allocPrint(allocator, "test-transcript-{d}.bin", .{result_index});
+        defer allocator.free(filename);
+        return try std.fs.path.join(allocator, &.{ spill_dir, filename });
+    }
+
+    fn writeSpillBytes(io: std.Io, path: []const u8, bytes: []const u8) CliOutputWriteError!void {
+        std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = bytes }) catch return error.WriteFailed;
+    }
+
+    fn appendSpillRecord(
+        allocator: Allocator,
+        io: std.Io,
+        path: []const u8,
+        event: CliTestTranscriptEvent,
+    ) ReportRenderError!void {
+        var record = std.ArrayList(u8).empty;
+        defer record.deinit(allocator);
+        try appendCliTestTranscriptEventRecord(&record, allocator, event);
+
+        var file = std.Io.Dir.cwd().openFile(io, path, .{ .mode = .read_write, .allow_directory = false }) catch return error.WriteFailed;
+        defer file.close(io);
+        const stat = file.stat(io) catch return error.WriteFailed;
+        var writer = file.writer(io, &.{});
+        writer.seekTo(stat.size) catch return error.WriteFailed;
+        writer.interface.writeAll(record.items) catch return error.WriteFailed;
+        writer.flush() catch return error.WriteFailed;
+    }
+
+    fn spillExistingEvents(
+        self: *CliTestBufferedTranscript,
+        allocator: Allocator,
+        io: std.Io,
+        spill_dir: []const u8,
+        result_index: usize,
+    ) ReportRenderError!void {
+        if (self.spill_path != null) return;
+
+        const path = try createSpillPath(allocator, spill_dir, result_index);
+        errdefer allocator.free(path);
+
+        var bytes = std.ArrayList(u8).empty;
+        defer bytes.deinit(allocator);
+        for (self.events.items) |event| {
+            try appendCliTestTranscriptEventRecord(&bytes, allocator, event);
+        }
+
+        try writeSpillBytes(io, path, bytes.items);
+        deinitCliTestTranscriptEventPayloads(allocator, self.events.items);
+        self.events.clearRetainingCapacity();
+        self.memory_bytes = 0;
+        self.spill_path = path;
+    }
+
+    fn append(
+        self: *CliTestBufferedTranscript,
+        allocator: Allocator,
+        io: std.Io,
+        result_index: usize,
+        event: CliTestTranscriptEvent,
+        spill_dir: ?[]const u8,
+        spill_threshold_bytes: usize,
+    ) ReportRenderError!void {
+        const event_size = cliTestTranscriptEventEncodedSize(event);
+        if (!self.shouldSpill(event_size, spill_dir, spill_threshold_bytes)) {
+            try self.appendInMemory(allocator, event, event_size);
+            return;
+        }
+
+        const dir = spill_dir orelse {
+            try self.appendInMemory(allocator, event, event_size);
+            return;
+        };
+        try self.spillExistingEvents(allocator, io, dir, result_index);
+        try appendSpillRecord(allocator, io, self.spill_path.?, event);
+    }
+
+    fn flush(
+        self: *CliTestBufferedTranscript,
+        allocator: Allocator,
+        io: std.Io,
+        stdout_body: *std.Io.Writer,
+        stderr_body: *std.Io.Writer,
+    ) ReportRenderError!usize {
+        var rendered_count: usize = 0;
+
+        if (self.spill_path) |path| {
+            const bytes = std.Io.Dir.cwd().readFileAlloc(io, path, allocator, .unlimited) catch return error.WriteFailed;
+            defer allocator.free(bytes);
+            rendered_count += try renderCliTestTranscriptEventRecords(stdout_body, stderr_body, bytes);
+            std.Io.Dir.cwd().deleteFile(io, path) catch {};
+            allocator.free(path);
+            self.spill_path = null;
+        }
+
+        if (self.events.items.len > 0) {
+            try renderCliTestTranscriptEvents(stdout_body, stderr_body, self.events.items);
+            rendered_count += self.events.items.len;
+            deinitCliTestTranscriptEventPayloads(allocator, self.events.items);
+            self.events.clearRetainingCapacity();
+            self.memory_bytes = 0;
+        }
+
+        return rendered_count;
+    }
+};
+
+const CliTestTranscriptCoordinator = struct {
+    allocator: Allocator,
+    io: std.Io,
+    stdout_body: *std.Io.Writer,
+    stderr_body: *std.Io.Writer,
+    verbose: bool,
+    report_config: reporting.ReportingConfig,
+    next_to_print: usize = 0,
+    entries: []?CliTestRenderEntry,
+    event_buffers: []CliTestBufferedTranscript,
+    rendered_event_counts: []usize,
+    spill_dir: ?[]const u8,
+    delete_spill_dir_on_deinit: bool,
+    spill_threshold_bytes: usize,
+
+    fn init(
+        allocator: Allocator,
+        io: std.Io,
+        stdout_body: *std.Io.Writer,
+        stderr_body: *std.Io.Writer,
+        verbose: bool,
+        report_config: reporting.ReportingConfig,
+        options: CliTestTranscriptCoordinatorOptions,
+    ) Allocator.Error!CliTestTranscriptCoordinator {
+        const entry_count = options.entry_count;
+        const entries = try allocator.alloc(?CliTestRenderEntry, entry_count);
+        errdefer allocator.free(entries);
+        for (entries) |*entry| {
+            entry.* = null;
+        }
+        const event_buffers = try allocator.alloc(CliTestBufferedTranscript, entry_count);
+        errdefer allocator.free(event_buffers);
+        for (event_buffers) |*buffer| {
+            buffer.* = .{};
+        }
+        const rendered_event_counts = try allocator.alloc(usize, entry_count);
+        errdefer allocator.free(rendered_event_counts);
+        @memset(rendered_event_counts, 0);
+        return .{
+            .allocator = allocator,
+            .io = io,
+            .stdout_body = stdout_body,
+            .stderr_body = stderr_body,
+            .verbose = verbose,
+            .report_config = report_config,
+            .entries = entries,
+            .event_buffers = event_buffers,
+            .rendered_event_counts = rendered_event_counts,
+            .spill_dir = options.spill_dir,
+            .delete_spill_dir_on_deinit = options.delete_spill_dir_on_deinit,
+            .spill_threshold_bytes = options.spill_threshold_bytes,
+        };
+    }
+
+    fn deinit(self: *CliTestTranscriptCoordinator) void {
+        for (self.event_buffers) |*buffer| {
+            buffer.deinit(self.allocator, self.io);
+        }
+        if (self.delete_spill_dir_on_deinit) {
+            if (self.spill_dir) |dir| {
+                std.Io.Dir.cwd().deleteTree(self.io, dir) catch {};
+            }
+        }
+        self.allocator.free(self.rendered_event_counts);
+        self.allocator.free(self.event_buffers);
+        self.allocator.free(self.entries);
+    }
+
+    fn publishEvent(
+        self: *CliTestTranscriptCoordinator,
+        result_index: usize,
+        event: CliTestTranscriptEvent,
+    ) ReportRenderError!void {
+        if (builtin.mode == .Debug and result_index >= self.entries.len) {
+            std.debug.panic("CLI test transcript coordinator received out-of-range event index {d} for {d} entries", .{ result_index, self.entries.len });
+        }
+        if (result_index < self.next_to_print) return;
+        if (result_index == self.next_to_print) {
+            try renderCliTestTranscriptEvents(self.stdout_body, self.stderr_body, (&event)[0..1]);
+            self.rendered_event_counts[result_index] += 1;
+            return;
+        }
+
+        try self.event_buffers[result_index].append(
+            self.allocator,
+            self.io,
+            result_index,
+            event,
+            self.spill_dir,
+            self.spill_threshold_bytes,
+        );
+    }
+
+    fn publishFinished(
+        self: *CliTestTranscriptCoordinator,
+        result_index: usize,
+        entry: CliTestRenderEntry,
+    ) ReportRenderError!void {
+        if (builtin.mode == .Debug and result_index >= self.entries.len) {
+            std.debug.panic("CLI test transcript coordinator received out-of-range result index {d} for {d} entries", .{ result_index, self.entries.len });
+        }
+        self.entries[result_index] = entry;
+        if (result_index == self.next_to_print) {
+            try self.flushReadyPrefix();
+        }
+    }
+
+    fn flushBufferedEventsForNext(self: *CliTestTranscriptCoordinator) ReportRenderError!void {
+        if (self.next_to_print >= self.event_buffers.len) return;
+        const buffer = &self.event_buffers[self.next_to_print];
+        self.rendered_event_counts[self.next_to_print] += try buffer.flush(
+            self.allocator,
+            self.io,
+            self.stdout_body,
+            self.stderr_body,
+        );
+    }
+
+    fn flushReadyPrefix(self: *CliTestTranscriptCoordinator) ReportRenderError!void {
+        while (self.next_to_print < self.entries.len) {
+            try self.flushBufferedEventsForNext();
+            const entry = self.entries[self.next_to_print] orelse break;
+            try renderCliTestResultEntry(
+                self.allocator,
+                self.stdout_body,
+                self.stderr_body,
+                entry,
+                self.verbose,
+                self.report_config,
+                self.rendered_event_counts[self.next_to_print],
+            );
+            self.entries[self.next_to_print] = null;
+            self.next_to_print += 1;
+        }
+        try self.flushBufferedEventsForNext();
+    }
+};
+
+const CliOptimizedLiveTestOutput = struct {
+    ctx: *CliCtx,
+    coordinator: *CliTestTranscriptCoordinator,
+    mutex: std.atomic.Mutex = .unlocked,
+    owned_results: []?CliTestResultItem,
+    runs: []const CliTestRootRun = &.{},
+    err: ?ReportRenderError = null,
+
+    fn init(
+        ctx: *CliCtx,
+        coordinator: *CliTestTranscriptCoordinator,
+        entry_count: usize,
+    ) Allocator.Error!CliOptimizedLiveTestOutput {
+        const owned_results = try ctx.gpa.alloc(?CliTestResultItem, entry_count);
+        for (owned_results) |*slot| {
+            slot.* = null;
+        }
+        return .{
+            .ctx = ctx,
+            .coordinator = coordinator,
+            .owned_results = owned_results,
+        };
+    }
+
+    fn lock(self: *CliOptimizedLiveTestOutput) void {
+        while (!self.mutex.tryLock()) {
+            std.atomic.spinLoopHint();
+        }
+    }
+
+    fn unlock(self: *CliOptimizedLiveTestOutput) void {
+        self.mutex.unlock();
+    }
+
+    fn deinit(self: *CliOptimizedLiveTestOutput) void {
+        for (self.owned_results) |maybe_result| {
+            if (maybe_result) |result| {
+                deinitCliTestResultItemPayload(self.ctx.gpa, result);
+            }
+        }
+        self.ctx.gpa.free(self.owned_results);
+    }
+
+    fn setRuns(self: *CliOptimizedLiveTestOutput, runs: []const CliTestRootRun) void {
+        self.runs = runs;
+    }
+
+    fn clearRuns(self: *CliOptimizedLiveTestOutput) void {
+        self.runs = &.{};
+    }
+
+    fn checkError(self: *CliOptimizedLiveTestOutput) ReportRenderError!void {
+        if (self.err) |err| return err;
+    }
+
+    fn publishCopiedEntry(
+        self: *CliOptimizedLiveTestOutput,
+        result_index: usize,
+        env: *const ModuleEnv,
+        path: []const u8,
+        result: CliTestResultItem,
+    ) void {
+        self.lock();
+        defer self.unlock();
+
+        if (self.err != null) return;
+        if (builtin.mode == .Debug and result_index >= self.owned_results.len) {
+            std.debug.panic("CLI optimized live output received out-of-range result index {d} for {d} entries", .{ result_index, self.owned_results.len });
+        }
+        if (builtin.mode == .Debug and self.owned_results[result_index] != null) {
+            std.debug.panic("CLI optimized live output received duplicate result index {d}", .{result_index});
+        }
+
+        const copied = copyCliTestResultItem(self.ctx.gpa, result) catch |err| {
+            self.err = err;
+            return;
+        };
+        self.owned_results[result_index] = copied;
+        self.coordinator.publishFinished(result_index, .{
+            .env = env,
+            .path = path,
+            .result = &self.owned_results[result_index].?,
+        }) catch |err| {
+            self.err = err;
+        };
+    }
+
+    fn publishEvalResult(
+        self: *CliOptimizedLiveTestOutput,
+        call_index: usize,
+        eval_result: eval.test_helpers.BoolRootEvalResult,
+    ) void {
+        if (builtin.mode == .Debug and call_index >= self.runs.len) {
+            std.debug.panic("CLI optimized live output received out-of-range call index {d} for {d} roots", .{ call_index, self.runs.len });
+        }
+        const run = self.runs[call_index];
+        const result = cliTestResultItemFromEval(self.ctx, run, eval_result) catch |err| {
+            self.lock();
+            self.err = err;
+            self.unlock();
+            return;
+        };
+
+        self.lock();
+        defer self.unlock();
+
+        if (self.err != null) {
+            deinitCliTestResultItemPayload(self.ctx.gpa, result);
+            return;
+        }
+        const result_index: usize = @intCast(run.result_index);
+        if (builtin.mode == .Debug and result_index >= self.owned_results.len) {
+            std.debug.panic("CLI optimized live output received out-of-range result index {d} for {d} entries", .{ result_index, self.owned_results.len });
+        }
+        if (builtin.mode == .Debug and self.owned_results[result_index] != null) {
+            std.debug.panic("CLI optimized live output received duplicate result index {d}", .{result_index});
+        }
+
+        self.owned_results[result_index] = result;
+        self.coordinator.publishFinished(result_index, .{
+            .env = run.env,
+            .path = run.path,
+            .result = &self.owned_results[result_index].?,
+        }) catch |err| {
+            self.err = err;
+        };
+    }
+
+    fn publishEvent(
+        self: *CliOptimizedLiveTestOutput,
+        call_index: usize,
+        event_view: eval.test_helpers.BoolRootEventView,
+    ) void {
+        if (builtin.mode == .Debug and call_index >= self.runs.len) {
+            std.debug.panic("CLI optimized live output received out-of-range event call index {d} for {d} roots", .{ call_index, self.runs.len });
+        }
+        const run = self.runs[call_index];
+        const event: CliTestTranscriptEvent = switch (event_view) {
+            .dbg => |payload| .{ .stream = .stderr, .kind = .dbg, .payload = payload },
+            .expect_failed => |payload| .{ .stream = .stderr, .kind = .expect_failed, .payload = payload },
+            .crashed => |payload| .{ .stream = .stderr, .kind = .crashed, .payload = payload },
+        };
+
+        self.lock();
+        defer self.unlock();
+
+        if (self.err != null) return;
+        self.coordinator.publishEvent(@intCast(run.result_index), event) catch |err| {
+            self.err = err;
+        };
+    }
+
+    fn completionCallback(
+        context: *anyopaque,
+        call_index: usize,
+        eval_result: *const eval.test_helpers.BoolRootEvalResult,
+    ) void {
+        const self: *CliOptimizedLiveTestOutput = @ptrCast(@alignCast(context));
+        self.publishEvalResult(call_index, eval_result.*);
+    }
+
+    fn eventCallback(
+        context: *anyopaque,
+        call_index: usize,
+        event: eval.test_helpers.BoolRootEventView,
+    ) void {
+        const self: *CliOptimizedLiveTestOutput = @ptrCast(@alignCast(context));
+        self.publishEvent(call_index, event);
+    }
+};
+
+test "test transcript coordinator streams and buffers in plan order" {
+    const allocator = std.testing.allocator;
+
+    var stdout_body = std.Io.Writer.Allocating.init(allocator);
+    defer stdout_body.deinit();
+    var stderr_body = std.Io.Writer.Allocating.init(allocator);
+    defer stderr_body.deinit();
+
+    var coordinator = try CliTestTranscriptCoordinator.init(
+        allocator,
+        std.testing.io,
+        &stdout_body.writer,
+        &stderr_body.writer,
+        false,
+        reporting.ReportingConfig.initForTesting(),
+        .{ .entry_count = 3 },
+    );
+    defer coordinator.deinit();
+
+    const dummy_env: *const ModuleEnv = undefined;
+
+    const event_zero = CliTestTranscriptEvent{ .stream = .stderr, .kind = .dbg, .payload = "zero" };
+    const event_one_a = CliTestTranscriptEvent{ .stream = .stderr, .kind = .dbg, .payload = "one-a" };
+    const event_one_b = CliTestTranscriptEvent{ .stream = .stderr, .kind = .dbg, .payload = "one-b" };
+    const event_two = CliTestTranscriptEvent{ .stream = .stderr, .kind = .dbg, .payload = "two" };
+
+    const transcript_zero = [_]CliTestTranscriptEvent{event_zero};
+    const transcript_one = [_]CliTestTranscriptEvent{ event_one_a, event_one_b };
+    const transcript_two = [_]CliTestTranscriptEvent{event_two};
+
+    const result_zero = CliTestResultItem{ .result = .passed, .order = 0, .region = base.Region.zero(), .transcript = transcript_zero[0..], .failure_detail = null };
+    const result_one = CliTestResultItem{ .result = .passed, .order = 1, .region = base.Region.zero(), .transcript = transcript_one[0..], .failure_detail = null };
+    const result_two = CliTestResultItem{ .result = .passed, .order = 2, .region = base.Region.zero(), .transcript = transcript_two[0..], .failure_detail = null };
+
+    try coordinator.publishEvent(2, event_two);
+    try coordinator.publishEvent(1, event_one_a);
+    try std.testing.expectEqualStrings("", stdout_body.written());
+    try std.testing.expectEqualStrings("", stderr_body.written());
+
+    try coordinator.publishEvent(0, event_zero);
+    try std.testing.expectEqualStrings("[dbg] zero\n", stderr_body.written());
+
+    try coordinator.publishFinished(0, .{ .env = dummy_env, .path = "test.roc", .result = &result_zero });
+    try std.testing.expectEqualStrings("[dbg] zero\n[dbg] one-a\n", stderr_body.written());
+
+    try coordinator.publishEvent(1, event_one_b);
+    try std.testing.expectEqualStrings("[dbg] zero\n[dbg] one-a\n[dbg] one-b\n", stderr_body.written());
+
+    try coordinator.publishFinished(1, .{ .env = dummy_env, .path = "test.roc", .result = &result_one });
+    try std.testing.expectEqualStrings("[dbg] zero\n[dbg] one-a\n[dbg] one-b\n[dbg] two\n", stderr_body.written());
+
+    try coordinator.publishFinished(2, .{ .env = dummy_env, .path = "test.roc", .result = &result_two });
+    try std.testing.expectEqualStrings("[dbg] zero\n[dbg] one-a\n[dbg] one-b\n[dbg] two\n", stderr_body.written());
+    try std.testing.expectEqualStrings("", stdout_body.written());
+}
+
+test "test transcript coordinator spills later buffered entries to isolated temp dir" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDir(std.testing.io, "spill", .default_dir);
+    const spill_dir = try tmp.dir.realPathFileAlloc(std.testing.io, "spill", allocator);
+    defer allocator.free(spill_dir);
+
+    var stdout_body = std.Io.Writer.Allocating.init(allocator);
+    defer stdout_body.deinit();
+    var stderr_body = std.Io.Writer.Allocating.init(allocator);
+    defer stderr_body.deinit();
+
+    const dummy_env: *const ModuleEnv = undefined;
+    const event_zero = CliTestTranscriptEvent{ .stream = .stderr, .kind = .dbg, .payload = "first" };
+    const event_one_spilled = CliTestTranscriptEvent{ .stream = .stderr, .kind = .dbg, .payload = "later-spilled" };
+    const event_one_live = CliTestTranscriptEvent{ .stream = .stderr, .kind = .dbg, .payload = "later-live" };
+
+    const transcript_zero = [_]CliTestTranscriptEvent{event_zero};
+    const transcript_one = [_]CliTestTranscriptEvent{ event_one_spilled, event_one_live };
+    const result_zero = CliTestResultItem{ .result = .passed, .order = 0, .region = base.Region.zero(), .transcript = transcript_zero[0..], .failure_detail = null };
+    const result_one = CliTestResultItem{ .result = .passed, .order = 1, .region = base.Region.zero(), .transcript = transcript_one[0..], .failure_detail = null };
+
+    {
+        var coordinator = try CliTestTranscriptCoordinator.init(
+            allocator,
+            std.testing.io,
+            &stdout_body.writer,
+            &stderr_body.writer,
+            false,
+            reporting.ReportingConfig.initForTesting(),
+            .{
+                .entry_count = 2,
+                .spill_dir = spill_dir,
+                .delete_spill_dir_on_deinit = true,
+                .spill_threshold_bytes = 1,
+            },
+        );
+        defer coordinator.deinit();
+
+        try coordinator.publishEvent(1, event_one_spilled);
+        try std.testing.expect(coordinator.event_buffers[1].spill_path != null);
+        try std.testing.expectEqualStrings("", stderr_body.written());
+
+        try coordinator.publishEvent(0, event_zero);
+        try std.testing.expectEqualStrings("[dbg] first\n", stderr_body.written());
+
+        try coordinator.publishFinished(0, .{ .env = dummy_env, .path = "test.roc", .result = &result_zero });
+        try std.testing.expectEqualStrings("[dbg] first\n[dbg] later-spilled\n", stderr_body.written());
+
+        try coordinator.publishEvent(1, event_one_live);
+        try coordinator.publishFinished(1, .{ .env = dummy_env, .path = "test.roc", .result = &result_one });
+        try std.testing.expectEqualStrings("[dbg] first\n[dbg] later-spilled\n[dbg] later-live\n", stderr_body.written());
+        try std.testing.expectEqualStrings("", stdout_body.written());
+    }
+
+    try std.testing.expectError(error.FileNotFound, tmp.dir.access(std.testing.io, "spill", .{}));
+}
+
+fn renderCliTestResultEntry(
+    allocator: Allocator,
+    stdout_body: *std.Io.Writer,
+    stderr_body: *std.Io.Writer,
+    entry: CliTestRenderEntry,
+    verbose: bool,
+    report_config: reporting.ReportingConfig,
+    transcript_events_already_rendered: usize,
+) ReportRenderError!void {
+    if (builtin.mode == .Debug and transcript_events_already_rendered > entry.result.transcript.len) {
+        std.debug.panic(
+            "CLI test transcript coordinator rendered {d} events before finished result with {d} events",
+            .{ transcript_events_already_rendered, entry.result.transcript.len },
+        );
+    }
+    try renderCliTestTranscriptEvents(stdout_body, stderr_body, entry.result.transcript[transcript_events_already_rendered..]);
+    switch (entry.result.result) {
+        .passed => {
+            if (!verbose) return;
+            const region_info = entry.env.calcRegionInfo(entry.result.region);
+            const green = if (report_config.shouldUseColors()) ansi_term.green else "";
+            const reset = if (report_config.shouldUseColors()) ansi_term.reset else "";
+            try stdout_body.print("{s}PASS{s}: {s}:{}\n", .{ green, reset, entry.path, region_info.start_line_idx + 1 });
+        },
+        .failed => {
+            const region_info = entry.env.calcRegionInfo(entry.result.region);
+            try printTestProblem(
+                allocator,
+                stderr_body,
+                entry.path,
+                entry.env,
+                region_info,
+                "Fail",
+                .runtime_error,
+                entry.result.failure_detail,
+                entry.result.failure_detail_visibility,
+                verbose,
+                report_config,
+            );
+        },
+        .compiler_error => {
+            const region_info = entry.env.calcRegionInfo(entry.result.region);
+            try printTestProblem(
+                allocator,
+                stderr_body,
+                entry.path,
+                entry.env,
+                region_info,
+                "Compiler Error",
+                .warning,
+                entry.result.failure_detail,
+                entry.result.failure_detail_visibility,
+                verbose,
+                report_config,
+            );
+        },
+    }
 }
 
 /// Walk the per-module test results and write the per-test body output to
@@ -11182,46 +12795,35 @@ fn renderTestResultBodies(
     stderr_body: *std.Io.Writer,
     module_results: []const CliModuleTestResult,
     verbose: bool,
+    report_config: reporting.ReportingConfig,
 ) ReportRenderError!void {
     // Verbose PASS lines go to stdout in every case; problem blocks go to
     // stderr. This matches the pre-refactor layout.
+    var entry_count: usize = 0;
     for (module_results) |module_result| {
-        for (module_result.results) |result| {
-            const region_info = module_result.env.calcRegionInfo(result.region);
-            switch (result.result) {
-                .passed => {
-                    if (!verbose) continue;
-                    try stdout_body.print("\x1b[32mPASS\x1b[0m: {s}:{}\n", .{ module_result.path, region_info.start_line_idx + 1 });
-                },
-                .failed => {
-                    try printTestProblem(
-                        allocator,
-                        stderr_body,
-                        module_result.path,
-                        module_result.env,
-                        region_info,
-                        "Fail",
-                        .runtime_error,
-                        result.failure_detail,
-                        result.failure_detail_visibility,
-                        verbose,
-                    );
-                },
-                .compiler_error => {
-                    try printTestProblem(
-                        allocator,
-                        stderr_body,
-                        module_result.path,
-                        module_result.env,
-                        region_info,
-                        "Compiler Error",
-                        .warning,
-                        result.failure_detail,
-                        result.failure_detail_visibility,
-                        verbose,
-                    );
-                },
-            }
+        entry_count += module_result.results.len;
+    }
+
+    var coordinator = try CliTestTranscriptCoordinator.init(
+        allocator,
+        std.Options.debug_io,
+        stdout_body,
+        stderr_body,
+        verbose,
+        report_config,
+        .{ .entry_count = entry_count },
+    );
+    defer coordinator.deinit();
+
+    var result_index: usize = 0;
+    for (module_results) |module_result| {
+        for (module_result.results) |*result| {
+            try coordinator.publishFinished(result_index, .{
+                .env = module_result.env,
+                .path = module_result.path,
+                .result = result,
+            });
+            result_index += 1;
         }
     }
 }
@@ -11239,6 +12841,7 @@ fn printTestProblem(
     failure_detail: ?[]const u8,
     failure_detail_visibility: CliTestFailureDetailVisibility,
     verbose: bool,
+    report_config: reporting.ReportingConfig,
 ) ReportRenderError!void {
     const src = env.getSourceAll();
 
@@ -11287,7 +12890,7 @@ fn printTestProblem(
     }
 
     try stderr.writeAll("\n");
-    try reporting.renderReportToTerminal(&report, stderr, reporting.ColorPalette.ANSI, reporting.ReportingConfig.initColorTerminal());
+    try reporting.renderReportToTerminal(&report, stderr, reporting.ColorUtils.getPaletteForConfig(report_config), report_config);
 }
 
 const ReplMode = enum {
@@ -11338,7 +12941,7 @@ fn rocRepl(ctx: *CliCtx, repl_args: cli_args.ReplArgs) CliMainError!void {
     // it before printing the greeting so the greeting and the first prompt appear
     // together and the REPL is immediately interactive — otherwise the greeting
     // shows with no prompt until this finishes.
-    var session = try ReplSession.init(ctx.gpa, ctx.io.std_io, backend_kind);
+    var session = try ReplSession.init(ctx.gpa, ctx.coreCtx(), backend_kind);
     defer session.deinit();
 
     if (mode == .interactive) {
@@ -11894,6 +13497,7 @@ fn checkFileWithBuildEnvPreserved(
     resolution_config: compile.package_resolution.Config,
     source_dir_override: ?[]const u8,
     track_watch_inputs: bool,
+    synthetic_default_app: bool,
 ) CheckFileWithBuildEnvPreservedError!CheckResultWithBuildEnv {
     const trace = tracy.trace(@src());
     defer trace.end();
@@ -11908,6 +13512,13 @@ fn checkFileWithBuildEnvPreserved(
     var build_env = try BuildEnv.init(ctx.gpa, mode, thread_count, RocTarget.detectNative(), cwd, ctx.io.std_io);
     build_env.setWatchInputTracking(track_watch_inputs);
     build_env.resolution_config = resolution_config;
+    if (synthetic_default_app) {
+        // Staged default-app roots and their synthesized platform live in a
+        // per-invocation temp dir; identity must be the stable synthetic one
+        // so cache keys and nominal identity match across runs and pipelines.
+        build_env.setSyntheticRootPackageIdentity();
+        build_env.setSyntheticRootPlatformPackageIdentity();
+    }
     if (source_dir_override) |source_dir| {
         build_env.setRootSourceDirOverride(source_dir);
     }
@@ -12067,6 +13678,7 @@ fn checkFileWithBuildEnv(
     max_threads: ?usize,
     resolution_config: compile.package_resolution.Config,
     source_dir_override: ?[]const u8,
+    synthetic_default_app: bool,
 ) CheckFileWithBuildEnvPreservedError!CheckResult {
     const trace = tracy.trace(@src());
     defer trace.end();
@@ -12078,6 +13690,13 @@ fn checkFileWithBuildEnv(
     defer ctx.gpa.free(cwd);
     var build_env = try BuildEnv.init(ctx.gpa, mode, thread_count, RocTarget.detectNative(), cwd, ctx.io.std_io);
     build_env.resolution_config = resolution_config;
+    if (synthetic_default_app) {
+        // Staged default-app roots and their synthesized platform live in a
+        // per-invocation temp dir; identity must be the stable synthetic one
+        // so cache keys and nominal identity match across runs and pipelines.
+        build_env.setSyntheticRootPackageIdentity();
+        build_env.setSyntheticRootPlatformPackageIdentity();
+    }
     if (source_dir_override) |source_dir| {
         build_env.setRootSourceDirOverride(source_dir);
     }
@@ -12296,6 +13915,7 @@ fn rocCheckDefaultApp(
         args.max_threads,
         resolutionConfigFromLimits(args.resolve_limits),
         original_source_dir,
+        true,
     );
     errdefer check_result.deinit(ctx.gpa);
 
@@ -12347,6 +13967,7 @@ fn rocCheckDefaultAppPreserved(
         resolutionConfigFromLimits(args.resolve_limits),
         original_source_dir,
         track_watch_inputs,
+        true,
     );
     errdefer result_with_env.deinit(ctx.gpa);
 
@@ -12441,6 +14062,7 @@ fn rocCheck(ctx: *CliCtx, args: cli_args.CheckArgs, arg0: []const u8) RocCheckEr
             resolutionConfigFromLimits(args.resolve_limits),
             null,
             true,
+            false,
         ) catch |err| {
             reporter.fail();
             try writeWatchInputsFile(ctx, file_path, null, extra_paths);
@@ -12475,6 +14097,7 @@ fn rocCheck(ctx: *CliCtx, args: cli_args.CheckArgs, arg0: []const u8) RocCheckEr
             args.max_threads,
             resolutionConfigFromLimits(args.resolve_limits),
             null,
+            false,
         ) catch |err| {
             reporter.fail();
             return handleProcessFileError(err, stderr, args.path);
@@ -12697,6 +14320,407 @@ fn sendResponse(
     try w.flush();
 }
 
+fn rocBump(ctx: *CliCtx, args: cli_args.BumpArgs) CliMainError!void {
+    const stdout = ctx.io.stdout();
+
+    // Resolve the old package's version, from --old-version or the URL.
+    var old_version: ?base.url.Version = null;
+    if (args.old_version) |raw| {
+        const version = base.url.parseVersionComponent(raw) orelse {
+            return ctx.fail(.{ .bump_failed = .{
+                .title = "Invalid Old Version",
+                .message = try std.fmt.allocPrint(ctx.arena, "`{s}` is not a valid version. Versions are MAJOR.MINOR.PATCH, e.g. 1.2.3.", .{raw}),
+            } });
+        };
+        if (!version.isPresent()) {
+            return ctx.fail(.{ .bump_failed = .{
+                .title = "Invalid Old Version",
+                .message = "The version 0.0.0 is reserved to mean \"no version\". The lowest publishable version is 0.0.1.",
+            } });
+        }
+        old_version = version;
+    }
+
+    // Parse --expect up front so a malformed version fails before compiling.
+    var expect_version: ?base.url.Version = null;
+    if (args.expect) |raw| {
+        expect_version = base.url.parseVersionComponent(raw) orelse {
+            return ctx.fail(.{ .bump_failed = .{
+                .title = "Invalid Expected Version",
+                .message = try std.fmt.allocPrint(ctx.arena, "`{s}` is not a valid version. Versions are MAJOR.MINOR.PATCH, e.g. 1.2.3.", .{raw}),
+            } });
+        };
+    }
+
+    // Resolve the old package source to a local main.roc path.
+    const old_path: []const u8 = blk: {
+        if (std.mem.find(u8, args.old, "://") != null) {
+            if (old_version == null) {
+                if (base.url.parseUrlPath(args.old)) |parsed| {
+                    if (parsed.version.isPresent()) old_version = parsed.version;
+                } else |_| {}
+            }
+            const resolved = try resolveUrlBundle(ctx, args.old);
+            break :blk resolved.source_path;
+        }
+        if (std.mem.endsWith(u8, args.old, ".tar.zst")) {
+            break :blk try extractBundleForBump(ctx, args.old);
+        }
+        if (std.mem.endsWith(u8, args.old, ".roc")) break :blk args.old;
+        break :blk try std.fs.path.join(ctx.arena, &.{ args.old, "main.roc" });
+    };
+
+    const old_version_value = old_version orelse {
+        return ctx.fail(.{ .bump_failed = .{
+            .title = "Missing Old Version",
+            .message = "The old package's version could not be determined. Pass it with --old-version <MAJOR.MINOR.PATCH>; it can only be inferred when --old is a URL with a version path segment.",
+        } });
+    };
+
+    const cache_config = CacheConfig{
+        .enabled = !args.no_cache,
+        .verbose = args.verbose,
+        .roc_ctx = ctx.coreCtx(),
+    };
+
+    var old_result = try bumpCheckSide(ctx, old_path, cache_config, args, "old");
+    defer old_result.deinit(ctx.gpa);
+    var new_result = try bumpCheckSide(ctx, args.path, cache_config, args, "new");
+    defer new_result.deinit(ctx.gpa);
+
+    var old_api = try bumpExtractApi(ctx, &old_result.build_env, "old");
+    defer old_api.deinit();
+    var new_api = try bumpExtractApi(ctx, &new_result.build_env, "new");
+    defer new_api.deinit();
+
+    var result = try bump.diff.diff(ctx.gpa, &old_api, &new_api);
+    defer result.deinit();
+
+    stdout.print("Comparing {s} (old, {f}) with {s} (new)...\n", .{ args.old, old_version_value, args.path }) catch {};
+
+    if (result.changes.len == 0) {
+        stdout.print("\nNo API changes detected.\n", .{}) catch {};
+    } else {
+        // Changes arrive grouped by module (the differ merge-walks sorted
+        // module lists), so a simple current-module tracker renders sections.
+        var current_module: []const u8 = "";
+        for (result.changes) |change| {
+            if (!std.mem.eql(u8, change.module, current_module)) {
+                current_module = change.module;
+                var module_magnitude = bump.diff.Magnitude.patch;
+                for (result.changes) |other| {
+                    if (std.mem.eql(u8, other.module, change.module)) {
+                        module_magnitude = module_magnitude.combine(other.magnitude);
+                    }
+                }
+                stdout.print("\n---- {s} - {s} ----\n\n", .{ change.module, module_magnitude.name() }) catch {};
+            }
+            switch (change.kind) {
+                .module_added => stdout.print("    Added module\n", .{}) catch {},
+                .module_removed => stdout.print("    Removed module\n", .{}) catch {},
+                .item_added => stdout.print("    + {s} : {s}\n", .{ change.path, change.new_rendered orelse "" }) catch {},
+                .item_removed => stdout.print("    - {s} : {s}\n", .{ change.path, change.old_rendered orelse "" }) catch {},
+                .item_changed => {
+                    stdout.print("    - {s} : {s}\n", .{ change.path, change.old_rendered orelse "" }) catch {};
+                    stdout.print("    + {s} : {s}\n", .{ change.path, change.new_rendered orelse "" }) catch {};
+                },
+            }
+        }
+    }
+
+    const next = bump.diff.nextVersion(old_version_value, result.magnitude);
+    stdout.print("\nThis is a {s} change.\n", .{result.magnitude.name()}) catch {};
+    stdout.print("\n{f} -> {f}\n", .{ old_version_value, next }) catch {};
+    if (old_version_value.major == 0) {
+        stdout.print("\n(Pre-1.0.0 versions are 0.X.Y: breaking changes bump X, everything else bumps Y.)\n", .{}) catch {};
+    }
+
+    // With --expect, fail unless the declared version bumps at least as far
+    // as the API diff requires. Bumping further than required is allowed.
+    if (expect_version) |expected| {
+        const declared = bump.diff.declaredMagnitude(old_version_value, expected) orelse {
+            return ctx.fail(.{ .bump_failed = .{
+                .title = "Insufficient Version Bump",
+                .message = try std.fmt.allocPrint(ctx.arena, "The expected version {f} does not move forward from {f}.", .{ expected, old_version_value }),
+            } });
+        };
+        if (@intFromEnum(declared) < @intFromEnum(result.magnitude)) {
+            return ctx.fail(.{ .bump_failed = .{
+                .title = "Insufficient Version Bump",
+                .message = try std.fmt.allocPrint(
+                    ctx.arena,
+                    "This is a {s} change, so the next version must be at least {f}, but --expect was {f}.",
+                    .{ result.magnitude.name(), next, expected },
+                ),
+            } });
+        }
+        stdout.print("\n{f} satisfies the required {s} bump.\n", .{ expected, result.magnitude.name() }) catch {};
+    }
+}
+
+/// Check one side of a bump comparison, keeping its BuildEnv alive so the
+/// public API can be extracted from the checked artifacts afterwards.
+fn bumpCheckSide(
+    ctx: *CliCtx,
+    path: []const u8,
+    cache_config: CacheConfig,
+    args: cli_args.BumpArgs,
+    side: []const u8,
+) CliMainError!CheckResultWithBuildEnv {
+    const stderr = ctx.io.stderr();
+    var result = checkFileWithBuildEnvPreserved(
+        ctx,
+        path,
+        null,
+        false,
+        cache_config,
+        null,
+        resolutionConfigFromLimits(args.resolve_limits),
+        null,
+        false,
+        false,
+    ) catch |err| {
+        try handleProcessFileError(err, stderr, path);
+        return error.CliError;
+    };
+    errdefer result.deinit(ctx.gpa);
+
+    for (result.check_result.reports) |module| {
+        for (module.reports) |*report| {
+            reporting.renderReportToTerminal(report, stderr, ColorPalette.ANSI, ctx.terminalReportConfig()) catch {};
+        }
+    }
+    if (result.check_result.error_count > 0) {
+        return ctx.fail(.{ .bump_failed = .{
+            .title = "Package Does Not Compile",
+            .message = try std.fmt.allocPrint(
+                ctx.arena,
+                "The {s} package ({s}) does not compile with this compiler. roc bump needs both packages to compile so their public APIs can be compared.",
+                .{ side, path },
+            ),
+        } });
+    }
+    return result;
+}
+
+/// Extract a local .tar.zst bundle into the content-addressed package cache
+/// (keyed by the hash in its filename) and return the path to its main.roc.
+fn extractBundleForBump(ctx: *CliCtx, archive_path: []const u8) CliMainError![]const u8 {
+    const basename = std.fs.path.basename(archive_path);
+    const hash = basename[0 .. basename.len - ".tar.zst".len];
+
+    const cache_dir_path = getRocCacheDir(ctx.arena) catch {
+        return ctx.fail(.{ .cache_dir_unavailable = .{ .reason = "Could not determine cache directory" } });
+    };
+    const package_dir_path = try std.fs.path.join(ctx.arena, &.{ cache_dir_path, hash });
+    const main_roc_path = try std.fs.path.join(ctx.arena, &.{ package_dir_path, "main.roc" });
+
+    // The cache is content-addressed by the archive's hash, so an existing
+    // extraction can be reused as-is.
+    const already_cached = blk: {
+        std.Io.Dir.cwd().access(ctx.io.std_io, main_roc_path, .{}) catch break :blk false;
+        break :blk true;
+    };
+    if (already_cached) return main_roc_path;
+
+    var output_dir = try std.Io.Dir.cwd().createDirPathOpen(ctx.io.std_io, package_dir_path, .{});
+    defer output_dir.close(ctx.io.std_io);
+
+    const archive_file = std.Io.Dir.cwd().openFile(ctx.io.std_io, archive_path, .{}) catch {
+        return ctx.fail(.{ .file_not_found = .{ .path = archive_path } });
+    };
+    defer archive_file.close(ctx.io.std_io);
+
+    var error_ctx: unbundle.ErrorContext = undefined;
+    var archive_reader_buffer: [4096]u8 = undefined;
+    var archive_reader = archive_file.reader(ctx.io.std_io, &archive_reader_buffer);
+    unbundle.unbundleFiles(
+        ctx.gpa,
+        &archive_reader.interface,
+        output_dir,
+        ctx.io.std_io,
+        basename,
+        &error_ctx,
+    ) catch |err| {
+        return ctx.fail(.{ .bump_failed = .{
+            .title = "Cannot Extract Old Bundle",
+            .message = try std.fmt.allocPrint(ctx.arena, "Failed to extract {s}: {s}.", .{ archive_path, @errorName(err) }),
+        } });
+    };
+
+    std.Io.Dir.cwd().access(ctx.io.std_io, main_roc_path, .{}) catch {
+        return ctx.fail(.{ .bump_failed = .{
+            .title = "Cannot Extract Old Bundle",
+            .message = try std.fmt.allocPrint(ctx.arena, "The bundle {s} does not contain a main.roc at its root.", .{archive_path}),
+        } });
+    };
+    return main_roc_path;
+}
+
+/// Extract the public API of the root package of a finished build.
+fn bumpExtractApi(ctx: *CliCtx, build_env: *compile.BuildEnv, side: []const u8) CliMainError!bump.PackageApi {
+    const root_name = build_env.discovered_pkg_name orelse return error.Internal;
+    const root_pkg = build_env.packages.getPtr(root_name) orelse return error.Internal;
+
+    switch (root_pkg.kind) {
+        .package, .platform => {},
+        else => return ctx.fail(.{ .bump_failed = .{
+            .title = "Not A Package",
+            .message = try std.fmt.allocPrint(
+                ctx.arena,
+                "roc bump compares package APIs, but the {s} module ({s}) has neither a package nor a platform header.",
+                .{ side, root_pkg.root_file },
+            ),
+        } }),
+    }
+
+    // Map every compiled module's identity to the package that owns it, so type
+    // origins in public signatures resolve to stable package identities.
+    var origins = bump.extract.OriginMap{};
+    defer origins.deinit(ctx.gpa);
+    {
+        const builtin_env = build_env.builtin_modules.builtin_module.env;
+        const builtin_identity_hash = builtin_env.contentIdentityHash() orelse return error.Internal;
+        const builtin_origin = bump.extract.OriginMap.Origin{
+            .kind = .builtin,
+            .module_name = builtin_env.module_name,
+        };
+        try origins.putIdentity(ctx.gpa, builtin_identity_hash, builtin_origin);
+        try origins.put(ctx.gpa, builtin_env.module_name, builtin_origin);
+        try origins.put(ctx.gpa, builtin_env.getIdentText(builtin_env.qualified_module_ident), builtin_origin);
+
+        var sched_iter = build_env.schedulers.iterator();
+        while (sched_iter.next()) |sched_entry| {
+            const pkg_name = sched_entry.key_ptr.*;
+            const origin_kind: bump.extract.OriginMap.Origin.Kind = origin_blk: {
+                if (std.mem.eql(u8, pkg_name, root_name)) break :origin_blk .self;
+                const pkg = build_env.packages.getPtr(pkg_name) orelse break :origin_blk .{ .unstable = pkg_name };
+                if (pkg.url) |*url_source| {
+                    const parsed = base.url.parseUrlPath(url_source.url) catch break :origin_blk .{ .unstable = url_source.url };
+                    if (!parsed.version.isPresent()) break :origin_blk .{ .unstable = url_source.url };
+                    const url_id = try std.fmt.allocPrint(ctx.arena, "{s}{s}", .{
+                        parsed.urlIdPrefix(url_source.url),
+                        parsed.urlIdSuffix(url_source.url),
+                    });
+                    break :origin_blk .{ .external = .{
+                        .url_id = url_id,
+                        .major = parsed.version.major,
+                        .minor = parsed.version.minor,
+                    } };
+                }
+                // Path dependencies have no stable published identity.
+                break :origin_blk .{ .unstable = pkg.root_file };
+            };
+            const package_env = sched_entry.value_ptr.*;
+            for (package_env.modules.items) |*module_state| {
+                if (module_state.moduleEnv()) |mod_env| {
+                    // Checked types record origins under the package-qualified
+                    // module name; register the bare name too for roots whose
+                    // modules are referenced unqualified.
+                    const origin = bump.extract.OriginMap.Origin{
+                        .kind = origin_kind,
+                        .module_name = mod_env.module_name,
+                    };
+                    const identity_hash = mod_env.contentIdentityHash() orelse return error.Internal;
+                    try origins.putIdentity(ctx.gpa, identity_hash, origin);
+                    try origins.put(ctx.gpa, mod_env.module_name, origin);
+                    try origins.put(ctx.gpa, mod_env.getIdentText(mod_env.qualified_module_ident), origin);
+                }
+            }
+        }
+    }
+
+    // The exposed module list comes from the root module's header.
+    const root_env = build_env.schedulers.get(root_name) orelse return error.Internal;
+    const root_mod_env: *ModuleEnv = root_blk: {
+        for (root_env.modules.items) |*module_state| {
+            if (module_state.moduleEnv()) |mod_env| {
+                if (mod_env.module_kind == .package or mod_env.module_kind == .platform) {
+                    break :root_blk mod_env;
+                }
+            }
+        }
+        return error.Internal;
+    };
+
+    var inputs = std.ArrayListUnmanaged(bump.extract.ModuleInput).empty;
+    defer inputs.deinit(ctx.gpa);
+
+    var exposed_iter = root_mod_env.common.exposed_items.iterator();
+    while (exposed_iter.next()) |entry| {
+        const exposed_name = root_mod_env.getIdentText(@bitCast(entry.ident_idx));
+        var found = false;
+        for (root_env.modules.items) |*module_state| {
+            const data = module_state.semanticData() orelse continue;
+            if (!std.mem.eql(u8, data.env.module_name, exposed_name)) continue;
+            const artifact = data.checked_artifact orelse return error.Internal;
+            try inputs.append(ctx.gpa, .{
+                .exposed_name = exposed_name,
+                .module_env = data.env,
+                .artifact = artifact,
+            });
+            found = true;
+            break;
+        }
+        // Platform headers put their `provides` value idents in the exposed
+        // scope alongside exposed modules; those have no matching module and
+        // are not part of the comparison (provides/requires are out of scope).
+        if (!found and root_pkg.kind == .package) {
+            return ctx.fail(.{ .bump_failed = .{
+                .title = "Missing Exposed Module",
+                .message = try std.fmt.allocPrint(
+                    ctx.arena,
+                    "The {s} package header exposes `{s}`, but no module with that name was compiled.",
+                    .{ side, exposed_name },
+                ),
+            } });
+        }
+    }
+
+    if (inputs.items.len == 0) {
+        return ctx.fail(.{ .bump_failed = .{
+            .title = "No Exposed Modules",
+            .message = try std.fmt.allocPrint(
+                ctx.arena,
+                "The {s} package does not expose any modules, so there is no public API to compare.",
+                .{side},
+            ),
+        } });
+    }
+
+    var extract_failure: ?bump.extract.Failure = null;
+    return bump.extract.extractPackageApi(ctx.gpa, inputs.items, &origins, &extract_failure) catch |err| switch (err) {
+        error.OutOfMemory => error.OutOfMemory,
+        error.ExtractFailed => {
+            const info = extract_failure.?;
+            defer info.deinit(ctx.gpa);
+            const message = switch (info.kind) {
+                .unpublished_public_type => try std.fmt.allocPrint(
+                    ctx.arena,
+                    "Missing checked type data for the public item `{s}` in module `{s}`: {s}.",
+                    .{ info.item_path, info.module_name, info.detail },
+                ),
+                .unknown_origin_module => try std.fmt.allocPrint(
+                    ctx.arena,
+                    "A public signature of `{s}` in module `{s}` references a type from module `{s}`, which does not belong to any package in this build.",
+                    .{ info.item_path, info.module_name, info.detail },
+                ),
+                .unstable_dependency_in_public_api => try std.fmt.allocPrint(
+                    ctx.arena,
+                    "The public API (item `{s}` in module `{s}`) exposes a type from an unstable dependency:\n\n    {s}\n\nA publishable package may only expose types from versioned URL dependencies, because consumers need a stable package identity to compare versions against. Either stop exposing this type, or publish the dependency and depend on its URL.",
+                    .{ info.item_path, info.module_name, info.detail },
+                ),
+                .private_type_in_public_api => try std.fmt.allocPrint(
+                    ctx.arena,
+                    "The {s} package's public API references the type `{s}`, which is not itself part of the exposed API.",
+                    .{ side, info.detail },
+                ),
+            };
+            return ctx.fail(.{ .bump_failed = .{ .title = "Cannot Extract Public API", .message = message } });
+        },
+    };
+}
+
 fn rocDocs(ctx: *CliCtx, args: cli_args.DocsArgs) CliMainError!void {
     const trace = tracy.trace(@src());
     defer trace.end();
@@ -12717,12 +14741,13 @@ fn rocDocs(ctx: *CliCtx, args: cli_args.DocsArgs) CliMainError!void {
     var result_with_env = checkFileWithBuildEnvPreserved(
         ctx,
         args.path,
-        null,
+        args.main,
         args.time,
         cache_config,
         null, // max_threads: use default (single-threaded for now)
         resolutionConfigFromLimits(args.resolve_limits),
         null,
+        false,
         false,
     ) catch |err| {
         return handleProcessFileError(err, stderr, args.path);
@@ -12816,9 +14841,9 @@ fn generateDocs(
     defer ctx.gpa.free(modules);
 
     for (modules) |module_info| {
-        // Docs show the alias the root uses for a package, not its internal
-        // identity name (full URL or absolute path).
-        const sched_pkg_name = build_env.rootAliasForPackage(module_info.package_name) orelse module_info.package_name;
+        // Docs show display names (root alias, or "app"/"module" for the
+        // root itself), never internal identity keys (URLs, absolute paths).
+        const sched_pkg_name = build_env.displayNameForPackage(module_info.package_name);
         modules_seen += 1;
 
         var mod_docs = extract.extractModuleDocs(ctx.gpa, module_info.semantic.env, sched_pkg_name, module_info.path) catch |err| {
@@ -12889,6 +14914,7 @@ fn generateDocs(
     // Promote the builtin types (Str, Num, …) to top-level modules so the
     // internal `Builtin` container never surfaces in the generated docs.
     try package_docs.reshapeBuiltin(ctx.gpa);
+    try package_docs.resolveDocRefs(ctx.gpa);
 
     // Remove existing output directory to ensure a clean build
     try std.Io.Dir.cwd().deleteTree(ctx.io.std_io, base_output_dir);

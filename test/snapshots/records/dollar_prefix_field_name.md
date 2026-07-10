@@ -19,8 +19,8 @@ INVALID RECORD FIELD NAME - dollar_prefix_field_name.md:1:3:1:9
  │    ‾‾‾‾‾‾                                                                  │
  └─────────────────────────────────────────── dollar_prefix_field_name.md:1:3 ┘
 
-    Names that start with $ are reassignable variables declared with the `var`
-    keyword, so they cannot be used as record field names.
+    Names that start with `$` are reassignable variables declared with the
+    `var` keyword, so they cannot be used as record field names.
 
 # TOKENS
 ~~~zig

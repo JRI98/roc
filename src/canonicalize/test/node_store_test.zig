@@ -1415,6 +1415,7 @@ test "NodeStore round trip - Pattern" {
             .value = rand.random().float(f64),
         },
     });
+    try patterns.append(gpa, CIR.Pattern{ .num_from_numeral_literal = .{} });
     try patterns.append(gpa, CIR.Pattern{ .underscore = {} });
     try patterns.append(gpa, CIR.Pattern{
         .runtime_error = .{

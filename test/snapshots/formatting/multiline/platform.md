@@ -135,19 +135,7 @@ EndOfFile,
 ~~~
 # FORMATTED
 ~~~roc
-platform "pf"
-	requires {
-		[R1 : r1, R2 : r2] for main : R1 -> R2
-	}
-	exposes [
-		E1,
-		E2,
-	]
-	packages {
-		pa1: "pa1",
-		pa2: "pa2",
-	}
-	provides { "roc_not implemented": pr1, "roc_not implemented": pr2 }
+NO CHANGE
 ~~~
 # CANONICALIZE
 ~~~clojure

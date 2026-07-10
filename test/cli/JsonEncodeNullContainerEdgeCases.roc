@@ -62,7 +62,7 @@ expect {
 expect {
 	result : Try({ field : Try(Str, [Null]) }, Json.ParseErr)
 	result = Json.parse("{}")
-	result == Err(MissingRequiredField("Missing required field: field"))
+	result == Err(MissingRequiredField("field"))
 }
 
 expect {

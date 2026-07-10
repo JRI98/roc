@@ -50,7 +50,7 @@ Host := [].{
   (name "test-app")
   (module
     (name "Stdout")
-    (package "app")
+    (package "module")
     (kind type_module)
     (entry
       (name "Stdout")

@@ -8,6 +8,14 @@ const logs_dir = out_dir ++ "/logs";
 const heartbeat_env = "MINICI_HEARTBEAT_INTERVAL_MS";
 const default_heartbeat_interval_ms: u64 = 30_000;
 
+/// How many bytes from the start and end of a failing step's log to echo to
+/// the console. Compiler and test errors land near the top of the output, while
+/// `--summary all` prints a large build tree that pushes the terminating error
+/// line to the very bottom, so surfacing both ends (and eliding the noisy
+/// middle) keeps the failure actionable without a re-run.
+const failure_log_head_bytes: usize = 12 * 1024;
+const failure_log_tail_bytes: usize = 4 * 1024;
+
 const JobKind = enum {
     single,
     harness,
@@ -73,6 +81,7 @@ const jobs = [_]Job{
     .{ .name = "run-test-zig-cli-main" },
     .{ .name = "run-test-zig-machine-code-shim" },
     .{ .name = "run-test-zig-watch-cli" },
+    .{ .name = "run-test-zig-minici" },
     .{ .name = "run-test-zig-fx-platform" },
     .{ .name = "run-test-eval", .kind = .harness, .args = &.{ "--timeout", "120000" } },
     .{ .name = "run-test-eval-host-effects", .kind = .harness },
@@ -96,6 +105,19 @@ const CommandResult = struct {
     heartbeat_printed: bool = false,
 };
 
+const Progress = struct {
+    current: usize,
+    total: usize,
+};
+
+const SummaryCounts = struct {
+    passed: usize = 0,
+    failed: usize = 0,
+    crashed: usize = 0,
+    skipped: usize = 0,
+    not_run: usize = 0,
+};
+
 fn nowNs(io: std.Io) u64 {
     return @intCast(@max(0, std.Io.Timestamp.now(io, .awake).nanoseconds));
 }
@@ -110,6 +132,49 @@ fn unixMs(io: std.Io) u64 {
 
 fn seconds(ns: u64) f64 {
     return @as(f64, @floatFromInt(ns)) / 1_000_000_000.0;
+}
+
+fn decimalDigits(value: usize) usize {
+    var digits: usize = 1;
+    var remaining = value;
+    while (remaining >= 10) : (remaining /= 10) {
+        digits += 1;
+    }
+    return digits;
+}
+
+fn appendProgressPrefix(out: *std.ArrayList(u8), allocator: std.mem.Allocator, progress: Progress) !void {
+    try out.appendSlice(allocator, "MiniCI ");
+    const width = decimalDigits(progress.total);
+    const current_width = decimalDigits(progress.current);
+    var padding = width -| current_width;
+    while (padding > 0) : (padding -= 1) {
+        try out.append(allocator, ' ');
+    }
+    const text = try std.fmt.allocPrint(allocator, "{d}/{d}: ", .{ progress.current, progress.total });
+    defer allocator.free(text);
+    try out.appendSlice(allocator, text);
+}
+
+fn printProgressPrefix(progress: Progress) void {
+    std.debug.print("MiniCI ", .{});
+    const width = decimalDigits(progress.total);
+    const current_width = decimalDigits(progress.current);
+    var padding = width -| current_width;
+    while (padding > 0) : (padding -= 1) {
+        std.debug.print(" ", .{});
+    }
+    std.debug.print("{d}/{d}: ", .{ progress.current, progress.total });
+}
+
+fn printBuildStart(progress: Progress) void {
+    printProgressPrefix(progress);
+    std.debug.print("Building CI steps ... ", .{});
+}
+
+fn printRunStart(progress: Progress, name: []const u8) void {
+    printProgressPrefix(progress);
+    std.debug.print("Running `{s}` ... ", .{name});
 }
 
 fn isPass(result: CommandResult) bool {
@@ -135,28 +200,6 @@ fn runStatusText(result: CommandResult) []const u8 {
     if (std.mem.eql(u8, result.status, "skip")) return "skipped";
     if (std.mem.eql(u8, result.status, "crash")) return "crashed";
     return "failed";
-}
-
-// CI runners discard the workspace, so a failed step's log file is
-// unreachable there; echo its tail to stdout so the GitHub log (and any
-// retry wrapper matching on output) can see the actual error.
-const log_tail_max_bytes: usize = 64 * 1024;
-
-fn printLogTail(allocator: std.mem.Allocator, io: std.Io, log_path: []const u8) void {
-    const contents = std.Io.Dir.cwd().readFileAlloc(io, log_path, allocator, .limited(256 * 1024 * 1024)) catch |err| {
-        std.debug.print("  (could not read log {s}: {s})\n", .{ log_path, @errorName(err) });
-        return;
-    };
-    defer allocator.free(contents);
-    const tail = contents[contents.len -| log_tail_max_bytes..];
-    if (tail.len < contents.len) {
-        std.debug.print("  --- log tail (last {d} of {d} bytes) ---\n", .{ tail.len, contents.len });
-    } else {
-        std.debug.print("  --- log ---\n", .{});
-    }
-    std.debug.print("{s}", .{tail});
-    if (tail.len > 0 and tail[tail.len - 1] != '\n') std.debug.print("\n", .{});
-    std.debug.print("  --- end log ---\n", .{});
 }
 
 fn printRerunHint(result: CommandResult) void {
@@ -185,6 +228,161 @@ fn printRerunHint(result: CommandResult) void {
     std.debug.print("  Log: `{s}`\n", .{result.log_path});
 }
 
+/// Prints each line of `bytes` indented so the echoed output is visually set
+/// apart from the orchestrator's own progress lines.
+fn printIndentedLines(bytes: []const u8) void {
+    var lines = std.mem.splitScalar(u8, bytes, '\n');
+    while (lines.next()) |line| {
+        std.debug.print("  | {s}\n", .{line});
+    }
+}
+
+/// Byte offset of `line` (a subslice of `log`) within `log`. Relies on the
+/// split iterators yielding subslices that point back into `log`.
+fn lineOffset(log: []const u8, line: []const u8) usize {
+    return @intFromPtr(line.ptr) - @intFromPtr(log.ptr);
+}
+
+/// A test harness summary line, e.g. `519 passed, 1 run failed, 32 skipped
+/// (552 total) in 353090ms using 12 worker(s)`. We only treat it as the core
+/// marker when it reports at least one failure, so a clean "all passed" summary
+/// from a job that still failed for infrastructure reasons falls through to the
+/// full-log fallback where the real error lives. A trailing harness token
+/// (`total)`, `worker`, `process`, `wall`) is required so an incidental "N
+/// passed, M failed" line in a test's own captured output does not match.
+fn isTestSummaryLine(line: []const u8) bool {
+    const t = std.mem.trim(u8, line, " \t\r");
+    if (t.len == 0 or !std.ascii.isDigit(t[0])) return false;
+    if (std.mem.find(u8, t, " passed") == null) return false;
+    const reports_failure = std.mem.find(u8, t, "failed") != null or
+        std.mem.find(u8, t, "crashed") != null or
+        std.mem.find(u8, t, "timed out") != null;
+    if (!reports_failure) return false;
+    return std.mem.find(u8, t, "total)") != null or
+        std.mem.find(u8, t, "worker") != null or
+        std.mem.find(u8, t, "process") != null or
+        std.mem.find(u8, t, "wall") != null;
+}
+
+/// Byte offset of the first line whose text (after leading spaces) begins with
+/// `prefix`, or null if no such line exists.
+fn findFirstLineStartingWith(log: []const u8, prefix: []const u8) ?usize {
+    var it = std.mem.splitScalar(u8, log, '\n');
+    while (it.next()) |line| {
+        if (std.mem.startsWith(u8, std.mem.trimStart(u8, line, " "), prefix)) return lineOffset(log, line);
+    }
+    return null;
+}
+
+/// A `--summary` tree child line, e.g. `+- compile test ...` (optionally
+/// indented under its parent).
+fn isTreeChild(line: []const u8) bool {
+    return std.mem.startsWith(u8, std.mem.trimStart(u8, line, " "), "+-");
+}
+
+/// The root line of a failing-step tree fragment: a non-empty, non-indented line
+/// that is not itself a tree node (e.g. `build-ci`, `run-test-zig-module-...`).
+fn isMiniTreeRoot(line: []const u8) bool {
+    return line.len != 0 and line[0] != ' ' and line[0] != '\t' and line[0] != '+';
+}
+
+/// Region from the start of the log through the first failure summary line.
+/// Everything after (suite/timing tables and the `--summary all` build tree) is
+/// noise for a harness failure.
+fn findTestSummaryRegion(log: []const u8) ?[]const u8 {
+    var it = std.mem.splitScalar(u8, log, '\n');
+    while (it.next()) |line| {
+        if (isTestSummaryLine(line)) return log[0 .. lineOffset(log, line) + line.len];
+    }
+    return null;
+}
+
+/// Region spanning a failed `zig build` step: from the failing step's tree
+/// fragment (`<step>` followed by `+- ...`) through the last line before the
+/// `failed command:` marker. This drops the leading success spam from parallel
+/// steps and the trailing `--summary all` dependency tree, and covers compiler
+/// errors, unit-test failures, panics, and check-tool failures alike.
+fn findZigBuildFailureRegion(log: []const u8) ?[]const u8 {
+    // Output for the failing step ends at its `failed command:` line; without one
+    // (rare), fall back to the build summary that precedes the dependency tree.
+    const end = findFirstLineStartingWith(log, "failed command:") orelse
+        findFirstLineStartingWith(log, "Build Summary:") orelse
+        return null;
+
+    // The failing step's tree fragment is the last `<root>` + `+- ...` pair before
+    // that marker; taking the last keeps us closest to the actual error.
+    var root: ?usize = null;
+    var prev_off: usize = 0;
+    var prev_line: []const u8 = "";
+    var have_prev = false;
+    var it = std.mem.splitScalar(u8, log, '\n');
+    while (it.next()) |line| {
+        const off = lineOffset(log, line);
+        if (off >= end) break;
+        if (isTreeChild(line) and have_prev and isMiniTreeRoot(prev_line)) root = prev_off;
+        prev_off = off;
+        prev_line = line;
+        have_prev = true;
+    }
+    const start = root orelse return null;
+    return std.mem.trimEnd(u8, log[start..end], "\n \t\r");
+}
+
+/// Extracts the core error region from a failing step's log, or null when no
+/// known failure shape matches (the caller then shows the head/tail fallback).
+/// The harness-summary shape is tried first because harness jobs also end with a
+/// `failed command:` marker whose tree fragment sits below the useful summary.
+fn findCoreError(log: []const u8) ?[]const u8 {
+    if (findTestSummaryRegion(log)) |region| return region;
+    if (findZigBuildFailureRegion(log)) |region| return region;
+    return null;
+}
+
+/// Echoes a failing step's captured output to the console so the failure is
+/// actionable without re-running the step. CI runners discard the workspace, so
+/// a failed step's log file is unreachable there; echoing puts the actual error
+/// into the GitHub log (and in front of any retry wrapper matching on output).
+/// It first tries to extract just the core error (a harness summary, or a failed
+/// `zig build` step's error output); when no known shape matches it falls back to
+/// showing the head and tail of the whole log with the noisy middle elided. The
+/// full output always remains in `result.log_path`, which `printRerunHint`
+/// points at.
+fn printFailureLog(allocator: std.mem.Allocator, io: std.Io, result: CommandResult) void {
+    const contents = std.Io.Dir.cwd().readFileAlloc(io, result.log_path, allocator, .limited(256 * 1024 * 1024)) catch |err| {
+        std.debug.print("  (could not read log `{s}`: {s})\n", .{ result.log_path, @errorName(err) });
+        return;
+    };
+    defer allocator.free(contents);
+
+    const trimmed = std.mem.trimEnd(u8, contents, "\n");
+    if (trimmed.len == 0) {
+        std.debug.print("  (`{s}` produced no output)\n", .{commandStepName(result.command)});
+        return;
+    }
+
+    const region = findCoreError(trimmed) orelse trimmed;
+    const extracted = region.len != trimmed.len;
+
+    std.debug.print("  --- output from `{s}` ---\n", .{commandStepName(result.command)});
+    if (region.len <= failure_log_head_bytes + failure_log_tail_bytes) {
+        printIndentedLines(region);
+        if (extracted) std.debug.print("  ... (extracted error; full log: `{s}`) ...\n", .{result.log_path});
+    } else {
+        // Trim the head back to a line boundary so it does not end mid-line.
+        var head: []const u8 = region[0..failure_log_head_bytes];
+        if (std.mem.findScalarLast(u8, head, '\n')) |nl| head = head[0..nl];
+        // Advance the tail to the next line boundary so it does not start mid-line.
+        var tail: []const u8 = region[region.len - failure_log_tail_bytes ..];
+        if (std.mem.findScalar(u8, tail, '\n')) |nl| tail = tail[nl + 1 ..];
+
+        const omitted = region.len - head.len - tail.len;
+        printIndentedLines(head);
+        std.debug.print("  ... {d} KiB omitted (full log: `{s}`) ...\n", .{ omitted / 1024, result.log_path });
+        printIndentedLines(tail);
+    }
+    std.debug.print("  --- end output ---\n", .{});
+}
+
 fn heartbeatIntervalMs(env: *const std.process.Environ.Map) u64 {
     const raw = env.get(heartbeat_env) orelse return default_heartbeat_interval_ms;
     if (raw.len == 0) return default_heartbeat_interval_ms;
@@ -198,11 +396,75 @@ fn commandStepName(argv: []const []const u8) []const u8 {
     return if (argv.len > 2) argv[2] else argv[0];
 }
 
+fn addResultToSummary(counts: *SummaryCounts, result: CommandResult) void {
+    if (isPass(result)) {
+        counts.passed += 1;
+    } else if (std.mem.eql(u8, result.status, "skip")) {
+        counts.skipped += 1;
+    } else if (std.mem.eql(u8, result.status, "crash")) {
+        counts.crashed += 1;
+    } else {
+        counts.failed += 1;
+    }
+}
+
+fn summaryCounts(total_phases: usize, build_result: CommandResult, results: []const CommandResult) SummaryCounts {
+    var counts = SummaryCounts{};
+    addResultToSummary(&counts, build_result);
+    for (results) |result| {
+        addResultToSummary(&counts, result);
+    }
+    const ran = 1 + results.len;
+    counts.not_run = total_phases -| ran;
+    return counts;
+}
+
+fn appendSummaryLine(
+    out: *std.ArrayList(u8),
+    allocator: std.mem.Allocator,
+    total_phases: usize,
+    build_result: CommandResult,
+    results: []const CommandResult,
+    wall_ns: u64,
+) !void {
+    const counts = summaryCounts(total_phases, build_result, results);
+    const ran = total_phases - counts.not_run;
+    const base = try std.fmt.allocPrint(
+        allocator,
+        "MiniCI summary: {d}/{d} phases ran; {d} passed, {d} failed, {d} crashed, {d} skipped",
+        .{ ran, total_phases, counts.passed, counts.failed, counts.crashed, counts.skipped },
+    );
+    defer allocator.free(base);
+    try out.appendSlice(allocator, base);
+    if (counts.not_run != 0) {
+        const not_run = try std.fmt.allocPrint(allocator, ", {d} not run", .{counts.not_run});
+        defer allocator.free(not_run);
+        try out.appendSlice(allocator, not_run);
+    }
+    const suffix = try std.fmt.allocPrint(allocator, "; wall {d:.3}s\n", .{seconds(wall_ns)});
+    defer allocator.free(suffix);
+    try out.appendSlice(allocator, suffix);
+}
+
+fn printSummary(
+    allocator: std.mem.Allocator,
+    total_phases: usize,
+    build_result: CommandResult,
+    results: []const CommandResult,
+    wall_ns: u64,
+) !void {
+    var out = std.ArrayList(u8).empty;
+    defer out.deinit(allocator);
+    try appendSummaryLine(&out, allocator, total_phases, build_result, results, wall_ns);
+    std.debug.print("{s}", .{out.items});
+}
+
 const Heartbeat = struct {
     io: std.Io,
     argv: []const []const u8,
     started: u64,
     interval_ms: u64,
+    progress: Progress,
     done: std.atomic.Value(bool),
     printed: std.atomic.Value(bool),
 
@@ -219,7 +481,8 @@ const Heartbeat = struct {
 
             const already_printed = self.printed.swap(true, .acq_rel);
             if (!already_printed) std.debug.print("\n", .{});
-            std.debug.print("  still running `{s}` after {d:.1}s\n", .{
+            printProgressPrefix(self.progress);
+            std.debug.print("still running `{s}` after {d:.1}s\n", .{
                 commandStepName(self.argv),
                 seconds(elapsed_ms * std.time.ns_per_ms),
             });
@@ -273,6 +536,7 @@ fn runCommand(
     log_path: []const u8,
     heartbeat_interval_ms: u64,
     run_started_ns: u64,
+    progress: Progress,
 ) !CommandResult {
     const started = nowNs(io);
     var heartbeat = Heartbeat{
@@ -280,6 +544,7 @@ fn runCommand(
         .argv = argv,
         .started = started,
         .interval_ms = heartbeat_interval_ms,
+        .progress = progress,
         .done = std.atomic.Value(bool).init(false),
         .printed = std.atomic.Value(bool).init(false),
     };
@@ -814,58 +1079,274 @@ pub fn main(init: std.process.Init) !void {
     std.debug.print("=== MINICI ORCHESTRATOR ===\n", .{});
     const run_started_ns = nowNs(io);
     const run_started_unix_ms = unixMs(io);
+    const total_phases = jobs.len + 1;
 
     const build_argv = try buildCommand(allocator, zig_exe, build_args, "build-ci", null, &.{});
     const build_log = logs_dir ++ "/build-ci.txt";
-    std.debug.print("Building CI steps ... ", .{});
-    const build_result = try runCommand(allocator, io, build_argv, build_log, heartbeat_interval_ms, run_started_ns);
-    if (build_result.heartbeat_printed) std.debug.print("Building CI steps ... ", .{});
+    const build_progress = Progress{ .current = 1, .total = total_phases };
+    printBuildStart(build_progress);
+    const build_result = try runCommand(allocator, io, build_argv, build_log, heartbeat_interval_ms, run_started_ns, build_progress);
+    if (build_result.heartbeat_printed) printBuildStart(build_progress);
     std.debug.print("{s} in {d:.3}s\n", .{ buildStatusText(build_result), seconds(build_result.duration_ns) });
 
     var results = std.ArrayList(CommandResult).empty;
     defer results.deinit(allocator);
 
     if (!isPass(build_result)) {
+        printFailureLog(allocator, io, build_result);
         printRerunHint(build_result);
-        printLogTail(allocator, io, build_result.log_path);
         try writeReportJson(allocator, io, run_started_unix_ms, build_result, results.items);
         try writeHtml(allocator, io, run_started_unix_ms, build_result, results.items);
+        try printSummary(allocator, total_phases, build_result, results.items, durationSince(io, run_started_ns));
         std.process.exit(1);
     }
 
-    for (jobs) |job| {
+    for (jobs, 0..) |job, job_index| {
         const log_path = try std.fmt.allocPrint(allocator, "{s}/{s}.txt", .{ logs_dir, job.name });
         const stats_path: ?[]const u8 = if (job.kind == .harness)
             try std.fmt.allocPrint(allocator, "{s}/{s}.json", .{ raw_dir, job.name })
         else
             null;
         const argv = try buildCommand(allocator, zig_exe, build_args, job.name, stats_path, job.args);
-        std.debug.print("Running `{s}` ... ", .{job.name});
+        const progress = Progress{ .current = job_index + 2, .total = total_phases };
+        printRunStart(progress, job.name);
         var result = if (job.skip_reason) |reason|
             try skipCommand(io, argv, log_path, reason, run_started_ns)
         else
-            try runCommand(allocator, io, argv, log_path, heartbeat_interval_ms, run_started_ns);
+            try runCommand(allocator, io, argv, log_path, heartbeat_interval_ms, run_started_ns, progress);
         result.stats_path = if (job.skip_reason == null) stats_path else null;
         try results.append(allocator, result);
-        if (result.heartbeat_printed) std.debug.print("Running `{s}` ... ", .{job.name});
+        if (result.heartbeat_printed) printRunStart(progress, job.name);
         std.debug.print("{s} in {d:.3}s\n", .{ runStatusText(result), seconds(result.duration_ns) });
 
         if (!isSuccessful(result)) {
+            printFailureLog(allocator, io, result);
             printRerunHint(result);
-            printLogTail(allocator, io, result.log_path);
         }
 
         if (isCheckJob(job.name) and !isSuccessful(result)) {
             try writeReportJson(allocator, io, run_started_unix_ms, build_result, results.items);
             try writeHtml(allocator, io, run_started_unix_ms, build_result, results.items);
+            try printSummary(allocator, total_phases, build_result, results.items, durationSince(io, run_started_ns));
             std.process.exit(1);
         }
     }
 
     try writeReportJson(allocator, io, run_started_unix_ms, build_result, results.items);
     try writeHtml(allocator, io, run_started_unix_ms, build_result, results.items);
+    try printSummary(allocator, total_phases, build_result, results.items, durationSince(io, run_started_ns));
 
     for (results.items) |result| {
         if (!isSuccessful(result)) std.process.exit(1);
     }
+}
+
+test "appendProgressPrefix aligns current phase to total width" {
+    var out = std.ArrayList(u8).empty;
+    defer out.deinit(std.testing.allocator);
+
+    try appendProgressPrefix(&out, std.testing.allocator, .{ .current = 1, .total = 61 });
+    try std.testing.expectEqualStrings("MiniCI  1/61: ", out.items);
+
+    out.clearRetainingCapacity();
+    try appendProgressPrefix(&out, std.testing.allocator, .{ .current = 20, .total = 61 });
+    try std.testing.expectEqualStrings("MiniCI 20/61: ", out.items);
+
+    out.clearRetainingCapacity();
+    try appendProgressPrefix(&out, std.testing.allocator, .{ .current = 7, .total = 123 });
+    try std.testing.expectEqualStrings("MiniCI   7/123: ", out.items);
+}
+
+fn testResult(status: []const u8, duration_ns: u64) CommandResult {
+    return .{
+        .status = status,
+        .start_ns = 0,
+        .end_ns = duration_ns,
+        .duration_ns = duration_ns,
+        .log_path = "log.txt",
+        .command = &.{ "zig", "build", "step" },
+    };
+}
+
+test "appendSummaryLine reports all phases passed" {
+    const build_result = testResult("pass", 1);
+    const results = [_]CommandResult{
+        testResult("pass", 2),
+        testResult("pass", 3),
+    };
+
+    var out = std.ArrayList(u8).empty;
+    defer out.deinit(std.testing.allocator);
+    try appendSummaryLine(&out, std.testing.allocator, 3, build_result, &results, 1_500_000_000);
+
+    try std.testing.expectEqualStrings(
+        "MiniCI summary: 3/3 phases ran; 3 passed, 0 failed, 0 crashed, 0 skipped; wall 1.500s\n",
+        out.items,
+    );
+}
+
+test "appendSummaryLine reports skipped phases" {
+    const build_result = testResult("pass", 1);
+    const results = [_]CommandResult{
+        testResult("skip", 2),
+        testResult("pass", 3),
+    };
+
+    var out = std.ArrayList(u8).empty;
+    defer out.deinit(std.testing.allocator);
+    try appendSummaryLine(&out, std.testing.allocator, 3, build_result, &results, 2_000_000_000);
+
+    try std.testing.expectEqualStrings(
+        "MiniCI summary: 3/3 phases ran; 2 passed, 0 failed, 0 crashed, 1 skipped; wall 2.000s\n",
+        out.items,
+    );
+}
+
+test "appendSummaryLine reports early failure with not-run phases" {
+    const build_result = testResult("pass", 1);
+    const results = [_]CommandResult{
+        testResult("fail", 2),
+    };
+
+    var out = std.ArrayList(u8).empty;
+    defer out.deinit(std.testing.allocator);
+    try appendSummaryLine(&out, std.testing.allocator, 4, build_result, &results, 3_250_000_000);
+
+    try std.testing.expectEqualStrings(
+        "MiniCI summary: 2/4 phases ran; 1 passed, 1 failed, 0 crashed, 0 skipped, 2 not run; wall 3.250s\n",
+        out.items,
+    );
+}
+
+test "findCoreError extracts a Zig compile error region" {
+    const log =
+        \\0 errors and 0 warnings found in 373ms while successfully building:
+        \\
+        \\    test/wasm/app.wasm
+        \\Build succeeded!
+        \\build-ci
+        \\+- build-test-zig
+        \\   +- compile test check Debug native 1 errors
+        \\src/check/checked_artifact.zig:28167:9: error: expected type 'A', found 'B'
+        \\        module_name,
+        \\        ^~~~~~~~~~~
+        \\src/check/canonical_names.zig:28:26: note: enum declared here
+        \\error: 1 compilation errors
+        \\failed command: /Users/x/zig test -ODebug --dep tracy --dep builtins ...
+        \\
+        \\Build succeeded!
+        \\Build Summary: 321/324 steps succeeded (1 failed)
+        \\build-ci transitive failure
+        \\+- roc success
+    ;
+    const region = findCoreError(log) orelse return error.NoMatch;
+    // Starts at the failing-step tree above the source error.
+    try std.testing.expect(std.mem.startsWith(u8, region, "build-ci\n+- build-test-zig"));
+    // Ends at the compiler terminator, dropping the giant `failed command:` line
+    // and the trailing summary tree.
+    try std.testing.expect(std.mem.endsWith(u8, region, "error: 1 compilation errors"));
+    try std.testing.expect(std.mem.find(u8, region, "failed command:") == null);
+    try std.testing.expect(std.mem.find(u8, region, "Build Summary:") == null);
+    // Leading success spam is not pulled into the context above the error.
+    try std.testing.expect(std.mem.find(u8, region, "successfully building") == null);
+}
+
+test "findCoreError extracts a Zig unit-test failure region" {
+    const log =
+        \\run-test-zig-module-collections
+        \\+- run test collections 45 pass, 1 fail (46 total)
+        \\error: 'mod.test.some assertion' failed:
+        \\       expected 1, found 2
+        \\       /path/src/collections/mod.zig:143:5: 0x0 in test.some assertion (collections)
+        \\           try std.testing.expectEqual(@as(u32, 1), @as(u32, 2));
+        \\           ^
+        \\failed command: ./.zig-cache/o/abc/collections --cache-dir=./.zig-cache --listen=-
+        \\
+        \\Build Summary: 1/3 steps succeeded (1 failed); 45/46 tests passed (1 failed)
+        \\run-test-zig-module-collections transitive failure
+    ;
+    const region = findCoreError(log) orelse return error.NoMatch;
+    try std.testing.expect(std.mem.startsWith(u8, region, "run-test-zig-module-collections\n+- run test collections"));
+    try std.testing.expect(std.mem.find(u8, region, "error: 'mod.test.some assertion' failed:") != null);
+    try std.testing.expect(std.mem.endsWith(u8, region, "^"));
+    try std.testing.expect(std.mem.find(u8, region, "failed command:") == null);
+    try std.testing.expect(std.mem.find(u8, region, "Build Summary:") == null);
+}
+
+test "findCoreError extracts a check-tool failure region" {
+    const log =
+        \\run-check-zig-format
+        \\+- zig fmt --check failure
+        \\error: /path/src/collections/BADFORMAT.zig: non-conforming formatting
+        \\error: process exited with error code 1
+        \\failed command: /path/zig fmt --check /path/src /path/build.zig
+        \\
+        \\Build Summary: 0/2 steps succeeded (1 failed)
+        \\run-check-zig-format transitive failure
+    ;
+    const region = findCoreError(log) orelse return error.NoMatch;
+    try std.testing.expect(std.mem.startsWith(u8, region, "run-check-zig-format\n+- zig fmt --check failure"));
+    try std.testing.expect(std.mem.endsWith(u8, region, "error: process exited with error code 1"));
+    try std.testing.expect(std.mem.find(u8, region, "failed command:") == null);
+    try std.testing.expect(std.mem.find(u8, region, "Build Summary:") == null);
+}
+
+test "findCoreError extracts a test harness summary region" {
+    const log =
+        \\Roc cache not found (nothing to clear)
+        \\=== CLI Test Runner ===
+        \\552 tests, 12 workers, 240s timeout, backends: interpreter, dev
+        \\
+        \\  run failed   echo platform: hello (interpreter)  (221.5ms, phase=run)
+        \\        stdout mismatch: expected 14 bytes, got 16
+        \\        stdout: Hellooo, World!
+        \\
+        \\519 passed, 1 run failed, 32 skipped (552 total) in 353090ms using 12 worker(s)
+        \\
+        \\=== Suite Summary ===
+        \\  echo           20 run,    1 failed,    9 skipped
+        \\run-test-cli
+        \\+- run exe parallel_cli_runner failure
+        \\error: process exited with error code 1
+        \\Build Summary: 229/231 steps succeeded (1 failed)
+    ;
+    const region = findCoreError(log) orelse return error.NoMatch;
+    // Starts at the top of the log and includes the failing case detail.
+    try std.testing.expect(std.mem.startsWith(u8, region, "Roc cache not found"));
+    try std.testing.expect(std.mem.find(u8, region, "run failed   echo platform") != null);
+    // Ends at the summary line, dropping the suite/timing tables and build tree.
+    try std.testing.expect(std.mem.endsWith(u8, region, "using 12 worker(s)"));
+    try std.testing.expect(std.mem.find(u8, region, "=== Suite Summary ===") == null);
+    try std.testing.expect(std.mem.find(u8, region, "Build Summary:") == null);
+}
+
+test "findCoreError ignores a clean all-passed summary" {
+    // A summary with no failures should not match: a job that failed despite an
+    // all-passed summary needs the full log, not a misleading green summary.
+    const log =
+        \\=== CLI Test Runner ===
+        \\519 passed, 32 skipped (552 total) in 353090ms using 12 worker(s)
+        \\error: process exited with error code 1
+    ;
+    try std.testing.expect(findCoreError(log) == null);
+}
+
+test "findCoreError ignores an incidental passed/failed line without a harness token" {
+    // A test's own captured output might print "3 passed, 1 failed" with no
+    // harness token; that must not be mistaken for the runner summary.
+    const log =
+        \\some captured program output
+        \\3 passed, 1 failed
+        \\more output
+    ;
+    try std.testing.expect(findCoreError(log) == null);
+}
+
+test "findCoreError returns null when no known shape matches" {
+    const log =
+        \\some lint tool output
+        \\a warning here
+        \\nothing actionable in a recognizable shape
+    ;
+    try std.testing.expect(findCoreError(log) == null);
 }
