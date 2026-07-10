@@ -530,6 +530,7 @@ const Formatter = struct {
                         try fmt.pushAll(" as ");
                     }
                     try fmt.pushTokenText(a);
+                    flushed = false;
                     if (i.exposes.span.len > 0) {
                         flushed = try fmt.flushCommentsAfter(a);
                     }
@@ -3629,6 +3630,12 @@ test "parenthesized type application with leading newline is idempotent" {
     const result = try moduleFmtsStable(std.testing.allocator, "\ne:[(N())()]", false);
     defer std.testing.allocator.free(result);
     try std.testing.expectEqualStrings("\ne : [(N()), ()]\n", result);
+}
+
+test "import alias after comment stays separated from synthetic exposing clause" {
+    const result = try moduleFmtsStable(std.testing.allocator, "import A .B as#\nX", false);
+    defer std.testing.allocator.free(result);
+    try std.testing.expectEqualStrings("import A\n\t.B as #\nX exposing []\n", result);
 }
 
 test "issue 8894: typed integer literal formats correctly" {
