@@ -2815,6 +2815,7 @@ const Formatter = struct {
         const multiline = fmt.nodeWillBeMultiline(AST.TypeAnno.Idx, anno);
         switch (a) {
             .apply => |app| {
+                region = app.region;
                 const slice = fmt.ast.store.typeAnnoSlice(app.args);
                 const first = slice[0];
                 try fmt.formatTypeAnnoDiscard(first);
@@ -3621,6 +3622,12 @@ test "issue 9785: multiline string followed by tuple access formats to valid sou
     , false);
     defer std.testing.allocator.free(result);
     try std.testing.expectEqualStrings("n = \\\\\n\t.0 - ||\n\t0\n", result);
+}
+
+test "parenthesized type application with leading newline is idempotent" {
+    const result = try moduleFmtsStable(std.testing.allocator, "\ne:[(N())()]", false);
+    defer std.testing.allocator.free(result);
+    try std.testing.expectEqualStrings("\ne : [(N()), ()]\n", result);
 }
 
 test "issue 8894: typed integer literal formats correctly" {
