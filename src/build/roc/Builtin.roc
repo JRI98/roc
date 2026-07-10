@@ -17114,6 +17114,106 @@ range_inclusive_with_len = |start, end, len_if_known|
 			},
 	)
 
+## The result of scanning a JSON string body; all fields are zero-copy slices.
+## `after` is the text following the closing quote. The body is:
+## - `NoEscapes` — it contains no escapes, so it already IS the decoded value
+## - `HasEscapes` — left undecoded, since the caller may be discarding it anyway
+ScannedJsonString : { after : Str, body : [NoEscapes(Str), HasEscapes(Str)] }
+
+## Scan a JSON string body to its closing (unescaped) quote, validating escapes
+## along the way.
+scan_json_string_tail : Str -> Try(ScannedJsonString, Json.ParseErr)
+scan_json_string_tail = |tail| {
+	bytes = Str.to_utf8(tail)
+	len = List.len(bytes)
+	var $index = 0
+	var $had_escape = False
+
+	# Walk the bytes, consuming each escape atomically, until the closing quote.
+	# Every escape must be validated so that invalid escapes are rejected as invalid JSON
+	# (even inside skipped strings).
+	while $index < len {
+		byte = list_get_unsafe(bytes, $index)
+		match byte {
+			# Because we consume escapes atomically, if we hit a quote we know that it's the end
+			# of the string.
+			'"' => {
+				raw = match Str.from_utf8(List.take_first(bytes, $index)) {
+					Ok(body) => body
+					# unreachable: the split point is an ASCII quote, so the prefix is always valid UTF-8
+					Err(_) => {
+						crash "Json scanner invariant violated: split at a quote was not valid UTF-8"
+					}
+				}
+
+				# Str has no index-based slicing, so recover `after` by dropping the
+				# body (a content-matched prefix of `tail`) and then the closing
+				# quote — both zero-copy slice operations.
+				after = Str.drop_prefix(Str.drop_prefix(tail, raw), "\"")
+
+				return Ok({ after, body: if $had_escape HasEscapes(raw) else NoEscapes(raw) })
+			}
+			# If we find any backslashes, we mark that we found an escape and consume the full
+			# escape sequence atomically
+			'\\' => {
+				$had_escape = True
+				escape = parse_json_escape_sequence(List.drop_first(bytes, $index + 1))?
+				$index = $index + 1 + escape.consumed
+			}
+			# For any other character besides a quote or a backslash, we continue.
+			_ => {
+				$index = $index + 1
+			}
+		}
+	}
+
+	# no unescaped closing quote anywhere: the string is unterminated
+	Err(Json.invalid_json)
+}
+
+## Find the end of a JSON string, for skipped values whose content is discarded.
+## Escapes are still validated (invalid escapes in skipped fields remain invalid
+## JSON), but the body is never decoded. Returns the text after the closing quote.
+skip_json_string_tail : Str -> Try(Str, Json.ParseErr)
+skip_json_string_tail = |tail| {
+	{ after, .. } = scan_json_string_tail(tail)?
+	Ok(after)
+}
+
+## Decode a JSON string body: walk it, mapping each escape sequence to its code point and
+## copying everything else.
+decode_json_string_body : Str -> Try(Str, Json.ParseErr)
+decode_json_string_body = |raw| {
+	bytes = Str.to_utf8(raw)
+	len = List.len(bytes)
+	var $out = u8_list_reserve([], len)
+	var $index = 0
+
+	while $index < len {
+		byte = list_get_unsafe(bytes, $index)
+		match byte {
+			'\\' => {
+				escape = parse_json_escape_sequence(List.drop_first(bytes, $index + 1))?
+				$out = append_utf8_code_point($out, escape.code_point)
+				$index = $index + 1 + escape.consumed
+			}
+			_ => {
+				$out = u8_append($out, byte)
+				$index = $index + 1
+			}
+		}
+	}
+
+	match Str.from_utf8($out) {
+		Ok(value) => Ok(value)
+		# unreachable: every appended byte run and decoded code point is
+		# valid UTF-8 by construction
+		Err(_) => {
+			crash "Json decoder invariant violated: decoded output was not valid UTF-8"
+		}
+	}
+}
+
 ## Parse one JSON escape sequence. `rest` is expected to hold the bytes after a backslash.
 ## Every JSON escape denotes exactly one code point (surrogate pairs combine into one), so
 ## this returns that code point plus the number of bytes consumed from `rest`.
@@ -17172,6 +17272,29 @@ decode_json_hex4 = |b0, b1, b2, b3| {
 decode_json_hex_digit : U8 -> Try(U64, Json.ParseErr)
 decode_json_hex_digit = |byte|
 	hex_digit_value(byte).map_ok(|value| value.to_u64()).map_err(|_| Json.invalid_json)
+
+## Append a Unicode code point as UTF-8 bytes. The caller guarantees the code point is at
+## most U+10FFFF and not an unpaired surrogate.
+append_utf8_code_point : List(U8), U64 -> List(U8)
+append_utf8_code_point = |out, code_point|
+	if code_point < 128 {
+		u8_append(out, code_point.to_u8_wrap())
+	} else if code_point < 2048 {
+		b0 = 192 + code_point.shift_right_by(6)
+		b1 = 128 + code_point.bitwise_and(63)
+		u8_append(u8_append(out, b0.to_u8_wrap()), b1.to_u8_wrap())
+	} else if code_point < 65536 {
+		b0 = 224 + code_point.shift_right_by(12)
+		b1 = 128 + code_point.shift_right_by(6).bitwise_and(63)
+		b2 = 128 + code_point.bitwise_and(63)
+		u8_append(u8_append(u8_append(out, b0.to_u8_wrap()), b1.to_u8_wrap()), b2.to_u8_wrap())
+	} else {
+		b0 = 240 + code_point.shift_right_by(18)
+		b1 = 128 + code_point.shift_right_by(12).bitwise_and(63)
+		b2 = 128 + code_point.shift_right_by(6).bitwise_and(63)
+		b3 = 128 + code_point.bitwise_and(63)
+		u8_append(u8_append(u8_append(u8_append(out, b0.to_u8_wrap()), b1.to_u8_wrap()), b2.to_u8_wrap()), b3.to_u8_wrap())
+	}
 
 # Implemented by the compiler, does not perform bounds checks
 list_get_unsafe : List(item), U64 -> item
