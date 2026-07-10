@@ -1977,8 +1977,8 @@ const Formatter = struct {
                     // Nominal-value destructure renders as `Type.(args)` (the `.`
                     // distinguishes it from an ordinary applied-tag `Tag(args)`).
                     try fmt.push('.');
-                    try fmt.formatCollection(region, .round, AST.Pattern.Idx, fmt.ast.store.patternSlice(t.args), Formatter.formatPattern);
-                } else if (t.args.span.len > 0) {
+                }
+                if (t.backing_value or t.has_args) {
                     try fmt.formatCollection(region, .round, AST.Pattern.Idx, fmt.ast.store.patternSlice(t.args), Formatter.formatPattern);
                 }
             },

@@ -6032,6 +6032,7 @@ fn runExprStatementKernel(
                     .args = args,
                     .tag_tok = pattern_tag_args_state.final_token,
                     .qualifiers = pattern_tag_args_state.qualifiers,
+                    .has_args = true,
                     .backing_value = pattern_tag_args_state.backing_value,
                 } });
                 continue :expr_kernel .pattern_complete;

@@ -2,18 +2,6 @@
 
 ## Active
 
-### [fuzz_crash_082](test/snapshots/fuzz_crash/fuzz_crash_082.md)
-- Fuzzer: parse (`fuzz-parse`)
-- Crash signature: `sig:06` in parse fuzzer run
-- Severity: P1
-- Repro: [test/snapshots/fuzz_crash/fuzz_crash_082.md](test/snapshots/fuzz_crash/fuzz_crash_082.md)
-- Reproducer command:
-  - `./zig-out/bin/repro-parse /tmp/roc-fuzz-plan-20260710/parse-run/default/crashes/id:000000,sig:06,src:000985,time:271224,execs:829515,op:havoc,rep:1`
-  - `cat /tmp/roc-fuzz-plan-20260710/parse-run/minimized.roc`
-- Notes:
-  - Snapshot has canonical expected sections generated from snapshot tool.
-  - This one is parser/formatter pipeline instability (`parse format output mismatch` path in `fmt` fuzzer).
-
 ### [fuzz_crash_083](test/snapshots/fuzz_crash/fuzz_crash_083.md)
 - Fuzzer: canonicalize (`fuzz-canonicalize`)
 - Crash signature: `sig:06` in canonicalize fuzzer run
