@@ -798,8 +798,8 @@ Builtin :: [].{
 						trimmed = Str.trim_start(raw)
 
 						if Str.starts_with(trimmed, "\"") {
-							value_parts = Json.split_json_string_tail(Str.drop_prefix(trimmed, "\""))?
-							Ok(JsonState.Input(Str.trim_start(value_parts.after)))
+							after_string = skip_json_string_tail(Str.drop_prefix(trimmed, "\""))?
+							Ok(JsonState.Input(Str.trim_start(after_string)))
 						} else if Str.starts_with(trimmed, "{") {
 							Json.skip_json_object(encoding, trimmed)
 						} else if Str.starts_with(trimmed, "[") {
@@ -834,8 +834,8 @@ Builtin :: [].{
 						return Err(Json.invalid_json)
 					}
 
-					key_parts = Json.split_json_string_tail(Str.drop_prefix($after_field, "\""))?
-					after_key = Str.trim_start(key_parts.after)
+					after_skipped_key = skip_json_string_tail(Str.drop_prefix($after_field, "\""))?
+					after_key = Str.trim_start(after_skipped_key)
 
 					if !Str.starts_with(after_key, ":") {
 						return Err(Json.invalid_json)
@@ -1245,26 +1245,19 @@ Builtin :: [].{
 					byte == 45
 				}
 
+			## Split a JSON string body into its decoded value and the text after the closing quote.
+			## Decodes the escape sequences JSON allows inside strings: \" \\ \/ \b \f \n \r \t and
+			## \uXXXX (with surrogate pairs combined into one code point). Unknown escapes, incomplete
+			## escapes, and unpaired surrogates are invalid JSON. Strings without escapes return
+			## zero-copy slices.
 			split_json_string_tail : Str -> Try({ value : Str, after : Str }, Json.ParseErr)
 			split_json_string_tail = |tail| {
-				quote_split = Str.find_first(tail, "\"")
-
-				match quote_split {
-					Ok(quote_parts) => {
-						slash_split = Str.find_first(tail, "\\")
-
-						match slash_split {
-							Ok(slash_parts) =>
-								if Str.count_utf8_bytes(slash_parts.before) < Str.count_utf8_bytes(quote_parts.before) {
-									Err(Json.invalid_json)
-								} else {
-									Ok({ value: quote_parts.before, after: quote_parts.after })
-								}
-							Err(NotFound) => Ok({ value: quote_parts.before, after: quote_parts.after })
-						}
-					}
-					Err(NotFound) => Err(Json.invalid_json)
+				{ body, after } = scan_json_string_tail(tail)?
+				value = match body {
+					NoEscapes(raw) => raw
+					HasEscapes(raw) => decode_json_string_body(raw)?
 				}
+				Ok({ value, after })
 			}
 
 			split_json_scalar_tail : Str -> Try({ value : Str, after : Str }, Json.ParseErr)
