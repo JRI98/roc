@@ -27,18 +27,20 @@ Everything in between those boundaries is a Cor-style typed IR pipeline:
 checked modules
   -> Monotype IR
   -> Monotype Lifted IR
+  -> optional SpecConstr
   -> Lambda Solved IR
-  -> Lambda Mono decisions
+  -> solved inline plan
+  -> direct Solved-to-LIR decisions
   -> LIR
   -> ARC insertion
   -> backend, interpreter, or LirImage
 ```
 
-There is no separate MIR layer. There is no separate stored layout IR between
-Lambda Mono and LIR. Layout selection is owned by the direct Lambda Mono to LIR
-builder. In optimized builds, Lambda Mono is represented by explicit callable
-and procedure decision tables consumed by direct LIR lowering, not by a second
-stored expression, pattern, and statement tree.
+There is no separate MIR layer and no separate stored layout IR. Layout and
+logical Lambda Mono callable/procedure decisions are owned by
+`SolvedLirLower` while it directly consumes Lambda Solved syntax. Release builds
+do not store a second expression, pattern, and statement tree. Debug builds may
+materialize Lambda Mono only to verify the direct decisions.
 
 ## Core Principles
 
@@ -101,12 +103,13 @@ wrapped around itself a runtime number of times) — so "this walk terminates"
 is an assumption, not a property, unless the walk either traverses a provably
 acyclic structure or carries an explicit budget. When a budget is exhausted,
 the walk must fail toward the conservative answer for its question — decline
-the optimization, keep the value materialized, take the boxed representation —
-never toward a hang, an unbounded specialization set, or a wrong result. The
+the optimization, keep the value materialized, or select an explicitly defined
+dynamic representation — never toward a hang, an unbounded specialization set,
+or a wrong result. The
 budget must be chosen so exhaustion errs in the safe direction for that
 specific question: a substitution check answers "cannot substitute" (a missed
-optimization), a minted-chain depth walk reports the cap (the chain takes the
-sanctioned dynamic-boundary box). Two standing instances: Monotype bounds
+optimization), and a minted-chain depth walk reports the cap (the chain takes
+the explicit `forced_dynamic` representation). Two standing instances: Monotype bounds
 minted iterator chain depth at the single construction choke point
 (`generatedIteratorType`), which is what guarantees specialization terminates
 for recursively-constructed chains regardless of call structure; and
@@ -1544,1814 +1547,231 @@ The method registry is an exact table keyed by `(MethodOwner, MethodNameId)`.
 It is not an owner-discovery mechanism. Post-check code may use it only after a
 concrete monomorphic dispatcher type has already determined the owner.
 
-### Optimized Callable-State And Control-Boundary Specialization
+### Post-Check Specialization And Iterator Representation
 
-This is the design for optimized callable-state lowering. The compiler has one
-architecture for this optimization: producer-under-demand lowering that emits
-ordinary LIR before ARC and backend code generation. Iterator-specific systems,
-cleanup passes, source-specific rules, and alternate mechanisms are not part of
-the design.
+There is one production checked-to-LIR route for every execution and code
+generation mode:
 
-This optimizer runs only in optimized code-generation modes: `--opt=size` and
-`--opt=speed`. It does not run during `roc check`, compile-time evaluation,
-dev builds, interpreter preparation, or any other non-optimized lowering path.
-Those paths must lower public Roc values directly and must not allocate dormant
-demand graphs, sparse private-state tables, loop fixed-point structures, or
-optimized worker queues. The mode gate is a construction boundary, not a
-late boolean buried in helper code.
+```text
+checked modules
+  -> Monotype
+  -> Monotype Lifted
+  -> optional Monotype Lifted SpecConstr
+  -> lifted capture recomputation
+  -> Lambda Solved
+  -> explicit solved inline plan
+  -> direct SolvedLirLower
+  -> TRMC, join scalarization, box reuse, return-slot rewriting
+  -> optional tag reachability
+  -> reachable-procedure pruning
+  -> ARC insertion
+  -> backend, interpreter, or LirImage
+```
 
-This opt-mode restriction is part of the target design. The optimizer is a
-generated-code specialization facility, so it is selected only when the user
-asks for optimized generated code. It is not a target policy, a wasm policy, an
-iterator policy, or a compile-time recovery mechanism. Checking,
-compile-time evaluation, const storage, diagnostics, interpreter preparation,
-and ordinary public-value lowering all remain correct without constructing
-optimized callable-state data. Optimized lowering may consume checked output and
-stored constants produced by those stages, but those stages must not create
-private cursor state, demand graphs, or demand-keyed workers just in case a
-later optimized build could use them.
+`src/lir/checked_pipeline.zig` owns this order. Dev and interpreter builds do
+not take a separate Lambda Mono or LIR-lowering route. Size and speed builds do
+not bypass Lambda Solved. All modes therefore consume the same Monotype type
+identities, the same Lambda Solved callable information, and the same direct
+Solved-to-LIR representation decisions.
 
-`Iter` and `Stream` are public Roc builtins whose methods remain ordinary Roc
-functions. Their public representation is the same family:
+The explicit `InlineMode` controls the optional specialization work:
+
+- `.none` skips Monotype Lifted SpecConstr and produces an empty solved inline
+  plan. Dev and interpreter modes select this.
+- `.wrappers` runs SpecConstr and produces wrapper-inline decisions from
+  Lambda Solved. Size and speed modes select this.
+- optimized eval and focused lowering tests may select `.wrappers` directly.
+
+The mode is compiler input supplied to the checked pipeline. SpecConstr and the
+solved inline analyzer consume it directly. They do not infer optimization mode
+from the target, backend, symbol names, builtin names, or emitted code. The mode
+changes optimization work, not source meaning or the stage route.
+
+`SolvedLirLower` computes the logical Lambda Mono callable, capture, procedure,
+and function-free type decisions while directly consuming Lambda Solved syntax.
+Release builds do not materialize a second Lambda Mono expression, pattern,
+statement, or local tree. Debug builds separately materialize Lambda Mono and
+compare its decisions with the direct lowerer; that verifier is not a production
+lowering route.
+
+#### Public Iterator Contract
+
+`Iter` and `Stream` remain public Roc builtins with their existing source
+types:
 
 ```roc
 Iter(item) :: {
-	len_if_known : [Known(U64), Unknown],
-	step : () -> [One({ item : item, rest : Iter(item) }), Skip({ rest : Iter(item) }), Done],
+    len_if_known : [Known(U64), Unknown],
+    step : () -> [One({ item, rest : Iter(item) }), Skip({ rest : Iter(item) }), Done],
 }
 
 Stream(item) :: {
-	len_if_known : [Known(U64), Unknown],
-	step! : () => [One({ item : item, rest : Stream(item) }), Skip({ rest : Stream(item) }), Done],
+    len_if_known : [Known(U64), Unknown],
+    step! : () => [One({ item, rest : Stream(item) }), Skip({ rest : Stream(item) }), Done],
 }
 ```
 
-`Iter.next` and `Stream.next!` return only `One`, `Skip`, or `Done`. There is no
-public `Append` step, no private step variant with different public meaning,
-and no compiler-private iterator type exposed to Roc source. The public model is
-a length hint and a zero-argument step function. Adapters such as `append`,
-`concat`, `map`, filters, ranges, and custom streams are ordinary Roc functions
-that build ordinary records and ordinary step callables.
+Adapters, custom sources, and consumers remain ordinary Roc functions. There is
+no public chain type, iterator trait, extra public step tag, or source-visible
+compiler representation. Internal representation data is attached only after
+checking, when Monotype creates concrete iterator call results.
 
-The optimized implementation target is Rust-like generated code: private cursor
-state, direct stepping, and no heap allocation for adapter wrappers in consuming
-hot paths. Rust gets that shape by making each adapter chain a distinct
-monomorphized iterator type with a `next(&mut state)` method. Roc must not copy
-that public typing design. Roc keeps the concrete public type `Iter(item)` or
-`Stream(item)`, and branches that produce different adapter chains still unify
-as that same Roc type.
+#### Explicit Iterator Representation Tiers
 
-Roc reaches the optimized shape through ordinary lambdas, lambda sets, captures,
-known constructor values, and result demand. A step field is a normal callable.
-Lambda-set solving already records finite callable targets and captures behind
-the single public callable type. Optimized post-check lowering consumes that
-ordinary compiler data and defunctionalizes reachable callable/capture graphs into
-private state machines when the surrounding code only demands private state.
-This is not an iterator source-meaning rule; `Iter` and `Stream` are important
-clients of a general callable-state and control-boundary optimization.
+A Monotype named type definition records an explicit iterator representation
+decision:
 
-The essential implementation contract is producer-under-demand lowering. When a
-consumer demands only a field, tag, payload, callable call, or loop transition,
-optimized lowering asks the producer for exactly that result. It does not first
-construct the public record, public callable, public tag, or public iterator
-wrapper and then erase it. For an iterator-consuming loop, demand reaches the
-`step` callable, the callable demand reaches the finite lambda-set targets and
-the captures those targets actually read, and each returned `One`, `Skip`, or
-`Done` value is cloned under the loop continuation's demand. The public
-`Iter(item)` record exists only when source code observes it as a public value.
+```zig
+const IteratorRepresentation = enum(u8) {
+    none,
+    minted,
+    forced_dynamic,
+};
 
-This is the Roc analogue of Rust's optimized iterator lowering, but the private
-state comes from Roc lambda-set data instead of from public type erasure. Rust
-puts adapter identity in the static type. Roc keeps adapter identity out of the
-public type and keeps it in ordinary checked callable data until optimized
-lowering consumes that data. The optimized state machine is therefore
-lowering-local data for `--opt=size` and `--opt=speed`, not a new
-source-level iterator representation.
-
-The optimizer must use actual Roc lambdas and the existing lambda-set model. It
-must not add an iterator-specific lambda-set variation, a second callable type
-system, or a public type-level encoding of adapter chains. If a callable crosses
-an erased or public boundary, ordinary public callable materialization is
-selected by explicit materialization demand. That boundary is part of the source
-program's public value behavior, not a deoptimization fallback.
-
-The selected design has these hard implementation commitments:
-
-- preserve the public `Iter` and `Stream` three-step records
-- use ordinary Roc lambdas and existing lambda-set data as the private adapter
-  shape source
-- enter optimized callable-state lowering only for `--opt=size` and
-  `--opt=speed`
-- make the optimized-mode decision before any lowering-owned optimizer state is
-  constructed
-- keep ordinary public-value lowering and optimized callable-state lowering as
-  separate construction paths, not one context with optional optimizer fields
-- clone producers under exact consumer demand before public wrappers are
-  materialized
-- represent private state sparsely by demanded checked child identity, not by
-  dense public value shape
-- solve recursive loop-carried demand with explicit loop-demand graph nodes
-- materialize public Roc records, callables, iterators, streams, tags, tuples,
-  lists, and nominals only at explicit public observation boundaries
-- emit ordinary scope-closed LIR before ARC and backend code generation
-
-The optimized entrypoint has a precise internal IR contract. This contract is
-builder-owned data inside optimized lowering, not a stored public IR stage:
-
-- `Demand` describes exactly what the current continuation observes:
-  materialization, runtime leaves, record fields, tuple items, nominal backing
-  data, tag alternatives and payloads, callable captures and results, direct
-  call results, and loop-carried values.
-- `KnownValue` and demanded-known values describe checked producer structure:
-  primitive leaves, records, tuples, nominals, tags, finite callable targets,
-  finite tag choices, and sparse demanded children by checked identity.
-- `PrivateState` describes optimized-only state that is not the public Roc
-  value. It stores only demanded children. A missing child means not carried; a
-  present unknown child means carried as a runtime leaf. For callable captures,
-  a demanded child may also be represented by an explicit supplier reference to
-  an active loop state value; that is distinct from omission, from a runtime
-  leaf, and from structural storage.
-- `FiniteCallableState` is ordinary lambda-set data plus demanded captures by
-  original capture index. Different alternatives may have different capture
-  indexes and counts without widening to a public erased callable.
-- `LoopDemandNode` represents recursive loop-carried demand by graph identity.
-  A demand may refer back to a loop parameter instead of expanding an infinite
-  structural tree. These references are legal only while the owning loop fixed
-  point is active and must be closed or resolved before crossing a worker,
-  public materialization, or LIR boundary. The same graph identity is used when
-  callable capture demand is supplied by an active loop state slot.
-- `DemandFrame` is the transient producer-consumer boundary while cloning a
-  value under demand. It owns the checked control scope for locals introduced
-  while satisfying that demand.
-- `WorkerId` is exact compiler data: callee identity, split argument data,
-  split capture data, result demand, and relevant type/layout decisions.
-
-The output contract is equally strict. Optimized lowering emits only ordinary
-scope-closed LIR. LIR does not contain `Demand`, demanded-known values,
-private-state values, finite callable-state alternatives, loop-demand nodes, or
-worker keys. ARC and backends consume ordinary LIR and explicit RC statements;
-they must not know whether the original source value was an iterator, stream,
-callable adapter, or private cursor.
-
-The following obsolete paths conflict with this contract and must stay deleted:
-
-- public or private `Append` step variants
-- explicit iterator-plan, stream-plan, or adapter-chain IR
-- source-form rewrites for `for`, `if`, `match`, `Iter.append`, or
-  `Stream.next!`
-- late cleanup passes that first materialize public wrappers and then try to
-  remove them
-- recursive direct-call expansion used as a substitute for loop-demand graph
-  nodes
-- final-code, symbol-name, wasm-byte, disassembly, target, or Rocci Bird
-  recognition rules
-
-None of those commitments is iterator-specific. They are the general optimized
-post-check lowering contract that happens to make `Iter` and `Stream` optimize
-to the Rust-like cursor shape when the checked program exposes finite callable
-data under demand.
-
-The concrete algorithm is selective demand-specialized lowering. It is not a
-source-loop rewrite, a source-conditional rewrite, a builtin iterator rewrite,
-or a late cleanup pass. A consumer creates exact result demand, optimized
-lowering clones the producer while that demand is active, and the same cloning
-context creates any private state machine, finite callable dispatch, or
-demand-keyed worker required by the data exposed during cloning. The optimizer
-may emit direct workers or LIR joins for compiler-created private state, but
-those workers are internal generated code; they do not change source loop
-behavior, source mutable-variable behavior, or public Roc value
-identity.
-
-The optimized callable-state path is an optimized-code-generation facility, not
-a correctness mechanism. It is allowed to spend extra time specializing calls,
-control-flow boundaries, and loop-carried private state only when the user has
-asked for optimized generated code. Non-optimized lowering must remain the
-straight public-value path; it must not construct optimized-demand data,
-attempt the optimized path speculatively, or depend on optimized state to
-preserve observable Roc behavior.
-
-Dev, check, interpreter, and compile-time-finalization paths use the
-ordinary-public-value lowering architecture. `--opt=size` and `--opt=speed`
-enter optimized callable-state lowering from the beginning, before public
-wrappers are created.
-
-The implementation consequence is strict: the post-check driver first classifies
-the requested build into exactly one of two lowering families, then constructs
-only the matching context. Ordinary public-value lowering has no result-demand
-arena, demanded-known-value arena, sparse private-state table, loop fixed-point
-graph, or demand-keyed worker queue. Optimized callable-state lowering owns all
-of those structures and is constructible only from the `--opt=size` or
-`--opt=speed` entrypoint. A helper that creates or consumes optimized demand,
-private state, loop graph nodes, or optimized workers must require the optimized
-context explicitly. Calling such a helper from ordinary lowering should be an
-API/type error, or at minimum a debug invariant violation at the optimized
-context boundary.
-
-Both optimized modes use the same callable-state specialization behavior.
-`--opt=size` and `--opt=speed` may differ later through backend optimization
-preferences, but they do not select different producer-under-demand rules,
-private-state representations, loop-demand fixed-point behavior, callable
-defunctionalization behavior, or public materialization boundaries. Focused
-optimizer-shape tests must therefore exercise both optimized modes with the
-same expected optimizer-owned data unless the test is explicitly about a later
-backend size-vs-speed preference.
-
-This mode boundary is allowed because the transformation is a generated-code
-optimization, not a source-language requirement. All modes must report
-the same checking diagnostics, run the same eligible compile-time expressions,
-preserve the same public iterator/callable immutability, and produce the same
-observable Roc behavior. Optimized modes may spend extra compiler time to avoid
-constructing public wrappers in hot paths; non-optimized modes may construct
-those public wrappers normally.
-
-The opt-mode gate is also the compile-time-performance contract. Demand
-propagation, sparse private-state construction, finite callable splitting, loop
-fixed-point solving, and demand-keyed worker generation are intentionally
-stronger than ordinary public-value lowering, and they are paid for only when
-the user requests optimized generated code. Correctness, diagnostics, checking,
-compile-time evaluation, static storage, and interpreter behavior must not
-depend on this optimizer. If an optimized-mode regression reveals missing
-checked data, the producer of that data must be fixed; non-optimized modes
-must not grow dormant optimizer state just to share the fix.
-
-This means the optimizer may use more expensive exact machinery than a dev
-lowering path would tolerate. It may create demand graphs, revisit provisional
-loop-edge clones when a fixed point grows, and create demand-keyed direct-call
-workers. That cost is acceptable only because the entrypoint is restricted to
-`--opt=size` and `--opt=speed`. The same design would be wrong if it ran during
-`roc check`, dev builds, interpreter preparation, or compile-time
-finalization. Those paths need low latency and public-value lowering, not
-Rust-like private cursor specialization.
-
-The compile-time performance contract is structural, not a benchmark-only
-promise. Non-optimized paths must be unable to allocate optimized-demand
-arenas, private-state tables, loop fixed-point graphs, or worker queues.
-Optimized helpers must require the optimized context in their API, so ordinary
-lowering cannot accidentally pay for specialization through a cold branch,
-nullable field, or lazy constructor. Performance tests may measure the
-boundary, but the primary proof is ownership: the data needed by this optimizer
-does not exist outside the optimized lowering context.
-
-Within optimized modes, compile-time cost is bounded by explicit optimizer work
-items: distinct result demands, sparse private-state nodes, finite callable
-alternatives, loop-demand graph nodes, and demand-keyed direct-call workers.
-Those keys are exact compiler data, not source-form heuristics. There is no
-state-count cutoff or "try optimized and fall back" escape hatch; if the graph
-is larger than expected, the correct fix is more precise demand production,
-better sharing of equivalent exact keys, or removal of unnecessary demanded
-public observations.
-
-This is not a heuristic and not a fallback boundary. The build mode selects the
-lowering architecture before optimized state exists. `--opt=size` and
-`--opt=speed` construct optimized callable-state lowering; every other mode
-constructs ordinary public-value lowering. If optimized lowering discovers that
-it needs explicit compiler data that was not produced, that is a compiler bug in
-the relevant producer, not permission to materialize a public wrapper, scan
-finished LIR, or retry through ordinary lowering.
-
-The optimization is enabled only for optimized code generation:
-
-- on for `--opt=size`
-- on for `--opt=speed`
-- off for every other optimization mode
-- off for `roc check`
-- off for compile-time finalization
-- off for interpreter builds
-- off for dev builds
-
-This is a hard allowlist, not a target policy. Wasm targets, native targets,
-tests, package builds, and hosted builds do not get this optimizer unless the
-selected build mode is `--opt=size` or `--opt=speed`. The post-check driver
-receives explicit build-mode data and chooses either ordinary public-value
-lowering or optimized callable-state specialization before constructing the
-lowering context. Non-optimized modes must not allocate result-demand
-structures, demanded-value arenas, private-state graphs, or optimized worker
-queues just to discard them. The mode decision is explicit compiler input; no
-stage may infer it from target triples, wasm output, backend choice, method
-names, builtin names, generated symbols, object bytes, or backend output.
-
-The gate should be represented as a small post-check lowering choice made
-before lowering state exists. One branch constructs the ordinary public-value
-lowering context. The other branch constructs the optimized callable-state
-context. Those context types must not be the same struct with nullable
-optimized fields, because that would let ordinary lowering accidentally pay
-the optimizer's allocation cost or call optimized-only helpers. The explicit
-build-mode decision is consumed at this boundary; after that, optimized helpers
-are reachable only through the optimized context's API.
-
-The mode classifier is deliberately smaller than the full build configuration.
-It answers one question for post-check lowering:
-
-```text
-ordinary public-value lowering
-optimized callable-state lowering
+const TypeDef = struct {
+    // declaration identity fields
+    generated: ?TypeDigest = null,
+    iterator_representation: IteratorRepresentation = .none,
+    iterator_depth: u8 = 0,
+};
 ```
 
-Only `--opt=size` and `--opt=speed` map to optimized callable-state lowering.
-Every other build mode maps to ordinary public-value lowering. The classifier
-must be computed once by the post-check driver and passed as explicit data into
-lowering construction. Lowering code must not re-read target options,
-optimization names, target triples, backend choices, or wasm-specific settings
-to decide whether it owns optimized-demand state.
-
-The classifier is consumed at construction time; it is not a global setting that
-optimized helpers can query later. After construction, ordinary lowering and
-optimized lowering should be represented by different context/API shapes. An
-optimized helper should require optimized-owned data in its arguments, and that
-data should not exist in ordinary lowering. This makes accidental use of the
-optimizer from dev/check/interpreter paths structurally impossible instead of
-depending on a runtime mode check.
-
-This gate is part of the optimizer's data-ownership model. Optimized demand
-state is not a dormant field on ordinary lowering, and ordinary lowering must
-not be able to manufacture an optimized context. `--opt=size` and `--opt=speed`
-enter the same callable-state specialization entrypoint and use the same
-producer-under-demand behavior; any later size-vs-speed differences belong to
-backend optimization preferences, not to the callable-state optimizer.
-Focused regressions for optimizer-owned data must therefore run in both
-optimized modes with the same expected private-state shape.
-
-The implementation boundary should be visible at construction time. The
-post-check driver first classifies the requested build as ordinary lowering or
-optimized lowering, then constructs exactly one matching context. Ordinary
-lowering has no nullable optimized context, no lazy demand-state constructor,
-and no helpers that accept "maybe optimized" state. Optimized lowering receives
-an optimized context whose type owns demand frames, sparse private-state tables,
-loop fixed-point work, and demand-keyed workers. Any helper that needs one of
-those structures must require that optimized context directly, so calling it
-from ordinary lowering is an API error rather than a mode check buried inside
-the helper.
-
-Focused tests should prove this boundary directly. A negative test should be
-able to lower the same small program through dev/check/interpreter-style paths
-without constructing the optimized context. Positive tests for `--opt=size` and
-`--opt=speed` should observe the same optimized entrypoint and the same
-optimizer-owned data before backend-specific size or speed preferences run.
-The proof must come from compiler-owned lowering/test data, not from final wasm
-size, generated symbol names, disassembly, or backend output.
-
-The optimized path is a different post-check lowering entrypoint, not a cleanup
-pass after ordinary lowering. It may create extra private workers, private
-state loops, and demand-specific direct calls while cloning optimized code. The
-ordinary public-value path never constructs that optimized-only state.
-Conversely, optimized lowering must not first build public iterator/callable
-wrappers and then try to remove them later; avoided materialization is the
-design, not a post-pass improvement.
-
-There is also no "try optimized, then fall back to public lowering" path inside
-the optimized entrypoint. If optimized lowering needs compiler data, that data must be
-explicit optimized input produced by checking, lambda-set solving, known-value
-construction, result-demand propagation, or loop fixed-point solving. Missing
-required optimized data is a compiler bug to fix at the producer; it is not a
-reason to guess from source syntax, recognize a builtin name, inspect lowered
-symbols, scan finished LIR, or silently materialize a public wrapper.
-
-This is also not a new whole-program pass between Lambda Mono and LIR. The
-optimized entrypoint may use local work queues, demand fixed points, and worker
-queues as implementation structure, but those structures are owned by the
-single optimized lowering operation. They are created only after the build mode
-has selected `--opt=size` or `--opt=speed`, and they are consumed before LIR is
-emitted. Ordinary lowering emits public values directly; optimized lowering
-emits ordinary LIR after deciding, under demand, which public values never need
-to be materialized.
-
-The optimizer may have temporary lowering data for demanded values, private
-state, loop graph nodes, and worker requests, but that data is not a stored IR
-and does not require a later elimination or materialization pass. Each producer
-is cloned while the relevant demand is active. The clone either emits ordinary
-LIR for a materialized public value, emits ordinary LIR for a demanded private
-state transition, or queues an optimized worker owned by the same lowering
-context. There is no phase that first builds plan values and then converts them
-into LIR afterward.
-
-The entrypoint gate is also the compile-time-cost gate. Result demand,
-demanded-value arenas, private-state graphs, worker queues, and loop fixed-point
-work are constructed only after the post-check driver has selected the optimized
-entrypoint. `--opt=size` and `--opt=speed` use the same optimizer and differ
-only in later optimization preferences. Dev, check, interpreter, and
-compile-time-finalization paths do not build these structures and do not rely on
-them for correctness.
-
-Every correctness and generated-code invariant of this optimizer applies to
-both optimized modes. A specialized shape proved only for `--opt=size` is not
-landed; the same focused property must also be proved for `--opt=speed` unless
-the test is explicitly about a later size-vs-speed backend preference. The
-callable-state optimizer itself has no size-only or speed-only behavior.
-
-The gate must be represented in the implementation as data ownership, not as a
-boolean checked deep inside lowering. Ordinary public-value lowering owns no
-result-demand arena, no demanded-value arena, no private-state graph, no
-optimized worker queue, and no state-machine fixed-point storage. Optimized
-lowering owns those structures and receives them only from the optimized
-entrypoint. If a helper needs access to optimized state, its caller must already
-be in the optimized lowering context; ordinary lowering must be unable to
-construct a dormant optimized context by accident.
-
-The optimized context owns all temporary specialization state:
-
-- result demand and demanded known values
-- sparse private-state keys and runtime leaves
-- finite callable-state alternatives
-- loop-parameter demand fixed points
-- demand-keyed direct-call workers
-
-None of those structures are checked output, LIR, ARC input, backend metadata,
-or interpreter metadata. They are local implementation data for the optimized
-entrypoint and must be consumed before LIR emission. The ordinary lowering
-context must not have nullable copies of these fields, debug-disabled versions
-of these fields, or lazy constructors for these fields.
-
-This ownership split is also the implementation split. The post-check driver
-owns the build-mode decision. Ordinary lowering owns public Roc value
-construction. Optimized lowering owns producer-under-demand cloning, sparse
-private-state construction, finite callable-state splitting, loop-demand fixed
-points, and demand-keyed workers. Direct LIR construction receives the ordinary
-control flow and value operations produced by whichever lowering context was
-selected; it must not receive an optimizer side table that later stages need to
-interpret. If LIR, ARC, a backend, or LirImage would need to know that a value
-was an iterator, stream, private cursor, or optimized callable state, the
-optimized lowering boundary has leaked and must be fixed before LIR emission.
-
-This gate is an ownership boundary in the implementation, not just a conditional
-inside the optimizer. Ordinary public-value lowering must not import, allocate,
-initialize, or retain dormant optimized-demand state. The post-check driver
-passes an explicit mode decision into lowering construction, and the optimized
-entrypoint is the only place that may create demand tables, private-state
-arenas, state-machine work queues, or demand-keyed optimized workers. If a
-future build mode wants this generated-code optimization, it must be added to
-the explicit allowlist; no consumer may infer it from target, backend, source
-constructs, package metadata, or output format.
-
-There is no iterator-plan value, adapter-chain IR, or separate elimination pass.
-The only representation before LIR is ordinary Monotype/Lambda Mono data plus
-optimized lowering's local demand, known-value, private-state, and worker
-tables. Those tables are consumed while the optimized body is cloned and
-lowered. The output is ordinary LIR control flow and ordinary LIR values.
-
-This is not a source-level loop-to-recursive-function transform. Optimized
-lowering may emit demand-specific private workers and state-machine joins, but
-those are implementation details created while lowering already checked control
-flow. A source loop remains source loop behavior: outer mutable variables,
-branch conditions, guards, scrutinees, appended item expressions, stream
-effects, `dbg`, `expect`, `crash`, `break`, and `return` keep their checked
-evaluation order and control behavior. The optimizer may update only
-compiler-created private cursor state; it must not turn a public Roc value or a
-source mutable variable into hidden mutable iterator state.
-
-Control-boundary specialization means optimized lowering may clone a producer
-through the continuation that immediately consumes it. A branch expression
-clones each branch result under the continuation's result demand. A match
-clones the scrutinee under explicit tag and payload demand, then clones branch
-results under the outer demand. A loop solves loop-parameter demand as a fixed
-point over body observations and reachable `continue` edges. A direct call may
-create an optimized worker keyed by callee identity, argument data, and result
-demand. These are all the same optimization family: defunctionalization and
-specialization under exact demand. They are not separate rules for `for`, `if`,
-`match`, or iterator builtins.
-
-The shared abstraction is a demand frame over a checked producer-consumer
-boundary. A demand frame contains the result demand, the checked control scope
-that owns any locals produced while satisfying that demand, and the optimized
-context that owns private state and worker queues. When a producer crosses a
-control boundary, optimized lowering does not ask which source construct it
-came from. It pushes the same demand into each reachable predecessor value,
-keeps branch-local and match-payload locals inside the cloned region that owns
-them, and re-joins only scope-closed private state or ordinary materialized
-values. This is the mechanism that makes branches, matches, loop transitions,
-and direct-call workers one design instead of several source-form rules.
-
-Demand frames are an implementation structure of the optimized entrypoint, not
-a persistent IR stage. They may be represented as builder-owned work items,
-state-machine nodes, or demand-keyed worker requests, but they must be consumed
-before LIR emission. The output of the optimized entrypoint is still ordinary
-LIR; neither LIR nor ARC receives a "demand frame" concept.
-
-This design follows the same broad precedent as closure conversion,
-defunctionalization, partial evaluation, and iterator or coroutine
-state-machine lowering in optimizing compilers. The important Roc-specific
-constraint is that the specialized state machine is never the public source
-type. Public Roc values remain ordinary immutable values; compiler-created
-private state exists only inside optimized lowering and disappears into ordinary
-LIR before ARC and backend code generation.
-
-The optimizer does not introduce a new global pass over finished code. It works
-where the producer and consumer meet: a consumer creates exact demand, the
-producer is cloned under that demand, and any private worker or private state
-loop is emitted from that same cloning context. Later stages should never need
-to infer that an iterator wrapper, callable wrapper, or public record was
-accidentally materialized and should have been avoided.
-
-The implementation may organize optimized lowering into helper phases, but those
-phases are internal to the optimized entrypoint and operate on explicit demand
-and known-value data as the body is cloned. They are not a second source-language IR, a
-whole-program cleanup pass, or an analysis that ordinary lowering has to run and
-then ignore.
-
-The optimized entrypoint is the only place that may run the extra demand work.
-If a helper would need result demand, demanded known values, sparse private
-state, state-machine fixed points, or demand-keyed worker creation, that helper
-belongs to the optimized lowering context. If ordinary public-value lowering
-needs the same source program to compile, it must do so through the ordinary
-materializing path without constructing dormant optimized state.
-
-The optimized entrypoint may contain internal helper phases, but those phases
-are ordered by data dependency, not by source syntax:
-
-1. establish the consumer's result demand
-2. clone the producer under that demand
-3. refine finite callable/tag/direct-call data exposed by that clone
-4. solve any loop-carried demand fixed point created by reachable transitions
-5. emit ordinary LIR from the resulting private state or materialized value
-
-No phase may recover missing demand from names, lowered symbols, backend
-output, wasm bytes, disassembly, or completed LIR. If a later helper needs
-compiler data, the earlier clone-under-demand step must produce it explicitly.
-
-This boundary is about compiler cost and generated code quality, not
-correctness. Checking, static-dispatch finalization, compile-time root
-selection, compile-time evaluation, static data emission, and
-`crash`/`dbg`/`expect` diagnostics are required in all modes and must not depend
-on this optimizer. Compile-time evaluation may produce constants that optimized
-lowering later consumes, but it must not construct optimized runtime private
-state. Build modes may differ in generated code size, generated code speed, and
-compile time, but never in observable Roc behavior.
-
-The optimizer is opt-mode-only because it deliberately performs extra
-post-check work: demand propagation, finite callable-state splitting,
-demand-specific direct-call worker discovery, and loop-state fixed points. Those
-costs are justified when the user asks for optimized generated code. They are
-not justified for fast feedback paths. Dev builds should favor low compiler
-latency and debuggable public-value code. `roc check` and compile-time
-evaluation must report the same checking results without constructing private
-runtime state. Interpreters and backend-independent consumers must see the
-ordinary public lowering path unless they explicitly request optimized code.
-
-Optimized callable-state specialization uses one set of generic compiler data:
-
-- direct-call targets
-- finite lambda-set callable targets
-- callable captures
-- known records, tuples, tags, nominals, and primitive leaves
-- checked type and layout decisions
-- explicit result demand
-
-The same mechanism applies to any ordinary Roc value whose producer and
-consumer expose enough checked data under demand. `Stream` does not get a
-separate compiler rule, `Iter` does not get a separate compiler rule, and a
-record wrapping a primitive does not get a more powerful rule than the primitive
-itself. The optimizer specializes callable state because the checked program
-contains finite callable data, not because a value has a particular builtin
-name.
-
-The intended implementation therefore has two explicit post-check lowering
-contexts. Ordinary lowering owns public-value construction and has no demand
-arena, demanded-known-value table, sparse private-state table, worker queue, or
-loop-state fixed-point storage. Optimized lowering owns those structures and is
-constructible only from the `--opt=size`/`--opt=speed` entrypoint. Helpers that
-create or consume optimized-only data must take the optimized context
-directly; ordinary lowering should be unable to call them by accident.
-
-The pass must not recognize source `for`, source `if`, source `match`,
-`Iter.append`, `Stream.next!`, wasm targets, Rocci Bird, public builtin names,
-or generated symbol names as optimization triggers. Source `for` lowers through
-the ordinary public `.iter` and `.next` meaning. Source `if` and `match` lower
-as ordinary control flow. The optimizer observes the generic demand and
-callable-state data created by that lowered code; it never asks which source
-construct produced them.
-
-Control-flow precision comes from the checked/Lambda representation that is
-already being lowered, not from source-shape rules. Branches merge demanded
-results because the continuation demands a value from the branch expression.
-Matches demand tag choices and payloads because the continuation observes those
-data. Loops demand parameters because body observations and reachable
-`continue` edges consume those parameters. These are ordinary producer-consumer
-relationships in the lowered program, so adding support for one control-flow
-form must not add a separate rule for a builtin or syntax form.
-
-Result demand is the optimizer's exact statement of how the current continuation
-will use a value. Required demand forms are:
-
-- materialize the ordinary public Roc value
-- use a runtime leaf as private state
-- read record fields by field name
-- read tuple items by original item index
-- unwrap nominal backing data
-- inspect a tag and read demanded payloads by original payload index
-- call a callable and read demanded captures by original capture index
-- consume a direct-call result under another demand
-- carry loop values through initial values and `continue` edges
-
-Demand is threaded through cloning. It is not a late program scan and not a
-cleanup pass. Field access clones the receiver under field demand. Tuple access
-clones the receiver under item demand. A tag match clones the scrutinee under
-tag demand. A call through a known callable clones the callable under call
-demand, then clones the selected body under the caller's result demand. A loop
-clones initial values, body observations, and `continue` edges under the
-fixed-point demand for loop parameters. If the surrounding context needs an
-ordinary Roc value, the demand is materialization and public lowering is used.
-
-Demand propagation is the only source of private state shape. Optimized
-lowering must not derive private state by starting with a dense public value and
-dropping fields opportunistically. It must also not rediscover demand by
-scanning completed LIR, symbol names, generated code, wasm disassembly, or
-backend output. If a producer needs a private shape, that requirement must be
-visible as explicit demand at the point where the producer is cloned.
-
-Loop-carried state products are paired with their entry products. For each loop
-parameter, optimized lowering applies the normalized loop demand to the original
-entry value and derives both the state identity and the entry split from that
-same demanded value. If applying demand produces sparse private state, the loop
-state identity is the demanded private-state shape, not an unknown public leaf
-of the same type. If later loop-body demand grows, the demanded product is
-rebuilt from the original entry value under the grown demand. It is illegal to
-derive a state identity from a previously split sparse value, from an ordinary
-public `any` placeholder, or from a later materialization attempt.
-
-Known values are optimizer data, not runtime values. They are not limited to
-aggregate source syntax. Primitive leaves are first-class known values, so a
-`U64` loop cursor must optimize the same way whether it appears directly or
-inside a single-field record. Records and tuples are only one way to expose
-children; wrapping a primitive in a record must never be required to make it
-optimizable.
-
-Known children must distinguish "unknown but carried" from "not demanded."
-Dense child arrays cannot represent that distinction for tuple items, tag
-payloads, or callable captures. The private-state representation therefore
-stores demanded children sparsely by checked child identity: record field name,
-tuple item index, tag payload index, nominal backing value, and callable capture
-index. A missing child means private state does not carry it. A present child
-whose data is unknown means private state carries the runtime value but has no
-more precise structure.
-
-Loop-carried private state also identifies its origin. When optimized lowering
-reconstructs loop-parameter private state for a state body, every private
-callable in that reconstruction records the owning loop parameter and the
-demanded path from that parameter to the callable. This origin is provenance,
-not state identity: it contributes no state slots and does not participate in
-private-state equality. It exists because a loop-state callable is the loop
-state at that path, so what its call sites observe is loop-parameter demand.
-
-Calling a loop-state callable is a loop body observation. The loop parameter
-local itself is substituted away while a state body is cloned, so ordinary
-local-demand observation cannot see it, and split-local provenance only carries
-demand for generated leaf locals. The callable's result demand has no leaf to
-attach to, and demanded-known callable products do not store result demand, so
-no other channel can return it to the demand owner. Therefore the
-private-callable call lowering must merge the observed callable demand — the
-per-alternative derived capture demands together with the observed result
-demand — into the owning loop parameter demand at the recorded origin path.
-Without this channel the loop demand node keeps a stale callable result demand,
-per-alternative capture derivation under that stale result correctly omits
-captures that later iterations need, and the state key can never carry them.
-
-When this observation grows the owning loop demand while a state body is being
-cloned from the now-stale state key, the state-body clone cannot bind a
-demanded capture that the stale key omitted. That is not a missing-capture
-compiler bug and not a site for placeholder values: the owning state-loop fixed
-point must abort the stale state-body clone and re-key from the original entry
-values under the grown normalized demand, exactly as it already does when
-demand grows between state bodies. Exactly one owner reacts to this growth: the
-state-loop fixed point that owns the grown parameter. A nested fixed point that
-observes the abort without its own demand having grown must pass the abort to
-its owner. A demanded capture that is absent when the owning loop demand did
-not grow remains an invariant violation.
-
-Callable captures have one additional private-state source: a capture may be
-supplied by an active loop state value through a loop-demand node. This is how a
-recursive iterator step closure can refer to the current cursor without storing
-the cursor inside itself and expanding forever.
-
-A loop supplier is a demanded/private value shape, not a demand tree. It is
-keyed by the active loop fixed point, the original loop parameter identity, and
-the demanded path from that parameter to the supplied value. The path uses the
-same checked child identities as sparse private state: record field name, tuple
-item index, tag payload identity, nominal backing, and callable capture index.
-The producer that creates the supplier must also merge the supplied capture's
-use demand back into the owning loop parameter demand at that path. Once that
-merge has happened, the supplier itself contributes zero state slots and zero
-compact-result slots. It is a reference to state already owned by the loop fixed
-point.
-
-Supplier references are explicit optimizer data. They must be produced from
-loop-state provenance: either the loop parameter itself or a generated private
-state local whose provenance records the original loop parameter and path. They
-must not be inferred from source names, debug ids, equality with the current
-sparse value, the incidental contents of a substitution table, or because a
-capture happened to be available while cloning one particular body.
-
-A supplier reference may appear only inside optimized demanded/private callable
-state owned by the active loop fixed point. It is illegal at public
-materialization boundaries, worker boundaries, ordinary public callable
-materialization, stored constants, LIR, ARC, and backends. While inlining the
-callable body inside the owning fixed point, the consumer resolves the supplier
-by reading the current active loop parameter private value at the recorded path
-and binding the source capture local to that private value. If the reference
-cannot be resolved through the owning fixed point, that is a compiler bug; the
-consumer must not materialize the public callable or structurally expand the
-loop state to recover.
-
-Sparse demanded private state must not be forced through the ordinary dense
-public `Value` representation. Ordinary public values require all children
-needed by the public layout. They cannot represent "capture 2 is present and
-capture 0 is absent" or "the tag choice is present and payloads are absent"
-without inventing fake children. Sparse private state may be converted to an
-ordinary public value only at an explicit materialization boundary.
-
-Every private state value is closed over the state boundary where it is used. A
-state body may read only its state parameters, globals/constants, and locals
-bound inside that state body. If a demanded value depends on a local introduced
-by a branch, match payload, guard, pending let, or nested control region, the
-optimizer must either keep the binding control inside the state body that uses
-the local or turn the local's value into an explicit runtime leaf carried across
-the state transition. It must never create a specialized state whose body refers
-to a local that was bound only in a different branch or predecessor state.
-
-This is a lowering invariant, not an ARC or backend repair opportunity. LIR
-joins and blocks receive explicit parameters. ARC certifies ownership of those
-parameters and locally bound values; it must not infer missing state parameters
-from out-of-scope references. A scope-closure failure in optimized lowering is a
-compiler bug that must be caught before ARC insertion.
-
-Callable-state specialization is defunctionalization driven by result demand.
-When a demanded callable has finite known targets, each target plus its demanded
-captures is a private state alternative. A single known target can inline
-directly. Multiple known targets become a state-machine dispatch before public
-callable materialization. The selected target may change as the state machine
-advances; for example, an append iterator can move from the append wrapper to
-the source iterator and then to the empty iterator. Those finite alternatives
-remain private states instead of being widened to an opaque callable merely
-because different edges have different targets or capture shapes.
-
-Loop-carried demand is a fixed point. The loop body creates demand on loop
-parameters from observations such as field reads, tuple reads, tag matches,
-callable calls, direct-call results, and public materialization. Each reachable
-`continue` edge then clones the value for parameter `i` under the current demand
-for parameter `i`; that clone may add demand to other loop parameters through
-values it reads. The loop demand is complete only when reachable body
-observations and reachable `continue` edges stop changing loop-parameter
-demand.
-
-Loop-carried demand is recursive data. An iterator state demand can say "read
-the `step` callable"; the result demand for that callable can say "when the
-step returns `One`, carry the `rest` payload as the next value for this same
-loop parameter." That is not a finite tree without either losing information or
-growing forever. The optimized lowering context must therefore represent
-loop-parameter demand as explicit graph nodes owned by the loop fixed point.
-Nested demands may refer back to a loop-parameter demand node instead of
-copying the current demand tree. Equality, merge, and worklist scheduling must
-operate on those graph identities and their monotonic contents, not on
-structural expansion of an infinite `rest.step.result.rest...` tree.
-
-Loop-demand graph references are allowed only inside the optimized loop fixed
-point that owns them. A nested demand may point at a loop-parameter node, but a
-producer may inspect that reference only by resolving it through the current
-fixed-point contents. If resolving a reference would require public
-materialization, the surrounding demand must explicitly be materialization.
-Using public wrapper construction merely to break a recursive demand graph is a
-compiler bug.
-
-The fixed point is over compiler-owned loop-carried private state, not over all
-program variables in scope. A loop may read or write ordinary source variables,
-call effectful stream steps, return, break, or evaluate diagnostics exactly as
-the checked program says. Those operations remain in ordinary control flow.
-Only values that the optimized lowering itself has split into private state
-become private loop parameters. If a value must be observed through the public
-Roc representation, materialization demand ends the private-state path for that
-value.
-
-The fixed point is exact, not heuristic. There is no state-count cutoff,
-size-count cutoff, or fallback path. If the graph grows unexpectedly, the fix is
-to make demand propagation more precise, share equivalent states, or remove
-unnecessary source demand. Silently disabling the optimization for a large graph
-would make post-check output depend on an arbitrary implementation limit and is
-not allowed.
-
-Loop values may include runtime leaves, known aggregate structure, known tags,
-and known callable alternatives. Runtime leaves are loop parameters; they are
-not finite-state dimensions. Known tag and callable choices are finite private
-states only when demanded. This keeps an iterator phase change, such as an
-append wrapper advancing to its source iterator, as an explicit private state
-transition without making ordinary numeric cursor values explode the state
-graph.
-
-For `Iter` and `Stream`, a consuming loop that only steps the value demands the
-step callable and the captures needed by that callable. It does not demand
-`len_if_known`, so private loop state must not carry the public size-hint field
-or execute size-hint overflow/sentinel bookkeeping. If source code reads the
-size hint, returns the iterator, stores it, passes it to unspecialized code, or
-directly observes the public step result, that use creates materialization or
-field demand and the ordinary public fields are preserved.
-
-Public iterator and stream values remain immutable and reusable. Source such as:
-
-```roc
-iter = [1, 2].iter()
-saved = iter
-
-for item in iter {
-	{}
-}
-
-use(saved)
-```
-
-must not mutate `saved`. Any cursor mutation introduced by optimization belongs
-to compiler-created private loop state derived from `iter`, not to the public
-Roc value. This rule is the same for pure `Iter` and effectful `Stream`; stream
-effects still occur exactly when the source program steps the stream.
-
-Some uses require the public representation: storing or returning an iterator
-as an ordinary value, passing it to unspecialized code, directly matching on the
-public result of `Iter.next` or `Stream.next!`, or otherwise observing the
-public callable/record value. At those boundaries the compiler builds the
-ordinary public record, callable value, and step-result tag. That is ordinary
-lowering selected by materialization demand, not a post-link cleanup pass.
-
-Finite and infinite iterators use the same public model. An unbounded range or
-custom Fibonacci-style iterator is just a step callable that may never produce
-`Done` unless a later adapter does. Optimized finite consumers may become
-bounded private loops when known values prove a bound; otherwise they remain
-ordinary potentially nonterminating Roc computations.
-
-The optimization creates extra direct-call workers only from explicit call
-patterns discovered while cloning optimized code. Worker identity includes the
-callee identity, split argument data, result demand, and relevant type/layout
-decisions. The original public-ABI body remains available. Extra workers are
-implementation details for optimized direct calls and callable-state
-specialization, not replacements for public callable boundaries.
-
-Private state machines lower to existing LIR control flow before ARC and
-backend code generation. Each private state becomes an ordinary join/block or
-equivalent loop shape, and each transition becomes a direct jump with explicit
-values. LIR, ARC, LirImage, the interpreter, LLVM, object, wasm, and Binaryen
-code do not know iterator rules, stream rules, public step-callable layouts, or
-reference-count policy for iterator wrappers. ARC remains the only owner of
-reference-count insertion.
-
-The opt-mode gate is part of the correctness boundary for the implementation,
-not a tuning knob inside the optimizer. The compiler has two construction
-paths after checking:
-
-- ordinary public-value lowering, which constructs no result-demand arena,
-  private-state graph, loop fixed point, or demand-keyed worker queue
-- optimized callable-state lowering, which exists only for `--opt=size` and
-  `--opt=speed` and owns all of those structures
-
-The ordinary path must remain able to lower every checked program by
-materializing ordinary Roc values. The optimized path may spend extra compiler
-time to avoid materialization under explicit demand, but it must produce the
-same observable Roc behavior. This separation is why the optimizer is not run
-from `roc check`, compile-time evaluation, dev builds, interpreter paths, or
-non-optimized builds. Those paths need correctness and diagnostics, not
-Rust-like generated-code specialization.
-
-The optimized lowering pipeline owns these pieces as one coherent system:
-
-- an explicit `--opt=size`/`--opt=speed` entrypoint gate
-- result demand as first-class optimizer data
-- sparse demanded private state for records, tuples, tags, nominals, callables,
-  and primitive leaves
-- demand-aware cloning through calls, branches, matches, and loops
-- finite callable-state defunctionalization from ordinary lambda-set data
-- loop-parameter demand fixed points over observations and reachable
-  `continue` edges
-- demand-keyed optimized direct-call workers
-- explicit public materialization boundaries
-
-Later stages must see only ordinary LIR. If a private-state shape is discovered
-only by scanning completed LIR, generated symbols, wasm bytes, object bytes, or
-disassembly, the implementation has missed the producer-consumer boundary where
-that data should have been produced.
-
-If an optimized path needs information that is not available, the fix is to make
-an earlier stage produce that information explicitly. It is not acceptable to
-recover the data from source syntax, builtin names, generated symbol names,
-completed LIR, backend output, wasm bytes, object bytes, or disassembly. If an
-ordinary public value must be observed, optimized lowering materializes it at
-that point. If it does not need to be observed, optimized lowering avoids
-constructing it in the first place.
-
-Focused tests must cover structurally equivalent source forms that previously
-optimized differently. In particular, primitive private state and a
-single-field record wrapper around that primitive must reach the same optimized
-shape under the same result demand. This proves the optimizer is using checked
-data and demand, not aggregate source shape, as its source of private state.
-
-The success condition is backend-neutral. A Rocci Bird `--opt=size` wasm build is
-an important integration proof, but the invariant is stronger: focused compiler
-tests must show that `.iter()` and direct-list source forms have equivalent
-optimized hot-path state, no public iterator wrapper allocation, no
-unobserved `len_if_known` work, and no iterator-specific rules in LIR, ARC, or
-backends. Rust's iterator output is the performance reference shape, not the
-source-language model Roc should copy.
-
-The implementation is complete only when those focused tests explain the
-generated-code shape without consulting wasm size, disassembly, generated symbol
-names, or Rocci Bird-specific source structure. Disassembly and byte-size
-comparisons are still useful final evidence, but they are not the source of
-truth for deciding whether the optimizer may fire.
-
-Some method registry targets are generated structural targets rather than
-procedure bodies. A nominal or opaque type can opt in to a compiler-derived
-structural codec with an annotation-only associated method such as
-`parser_for : _` or `encoder_for : _`. Canonicalization may represent this marker
-as `e_anno_only` or, for hosted/type-module processing, as a zero-argument
-`e_hosted_lambda`; `CheckedModule.method_registry` records it explicitly as a
-generated parser or generated encoder target. Post-check lowering must consume
-that explicit target kind and lower the structural parser/encoder from the
-dispatch plan's concrete callable type. It must not treat the marker as a
-procedure body, synthesize a fake source function, or infer generated behavior
-from a missing procedure template.
-
-### Structural Serialization Methods
-
-Parsing and encoding are ordinary static-dispatch methods. Roc does not expose a
-builtin `Parser`, `Decoder`, or `Encoding` interface type; the public model is
-method-based.
-
-The performance target is the same shape as hand-written systems parsers:
-formats keep input state as cursors and slices, avoid runtime allocation during
-parsing, receive the whole requested structural shape before scanning, and lower
-to direct calls rather than callback tables, shape interpreters, or temporary
-maps built for convenience. The compiler knows Roc structural shapes and method
-requirements. It does not know JSON, HTTP headers, CSV, XML, or any other
-serialized format.
-
-A format is ordinary Roc code. Its type owns the methods that describe how that
-format reads or writes each shape. Public modules expose small convenience
-functions:
-
-```roc
-thing = Json.parse(json_str)?
-thing = Json.parse_trailing_commas(json_str)?
-thing = Json.Utf8.parse(json_bytes)?
-
-json_str = Json.to_str(thing)
-json_str = Json.to_str_try(floaty_thing)?
-json_bytes = Json.Utf8.encode(thing)?
-
-headers = Encoding.HttpHeader.parse(raw_headers)?
-```
-
-The convenience functions construct the internal format state directly, call the
-value or type's ordinary method, validate the remaining state if the format
-requires it, and return the final public value. A fallible helper such as
-`Json.to_str_try` returns a `Try` and preserves the encoder's error type. This
-is for values that cannot always be represented as JSON, such as `F32` or `F64`
-values that are `NaN`, positive infinity, or negative infinity. An infallible
-helper such as `Json.to_str` requires an empty encoder error type and returns
-the string directly. They do not need a required `init`, `finish`, or `default`
-hook. The runtime cursor types are implementation details of the builtin format
-module, not public `Json.State` or
-`Encoding.HttpHeader.State` APIs.
-
-The underlying parse method is public and callable. It is deliberately curried:
-
-```roc
-a.parser_for : encoding -> (state -> Try({ value : a, rest : state }, err))
-a.encoder_for : encoding -> (a, state -> Try(state, err))
-```
-
-`parser_for` is a method on the value type being produced. `encoder_for` is a
-method on the value type being serialized. Structural types get these methods
-from the compiler. Nominal types may define them explicitly, and structural
-derivation uses those explicit nominal methods when a field, payload, list
-element, nested value, or other sub-shape has that nominal type.
-
-The `encoding` argument is the pure format/configuration value used to construct
-the specialized parser. It may represent choices such as JSON object field
-renaming, whether JSON accepts trailing commas, JSON tag representation, or a
-header matching mode. The `state`
-argument is the runtime cursor or output state. Keeping these separate matters:
-parser construction can transform the requested structural shape before the
-runtime scan starts, while the returned runtime function threads only the cursor
-state and parsed values. Encoder construction can similarly precompute
-shape-specific metadata before the returned runtime function receives the value
-and output state.
-
-For example, the builtin HTTP header helper inside `Builtin.Encoding` has this
-shape:
-
-```roc
-HttpHeader := [MissingRequired, BadHeader].{
-	parse : Str -> Try(output, HttpHeader)
-		where [
-			output.parser_for : HttpHeaderEncoding -> (HttpHeaderState -> Try({ value : output, rest : HttpHeaderState }, HttpHeader)),
-		]
-	parse = |raw| {
-		Output : output
-
-		parse_output = Output.parser_for(HttpHeaderEncoding.Caseless)
-		parsed = parse_output(HttpHeaderState.{ raw })?
-
-		Ok(parsed.value)
-	}
-}
-```
-
-The important split is that `Output.parser_for(HttpHeaderEncoding.Caseless)`
-constructs the concrete parser and the hidden `HttpHeaderState.{ raw }` is the
-runtime input state. Formats with no configurable behavior can still use a
-zero-sized internal encoding value.
-
-The error type is inferred from the format methods. All `Try` errors in one
-parse or encode operation unify with the public function's returned error type.
-When a concrete encode operation cannot fail, its error type is empty, so
-`Json.to_str` can bind the underlying encoder result with an exhaustive
-`Ok(encoded_state) = ...` pattern and return `Str` directly. When a concrete
-encode operation can fail, `Json.to_str_try` returns `Try(Str, err)` instead.
-
-Checking derives structural methods by emitting ordinary static-dispatch
-constraints. For example, deriving `a.parser_for` for a concrete shape asks the
-encoding and state types for exactly the methods needed by that shape:
-
-- `Str` calls the format's string method;
-- records use compiler-generated field sets and the format's record-field
-  method;
-- tag unions call the format's tag-union method with a compiler-generated
-  tag-union spec;
-- lists, numbers, booleans, tuples, and other structural forms call the
-  corresponding format methods;
-- type aliases use their expanded structural shape;
-- named nominal values call that nominal type's explicit method. If the method
-  is missing, checking reports the missing static-dispatch requirement.
-
-If a format does not support a shape, checking reports the missing method as a
-static-dispatch error. Unsupported shapes are not represented as runtime parse
-or encode failures. Runtime failures are reserved for input/output conditions
-the format can only know while processing bytes or values, such as a malformed
-header line, invalid JSON syntax, invalid UTF-8 in a byte input, or a
-user-defined nominal method returning an error.
-
-Compile-time evaluation uses the ordinary Roc constant machinery. The
-serialization API does not add a special compile-time marker. A derived
-`parser_for` constructs its transformed field sets and nested parsers before it
-returns the runtime lambda. If that parser construction is evaluated during
-checking, those transformed values are stored as checked constants and restored
-later as ordinary Roc values. The returned runtime lambda then closes over only
-the transformed field sets and nested parser functions. For a parser constructed
-at compile time, original record field names that were renamed during
-construction do not need to appear in the final runtime data.
-
-Tag-union specs are opaque compiler values. They describe the concrete
-structural shape being derived: tag names, payload shapes, and the concrete
-payload result positions. They are not arity-specific user APIs, and userspace
-code does not construct or pattern match on them. The compiler specializes every
-use with the concrete tag-union type, so opaque spec operations lower to direct
-tag code.
-
-Userspace format code operates through safe Roc values, opaque specs, opaque
-field values, iterators, and slice-returning string/list APIs. The compiler does
-not expose raw field-slot indices, unsafe byte indexing, or unchecked memory
-primitives as part of the serialization method surface.
-
-Record parsing is driven by the compiler-generated structural `parser_for` method.
-The compiler creates a `Encoding.FieldName.FieldNames(_shape)` value for each
-concrete record shape:
-
-```roc
-Encoding.FieldName(_shape) : opaque
-Encoding.FieldName.FieldNames(_shape) : opaque
-
-Encoding.FieldName.FieldNames.rename_fields : Encoding.FieldName.FieldNames(_shape), (Str -> Str) -> Encoding.FieldName.FieldNames(_shape)
-Encoding.FieldName.FieldNames.shortest_name : Encoding.FieldName.FieldNames(_shape) -> U64
-Encoding.FieldName.FieldNames.longest_name : Encoding.FieldName.FieldNames(_shape) -> U64
-Encoding.FieldName.FieldNames.iter : Encoding.FieldName.FieldNames(_shape) -> Iter(Encoding.FieldName(_shape))
-Encoding.FieldName.FieldNames.for_size : Encoding.FieldName.FieldNames(_shape), U64 -> Iter(Encoding.FieldName(_shape))
-
-Encoding.FieldName.name : Encoding.FieldName(_shape) -> Str
-```
-
-`Encoding.FieldName.FieldNames(_shape)` contains the requested field names and
-compiler-owned result positions for one concrete record shape.
-`Encoding.FieldName(_shape)` is an opaque handle to one field in that same shape. The
-`_shape` parameter is a phantom type: it is not runtime data, but it ties a
-field handle to the exact field set that created it. A parser for
-`{ cache_control : Str, content_length : U64 }` cannot accept a
-`Encoding.FieldName` produced from `{ foo : Str }`, because the phantom types do not
-unify. That type-level tie is what lets generated record parsers avoid runtime
-bounds checks on field handles. If the only way to obtain a
-`Encoding.FieldName(_shape)` is from the matching
-`Encoding.FieldName.FieldNames(_shape)`, then the compiler already knows every handle
-is in range for that record. There is no user-exposed `U64` slot to validate at
-runtime.
-
-The derived `parser_for` constructs field metadata before returning the runtime
-lambda:
-
-```roc
-renamed_fields = Encoding.FieldName.FieldNames.rename_fields(original_fields, |name| encoding.rename_field(name))
-parse_nested = Nested.parser_for(encoding)
-```
-
-`encoding.rename_field(name)` is ordinary method-call syntax for a pure format
-method whose first argument is the encoding value. Every encoding provides it;
-identity is the normal implementation. Taking the encoding value as an argument
-lets one encoding type store parser-construction configuration such as JSON
-field naming style. `Encoding.FieldName.FieldNames.rename_fields` applies that
-function to every requested record field, discards the original names from the
-returned `Encoding.FieldName.FieldNames`, and rebuilds the length buckets used by
-`Encoding.FieldName.FieldNames.for_size`, `Encoding.FieldName.FieldNames.shortest_name`,
-and `Encoding.FieldName.FieldNames.longest_name`. If parser construction is
-compile-time evaluated, the renaming work is also compile-time work. For JSON
-camel-case decoding, the final runtime parser can contain only `camelCase`
-field names. For HTTP header decoding, the final runtime parser can contain only
-lowercase kebab-case header names such as `cache-control`.
-
-Formats expose the methods needed for the shapes they support. A format that can
-parse strings, `U64`, tag unions, and records uses these method shapes:
-
-```roc
-encoding.parse_str : encoding, state -> Try({ value : Str, rest : state }, err)
-encoding.parse_u64 : encoding, state -> Try({ value : U64, rest : state }, err)
-encoding.parse_tag_union : encoding, Encoding.ParseTagUnionSpec(a), state -> Try({ value : a, rest : state }, err)
-
-encoding.parse_record_field : encoding, Encoding.FieldName.FieldNames(_shape), state -> Try(
-	[
-		Field({ field : Encoding.FieldName(_shape), rest : state }),
-		TryField({ name : Str, rest : state }),
-		TryFieldCaseless({ name : Str, rest : state }),
-		Continue({ rest : state }),
-		Done({ rest : state }),
-	],
-	err,
-)
-
-encoding.skip_record_field : encoding, state -> Try(state, err)
-encoding.missing_record_field : encoding, Str, state -> err
-encoding.missing_optional_field : encoding, Str, state -> optional_err
-encoding.rename_field : encoding, Str -> Str
-```
-
-For `Field`, `TryField`, and `TryFieldCaseless`, `rest` is the state positioned
-at the field's value. If the field matches the target record, the generated
-parser calls the parser for that field's type from that value-start state and
-continues from the value parser's returned `rest`. This is what allows records
-with different field shapes:
-
-```roc
-{
-	content_length : U64,
-	x_auth_token : Try(Str, [Missing]),
-	cache_control : Str,
-}
-```
-
-The record loop does not store every value as `Str` first. When it sees the
-`content_length` field, it calls the `U64` parser from the value-start state and
-continues from that parser's returned state. When it sees `cache_control`, it
-calls the `Str` parser. The value parser owns value consumption.
-
-`Field` means the format already matched the input field name against the
-provided `Encoding.FieldName.FieldNames(_shape)`, usually by iterating
-`Encoding.FieldName.FieldNames.for_size(fields, len)`
-or another field iterator. `TryField` means the format parsed a field name and
-asks the generated record parser to exact-match it against the transformed
-fields. `TryFieldCaseless` is the same, but uses ASCII caseless matching. If a
-`TryField` or `TryFieldCaseless` name does not match any target field, generated
-code calls the format's `skip_record_field` method with the encoding and `rest`,
-then continues with the returned state. This avoids scanning matched values
-twice while still letting unknown fields be skipped correctly.
-
-`Continue.rest` advances the record loop after the format has consumed input
-that cannot be a relevant field. `Done.rest` is the state remaining after the
-record ends. If the generated finisher sees that a required field was never
-filled, it calls the format's `missing_record_field` method with the encoding,
-field name, and final state to produce the format's concrete parse error value.
-Optional fields are expressed by their field type, for example
-`Try(Str, [Missing])`. If an optional field is absent, the generated finisher
-calls the format's `missing_optional_field` method with the encoding, field
-name, and final state at the optional field's error type and stores
-`Err(missing)` in that field. This lets the format define the absence tag;
-`Missing`, `Absent`, or any other tag name is ordinary userspace data, not a
-compiler-known concept. A field annotated as `Try(Str, _)` can infer that error
-type from the format method's return type.
-
-Record-field dispatch is optimized around the assumption that serialized record
-field names are overwhelmingly small. JSON object keys, HTTP headers, CSV
-column names, XML attributes, environment variables, and similar schema fields
-are expected to land in Roc's small-string representation almost all the time on
-64-bit targets, and still most of the time on 32-bit targets. The optimization
-strategy treats this as the hot path, not as a correctness requirement: long
-field names remain supported, but generated code is arranged so that small names
-take the shortest route.
-
-Formats own conversion from Roc record field names to serialized field names.
-HTTP header parsing can rename `cache_control` to `cache-control` at parser
-construction time and then use `TryFieldCaseless("Cache-Control")` at runtime.
-JSON camel-case parsing can rename `user_id` to `userId` at parser construction
-time and then use `TryField("userId")` at runtime. The compiler does not know
-those policies; it only knows that it has a transformed
-`Encoding.FieldName.FieldNames(_shape)` value and a requested matching mode.
-
-`Encoding.FieldName.FieldNames.shortest_name` and
-`Encoding.FieldName.FieldNames.longest_name` are computed after renaming. Formats may
-use them to skip impossible fields before doing more expensive work. For
-example, if a header name is longer than
-`Encoding.FieldName.FieldNames.longest_name(fields)` and the format's `rename_field`
-never increases field length for headers, the format can consume the line and
-return `Continue` without constructing any temporary field name. This is not a
-parse failure: for formats such as HTTP headers and JSON objects, unknown fields
-remain ordinary input according to that format's rules. If the target record
-actually contains a long renamed field name, the long input field remains
-matchable through the same `Encoding.FieldName.FieldNames` iteration APIs.
-
-For small fields, generated record dispatch compares the packed small string
-representation directly. Roc zeroes unused SSO bytes, so equality can use
-fixed-width word comparisons without masking tail bytes. On 64-bit targets, the
-generated dispatcher groups fields into 1-8, 9-16, and 17-23 byte size classes;
-on 32-bit targets, the groups are scaled to that target's smaller SSO capacity.
-The group selection can be implemented with a branchless or near-branchless
-table lookup instead of a source-level length switch.
-
-Within each size class, the compiler chooses the most discriminating word lane
-for the concrete field set. For example, if several fields share the same first
-eight bytes, the generated code can use the second or third word as the first
-comparison instead. The hot miss path compares one machine word per candidate in
-that class. Only after a discriminator hit does the code verify the full SSO key
-with one, two, or three word comparisons and dispatch to the matched field's
-already-constructed value parser. Collision-heavy classes may use another
-discriminating lane or a generated perfect hash over the packed SSO words before
-final verification.
-
-This keeps the performance center on the common case: no heap allocation, no
-runtime field map, no interpretation of a record plan, and no byte-by-byte
-string comparison unless the selected format's field-name conversion itself
-requires it. Long-field paths must preserve the same public behavior and memory
-invariants. If a format must handle long fields without allocation, that path
-must use field iteration and slice comparisons rather than constructing a
-transformed heap `Str`; it is not allowed to make the SSO path slower for the
-sake of generality.
-
-Nested records follow the same construction/runtime split. The outer derived
-`parser_for` method eagerly calls every nested parser constructor before
-returning its runtime lambda. A nested record gets its own
-`Encoding.FieldName.FieldNames(_nested_shape)` value, then renames and rebuckets that
-field set through the same `encoding.rename_field` method. A custom nominal
-field calls that nominal type's explicit `parser_for` method during parser
-construction. At runtime the outer record parser dispatches to the
-already-constructed field parser for the matched field shape.
-
-Tag-union parsing follows the same separation. The format's tag-union method
-receives the complete tag spec, identifies the input tag according to that
-format's own rules, and uses opaque spec operations to parse and assemble the
-selected payload. Recursive tag unions are ordinary recursive method calls
-through the selected payload type. The compiler knows the Roc shape and the
-static-dispatch requirements; it does not know any format-specific tag
-representation. Tag-name renaming can use an analogous construction-time
-transformation later; record field renaming does not require the compiler to
-know any tag-union convention.
-
-The generated code uses direct static calls. Tag spec matching is compiler-
-generated exact matching over the concrete tag labels; userspace does not pass a
-matcher function to spec operations. It does not pass user callbacks,
-does not build a runtime interpretation plan, and does not route shape handling
-through a central dispatch function. Generic userspace format code produces
-record field events, iterates opaque field sets, and calls opaque tag spec
-operations. The record loop and field dispatch are compiler-generated for the
-concrete shape; tag spec operations are compiler primitives specialized for the
-concrete tag-union shape and lower to direct code.
-
-Input formats return seamless slices whenever the value being produced is a
-slice of the original input. Parsing a `Str` from a larger `Str` or validated
-byte buffer returns a slice into that buffer when the format can do so. The
-format must validate bytes before producing `Str`; `Json.Utf8.parse` validates
-string bytes from `List(U8)`, while `Json.parse` starts from an already-valid
-`Str`. Hosts that pass request memory to Roc as `Str` must validate that memory
-first and keep it alive for the duration of the request.
-
-The HTTP header format receives only the raw header section, starting at the
-first header line and ending before the blank line. Its record-field method
-parses one CRLF-delimited line at a time. Each non-empty line must contain `:`;
-otherwise the method returns the header format's bad-header error.
-
-The header encoding's `rename_field` maps Roc field names to lowercase
-kebab-case at parser construction time:
-
-```roc
-cache_control -> cache-control
-content_length -> content-length
-x_auth_token -> x-auth-token
-```
-
-At runtime the header parser parses the input line name as a seamless slice. It
-may use `Encoding.FieldName.FieldNames.for_size` plus ASCII-caseless comparison
-against `Encoding.FieldName.name` to match the transformed field set directly and
-return `Field({ field, rest: value_start })`. It may also return
-`TryFieldCaseless({ name, rest: value_start })` and let generated record
-dispatch perform the ASCII-caseless match. If the name cannot match any target
-field, the format consumes the line and returns `Continue({ rest: next_line })`.
-Matching `Cache-Control`, `cache-control`, and `CACHE-CONTROL` against the
-transformed `cache-control` field set does not require allocating a lowercased
-copy. Header values are trimmed and passed to field parsing as seamless `Str`
-slices. The format does not allocate a header map.
-
-The JSON `Str` format receives valid UTF-8 text. The JSON `Utf8` format receives
-bytes and validates UTF-8 before producing any `Str`. JSON record parsing scans
-an object one field event at a time through the compiler-generated record loop,
-so object key order does not affect performance beyond normal key matching. A
-plain JSON encoding value can use identity `rename_field`. The same JSON
-encoding type can carry a camel-case configuration value that renames Roc fields
-at parser construction time:
-
-```roc
-user_id -> userId
-cache_control -> cacheControl
-```
-
-The runtime JSON scanner can use `Encoding.FieldName.FieldNames.for_size` and exact
-`Encoding.FieldName.name` comparison to match each object key against the
-already-renamed field set and return `Field({ field, rest: value_start })` for
-known keys. It may also return `TryField({ name, rest: value_start })` and let
-generated record dispatch perform exact matching. For unknown keys, it skips the
-JSON value according to JSON syntax and returns
-`Continue({ rest: after_value })`. The matched field's parser consumes the JSON
-value from `value_start`.
-
-JSON tag unions use the externally tagged representation:
-
-```json
-{ "Admin": { "name": "Sam" } }
-```
-
-Zero-payload tags encode as the tag string, one-payload tags encode as
-`{"Tag":payload}`, and multi-payload tags encode as `{"Tag":[...]}`. This
-representation avoids collisions between tag names and ordinary record field
-names. Other JSON conventions are represented by different JSON format values
-with different methods. The compiler receives the null, missing-field, and
-tag-union rules through explicit format methods rather than through hard-coded
-JSON syntax recovery.
-
-Parsing a Roc `Str` from JSON succeeds only for JSON string values. JSON `null`
-and missing object fields are separate format conditions. They are surfaced only
-through field or value types that request them, such as `Try(Str, [Null])` or
-`Try(Str, [Missing])`; the plain `Str` method does not accept either condition.
-`Try(a, [Null])` is the nullable JSON value shape. A format's
-`missing_optional_field` method chooses the record-field absence tag for
-optional fields; JSON uses `Missing`, but another format may choose `Absent` or
-any other tag. `Try(a, [Missing])` and `Try(a, [Missing, Null])` are JSON's
-record-field-only shapes: missing fields parse as `Err(Missing)`, explicit
-`null` parses as `Err(Null)` only when `Null` is in the row, and encoding
-`Err(Missing)` omits the field. Missing fields and `Null` are never conflated.
-
-JSON arrays are used for lists, tuples, and sets. Tuples parse with exact arity.
-Sets preserve `Set` insertion order and parse by inserting the array elements.
-JSON dictionaries use object representation only when the key type has a
-lossless object-key codec: strings, bools, numeric types, and zero-payload tags.
-Composite dictionary keys are rejected by static dispatch validation; there is
-no automatic pair-array fallback. Dictionary and set encoders do not sort,
-because Roc does not require keys or elements to be sortable.
-
-Concrete HTTP header parser code has this shape inside `Builtin.Encoding`:
-
-```roc
-HttpHeaderState :: { raw : Str }
-
-HttpHeaderEncoding :: [Caseless].{
-	rename_field : HttpHeaderEncoding, Str -> Str
-	parse_str : HttpHeaderEncoding, HttpHeaderState -> Try({ value : Str, rest : HttpHeaderState }, HttpHeader)
-	parse_u64 : HttpHeaderEncoding, HttpHeaderState -> Try({ value : U64, rest : HttpHeaderState }, HttpHeader)
-
-	parse_record_field : HttpHeaderEncoding, Encoding.FieldName.FieldNames(_shape), HttpHeaderState -> Try(
-		[
-			Field({ field : Encoding.FieldName(_shape), rest : HttpHeaderState }),
-			TryField({ name : Str, rest : HttpHeaderState }),
-			TryFieldCaseless({ name : Str, rest : HttpHeaderState }),
-			Continue({ rest : HttpHeaderState }),
-			Done({ rest : HttpHeaderState }),
-		],
-		HttpHeader,
-	)
-
-	skip_record_field : HttpHeaderEncoding, HttpHeaderState -> Try(HttpHeaderState, HttpHeader)
-	missing_record_field : HttpHeaderEncoding, Str, HttpHeaderState -> HttpHeader
-	missing_optional_field : HttpHeaderEncoding, Str, HttpHeaderState -> [Missing]
-}
-
-HttpHeader := [MissingRequired, BadHeader].{
-	parser_for : () -> (Str -> Try(output, HttpHeader))
-		where [
-			output.parser_for : HttpHeaderEncoding -> (HttpHeaderState -> Try({ value : output, rest : HttpHeaderState }, HttpHeader)),
-		]
-	parser_for = || {
-		Output : output
-		parse_output = Output.parser_for(HttpHeaderEncoding.Caseless)
-
-		|raw| {
-			parsed = parse_output(HttpHeaderState.{ raw })?
-			Ok(parsed.value)
-		}
-	}
-
-	parse : Str -> Try(output, HttpHeader)
-}
-```
-
-The exact derived parser type for a header record with mixed field shapes is:
-
-```roc
-{
-	cache_control : Str,
-	content_length : U64,
-	x_auth_token : Try(Str, [Missing]),
-}.parser_for : HttpHeaderEncoding -> (HttpHeaderState -> Try(
-	{
-		value : {
-			cache_control : Str,
-			content_length : U64,
-			x_auth_token : Try(Str, [Missing]),
-		},
-		rest : HttpHeaderState,
-	},
-	Encoding.HttpHeader,
-))
-```
-
-Because `Encoding.HttpHeader` does not define `parse_tag_union`, trying to parse a
-header record that contains a tag union is a compile-time static-dispatch error:
-
-```roc
-bad : Try({ mode : [On, Off] }, Encoding.HttpHeader)
-bad = Encoding.HttpHeader.parse("mode: On\r\n")
-```
-
-The missing requirement is `HttpHeaderEncoding.parse_tag_union`; the compiler
-does not wait until runtime to discover that this format does not support tags.
-
-Concrete JSON parser code has this shape:
-
-```roc
-JsonState :: [Input(Str)]
-
-JsonEncoding :: [Default, CamelCase, TrailingCommas].{
-	rename_field : JsonEncoding, Str -> Str
-	rename_field = |encoding, name|
-		match encoding {
-			Default => name
-			TrailingCommas => name
-			CamelCase => snake_to_camel(name)
-		}
-
-	allows_trailing_commas : JsonEncoding -> Bool
-	allows_trailing_commas = |encoding|
-		match encoding {
-			Default => False
-			CamelCase => False
-			TrailingCommas => True
-		}
-
-	parse_str : JsonEncoding, JsonState -> Try({ value : Str, rest : JsonState }, Json.ParseErr)
-	parse_record_field : JsonEncoding, Encoding.FieldName.FieldNames(_shape), JsonState -> Try(
-		[
-			Field({ field : Encoding.FieldName(_shape), rest : JsonState }),
-			TryField({ name : Str, rest : JsonState }),
-			TryFieldCaseless({ name : Str, rest : JsonState }),
-			Continue({ rest : JsonState }),
-			Done({ rest : JsonState }),
-		],
-		Json.ParseErr,
-	)
-	skip_record_field : JsonEncoding, JsonState -> Try(JsonState, Json.ParseErr)
-	missing_record_field : JsonEncoding, Str, JsonState -> Json.ParseErr
-	missing_optional_field : JsonEncoding, Str, JsonState -> [Missing]
-	parse_tag_union : JsonEncoding, Encoding.ParseTagUnionSpec(a), JsonState -> Try({ value : a, rest : JsonState }, Json.ParseErr)
-}
-
-Json :: {}.{
-	ParseErr : [MissingRequiredField(Str), InvalidJson(Str)]
-
-	parse : Str -> Try(a, Json.ParseErr)
-		where [
-			a.parser_for : JsonEncoding -> (JsonState -> Try({ value : a, rest : JsonState }, Json.ParseErr)),
-		]
-	parse = |json| {
-		Shape : a
-		parse_shape = Shape.parser_for(JsonEncoding.Default)
-		parsed = parse_shape(JsonState.Input(json))?
-
-		match parsed.rest {
-			Input(rest) =>
-				if Str.is_empty(Str.trim_start(rest)) {
-					Ok(parsed.value)
-				} else {
-					Err(InvalidJson("Invalid JSON"))
-				}
-		}
-	}
-
-	parse_trailing_commas : Str -> Try(a, Json.ParseErr)
-		where [
-			a.parser_for : JsonEncoding -> (JsonState -> Try({ value : a, rest : JsonState }, Json.ParseErr)),
-		]
-	parse_trailing_commas = |json| {
-		Shape : a
-		parse_shape = Shape.parser_for(JsonEncoding.TrailingCommas)
-		parsed = parse_shape(JsonState.Input(json))?
-
-		match parsed.rest {
-			Input(rest) =>
-				if Str.is_empty(Str.trim_start(rest)) {
-					Ok(parsed.value)
-				} else {
-					Err(InvalidJson("Invalid JSON"))
-				}
-		}
-	}
-
-	parser_camel : () -> (Str -> Try(a, Json.ParseErr))
-		where [
-			a.parser_for : JsonEncoding -> (JsonState -> Try({ value : a, rest : JsonState }, Json.ParseErr)),
-		]
-	parser_camel = || {
-		Shape : a
-		parse_shape = Shape.parser_for(JsonEncoding.CamelCase)
-
-		|json| {
-			parsed = parse_shape(JsonState.Input(json))?
-
-			match parsed.rest {
-				Input(rest) =>
-					if Str.is_empty(Str.trim_start(rest)) {
-						Ok(parsed.value)
-					} else {
-						Err(InvalidJson("Invalid JSON"))
-					}
-			}
-		}
-	}
-}
-```
-
-The exact derived parser type for a JSON record is:
-
-```roc
-{
-	cache_control : Str,
-	nested_record : { inner_value : Str },
-	user_id : Str,
-}.parser_for : JsonEncoding -> (JsonState -> Try(
-	{
-		value : {
-			cache_control : Str,
-			nested_record : { inner_value : Str },
-			user_id : Str,
-		},
-		rest : JsonState,
-	},
-	Json.ParseErr,
-))
-```
-
-The exact derived parser type for an externally tagged JSON union is:
-
-```roc
-[Admin({ name : Str }), Guest].parser_for : JsonEncoding -> (JsonState -> Try(
-	{
-		value : [Admin({ name : Str }), Guest],
-		rest : JsonState,
-	},
-	Json.ParseErr,
-))
-```
-
-With `JsonEncoding.Default`, this parses values like:
-
-```json
-{ "Admin": { "name": "Sam" } }
-{ "Guest": {} }
-```
-
-A custom nominal type can define `parser_for` manually and remain polymorphic
-over any encoding that supplies the methods it uses. This does not auto-derive
-the nominal type; it is an ordinary method the user wrote:
-
-```roc
-Token := { raw : Str }.{
-	parser_for : encoding -> (state -> Try({ value : Token, rest : state }, err))
-		where [
-			encoding.parse_str : encoding, state -> Try({ value : Str, rest : state }, err),
-		]
-	parser_for = |encoding| {
-		Encoding : encoding
-
-		|state| {
-			parsed = Encoding.parse_str(encoding, state)?
-			Ok({ value: Token.{ raw: parsed.value }, rest: parsed.rest })
-		}
-	}
-}
-```
-
-An encoding type can also be the runtime state type. There is no requirement to
-invent a separate `State` type if the format state naturally belongs in the
-encoding value:
-
-```roc
-TinyText :: [Input(Str), Done].{
-	rename_field : TinyText, Str -> Str
-	rename_field = |_, name| name
-
-	parse_str : TinyText, TinyText -> Try({ value : Str, rest : TinyText }, [MissingRequired])
-	parse_str = |_, state|
-		match state {
-			Input(value) => Ok({ value, rest: Done })
-			Done => Err(MissingRequired)
-		}
-}
-
-parse_token : TinyText -> Try(Token, [MissingRequired])
-parse_token = |input| {
-	parse = Token.parser_for(input)
-	parsed = parse(input)?
-	Ok(parsed.value)
-}
-```
-
-Encoding is symmetric. Structural `encoder_for` methods call the format's output
-methods for strings, records, tag unions, lists, and other shapes. A format's
-output state owns whatever builder it needs. JSON encoding to `Str` allocates
-the final string in the ordinary way, and JSON UTF-8 encoding produces
-`List(U8)`. Formats whose serialization can fail express that through the same
-inferred `Try` error type as parsing.
-
-The public structural encode method has this exact shape:
-
-```roc
-value.encoder_for : encoding -> (value, state -> Try(state, err))
-```
-
-Generated encoders compose child error rows. JSON helpers that cannot fail use a
-named `_never_fails` row variable so they can sequence with encoders that can
-fail. `Json.to_str` requires the final structural encoder's error type to be the
-empty row `[]`; `Json.to_str_try` preserves the final structural encoder's error
-type as `Try(Str, err)`. JSON `F32` and `F64` encoders are the deliberate failing
-scalar case: finite values encode as JSON numbers, while `NaN`, positive
-infinity, and negative infinity return `Err(NaN)`, `Err(Infinity)`, or
-`Err(NegativeInfinity)`. They must not encode non-finite values as JSON `null`,
-and they do not satisfy `Json.to_str`'s infallible encoder requirement.
-
-For a concrete record, the compiler can derive:
-
-```roc
-{
-	count : U64,
-	foo_bar : Str,
-}.encoder_for : MyEncoding -> ({ count : U64, foo_bar : Str }, MyState -> Try(MyState, MyErr))
-```
-
-The encoding type owns the output methods required by that shape:
-
-```roc
-MyEncoding :: [Out(Str)].{
-	rename_field : MyEncoding, Str -> Str
-	encode_record :
-		MyState,
-		U64,
-		(MyState, (MyState, Str, (MyState -> Try(MyState, MyErr)) -> Try(MyState, MyErr)) -> Try(MyState, MyErr))
-			-> Try(MyState, MyErr)
-	encode_str : Str, MyState -> Try(MyState, MyErr)
-	encode_u64 : U64, MyState -> Try(MyState, MyErr)
-}
-```
-
-The `U64` argument is the statically-known number of record fields that will be
-encoded. The callback receives the current state and a field writer supplied by
-the format. Generated record encoders call the field writer once per present
-field:
-
-```roc
-MyEncoding.encode_record(
-	state,
-	2,
-	|state0, field| {
-		state1 = field(state0, "count", |s| encode_count(value.count, s))?
-		field(state1, "foo-bar", |s| encode_foo_bar(value.foo_bar, s))
-	},
-)
-```
-
-Tuples and lists use the same ownership pattern, except their writer has no
-field name:
-
-```roc
-encode_tuple :
-	MyState,
-	U64,
-	(MyState, (MyState, (MyState -> Try(MyState, MyErr)) -> Try(MyState, MyErr)) -> Try(MyState, MyErr))
-		-> Try(MyState, MyErr)
-
-encode_list :
-	MyState,
-	U64,
-	(MyState, (MyState, (MyState -> Try(MyState, MyErr)) -> Try(MyState, MyErr)) -> Try(MyState, MyErr))
-		-> Try(MyState, MyErr)
-```
-
-### Compile-Time Literal Conversions
-
-A numeric literal whose target type is a non-builtin nominal type converts
-through that type's **own declared** `from_numeral` method, and a string literal
-converts through its declared `from_quote` (receiving the literal's post-escape
-contents as `Str`). The conversion is not inherited through the backing chain: a
-transparent newtype that declares no `from_` does not accept a bare literal —
-that is a type error; use explicit `Nominal.(value)` construction instead.
-Every such conversion with a concrete target type is a
-compile-time root (`numeral_conversion` / `quote_conversion`), no matter
-where the literal sits in the AST: checking finalization evaluates the raw
-dispatch call, stores its `Try` result through `ConstStore`, unwraps `Ok` into
-the literal's stored constant, and reports `Err(InvalidNumeral(msg))` /
-`Err(BadQuotedBytes(msg))` as a checking problem carrying the implementation's
-message. Runtime lowering restores the stored constant instead of emitting a
-call. Conversions whose target type is still polymorphic (literals inside
-generalized functions) keep the dispatch call per monomorphic specialization.
-
-Unresolved literal-origin type variables default — numerals to `Dec`, quotes
-to `Str`. Quote defaulting runs before numeric context resolution because a
-still-flex string receiver blocks the method chains that give numeric literals
-their context, and it also resolves generalized literal variables that no
-instantiation can pin, which is the same resolution monomorphic specialization
-would apply, made early enough for checking to resolve dependent dispatch.
-Generalized function signatures are different: a still-flex literal-origin or
-method-constrained argument in a polymorphic function is a valid contract, not a
-def-site error. Checking must not validate those generalized constraints against
-`Dec` or `Str` at the function definition. Each instantiated copy is defaulted
-and validated only after call-site evidence has had a chance to pin it.
-
-Literal patterns participate through the same machinery. A literal pattern on
-a non-builtin number or string type carries a synthesized checked conversion
-expression; match lowering binds the matched value and tests it against the
-converted constant, dispatching to the type's `is_eq` method when it has one
-and using derived `is_eq` otherwise — exactly mirroring `==`. Checking
-attaches an `is_eq` constraint to the pattern's type so this lowering is
-total. Literal patterns on builtin types keep their direct literal-pattern
-encoding.
-
-### Constructing Nominal Values
-
-Nominal construction is expression-directed, not a unification side effect.
-Explicit construction syntax — `Type.(value)`, `Type.(a, b)`, `Type.{ field }`,
-`Type.Tag(payload)` — canonicalizes to a single `e_nominal` (or
-`e_nominal_external`) expression whose `backing_type` records the surface form
-(`value`, `tuple`, `record`, `tag`). Checking instantiates the nominal
-declaration, unifies the user-written backing expression against the
-declaration's backing variable, and gives the whole expression the nominal type.
-The backing variable is read **only** during this unification; nominal identity
-is defined by origin, name, and arguments, and two nominals of different identity
-never unify. A value already typed as a different nominal or primitive therefore
-does not silently lift into a nominal — the implicit path is reserved for
-literals, which convert through the `from_numeral` / `from_quote` mechanism above
-(walking transparent newtype chains to reach the builtin backing).
-
-### String Interpolation
-
-An interpolated string literal is its own CIR expression. It is not
-desugared as receiver method-call syntax, because interpolation method
-selection is owned by the expression result type, not by the first literal
-segment. The interpolated expressions bind to locals in source order. Literal
-segments are always builtin `Str` values, and the interpolation expression
-passes the first segment plus an `Iter((interpolated, Str))` of the remaining
-interpolated values paired with the literal segment that follows each one.
-
-For an unsuffixed interpolation, checking gives the expression this type:
-
-```roc
-val where [
-    val.from_interpolation : Str, Iter((_interpolated, Str)) -> val,
-]
-```
-
-The static dispatch owner is `val`, the interpolation result type. If `val`
-remains unconstrained, it defaults to `Str`, which selects:
-
-```roc
-Str.from_interpolation : Str, Iter((Str, Str)) -> Str
-```
-
-Types that want checked interpolation through `Try` implement their own
-`from_interpolation` and rely on `Try` forwarding:
-
-```roc
-Try.from_interpolation : Str, Iter((interpolated, Str)) -> Try(ok, err)
-    where [
-        ok.from_interpolation : Str, Iter((interpolated, Str)) -> Try(ok, err),
-    ]
-```
-
-For a suffixed interpolation such as `"a${x}b".Regex`, the suffix is not a
-static-dispatch owner. It is a direct associated-function call to
-`Regex.from_interpolation`; the function's argument types constrain the
-literal segments and interpolated expressions, and the function's return type is
-the type of the whole interpolation expression. Missing suffixed interpolation
-functions are reported as missing associated functions on the resolved suffix
-target.
-
-Interpolation deliberately does not parameterize literal segments over an
-arbitrary `literal` type with a `literal.from_quote` constraint. That design
-would defer quoted-segment conversion errors until monomorphic specializations
-are known. `roc check` must report all compile-time conversion errors without
-monomorphizing the program, so interpolation segments use builtin `Str`
-directly. Normal non-interpolated quoted literals still convert through
-`from_quote` as described above.
+The fields have these meanings:
+
+- `none` is the ordinary public nominal. It carries no internal chain identity.
+- `minted` is a statically bounded internal chain representation.
+  `generated` is its chain/callable-evidence digest and `iterator_depth` is
+  the producer-computed chain depth.
+- `forced_dynamic` is the explicit fixed-point representation selected at the
+  mint-depth boundary. It retains the public declaration identity while the
+  representation field keeps it distinct from the ordinary public nominal.
+
+These fields participate in named-type equality, cross-store equality, and type
+digests. Every type-store translation copies them. A later stage never derives a
+tier or mint depth from lowered type shape.
+
+For a minted iterator, Monotype rewrites the public recursive `rest` type in the
+step result to the minted self type and records concrete adapter components as
+additional nominal arguments. Each adapter layer therefore embeds its concrete
+predecessor by value. A bounded chain is a finite tower of distinct nominal
+identities rather than one public nominal with a recursive self edge.
+
+The representation producer is `generatedIteratorType` in
+`src/postcheck/monotype/lower.zig`. It computes:
+
+- source depth 1;
+- adapter depth as one plus the maximum minted depth reachable by value through
+  its components;
+- a hard minted depth limit of 16;
+- a structural-walk budget of 64.
+
+A `minted` child contributes its recorded depth. A `forced_dynamic` child
+contributes the cap, so every adapter above it remains dynamic. Ordinary named
+arguments, records, tuples, tag payloads, lists, and boxes propagate the maximum
+depth of values they contain. Function types do not contribute stored chain
+depth, and named backings are not traversed.
+
+If the next chain would exceed the limit, Monotype interns one
+`forced_dynamic` iterator type per item-type digest. Its public-shaped backing
+is recursively rewritten to its own type, giving recursive construction a
+finite type fixed point. The bounded walk reports the cap when its own budget is
+exhausted, so exhaustion selects the explicit dynamic tier rather than allowing
+the minted type universe to grow without bound.
+
+This cap is a type-universe bound, not a call-depth or specialization-request
+counter. Every path that mints an iterator passes through the same producer, so
+recursive functions, loops, and ordinary calls all receive the same finite
+representation decision.
+
+#### Tier Unification And Callable Flow
+
+Monotype instantiation and Lambda Solved unification consume the representation
+tier explicitly:
+
+- a forced-dynamic iterator wins when related to a minted or ordinary public
+  iterator with the same source declaration and item type;
+- a minted iterator wins when related to its ordinary public source type;
+- distinct minted iterator identities join their item and backing information
+  without discarding callable members;
+- equal tiers use ordinary named-type equality.
+
+At a forced-dynamic relation, Lambda Solved unifies the item type and both
+backings before linking the other type to the dynamic root. This is what carries
+every reachable finite step implementation into the dynamic callable set.
+
+When a complete Monotype type clone contains a forced-dynamic iterator,
+Lambda Solved marks the callable in that iterator's backing as erased. The mark
+runs only after the clone is structurally complete, so the erased callable's
+source-function digest never observes a partially built type. The erased
+callable then accumulates exact finite members through normal Lambda Solved
+unification.
+
+Minted iterator backings keep finite callable slots inline. Only
+forced-dynamic backings take this explicit erased-callable boundary. The direct
+LIR lowerer dumbly consumes the solved result: finite callables become generated
+tag-union values; erased callables become packed erased-callable values and
+indirect calls. It does not apply iterator depth policy or repair callable
+variant sets.
+
+#### SpecConstr And Loop Scalarization
+
+Monotype Lifted SpecConstr is a general call-pattern specialization pass. It
+runs only when `InlineMode` is not `.none`. It consumes explicit lifted
+constructor and callable values and creates workers whose arguments are the
+parts the callee immediately observes.
+
+Iterator and stream loops are important clients. After wrapper inlining exposes
+a known iterator constructor, SpecConstr can:
+
+- split known record, tuple, tag, nominal, and callable arguments into leaves;
+- redirect matching direct calls to specialized workers;
+- simplify field reads and matches from known values;
+- scalarize loop-carried constructor state;
+- supply each reachable `continue` edge with the scalar leaves required by the
+  loop fixed point.
+
+Iterator classification in this pass consumes the explicit iterator
+representation field (or the checked public `Builtin.Iter` identity). It does
+not identify generated iterator types solely from a nullable generated digest.
+
+SpecConstr is not responsible for making bounded iterator representation
+allocation-free. Per-chain minting removes the recursive layout edge in every
+mode. SpecConstr improves optimized loop and call shape so later lowering and
+LLVM see scalar state and direct operations.
+
+#### Constant Storage
+
+Compile-time finalization is separate from iterator representation and
+SpecConstr. Eligible constant list values become explicit
+`static_data_candidate` nodes, and direct LIR lowering emits their bytes into
+the data segment. This is why a constant list consumed through `.iter()` can
+have zero runtime list allocation in a size cart even though the eval allocation
+harness, which does not perform final constant hoisting, observes one base-list
+allocation.
+
+#### Correctness Boundaries
+
+All modes must preserve the same observable Roc behavior. The optional
+specialization mode may change compile-time work and generated shape only.
+
+The following properties require focused tests:
+
+- bounded iterator chains remain minted and have no iterator-attributable box or
+  erased callable;
+- recursive and over-cap chains terminate and use the forced-dynamic callable
+  representation;
+- forced-dynamic callable sets contain every member that can reach the boundary;
+- wrapper mode and ordinary mode agree on values and effects;
+- iterator loop scalarization preserves every reachable transition, including
+  adapter-state changes across `continue` edges;
+- constant-list zero-allocation claims are tested on a cart path that performs
+  compile-time finalization;
+- direct Solved-to-LIR decisions agree with the debug materialized Lambda Mono
+  verifier.
+
+Backends receive only ordinary LIR and explicit ARC statements. They must not
+know whether a value originated as a public iterator, a minted iterator,
+forced-dynamic callable state, or a scalarized loop.
 
 ## Shared Post-Check Model
 
@@ -3378,7 +1798,9 @@ Type-store ownership is explicit at each stage boundary:
 - Monotype Lifted IR uses the same Monotype type store because lifting does not
   change types.
 - Lambda Solved IR owns a new type store with lambda-set variables.
-- Lambda Mono owns a new type store with no function types.
+- Direct Solved-to-LIR lowering owns its function-free logical Lambda Mono type
+  decisions; only the debug verifier materializes the corresponding Lambda Mono
+  store.
 - LIR owns committed layouts, not post-check type ids.
 
 A later stage must not reinterpret an earlier stage's type ids unless the stage
@@ -3396,8 +1818,8 @@ stage owns, such as:
 - symbol to local environment
 - source procedure to specialization record
 - type id to already-lowered type id
-- Lambda Mono type id to committed LIR layout id
-- Lambda Mono procedure id to LIR procedure id
+- direct-lowering type decision to committed LIR layout id
+- direct-lowering procedure decision to LIR procedure id
 
 Those tables are not hidden checked-data side channels. They must not contain
 data that are missing from the produced IR. If deleting a table would make it
@@ -3446,13 +1868,21 @@ const MonoType = union(enum) {
     erased: TypeDigest,
 };
 
-const CheckedModuleId = enum(u32) { _ };
-const TypeDefId = enum(u32) { _ };
 const TypeDigest = struct { bytes: [32]u8 };
 
 const TypeDef = struct {
-    module: CheckedModuleId,
-    id: TypeDefId,
+    module: ModuleIdentityId,
+    type_name: TypeNameId,
+    source_decl: ?u32,
+    generated: ?TypeDigest,
+    iterator_representation: IteratorRepresentation,
+    iterator_depth: u8,
+};
+
+const IteratorRepresentation = enum(u8) {
+    none,
+    minted,
+    forced_dynamic,
 };
 
 const Fn = struct {
@@ -4362,7 +2792,8 @@ const LiftedFn = struct {
 
 Function references remain ordinary values with function type. A function value
 is not packed here. Captures are explicit metadata on the lifted function
-definition; callable representation is not chosen until Lambda Mono.
+definition; callable flow is solved in Lambda Solved and runtime representation
+is committed by direct LIR lowering.
 
 The lifting pass owns free-variable analysis. It does not choose finite
 callable representations, erased callable representations, closure object
@@ -4467,8 +2898,9 @@ output, and no representation recovery later.
 
 ### Erased Callable Requirements
 
-`erased` callable requirements are explicit data entering Lambda Solved IR.
-They are not inferred from backend needs or recovered from runtime encodings.
+`erased` callable requirements are explicit data entering or produced at the
+Lambda Solved boundary. They are not inferred from backend needs or recovered
+from runtime encodings.
 
 The producers are:
 
@@ -4481,25 +2913,30 @@ The producers are:
   callable parameter or result
 - checked root ABI metadata for values that will later be consumed by LirImage
   or glue, when that metadata explicitly names erased callable slots
+- a Monotype iterator type explicitly marked `forced_dynamic`, whose recursive
+  step callable crosses the dynamic representation boundary
 
-Monotype lowering carries these requirements as typed checked annotations into
-Lambda Solved IR. Lambda solving unifies them through the same function
+Monotype lowering carries boundary requirements as typed annotations into
+Lambda Solved IR. Lambda solving also consumes the explicit iterator
+representation tier and marks a completed forced-dynamic backing callable as
+erased. It unifies all requirements through the same function
 `args/callable/ret` graph used for finite lambda sets. If a callable slot is
-forced to `erased`, Lambda Mono lowering produces packed erased callable values
+forced to `erased`, direct LIR lowering produces packed erased callable values
 and indirect erased calls. If no explicit erased requirement reaches a callable
 slot, finite lambda-set dispatch is used.
 
-No ordinary source expression becomes erased because a later stage finds finite
-dispatch inconvenient. Erasure is introduced only by one of the checked boundary
-data above.
+No ordinary source expression becomes erased because direct lowering finds
+finite dispatch inconvenient. Erasure is introduced only by explicit checked
+boundary data or the explicit Monotype forced-dynamic iterator tier.
 
-## Lambda Mono Decisions
+## Direct LIR Callable Decisions
 
-Lambda Mono consumes Lambda Solved IR and chooses function-free callable,
-procedure, capture, and type representation data. These decisions are explicit
-stage output, but release builds do not store a full Lambda Mono expression,
-pattern, or statement tree. The direct LIR builder consumes the Lambda Solved
-lifted syntax together with Lambda Mono decision tables.
+`SolvedLirLower` consumes Lambda Solved IR and chooses function-free callable,
+procedure, capture, and type representation data while lowering directly to
+LIR. This section calls those choices the logical Lambda Mono decisions because
+the debug verifier materializes the Lambda Mono program that represents them.
+In release builds they are lowerer-owned data, not a separate stage output, and
+there is no stored Lambda Mono expression, pattern, or statement tree.
 
 The Lambda Mono type store has no function type. Function values have already
 become ordinary value representations:
@@ -4552,8 +2989,8 @@ capture record with those exact slots and stores it in the callable value. It
 does not use the source function's own function type as a proxy for the
 expression-site callable type.
 
-The release-build Lambda Mono output contains only data that later stages must
-consume explicitly:
+The release-build direct lowerer owns only the decision data needed to produce
+LIR:
 
 - the function-free Lambda Mono type store
 - queued function specializations keyed by exact lifted function id, solved
@@ -4571,9 +3008,9 @@ the original lifted node. When Lambda Mono changes behavior, direct LIR lowering
 uses the explicit Lambda Mono decision associated with that expression, call,
 function reference, captured local, or callable pattern.
 
-This keeps Lambda Mono as a real compiler stage without making the normal
-pipeline pay for a second syntax arena that mostly duplicates Monotype Lifted
-IR.
+This keeps the logical Lambda Mono contract explicit without making the
+production pipeline pay for a second syntax arena that mostly duplicates
+Monotype Lifted IR.
 
 ### Logical Lambda Mono Expressions
 
@@ -4665,10 +3102,12 @@ after-the-result conversion.
 
 ## Direct LIR Lowering
 
-LIR lowering consumes Lambda Solved lifted syntax plus Lambda Mono decision
-tables directly. It is the only production path from Lambda Solved to LIR.
+LIR lowering consumes Lambda Solved lifted syntax plus the explicit solved
+inline plan. It computes and consumes the logical Lambda Mono decisions inside
+the same direct builder. This is the only production path from Lambda Solved to
+LIR.
 
-There is no separate stored layout IR. The Lambda Mono to LIR builder owns:
+There is no separate stored layout IR. The direct Solved-to-LIR builder owns:
 
 - a layout builder that interns and commits recursive layouts from
   Lambda Mono type nodes
@@ -4691,8 +3130,8 @@ The builder may maintain temporary maps such as `TypeId -> layout.Idx`,
 `LambdaMonoFnId -> LirProcSpecId`, `LiftedLocalId -> LirLocalId`, and
 `LiftedExprId -> lowered logical expression` while lowering one function
 specialization. These maps are caches of work the builder owns. They must not
-contain checked data that are absent from Lambda Solved IR, Lambda Mono
-decisions, or the LIR result.
+contain checked data that are absent from Lambda Solved IR, the explicit inline
+plan, the builder's logical Lambda Mono decisions, or the LIR result.
 
 Release builds must not allocate, fill, traverse, or validate a materialized
 Lambda Mono expression, pattern, or statement tree. Release builds may allocate
@@ -5602,8 +4041,10 @@ checked CIR
   -> CheckedModuleBuilder during checking finalization
   -> Monotype IR
   -> Monotype Lifted IR
+  -> optional SpecConstr
   -> Lambda Solved IR
-  -> Lambda Mono decisions
+  -> solved inline plan
+  -> direct Solved-to-LIR decisions
   -> LIR
   -> ARC insertion
   -> native dev backend on native compiler hosts
@@ -6196,8 +4637,8 @@ Roc's checked module boundary and existing LIR.
 | `monotype` | Monotype IR |
 | `monotype_lifted` | Monotype Lifted IR |
 | `lambdasolved` | Lambda Solved IR |
-| `lambdamono` | Lambda Mono decisions |
-| `ir` | direct Lambda Mono to LIR builder |
+| `lambdamono` | logical Lambda Mono decisions in direct lowering; materialized only by the debug verifier |
+| `ir` | direct Solved-to-LIR builder |
 | `eval` | LIR interpreter for compile-time evaluation |
 
 Roc intentionally keeps Cor's post-solve shape:
@@ -6283,7 +4724,7 @@ The allowed replacement is explicit stage ownership:
 - Monotype owns monomorphic specialization and static-dispatch elimination
 - Monotype Lifted owns closure lifting
 - Lambda Solved owns callable flow in the type graph
-- Lambda Mono owns explicit callable value representation
+- direct Solved-to-LIR lowering owns explicit callable value representation
 - LIR lowering owns committed layouts and statement lowering
 - ARC owns borrow inference, mode specialization, and reference-count
   insertion
@@ -6305,13 +4746,13 @@ Minimum boundary checks:
   definitions in expression position, definition references in expression
   position, or direct calls whose callee is still a Monotype function template.
 - Lambda Solved IR has every function type in `args/callable/ret` form.
-- Lambda Solved IR has no unresolved callable slot before Lambda Mono lowering.
+- Lambda Solved IR has no unresolved callable slot before direct LIR lowering.
 - Lambda Mono decisions contain no function type and no value-call node.
 - Lambda Mono decisions contain no unresolved lambda set.
 - Lambda Mono decisions contain no runtime tag discriminants or layout ids.
 - Checked compile-time stores contain only `ConstStore` data.
-- LIR lowering receives only Lambda Solved lifted syntax plus Lambda Mono
-  decisions.
+- LIR lowering receives only Lambda Solved lifted syntax plus the solved inline
+  plan and owns its logical Lambda Mono decisions.
 - ARC insertion receives LIR containing no RC statements.
 - ARC output passes the debug borrow certifier.
 - Backends receive only ARC-complete LIR.
