@@ -8558,7 +8558,7 @@ const BodyContext = struct {
             .lookup_required => |resolved| try self.activeNodeFromType(try self.lookupExprMonoType(expr.ty, resolved)),
             .lambda => |lambda| try self.lambdaFunctionNode(lambda),
             .closure => |closure| try self.closureFunctionNode(closure),
-            .field_access => |field| try self.activeNodeFromType(try self.fieldAccessMonoType(field.receiver, field.field_name)),
+            .field_access => |field| try self.fieldAccessTypeNode(expr.ty, field.receiver, field.field_name, null),
             else => try self.lowerTypeNode(expr.ty),
         };
     }
@@ -8576,7 +8576,7 @@ const BodyContext = struct {
             .lookup_required => |resolved| try self.lookupExprMonoType(expr.ty, resolved),
             .lambda => |lambda| try self.lambdaFunctionType(lambda),
             .closure => |closure| try self.closureFunctionType(closure),
-            .field_access => |field| try self.fieldAccessMonoType(field.receiver, field.field_name),
+            .field_access => |field| try self.activeTypeFromNode(try self.fieldAccessTypeNode(expr.ty, field.receiver, field.field_name, null)),
             else => try self.lowerTypeView(expr.ty),
         };
     }
@@ -8826,6 +8826,15 @@ const BodyContext = struct {
             .structural_hash => Common.invariant("structural hash reached ordinary expression lowering after explicit hash lowering"),
             .field_access => |field| field_access: {
                 const receiver_ty = try self.lowerExprType(field.receiver);
+                if (@import("builtin").mode == .Debug) {
+                    const field_ty = self.builder.recordFieldType(
+                        receiver_ty,
+                        try self.builder.recordFieldName(self.view, field.field_name),
+                    );
+                    if (!self.sameType(ty, field_ty)) {
+                        Common.invariant("Monotype field access type differed from its receiver field type");
+                    }
+                }
                 break :field_access .{ .field_access = .{
                     .receiver = try self.lowerExprAtType(field.receiver, receiver_ty),
                     .field = try self.builder.recordFieldName(self.view, field.field_name),
@@ -14627,7 +14636,7 @@ const BodyContext = struct {
             .interpolation => |interpolation| return try self.dispatchResultMonoType(expr.ty, interpolation.plan, expected_ty),
             .type_dispatch_call => |plan| return try self.dispatchResultMonoType(expr.ty, plan, expected_ty),
             .method_eq => |plan| return try self.dispatchResultMonoType(expr.ty, plan, expected_ty),
-            .field_access => |field| return try self.fieldAccessMonoType(field.receiver, field.field_name),
+            .field_access => |field| return try self.activeTypeFromNode(try self.fieldAccessTypeNode(expr.ty, field.receiver, field.field_name, expected_ty)),
             .lookup_local => |lookup| return try self.lookupExprMonoType(expr.ty, lookup.resolved),
             .lookup_external => |resolved| return try self.lookupExprMonoType(expr.ty, resolved),
             .lookup_required => |resolved| return try self.lookupExprMonoType(expr.ty, resolved),
@@ -14697,16 +14706,24 @@ const BodyContext = struct {
         };
     }
 
-    fn fieldAccessMonoType(
+    fn fieldAccessTypeNode(
         self: *BodyContext,
+        checked_ty: checked.CheckedTypeId,
         receiver: checked.CheckedExprId,
         field_name: names.RecordFieldNameId,
-    ) Allocator.Error!Type.TypeId {
-        const receiver_ty = try self.lowerExprType(receiver);
-        return self.builder.recordFieldType(
-            receiver_ty,
+        expected_ty: ?Type.TypeId,
+    ) Allocator.Error!NodeId {
+        const receiver_node = try self.lowerExprTypeNode(receiver);
+        const field_node = try self.graph.recordFieldNode(
+            receiver_node,
             try self.builder.recordFieldName(self.view, field_name),
         );
+        try self.graph.unify(field_node, try self.instNode(checked_ty));
+        if (expected_ty) |expected| {
+            try self.graph.unify(field_node, try self.graph.importMono(expected));
+        }
+        try self.graph.drainDirty();
+        return field_node;
     }
 
     fn callResultMonoType(
@@ -16303,6 +16320,15 @@ const BodyContext = struct {
                 const lowered = try self.lowerDirectStructuralHashAtType(h, ty);
                 if (!self.sameType(ty, try self.exprType(lowered))) {
                     Common.invariant("checked structural hash lowered at a type different from its context type");
+                }
+                return lowered;
+            },
+            .field_access => |field| {
+                const field_node = try self.fieldAccessTypeNode(expr.ty, field.receiver, field.field_name, ty);
+                const field_ty = try self.activeTypeFromNode(field_node);
+                const lowered = try self.lowerExprWithType(checked_expr, field_ty);
+                if (!self.sameType(ty, try self.exprType(lowered))) {
+                    Common.invariant("checked field access lowered at a type different from its context type");
                 }
                 return lowered;
             },
@@ -20681,13 +20707,7 @@ const BodyContext = struct {
             .lookup_local => |lookup| try self.lookupExprMonoType(expr.ty, lookup.resolved),
             .lookup_external => |resolved| try self.lookupExprMonoType(expr.ty, resolved),
             .lookup_required => |resolved| try self.lookupExprMonoType(expr.ty, resolved),
-            .field_access => |field| blk: {
-                if (expected_ty) |ty| {
-                    try self.constrainTypeToMono(expr.ty, ty);
-                    break :blk ty;
-                }
-                break :blk try self.fieldAccessMonoType(field.receiver, field.field_name);
-            },
+            .field_access => |field| try self.activeTypeFromNode(try self.fieldAccessTypeNode(expr.ty, field.receiver, field.field_name, expected_ty)),
             else => null,
         };
     }
