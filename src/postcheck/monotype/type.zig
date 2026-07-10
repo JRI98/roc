@@ -64,6 +64,17 @@ pub const TypeDef = struct {
     /// Compiler-generated specialization identity for internal nominals minted
     /// from a public source nominal. Null means this is the source nominal.
     generated: ?names.TypeDigest = null,
+    /// Representation decision produced when an internal iterator nominal is
+    /// created. Later stages consume the recorded tier and mint depth directly.
+    iterator_representation: IteratorRepresentation = .none,
+    /// Producer-computed minted-chain depth. Meaningful only for `.minted`.
+    iterator_depth: u8 = 0,
+};
+
+pub const IteratorRepresentation = enum(u8) {
+    none,
+    minted,
+    forced_dynamic,
 };
 
 /// Named checked type instance.
@@ -838,6 +849,8 @@ pub const Store = struct {
                     writeBytes(hasher, name_store.typeNameText(named.def.type_name));
                 }
                 writeOptionalDigest(hasher, named.def.generated);
+                writeBytes(hasher, @tagName(named.def.iterator_representation));
+                writeU32(hasher, named.def.iterator_depth);
                 writeBytes(hasher, @tagName(named.kind));
                 if (named.builtin_owner) |owner| {
                     writeBytes(hasher, "builtin");
@@ -997,6 +1010,8 @@ pub const Store = struct {
                     writeBytes(hasher, name_store.typeNameText(named.def.type_name));
                 }
                 writeOptionalDigest(hasher, named.def.generated);
+                writeBytes(hasher, @tagName(named.def.iterator_representation));
+                writeU32(hasher, named.def.iterator_depth);
                 writeBytes(hasher, @tagName(named.kind));
                 if (named.builtin_owner) |owner| {
                     writeBytes(hasher, "builtin");
@@ -1222,6 +1237,8 @@ fn namedTypeViewEql(
         return false;
     }
     if (!optionalDigestEql(lhs.def.generated, rhs.def.generated)) return false;
+    if (lhs.def.iterator_representation != rhs.def.iterator_representation) return false;
+    if (lhs.def.iterator_depth != rhs.def.iterator_depth) return false;
     if (lhs.builtin_owner != rhs.builtin_owner) return false;
     if (!try typeSpanViewEql(type_view, name_store, lhs.args, rhs.args, visited)) return false;
 
@@ -1539,6 +1556,8 @@ fn namedTypeEqlAcrossStores(
         return false;
     }
     if (!optionalDigestEql(lhs.def.generated, rhs.def.generated)) return false;
+    if (lhs.def.iterator_representation != rhs.def.iterator_representation) return false;
+    if (lhs.def.iterator_depth != rhs.def.iterator_depth) return false;
     if (lhs.builtin_owner != rhs.builtin_owner) return false;
     if (!try typeSpanEqlAcrossStores(name_store, lhs_view, lhs.args, rhs_view, rhs.args, visited)) return false;
 

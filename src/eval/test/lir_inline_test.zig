@@ -3097,9 +3097,9 @@ test "iter alloc static: recursive map wrapping terminates at dynamic boundary" 
 
     var ordinary = try lowerModuleWithOptions(allocator, source, .none, .{ .tag_reachability = true });
     defer ordinary.deinit(allocator);
-    try std.testing.expect(try reachableProcShapeFieldTotal(allocator, &ordinary.lowered, "box_box_count") > 0);
-    try expectReachableProcShapeFieldEqual(allocator, &ordinary.lowered, "erased_call_count", 0);
-    try expectReachableProcShapeFieldEqual(allocator, &ordinary.lowered, "packed_erased_fn_count", 0);
+    try expectReachableProcShapeFieldEqual(allocator, &ordinary.lowered, "box_box_count", 0);
+    try expectReachableProcShapeFieldEqual(allocator, &ordinary.lowered, "erased_call_count", 1);
+    try std.testing.expect(try reachableProcShapeFieldTotal(allocator, &ordinary.lowered, "packed_erased_fn_count") > 0);
 
     // The `.wrappers` half of this case is blocked on a capture-identity bug
     // that the termination fixes above unmasked: the recursively-wrapped
@@ -3114,9 +3114,9 @@ test "iter alloc static: recursive map wrapping terminates at dynamic boundary" 
 
 // Both sides of the depth backstop on statically bounded chains: a 10-adapter
 // chain (depth 11) stays under the cap and lowers flat, while a 20-adapter
-// chain (depth 21) trips it and takes the sanctioned box — but still compiles,
-// still avoids erased callables, and stays correct. Sources are generated so
-// the two tests differ only in adapter count.
+// chain (depth 21) trips it and takes the explicit forced-dynamic callable
+// representation. Sources are generated so the two tests differ only in
+// adapter count.
 fn deepStaticChainSource(comptime map_count: usize) []const u8 {
     comptime {
         var source: []const u8 =
@@ -3145,14 +3145,14 @@ test "iter alloc static: deep static chain under the depth cap stays flat" {
     try expectReachableProcShapeFieldEqual(allocator, &ordinary.lowered, "packed_erased_fn_count", 0);
 }
 
-test "iter alloc static: static chain past the depth cap boxes but compiles" {
+test "iter alloc static: static chain past the depth cap uses forced dynamic representation" {
     const allocator = std.testing.allocator;
     const source = comptime deepStaticChainSource(20);
     var ordinary = try lowerModuleWithOptions(allocator, source, .none, .{ .tag_reachability = true });
     defer ordinary.deinit(allocator);
-    try std.testing.expect(try reachableProcShapeFieldTotal(allocator, &ordinary.lowered, "box_box_count") > 0);
-    try expectReachableProcShapeFieldEqual(allocator, &ordinary.lowered, "erased_call_count", 0);
-    try expectReachableProcShapeFieldEqual(allocator, &ordinary.lowered, "packed_erased_fn_count", 0);
+    try expectReachableProcShapeFieldEqual(allocator, &ordinary.lowered, "box_box_count", 0);
+    try expectReachableProcShapeFieldEqual(allocator, &ordinary.lowered, "erased_call_count", 1);
+    try expectReachableProcShapeFieldEqual(allocator, &ordinary.lowered, "packed_erased_fn_count", 2);
 }
 
 // The base `[list].iter().fold` must lower with no boxed iterator state and no

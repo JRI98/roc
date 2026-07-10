@@ -1052,10 +1052,11 @@ const Solver = struct {
                     try self.markErasedCallablesReachedByTypeInner(arg, active, false);
                 }
                 if (named.backing) |backing| {
-                    const backing_is_iter = if (named.builtin_owner) |owner|
-                        static_dispatch.isIteratorOwner(owner)
-                    else
-                        false;
+                    const backing_is_iter = named.def.iterator_representation == .minted and
+                        if (named.builtin_owner) |owner|
+                            static_dispatch.isIteratorOwner(owner)
+                        else
+                            false;
                     try self.markErasedCallablesReachedByTypeInner(backing.ty, active, backing_is_iter);
                 }
             },
@@ -1072,7 +1073,11 @@ const Solver = struct {
     fn lowerTypeFresh(self: *Solver, ty: MonoType.TypeId) Allocator.Error!Type.TypeVarId {
         var cloner = TypeCloner.init(self);
         defer cloner.deinit();
-        return try cloner.lower(ty);
+        const lowered = try cloner.lower(ty);
+        for (cloner.forced_dynamic_backings.items) |backing| {
+            try self.markErasedCallablesReachedByType(backing);
+        }
+        return lowered;
     }
 
     fn listElem(self: *Solver, ty: Type.TypeVarId) Allocator.Error!Type.TypeVarId {
@@ -1137,7 +1142,7 @@ const Solver = struct {
     fn generatedIteratorBacking(self: *Solver, ty: Type.TypeVarId) ?Type.TypeVarId {
         return switch (self.program.types.rootContent(ty)) {
             .named => |named| blk: {
-                if (named.def.generated == null) break :blk null;
+                if (named.def.iterator_representation == .none) break :blk null;
                 const owner = named.builtin_owner orelse break :blk null;
                 if (!static_dispatch.isIteratorOwner(owner)) break :blk null;
                 break :blk if (named.backing) |backing| backing.ty else null;
@@ -1462,6 +1467,7 @@ const Solver = struct {
                         left_named.kind != right_named.kind or
                         left_named.builtin_owner != right_named.builtin_owner)
                     {
+                        if (try self.unifyForcedDynamicIterator(a, b, left_named, right_named)) return;
                         if (try self.unifyIteratorOwnerStampedPublic(a, b, left_named, right_named)) return;
                         if (try self.unifyGeneratedIteratorJoin(a, b, left_named, right_named)) return;
                         if (try self.unifyPublicGeneratedIterator(a, b, left_named, right_named)) return;
@@ -1518,6 +1524,34 @@ const Solver = struct {
         return true;
     }
 
+    fn unifyForcedDynamicIterator(
+        self: *Solver,
+        left_ty: Type.TypeVarId,
+        right_ty: Type.TypeVarId,
+        left: anytype,
+        right: anytype,
+    ) Allocator.Error!bool {
+        if (left.kind != right.kind) return false;
+        if (!sameSourceTypeDef(left.def, right.def)) return false;
+        _ = iteratorLikeOwnerFromPair(left.builtin_owner, right.builtin_owner) orelse return false;
+
+        const left_dynamic = left.def.iterator_representation == .forced_dynamic;
+        const right_dynamic = right.def.iterator_representation == .forced_dynamic;
+        if (left_dynamic == right_dynamic) return false;
+        if (left.args.count() == 0 or right.args.count() == 0) {
+            Common.invariant("forced-dynamic iterator reached Lambda Solved without a public item argument");
+        }
+
+        try self.unify(self.program.types.spanItem(left.args, 0), self.program.types.spanItem(right.args, 0));
+        try self.unifyIteratorBackings(left, right);
+        if (left_dynamic) {
+            self.program.types.set(right_ty, .{ .link = left_ty });
+        } else {
+            self.program.types.set(left_ty, .{ .link = right_ty });
+        }
+        return true;
+    }
+
     fn unifyGeneratedIteratorJoin(
         self: *Solver,
         left_ty: Type.TypeVarId,
@@ -1565,12 +1599,25 @@ const Solver = struct {
         }
         try self.unify(self.program.types.spanItem(left.args, 0), self.program.types.spanItem(right.args, 0));
 
-        if (left.def.generated != null) {
+        if (left.def.iterator_representation == .minted) {
             self.program.types.set(right_ty, .{ .link = left_ty });
         } else {
             self.program.types.set(left_ty, .{ .link = right_ty });
         }
         return true;
+    }
+
+    fn unifyIteratorBackings(self: *Solver, left: anytype, right: anytype) Allocator.Error!void {
+        if (left.backing) |left_backing| {
+            const right_backing = right.backing orelse
+                Common.invariant("iterator unification found backing on only one side");
+            if (left_backing.use != right_backing.use) {
+                Common.invariant("iterator unification found different backing uses");
+            }
+            try self.unify(left_backing.ty, right_backing.ty);
+        } else if (right.backing != null) {
+            Common.invariant("iterator unification found backing on only one side");
+        }
     }
 
     fn transparentAliasBacking(content: Type.Content) ?Type.TypeVarId {
@@ -1792,15 +1839,18 @@ fn writeU32(hasher: *std.crypto.hash.sha2.Sha256, value: u32) void {
 const TypeCloner = struct {
     solver: *Solver,
     map: std.AutoHashMap(MonoType.TypeId, Type.TypeVarId),
+    forced_dynamic_backings: std.ArrayList(Type.TypeVarId),
 
     fn init(solver: *Solver) TypeCloner {
         return .{
             .solver = solver,
             .map = std.AutoHashMap(MonoType.TypeId, Type.TypeVarId).init(solver.allocator),
+            .forced_dynamic_backings = .empty,
         };
     }
 
     fn deinit(self: *TypeCloner) void {
+        self.forced_dynamic_backings.deinit(self.solver.allocator);
         self.map.deinit();
     }
 
@@ -1808,7 +1858,13 @@ const TypeCloner = struct {
         if (self.map.get(ty)) |cached| return cached;
         const reserved = try self.solver.program.types.add(.unbound);
         try self.map.put(ty, reserved);
-        self.solver.program.types.set(reserved, try self.lowerContent(self.solver.lifted.types.get(ty)));
+        const content = try self.lowerContent(self.solver.lifted.types.get(ty));
+        self.solver.program.types.set(reserved, content);
+        if (content == .named and content.named.def.iterator_representation == .forced_dynamic) {
+            const backing = content.named.backing orelse
+                Common.invariant("forced-dynamic iterator reached Lambda Solved without a backing type");
+            try self.forced_dynamic_backings.append(self.solver.allocator, backing.ty);
+        }
         return reserved;
     }
 
@@ -1953,15 +2009,16 @@ fn isPublicGeneratedIteratorPair(left: anytype, right: anytype) bool {
     if (left.kind != right.kind) return false;
     _ = iteratorLikeOwnerFromPair(left.builtin_owner, right.builtin_owner) orelse return false;
     if (!sameSourceTypeDef(left.def, right.def)) return false;
-    return (left.def.generated == null) != (right.def.generated == null);
+    return (left.def.iterator_representation == .minted and right.def.iterator_representation == .none) or
+        (left.def.iterator_representation == .none and right.def.iterator_representation == .minted);
 }
 
 fn isGeneratedIteratorJoinPair(left: anytype, right: anytype) bool {
     if (left.kind != right.kind) return false;
     _ = iteratorLikeOwnerFromPair(left.builtin_owner, right.builtin_owner) orelse return false;
     if (!sameSourceTypeDef(left.def, right.def)) return false;
-    return left.def.generated != null and
-        right.def.generated != null and
+    return left.def.iterator_representation == .minted and
+        right.def.iterator_representation == .minted and
         !optionalDigestEql(left.def.generated, right.def.generated);
 }
 
@@ -2003,7 +2060,9 @@ fn sameMonoTypeDef(left: MonoType.TypeDef, right: MonoType.TypeDef) bool {
     return left.module == right.module and
         left.type_name == right.type_name and
         left.source_decl == right.source_decl and
-        optionalDigestEql(left.generated, right.generated);
+        optionalDigestEql(left.generated, right.generated) and
+        left.iterator_representation == right.iterator_representation and
+        left.iterator_depth == right.iterator_depth;
 }
 
 fn optionalDigestEql(left: ?names.TypeDigest, right: ?names.TypeDigest) bool {

@@ -278,6 +278,8 @@ pub const Store = struct {
                 writeOptionalU32(hasher, named.def.source_decl);
                 writeBytes(hasher, name_store.typeNameText(named.def.type_name));
                 writeOptionalDigest(hasher, named.def.generated);
+                writeBytes(hasher, @tagName(named.def.iterator_representation));
+                writeU32(hasher, named.def.iterator_depth);
                 writeBytes(hasher, @tagName(named.kind));
                 if (named.builtin_owner) |owner| {
                     writeBytes(hasher, "builtin");

@@ -3617,6 +3617,19 @@ pub fn build(b: *std.Build) void {
         build_wasm_iter_for_dev_app.step.dependOn(build_test_hosts_step);
         build_test_wasm_static_lib_runner_step.dependOn(&build_wasm_iter_for_dev_app.step);
 
+        // Dev-mode recursive iterator construction must converge at the
+        // explicit forced-dynamic representation tier.
+        const build_wasm_iter_recursive_concat_app = b.addRunArtifact(roc_exe);
+        build_wasm_iter_recursive_concat_app.addArgs(&.{
+            "build",
+            "test/wasm/iter_recursive_concat_static_lib_app.roc",
+            "--opt=dev",
+            "--target=wasm32",
+            "--output=test/wasm/iter_recursive_concat_static_lib_app.wasm",
+        });
+        build_wasm_iter_recursive_concat_app.step.dependOn(build_test_hosts_step);
+        build_test_wasm_static_lib_runner_step.dependOn(&build_wasm_iter_recursive_concat_app.step);
+
         // Static-data hoisting gate: a constant list literal consumed via
         // `.iter()` must materialize as static data and allocate nothing, so the
         // whole minted chain (base list included) is zero-alloc on the cart path.
@@ -3774,6 +3787,21 @@ pub fn build(b: *std.Build) void {
             });
             run_wasm_iter_for_test.step.dependOn(build_test_wasm_static_lib_runner_step);
             run_test_wasm_static_lib_step.dependOn(&run_wasm_iter_for_test.step);
+
+            const run_wasm_iter_recursive_concat_test = b.addRunArtifact(wasm_test_exe);
+            run_wasm_iter_recursive_concat_test.addArgs(&.{
+                "--wasm-path",
+                "test/wasm/iter_recursive_concat_static_lib_app.wasm",
+                "--expected",
+                "ok",
+                "--assert-alloc-balanced",
+                // The fixed cart is ~542 KB. The prior unbounded generated
+                // callable expansion exceeded 815 KB before failing to lower.
+                "--max-bytes",
+                "600000",
+            });
+            run_wasm_iter_recursive_concat_test.step.dependOn(build_test_wasm_static_lib_runner_step);
+            run_test_wasm_static_lib_step.dependOn(&run_wasm_iter_recursive_concat_test.step);
 
             // Static-data hoisting: the constant list literal is materialized as
             // static data, so the whole chain allocates nothing. `--max-allocs 0`

@@ -75,6 +75,14 @@ pub const TypeDef = struct {
     /// Compiler-generated specialization identity for internal nominals minted
     /// after checking while preserving the public declaration identity.
     generated: ?names.TypeDigest = null,
+    iterator_representation: IteratorRepresentation = .none,
+    iterator_depth: u8 = 0,
+};
+
+pub const IteratorRepresentation = enum(u8) {
+    none,
+    minted,
+    forced_dynamic,
 };
 
 /// How much of a stored named type's backing type later stages may inspect.
@@ -464,6 +472,8 @@ pub const ConstTypeStore = struct {
             .type_name = try translation.target.internTypeName(translation.source.typeNameText(def.type_name)),
             .source_decl = def.source_decl,
             .generated = def.generated,
+            .iterator_representation = def.iterator_representation,
+            .iterator_depth = def.iterator_depth,
         };
     }
 

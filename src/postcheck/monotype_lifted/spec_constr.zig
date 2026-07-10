@@ -1420,7 +1420,7 @@ const Pass = struct {
         return switch (self.program.types.get(ty)) {
             .named => |named| blk: {
                 const type_name = self.program.names.typeNameText(named.def.type_name);
-                break :blk named.def.generated != null or std.mem.eql(u8, type_name, "Builtin.Iter");
+                break :blk named.def.iterator_representation != .none or std.mem.eql(u8, type_name, "Builtin.Iter");
             },
             else => false,
         };

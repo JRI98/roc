@@ -678,6 +678,21 @@ pub const InstGraph = struct {
                         try self.unifyThroughBacking(right, right_content, left, pending);
                         return;
                     }
+                    if (isForcedDynamicIteratorPair(left_named, right_named)) {
+                        if (left_named.args.len == 0 or right_named.args.len == 0) {
+                            Common.invariant("forced-dynamic iterator reached Monotype instantiation without a public item argument");
+                        }
+                        try pending.append(self.allocator, .{
+                            .left = left_named.args[0],
+                            .right = right_named.args[0],
+                        });
+                        if (left_named.def.iterator_representation == .forced_dynamic) {
+                            try self.union_(left, right);
+                        } else {
+                            try self.union_(right, left);
+                        }
+                        return;
+                    }
                     if (std.meta.eql(left_named.def, right_named.def) and left_named.args.len == right_named.args.len) {
                         for (left_named.args, right_named.args) |left_arg, right_arg| {
                             try pending.append(self.allocator, .{ .left = left_arg, .right = right_arg });
@@ -851,7 +866,9 @@ pub const InstGraph = struct {
         return left.module == right.module and
             left.type_name == right.type_name and
             left.source_decl == right.source_decl and
-            optionalDigestEql(left.generated, right.generated);
+            optionalDigestEql(left.generated, right.generated) and
+            left.iterator_representation == right.iterator_representation and
+            left.iterator_depth == right.iterator_depth;
     }
 
     fn optionalDigestEql(left: ?names.TypeDigest, right: ?names.TypeDigest) bool {
@@ -1799,9 +1816,12 @@ pub const GraphTypeFinals = struct {
 
     fn isGeneratedIteratorEvidenceType(self: *GraphTypeFinals, ty: Type.TypeId) bool {
         return switch (self.graph.types.get(ty)) {
-            .named => |named| named.def.generated != null and switch (named.builtin_owner orelse return false) {
-                .iter, .stream => true,
-                else => false,
+            .named => |named| switch (named.def.iterator_representation) {
+                .minted, .forced_dynamic => switch (named.builtin_owner orelse return false) {
+                    .iter, .stream => true,
+                    else => false,
+                },
+                .none => false,
             },
             else => false,
         };
@@ -2250,6 +2270,31 @@ fn eitherBuiltinOwner(left: ?static_dispatch.BuiltinOwner, right: ?static_dispat
         if (right_owner == owner) return true;
     }
     return false;
+}
+
+fn isForcedDynamicIteratorPair(left: InstNamed, right: InstNamed) bool {
+    if (left.kind != right.kind) return false;
+    if (left.def.module != right.def.module or
+        left.def.type_name != right.def.type_name or
+        left.def.source_decl != right.def.source_decl)
+    {
+        return false;
+    }
+    if (!isIteratorLikeOwnerPair(left.builtin_owner, right.builtin_owner)) return false;
+    return (left.def.iterator_representation == .forced_dynamic) !=
+        (right.def.iterator_representation == .forced_dynamic);
+}
+
+fn isIteratorLikeOwnerPair(left: ?static_dispatch.BuiltinOwner, right: ?static_dispatch.BuiltinOwner) bool {
+    const owner = left orelse right orelse return false;
+    if (owner != .iter and owner != .stream) return false;
+    if (left) |left_owner| {
+        if (left_owner != owner) return false;
+    }
+    if (right) |right_owner| {
+        if (right_owner != owner) return false;
+    }
+    return true;
 }
 
 fn testCheckedTypeId(comptime value: u32) checked.CheckedTypeId {

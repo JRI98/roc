@@ -644,6 +644,8 @@ const Lowerer = struct {
             .type_name = try self.result.const_type_names.internTypeName(self.program.names.typeNameText(def.type_name)),
             .source_decl = def.source_decl,
             .generated = def.generated,
+            .iterator_representation = @enumFromInt(@intFromEnum(def.iterator_representation)),
+            .iterator_depth = def.iterator_depth,
         };
     }
 

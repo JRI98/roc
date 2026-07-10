@@ -581,12 +581,7 @@ const Builder = struct {
     symbols: Common.SymbolGen = .{},
     type_cache: std.AutoHashMap(CheckedTypeAddress, Type.TypeId),
     generated_iter_types: std.AutoHashMap([32]u8, Type.TypeId),
-    /// Chain depth per minted iterator digest (source = 1, each adapter +1),
-    /// keyed the same as `generated_iter_types`. Bounds minting so a
-    /// recursively-constructed chain terminates specialization: past the
-    /// depth backstop the constructor keeps the public recursive `Iter`
-    /// result, which takes the sanctioned dynamic-boundary box.
-    generated_iter_depths: std.AutoHashMap([32]u8, u32),
+    forced_dynamic_iter_types: std.AutoHashMap([32]u8, Type.TypeId),
     spec_store: specialize.SpecBuilder,
     /// Monotypes owned by the builder-global type cache. They are lowered
     /// without body evidence, so empty tag unions inside them are unresolved
@@ -644,7 +639,7 @@ const Builder = struct {
             .target_usize = options.target_usize,
             .type_cache = std.AutoHashMap(CheckedTypeAddress, Type.TypeId).init(allocator),
             .generated_iter_types = std.AutoHashMap([32]u8, Type.TypeId).init(allocator),
-            .generated_iter_depths = std.AutoHashMap([32]u8, u32).init(allocator),
+            .forced_dynamic_iter_types = std.AutoHashMap([32]u8, Type.TypeId).init(allocator),
             .spec_store = spec_store,
             .unsolved_monos = std.AutoHashMap(Type.TypeId, void).init(allocator),
             .lowered_templates = std.AutoHashMap(Ast.FnId, LoweredTemplate).init(allocator),
@@ -695,7 +690,7 @@ const Builder = struct {
         self.spec_store.deinit();
         self.unsolved_monos.deinit();
         self.generated_iter_types.deinit();
-        self.generated_iter_depths.deinit();
+        self.forced_dynamic_iter_types.deinit();
         self.type_cache.deinit();
         self.evidence_arena.deinit();
     }
@@ -2107,7 +2102,7 @@ const Builder = struct {
             .zst,
             => false,
             .named => |named| blk: {
-                if (named.def.generated != null) {
+                if (named.def.iterator_representation != .none) {
                     if (named.builtin_owner) |owner| {
                         if (owner == .iter or owner == .stream) break :blk true;
                     }
@@ -9998,10 +9993,20 @@ const BodyContext = struct {
 
     fn isGeneratedIteratorEvidenceType(self: *BodyContext, ty: Type.TypeId) bool {
         return switch (self.builder.program.types.get(ty)) {
-            .named => |named| named.def.generated != null and switch (named.builtin_owner orelse return false) {
-                .iter, .stream => true,
-                else => false,
+            .named => |named| switch (named.def.iterator_representation) {
+                .minted, .forced_dynamic => switch (named.builtin_owner orelse return false) {
+                    .iter, .stream => true,
+                    else => false,
+                },
+                .none => false,
             },
+            else => false,
+        };
+    }
+
+    fn isForcedDynamicIteratorType(self: *BodyContext, ty: Type.TypeId) bool {
+        return switch (self.builder.program.types.get(ty)) {
+            .named => |named| named.def.iterator_representation == .forced_dynamic,
             else => false,
         };
     }
@@ -10224,6 +10229,8 @@ const BodyContext = struct {
 
                 var public_def = ctx.named.def;
                 public_def.generated = null;
+                public_def.iterator_representation = .none;
+                public_def.iterator_depth = 0;
                 const args = ctx.body.builder.program.types.span(ctx.named.args);
                 if (args.len == 0) Common.invariant("generated iterator evidence had no public item argument");
                 const public_item = try ctx.body.publicOpaqueUnificationTypeInner(GuardedList.at(args, 0), ctx.cache);
@@ -10260,6 +10267,8 @@ const BodyContext = struct {
     ) Allocator.Error!Type.TypeId {
         var public_def = named.def;
         public_def.generated = null;
+        public_def.iterator_representation = .none;
+        public_def.iterator_depth = 0;
         return try self.builder.program.types.add(.{ .named = .{
             .named_type = named.named_type,
             .def = public_def,
@@ -10349,6 +10358,9 @@ const BodyContext = struct {
             if (expected_ret_ty) |expected| {
                 if (self.isGeneratedIteratorEvidenceType(expected)) {
                     const stable_expected = try self.stableGeneratedIteratorEvidenceType(expected);
+                    if (self.isForcedDynamicIteratorType(stable_expected)) {
+                        return try self.functionTypeWithReturn(arg_tys, stable_expected);
+                    }
                     const expected_components = try self.generatedIteratorComponentArgs(stable_expected, 2);
                     defer self.allocator.free(expected_components);
                     const stable_args = [_]Type.TypeId{ expected_components[0], arg_tys[1], expected_components[1] };
@@ -10366,6 +10378,9 @@ const BodyContext = struct {
             if (expected_ret_ty) |expected| {
                 if (self.isGeneratedIteratorEvidenceType(expected)) {
                     const stable_expected = try self.stableGeneratedIteratorEvidenceType(expected);
+                    if (self.isForcedDynamicIteratorType(stable_expected)) {
+                        return try self.functionTypeWithReturn(arg_tys, stable_expected);
+                    }
                     const expected_args = try self.generatedIteratorComponentArgs(stable_expected, 1);
                     defer self.allocator.free(expected_args);
                     return try self.functionTypeWithReturn(expected_args, stable_expected);
@@ -10390,6 +10405,9 @@ const BodyContext = struct {
             if (expected_ret_ty) |expected| {
                 if (self.isGeneratedIteratorEvidenceType(expected)) {
                     const stable_expected = try self.stableGeneratedIteratorEvidenceType(expected);
+                    if (self.isForcedDynamicIteratorType(stable_expected)) {
+                        return try self.functionTypeWithReturn(arg_tys, stable_expected);
+                    }
                     const expected_args = try self.generatedIteratorComponentArgs(stable_expected, 2);
                     defer self.allocator.free(expected_args);
                     return try self.functionTypeWithReturn(expected_args, stable_expected);
@@ -10408,6 +10426,9 @@ const BodyContext = struct {
             if (expected_ret_ty) |expected| {
                 if (self.isGeneratedIteratorEvidenceType(expected)) {
                     const stable_expected = try self.stableGeneratedIteratorEvidenceType(expected);
+                    if (self.isForcedDynamicIteratorType(stable_expected)) {
+                        return try self.functionTypeWithReturn(arg_tys, stable_expected);
+                    }
                     const expected_args = try self.generatedIteratorComponentArgs(stable_expected, 2);
                     defer self.allocator.free(expected_args);
                     return try self.functionTypeWithReturn(expected_args, stable_expected);
@@ -10426,6 +10447,9 @@ const BodyContext = struct {
             if (expected_ret_ty) |expected| {
                 if (self.isGeneratedIteratorEvidenceType(expected)) {
                     const stable_expected = try self.stableGeneratedIteratorEvidenceType(expected);
+                    if (self.isForcedDynamicIteratorType(stable_expected)) {
+                        return try self.functionTypeWithReturn(arg_tys, stable_expected);
+                    }
                     const expected_args = try self.generatedIteratorComponentArgs(stable_expected, 2);
                     defer self.allocator.free(expected_args);
                     return try self.functionTypeWithReturn(expected_args, stable_expected);
@@ -10444,6 +10468,9 @@ const BodyContext = struct {
             if (expected_ret_ty) |expected| {
                 if (self.isGeneratedIteratorEvidenceType(expected)) {
                     const stable_expected = try self.stableGeneratedIteratorEvidenceType(expected);
+                    if (self.isForcedDynamicIteratorType(stable_expected)) {
+                        return try self.functionTypeWithReturn(arg_tys, stable_expected);
+                    }
                     const expected_args = try self.generatedIteratorComponentArgs(stable_expected, 2);
                     defer self.allocator.free(expected_args);
                     return try self.functionTypeWithReturn(expected_args, stable_expected);
@@ -10462,6 +10489,9 @@ const BodyContext = struct {
             if (expected_ret_ty) |expected| {
                 if (self.isGeneratedIteratorEvidenceType(expected)) {
                     const stable_expected = try self.stableGeneratedIteratorEvidenceType(expected);
+                    if (self.isForcedDynamicIteratorType(stable_expected)) {
+                        return try self.functionTypeWithReturn(arg_tys, stable_expected);
+                    }
                     const expected_args = try self.generatedIteratorComponentArgs(stable_expected, 2);
                     defer self.allocator.free(expected_args);
                     return try self.functionTypeWithReturn(expected_args, stable_expected);
@@ -10480,6 +10510,9 @@ const BodyContext = struct {
             if (expected_ret_ty) |expected| {
                 if (self.isGeneratedIteratorEvidenceType(expected)) {
                     const stable_expected = try self.stableGeneratedIteratorEvidenceType(expected);
+                    if (self.isForcedDynamicIteratorType(stable_expected)) {
+                        return try self.functionTypeWithReturn(arg_tys, stable_expected);
+                    }
                     const expected_args = try self.generatedIteratorComponentArgs(stable_expected, 2);
                     defer self.allocator.free(expected_args);
                     return try self.functionTypeWithReturn(expected_args, stable_expected);
@@ -10499,6 +10532,9 @@ const BodyContext = struct {
             if (expected_ret_ty) |expected| {
                 if (self.isGeneratedIteratorEvidenceType(expected)) {
                     const stable_expected = try self.stableGeneratedIteratorEvidenceType(expected);
+                    if (self.isForcedDynamicIteratorType(stable_expected)) {
+                        return try self.functionTypeWithReturn(arg_tys, stable_expected);
+                    }
                     const expected_args = try self.generatedIteratorComponentArgs(stable_expected, 2);
                     defer self.allocator.free(expected_args);
                     return try self.functionTypeWithReturn(expected_args, stable_expected);
@@ -10533,6 +10569,7 @@ const BodyContext = struct {
         ty: Type.TypeId,
     ) Allocator.Error!Type.TypeId {
         if (!self.isGeneratedIteratorEvidenceType(ty)) return ty;
+        if (self.isForcedDynamicIteratorType(ty)) return ty;
         const original_digest = self.generatedIteratorEvidenceDigest(ty) orelse
             Common.invariant("generated iterator evidence had no generated digest");
         const Context = struct {
@@ -10556,7 +10593,7 @@ const BodyContext = struct {
 
     fn generatedIteratorEvidenceDigest(self: *BodyContext, ty: Type.TypeId) ?names.TypeDigest {
         return switch (self.builder.program.types.get(ty)) {
-            .named => |named| if (self.isGeneratedIteratorEvidenceType(ty)) named.def.generated else null,
+            .named => |named| if (named.def.iterator_representation == .minted) named.def.generated else null,
             else => null,
         };
     }
@@ -10777,26 +10814,26 @@ const BodyContext = struct {
     ) Allocator.Error!Type.TypeId {
         // Mint a per-chain internal `Iter` nominal. Reusing the public `Iter`
         // definition here is only provenance for public unification and error
-        // boundaries; `def.generated` is what separates this chain's nominal
-        // identity from the public recursive `Iter` and from other adapter
-        // chains. This is representation-level minting, not SpecConstr.
+        // boundaries. The explicit representation tier and generated digest
+        // separate this chain's nominal identity from public `Iter`, the
+        // forced-dynamic tier, and sibling chains. This is representation-level
+        // minting, not SpecConstr.
         const public_named = self.publicIteratorNamed(public_iter_ty);
         const item_ty = self.iterItemType(public_iter_ty);
         const digest = self.generatedIteratorDigest(kind, item_ty, components, callable_evidence);
         if (self.builder.generated_iter_types.get(digest.bytes)) |cached| return cached;
 
-        // Depth backstop: a chain nested past the cap keeps the public
-        // recursive `Iter` result instead of minting deeper. Adapters over the
-        // public nominal never mint, so a recursively-constructed chain (its
-        // nesting depth a runtime value) reaches a fixed point here and
-        // specialization terminates; the public result takes the sanctioned
-        // dynamic-boundary box. A statically bounded chain deeper than the cap
-        // also boxes — a tier degradation, never a hang.
+        // Depth backstop: a chain nested past the cap becomes the explicit
+        // forced-dynamic representation instead of minting deeper. Adapters
+        // over that representation remain forced-dynamic, so a recursively
+        // constructed chain reaches a type fixed point and specialization
+        // terminates. A statically bounded chain deeper than the cap takes the
+        // same representation degradation, never an unbounded type expansion.
         var chain_depth: u32 = 1;
         for (components) |component| {
             chain_depth = @max(chain_depth, self.mintedIteratorChainDepth(component, depth_walk_fuel) + 1);
         }
-        if (chain_depth > max_minted_iterator_chain_depth) return public_iter_ty;
+        if (chain_depth > max_minted_iterator_chain_depth) return try self.forcedDynamicIteratorType(public_iter_ty);
 
         const args = try self.allocator.alloc(Type.TypeId, components.len + 1);
         defer self.allocator.free(args);
@@ -10809,9 +10846,10 @@ const BodyContext = struct {
             item_ty: Type.TypeId,
             args: []const Type.TypeId,
             digest: names.TypeDigest,
+            chain_depth: u32,
 
             fn fill(ctx: @This(), self_ty: Type.TypeId) Allocator.Error!Type.Content {
-                return try ctx.body.generatedIteratorContent(ctx.public_named, ctx.item_ty, ctx.args, ctx.digest, self_ty);
+                return try ctx.body.generatedIteratorContent(ctx.public_named, ctx.item_ty, ctx.args, ctx.digest, ctx.chain_depth, self_ty);
             }
         };
 
@@ -10821,10 +10859,10 @@ const BodyContext = struct {
             .item_ty = item_ty,
             .args = args,
             .digest = digest,
+            .chain_depth = chain_depth,
         };
         const generated = try self.builder.program.types.addRecursive(context, Context.fill);
         try self.builder.generated_iter_types.put(digest.bytes, generated);
-        try self.builder.generated_iter_depths.put(digest.bytes, chain_depth);
         return generated;
     }
 
@@ -10837,8 +10875,9 @@ const BodyContext = struct {
     /// many routes into specialization, and capping the type universe covers
     /// all of them at the single point where minted types are born. See
     /// design.md "Core Principles" on bounded post-check walks: exhaustion
-    /// errs toward the sanctioned dynamic-boundary box (a tier degradation on
-    /// an implausibly deep static chain), never toward divergence.
+    /// errs toward the explicit forced-dynamic representation (a tier
+    /// degradation on an implausibly deep static chain), never toward
+    /// divergence.
     const max_minted_iterator_chain_depth: u32 = 16;
 
     /// Recursion budget for the structural depth walk; exhausting it reports
@@ -10860,12 +10899,10 @@ const BodyContext = struct {
         return switch (self.builder.program.types.get(ty)) {
             .primitive, .erased, .zst, .func => 0,
             .named => |named| blk: {
-                if (named.def.generated) |generated_digest| {
-                    if (named.builtin_owner) |owner| switch (owner) {
-                        .iter, .stream => break :blk self.builder.generated_iter_depths.get(generated_digest.bytes) orelse
-                            max_minted_iterator_chain_depth,
-                        else => {},
-                    };
+                switch (named.def.iterator_representation) {
+                    .minted => break :blk named.def.iterator_depth,
+                    .forced_dynamic => break :blk max_minted_iterator_chain_depth,
+                    .none => {},
                 }
                 var depth: u32 = 0;
                 const named_args = self.builder.program.types.span(named.args);
@@ -11008,12 +11045,15 @@ const BodyContext = struct {
         item_ty: Type.TypeId,
         args: []const Type.TypeId,
         digest: names.TypeDigest,
+        chain_depth: u32,
         self_ty: Type.TypeId,
     ) Allocator.Error!Type.Content {
         const public_backing = public_named.backing orelse
             Common.invariant("generated iterator requested a public Iter without backing");
         var def = public_named.def;
         def.generated = digest;
+        def.iterator_representation = .minted;
+        def.iterator_depth = @intCast(chain_depth);
         return .{ .named = .{
             .named_type = public_named.named_type,
             .def = def,
@@ -11026,6 +11066,55 @@ const BodyContext = struct {
             },
             .declared_order = public_named.declared_order,
         } };
+    }
+
+    fn forcedDynamicIteratorType(
+        self: *BodyContext,
+        public_iter_ty: Type.TypeId,
+    ) Allocator.Error!Type.TypeId {
+        const public_named = self.publicIteratorNamed(public_iter_ty);
+        const item_ty = self.iterItemType(public_iter_ty);
+        var hasher = std.crypto.hash.sha2.Sha256.init(.{});
+        hasher.update("roc.forced_dynamic_iterator");
+        self.updateTypeDigest(&hasher, item_ty);
+        const key = hasher.finalResult();
+        if (self.builder.forced_dynamic_iter_types.get(key)) |cached| return cached;
+
+        const Context = struct {
+            body: *BodyContext,
+            public_named: Type.NamedContent,
+            item_ty: Type.TypeId,
+
+            fn fill(ctx: @This(), self_ty: Type.TypeId) Allocator.Error!Type.Content {
+                const public_backing = ctx.public_named.backing orelse
+                    Common.invariant("forced dynamic iterator requested a public Iter without backing");
+                var def = ctx.public_named.def;
+                def.generated = null;
+                def.iterator_representation = .forced_dynamic;
+                def.iterator_depth = max_minted_iterator_chain_depth;
+                const args = [_]Type.TypeId{ctx.item_ty};
+                return .{ .named = .{
+                    .named_type = ctx.public_named.named_type,
+                    .def = def,
+                    .kind = ctx.public_named.kind,
+                    .builtin_owner = ctx.public_named.builtin_owner,
+                    .args = try ctx.body.builder.program.types.addSpan(&args),
+                    .backing = .{
+                        .ty = try ctx.body.generatedIteratorBackingType(public_backing.ty, self_ty, ctx.item_ty),
+                        .use = public_backing.use,
+                    },
+                    .declared_order = ctx.public_named.declared_order,
+                } };
+            }
+        };
+
+        const dynamic = try self.builder.program.types.addRecursive(Context{
+            .body = self,
+            .public_named = public_named,
+            .item_ty = item_ty,
+        }, Context.fill);
+        try self.builder.forced_dynamic_iter_types.put(key, dynamic);
+        return dynamic;
     }
 
     fn generatedIteratorBackingType(
@@ -17661,6 +17750,8 @@ const BodyContext = struct {
         if (expected.def.source_decl != actual.def.source_decl) return false;
         if (expected.def.source_decl == null and expected.def.type_name != actual.def.type_name) return false;
         if (!optionalDigestEql(expected.def.generated, actual.def.generated)) return false;
+        if (expected.def.iterator_representation != actual.def.iterator_representation) return false;
+        if (expected.def.iterator_depth != actual.def.iterator_depth) return false;
         if (expected.kind != actual.kind) return false;
         if (expected.builtin_owner != actual.builtin_owner) return false;
         if (!self.sameTypeSpans(expected.args, actual.args, visiting)) return false;
@@ -26802,7 +26893,9 @@ fn sameTypeDef(left: Type.TypeDef, right: Type.TypeDef) bool {
     return left.module == right.module and
         left.type_name == right.type_name and
         left.source_decl == right.source_decl and
-        optionalDigestEql(left.generated, right.generated);
+        optionalDigestEql(left.generated, right.generated) and
+        left.iterator_representation == right.iterator_representation and
+        left.iterator_depth == right.iterator_depth;
 }
 
 fn optionalDigestEql(left: ?names.TypeDigest, right: ?names.TypeDigest) bool {
