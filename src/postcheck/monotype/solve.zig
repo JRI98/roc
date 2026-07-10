@@ -42,6 +42,10 @@ pub const DeferredTemplate = struct {
     template_ref: names.ProcTemplate,
     source_fn_ty: checked.CheckedTypeId,
     source_fn_key: names.TypeDigest,
+    /// The requester's live function type cell. `fn_ty` may be replaced by a
+    /// sealed specialization-key snapshot, but callee body evidence must flow
+    /// back through this node before the requester seals its body draft.
+    requester_fn_node: NodeId,
     fn_ty: Type.TypeId,
     source_region_override: ?base.Region,
     current_entry_root: ?EntryRoot,
