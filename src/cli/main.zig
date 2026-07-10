@@ -8197,6 +8197,7 @@ fn rocBuildLlvm(ctx: *CliCtx, args: cli_args.BuildArgs) CliMainError!void {
     };
 
     build_env.setTarget(target);
+    build_env.setValidateTargetFilesForSelectedTarget(true);
     reporter.begin("Type Checking");
     build_env.compileDiscovered() catch |err| {
         reporter.fail();
@@ -8534,6 +8535,7 @@ fn rocBuildNative(ctx: *CliCtx, args: cli_args.BuildArgs) CliMainError!void {
     };
 
     build_env.setTarget(target);
+    build_env.setValidateTargetFilesForSelectedTarget(true);
     reporter.begin("Type Checking");
     build_env.compileDiscovered() catch |err| {
         reporter.fail();
@@ -8877,6 +8879,7 @@ fn rocBuildEmbedded(ctx: *CliCtx, args: cli_args.BuildArgs) CliMainError!void {
     };
 
     build_env.setTarget(target);
+    build_env.setValidateTargetFilesForSelectedTarget(true);
     reporter.begin("Type Checking");
     build_env.compileDiscovered() catch |err| {
         reporter.fail();

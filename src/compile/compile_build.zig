@@ -184,6 +184,10 @@ pub const BuildEnv = struct {
     /// Whether to retain exact source byte states for watch-mode refreshes.
     track_watch_inputs: bool = false,
 
+    /// Whether `compileDiscovered` validates that the selected platform target's
+    /// declared link files exist before type checking.
+    validate_target_files_for_selected_target: bool = false,
+
     /// Controls which checked-artifact publication work runs after ordinary
     /// checking has completed.
     ///
@@ -462,6 +466,10 @@ pub const BuildEnv = struct {
         self.target = target;
     }
 
+    pub fn setValidateTargetFilesForSelectedTarget(self: *BuildEnv, enabled: bool) void {
+        self.validate_target_files_for_selected_target = enabled;
+    }
+
     pub fn setFinalizeExecutableArtifacts(self: *BuildEnv, enabled: bool) void {
         self.post_check_publication_mode = if (enabled) .executable_artifacts else .none;
     }
@@ -651,7 +659,6 @@ pub const BuildEnv = struct {
                 header_info.targets_config = null; // Prevent double-free in deinit
                 if (header_info.kind == .platform) {
                     self.moveHeaderExposesToPackage(pkg, &header_info);
-                    try self.validateDiscoveredPlatformTargetFiles(pkg.root_file, pkg.root_dir, pkg.targets_config);
                 }
             }
         }
@@ -669,7 +676,9 @@ pub const BuildEnv = struct {
     pub fn compileDiscovered(self: *BuildEnv) CompileDiscoveredError!void {
         const pkg_name = self.discovered_pkg_name orelse unreachable; // Must call discoverDependencies() first
 
-        try self.validateDiscoveredPlatformTargetFilesForCurrentTarget();
+        if (self.validate_target_files_for_selected_target) {
+            try self.validateDiscoveredPlatformTargetFilesForCurrentTarget();
+        }
 
         // Initialize coordinator if not already done
         try self.initCoordinator();
@@ -1947,7 +1956,6 @@ pub const BuildEnv = struct {
                 if (plat_pkg.exposes.items.len == 0) {
                     self.moveHeaderExposesToPackage(plat_pkg, &child_info);
                 }
-                try self.validateDiscoveredPlatformTargetFiles(plat_pkg.root_file, plat_pkg.root_dir, plat_pkg.targets_config);
             }
         }
 
