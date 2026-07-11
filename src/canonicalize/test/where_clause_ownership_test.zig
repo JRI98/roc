@@ -6,7 +6,13 @@ const testing = std.testing;
 const CIR = @import("../CIR.zig");
 const TestEnv = @import("TestEnv.zig").TestEnv;
 
-fn firstStatement(test_env: *TestEnv, block_idx: CIR.Expr.Idx) !CIR.Statement {
+const TestError = std.mem.Allocator.Error || error{
+    ExpectedLambda,
+    TestExpectedEqual,
+    TestUnexpectedResult,
+};
+
+fn firstStatement(test_env: *TestEnv, block_idx: CIR.Expr.Idx) TestError!CIR.Statement {
     const block = test_env.getCanonicalExpr(block_idx);
     try testing.expectEqual(.e_block, std.meta.activeTag(block));
     const statements = test_env.module_env.store.sliceStatements(block.e_block.stmts);
@@ -14,7 +20,7 @@ fn firstStatement(test_env: *TestEnv, block_idx: CIR.Expr.Idx) !CIR.Statement {
     return test_env.module_env.store.getStatement(statements[0]);
 }
 
-fn lambdaBody(test_env: *TestEnv, expr_idx: CIR.Expr.Idx) !CIR.Expr.Idx {
+fn lambdaBody(test_env: *TestEnv, expr_idx: CIR.Expr.Idx) TestError!CIR.Expr.Idx {
     const expr = test_env.getCanonicalExpr(expr_idx);
     const lambda_idx = switch (expr) {
         .e_lambda => expr_idx,
