@@ -16719,23 +16719,7 @@ const BodyContext = struct {
                         .generated_quote,
                         => {},
                     }
-                    var lowered_ty = try self.exprType(lowered);
-                    if (methodOwnerFromType(&self.builder.program.types, lowered_ty) == null and
-                        methodOwnerFromType(&self.builder.program.types, plan_ret_ty) != null and
-                        plan.result_mode == .value)
-                    {
-                        switch (plan_args[index]) {
-                            .checked_expr => |expr| {
-                                try self.constrainTypeToMono(self.view.bodies.expr(expr).ty, plan_ret_ty);
-                                lowered_ty = try self.activeTypeFromType(plan_ret_ty);
-                                self.draft.exprs.items[@intFromEnum(lowered)].ty = try self.draftTypeCell(lowered_ty);
-                            },
-                            .generated_interpolation_iter,
-                            .generated_numeral,
-                            .generated_quote,
-                            => {},
-                        }
-                    }
+                    const lowered_ty = try self.exprType(lowered);
                     pre_lowered = .{
                         .index = index,
                         .expr = lowered,
