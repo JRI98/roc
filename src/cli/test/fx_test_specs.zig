@@ -189,6 +189,16 @@ pub const io_spec_tests = [_]TestSpec{
         .description = "Regression test: compiled Dict operations call the hasher builtins",
     },
     .{
+        .roc_file = "test/fx/issue_10038_top_level_dict.roc",
+        .io_spec = "0<a|1>b",
+        .description = "Regression test: runtime lookup honors a comptime Dict's deterministic seed",
+    },
+    .{
+        .roc_file = "test/fx/issue_10038_comptime_dict_transitions.roc",
+        .io_spec = "0<a|1>direct:A|1>insert-old:A|1>insert-new:C|1>update-new:D|1>release:A|1>keep:A|1>reserve:A|1>clear:refilled|1>map:A!|1>remove:B|1>nested:nested|1>runtime:runtime",
+        .description = "Regression test: comptime Dict lookup and runtime seed-domain transitions",
+    },
+    .{
         .roc_file = "test/fx/test_direct_string.roc",
         .io_spec = "1>Hello",
         .description = "Direct string output",

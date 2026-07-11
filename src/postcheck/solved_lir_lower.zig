@@ -115,6 +115,12 @@ pub const InlineExpectMode = enum {
     omit,
 };
 
+/// Seed source used by the internal Dict implementation.
+pub const DictSeedMode = enum {
+    runtime,
+    comptime_zero,
+};
+
 /// Configuration for direct solved-to-LIR lowering.
 pub const Options = struct {
     inline_plan: SolvedInline.Plan = .{},
@@ -127,6 +133,9 @@ pub const Options = struct {
     /// When disabled, `list_map_can_reuse` lowers to a constant 0 and the
     /// in-place branch of `List.map` is dropped before it reaches LIR.
     list_in_place_map: bool = false,
+    /// Compile-time evaluation must use the deterministic seed zero. Runtime
+    /// lowering retains the process-randomized seed operation.
+    dict_seed_mode: DictSeedMode = .runtime,
     /// Preserve source-level procedure names in LIR for runtime diagnostics.
     proc_debug_names: bool = false,
     /// Build ConstStore materialization plans for requested layouts.
@@ -305,6 +314,7 @@ const Lowerer = struct {
     inline_plan: SolvedInline.Plan,
     inline_expects: InlineExpectMode,
     list_in_place_map: bool,
+    dict_seed_mode: DictSeedMode,
     proc_debug_names: bool,
     layout_request_const_plans: bool,
     /// Match sites statically resolved by `foldListMapCanReuseMatch`,
@@ -376,6 +386,7 @@ const Lowerer = struct {
             .inline_plan = options.inline_plan,
             .inline_expects = options.inline_expects,
             .list_in_place_map = options.list_in_place_map,
+            .dict_seed_mode = options.dict_seed_mode,
             .proc_debug_names = options.proc_debug_names,
             .layout_request_const_plans = options.layout_request_const_plans,
             .root_requests = .{ .test_plan_metadata = options.test_plan_metadata },
@@ -3436,6 +3447,17 @@ const Lowerer = struct {
     fn lowerLowLevelInto(self: *Lowerer, target: LIR.LocalId, op: can.CIR.Expr.LowLevel, span: Lifted.Span(Lifted.ExprId), next: LIR.CFStmtId) Common.LowerError!LIR.CFStmtId {
         const args = self.solved.lifted.exprSpan(span);
         switch (op) {
+            .dict_pseudo_seed => if (self.dict_seed_mode == .comptime_zero) {
+                if (args.len != 0) Common.invariant("Dict seed low-level operation received arguments");
+                return try self.result.store.addCFStmt(.{ .assign_literal = .{
+                    .target = target,
+                    .value = .{ .i64_literal = .{
+                        .value = 0,
+                        .layout_idx = self.result.store.getLocal(target).layout_idx,
+                    } },
+                    .next = next,
+                } });
+            },
             .box_box,
             .box_unbox,
             => return try self.lowerBoxBoundaryLowLevelInto(target, op, args, next),

@@ -252,6 +252,10 @@ pub fn lowerCheckedModulesToLir(
         .inline_plan = inline_plan.view(),
         .inline_expects = target.inline_expects,
         .list_in_place_map = target.list_in_place_map,
+        .dict_seed_mode = switch (target.checked_module_state) {
+            .complete => .runtime,
+            .checking_finalization => .comptime_zero,
+        },
         .proc_debug_names = target.proc_debug_names,
         .layout_request_const_plans = target.layout_request_const_plans,
         .test_plan_metadata = roots.test_plan_metadata,

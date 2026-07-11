@@ -4439,6 +4439,39 @@ Builtin :: [].{
 	].{
 		DictBucket : { dist_and_fingerprint : U32, entry_index : U32 }
 
+		# INTERNAL SEED-DOMAIN REPRESENTATION INVARIANT
+		#
+		# The high bit of `shifts` records which seed was used to build the current
+		# bucket table; the low seven bits store the actual shift count:
+		#
+		#   0 means the buckets use the deterministic compile-time seed 0.
+		#   1 means the buckets use the randomized process runtime seed.
+		#
+		# This bit and the two seed domains are compiler/host implementation data.
+		# They are not part of Dict's userspace API and must never be exposed as a
+		# source-level option or observable Dict property. Trusted host code may
+		# deliberately construct seed-0 constants when that is correct, but normal
+		# runtime Dict construction always uses the runtime seed.
+		#
+		# Lookup expands the bit to an all-zero or all-one U64 mask and bitwise-ANDs
+		# that mask with the runtime seed. This selects seed 0 or the runtime seed
+		# without a branch, a larger Dict value, a different hash algorithm, or any
+		# startup initialization. Compile-time evaluation must produce seed 0
+		# directly; it must never derive constant data from an address or any other
+		# process-specific state, so identical compiler inputs remain deterministic.
+		#
+		# The bit describes the seed used by the buckets, not when or where the
+		# surrounding value was allocated. Operations that preserve a bucket table
+		# preserve its bit. However, whenever an ordinary runtime operation rehashes
+		# a seed-0 Dict, it must rebuild every bucket with the runtime seed and set
+		# the bit to 1. This is required even when uniqueness permits the buckets to
+		# be updated in place: in-place mutation does not permit seed 0 to survive a
+		# runtime rehash. In particular, runtime-controlled keys must never be added
+		# to a seed-0 bucket table; convert it to the runtime seed first. This rule is
+		# what preserves hash-flooding protection for malicious runtime input.
+		#
+		# Hosts and generated glue that inspect or mutate Dict values must follow the
+		# same rules and use the same authoritative process runtime seed as Roc.
 		DictData(k, v) : {
 			entries : List((k, v)),
 			buckets : List(DictBucket),
@@ -4499,7 +4532,7 @@ Builtin :: [].{
 				var $entry_hashes = 0
 
 				for (key, value) in data.entries {
-					entry_hash = hasher_finish(Value.to_hash(value, Key.to_hash(key, hasher_start(dict_seed()))))
+					entry_hash = hasher_finish(Value.to_hash(value, Key.to_hash(key, hasher)))
 					$entry_hashes = dict_combine_entry_hashes($entry_hashes, entry_hash)
 				}
 
@@ -4512,7 +4545,7 @@ Builtin :: [].{
 		## empty_dict = Dict.empty()
 		## ```
 		empty : () -> Dict(_k, _v)
-		empty = || HashMap({ entries: [], buckets: [], max_entries_before_grow: 0, shifts: dict_initial_shifts })
+		empty = || HashMap({ entries: [], buckets: [], max_entries_before_grow: 0, shifts: dict_shifts_for_current_seed(dict_initial_shifts) })
 
 		## Returns an empty `Dict` with room for at least the requested number of entries.
 		with_capacity : U64 -> Dict(_k, _v)
@@ -4653,17 +4686,7 @@ Builtin :: [].{
 						HashMap({ entries, buckets: data.buckets, max_entries_before_grow: data.max_entries_before_grow, shifts: data.shifts })
 					}
 					Missing(missing) => {
-						if List.len(data.entries) < data.max_entries_before_grow {
-							HashMap(dict_insert_new_data(data, missing.bucket_index, missing.dist_and_fingerprint, key, value))
-						} else {
-							prepared = dict_ensure_capacity(data, dict_add_capacity(List.len(data.entries), 1))
-							match dict_find(prepared, key) {
-								Found(_) => {
-									crash "Dict invariant violated: found duplicate after growth"
-								}
-								Missing(grown_missing) => HashMap(dict_insert_new_data(prepared, grown_missing.bucket_index, grown_missing.dist_and_fingerprint, key, value))
-							}
-						}
+						HashMap(dict_insert_absent_data(data, missing, key, value))
 					}
 				}
 			}
@@ -4784,8 +4807,9 @@ Builtin :: [].{
 					}
 				}
 				empty_buckets = List.map(data.buckets, |_| dict_empty_bucket)
-				buckets = dict_fill_buckets_from_entries(empty_buckets, $entries, data.shifts)
-				HashMap({ entries: $entries, buckets, max_entries_before_grow: data.max_entries_before_grow, shifts: data.shifts })
+				shifts = dict_shifts_for_current_seed(data.shifts)
+				buckets = dict_fill_buckets_from_entries(empty_buckets, $entries, shifts)
+				HashMap({ entries: $entries, buckets, max_entries_before_grow: data.max_entries_before_grow, shifts })
 			}
 		}
 
@@ -4954,12 +4978,7 @@ Builtin :: [].{
 					}
 				Missing(missing) =>
 					match alter(Try.Err(Missing)) {
-						Try.Ok(new_value) =>
-							if List.len(data.entries) < data.max_entries_before_grow {
-								HashMap(dict_insert_new_data(data, missing.bucket_index, missing.dist_and_fingerprint, key, new_value))
-							} else {
-								Dict.insert(dict, key, new_value)
-							}
+						Try.Ok(new_value) => HashMap(dict_insert_absent_data(data, missing, key, new_value))
 						Try.Err(Missing) => dict
 					}
 				}
@@ -15227,6 +15246,12 @@ dict_fingerprint_mask = dict_dist_inc - 1
 dict_initial_shifts : U8
 dict_initial_shifts = 61
 
+dict_runtime_seed_bit : U8
+dict_runtime_seed_bit = 128
+
+dict_shifts_mask : U8
+dict_shifts_mask = 127
+
 dict_min_shifts : U8
 dict_min_shifts = 32
 
@@ -15236,8 +15261,26 @@ dict_max_bucket_count = 4294967296
 dict_max_entry_count : U64
 dict_max_entry_count = 4294967296
 
+dict_actual_shifts : U8 -> U8
+dict_actual_shifts = |shifts| U8.bitwise_and(shifts, dict_shifts_mask)
+
+dict_shifts_for_current_seed : U8 -> U8
+dict_shifts_for_current_seed = |shifts| {
+	actual = dict_actual_shifts(shifts)
+	seed_high_byte = U64.to_u8_wrap(U64.shift_right_zf_by(dict_seed(), 56))
+	runtime_bit = U8.bitwise_and(seed_high_byte, dict_runtime_seed_bit)
+	U8.bitwise_or(actual, runtime_bit)
+}
+
+dict_seed_for_shifts : U8 -> U64
+dict_seed_for_shifts = |shifts| {
+	seed_mask_i8 = I8.shift_right_by(U8.to_i8_wrap(shifts), 7)
+	seed_mask = I8.to_u64_wrap(seed_mask_i8)
+	U64.bitwise_and(dict_seed(), seed_mask)
+}
+
 dict_bucket_count_for_shifts : U8 -> U64
-dict_bucket_count_for_shifts = |shifts| U64.shift_left_by(1, 64 - shifts)
+dict_bucket_count_for_shifts = |shifts| U64.shift_left_by(1, 64 - dict_actual_shifts(shifts))
 
 dict_max_entries_for_bucket_count : U64 -> U64
 dict_max_entries_for_bucket_count = |bucket_count|
@@ -15266,9 +15309,9 @@ dict_shifts_for_capacity = |requested| {
 dict_allocate_buckets_for_capacity : U64 -> Dict.DictMetadata
 dict_allocate_buckets_for_capacity = |requested| {
 	if requested == 0 {
-		{ buckets: [], max_entries_before_grow: 0, shifts: dict_initial_shifts }
+		{ buckets: [], max_entries_before_grow: 0, shifts: dict_shifts_for_current_seed(dict_initial_shifts) }
 	} else {
-		shifts = dict_shifts_for_capacity(requested)
+		shifts = dict_shifts_for_current_seed(dict_shifts_for_capacity(requested))
 		bucket_count = dict_bucket_count_for_shifts(shifts)
 		{
 			buckets: List.repeat(dict_empty_bucket, bucket_count),
@@ -15286,9 +15329,9 @@ dict_add_capacity = |a, b|
 		a + b
 	}
 
-dict_hash_key : k -> U64
+dict_hash_key : k, U8 -> U64
 	where [k.to_hash : k, Hasher -> Hasher]
-dict_hash_key = |key| hasher_finish(key.to_hash(hasher_start(dict_seed())))
+dict_hash_key = |key, shifts| hasher_finish(key.to_hash(hasher_start(dict_seed_for_shifts(shifts))))
 
 dict_entry_index_from_u64 : U64 -> U32
 dict_entry_index_from_u64 = |index|
@@ -15299,7 +15342,7 @@ dict_entry_index_from_u64 = |index|
 	}
 
 dict_bucket_index_from_hash : U64, U8 -> U64
-dict_bucket_index_from_hash = |hash, shifts| U64.shift_right_zf_by(hash, shifts)
+dict_bucket_index_from_hash = |hash, shifts| U64.shift_right_zf_by(hash, dict_actual_shifts(shifts))
 
 dict_dist_and_fingerprint_from_hash : U64 -> U32
 dict_dist_and_fingerprint_from_hash = |hash| {
@@ -15334,6 +15377,51 @@ dict_ensure_capacity = |data, desired| {
 	}
 }
 
+dict_prepare_for_insert : Dict.DictData(k, v) -> Dict.DictData(k, v)
+	where [k.to_hash : k, Hasher -> Hasher]
+dict_prepare_for_insert = |data| {
+	shifts = dict_shifts_for_current_seed(data.shifts)
+	if shifts == data.shifts {
+		data
+	} else {
+		empty_buckets = List.map(data.buckets, |_| dict_empty_bucket)
+		buckets = dict_fill_buckets_from_entries(empty_buckets, data.entries, shifts)
+		{ entries: data.entries, buckets, max_entries_before_grow: data.max_entries_before_grow, shifts }
+	}
+}
+
+dict_insert_missing_data : Dict.DictData(k, v), { bucket_index : U64, dist_and_fingerprint : U32 }, k, v -> Dict.DictData(k, v)
+	where [k.is_eq : k, k -> Bool, k.to_hash : k, Hasher -> Hasher]
+dict_insert_missing_data = |data, missing, key, value| {
+	if List.len(data.entries) < data.max_entries_before_grow {
+		dict_insert_new_data(data, missing.bucket_index, missing.dist_and_fingerprint, key, value)
+	} else {
+		prepared = dict_ensure_capacity(data, dict_add_capacity(List.len(data.entries), 1))
+		match dict_find(prepared, key) {
+			Found(_) => {
+				crash "Dict invariant violated: found duplicate after growth"
+			}
+			Missing(grown_missing) => dict_insert_new_data(prepared, grown_missing.bucket_index, grown_missing.dist_and_fingerprint, key, value)
+		}
+	}
+}
+
+dict_insert_absent_data : Dict.DictData(k, v), { bucket_index : U64, dist_and_fingerprint : U32 }, k, v -> Dict.DictData(k, v)
+	where [k.is_eq : k, k -> Bool, k.to_hash : k, Hasher -> Hasher]
+dict_insert_absent_data = |data, missing, key, value| {
+	prepared = dict_prepare_for_insert(data)
+	if prepared.shifts == data.shifts {
+		dict_insert_missing_data(prepared, missing, key, value)
+	} else {
+		match dict_find(prepared, key) {
+			Found(_) => {
+				crash "Dict invariant violated: found duplicate after seed change"
+			}
+			Missing(reseeded_missing) => dict_insert_missing_data(prepared, reseeded_missing, key, value)
+		}
+	}
+}
+
 dict_find : Dict.DictData(k, v), k -> [Found({ bucket_index : U64, entry_index : U64, value : v }), Missing({ bucket_index : U64, dist_and_fingerprint : U32 })]
 	where [k.is_eq : k, k -> Bool, k.to_hash : k, Hasher -> Hasher]
 dict_find = |data, key| {
@@ -15341,7 +15429,7 @@ dict_find = |data, key| {
 		if List.is_empty(data.buckets) {
 			Missing({ bucket_index: 0, dist_and_fingerprint: 0 })
 		} else {
-			hash = dict_hash_key(key)
+			hash = dict_hash_key(key, data.shifts)
 			Missing(
 				{
 					bucket_index: dict_bucket_index_from_hash(hash, data.shifts),
@@ -15352,7 +15440,7 @@ dict_find = |data, key| {
 	} else if List.is_empty(data.buckets) {
 		crash "Dict invariant violated: entries without buckets"
 	} else {
-		hash = dict_hash_key(key)
+		hash = dict_hash_key(key, data.shifts)
 		dict_find_from(
 			data.buckets,
 			data.entries,
@@ -15416,7 +15504,7 @@ dict_remove_bucket_data = |data, bucket_index| {
 	} else {
 		entries_swapped = list_swap_unsafe(data.entries, removed_entry_index_u64, last_entry_index)
 		(moved_key, _) = list_get_unsafe(entries_swapped, removed_entry_index_u64)
-		moved_hash = dict_hash_key(moved_key)
+		moved_hash = dict_hash_key(moved_key, data.shifts)
 		moved_base_bucket_index = dict_bucket_index_from_hash(moved_hash, data.shifts)
 		moved_entry_index = dict_entry_index_from_u64(last_entry_index)
 		moved_bucket_index = dict_scan_for_entry_index(buckets_without_removed, moved_base_bucket_index, moved_entry_index)
@@ -15480,7 +15568,7 @@ dict_fill_buckets_from_entries = |buckets, entries, shifts| {
 dict_next_while_less : List(Dict.DictBucket), k, U8 -> (U64, U32)
 	where [k.to_hash : k, Hasher -> Hasher]
 dict_next_while_less = |buckets, key, shifts| {
-	hash = dict_hash_key(key)
+	hash = dict_hash_key(key, shifts)
 	dict_next_while_less_from(buckets, dict_bucket_index_from_hash(hash, shifts), dict_dist_and_fingerprint_from_hash(hash))
 }
 

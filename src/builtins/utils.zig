@@ -975,8 +975,9 @@ pub const UpdateMode = enum(u8) {
     InPlace = 1,
 };
 
-/// Generates a pseudo-random seed for dictionary hashing
-/// Uses the memory address of this function as the seed value, which:
+/// Generates a pseudo-random seed for dictionary hashing.
+/// Uses the memory address of this function as the seed value, with the high
+/// bit set as the internal runtime-seed marker. This:
 /// - Changes between program runs on most OSes due to ASLR
 /// - Prevents all dictionaries from using a predictable seed (avoiding DoS attacks)
 /// - Provides more security than a fixed seed but less than true randomness
@@ -985,7 +986,13 @@ pub const UpdateMode = enum(u8) {
 /// Note: On most operating systems, this will be affected by ASLR and different each run.
 /// In WebAssembly, the value will be constant for the entire build.
 pub fn dictPseudoSeed() callconv(.c) u64 {
-    return @as(u64, @intCast(@intFromPtr(&dictPseudoSeed)));
+    const runtime_marker = @as(u64, 1) << 63;
+    return @as(u64, @intCast(@intFromPtr(&dictPseudoSeed))) | runtime_marker;
+}
+
+test "Dict runtime seed carries its internal marker" {
+    const runtime_marker = @as(u64, 1) << 63;
+    try std.testing.expect(dictPseudoSeed() & runtime_marker != 0);
 }
 
 /// Debug-only shadow refcount tracker.
