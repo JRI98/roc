@@ -6,6 +6,7 @@ Node := [].{
 
     SignalExpr := [
         LocationSource(Box(U64), Box((HostValue -> HostValue)), HostValue.CapabilityHandle, HostValue.CapabilityHandle),
+        Map(Box(U64), Box(SignalExpr), Box((HostValue -> HostValue)), HostValue.CapabilityHandle),
         UnusedSource(Box((HostValue -> Str))),
     ]
 }

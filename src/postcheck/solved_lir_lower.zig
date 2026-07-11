@@ -1480,7 +1480,7 @@ const Lowerer = struct {
                 } };
             },
             .callable => |variants| return try self.constFuncTypeForCallable(ty, variants),
-            .erased_fn => |erased| return try self.constFuncTypeForErased(erased.members),
+            .erased_fn => |erased| return try self.constFuncTypeForErased(ty, erased.members),
             .capture_record => Common.invariant("capture record reached ConstStore type output as a captured value"),
             .erased_capture_ptr => Common.invariant("erased capture pointer reached ConstStore type output as a captured value"),
         };
@@ -1514,9 +1514,9 @@ const Lowerer = struct {
         } };
     }
 
-    fn constFuncTypeForErased(self: *Lowerer, variants_span: Type.Span) Common.LowerError!const_store.ConstType {
+    fn constFuncTypeForErased(self: *Lowerer, ty: Type.TypeId, variants_span: Type.Span) Common.LowerError!const_store.ConstType {
         const variants = self.types.fnVariantSpan(variants_span);
-        if (variants.len == 0) Common.invariant("erased function capture type had no function variants");
+        if (variants.len == 0) return try self.constFuncTypeForEmptyCallable(ty);
         const function = try self.constFuncTypeForVariants(variants);
         return .{ .func = .{ .args = function.args, .ret = function.ret } };
     }

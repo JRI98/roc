@@ -6,6 +6,7 @@ platform ""
     packages {}
     provides { "roc_ui_init": ui_init }
     hosted {
+        "roc_get": HostValue.get_with_capability!,
         "roc_store": HostValue.store_with_capability!,
         "roc_take": HostValue.take_with_capability!,
     }
