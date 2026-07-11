@@ -749,18 +749,31 @@ fn hostU64ModBy(_: ?*anyopaque, _: *bytebox.ModuleInstance, params: [*]const byt
 }
 
 fn hostDecDiv(_: ?*anyopaque, module: *bytebox.ModuleInstance, params: [*]const bytebox.Val, _: [*]bytebox.Val) error{}!void {
+    const RocDec = builtins.dec.RocDec;
     const buffer = module.store.getMemory(0).buffer();
-    const lhs = readI128FromMem(buffer, @intCast(params[0].I32));
-    const rhs = readI128FromMem(buffer, @intCast(params[1].I32));
-    const scaled: i256 = @as(i256, lhs) * @as(i256, dec_one_i128);
-    writeI128ToMem(buffer, @intCast(params[2].I32), @intCast(@divTrunc(scaled, rhs)));
+    const lhs = RocDec{ .num = readI128FromMem(buffer, @intCast(params[0].I32)) };
+    const rhs = RocDec{ .num = readI128FromMem(buffer, @intCast(params[1].I32)) };
+    if (rhs.num == 0) {
+        wasm_crash_state = .crashed;
+        return;
+    }
+    const result = builtins.dec.divC(lhs, rhs, &wasm_dec_roc_ops);
+    if (wasm_crash_state == .crashed) return;
+    writeI128ToMem(buffer, @intCast(params[2].I32), result);
 }
 
 fn hostDecDivTrunc(_: ?*anyopaque, module: *bytebox.ModuleInstance, params: [*]const bytebox.Val, _: [*]bytebox.Val) error{}!void {
+    const RocDec = builtins.dec.RocDec;
     const buffer = module.store.getMemory(0).buffer();
-    const lhs = readI128FromMem(buffer, @intCast(params[0].I32));
-    const rhs = readI128FromMem(buffer, @intCast(params[1].I32));
-    writeI128ToMem(buffer, @intCast(params[2].I32), @divTrunc(lhs, rhs) * dec_one_i128);
+    const lhs = RocDec{ .num = readI128FromMem(buffer, @intCast(params[0].I32)) };
+    const rhs = RocDec{ .num = readI128FromMem(buffer, @intCast(params[1].I32)) };
+    if (rhs.num == 0) {
+        wasm_crash_state = .crashed;
+        return;
+    }
+    const result = builtins.dec.divTruncC(lhs, rhs, &wasm_dec_roc_ops);
+    if (wasm_crash_state == .crashed) return;
+    writeI128ToMem(buffer, @intCast(params[2].I32), result);
 }
 
 const DecUnaryMathOp = enum {
