@@ -45,7 +45,8 @@ pub const Constants = struct {
     /// 19: Annotation node payload records a precomputed `contains_underscore` flag.
     /// 20: Nominal declaration table serialized with the type store.
     /// 21: Checked function serialization no longer carries instantiation stamps.
-    pub const CACHE_VERSION = 21;
+    /// 22: CommonIdents carries the range_exclusive/range_inclusive method idents.
+    pub const CACHE_VERSION = 22;
 };
 
 /// Configuration for the Roc cache system.
