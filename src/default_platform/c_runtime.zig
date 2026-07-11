@@ -6,7 +6,7 @@
 
 const builtin = @import("builtin");
 
-const seamless_slice_tag: usize = 1;
+const RocStr = @import("roc_str_view").RocStr;
 
 const c = switch (builtin.os.tag) {
     .windows => struct {
@@ -33,56 +33,6 @@ const AllocationHeader = extern struct {
     len: usize,
 };
 
-const RocStr = extern struct {
-    bytes: ?[*]u8,
-    capacity_or_alloc_ptr: usize,
-    length: usize,
-
-    fn isSmallStr(self: RocStr) bool {
-        return @as(isize, @bitCast(self.length)) < 0;
-    }
-
-    fn isSeamlessSlice(self: RocStr) bool {
-        return !self.isSmallStr() and (self.capacity_or_alloc_ptr & seamless_slice_tag) == seamless_slice_tag;
-    }
-
-    fn len(self: RocStr) usize {
-        if (self.isSmallStr()) {
-            const raw: *const [@sizeOf(RocStr)]u8 = @ptrCast(&self);
-            return raw.*[@sizeOf(RocStr) - 1] ^ 0b1000_0000;
-        }
-        return self.length;
-    }
-
-    fn allocationPtr(self: RocStr) ?[*]u8 {
-        if (self.isSmallStr()) return null;
-        if (self.isSeamlessSlice()) {
-            return @ptrFromInt(self.capacity_or_alloc_ptr & ~seamless_slice_tag);
-        }
-        return self.bytes;
-    }
-
-    fn asSlice(self: *const RocStr) []const u8 {
-        const ptr: [*]const u8 = if (self.isSmallStr())
-            @ptrCast(self)
-        else
-            @ptrCast(self.bytes.?);
-        return ptr[0..self.len()];
-    }
-
-    fn decref(self: *RocStr) void {
-        const data = self.allocationPtr() orelse return;
-        const refcount_ptr: *isize = @ptrCast(@alignCast(data - @sizeOf(usize)));
-        const refcount = refcount_ptr.*;
-        if (refcount == 0) return;
-
-        const last = @atomicRmw(isize, refcount_ptr, .Sub, 1, .monotonic);
-        if (last == 1) {
-            roc_dealloc(data - @sizeOf(usize), @alignOf(usize));
-        }
-    }
-};
-
 export fn roc_default_runtime_init() callconv(.c) void {}
 
 export fn roc_default_exit(code: u8) callconv(.c) noreturn {
@@ -94,7 +44,7 @@ export fn roc_default_echo_line(str: RocStr) callconv(.c) void {
     const message = owned.asSlice();
     writeAll(1, message);
     writeAll(1, "\n");
-    owned.decref();
+    owned.decref(roc_dealloc);
 }
 
 export fn roc_dbg(bytes: [*]const u8, len: usize) callconv(.c) void {

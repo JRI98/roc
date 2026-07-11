@@ -2,6 +2,7 @@
 
 const std = @import("std");
 const core = @import("lir_core");
+const builtins = @import("builtins");
 
 /// Core statement-only LIR type definitions.
 pub const LIR = core.LIR;
@@ -80,6 +81,58 @@ pub const LirPattern = LIR.LirPattern;
 pub const LirPatternId = LIR.LirPatternId;
 /// Span into flat pattern-id storage.
 pub const LirPatternSpan = LIR.LirPatternSpan;
+
+/// Domain category byte mixed into a builtin Hasher for a `hasher_write_*`
+/// low-level op. This is the single source of truth shared by the interpreter
+/// and every backend, so their hashes stay identical. The mapping is total over
+/// the hashing ops (bool, the fixed-width ints, f32, f64, Dec, bytes, and str);
+/// callers only pass `hasher_write_*` ops.
+pub fn hasherDomain(op: LowLevel) builtins.hash.HasherDomain {
+    return switch (op) {
+        .hasher_write_bool => .bool,
+        .hasher_write_u8 => .u8,
+        .hasher_write_u16 => .u16,
+        .hasher_write_u32 => .u32,
+        .hasher_write_u64 => .u64,
+        .hasher_write_u128 => .u128,
+        .hasher_write_i8 => .i8,
+        .hasher_write_i16 => .i16,
+        .hasher_write_i32 => .i32,
+        .hasher_write_i64 => .i64,
+        .hasher_write_i128 => .i128,
+        .hasher_write_f32 => .f32,
+        .hasher_write_f64 => .f64,
+        .hasher_write_dec => .dec,
+        .hasher_write_bytes => .bytes,
+        .hasher_write_str => .str,
+        else => unreachable,
+    };
+}
+
+/// Byte width of the scalar handed to `hasher_write_u64` for a fixed-width
+/// `hasher_write_*` op. Defined for the 1/2/4/8-byte scalar ops, including f32
+/// and f64; the u128, Dec, bytes, and str ops travel their own wider paths and
+/// never call this.
+pub fn hasherU64Width(op: LowLevel) u8 {
+    return switch (op) {
+        .hasher_write_bool,
+        .hasher_write_u8,
+        .hasher_write_i8,
+        => 1,
+        .hasher_write_u16,
+        .hasher_write_i16,
+        => 2,
+        .hasher_write_u32,
+        .hasher_write_i32,
+        .hasher_write_f32,
+        => 4,
+        .hasher_write_u64,
+        .hasher_write_i64,
+        .hasher_write_f64,
+        => 8,
+        else => unreachable,
+    };
+}
 
 test "lir tests" {
     std.testing.refAllDecls(@This());

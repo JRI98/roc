@@ -757,11 +757,7 @@ fn linkSharedLibrary(
             try args.append(allocator, std.mem.sliceTo(shared_lib_path, 0));
             try args.append(allocator, "-w");
             try args.append(allocator, "-arch");
-            try args.append(allocator, switch (builtin.cpu.arch) {
-                .aarch64 => "arm64",
-                .x86_64 => "x86_64",
-                else => return Error.LinkFailed,
-            });
+            try args.append(allocator, roc_target.machoArchName(builtin.cpu.arch) catch return Error.LinkFailed);
             try args.append(allocator, "-platform_version");
             try args.append(allocator, "macos");
             try args.append(allocator, roc_target.macos_deployment.linker_version);

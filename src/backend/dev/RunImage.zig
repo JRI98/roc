@@ -18,7 +18,9 @@ pub const MAGIC: u32 = 0x56454452;
 /// Version of the shared-memory dev run image format.
 pub const FORMAT_VERSION: u32 = 2;
 
-/// Maximum bytes needed for one host jump stub on the supported dev-shim hosts.
+/// Maximum bytes reserved per host jump stub on the supported dev-shim hosts.
+/// The machine-code shim owns the per-arch emitted sizes and asserts at compile
+/// time that each fits within this reservation (see `machine_code_shim/main.zig`).
 pub const max_jump_stub_size = 20;
 
 /// Errors raised when a mapped dev run image is malformed or unsupported.

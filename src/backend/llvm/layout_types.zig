@@ -12,6 +12,7 @@
 //! - ZST (zero-sized types) → void/i1 placeholder
 
 const std = @import("std");
+const builtins = @import("builtins");
 const Builder = @import("vendor_llvm_ir").Builder;
 const layout = @import("../../layout/mod.zig");
 const types = @import("../../types/types.zig");
@@ -132,18 +133,33 @@ fn fracPrecisionToLlvmType(precision: types.Frac.Precision) Builder.Type {
     };
 }
 
-/// Get the LLVM type for a Roc List (3-element struct: ptr, len, capacity)
+/// Get the LLVM type for a Roc List: a pointer word followed by length and
+/// encoded-capacity words. The field count comes from the canonical `RocList`
+/// definition in `builtins/list.zig` (`word_count`). This LLVM backend targets
+/// 64-bit only, so each non-pointer word is an `i64`.
 fn listLlvmType(builder: *Builder) Error!Builder.Type {
-    // List layout: { ptr: *T, len: u64, capacity: u64 }
-    const fields = [_]Builder.Type{ .ptr, .i64, .i64 };
-    return builder.structType(.normal, &fields) catch return error.OutOfMemory;
+    return rocHeaderLlvmType(builder, builtins.list.RocList);
 }
 
-/// Get the LLVM type for a Roc Str (3-element struct: ptr, encoded capacity, len)
-/// Note: Str also has seamless small string optimization, but the LLVM type
-/// is the same (the SSO is handled at runtime)
+/// Get the LLVM type for a Roc Str: a pointer word followed by encoded-capacity
+/// and length words. The field count comes from the canonical `RocStr`
+/// definition in `builtins/str.zig` (`word_count`). Str also uses the seamless
+/// small-string optimization, but the LLVM type is the same (the SSO is handled
+/// at runtime). This LLVM backend targets 64-bit only, so each non-pointer word
+/// is an `i64`.
 pub fn strLlvmType(builder: *Builder) Error!Builder.Type {
-    const fields = [_]Builder.Type{ .ptr, .i64, .i64 };
+    return rocHeaderLlvmType(builder, builtins.str.RocStr);
+}
+
+/// Build the LLVM struct type for a `word_count`-word Roc header (RocStr or
+/// RocList): the first word is the byte pointer, the remaining words are
+/// integer words. The word count is derived from the canonical builtin struct,
+/// and the comptime assertion ties that count to the struct's host-width size.
+fn rocHeaderLlvmType(builder: *Builder, comptime RocHeader: type) Error!Builder.Type {
+    comptime std.debug.assert(RocHeader.word_count * @sizeOf(usize) == @sizeOf(RocHeader));
+    var fields: [RocHeader.word_count]Builder.Type = undefined;
+    fields[0] = .ptr;
+    for (fields[1..]) |*field| field.* = .i64;
     return builder.structType(.normal, &fields) catch return error.OutOfMemory;
 }
 

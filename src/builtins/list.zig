@@ -32,12 +32,37 @@ pub const RocList = extern struct {
     // This pointer is to the first element of the original list.
     capacity_or_alloc_ptr: usize,
 
+    /// Number of pointer-sized words in a RocList's in-memory layout. The layout
+    /// is target-width parameterized: its byte size is `word_count` times the
+    /// target pointer width. Sites that build a RocList for a target of a
+    /// different width than the host multiply this by the target word size.
+    pub const word_count = 3;
+
+    /// Big-list capacities are stored shifted left by this many bits so the low
+    /// bit stays free for the seamless-slice tag.
+    pub const capacity_shift = 1;
+
+    comptime {
+        std.debug.assert(word_count * @sizeOf(usize) == @sizeOf(RocList));
+    }
+
+    fn encodeCapacityGeneric(comptime T: type, capacity: T) T {
+        return capacity << capacity_shift;
+    }
+
     pub inline fn encodeCapacity(capacity: usize) usize {
-        return capacity << 1;
+        return encodeCapacityGeneric(usize, capacity);
+    }
+
+    /// Encode a big-list capacity for a target whose pointer width may differ
+    /// from the host's. Applies the same shift as the host-width
+    /// `encodeCapacity`, but on a `u64` so it can hold any target word's value.
+    pub fn encodeCapacityForWidth(capacity: u64) u64 {
+        return encodeCapacityGeneric(u64, capacity);
     }
 
     pub inline fn decodeCapacity(encoded_capacity: usize) usize {
-        return encoded_capacity >> 1;
+        return encoded_capacity >> capacity_shift;
     }
 
     pub inline fn encodeSliceAllocationPtr(alloc_ptr: [*]u8) usize {

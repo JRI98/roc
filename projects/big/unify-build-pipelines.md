@@ -122,22 +122,30 @@ pass-through (`if (args.no_cache) null else build_env.cache_manager`) into
   9788 (run never cached, filed as slowness), 9694 (`--opt` ignored),
   9509 (transitive package failure on run, fixed by PR 9627).
 - A July 2026 audit diffed the two Coordinator-driving sequences line by
-  line and found four **live** divergences waiting to become the next bug
-  reports, plus two more wholesale copies:
-  - Platform root module name: `lowerLirWithCoordinator` registers the
-    platform root with a hardcoded module name `"main"`, while the
-    BuildEnv path derives it via `PackageEnv.moduleNameFromPath` from the
-    platform package's actual root file. A platform whose root file is not
-    `main.roc` wires differently under run vs. build.
-  - `explicit_root_ident_names`: the BuildEnv path sets these on the
-    platform root from `targets_config` (this is how wasm
-    `import_memory` / `minimum_memory` idents reach codegen); the run path
-    never sets them.
-  - Platform discovery scope: the run path only handles the root's one
-    direct `is_platform` dependency; the BuildEnv path scans all resolved
-    packages for `.platform` kind.
-  - `markNoAppPackage` exists only in the BuildEnv path; the run path has
-    no equivalent for app-less roots (the hosted-transform tri-state).
+  line. Two divergences were live bugs and have since been aligned
+  (platform root module name — run hardcoded `"main"` where build derives
+  it from the package's root file via `base.module_path.getModuleName` —
+  and platform discovery scope, where run special-cased the root's one
+  direct `is_platform` dep instead of scanning resolved packages by
+  `.platform` kind). Two more turned out to be structural, and are the
+  kind of asymmetry the unified core must make explicit rather than
+  implicit:
+  - `explicit_root_ident_names`: the BuildEnv path parses each platform
+    package's header for `targets_config` and sets these idents (the wasm
+    `import_memory` / `minimum_memory` family, emitted as compile-time
+    requests); the run path never parses platform headers at all, and no
+    run-path consumer reads those requests today because run is
+    native-interpreter-only. A unified core should parse platform headers
+    once, unconditionally, so a future run-path consumer cannot be
+    silently starved.
+  - `markNoAppPackage` exists only in the BuildEnv path; the run path is
+    app-only by construction (`parseAppHeader` rejects non-app roots), so
+    the hosted-transform tri-state is only ever exercised via BuildEnv.
+  - Verified intentional (not drift): run selects platform roots via
+    `selectPlatformEntrypointRoots` (provided exports plus
+    platform-required bindings — the interpreter needs bindings as
+    entrypoints) while linked builds use `selectPlatformExportRoots`
+    (provided exports only).
   - The package resolution + materialization sequence (resolver
     construction, `buildPackageKeys`, per-package registration and
     shorthand wiring, URL-vs-local watch state) is duplicated between

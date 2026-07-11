@@ -53,13 +53,19 @@ else
     .vtable;
 
 /// The fixed runtime symbols every host defines under the symbol ABI.
-const extern_host = struct {
-    extern fn roc_alloc(length: usize, alignment: usize) ?*anyopaque;
-    extern fn roc_dealloc(ptr: *anyopaque, alignment: usize) void;
-    extern fn roc_realloc(ptr: *anyopaque, new_length: usize, alignment: usize) ?*anyopaque;
-    extern fn roc_dbg(bytes: [*]const u8, len: usize) void;
-    extern fn roc_expect_failed(bytes: [*]const u8, len: usize) void;
-    extern fn roc_crashed(bytes: [*]const u8, len: usize) void;
+///
+/// These are the same operations as the `RocOps` vtable methods below, but
+/// without the leading `*RocOps` parameter: compiled output resolves them as
+/// linker symbols instead of calling through the vtable. The shim host
+/// (`src/shim_host_abi.zig`) reuses this declaration rather than restating it,
+/// so the extern symbol ABI is written down in exactly one place.
+pub const extern_host = struct {
+    pub extern fn roc_alloc(length: usize, alignment: usize) ?*anyopaque;
+    pub extern fn roc_dealloc(ptr: *anyopaque, alignment: usize) void;
+    pub extern fn roc_realloc(ptr: *anyopaque, new_length: usize, alignment: usize) ?*anyopaque;
+    pub extern fn roc_dbg(bytes: [*]const u8, len: usize) void;
+    pub extern fn roc_expect_failed(bytes: [*]const u8, len: usize) void;
+    pub extern fn roc_crashed(bytes: [*]const u8, len: usize) void;
 };
 
 /// Type-erased pointer to a hosted platform function stored in the

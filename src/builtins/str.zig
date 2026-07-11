@@ -59,6 +59,26 @@ pub const RocStr = extern struct {
 
     pub const alignment = @alignOf(usize);
 
+    /// Number of pointer-sized words in a RocStr's in-memory layout. The layout
+    /// is target-width parameterized: its byte size is `word_count` times the
+    /// target pointer width. Sites that build a RocStr for a target of a
+    /// different width than the host multiply this by the target word size.
+    pub const word_count = 3;
+
+    /// The high bit of a RocStr's final byte marks the small-string
+    /// representation. The low seven bits of that byte hold the small-string
+    /// length.
+    pub const small_str_flag: u8 = 0b1000_0000;
+
+    /// Big-string capacities are stored shifted left by this many bits so the
+    /// low bit stays free for the seamless-slice tag.
+    pub const capacity_shift = 1;
+
+    comptime {
+        std.debug.assert(word_count * @sizeOf(usize) == @sizeOf(RocStr));
+        std.debug.assert(SMALL_STR_BIT == @as(usize, small_str_flag) << (@bitSizeOf(usize) - 8));
+    }
+
     pub inline fn empty() RocStr {
         return RocStr{
             .bytes = null,
@@ -67,12 +87,35 @@ pub const RocStr = extern struct {
         };
     }
 
+    fn encodeCapacityGeneric(comptime T: type, capacity: T) T {
+        return capacity << capacity_shift;
+    }
+
     pub inline fn encodeCapacity(capacity: usize) usize {
-        return capacity << 1;
+        return encodeCapacityGeneric(usize, capacity);
+    }
+
+    /// Encode a big-string capacity for a target whose pointer width may differ
+    /// from the host's. Applies the same shift as the host-width
+    /// `encodeCapacity`, but on a `u64` so it can hold any target word's value.
+    pub fn encodeCapacityForWidth(capacity: u64) u64 {
+        return encodeCapacityGeneric(u64, capacity);
     }
 
     pub inline fn decodeCapacity(encoded: usize) usize {
-        return encoded >> 1;
+        return encoded >> capacity_shift;
+    }
+
+    /// The final byte of a small RocStr: the small-string flag OR'd with the
+    /// small-string length. Target-width independent, since the flag and length
+    /// always live in the layout's final byte.
+    pub fn smallStrFlagByte(length: usize) u8 {
+        return @as(u8, @intCast(length)) | small_str_flag;
+    }
+
+    /// Recover the small-string length from a RocStr's final byte.
+    pub fn smallStrLenFromFlagByte(byte: u8) u8 {
+        return byte & ~small_str_flag;
     }
 
     pub inline fn encodeSliceAllocationPtr(ptr: [*]u8) usize {
@@ -143,7 +186,7 @@ pub const RocStr = extern struct {
         std.debug.assert(slice.len < SMALL_STRING_SIZE);
         var result = RocStr.empty();
         @memcpy(result.asU8ptrMut()[0..slice.len], slice);
-        result.asU8ptrMut()[@sizeOf(RocStr) - 1] = @as(u8, @intCast(slice.len)) | 0b1000_0000;
+        result.asU8ptrMut()[@sizeOf(RocStr) - 1] = smallStrFlagByte(slice.len);
         return result;
     }
 
@@ -186,7 +229,7 @@ pub const RocStr = extern struct {
         } else {
             var string = RocStr.empty();
 
-            string.asU8ptrMut()[@sizeOf(RocStr) - 1] = @as(u8, @intCast(length)) | 0b1000_0000;
+            string.asU8ptrMut()[@sizeOf(RocStr) - 1] = smallStrFlagByte(length);
 
             return string;
         }
@@ -205,7 +248,7 @@ pub const RocStr = extern struct {
         } else {
             var string = RocStr.empty();
 
-            string.asU8ptrMut()[@sizeOf(RocStr) - 1] = @as(u8, @intCast(length)) | 0b1000_0000;
+            string.asU8ptrMut()[@sizeOf(RocStr) - 1] = smallStrFlagByte(length);
 
             return string;
         }
@@ -460,7 +503,7 @@ pub const RocStr = extern struct {
             // I believe taking this reference on the stack here is important for correctness.
             // Doing it via a method call seemed to cause issues
             const dest_ptr = @as([*]u8, @ptrCast(&string));
-            dest_ptr[@sizeOf(RocStr) - 1] = @as(u8, @intCast(new_length)) | 0b1000_0000;
+            dest_ptr[@sizeOf(RocStr) - 1] = smallStrFlagByte(new_length);
 
             const source_ptr = self.asU8ptr();
 
@@ -490,7 +533,7 @@ pub const RocStr = extern struct {
 
     pub fn len(self: RocStr) usize {
         if (self.isSmallStr()) {
-            return self.asArray()[@sizeOf(RocStr) - 1] ^ 0b1000_0000;
+            return smallStrLenFromFlagByte(self.asArray()[@sizeOf(RocStr) - 1]);
         } else {
             return self.length;
         }
@@ -498,7 +541,7 @@ pub const RocStr = extern struct {
 
     pub fn setLen(self: *RocStr, length: usize) void {
         if (self.isSmallStr()) {
-            self.asU8ptrMut()[@sizeOf(RocStr) - 1] = @as(u8, @intCast(length)) | 0b1000_0000;
+            self.asU8ptrMut()[@sizeOf(RocStr) - 1] = smallStrFlagByte(length);
         } else {
             self.length = length;
         }
@@ -4884,4 +4927,24 @@ test "strConcat Immutable copies a shared big allocation" {
     try std.testing.expect(result.bytes != original_bytes);
     try std.testing.expect(std.mem.eql(u8, result.asSlice(), "a string long enough to be heap allocated!?"));
     try std.testing.expect(std.mem.eql(u8, base.asSlice(), "a string long enough to be heap allocated"));
+}
+
+test "default-platform RocStr view matches canonical RocStr layout" {
+    // The freestanding default-platform runtimes cannot import this module, so
+    // they read the RocStr encoding through `default_platform/roc_str_view.zig`.
+    // Assert that view's layout stays byte-for-byte identical to the canonical
+    // struct so the host boundary cannot silently drift.
+    const View = @import("roc_str_view").RocStr;
+
+    try std.testing.expectEqual(@sizeOf(RocStr), @sizeOf(View));
+    try std.testing.expectEqual(@alignOf(RocStr), @alignOf(View));
+
+    const canonical_fields = @typeInfo(RocStr).@"struct".fields;
+    const view_fields = @typeInfo(View).@"struct".fields;
+    try std.testing.expectEqual(canonical_fields.len, view_fields.len);
+    inline for (canonical_fields, view_fields) |cf, vf| {
+        try std.testing.expect(std.mem.eql(u8, cf.name, vf.name));
+        try std.testing.expectEqual(cf.type, vf.type);
+        try std.testing.expectEqual(@offsetOf(RocStr, cf.name), @offsetOf(View, vf.name));
+    }
 }

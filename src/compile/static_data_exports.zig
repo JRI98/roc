@@ -390,10 +390,10 @@ const StaticDataBuilder = struct {
         const str_bytes = source.store.strBytes(str);
         const backing = source.store.strData(str.data);
         const whole_backing = str.offset == 0 and @as(usize, str.len) == backing.len;
-        const roc_str_size = self.word_size * 3;
+        const roc_str_size = self.word_size * builtins.str.RocStr.word_count;
         if (backing.len < roc_str_size and str_bytes.len < roc_str_size) {
             self.writeBytes(bytes, base_offset, str_bytes);
-            bytes[base_offset + roc_str_size - 1] = @as(u8, @intCast(str_bytes.len)) | 0x80;
+            bytes[base_offset + roc_str_size - 1] = builtins.str.RocStr.smallStrFlagByte(str_bytes.len);
             return;
         }
 
@@ -948,16 +948,16 @@ const StaticDataBuilder = struct {
 
     fn encodeRocStrCapacity(self: *StaticDataBuilder, capacity: usize) u64 {
         const target_capacity: u64 = @intCast(capacity);
-        const max_capacity = self.targetWordMax() >> 1;
+        const max_capacity = self.targetWordMax() >> builtins.str.RocStr.capacity_shift;
         if (target_capacity > max_capacity) staticDataInvariant("static string exceeds RocStr capacity limit for target");
-        return target_capacity << 1;
+        return builtins.str.RocStr.encodeCapacityForWidth(target_capacity);
     }
 
     fn encodeRocListCapacity(self: *StaticDataBuilder, capacity: usize) u64 {
         const target_capacity: u64 = @intCast(capacity);
-        const max_capacity = self.targetWordMax() >> 1;
+        const max_capacity = self.targetWordMax() >> builtins.list.RocList.capacity_shift;
         if (target_capacity > max_capacity) staticDataInvariant("static list exceeds RocList capacity limit for target");
-        return target_capacity << 1;
+        return builtins.list.RocList.encodeCapacityForWidth(target_capacity);
     }
 
     fn writeTargetSignedWord(self: *StaticDataBuilder, bytes: []u8, offset: u32, value: i64) void {

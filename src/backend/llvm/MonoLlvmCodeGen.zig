@@ -2821,9 +2821,9 @@ pub const MonoLlvmCodeGen = struct {
                     &.{ .i64, .i8, .i64, .i8 },
                     &.{
                         seed,
-                        builder.intValue(.i8, hasherDomain(op)) catch return error.OutOfMemory,
+                        builder.intValue(.i8, @intFromEnum(lir.hasherDomain(op))) catch return error.OutOfMemory,
                         value,
-                        builder.intValue(.i8, hasherWidth(op)) catch return error.OutOfMemory,
+                        builder.intValue(.i8, lir.hasherU64Width(op)) catch return error.OutOfMemory,
                     },
                 );
             },
@@ -2856,7 +2856,7 @@ pub const MonoLlvmCodeGen = struct {
                     &.{ .i64, .i8, .i64, .i64 },
                     &.{
                         seed,
-                        builder.intValue(.i8, hasherDomain(op)) catch return error.OutOfMemory,
+                        builder.intValue(.i8, @intFromEnum(lir.hasherDomain(op))) catch return error.OutOfMemory,
                         parts.low,
                         parts.high,
                     },
@@ -2873,7 +2873,7 @@ pub const MonoLlvmCodeGen = struct {
                     &.{ .i64, .i8, try self.ptrType(), self.ptrSizedIntType() },
                     &.{
                         seed,
-                        builder.intValue(.i8, hasherDomain(op)) catch return error.OutOfMemory,
+                        builder.intValue(.i8, @intFromEnum(lir.hasherDomain(op))) catch return error.OutOfMemory,
                         list_args.values.items[0],
                         list_args.values.items[1],
                     },
@@ -2942,44 +2942,6 @@ pub const MonoLlvmCodeGen = struct {
         try call_args.prepend(self.allocator, try self.ptrType(), self.slot(target).ptr);
         try call_args.append(self.allocator, try self.ptrType(), self.rocOps());
         try self.callBuiltinVoid(info.name, call_args.types.items, call_args.values.items);
-    }
-
-    fn hasherDomain(op: lir.LowLevel) u8 {
-        return @intFromEnum(switch (op) {
-            .hasher_write_bool => builtins.hash.HasherDomain.bool,
-            .hasher_write_u8 => builtins.hash.HasherDomain.u8,
-            .hasher_write_u16 => builtins.hash.HasherDomain.u16,
-            .hasher_write_u32 => builtins.hash.HasherDomain.u32,
-            .hasher_write_u64 => builtins.hash.HasherDomain.u64,
-            .hasher_write_u128 => builtins.hash.HasherDomain.u128,
-            .hasher_write_i8 => builtins.hash.HasherDomain.i8,
-            .hasher_write_i16 => builtins.hash.HasherDomain.i16,
-            .hasher_write_i32 => builtins.hash.HasherDomain.i32,
-            .hasher_write_i64 => builtins.hash.HasherDomain.i64,
-            .hasher_write_i128 => builtins.hash.HasherDomain.i128,
-            .hasher_write_dec => builtins.hash.HasherDomain.dec,
-            .hasher_write_bytes => builtins.hash.HasherDomain.bytes,
-            else => unreachable,
-        });
-    }
-
-    fn hasherWidth(op: lir.LowLevel) u8 {
-        return switch (op) {
-            .hasher_write_bool,
-            .hasher_write_u8,
-            .hasher_write_i8,
-            => 1,
-            .hasher_write_u16,
-            .hasher_write_i16,
-            => 2,
-            .hasher_write_u32,
-            .hasher_write_i32,
-            => 4,
-            .hasher_write_u64,
-            .hasher_write_i64,
-            => 8,
-            else => unreachable,
-        };
     }
 
     fn hasherStatePtr(self: *MonoLlvmCodeGen, local: LocalId) Error!LlvmBuilder.Value {

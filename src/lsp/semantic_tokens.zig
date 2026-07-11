@@ -60,153 +60,24 @@ pub const SemanticToken = struct {
 
 /// Maps a Roc Token.Tag to an LSP semantic type index.
 /// Returns null for tokens that should not be highlighted (punctuation, etc.).
+///
+/// Classification is driven by `Token.Tag.highlightCategory`, the single source
+/// of truth shared with the playground's HTML token view; this function only
+/// projects each category onto the LSP `SemanticType` index it corresponds to.
 pub fn tokenTagToSemanticType(tag: Token.Tag) ?u32 {
-    return switch (tag) {
-        // Keywords
-        .KwApp,
-        .KwAs,
-        .KwCrash,
-        .KwDbg,
-        .KwElse,
-        .KwExpect,
-        .KwExposes,
-        .KwExposing,
-        .KwFor,
-        .KwGenerates,
-        .KwHas,
-        .KwHosted,
-        .KwIf,
-        .KwImplements,
-        .KwImport,
-        .KwImports,
-        .KwIn,
-        .KwInterface,
-        .KwMatch,
-        .KwModule,
-        .KwPackage,
-        .KwPackages,
-        .KwPlatform,
-        .KwProvides,
-        .KwRequires,
-        .KwReturn,
-        .KwTargets,
-        .KwVar,
-        .KwWhere,
-        .KwWhile,
-        .KwWith,
-        .KwBreak,
-        => @intFromEnum(SemanticType.keyword),
+    return switch (tag.highlightCategory()) {
+        .keyword => @intFromEnum(SemanticType.keyword),
+        .type => @intFromEnum(SemanticType.type),
+        .variable => @intFromEnum(SemanticType.variable),
+        .field => @intFromEnum(SemanticType.property),
+        .tag => @intFromEnum(SemanticType.enumMember),
+        .number => @intFromEnum(SemanticType.number),
+        .string => @intFromEnum(SemanticType.string),
+        .operator => @intFromEnum(SemanticType.operator),
 
-        // Type identifiers
-        .UpperIdent => @intFromEnum(SemanticType.type),
-
-        // Variable identifiers
-        .LowerIdent => @intFromEnum(SemanticType.variable),
-
-        // Property access (record fields)
-        .DotLowerIdent,
-        .NoSpaceDotLowerIdent,
-        => @intFromEnum(SemanticType.property),
-
-        // Tag access (enum members)
-        .DotUpperIdent,
-        .NoSpaceDotUpperIdent,
-        => @intFromEnum(SemanticType.enumMember),
-
-        // Numeric literals
-        .Int,
-        .Float,
-        .DotInt,
-        .NoSpaceDotInt,
-        .MalformedNumberBadSuffix,
-        .MalformedNumberUnicodeSuffix,
-        .MalformedNumberNoDigits,
-        .MalformedNumberNoExponentDigits,
-        => @intFromEnum(SemanticType.number),
-
-        // String literals
-        .StringStart,
-        .StringEnd,
-        .StringPart,
-        .MultilineStringStart,
-        .SingleQuote,
-        .MalformedSingleQuote,
-        .MalformedStringPart,
-        .MalformedInvalidUnicodeEscapeSequence,
-        .MalformedInvalidEscapeSequence,
-        => @intFromEnum(SemanticType.string),
-
-        // Operators
-        .OpPlus,
-        .OpStar,
-        .OpPizza,
-        .OpAssign,
-        .OpBinaryMinus,
-        .OpUnaryMinus,
-        .OpNotEquals,
-        .OpBang,
-        .OpAnd,
-        .OpAmpersand,
-        .OpQuestion,
-        .OpDoubleQuestion,
-        .OpOr,
-        .OpBar,
-        .OpDoubleSlash,
-        .OpSlash,
-        .OpPercent,
-        .OpCaret,
-        .OpGreaterThanOrEq,
-        .OpGreaterThan,
-        .OpLessThanOrEq,
-        .OpBackArrow,
-        .OpLessThan,
-        .OpDoubleDotLessThan,
-        .OpDoubleDotEquals,
-        .OpEquals,
-        .OpColonEqual,
-        .OpDoubleColon,
-        .NoSpaceOpQuestion,
-        .OpColon,
-        .OpArrow,
-        .OpFatArrow,
-        .OpBackslash,
-        .DoubleDot,
-        .TripleDot,
-        .DotStar,
-        => @intFromEnum(SemanticType.operator),
-
-        // Named underscore and opaque names
-        .NamedUnderscore,
-        .MalformedNamedUnderscoreUnicode,
-        => @intFromEnum(SemanticType.variable),
-
-        .OpaqueName,
-        .MalformedOpaqueNameUnicode,
-        .MalformedOpaqueNameWithoutName,
-        => @intFromEnum(SemanticType.type),
-
-        // Unicode identifier variants
-        .MalformedUnicodeIdent,
-        .MalformedDotUnicodeIdent,
-        .MalformedNoSpaceDotUnicodeIdent,
-        => @intFromEnum(SemanticType.variable),
-
-        // Punctuation and structural tokens (not highlighted)
-        .EndOfFile,
-        .OpenRound,
-        .CloseRound,
-        .OpenSquare,
-        .CloseSquare,
-        .OpenCurly,
-        .CloseCurly,
-        .OpenStringInterpolation,
-        .CloseStringInterpolation,
-        .NoSpaceOpenRound,
-        .Comma,
-        .Dot,
-        .Underscore,
-        .MalformedUnknownToken,
-        => null,
+        // Brackets, structural punctuation, and non-highlighted tokens carry no
+        // semantic-token type.
+        .bracket, .punctuation, .default => null,
     };
 }
 

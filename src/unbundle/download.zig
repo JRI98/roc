@@ -82,16 +82,10 @@ pub const parseUrlPath = base.url.parseUrlPath;
 /// Parse URL and validate it meets our security requirements.
 /// Returns the parsed hash and optional version from the URL if valid.
 pub fn validateUrl(url: []const u8) DownloadError!ParsedUrl {
-    // Check for https:// prefix
-    if (std.mem.startsWith(u8, url, "https://")) {
-        // This is fine, extract hash from last segment
-    } else if (std.mem.startsWith(u8, url, "http://127.0.0.1:") or std.mem.startsWith(u8, url, "http://127.0.0.1/")) {
-        // This is allowed for local testing (IPv4 loopback)
-    } else if (std.mem.startsWith(u8, url, "http://[::1]:") or std.mem.startsWith(u8, url, "http://[::1]/")) {
-        // This is allowed for local testing (IPv6 loopback)
-    } else if (std.mem.startsWith(u8, url, "http://localhost:") or std.mem.startsWith(u8, url, "http://localhost/")) {
-        // This is allowed but will require verification that localhost resolves to loopback
-    } else {
+    // The shared allowlist gate: https anywhere, or http only to loopback
+    // hosts. A `localhost` URL is additionally verified to resolve to a
+    // loopback address in `downloadToFile` before any request is made.
+    if (!base.url.isSafeUrl(url)) {
         return error.InvalidUrl;
     }
 

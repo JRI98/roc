@@ -29,6 +29,25 @@ pub const macos_deployment = struct {
     }
 };
 
+/// Errors returned when a target cannot be expressed for a Mach-O link.
+pub const MachoArchError = error{
+    /// The CPU architecture is not one Mach-O links support in this compiler.
+    UnsupportedMachoArch,
+};
+
+/// The Mach-O `-arch` name (`ld64.lld`'s spelling) for a CPU architecture.
+///
+/// Returns `error.UnsupportedMachoArch` for any architecture Roc does not link
+/// as Mach-O, so an unexpected arch fails loudly instead of being silently
+/// linked as the wrong architecture.
+pub fn machoArchName(arch: std.Target.Cpu.Arch) MachoArchError![]const u8 {
+    return switch (arch) {
+        .aarch64 => "arm64",
+        .x86_64 => "x86_64",
+        else => error.UnsupportedMachoArch,
+    };
+}
+
 /// Dynamic-linker (`ld.so`) soname filenames, one authority for the bare
 /// filenames used both by `RocTarget.getDynamicLinkerPath` (which prefixes them
 /// with a known absolute directory) and by `cli/libc_finder.zig` (which probes

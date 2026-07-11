@@ -12,14 +12,7 @@ const RocOps = builtins.host_abi.RocOps;
 const RocList = builtins.list.RocList;
 const RocStr = builtins.str.RocStr;
 
-const extern_host = struct {
-    extern fn roc_alloc(length: usize, alignment: usize) ?*anyopaque;
-    extern fn roc_dealloc(ptr: *anyopaque, alignment: usize) void;
-    extern fn roc_realloc(ptr: *anyopaque, new_length: usize, alignment: usize) ?*anyopaque;
-    extern fn roc_dbg(bytes: [*]const u8, len: usize) void;
-    extern fn roc_expect_failed(bytes: [*]const u8, len: usize) void;
-    extern fn roc_crashed(bytes: [*]const u8, len: usize) void;
-};
+const extern_host = builtins.host_abi.extern_host;
 
 /// Hosted dispatch table defined by the generated platform shim module, in
 /// hosted-section order.

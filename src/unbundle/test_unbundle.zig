@@ -428,6 +428,24 @@ test "download URL validation finds versions embedded in a path segment" {
     }
 }
 
+test "download URL validation rejects non-allowlisted URLs via the shared gate" {
+    // Plain http to a non-loopback host is rejected by base.url.isSafeUrl
+    // before any parsing happens.
+    const rejected = [_][]const u8{
+        "http://example.com/packages/4ZGqXJtqH5n9wMmQ7nPQTU8zgHBNfZ3kcVnNcL3hKqXf.tar.zst",
+        "http://192.168.1.100/packages/4ZGqXJtqH5n9wMmQ7nPQTU8zgHBNfZ3kcVnNcL3hKqXf.tar.zst",
+        "ftp://example.com/packages/4ZGqXJtqH5n9wMmQ7nPQTU8zgHBNfZ3kcVnNcL3hKqXf.tar.zst",
+        "./relative/path",
+    };
+    for (rejected) |url| {
+        try testing.expectError(download.DownloadError.InvalidUrl, download.validateUrl(url));
+    }
+
+    // Loopback http hosts remain allowed through the same gate.
+    const accepted = try download.validateUrl("http://127.0.0.1:8000/packages/4ZGqXJtqH5n9wMmQ7nPQTU8zgHBNfZ3kcVnNcL3hKqXf.tar.zst");
+    try testing.expectEqualStrings("4ZGqXJtqH5n9wMmQ7nPQTU8zgHBNfZ3kcVnNcL3hKqXf", accepted.hash);
+}
+
 test "download URL validation rejects the reserved 0.0.0 version" {
     try testing.expectError(
         download.DownloadError.InvalidVersion,

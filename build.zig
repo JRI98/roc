@@ -5721,6 +5721,7 @@ fn addMainExe(
                     .single_threaded = true,
                 }),
             });
+            default_platform_runtime_obj.root_module.addImport("roc_str_view", roc_modules.roc_str_view);
             default_platform_runtime_obj.root_module.stack_check = false;
             default_platform_runtime_obj.root_module.link_libc = false;
             default_platform_runtime_obj.bundle_compiler_rt = false;

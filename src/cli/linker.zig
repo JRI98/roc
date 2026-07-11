@@ -441,11 +441,7 @@ fn buildLinkArgs(ctx: *CliCtx, config: LinkConfig) LinkError!std.array_list.Mana
 
             // Add architecture flag
             try args.append("-arch");
-            switch (target_arch) {
-                .aarch64 => try args.append("arm64"),
-                .x86_64 => try args.append("x86_64"),
-                else => try args.append("arm64"), // default to arm64
-            }
+            try args.append(roc_target.machoArchName(target_arch) catch return LinkError.LinkFailed);
 
             // Roc rewrites the ad-hoc code signature after patching Mach-O
             // load commands. Suppress lld's content-derived LC_UUID so the

@@ -422,10 +422,25 @@ fn maxDevDataAlignment(view: *const RunImage.ProgramView) RunImage.ImageError!us
 
 const JumpStubError = RunImage.ImageError || error{UnsupportedPlatform};
 
+/// Bytes emitted for one host jump stub on x86_64 (`movabs r11, imm64; jmp r11`).
+const x86_64_jump_stub_size = 13;
+/// Bytes emitted for one host jump stub on aarch64 (four `movk`/`movz x16`
+/// instructions followed by `br x16`).
+const aarch64_jump_stub_size = 20;
+
+comptime {
+    // `RunImage` reserves `max_jump_stub_size` bytes per stub in the shared image;
+    // the stub this shim emits for every supported host arch must fit within that
+    // reservation. This is the single compile-time link between the emitted sizes
+    // (owned here) and the reservation (owned by `RunImage`).
+    std.debug.assert(x86_64_jump_stub_size <= RunImage.max_jump_stub_size);
+    std.debug.assert(aarch64_jump_stub_size <= RunImage.max_jump_stub_size);
+}
+
 fn jumpStubSize() JumpStubError!usize {
     return switch (builtin.cpu.arch) {
-        .x86_64 => 13,
-        .aarch64, .aarch64_be => 20,
+        .x86_64 => x86_64_jump_stub_size,
+        .aarch64, .aarch64_be => aarch64_jump_stub_size,
         else => error.UnsupportedPlatform,
     };
 }
@@ -433,7 +448,7 @@ fn jumpStubSize() JumpStubError!usize {
 fn writeJumpStub(buf: []u8, target_addr: usize) JumpStubError!void {
     switch (builtin.cpu.arch) {
         .x86_64 => {
-            if (buf.len < 13) return error.InvalidDevRunImage;
+            if (buf.len < x86_64_jump_stub_size) return error.InvalidDevRunImage;
             buf[0] = 0x49; // movabs r11, imm64
             buf[1] = 0xBB;
             std.mem.writeInt(u64, buf[2..][0..8], @intCast(target_addr), .little);
@@ -442,7 +457,7 @@ fn writeJumpStub(buf: []u8, target_addr: usize) JumpStubError!void {
             buf[12] = 0xE3;
         },
         .aarch64, .aarch64_be => {
-            if (buf.len < 20) return error.InvalidDevRunImage;
+            if (buf.len < aarch64_jump_stub_size) return error.InvalidDevRunImage;
             const addr: u64 = @intCast(target_addr);
             std.mem.writeInt(u32, buf[0..][0..4], movzX16(@truncate(addr), 0), .little);
             std.mem.writeInt(u32, buf[4..][0..4], movkX16(@truncate(addr >> 16), 16), .little);

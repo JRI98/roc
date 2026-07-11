@@ -8,10 +8,11 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const base58 = @import("base58");
 const zstd = std.compress.zstd;
+const format = @import("format.zig");
 
 // Constants
-const TAR_EXTENSION = ".tar.zst";
-const STREAM_BUFFER_SIZE: usize = 64 * 1024; // 64KB buffer for streaming operations
+const TAR_EXTENSION = format.TAR_EXTENSION;
+const STREAM_BUFFER_SIZE = format.STREAM_BUFFER_SIZE;
 // Buffer size for stdlib zstd decompressor: window_len + block_size_max for tar extraction
 const DECOMPRESS_BUFFER_SIZE: usize = zstd.default_window_len + zstd.block_size_max;
 // Max path bytes - use 4096 on WASM/freestanding, std.Io.Dir.max_path_bytes elsewhere

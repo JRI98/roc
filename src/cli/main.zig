@@ -5577,27 +5577,33 @@ fn lowerLirWithCoordinator(
             coord.packages.get(package_keys.identity(i)) orelse return error.CliError;
 
         for (package.deps) |dep| {
-            const target = resolved_packages[dep.target];
             const target_name = package_keys.identity(dep.target);
             try from_pkg.shorthands.put(
                 try ctx.gpa.dupe(u8, dep.alias),
                 try ctx.gpa.dupe(u8, target_name),
             );
+        }
+    }
 
-            // The app's platform root module is parsed eagerly so its
-            // provides/hosted declarations are available to the build.
-            if (i == compile.package_resolution.Resolved.root_index and dep.is_platform) {
-                const pf_pkg = coord.packages.get(target_name) orelse return error.CliError;
-                coord.markPlatformPackage(pf_pkg.name);
-                if (pf_pkg.root_module_id == null) {
-                    const pf_module_id = try pf_pkg.ensureModule(ctx.gpa, "main", target.root_file);
-                    pf_pkg.root_module_id = pf_module_id;
-                    pf_pkg.modules.items[pf_module_id].depth = 1;
-                    pf_pkg.remaining_modules += 1;
-                    coord.total_remaining += 1;
-                    try coord.enqueueParseTask(target_name, pf_module_id);
-                }
-            }
+    // Eagerly parse every resolved platform package's root module so its
+    // provides/hosted declarations are available to the build. Scanning by
+    // package kind matches the BuildEnv path; for an app root the sole
+    // platform is the root's direct platform dependency, but scanning keeps
+    // the two paths in lockstep. The module name is derived from the platform's
+    // actual root file rather than assumed to be "main".
+    for (resolved_packages, 0..) |package, i| {
+        if (package.kind != .platform) continue;
+        const platform_name = package_keys.identity(i);
+        const pf_pkg = coord.packages.get(platform_name) orelse return error.CliError;
+        coord.markPlatformPackage(pf_pkg.name);
+        if (pf_pkg.root_module_id == null) {
+            const pf_module_name = base.module_path.getModuleName(package.root_file);
+            const pf_module_id = try pf_pkg.ensureModule(ctx.gpa, pf_module_name, package.root_file);
+            pf_pkg.root_module_id = pf_module_id;
+            pf_pkg.modules.items[pf_module_id].depth = 1;
+            pf_pkg.remaining_modules += 1;
+            coord.total_remaining += 1;
+            try coord.enqueueParseTask(platform_name, pf_module_id);
         }
     }
 

@@ -750,6 +750,31 @@ pub const RocDec = extern struct {
         // For Dec, remainder is straightforward since both operands have the same scaling factor
         return RocDec{ .num = i128h.rem_i128(self.num, other.num) };
     }
+
+    pub fn mod(
+        self: RocDec,
+        other: RocDec,
+        roc_ops: *RocOps,
+    ) RocDec {
+        // (n % 0) is an error
+        if (other.num == 0) {
+            roc_ops.crash("Decimal modulo by 0!");
+        }
+
+        // Both operands share the same scaling factor, so the truncated
+        // remainder of the raw values is the truncated remainder of the Decs.
+        const remainder = i128h.rem_i128(self.num, other.num);
+        if (remainder == 0) {
+            return RocDec{ .num = 0 };
+        }
+
+        // Modulo carries the sign of the divisor: when the truncated remainder
+        // has the opposite sign, shift it by the divisor to flip its sign.
+        if ((remainder > 0) != (other.num > 0)) {
+            return RocDec{ .num = remainder +% other.num };
+        }
+        return RocDec{ .num = remainder };
+    }
 };
 
 const dec_cordic_k = RocDec{ .num = 607252935008881256 };
@@ -1531,6 +1556,26 @@ pub fn divTruncC(
 ) callconv(.c) i128 {
     const quotient = @call(.always_inline, RocDec.div, .{ arg1, arg2, roc_ops });
     return @call(.always_inline, RocDec.trunc, .{ quotient, roc_ops }).num;
+}
+
+/// C ABI truncated-remainder wrapper. The result carries the sign of the
+/// dividend. Crashes through RocOps on a zero divisor.
+pub fn remC(
+    arg1: RocDec,
+    arg2: RocDec,
+    roc_ops: *RocOps,
+) callconv(.c) i128 {
+    return @call(.always_inline, RocDec.rem, .{ arg1, arg2, roc_ops }).num;
+}
+
+/// C ABI modulo wrapper. The result carries the sign of the divisor. Crashes
+/// through RocOps on a zero divisor.
+pub fn modC(
+    arg1: RocDec,
+    arg2: RocDec,
+    roc_ops: *RocOps,
+) callconv(.c) i128 {
+    return @call(.always_inline, RocDec.mod, .{ arg1, arg2, roc_ops }).num;
 }
 
 /// C ABI natural-log wrapper. The caller must provide a positive Dec; arithmetic
@@ -2763,6 +2808,50 @@ test "sqrt fixtures match exact fixed-point spec" {
 
     inline for (dec_sqrt_spec_cases) |case| {
         try std.testing.expectEqual(case.expected, case.input.sqrt(test_env.getOps()));
+    }
+}
+
+test "Dec rem carries sign of dividend; mod carries sign of divisor" {
+    var test_env = TestEnv.init(std.testing.allocator);
+    defer test_env.deinit();
+
+    const whole = struct {
+        fn dec(n: i128) RocDec {
+            return RocDec{ .num = n * RocDec.one_point_zero_i128 };
+        }
+    }.dec;
+
+    const Case = struct {
+        lhs: RocDec,
+        rhs: RocDec,
+        expected_rem: RocDec,
+        expected_mod: RocDec,
+    };
+
+    const cases = [_]Case{
+        .{ .lhs = whole(7), .rhs = whole(3), .expected_rem = whole(1), .expected_mod = whole(1) },
+        .{ .lhs = whole(-7), .rhs = whole(3), .expected_rem = whole(-1), .expected_mod = whole(2) },
+        .{ .lhs = whole(7), .rhs = whole(-3), .expected_rem = whole(1), .expected_mod = whole(-2) },
+        .{ .lhs = whole(-7), .rhs = whole(-3), .expected_rem = whole(-1), .expected_mod = whole(-1) },
+        .{ .lhs = whole(0), .rhs = whole(3), .expected_rem = whole(0), .expected_mod = whole(0) },
+        .{ .lhs = whole(6), .rhs = whole(3), .expected_rem = whole(0), .expected_mod = whole(0) },
+        .{
+            .lhs = RocDec.fromFraction(55, 1),
+            .rhs = whole(2),
+            .expected_rem = RocDec.fromFraction(15, 1),
+            .expected_mod = RocDec.fromFraction(15, 1),
+        },
+        .{
+            .lhs = RocDec.fromFraction(-55, 1),
+            .rhs = whole(2),
+            .expected_rem = RocDec.fromFraction(-15, 1),
+            .expected_mod = RocDec.fromFraction(5, 1),
+        },
+    };
+
+    for (cases) |case| {
+        try std.testing.expectEqual(case.expected_rem.num, remC(case.lhs, case.rhs, test_env.getOps()));
+        try std.testing.expectEqual(case.expected_mod.num, modC(case.lhs, case.rhs, test_env.getOps()));
     }
 }
 

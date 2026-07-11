@@ -656,7 +656,7 @@ pub const Store = struct {
     pub fn putTagUnion(self: *Self, variant_layouts: []const Idx) std.mem.Allocator.Error!Idx {
         // Single-variant tag unions keep their tag_union layout but use an implicit
         // discriminant, so they do not reserve any discriminant bytes in memory.
-        const discriminant_size: u8 = tagUnionDiscriminantSize(variant_layouts.len);
+        const discriminant_size: u8 = TagUnionData.discriminantSize(variant_layouts.len);
 
         // Size and discriminant offset, precomputed for both pointer widths.
         const m32 = self.tagUnionMetricsAt(variant_layouts, discriminant_size, .u32);
@@ -712,7 +712,7 @@ pub const Store = struct {
     fn buildUninternedTagUnionLayout(self: *Self, variant_layouts: []const Idx) std.mem.Allocator.Error!Layout {
         std.debug.assert(variant_layouts.len >= 1);
 
-        const discriminant_size: u8 = tagUnionDiscriminantSize(variant_layouts.len);
+        const discriminant_size: u8 = TagUnionData.discriminantSize(variant_layouts.len);
         const m32 = self.tagUnionMetricsAt(variant_layouts, discriminant_size, .u32);
         const m64 = self.tagUnionMetricsAt(variant_layouts, discriminant_size, .u64);
         if (m64.size == 0) {
@@ -2121,19 +2121,6 @@ pub const Store = struct {
 
     pub fn rcHelperTagUnionVariantPlan(self: *const Self, tag_plan: @import("./rc_helper.zig").TagUnionPlan, variant_index: u32) ?@import("./rc_helper.zig").HelperKey {
         return rc_helper.Resolver.init(self).tagUnionVariantPlan(tag_plan, variant_index);
-    }
-
-    fn tagUnionDiscriminantSize(variant_count: usize) u8 {
-        return if (variant_count <= 1)
-            0
-        else if (variant_count <= 256)
-            1
-        else if (variant_count <= 65536)
-            2
-        else if (variant_count <= (1 << 32))
-            4
-        else
-            8;
     }
 
     /// Note: the caller must verify ahead of time that the given variable does not

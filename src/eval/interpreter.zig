@@ -4438,49 +4438,6 @@ pub const Interpreter = struct {
         return val;
     }
 
-    fn hasherDomain(op: LIR.LowLevel) builtins.hash.HasherDomain {
-        return switch (op) {
-            .hasher_write_bool => .bool,
-            .hasher_write_u8 => .u8,
-            .hasher_write_u16 => .u16,
-            .hasher_write_u32 => .u32,
-            .hasher_write_u64 => .u64,
-            .hasher_write_u128 => .u128,
-            .hasher_write_i8 => .i8,
-            .hasher_write_i16 => .i16,
-            .hasher_write_i32 => .i32,
-            .hasher_write_i64 => .i64,
-            .hasher_write_i128 => .i128,
-            .hasher_write_f32 => .f32,
-            .hasher_write_f64 => .f64,
-            .hasher_write_dec => .dec,
-            .hasher_write_bytes => .bytes,
-            .hasher_write_str => .str,
-            else => unreachable,
-        };
-    }
-
-    fn hasherU64Width(op: LIR.LowLevel) u8 {
-        return switch (op) {
-            .hasher_write_bool,
-            .hasher_write_u8,
-            .hasher_write_i8,
-            => 1,
-            .hasher_write_u16,
-            .hasher_write_i16,
-            => 2,
-            .hasher_write_u32,
-            .hasher_write_i32,
-            .hasher_write_f32,
-            => 4,
-            .hasher_write_u64,
-            .hasher_write_i64,
-            .hasher_write_f64,
-            => 8,
-            else => unreachable,
-        };
-    }
-
     fn byteListSlice(self: *LirInterpreter, list_val: Value, list_layout: layout_mod.Idx) Error![]const u8 {
         const list = self.valueToRocListForLayout(list_val, list_layout);
         if (list.bytes) |bytes| return bytes[0..list.len()];
@@ -5393,7 +5350,7 @@ pub const Interpreter = struct {
             .hasher_write_bool => blk: {
                 const seed = args[0].read(u64);
                 const value: u64 = if (try self.readBoolValue(args[1], try self.lowLevelArgLayout(ll, 1))) 1 else 0;
-                const next = builtins.hash.hasher_write_u64(seed, @intFromEnum(hasherDomain(ll.op)), value, hasherU64Width(ll.op));
+                const next = builtins.hash.hasher_write_u64(seed, @intFromEnum(lir.hasherDomain(ll.op)), value, lir.hasherU64Width(ll.op));
                 break :blk self.writeHasherValue(ll.ret_layout, next);
             },
             .hasher_write_u8,
@@ -5417,21 +5374,21 @@ pub const Interpreter = struct {
                     .hasher_write_i64 => @bitCast(args[1].read(i64)),
                     else => unreachable,
                 };
-                const next = builtins.hash.hasher_write_u64(seed, @intFromEnum(hasherDomain(ll.op)), value, hasherU64Width(ll.op));
+                const next = builtins.hash.hasher_write_u64(seed, @intFromEnum(lir.hasherDomain(ll.op)), value, lir.hasherU64Width(ll.op));
                 break :blk self.writeHasherValue(ll.ret_layout, next);
             },
             .hasher_write_f32 => blk: {
                 const seed = args[0].read(u64);
                 const value = args[1].read(f32);
                 const bits: u64 = if (value == 0.0) 0 else @as(u64, @as(u32, @bitCast(value)));
-                const next = builtins.hash.hasher_write_u64(seed, @intFromEnum(hasherDomain(ll.op)), bits, hasherU64Width(ll.op));
+                const next = builtins.hash.hasher_write_u64(seed, @intFromEnum(lir.hasherDomain(ll.op)), bits, lir.hasherU64Width(ll.op));
                 break :blk self.writeHasherValue(ll.ret_layout, next);
             },
             .hasher_write_f64 => blk: {
                 const seed = args[0].read(u64);
                 const value = args[1].read(f64);
                 const bits: u64 = if (value == 0.0) 0 else @bitCast(value);
-                const next = builtins.hash.hasher_write_u64(seed, @intFromEnum(hasherDomain(ll.op)), bits, hasherU64Width(ll.op));
+                const next = builtins.hash.hasher_write_u64(seed, @intFromEnum(lir.hasherDomain(ll.op)), bits, lir.hasherU64Width(ll.op));
                 break :blk self.writeHasherValue(ll.ret_layout, next);
             },
             .hasher_write_u128,
@@ -5442,20 +5399,20 @@ pub const Interpreter = struct {
                 const bits: u128 = @bitCast(args[1].read(i128));
                 const low: u64 = @truncate(bits);
                 const high: u64 = @truncate(bits >> 64);
-                const next = builtins.hash.hasher_write_u128(seed, @intFromEnum(hasherDomain(ll.op)), low, high);
+                const next = builtins.hash.hasher_write_u128(seed, @intFromEnum(lir.hasherDomain(ll.op)), low, high);
                 break :blk self.writeHasherValue(ll.ret_layout, next);
             },
             .hasher_write_bytes => blk: {
                 const seed = args[0].read(u64);
                 const bytes = try self.byteListSlice(args[1], try self.lowLevelArgLayout(ll, 1));
-                const next = builtins.hash.hasher_write_bytes(seed, @intFromEnum(hasherDomain(ll.op)), bytes.ptr, bytes.len);
+                const next = builtins.hash.hasher_write_bytes(seed, @intFromEnum(lir.hasherDomain(ll.op)), bytes.ptr, bytes.len);
                 break :blk self.writeHasherValue(ll.ret_layout, next);
             },
             .hasher_write_str => blk: {
                 const seed = args[0].read(u64);
                 var str = valueToRocStr(args[1]);
                 const bytes = str.asSlice();
-                const next = builtins.hash.hasher_write_bytes(seed, @intFromEnum(hasherDomain(ll.op)), bytes.ptr, bytes.len);
+                const next = builtins.hash.hasher_write_bytes(seed, @intFromEnum(lir.hasherDomain(ll.op)), bytes.ptr, bytes.len);
                 break :blk self.writeHasherValue(ll.ret_layout, next);
             },
 
@@ -7099,31 +7056,12 @@ pub const Interpreter = struct {
                 break :blk builtins.dec.divTruncC(RocDec{ .num = av }, RocDec{ .num = bv }, &self.roc_ops);
             },
             .rem => blk: {
-                // Dec rem: a - trunc(a/b) * b
                 if (bv == 0) break :blk @as(i128, 0);
-                var crash_boundary = self.enterCrashBoundary();
-                defer crash_boundary.deinit();
-                const sj = crash_boundary.set();
-                if (sj != 0) break :blk @as(i128, 0);
-                const div_result = builtins.dec.divTruncC(RocDec{ .num = av }, RocDec{ .num = bv }, &self.roc_ops);
-                const mul_result = RocDec.mulWithOverflow(RocDec{ .num = div_result }, RocDec{ .num = bv });
-                break :blk av -% mul_result.value.num;
+                break :blk builtins.dec.remC(RocDec{ .num = av }, RocDec{ .num = bv }, &self.roc_ops);
             },
             .mod => blk: {
                 if (bv == 0) break :blk @as(i128, 0);
-                var crash_boundary = self.enterCrashBoundary();
-                defer crash_boundary.deinit();
-                const sj = crash_boundary.set();
-                if (sj != 0) break :blk @as(i128, 0);
-                const div_result = builtins.dec.divTruncC(RocDec{ .num = av }, RocDec{ .num = bv }, &self.roc_ops);
-                const mul_result = RocDec.mulWithOverflow(RocDec{ .num = div_result }, RocDec{ .num = bv });
-                const remainder = av -% mul_result.value.num;
-                // Mod adjusts sign to match divisor
-                if (remainder == 0) break :blk @as(i128, 0);
-                if ((remainder > 0) != (bv > 0))
-                    break :blk remainder +% bv
-                else
-                    break :blk remainder;
+                break :blk builtins.dec.modC(RocDec{ .num = av }, RocDec{ .num = bv }, &self.roc_ops);
             },
         };
     }

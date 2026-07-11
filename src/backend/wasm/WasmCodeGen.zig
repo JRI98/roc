@@ -760,44 +760,6 @@ fn emitListEqCall(
     try self.emitBuiltinCall(kind, host_import);
 }
 
-fn hasherDomain(op: lir.LowLevel) u8 {
-    return @intFromEnum(switch (op) {
-        .hasher_write_bool => builtins.hash.HasherDomain.bool,
-        .hasher_write_u8 => builtins.hash.HasherDomain.u8,
-        .hasher_write_u16 => builtins.hash.HasherDomain.u16,
-        .hasher_write_u32 => builtins.hash.HasherDomain.u32,
-        .hasher_write_u64 => builtins.hash.HasherDomain.u64,
-        .hasher_write_u128 => builtins.hash.HasherDomain.u128,
-        .hasher_write_i8 => builtins.hash.HasherDomain.i8,
-        .hasher_write_i16 => builtins.hash.HasherDomain.i16,
-        .hasher_write_i32 => builtins.hash.HasherDomain.i32,
-        .hasher_write_i64 => builtins.hash.HasherDomain.i64,
-        .hasher_write_i128 => builtins.hash.HasherDomain.i128,
-        .hasher_write_dec => builtins.hash.HasherDomain.dec,
-        .hasher_write_bytes => builtins.hash.HasherDomain.bytes,
-        else => unreachable,
-    });
-}
-
-fn hasherWidth(op: lir.LowLevel) u8 {
-    return switch (op) {
-        .hasher_write_bool,
-        .hasher_write_u8,
-        .hasher_write_i8,
-        => 1,
-        .hasher_write_u16,
-        .hasher_write_i16,
-        => 2,
-        .hasher_write_u32,
-        .hasher_write_i32,
-        => 4,
-        .hasher_write_u64,
-        .hasher_write_i64,
-        => 8,
-        else => unreachable,
-    };
-}
-
 fn emitHasherState(self: *Self, hasher: ProcLocalId) Allocator.Error!void {
     try self.emitProcLocal(hasher);
     try self.emitLoadOp(.i64, 0);
@@ -874,9 +836,9 @@ fn emitHasherLowLevel(self: *Self, op: lir.LowLevel, args: anytype) Allocator.Er
         .hasher_write_i64,
         => {
             try self.emitHasherState(GuardedList.at(args, 0));
-            try self.emitI32Const(@intCast(hasherDomain(op)));
+            try self.emitI32Const(@intCast(@intFromEnum(lir.hasherDomain(op))));
             try self.emitHasherScalarAsI64(GuardedList.at(args, 1));
-            try self.emitI32Const(@intCast(hasherWidth(op)));
+            try self.emitI32Const(@intCast(lir.hasherU64Width(op)));
             try self.emitBuiltinCall(.hasher_write_u64, self.hasher_write_u64_import);
             try self.emitHasherRecordFromI64();
         },
@@ -897,7 +859,7 @@ fn emitHasherLowLevel(self: *Self, op: lir.LowLevel, args: anytype) Allocator.Er
         .hasher_write_dec,
         => {
             try self.emitHasherState(GuardedList.at(args, 0));
-            try self.emitI32Const(@intCast(hasherDomain(op)));
+            try self.emitI32Const(@intCast(@intFromEnum(lir.hasherDomain(op))));
             try self.emitHasherU128Parts(GuardedList.at(args, 1));
             try self.emitBuiltinCall(.hasher_write_u128, self.hasher_write_u128_import);
             try self.emitHasherRecordFromI64();
@@ -909,7 +871,7 @@ fn emitHasherLowLevel(self: *Self, op: lir.LowLevel, args: anytype) Allocator.Er
             const fields = try self.loadRocListFields(list_ptr);
 
             try self.emitHasherState(GuardedList.at(args, 0));
-            try self.emitI32Const(@intCast(hasherDomain(op)));
+            try self.emitI32Const(@intCast(@intFromEnum(lir.hasherDomain(op))));
             try self.emitLocalGet(fields.bytes);
             try self.emitLocalGet(fields.len);
             try self.emitBuiltinCall(.hasher_write_bytes, self.hasher_write_bytes_import);
@@ -9341,8 +9303,8 @@ fn layoutStorageByteAlign(self: *const Self, layout_idx: layout.Idx) Allocator.E
             },
         },
         .list, .list_of_zst, .box, .box_of_zst => 4,
-        .tag_union => (try WasmLayout.tagUnionLayoutWithStore(l.getTagUnion().idx, ls)).alignment,
-        .struct_ => try WasmLayout.structAlignWithStore(l.getStruct().idx, ls),
+        .tag_union => WasmLayout.layoutAlignWasm(l),
+        .struct_ => WasmLayout.layoutAlignWasm(l),
         else => try self.layoutByteAlign(layout_idx),
     };
 }
@@ -9647,7 +9609,7 @@ fn generateStruct(self: *Self, r: anytype) Allocator.Error!void {
         return;
     }
 
-    const align_val: u32 = try WasmLayout.structAlignWithStore(l.getStruct().idx, ls);
+    const align_val: u32 = WasmLayout.layoutAlignWasm(l);
 
     const frame_offset = try self.allocStackMemory(size, align_val);
 
@@ -9853,7 +9815,7 @@ fn generateTag(self: *Self, t: anytype) Allocator.Error!void {
         return;
     }
 
-    const align_val: u32 = tu_layout.alignment;
+    const align_val: u32 = WasmLayout.layoutAlignWasm(l);
     const frame_offset = try self.allocStackMemory(tu_size, align_val);
 
     const base_local = self.storage.allocAnonymousLocal(.i32) catch return error.OutOfMemory;

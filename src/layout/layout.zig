@@ -380,8 +380,13 @@ pub const TagUnionData = struct {
 
     /// Compute the discriminant size in bytes from a variant count.
     /// Can be called before a TagUnionData is created.
+    ///
+    /// A single-variant tag union has an implicit discriminant (the tag is
+    /// statically known), so it reserves zero discriminant bytes in memory.
+    /// This is the width committed into `TagUnionData.discriminant_size`, so
+    /// it is the width every backend and glue read back for the layout.
     pub fn discriminantSize(variant_count: usize) u8 {
-        return if (variant_count <= 256) 1 else if (variant_count <= 65536) 2 else if (variant_count <= (1 << 32)) 4 else 8;
+        return if (variant_count <= 1) 0 else if (variant_count <= 256) 1 else if (variant_count <= 65536) 2 else if (variant_count <= (1 << 32)) 4 else 8;
     }
 
     /// Get the integer precision for this discriminant (always unsigned).
