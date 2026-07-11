@@ -160,10 +160,11 @@ measurably speed up debug-mode snapshot runs.
 
 ## Related projects
 
-- [Replace the Dispatch Ambiguity Sweep with a Generalization-Time
-  Rule](generalization-time-ambiguity.md) — the sibling dispatch project:
-  that one moves the *ambiguity* decision to check time; this one makes the
-  *target* decision travel from check time. Both shrink what monotype
+- The generalization-time ambiguity judging that landed in July 2026
+  (constraint provenance; `judgeAmbiguityCandidatesAtGeneralization` in
+  `src/check/Check.zig`) — the sibling dispatch work: it moved the
+  *ambiguity* decision to check time; this project makes the *target*
+  decision travel from check time. Both shrink what monotype
   lowering is allowed to figure out on its own.
 - [Cross-Phase Coverage Parity
   Tests](../small/cross-phase-coverage-parity-tests.md) — the parity-test
