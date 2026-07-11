@@ -9580,7 +9580,9 @@ fn generateStandaloneTypeAnno(
     const ctx = GenTypeAnnoCtx{ .annotation = type_anno.where };
     try self.generateAnnoTypeInPlace(type_anno.anno, env, ctx);
     if (type_anno.where) |where_span| {
-        try self.generateRemainingWhereConstraintOwners(where_span, env, ctx);
+        if (try self.generateRemainingWhereConstraintOwners(where_span, env, ctx)) {
+            try self.unifyWith(anno_var, .err, env);
+        }
         try self.reportUnsupportedWhereAliases(where_span);
     }
 
@@ -9670,7 +9672,9 @@ fn generateAnnotationType(self: *Self, annotation_idx: CIR.Annotation.Idx, env: 
     const ctx = GenTypeAnnoCtx{ .annotation = annotation.where };
     try self.generateAnnoTypeInPlace(annotation.anno, env, ctx);
     if (annotation.where) |where_span| {
-        try self.generateRemainingWhereConstraintOwners(where_span, env, ctx);
+        if (try self.generateRemainingWhereConstraintOwners(where_span, env, ctx)) {
+            try self.unifyWith(ModuleEnv.varFrom(annotation.anno), .err, env);
+        }
         try self.reportUnsupportedWhereAliases(where_span);
     }
 
@@ -9745,11 +9749,28 @@ fn generateRemainingWhereConstraintOwners(
     where_span: CIR.WhereClause.Span,
     env: *Env,
     ctx: GenTypeAnnoCtx,
-) std.mem.Allocator.Error!void {
+) std.mem.Allocator.Error!bool {
+    var invalid_receiver = false;
     for (self.cir.store.sliceWhereClauseOwners(where_span)) |owner| {
-        if (!owner.introduced_in_scope) continue;
-        try self.generateAnnoTypeInPlace(@enumFromInt(owner.rigid_var), env, ctx);
+        if (owner.introduced_in_scope) {
+            try self.generateAnnoTypeInPlace(@enumFromInt(owner.rigid_var), env, ctx);
+            continue;
+        }
+
+        invalid_receiver = true;
+        for (self.cir.store.sliceWhereClausesForOwner(owner)) |where_idx| {
+            switch (self.cir.store.getWhereClause(where_idx)) {
+                .w_method => |method| {
+                    _ = try self.problems.appendProblem(self.gpa, .{ .where_clause_receiver_not_introduced = .{
+                        .method_name = method.method_name,
+                        .region = self.cir.store.getNodeRegion(ModuleEnv.nodeIdxFrom(where_idx)),
+                    } });
+                },
+                .w_alias, .w_malformed => {},
+            }
+        }
     }
+    return invalid_receiver;
 }
 
 fn reportUnsupportedWhereAliases(self: *Self, where_span: CIR.WhereClause.Span) std.mem.Allocator.Error!void {

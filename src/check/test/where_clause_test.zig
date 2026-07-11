@@ -174,6 +174,25 @@ test "where clause - cyclic constraint signatures resolve through canonical owne
     );
 }
 
+test "where clause - cannot constrain rigid introduced by enclosing annotation" {
+    const source =
+        \\outer : a -> Str
+        \\outer = |value| {
+        \\    inner : a -> Str where [a.show : a -> Str]
+        \\    inner = |_ignored| "ok"
+        \\    inner(value)
+        \\}
+    ;
+    var test_env = try TestEnv.init("EnclosingWhereReceiver", source);
+    defer test_env.deinit();
+
+    try test_env.assertOneTypeError("Invalid Where Constraint");
+    try std.testing.expectEqual(
+        .where_clause_receiver_not_introduced,
+        std.meta.activeTag(test_env.checker.problems.problems.items[0]),
+    );
+}
+
 test "where clause - multiple constraints on same variable" {
     const source_a =
         \\A := [D(Str, U64)].{
