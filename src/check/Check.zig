@@ -1207,6 +1207,7 @@ const ValueLookupEntry = struct {
 const ScratchStaticDispatchConstraint = struct {
     var_: Var,
     constraint: types_mod.StaticDispatchConstraint,
+    state: enum { declared, completed },
 };
 
 const ReturnConstraint = struct {
@@ -9573,12 +9574,11 @@ fn generateStandaloneTypeAnno(
     const scratch_static_dispatch_constraints_top = self.scratch_static_dispatch_constraints.top();
     defer self.scratch_static_dispatch_constraints.clearFrom(scratch_static_dispatch_constraints_top);
 
-    // Iterate over where clauses (if they exist), adding them to scratch_static_dispatch_constraints
+    // Declare every where constraint before generating any of their type
+    // annotations. A rigid variable may occur only inside the where signatures,
+    // so its first occurrence must already see the complete constraint set.
     if (type_anno.where) |where_span| {
-        const where_slice = self.cir.store.sliceWhereClauses(where_span);
-        for (where_slice) |where_idx| {
-            try self.generateStaticDispatchConstraintFromWhere(where_idx, env);
-        }
+        try self.generateStaticDispatchConstraintsFromWhere(where_span, env);
     }
 
     // Generate the type from the annotation
@@ -9667,12 +9667,11 @@ fn generateAnnotationType(self: *Self, annotation_idx: CIR.Annotation.Idx, env: 
     const scratch_static_dispatch_constraints_top = self.scratch_static_dispatch_constraints.top();
     defer self.scratch_static_dispatch_constraints.clearFrom(scratch_static_dispatch_constraints_top);
 
-    // Iterate over where clauses (if they exist), adding them to scratch_static_dispatch_constraints
+    // Declare every where constraint before generating any of their type
+    // annotations. A rigid variable may occur only inside the where signatures,
+    // so its first occurrence must already see the complete constraint set.
     if (annotation.where) |where_span| {
-        const where_slice = self.cir.store.sliceWhereClauses(where_span);
-        for (where_slice) |where_idx| {
-            try self.generateStaticDispatchConstraintFromWhere(where_idx, env);
-        }
+        try self.generateStaticDispatchConstraintsFromWhere(where_span, env);
     }
 
     // Then, generate the type for the annotation
@@ -9682,39 +9681,44 @@ fn generateAnnotationType(self: *Self, annotation_idx: CIR.Annotation.Idx, env: 
     _ = try self.unify(annotation_var, ModuleEnv.varFrom(annotation.anno), env);
 }
 
-/// Given a where clause, generate static dispatch constraints and add to scratch_static_dispatch_constraints
-fn generateStaticDispatchConstraintFromWhere(self: *Self, where_idx: CIR.WhereClause.Idx, env: *Env) std.mem.Allocator.Error!void {
+/// Declare every method relation first, then complete each function signature.
+/// Constraint-only rigid variables can be first encountered in any signature;
+/// predeclaration ensures that encounter sees every constraint on the variable.
+fn generateStaticDispatchConstraintsFromWhere(self: *Self, where_span: CIR.WhereClause.Span, env: *Env) std.mem.Allocator.Error!void {
     const trace = tracy.trace(@src());
     defer trace.end();
 
+    const constraints_start = self.scratch_static_dispatch_constraints.top();
+    const where_slice = self.cir.store.sliceWhereClauses(where_span);
+
+    for (where_slice) |where_idx| {
+        try self.declareStaticDispatchConstraintFromWhere(where_idx, env);
+    }
+
+    var constraint_index = constraints_start;
+    for (where_slice) |where_idx| {
+        switch (self.cir.store.getWhereClause(where_idx)) {
+            .w_method => |method| {
+                try self.completeStaticDispatchConstraintFromWhere(method, constraint_index, env);
+                constraint_index += 1;
+            },
+            .w_alias, .w_malformed => {},
+        }
+    }
+
+    std.debug.assert(constraint_index == self.scratch_static_dispatch_constraints.top());
+}
+
+fn declareStaticDispatchConstraintFromWhere(self: *Self, where_idx: CIR.WhereClause.Idx, env: *Env) std.mem.Allocator.Error!void {
     const where = self.cir.store.getWhereClause(where_idx);
     const where_region = self.cir.store.getNodeRegion(ModuleEnv.nodeIdxFrom(where_idx));
 
     switch (where) {
         .w_method => |method| {
-            // Generate type of the thing dispatch receiver
-            try self.generateAnnoTypeInPlace(method.var_, env, .annotation);
+            try self.declareStaticDispatchReceiver(method.var_, env);
             const method_var = ModuleEnv.varFrom(method.var_);
+            const func_var = try self.fresh(env, where_region);
 
-            // Generate the arguments
-            const args_anno_slice = self.cir.store.sliceTypeAnnos(method.args);
-            for (args_anno_slice) |arg_anno_idx| {
-                try self.generateAnnoTypeInPlace(arg_anno_idx, env, .annotation);
-            }
-            const anno_arg_vars: []Var = @ptrCast(args_anno_slice);
-
-            // Generate return type
-            try self.generateAnnoTypeInPlace(method.ret, env, .annotation);
-            const ret_var = ModuleEnv.varFrom(method.ret);
-
-            // Create the function var
-            const func_content = if (method.effectful)
-                try self.types.mkFuncEffectful(anno_arg_vars, ret_var)
-            else
-                try self.types.mkFuncPure(anno_arg_vars, ret_var);
-            const func_var = try self.freshFromContent(func_content, env, where_region);
-
-            // Add to scratch list
             try self.scratch_static_dispatch_constraints.append(ScratchStaticDispatchConstraint{
                 .var_ = method_var,
                 .constraint = StaticDispatchConstraint{
@@ -9722,6 +9726,7 @@ fn generateStaticDispatchConstraintFromWhere(self: *Self, where_idx: CIR.WhereCl
                     .fn_var = func_var,
                     .origin = .{ .where_clause = .{} },
                 },
+                .state = .declared,
             });
         },
         .w_alias => |alias| {
@@ -9736,6 +9741,57 @@ fn generateStaticDispatchConstraintFromWhere(self: *Self, where_idx: CIR.WhereCl
             // If it's malformed, just ignore
         },
     }
+}
+
+/// Establish the explicit identity edge from a where-clause receiver lookup to
+/// its rigid declaration without materializing that declaration yet. Phase A
+/// must link every receiver before phase B can encounter a constraint-only
+/// rigid in any signature.
+fn declareStaticDispatchReceiver(self: *Self, receiver_anno: CIR.TypeAnno.Idx, env: *Env) std.mem.Allocator.Error!void {
+    const receiver_var = ModuleEnv.varFrom(receiver_anno);
+    try self.setVarRank(receiver_var, env);
+
+    switch (self.cir.store.getTypeAnno(receiver_anno)) {
+        .rigid_var => {},
+        .rigid_var_lookup => |lookup| {
+            _ = try self.unify(receiver_var, ModuleEnv.varFrom(lookup.ref), env);
+        },
+        else => try self.unifyWith(receiver_var, .err, env),
+    }
+}
+
+fn completeStaticDispatchConstraintFromWhere(
+    self: *Self,
+    method: std.meta.fieldInfo(CIR.WhereClause, .w_method).type,
+    constraint_index: usize,
+    env: *Env,
+) std.mem.Allocator.Error!void {
+    const entry = self.scratch_static_dispatch_constraints.items.items[constraint_index];
+    const expected_receiver = ModuleEnv.varFrom(method.var_);
+    if (entry.state != .declared or entry.var_ != expected_receiver) {
+        try self.unifyWith(entry.var_, .err, env);
+        try self.unifyWith(entry.constraint.fn_var, .err, env);
+        self.scratch_static_dispatch_constraints.items.items[constraint_index].state = .completed;
+        return;
+    }
+
+    try self.generateAnnoTypeInPlace(method.var_, env, .annotation);
+
+    const args_anno_slice = self.cir.store.sliceTypeAnnos(method.args);
+    for (args_anno_slice) |arg_anno_idx| {
+        try self.generateAnnoTypeInPlace(arg_anno_idx, env, .annotation);
+    }
+    const anno_arg_vars: []Var = @ptrCast(args_anno_slice);
+
+    try self.generateAnnoTypeInPlace(method.ret, env, .annotation);
+    const ret_var = ModuleEnv.varFrom(method.ret);
+
+    const func_content = if (method.effectful)
+        try self.types.mkFuncEffectful(anno_arg_vars, ret_var)
+    else
+        try self.types.mkFuncPure(anno_arg_vars, ret_var);
+    try self.unifyWith(entry.constraint.fn_var, func_content, env);
+    self.scratch_static_dispatch_constraints.items.items[constraint_index].state = .completed;
 }
 
 /// Given an annotation, generate the corresponding type based on the CIR

@@ -118,6 +118,48 @@ test "where clause - constraint with multiple args" {
 
 // Multiple constraints tests
 
+test "where clause - constraint-only receiver is linked through another constraint" {
+    const source =
+        \\chain : c -> a where [c.get : c -> item, item.get : item -> a]
+        \\chain = |value| value.get().get()
+    ;
+    var test_env = try TestEnv.init("ConstraintChain", source);
+    defer test_env.deinit();
+
+    try test_env.assertDefType(
+        "chain",
+        "c -> a where [c.get : c -> item, item.get : item -> a]",
+    );
+}
+
+test "where clause - constraint-only receiver is independent of declaration order" {
+    const source =
+        \\chain : c -> a where [item.get : item -> a, c.get : c -> item]
+        \\chain = |value| value.get().get()
+    ;
+    var test_env = try TestEnv.init("ConstraintChainReversed", source);
+    defer test_env.deinit();
+
+    try test_env.assertDefType(
+        "chain",
+        "c -> a where [c.get : c -> item, item.get : item -> a]",
+    );
+}
+
+test "where clause - issue 10084 nested iterator constraint resolves" {
+    const source =
+        \\join : c -> Iter(Iter(a)) where [c.iter : c -> Iter(item), item.iter : item -> Iter(a)]
+        \\join = |iters| iters.iter().map(|item| item.iter())
+    ;
+    var test_env = try TestEnv.init("NestedIteratorConstraint", source);
+    defer test_env.deinit();
+
+    try test_env.assertDefType(
+        "join",
+        "c -> Iter(Iter(a)) where [c.iter : c -> Iter(item), item.iter : item -> Iter(a)]",
+    );
+}
+
 test "where clause - multiple constraints on same variable" {
     const source_a =
         \\A := [D(Str, U64)].{
