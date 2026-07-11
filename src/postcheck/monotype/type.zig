@@ -393,14 +393,16 @@ pub const Store = struct {
     pub fn typeDigest(self: *const Store, name_store: *const names.NameStore, ty: TypeId) names.TypeDigest {
         var hasher = std.crypto.hash.sha2.Sha256.init(.{});
         var visiting = DigestVisiting{};
-        self.writeTypeDigest(name_store, &hasher, ty, &visiting, .full);
+        var strategy = UncachedDigestStrategy{ .store = self, .name_store = name_store, .visiting = &visiting };
+        strategy.child(&hasher, ty, .full);
         return .{ .bytes = hasher.finalResult() };
     }
 
     pub fn specializationDigest(self: *const Store, name_store: *const names.NameStore, ty: TypeId) names.TypeDigest {
         var hasher = std.crypto.hash.sha2.Sha256.init(.{});
         var visiting = DigestVisiting{};
-        self.writeTypeDigest(name_store, &hasher, ty, &visiting, .identity_only);
+        var strategy = UncachedDigestStrategy{ .store = self, .name_store = name_store, .visiting = &visiting };
+        strategy.child(&hasher, ty, .identity_only);
         return .{ .bytes = hasher.finalResult() };
     }
 
@@ -762,7 +764,8 @@ pub const Store = struct {
         ctx.len += 1;
         const saw_cycle_before = ctx.saw_cycle;
         var hasher = std.crypto.hash.sha2.Sha256.init(.{});
-        self.writeCachedTypeDigest(name_store, &hasher, ty, named_mode, ctx, stats);
+        var strategy = CachedDigestStrategy{ .store = self, .name_store = name_store, .ctx = ctx, .stats = stats };
+        self.writeIdentityDigest(name_store, &hasher, ty, named_mode, &strategy);
         ctx.len -= 1;
 
         const digest: names.TypeDigest = .{ .bytes = hasher.finalResult() };
@@ -781,203 +784,87 @@ pub const Store = struct {
         return digest;
     }
 
-    fn writeCachedChildDigest(
-        self: *Store,
+    /// Folds `child_ty` into `hasher` by inlining the child's identity bytes
+    /// directly into the running hash, tracking the visiting stack so a
+    /// recursive reference back to an in-progress type digests as a stable
+    /// back reference by stack position. This is the cycle-tracking and
+    /// child-emission strategy behind `typeDigest` / `specializationDigest`.
+    const UncachedDigestStrategy = struct {
+        store: *const Store,
         name_store: *const names.NameStore,
-        hasher: *std.crypto.hash.sha2.Sha256,
-        child: TypeId,
-        named_mode: NamedDigestMode,
-        ctx: *CachedDigestContext,
-        stats: ?*DigestStats,
-    ) void {
-        writeBytes(hasher, "type-digest");
-        const digest = self.cachedDigestInner(name_store, child, named_mode, ctx, stats);
-        hasher.update(&digest.bytes);
-    }
+        visiting: *DigestVisiting,
 
-    fn writeCachedTypeSpanDigest(
-        self: *Store,
-        name_store: *const names.NameStore,
-        hasher: *std.crypto.hash.sha2.Sha256,
-        span_: Span,
-        named_mode: NamedDigestMode,
-        ctx: *CachedDigestContext,
-        stats: ?*DigestStats,
-    ) void {
-        const values = self.span(span_);
-        writeU32(hasher, @intCast(values.len));
-        for (0..values.len) |index| {
-            const child = GuardedList.at(values, index);
-            self.writeCachedChildDigest(name_store, hasher, child, named_mode, ctx, stats);
-        }
-    }
-
-    fn writeCachedTypeDigest(
-        self: *Store,
-        name_store: *const names.NameStore,
-        hasher: *std.crypto.hash.sha2.Sha256,
-        ty: TypeId,
-        named_mode: NamedDigestMode,
-        ctx: *CachedDigestContext,
-        stats: ?*DigestStats,
-    ) void {
-        switch (self.get(ty)) {
-            .primitive => |primitive| {
-                writeBytes(hasher, "primitive");
-                writeBytes(hasher, @tagName(primitive));
-            },
-            .named => |named| {
-                if (named.kind == .alias) {
-                    const backing = named.backing orelse {
-                        writeBytes(hasher, "alias-without-backing");
-                        return;
-                    };
-                    self.writeCachedChildDigest(name_store, hasher, backing.ty, named_mode, ctx, stats);
+        fn child(
+            self: *UncachedDigestStrategy,
+            hasher: *std.crypto.hash.sha2.Sha256,
+            child_ty: TypeId,
+            named_mode: NamedDigestMode,
+        ) void {
+            for (self.visiting.items[0..self.visiting.len], 0..) |open_ty, position| {
+                if (open_ty == child_ty) {
+                    writeBytes(hasher, "cycle");
+                    writeU32(hasher, @intCast(position));
                     return;
                 }
-                writeBytes(hasher, "named");
-                hasher.update(&named.named_type.module.bytes);
-                writeBytes(hasher, name_store.moduleIdentityBytes(named.def.module));
-                writeOptionalU32(hasher, named.def.source_decl);
-                if (named.def.source_decl == null) {
-                    writeBytes(hasher, name_store.typeNameText(named.def.type_name));
-                }
-                writeBytes(hasher, @tagName(named.kind));
-                if (named.builtin_owner) |owner| {
-                    writeBytes(hasher, "builtin");
-                    writeBytes(hasher, @tagName(owner));
-                } else {
-                    writeBytes(hasher, "not-builtin");
-                }
-                self.writeCachedTypeSpanDigest(name_store, hasher, named.args, named_mode, ctx, stats);
-                if (named_mode == .full) {
-                    self.writeCachedNamedBackingDigest(name_store, hasher, named.backing, ctx, stats);
-                    self.writeCachedDeclaredOrderDigest(name_store, hasher, named.declared_order, ctx, stats);
-                } else if (named.builtin_owner) |owner| {
-                    if (generatedEvidenceOwnerUsesBacking(owner)) {
-                        writeBytes(hasher, "specialization-builtin-backing");
-                        self.writeCachedNamedBackingDigest(name_store, hasher, named.backing, ctx, stats);
-                    } else {
-                        writeBytes(hasher, "specialization-named-identity");
-                    }
-                } else {
-                    writeBytes(hasher, "specialization-named-identity");
-                }
-            },
-            .record => |fields| {
-                writeBytes(hasher, "record");
-                const field_slice = self.fieldSpan(fields);
-                writeU32(hasher, @intCast(field_slice.len));
-                for (0..field_slice.len) |index| {
-                    const field = GuardedList.at(field_slice, index);
-                    writeBytes(hasher, name_store.recordFieldLabelText(field.name));
-                    self.writeCachedChildDigest(name_store, hasher, field.ty, named_mode, ctx, stats);
-                }
-            },
-            .tuple => |items| {
-                writeBytes(hasher, "tuple");
-                self.writeCachedTypeSpanDigest(name_store, hasher, items, named_mode, ctx, stats);
-            },
-            .tag_union => |tags| {
-                writeBytes(hasher, "tag_union");
-                const tag_slice = self.tagSpan(tags);
-                writeU32(hasher, @intCast(tag_slice.len));
-                for (0..tag_slice.len) |index| {
-                    const tag = GuardedList.at(tag_slice, index);
-                    writeBytes(hasher, name_store.tagLabelText(tag.name));
-                    self.writeCachedTypeSpanDigest(name_store, hasher, tag.payloads, named_mode, ctx, stats);
-                }
-            },
-            .list => |elem| {
-                writeBytes(hasher, "list");
-                self.writeCachedChildDigest(name_store, hasher, elem, named_mode, ctx, stats);
-            },
-            .box => |elem| {
-                writeBytes(hasher, "box");
-                self.writeCachedChildDigest(name_store, hasher, elem, named_mode, ctx, stats);
-            },
-            .func => |function| {
-                writeBytes(hasher, "func");
-                self.writeCachedTypeSpanDigest(name_store, hasher, function.args, named_mode, ctx, stats);
-                self.writeCachedChildDigest(name_store, hasher, function.ret, named_mode, ctx, stats);
-            },
-            .erased => |erased| {
-                writeBytes(hasher, "erased");
-                hasher.update(&erased.bytes);
-            },
-            .zst => writeBytes(hasher, "zst"),
-        }
-    }
-
-    fn writeCachedNamedBackingDigest(
-        self: *Store,
-        name_store: *const names.NameStore,
-        hasher: *std.crypto.hash.sha2.Sha256,
-        backing: ?NamedBacking,
-        ctx: *CachedDigestContext,
-        stats: ?*DigestStats,
-    ) void {
-        writeBytes(hasher, "backing");
-        if (backing) |named_backing| {
-            writeBytes(hasher, @tagName(named_backing.use));
-            self.writeCachedChildDigest(name_store, hasher, named_backing.ty, .full, ctx, stats);
-        } else {
-            writeBytes(hasher, "none");
-        }
-    }
-
-    fn writeCachedDeclaredOrderDigest(
-        self: *Store,
-        name_store: *const names.NameStore,
-        hasher: *std.crypto.hash.sha2.Sha256,
-        declared_order: Span,
-        ctx: *CachedDigestContext,
-        stats: ?*DigestStats,
-    ) void {
-        writeBytes(hasher, "declared_order");
-        const entries = self.declaredFieldSpan(declared_order);
-        writeU32(hasher, @intCast(entries.len));
-        for (0..entries.len) |index| {
-            const entry = GuardedList.at(entries, index);
-            switch (entry) {
-                .named => |field_name| {
-                    writeBytes(hasher, "named");
-                    writeBytes(hasher, name_store.recordFieldLabelText(field_name));
-                },
-                .padding => |padding_ty| {
-                    writeBytes(hasher, "padding");
-                    self.writeCachedChildDigest(name_store, hasher, padding_ty, .full, ctx, stats);
-                },
             }
+            if (self.visiting.len == digest_visiting_max) {
+                // Deeper nesting than the stack tracks cannot contain an
+                // unrecorded cycle shorter than the stack, so digest the
+                // type's identity instead of recursing further.
+                writeBytes(hasher, "deep");
+                writeU32(hasher, @intFromEnum(child_ty));
+                return;
+            }
+            self.visiting.items[self.visiting.len] = child_ty;
+            self.visiting.len += 1;
+            defer self.visiting.len -= 1;
+            self.store.writeIdentityDigest(self.name_store, hasher, child_ty, named_mode, self);
         }
-    }
+    };
 
-    fn writeTypeDigest(
+    /// Folds `child_ty` into `hasher` as a nested sub-digest: the tag
+    /// `"type-digest"` followed by the child's own cached digest. Computing
+    /// parent digests from cached child digests is what lets structurally
+    /// growing records and function types reuse child work instead of walking
+    /// their whole prefix, and it is the cycle-tracking and child-emission
+    /// strategy behind `typeDigestCached` / `specializationDigestCached`.
+    const CachedDigestStrategy = struct {
+        store: *Store,
+        name_store: *const names.NameStore,
+        ctx: *CachedDigestContext,
+        stats: ?*DigestStats,
+
+        fn child(
+            self: *CachedDigestStrategy,
+            hasher: *std.crypto.hash.sha2.Sha256,
+            child_ty: TypeId,
+            named_mode: NamedDigestMode,
+        ) void {
+            writeBytes(hasher, "type-digest");
+            const digest = self.store.cachedDigestInner(self.name_store, child_ty, named_mode, self.ctx, self.stats);
+            hasher.update(&digest.bytes);
+        }
+    };
+
+    /// The single traversal of the `Type` union that both digest paths share.
+    ///
+    /// This is the one place the specialization identity rules are stated:
+    /// aliases are transparent (an alias digests as its backing); non-alias
+    /// named types are discriminated by module bytes, def module, source decl,
+    /// type name, kind, builtin owner, arguments, backing, and declared field
+    /// order; and structural rows are compared by label text with ordered
+    /// children. The cached and uncached paths differ only in how a child type
+    /// is folded in and how cycles are tracked, which the `strategy` supplies
+    /// through its `child` method; every recursive descent goes through it so
+    /// the two paths cannot disagree about which fields carry identity.
+    fn writeIdentityDigest(
         self: *const Store,
         name_store: *const names.NameStore,
         hasher: *std.crypto.hash.sha2.Sha256,
         ty: TypeId,
-        visiting: *DigestVisiting,
         named_mode: NamedDigestMode,
+        strategy: anytype,
     ) void {
-        for (visiting.items[0..visiting.len], 0..) |open_ty, position| {
-            if (open_ty == ty) {
-                writeBytes(hasher, "cycle");
-                writeU32(hasher, @intCast(position));
-                return;
-            }
-        }
-        if (visiting.len == digest_visiting_max) {
-            // Deeper nesting than the stack tracks cannot contain an
-            // unrecorded cycle shorter than the stack, so digest the type's
-            // identity instead of recursing further.
-            writeBytes(hasher, "deep");
-            writeU32(hasher, @intFromEnum(ty));
-            return;
-        }
-        visiting.items[visiting.len] = ty;
-        visiting.len += 1;
-        defer visiting.len -= 1;
         switch (self.get(ty)) {
             .primitive => |primitive| {
                 writeBytes(hasher, "primitive");
@@ -990,7 +877,7 @@ pub const Store = struct {
                         writeBytes(hasher, "alias-without-backing");
                         return;
                     };
-                    self.writeTypeDigest(name_store, hasher, backing.ty, visiting, named_mode);
+                    strategy.child(hasher, backing.ty, named_mode);
                     return;
                 }
                 writeBytes(hasher, "named");
@@ -1007,14 +894,14 @@ pub const Store = struct {
                 } else {
                     writeBytes(hasher, "not-builtin");
                 }
-                self.writeTypeSpanDigest(name_store, hasher, named.args, visiting, named_mode);
+                self.writeIdentitySpan(name_store, hasher, named.args, named_mode, strategy);
                 if (named_mode == .full) {
-                    self.writeNamedBackingDigest(name_store, hasher, named.backing, visiting);
-                    self.writeDeclaredOrderDigest(name_store, hasher, named.declared_order, visiting);
+                    self.writeIdentityBacking(name_store, hasher, named.backing, strategy);
+                    self.writeIdentityDeclaredOrder(name_store, hasher, named.declared_order, strategy);
                 } else if (named.builtin_owner) |owner| {
                     if (generatedEvidenceOwnerUsesBacking(owner)) {
                         writeBytes(hasher, "specialization-builtin-backing");
-                        self.writeNamedBackingDigest(name_store, hasher, named.backing, visiting);
+                        self.writeIdentityBacking(name_store, hasher, named.backing, strategy);
                     } else {
                         writeBytes(hasher, "specialization-named-identity");
                     }
@@ -1029,12 +916,12 @@ pub const Store = struct {
                 for (0..field_slice.len) |index| {
                     const field = GuardedList.at(field_slice, index);
                     writeBytes(hasher, name_store.recordFieldLabelText(field.name));
-                    self.writeTypeDigest(name_store, hasher, field.ty, visiting, named_mode);
+                    strategy.child(hasher, field.ty, named_mode);
                 }
             },
             .tuple => |items| {
                 writeBytes(hasher, "tuple");
-                self.writeTypeSpanDigest(name_store, hasher, items, visiting, named_mode);
+                self.writeIdentitySpan(name_store, hasher, items, named_mode, strategy);
             },
             .tag_union => |tags| {
                 writeBytes(hasher, "tag_union");
@@ -1043,21 +930,21 @@ pub const Store = struct {
                 for (0..tag_slice.len) |index| {
                     const tag = GuardedList.at(tag_slice, index);
                     writeBytes(hasher, name_store.tagLabelText(tag.name));
-                    self.writeTypeSpanDigest(name_store, hasher, tag.payloads, visiting, named_mode);
+                    self.writeIdentitySpan(name_store, hasher, tag.payloads, named_mode, strategy);
                 }
             },
             .list => |elem| {
                 writeBytes(hasher, "list");
-                self.writeTypeDigest(name_store, hasher, elem, visiting, named_mode);
+                strategy.child(hasher, elem, named_mode);
             },
             .box => |elem| {
                 writeBytes(hasher, "box");
-                self.writeTypeDigest(name_store, hasher, elem, visiting, named_mode);
+                strategy.child(hasher, elem, named_mode);
             },
             .func => |function| {
                 writeBytes(hasher, "func");
-                self.writeTypeSpanDigest(name_store, hasher, function.args, visiting, named_mode);
-                self.writeTypeDigest(name_store, hasher, function.ret, visiting, named_mode);
+                self.writeIdentitySpan(name_store, hasher, function.args, named_mode, strategy);
+                strategy.child(hasher, function.ret, named_mode);
             },
             .erased => |erased| {
                 writeBytes(hasher, "erased");
@@ -1067,44 +954,46 @@ pub const Store = struct {
         }
     }
 
-    fn writeTypeSpanDigest(
+    fn writeIdentitySpan(
         self: *const Store,
         name_store: *const names.NameStore,
         hasher: *std.crypto.hash.sha2.Sha256,
         span_: Span,
-        visiting: *DigestVisiting,
         named_mode: NamedDigestMode,
+        strategy: anytype,
     ) void {
+        _ = name_store;
         const values = self.span(span_);
         writeU32(hasher, @intCast(values.len));
         for (0..values.len) |index| {
             const child = GuardedList.at(values, index);
-            self.writeTypeDigest(name_store, hasher, child, visiting, named_mode);
+            strategy.child(hasher, child, named_mode);
         }
     }
 
-    fn writeNamedBackingDigest(
-        self: *const Store,
+    fn writeIdentityBacking(
+        _: *const Store,
         name_store: *const names.NameStore,
         hasher: *std.crypto.hash.sha2.Sha256,
         backing: ?NamedBacking,
-        visiting: *DigestVisiting,
+        strategy: anytype,
     ) void {
+        _ = name_store;
         writeBytes(hasher, "backing");
         if (backing) |named_backing| {
             writeBytes(hasher, @tagName(named_backing.use));
-            self.writeTypeDigest(name_store, hasher, named_backing.ty, visiting, .full);
+            strategy.child(hasher, named_backing.ty, .full);
         } else {
             writeBytes(hasher, "none");
         }
     }
 
-    fn writeDeclaredOrderDigest(
+    fn writeIdentityDeclaredOrder(
         self: *const Store,
         name_store: *const names.NameStore,
         hasher: *std.crypto.hash.sha2.Sha256,
         declared_order: Span,
-        visiting: *DigestVisiting,
+        strategy: anytype,
     ) void {
         writeBytes(hasher, "declared_order");
         const entries = self.declaredFieldSpan(declared_order);
@@ -1118,7 +1007,7 @@ pub const Store = struct {
                 },
                 .padding => |padding_ty| {
                     writeBytes(hasher, "padding");
-                    self.writeTypeDigest(name_store, hasher, padding_ty, visiting, .full);
+                    strategy.child(hasher, padding_ty, .full);
                 },
             }
         }
@@ -2567,6 +2456,289 @@ test "monotype cached digest reuses acyclic child digests and invalidates on res
     try std.testing.expectEqual(@as(u64, 0), after_refill_stats.cache_hits);
     try std.testing.expectEqual(@as(u64, 1), after_refill_stats.cache_misses);
     try std.testing.expectEqual(@as(u64, 1), after_refill_stats.nodes_visited);
+}
+
+test "monotype cached and uncached digests agree on type identity" {
+    // Guards the shared identity walker: the cached digest path is an
+    // optimization of the uncached path, so both must make exactly the same
+    // identity decisions. Their absolute bytes intentionally differ (the cached
+    // path folds children in as nested sub-digests for incrementality; the
+    // uncached path inlines them), so the invariant is not byte equality but
+    // that both induce the same equivalence relation on types, that each is
+    // deterministic, and that a digest match is always confirmable by the
+    // authoritative `typeEql`.
+    var name_store = names.NameStore.init(std.testing.allocator);
+    defer name_store.deinit();
+
+    var store = Store.init(std.testing.allocator);
+    defer store.deinit();
+
+    const module_identity = try name_store.internModuleIdentity(&([_]u8{0xC3} ** 32));
+    const box_name = try name_store.internTypeName("Box");
+    const unit_name = try name_store.internTypeName("Unit");
+    const padded_name = try name_store.internTypeName("Padded");
+    const wrap_name = try name_store.internTypeName("Wrap");
+    const checked_ty: checked.CheckedTypeId = @enumFromInt(1);
+
+    const f_a = try name_store.internRecordFieldLabel("a");
+    const f_b = try name_store.internRecordFieldLabel("b");
+    const f_step = try name_store.internRecordFieldLabel("step");
+    const f_other = try name_store.internRecordFieldLabel("other");
+    const t_a = try name_store.internTagLabel("A");
+    const t_b = try name_store.internTagLabel("B");
+
+    // Deterministic, enumerated corpus. Every entry carries a group id: entries
+    // that are structurally equal under `typeEql` share a group (they must all
+    // digest equally); entries in different groups are distinct under full
+    // identity (their full digests must differ). The corpus is kept "clean" --
+    // no two groups differ only in a field the digest sees but `typeEql`
+    // ignores (declared order or non-builtin backing) -- so the group id
+    // cleanly encodes both relations at once.
+    var types: [64]TypeId = undefined;
+    var groups: [64]usize = undefined;
+    var count: usize = 0;
+    var next_group: usize = 0;
+    const H = struct {
+        fn push(ts: *[64]TypeId, gs: *[64]usize, n: *usize, ty: TypeId, group: usize) void {
+            ts[n.*] = ty;
+            gs[n.*] = group;
+            n.* += 1;
+        }
+    };
+
+    // Primitives, zst, erased.
+    const i64_ty = try store.add(.{ .primitive = .i64 });
+    const str_ty = try store.add(.{ .primitive = .str });
+    const bool_ty = try store.add(.{ .primitive = .bool });
+    inline for (.{ i64_ty, str_ty, bool_ty }) |p| {
+        H.push(&types, &groups, &count, p, next_group);
+        next_group += 1;
+    }
+    H.push(&types, &groups, &count, try store.add(.zst), next_group);
+    next_group += 1;
+    H.push(&types, &groups, &count, try store.add(.{ .erased = .{ .bytes = [_]u8{1} ** 32 } }), next_group);
+    next_group += 1;
+    H.push(&types, &groups, &count, try store.add(.{ .erased = .{ .bytes = [_]u8{2} ** 32 } }), next_group);
+    next_group += 1;
+
+    // Lists and boxes.
+    H.push(&types, &groups, &count, try store.add(.{ .list = i64_ty }), next_group);
+    next_group += 1;
+    H.push(&types, &groups, &count, try store.add(.{ .list = str_ty }), next_group);
+    next_group += 1;
+    H.push(&types, &groups, &count, try store.add(.{ .box = i64_ty }), next_group);
+    next_group += 1;
+
+    // Tuples (order-sensitive).
+    H.push(&types, &groups, &count, try store.add(.{ .tuple = try store.addSpan(&.{ i64_ty, str_ty }) }), next_group);
+    next_group += 1;
+    H.push(&types, &groups, &count, try store.add(.{ .tuple = try store.addSpan(&.{ str_ty, i64_ty }) }), next_group);
+    next_group += 1;
+
+    // Records: empty, one field, two fields, nested.
+    H.push(&types, &groups, &count, try store.add(.{ .record = try store.addFields(&.{}) }), next_group);
+    next_group += 1;
+    const rec_a_i64 = try store.add(.{ .record = try store.addFields(&.{.{ .name = f_a, .ty = i64_ty }}) });
+    H.push(&types, &groups, &count, rec_a_i64, next_group);
+    next_group += 1;
+    H.push(&types, &groups, &count, try store.add(.{ .record = try store.addFields(&.{
+        .{ .name = f_a, .ty = i64_ty },
+        .{ .name = f_b, .ty = str_ty },
+    }) }), next_group);
+    next_group += 1;
+    H.push(&types, &groups, &count, try store.add(.{ .record = try store.addFields(&.{.{ .name = f_a, .ty = rec_a_i64 }}) }), next_group);
+    next_group += 1;
+
+    // Tag unions.
+    H.push(&types, &groups, &count, try store.add(.{ .tag_union = try store.addTags(&.{}) }), next_group);
+    next_group += 1;
+    H.push(&types, &groups, &count, try store.add(.{ .tag_union = try store.addTags(&.{
+        .{ .name = t_a, .checked_name = t_a, .payloads = Span.empty() },
+    }) }), next_group);
+    next_group += 1;
+    H.push(&types, &groups, &count, try store.add(.{ .tag_union = try store.addTags(&.{
+        .{ .name = t_a, .checked_name = t_a, .payloads = try store.addSpan(&.{i64_ty}) },
+    }) }), next_group);
+    next_group += 1;
+    H.push(&types, &groups, &count, try store.add(.{ .tag_union = try store.addTags(&.{
+        .{ .name = t_a, .checked_name = t_a, .payloads = Span.empty() },
+        .{ .name = t_b, .checked_name = t_b, .payloads = Span.empty() },
+    }) }), next_group);
+    next_group += 1;
+
+    // Functions.
+    H.push(&types, &groups, &count, try store.add(.{ .func = .{ .args = try store.addSpan(&.{i64_ty}), .ret = str_ty } }), next_group);
+    next_group += 1;
+    H.push(&types, &groups, &count, try store.add(.{ .func = .{ .args = Span.empty(), .ret = i64_ty } }), next_group);
+    next_group += 1;
+    H.push(&types, &groups, &count, try store.add(.{ .func = .{ .args = try store.addSpan(&.{ i64_ty, str_ty }), .ret = bool_ty } }), next_group);
+    next_group += 1;
+
+    // Named types: distinct by args, name, and kind.
+    const named_box_i64 = try store.add(.{ .named = .{
+        .named_type = .{ .module = .{}, .ty = checked_ty },
+        .def = .{ .module = module_identity, .type_name = box_name },
+        .kind = .nominal,
+        .args = try store.addSpan(&.{i64_ty}),
+    } });
+    H.push(&types, &groups, &count, named_box_i64, next_group);
+    next_group += 1;
+    H.push(&types, &groups, &count, try store.add(.{ .named = .{
+        .named_type = .{ .module = .{}, .ty = checked_ty },
+        .def = .{ .module = module_identity, .type_name = box_name },
+        .kind = .nominal,
+        .args = try store.addSpan(&.{str_ty}),
+    } }), next_group);
+    next_group += 1;
+    H.push(&types, &groups, &count, try store.add(.{ .named = .{
+        .named_type = .{ .module = .{}, .ty = checked_ty },
+        .def = .{ .module = module_identity, .type_name = unit_name },
+        .kind = .nominal,
+        .args = Span.empty(),
+    } }), next_group);
+    next_group += 1;
+    H.push(&types, &groups, &count, try store.add(.{ .named = .{
+        .named_type = .{ .module = .{}, .ty = checked_ty },
+        .def = .{ .module = module_identity, .type_name = box_name },
+        .kind = .@"opaque",
+        .args = try store.addSpan(&.{i64_ty}),
+    } }), next_group);
+    next_group += 1;
+
+    // Named type carrying a declared padding order (exercises that walk arm).
+    H.push(&types, &groups, &count, try store.add(.{ .named = .{
+        .named_type = .{ .module = .{}, .ty = checked_ty },
+        .def = .{ .module = module_identity, .type_name = padded_name },
+        .kind = .nominal,
+        .args = Span.empty(),
+        .declared_order = try store.addDeclaredFields(&.{ .{ .named = f_a }, .{ .padding = i64_ty } }),
+    } }), next_group);
+    next_group += 1;
+
+    // Named type carrying a backing (exercises the backing walk arm).
+    H.push(&types, &groups, &count, try store.add(.{ .named = .{
+        .named_type = .{ .module = .{}, .ty = checked_ty },
+        .def = .{ .module = module_identity, .type_name = wrap_name },
+        .kind = .nominal,
+        .args = Span.empty(),
+        .backing = .{ .ty = i64_ty, .use = .inspectable },
+    } }), next_group);
+    next_group += 1;
+
+    // Isomorphic recursive records at different ids: structurally equal, so
+    // they share a group. Cycles are tied by reserving a slot, building
+    // children that reference the reserved id, then filling the slot.
+    const cyc_group = next_group;
+    next_group += 1;
+    {
+        const rec = try store.reserveSlot();
+        const fn_ret = try store.add(.{ .func = .{ .args = Span.empty(), .ret = rec } });
+        const flds = try store.addFields(&.{.{ .name = f_step, .ty = fn_ret }});
+        store.fillReservedSlot(rec, .{ .record = flds });
+        H.push(&types, &groups, &count, rec, cyc_group);
+    }
+    {
+        const rec = try store.reserveSlot();
+        const fn_ret = try store.add(.{ .func = .{ .args = Span.empty(), .ret = rec } });
+        const flds = try store.addFields(&.{.{ .name = f_step, .ty = fn_ret }});
+        store.fillReservedSlot(rec, .{ .record = flds });
+        H.push(&types, &groups, &count, rec, cyc_group);
+    }
+    // A different cycle (distinct field name) is its own group.
+    {
+        const rec = try store.reserveSlot();
+        const fn_ret = try store.add(.{ .func = .{ .args = Span.empty(), .ret = rec } });
+        const flds = try store.addFields(&.{.{ .name = f_other, .ty = fn_ret }});
+        store.fillReservedSlot(rec, .{ .record = flds });
+        H.push(&types, &groups, &count, rec, next_group);
+        next_group += 1;
+    }
+
+    const items = types[0..count];
+    const item_groups = groups[0..count];
+
+    // Determinism: every public digest function returns the same bytes when
+    // called twice for the same type.
+    for (items) |ty| {
+        try std.testing.expect(std.mem.eql(u8, store.typeDigest(&name_store, ty).bytes[0..], store.typeDigest(&name_store, ty).bytes[0..]));
+        try std.testing.expect(std.mem.eql(u8, store.specializationDigest(&name_store, ty).bytes[0..], store.specializationDigest(&name_store, ty).bytes[0..]));
+        try std.testing.expect(std.mem.eql(u8, store.typeDigestCached(&name_store, ty, null).bytes[0..], store.typeDigestCached(&name_store, ty, null).bytes[0..]));
+        try std.testing.expect(std.mem.eql(u8, store.specializationDigestCached(&name_store, ty, null).bytes[0..], store.specializationDigestCached(&name_store, ty, null).bytes[0..]));
+    }
+
+    for (items, item_groups, 0..) |lhs, lhs_group, i| {
+        for (items[i..], item_groups[i..]) |rhs, rhs_group| {
+            const same_group = lhs_group == rhs_group;
+
+            const td_eq = std.mem.eql(u8, store.typeDigest(&name_store, lhs).bytes[0..], store.typeDigest(&name_store, rhs).bytes[0..]);
+            const tdc_eq = std.mem.eql(u8, store.typeDigestCached(&name_store, lhs, null).bytes[0..], store.typeDigestCached(&name_store, rhs, null).bytes[0..]);
+            const sd_eq = std.mem.eql(u8, store.specializationDigest(&name_store, lhs).bytes[0..], store.specializationDigest(&name_store, rhs).bytes[0..]);
+            const sdc_eq = std.mem.eql(u8, store.specializationDigestCached(&name_store, lhs, null).bytes[0..], store.specializationDigestCached(&name_store, rhs, null).bytes[0..]);
+
+            // Cached and uncached paths induce the same equivalence relation.
+            try std.testing.expectEqual(td_eq, tdc_eq);
+            try std.testing.expectEqual(sd_eq, sdc_eq);
+
+            const eql = try store.typeEql(&name_store, lhs, rhs);
+
+            // Full type digests match the authoritative equality exactly for
+            // this clean corpus: same group means equal digests, distinct group
+            // means differing digests.
+            try std.testing.expectEqual(same_group, td_eq);
+            try std.testing.expectEqual(same_group, tdc_eq);
+            try std.testing.expectEqual(same_group, eql);
+
+            // Protocol soundness: a digest match is always confirmable by
+            // `typeEql`.
+            if (td_eq) try std.testing.expect(eql);
+            if (tdc_eq) try std.testing.expect(eql);
+
+            // Equal types agree on the specialization digest too (it is a
+            // coarsening of the full identity).
+            if (same_group) {
+                try std.testing.expect(sd_eq);
+                try std.testing.expect(sdc_eq);
+            }
+        }
+    }
+
+    // Alias-transparent chains. The uncached digest path folds an alias into
+    // its backing inline, so an alias over i64 (and an alias over that alias)
+    // digests exactly as i64 does. `typeEql` -- the authority -- agrees the
+    // alias and its backing are the same type. The cached path folds children
+    // in as nested sub-digests, so a cached alias digest wraps its backing's
+    // digest rather than reproducing it byte for byte; that is soundness
+    // preserving (a cached digest match is still confirmed by `typeEql`), so it
+    // is checked here rather than through the byte-level relation above.
+    const alias_i64 = try store.add(.{ .named = .{
+        .named_type = .{ .module = .{}, .ty = checked_ty },
+        .def = .{ .module = module_identity, .type_name = box_name },
+        .kind = .alias,
+        .args = Span.empty(),
+        .backing = .{ .ty = i64_ty, .use = .inspectable },
+    } });
+    const alias_chain = try store.add(.{ .named = .{
+        .named_type = .{ .module = .{}, .ty = checked_ty },
+        .def = .{ .module = module_identity, .type_name = unit_name },
+        .kind = .alias,
+        .args = Span.empty(),
+        .backing = .{ .ty = alias_i64, .use = .inspectable },
+    } });
+
+    try std.testing.expect(try store.typeEql(&name_store, alias_i64, i64_ty));
+    try std.testing.expect(try store.typeEql(&name_store, alias_chain, i64_ty));
+
+    // Uncached transparency: an alias digests exactly as its backing.
+    inline for (.{ alias_i64, alias_chain }) |alias_ty| {
+        try std.testing.expect(std.mem.eql(u8, store.typeDigest(&name_store, alias_ty).bytes[0..], store.typeDigest(&name_store, i64_ty).bytes[0..]));
+        try std.testing.expect(std.mem.eql(u8, store.specializationDigest(&name_store, alias_ty).bytes[0..], store.specializationDigest(&name_store, i64_ty).bytes[0..]));
+    }
+
+    // Both paths remain deterministic on aliases, and a cached digest match is
+    // still authoritative: it is never claimed between types `typeEql` rejects.
+    inline for (.{ alias_i64, alias_chain }) |alias_ty| {
+        try std.testing.expect(std.mem.eql(u8, store.typeDigestCached(&name_store, alias_ty, null).bytes[0..], store.typeDigestCached(&name_store, alias_ty, null).bytes[0..]));
+    }
 }
 
 test "monotype type equality accepts isomorphic recursive structural types" {
