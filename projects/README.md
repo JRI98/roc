@@ -22,6 +22,39 @@ duplicated computation. `design.md` at the repo root is the authoritative
 post-check design; these projects implement its stated principles more
 completely.
 
+A second batch of projects came out of the 2026-07 comparative review of
+the post-check pipeline against the cor `lss` prototype it was
+productionized from (stage-by-stage divergence review; no shipped
+miscompile found, but several unstated load-bearing invariants, one
+termination hazard, and one verification coverage gap):
+
+- [small/spec-constr-specialization-limits.md](small/spec-constr-specialization-limits.md)
+  — termination budgets for call-pattern specialization (compile-time
+  divergence is reachable today).
+- [small/empty-tag-union-yield-provenance.md](small/empty-tag-union-yield-provenance.md)
+  — key Lambda Solved's one unification escape hatch on carried provenance
+  instead of shape.
+- [small/pin-lambda-solved-invariants.md](small/pin-lambda-solved-invariants.md)
+  — state, assert, and test the four invariants that make monomorphic
+  lambda-set solving sound.
+- [small/lambda-mono-oracle-fidelity.md](small/lambda-mono-oracle-fidelity.md)
+  — agreement asserts and contract pins for the Debug Lambda Mono oracle;
+  delete its dead Queue.
+- [small/monotype-machinery-hardening.md](small/monotype-machinery-hardening.md)
+  — release-gate verification-only type checks; measure-first fixes for
+  digest depth fallback, unify memo, spec duplication, cross-store reuse.
+- [small/lift-capture-single-sourcing.md](small/lift-capture-single-sourcing.md)
+  — one capture-fixpoint driver, the `if_initialized_payload` binder
+  question, and the capture-id override path.
+- [big/solved-lir-body-verification.md](big/solved-lir-body-verification.md)
+  — a body-level oracle for the fused solved-to-LIR path (decision
+  verification exists; statement bodies are unverified).
+
+Within this batch: land `lambda-mono-oracle-fidelity` before
+`solved-lir-body-verification`; the rest are independent.
+`spec-constr-specialization-limits` pairs naturally with
+`spec-constr-static-match-soundness`.
+
 ## Recommended order
 
 ### Start here
