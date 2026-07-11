@@ -725,8 +725,7 @@ pub const NumeralDigits = struct {
     }
 };
 
-// RocDec type definition (for missing export)
-// Must match the structure of builtins.RocDec
+// Re-export of the canonical Dec type so CIR consumers can name it locally.
 pub const RocDec = builtins.dec.RocDec;
 
 /// Converts a RocDec to an i128 integer
@@ -737,7 +736,7 @@ pub fn toI128(self: RocDec) i128 {
 /// Creates a RocDec from an f64 value, returns null if conversion fails
 pub fn fromF64(f: f64) ?RocDec {
     // Simple conversion - the real implementation is in builtins/dec.zig
-    const scaled = builtins.compiler_rt_128.f64_to_i128(f * 1_000_000_000_000_000_000.0);
+    const scaled = builtins.compiler_rt_128.f64_to_i128(f * @as(f64, @floatFromInt(RocDec.one_point_zero_i128)));
     return RocDec{ .num = scaled };
 }
 

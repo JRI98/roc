@@ -42,9 +42,13 @@ pub const Target = enum(u4) {
 /// literal type variables unify.
 pub const FitSet = std.EnumSet(Target);
 
-/// Dec's fractional precision: values are scaled by 10^18.
+/// Dec's fractional precision: values are scaled by 10^18. This must equal
+/// `builtins.dec.RocDec.decimal_places`, which is the canonical definition; the
+/// `types` module cannot import `builtins`, so the value is restated here.
 pub const dec_decimal_places: u32 = 18;
-/// 10^18, the Dec scaling factor.
+/// 10^18, the Dec scaling factor. This must equal
+/// `builtins.dec.RocDec.one_point_zero_i128`, the canonical definition; the
+/// `types` module cannot import `builtins`, so the value is restated here.
 pub const dec_one: u128 = 1_000_000_000_000_000_000;
 
 /// Borrowed view of a literal's exact digit facts.

@@ -36,6 +36,10 @@ completely.
 1. [big/generalization-time-ambiguity.md](big/generalization-time-ambiguity.md)
    — builds on the landed total static-dispatch plan work and replaces the
    remaining ambiguity sweep with a generalization-time rule.
+2. [big/complete-dispatch-evidence-migration.md](big/complete-dispatch-evidence-migration.md)
+   — finishes the in-tree migration from owner re-derivation to checked
+   dispatch evidence (`evidence_missing` → 0), then deletes the derivation
+   path.
 
 **Chain B — ARC:**
 1. [big/arc-inserter-join-summaries.md](big/arc-inserter-join-summaries.md)
@@ -59,6 +63,9 @@ Small:
 - [small/shared-checked-type-traversal.md](small/shared-checked-type-traversal.md)
 - [small/glue-consumes-committed-layouts.md](small/glue-consumes-committed-layouts.md)
 - [small/structural-hoist-contexts.md](small/structural-hoist-contexts.md)
+- [small/silent-drift-guards.md](small/silent-drift-guards.md)
+  — pins the remaining intentional mirrors (type digests, escape rules,
+  list decref, SWAR string equality) with shared tables or drift tests.
 
 Big:
 - [big/decision-tree-match-compiler.md](big/decision-tree-match-compiler.md)
@@ -68,6 +75,9 @@ Big:
 - [big/unify-build-pipelines.md](big/unify-build-pipelines.md) — independent;
   package identity is already centralized, but the run path still hand-wires
   coordinator setup and report rendering.
+- [big/single-source-builtin-registration.md](big/single-source-builtin-registration.md)
+  — independent; collapses the seven hand-typed `roc_builtins_*`
+  symbol/ABI tables onto one comptime-generated registry.
 
 ### Suggested overall sequence
 
@@ -82,7 +92,10 @@ leverage and keeps prerequisites satisfied:
 6. `big/arc-inserter-join-summaries.md`
 7. `big/exact-numeral-pipeline.md`
 8. `big/generalization-time-ambiguity.md`
-9. `big/unify-build-pipelines.md`
-10. `big/decision-tree-match-compiler.md`
-11. `small/glue-consumes-committed-layouts.md`
-12. `small/structural-hoist-contexts.md`
+9. `big/complete-dispatch-evidence-migration.md`
+10. `big/unify-build-pipelines.md`
+11. `big/decision-tree-match-compiler.md`
+12. `big/single-source-builtin-registration.md`
+13. `small/silent-drift-guards.md`
+14. `small/glue-consumes-committed-layouts.md`
+15. `small/structural-hoist-contexts.md`

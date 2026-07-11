@@ -41,26 +41,10 @@ pub const ConstScalar = union(enum) {
 /// generated (a compiler-synthesized capturable local, minted during CTFE).
 pub const CaptureId = checked_ids.CaptureId;
 
-/// Primitive type stored at the ConstStore boundary. This mirrors
-/// `CheckedPrimitive` without importing `checked_artifact.zig`, which owns the
-/// full checked artifact and itself imports this file.
-pub const Primitive = enum {
-    bool,
-    str,
-    u8,
-    i8,
-    u16,
-    i16,
-    u32,
-    i32,
-    u64,
-    i64,
-    u128,
-    i128,
-    f32,
-    f64,
-    dec,
-};
+/// Primitive type stored at the ConstStore boundary. Aliased to the checked
+/// artifact's `CheckedPrimitive` so the two cannot drift; Zig permits the
+/// circular file import (`checked_artifact.zig` itself imports this file).
+pub const Primitive = @import("checked_artifact.zig").CheckedPrimitive;
 
 /// Named type definition owner for stored monomorphic type evidence.
 pub const TypeDef = struct {

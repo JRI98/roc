@@ -121,11 +121,7 @@ const StaticDataBuilder = struct {
         lowered: *const lir.CheckedPipeline.LoweredProgram,
         target: roc_target.RocTarget,
     ) ?StaticDataBuilder {
-        const target_usize = switch (target.ptrBitWidth()) {
-            32 => @import("base").target.TargetUsize.u32,
-            64 => @import("base").target.TargetUsize.u64,
-            else => return null,
-        };
+        const target_usize = @import("base").target.TargetUsize.fromPtrBitWidth(target.ptrBitWidth());
         return .{
             .allocator = allocator,
             .root = root,

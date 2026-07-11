@@ -6865,24 +6865,6 @@ fn canonicalizeSingleQuote(
     }
 }
 
-/// Parse an integer with underscores.
-pub fn parseIntWithUnderscores(allocator: std.mem.Allocator, comptime T: type, text: []const u8, int_base: u8) (Allocator.Error || error{ InvalidCharacter, Overflow })!T {
-    const buf = try allocator.alloc(u8, text.len);
-    defer allocator.free(buf);
-
-    var len: usize = 0;
-    for (text) |char| {
-        if (char != '_') {
-            buf[len] = char;
-            len += 1;
-        }
-    }
-    return std.fmt.parseInt(T, buf[0..len], int_base);
-}
-
-/// Parse integer text into a CIR.IntValue.
-/// Handles base prefixes (0x, 0b, 0o), underscores, and negative numbers.
-/// Returns null if the number is invalid (too large, etc).
 /// Project a parser-side IntValue onto the CIR-side IntValue shape.
 fn cirIntValue(value: NumericLiteral.IntValue) CIR.IntValue {
     return .{
@@ -6937,82 +6919,6 @@ fn recordNumeralLiteralForPattern(
         literal.flags.had_decimal_point,
         literal.isMaterialized(),
     );
-}
-
-/// Parse an integer literal's textual form into a CIR.IntValue, honoring an
-/// optional leading minus and `0x`/`0o`/`0b`/`0d` base prefixes.
-pub fn parseIntText(allocator: std.mem.Allocator, num_text: []const u8) std.mem.Allocator.Error!?CIR.IntValue {
-    const is_negated = num_text[0] == '-';
-    const after_minus_sign = @as(usize, @intFromBool(is_negated));
-
-    var first_digit: usize = undefined;
-    const DEFAULT_BASE = 10;
-    var int_base: u8 = undefined;
-
-    if (num_text[after_minus_sign] == '0' and num_text.len > after_minus_sign + 2) {
-        switch (num_text[after_minus_sign + 1]) {
-            'x', 'X' => {
-                int_base = 16;
-                first_digit = after_minus_sign + 2;
-            },
-            'o', 'O' => {
-                int_base = 8;
-                first_digit = after_minus_sign + 2;
-            },
-            'b', 'B' => {
-                int_base = 2;
-                first_digit = after_minus_sign + 2;
-            },
-            else => {
-                int_base = DEFAULT_BASE;
-                first_digit = after_minus_sign;
-            },
-        }
-    } else {
-        int_base = DEFAULT_BASE;
-        first_digit = after_minus_sign;
-    }
-
-    const digit_part = num_text[first_digit..];
-
-    const u128_val = parseIntWithUnderscores(allocator, u128, digit_part, int_base) catch |err| switch (err) {
-        error.OutOfMemory => return error.OutOfMemory,
-        error.InvalidCharacter, error.Overflow => return null,
-    };
-
-    // If this had a minus sign, but negating it would result in a negative number
-    // that would be too low to fit in i128, then this int literal is also invalid.
-    if (is_negated and u128_val > min_i128_negated) {
-        return null;
-    }
-
-    // Determine the appropriate storage type
-    if (is_negated) {
-        // Negative: must be i128 (or smaller)
-        const i128_val = if (u128_val == min_i128_negated)
-            std.math.minInt(i128) // Special case for -2^127
-        else
-            -@as(i128, @intCast(u128_val));
-        return CIR.IntValue{
-            .bytes = @bitCast(i128_val),
-            .kind = .i128,
-        };
-    } else {
-        // Positive: could be i128 or u128
-        if (u128_val > @as(u128, std.math.maxInt(i128))) {
-            // Too big for i128, keep as u128
-            return CIR.IntValue{
-                .bytes = @bitCast(u128_val),
-                .kind = .u128,
-            };
-        } else {
-            // Fits in i128
-            return CIR.IntValue{
-                .bytes = @bitCast(@as(i128, @intCast(u128_val))),
-                .kind = .i128,
-            };
-        }
-    }
 }
 
 /// Canonicalize an expression.

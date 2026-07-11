@@ -6588,7 +6588,7 @@ pub const Interpreter = struct {
     fn intToDec(self: *LirInterpreter, comptime Src: type, arg: Value, ret_layout: layout_mod.Idx) Error!Value {
         const val = try self.alloc(ret_layout);
         const sv = arg.read(Src);
-        const scale: i128 = 1_000_000_000_000_000_000; // 10^18
+        const scale: i128 = RocDec.one_point_zero_i128;
         val.write(i128, @as(i128, @intCast(sv)) *% scale);
         return val;
     }

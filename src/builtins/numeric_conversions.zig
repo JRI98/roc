@@ -158,5 +158,5 @@ test "raw float and Dec conversion bits preserve signed integer representation" 
     try std.testing.expectEqual(@as(?u128, @bitCast(@as(i128, -42))), decToIntTryBits(-42_900_000_000_000_000_000, 8, true));
     try std.testing.expectEqual(@as(?u128, 255), decToIntTryBits(255_999_000_000_000_000_000, 8, false));
     try std.testing.expectEqual(@as(?u128, null), decToIntTryBits(128_000_000_000_000_000_000, 8, true));
-    try std.testing.expectEqual(@as(?u128, null), decToIntTryBits(-1_000_000_000_000_000_000, 8, false));
+    try std.testing.expectEqual(@as(?u128, null), decToIntTryBits(-dec.RocDec.one_point_zero_i128, 8, false));
 }

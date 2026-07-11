@@ -7567,8 +7567,10 @@ fn cloneSlice(comptime T: type, allocator: std.mem.Allocator, source: []const T)
 }
 
 fn constPrimitive(primitive: MonoType.Primitive) const_store.Primitive {
-    return std.meta.stringToEnum(const_store.Primitive, @tagName(primitive)) orelse
-        Common.invariant("monotype primitive had no ConstStore primitive equivalent");
+    // `MonoType.Primitive` and `const_store.Primitive` both alias the same
+    // `CheckedPrimitive` enum, so this is an identity mapping and any future
+    // divergence becomes a compile error here.
+    return primitive;
 }
 
 fn constNamedKind(kind: MonoType.NamedKind) const_store.TypeNamedKind {

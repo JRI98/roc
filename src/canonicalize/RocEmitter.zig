@@ -14,6 +14,7 @@ const builtins = @import("builtins");
 const parse = @import("parse");
 
 const i128h = builtins.compiler_rt_128;
+const RocDec = builtins.dec.RocDec;
 
 const ModuleEnv = @import("ModuleEnv.zig");
 const CIR = @import("CIR.zig");
@@ -282,14 +283,14 @@ fn emitExprFrame(
         .e_frac_f64 => |frac| try self.output.print(self.allocator, "{d}f64", .{frac.value}),
         .e_dec => |dec| {
             const value = dec.value.num;
-            const scale: i128 = 1_000_000_000_000_000_000;
+            const scale: i128 = RocDec.one_point_zero_i128;
             const whole = i128h.divTrunc_i128(value, scale);
             const frac_part = i128h.rem_u128(@abs(value), @as(u128, @intCast(scale)));
             try self.write(try self.formatI128(whole));
             if (frac_part != 0) {
                 try self.write(".");
                 const frac_str = try self.formatU128(frac_part);
-                var pad: usize = 18 - frac_str.len;
+                var pad: usize = @as(usize, RocDec.decimal_places) - frac_str.len;
                 while (pad > 0) : (pad -= 1) try self.write("0");
                 try self.write(frac_str);
             }
@@ -314,7 +315,7 @@ fn emitExprFrame(
         },
         .e_typed_frac => |typed| {
             const value = typed.value.toI128();
-            const scale: i128 = 1_000_000_000_000_000_000;
+            const scale: i128 = RocDec.one_point_zero_i128;
             const whole = i128h.divTrunc_i128(value, scale);
             const frac_part = i128h.rem_u128(@abs(value), @as(u128, @intCast(scale)));
             if (frac_part == 0) {
@@ -696,14 +697,14 @@ fn emitPatternFrame(
         },
         .dec_literal => |dec| {
             const value = dec.value.num;
-            const scale: i128 = 1_000_000_000_000_000_000;
+            const scale: i128 = RocDec.one_point_zero_i128;
             const whole = i128h.divTrunc_i128(value, scale);
             const frac_part = i128h.rem_u128(@abs(value), @as(u128, @intCast(scale)));
             try self.write(try self.formatI128(whole));
             if (frac_part != 0) {
                 try self.write(".");
                 const frac_str = try self.formatU128(frac_part);
-                var pad: usize = 18 - frac_str.len;
+                var pad: usize = @as(usize, RocDec.decimal_places) - frac_str.len;
                 while (pad > 0) : (pad -= 1) try self.write("0");
                 try self.write(frac_str);
             }

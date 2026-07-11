@@ -17,6 +17,10 @@ const Allocator = std.mem.Allocator;
 const base = @import("base");
 const builtins = @import("builtins");
 const layout = @import("layout");
+/// Dec's scaling factor (10^18) as an i64, sourced from the canonical Dec type.
+const dec_one_i64: i64 = @intCast(builtins.dec.RocDec.one_point_zero_i128);
+/// Dec's scaling factor (10^18) as an f64, sourced from the canonical Dec type.
+const dec_one_f64: f64 = @floatFromInt(builtins.dec.RocDec.one_point_zero_i128);
 
 const lir = @import("lir");
 const CheckedArithmetic = lir.CheckedArithmetic;
@@ -13186,7 +13190,7 @@ fn generateLowLevel(self: *Self, ll: anytype) Allocator.Error!void {
             WasmModule.leb128WriteU32(self.allocator, self.currentCode(), val) catch return error.OutOfMemory;
             const dec_factor = self.storage.allocAnonymousLocal(.i64) catch return error.OutOfMemory;
             self.currentCode().append(self.allocator, Op.i64_const) catch return error.OutOfMemory;
-            WasmModule.leb128WriteI64(self.allocator, self.currentCode(), 1_000_000_000_000_000_000) catch return error.OutOfMemory;
+            WasmModule.leb128WriteI64(self.allocator, self.currentCode(), dec_one_i64) catch return error.OutOfMemory;
             self.currentCode().append(self.allocator, Op.local_set) catch return error.OutOfMemory;
             WasmModule.leb128WriteU32(self.allocator, self.currentCode(), dec_factor) catch return error.OutOfMemory;
             try self.emitI64MulToI128(val, dec_factor);
@@ -13199,7 +13203,7 @@ fn generateLowLevel(self: *Self, ll: anytype) Allocator.Error!void {
             WasmModule.leb128WriteU32(self.allocator, self.currentCode(), val) catch return error.OutOfMemory;
             const dec_factor = self.storage.allocAnonymousLocal(.i64) catch return error.OutOfMemory;
             self.currentCode().append(self.allocator, Op.i64_const) catch return error.OutOfMemory;
-            WasmModule.leb128WriteI64(self.allocator, self.currentCode(), 1_000_000_000_000_000_000) catch return error.OutOfMemory;
+            WasmModule.leb128WriteI64(self.allocator, self.currentCode(), dec_one_i64) catch return error.OutOfMemory;
             self.currentCode().append(self.allocator, Op.local_set) catch return error.OutOfMemory;
             WasmModule.leb128WriteU32(self.allocator, self.currentCode(), dec_factor) catch return error.OutOfMemory;
             try self.emitI64MulToI128(val, dec_factor);
@@ -13213,7 +13217,7 @@ fn generateLowLevel(self: *Self, ll: anytype) Allocator.Error!void {
             WasmModule.leb128WriteU32(self.allocator, self.currentCode(), val) catch return error.OutOfMemory;
             const dec_factor = self.storage.allocAnonymousLocal(.i64) catch return error.OutOfMemory;
             self.currentCode().append(self.allocator, Op.i64_const) catch return error.OutOfMemory;
-            WasmModule.leb128WriteI64(self.allocator, self.currentCode(), 1_000_000_000_000_000_000) catch return error.OutOfMemory;
+            WasmModule.leb128WriteI64(self.allocator, self.currentCode(), dec_one_i64) catch return error.OutOfMemory;
             self.currentCode().append(self.allocator, Op.local_set) catch return error.OutOfMemory;
             WasmModule.leb128WriteU32(self.allocator, self.currentCode(), dec_factor) catch return error.OutOfMemory;
             try self.emitI64MulToI128Signed(val, dec_factor);
@@ -13226,7 +13230,7 @@ fn generateLowLevel(self: *Self, ll: anytype) Allocator.Error!void {
             WasmModule.leb128WriteU32(self.allocator, self.currentCode(), val) catch return error.OutOfMemory;
             const dec_factor = self.storage.allocAnonymousLocal(.i64) catch return error.OutOfMemory;
             self.currentCode().append(self.allocator, Op.i64_const) catch return error.OutOfMemory;
-            WasmModule.leb128WriteI64(self.allocator, self.currentCode(), 1_000_000_000_000_000_000) catch return error.OutOfMemory;
+            WasmModule.leb128WriteI64(self.allocator, self.currentCode(), dec_one_i64) catch return error.OutOfMemory;
             self.currentCode().append(self.allocator, Op.local_set) catch return error.OutOfMemory;
             WasmModule.leb128WriteU32(self.allocator, self.currentCode(), dec_factor) catch return error.OutOfMemory;
             try self.emitI64MulToI128Signed(val, dec_factor);
@@ -13256,7 +13260,7 @@ fn generateLowLevel(self: *Self, ll: anytype) Allocator.Error!void {
             // low word = 10^18
             try self.emitLocalGet(divisor_local);
             self.currentCode().append(self.allocator, Op.i64_const) catch return error.OutOfMemory;
-            WasmModule.leb128WriteI64(self.allocator, self.currentCode(), 1_000_000_000_000_000_000) catch return error.OutOfMemory;
+            WasmModule.leb128WriteI64(self.allocator, self.currentCode(), dec_one_i64) catch return error.OutOfMemory;
             try self.emitStoreOp(.i64, 0);
             // high word = 0
             try self.emitLocalGet(divisor_local);
@@ -13302,7 +13306,7 @@ fn generateLowLevel(self: *Self, ll: anytype) Allocator.Error!void {
             try self.emitLocalSet(divisor_local);
             try self.emitLocalGet(divisor_local);
             self.currentCode().append(self.allocator, Op.i64_const) catch return error.OutOfMemory;
-            WasmModule.leb128WriteI64(self.allocator, self.currentCode(), 1_000_000_000_000_000_000) catch return error.OutOfMemory;
+            WasmModule.leb128WriteI64(self.allocator, self.currentCode(), dec_one_i64) catch return error.OutOfMemory;
             try self.emitStoreOp(.i64, 0);
             try self.emitLocalGet(divisor_local);
             self.currentCode().append(self.allocator, Op.i64_const) catch return error.OutOfMemory;
@@ -13318,7 +13322,7 @@ fn generateLowLevel(self: *Self, ll: anytype) Allocator.Error!void {
             self.currentCode().append(self.allocator, Op.f64_convert_i64_s) catch return error.OutOfMemory;
             self.currentCode().append(self.allocator, Op.f64_const) catch return error.OutOfMemory;
             // 10^18 as f64 bytes (IEEE 754 double for 1e18)
-            const dec_f64_bytes = @as([8]u8, @bitCast(@as(f64, 1_000_000_000_000_000_000.0)));
+            const dec_f64_bytes = @as([8]u8, @bitCast(dec_one_f64));
             self.currentCode().appendSlice(self.allocator, &dec_f64_bytes) catch return error.OutOfMemory;
             self.currentCode().append(self.allocator, Op.f64_div) catch return error.OutOfMemory;
         },
@@ -13328,7 +13332,7 @@ fn generateLowLevel(self: *Self, ll: anytype) Allocator.Error!void {
             try self.emitLoadOp(.i64, 0);
             self.currentCode().append(self.allocator, Op.f64_convert_i64_s) catch return error.OutOfMemory;
             self.currentCode().append(self.allocator, Op.f64_const) catch return error.OutOfMemory;
-            const dec_f64_bytes = @as([8]u8, @bitCast(@as(f64, 1_000_000_000_000_000_000.0)));
+            const dec_f64_bytes = @as([8]u8, @bitCast(dec_one_f64));
             self.currentCode().appendSlice(self.allocator, &dec_f64_bytes) catch return error.OutOfMemory;
             self.currentCode().append(self.allocator, Op.f64_div) catch return error.OutOfMemory;
             self.currentCode().append(self.allocator, Op.f32_demote_f64) catch return error.OutOfMemory;

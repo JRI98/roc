@@ -121,6 +121,38 @@ pass-through (`if (args.no_cache) null else build_env.cache_manager`) into
 - PRs (roc-lang/roc): 9811, 9459, 9698, 9627, 9759, 9720, 9768. Issues:
   9788 (run never cached, filed as slowness), 9694 (`--opt` ignored),
   9509 (transitive package failure on run, fixed by PR 9627).
+- A July 2026 audit diffed the two Coordinator-driving sequences line by
+  line and found four **live** divergences waiting to become the next bug
+  reports, plus two more wholesale copies:
+  - Platform root module name: `lowerLirWithCoordinator` registers the
+    platform root with a hardcoded module name `"main"`, while the
+    BuildEnv path derives it via `PackageEnv.moduleNameFromPath` from the
+    platform package's actual root file. A platform whose root file is not
+    `main.roc` wires differently under run vs. build.
+  - `explicit_root_ident_names`: the BuildEnv path sets these on the
+    platform root from `targets_config` (this is how wasm
+    `import_memory` / `minimum_memory` idents reach codegen); the run path
+    never sets them.
+  - Platform discovery scope: the run path only handles the root's one
+    direct `is_platform` dependency; the BuildEnv path scans all resolved
+    packages for `.platform` kind.
+  - `markNoAppPackage` exists only in the BuildEnv path; the run path has
+    no equivalent for app-less roots (the hosted-transform tri-state).
+  - The package resolution + materialization sequence (resolver
+    construction, `buildPackageKeys`, per-package registration and
+    shorthand wiring, URL-vs-local watch state) is duplicated between
+    `resolvePackages` + the inline registration loop in `cli/main.zig` and
+    `resolveAndMaterialize` / `materializeResolved` in
+    `compile_build.zig` — including a version-bump-notes loop copy-pasted
+    essentially verbatim, identical comments and all.
+  - Downstream of orchestration, the "checked artifacts → LIR" adapter
+    (`executableRootCheckedArtifact` → `collectImportedArtifactViews` →
+    `collectRelationArtifactViews` → platform-roots selection →
+    `lowerCheckedModulesToLir` with per-opt options) is hand-copied five
+    times inside `cli/main.zig` (run, build-LLVM, build-native, embedded,
+    hot-reload), each spelling out its own lowering-option list; the run
+    copy selects entrypoint roots where the build copies select export
+    roots.
 
 ## Solution design
 
@@ -160,9 +192,18 @@ only (`roc check`), docs extraction, glue extraction.
    `setupSharedMemoryWithCoordinator` either gains the core's cache wiring
    or is deleted if truly dead. Glue, the LSP, and the playground consume
    the core — no new entry path may construct a Coordinator directly.
-6. **Enumerate the known divergences as the acceptance checklist**:
+6. **Collapse the five "checked artifacts → LIR" adapter copies.** One
+   helper (roughly `lowerCheckedRootToLir(source, roots_kind, opt,
+   target)`) owns the artifact-view collection, platform-roots selection
+   (parameterized entrypoint-vs-export), and the opt-derived lowering
+   options, so a new lowering option cannot be added to four of five
+   backends.
+7. **Enumerate the known divergences as the acceptance checklist**:
    caching parity, `--opt` parity, transitive package registration parity,
-   diagnostic single-render, warning exit codes, and package-identity parity.
+   diagnostic single-render, warning exit codes, package-identity parity,
+   platform root-module naming parity, `explicit_root_ident_names` parity,
+   platform-discovery-scope parity, and app-less-root (`markNoAppPackage`)
+   parity.
 
 ## What success looks like
 
