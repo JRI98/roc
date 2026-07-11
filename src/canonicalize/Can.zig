@@ -5964,8 +5964,10 @@ fn importAliased(
 
     // If this import satisfies an exposed type requirement (e.g., platform re-exporting
     // an imported module), remove it from exposed_type_texts so we don't report
-    // "Exposed But Not Defined" for re-exported imports.
-    _ = self.exposed_type_texts.remove(module_name_text);
+    // "Exposed But Not Defined" for re-exported imports. The ident text must be
+    // fetched fresh here: the import processing above interns new idents, which
+    // can grow the interner's byte buffer and invalidate any earlier text slice.
+    _ = self.exposed_type_texts.remove(self.env.getIdent(module_name));
 
     return import_idx;
 }
@@ -6029,8 +6031,10 @@ fn importUnaliased(
 
     // If this import satisfies an exposed type requirement (e.g., platform re-exporting
     // an imported module), remove it from exposed_type_texts so we don't report
-    // "Exposed But Not Defined" for re-exported imports.
-    _ = self.exposed_type_texts.remove(module_name_text);
+    // "Exposed But Not Defined" for re-exported imports. The ident text must be
+    // fetched fresh here: the import processing above interns new idents, which
+    // can grow the interner's byte buffer and invalidate any earlier text slice.
+    _ = self.exposed_type_texts.remove(self.env.getIdent(module_name));
 
     return import_idx;
 }
