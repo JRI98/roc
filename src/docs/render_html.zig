@@ -138,6 +138,10 @@ const RenderContext = struct {
     /// When true, renderDocTypeHtml emits plain <span> instead of <a> for type
     /// references. Used inside search entries to avoid invalid nested <a> tags.
     suppress_type_links: bool = false,
+    /// When true, where clauses render on a single line instead of the
+    /// multi-line layout. Used inside inline search entries, which must stay on
+    /// one line.
+    single_line_signatures: bool = false,
     /// True when the package being documented is Builtin itself, so references
     /// to builtin types stay local instead of pointing at roc-lang.org.
     documenting_builtin: bool = false,
@@ -1486,6 +1490,7 @@ fn renderSearchTree(
             // nested <a> tags (the entire entry is already wrapped in <a>).
             var no_links_ctx = ctx.*;
             no_links_ctx.suppress_type_links = true;
+            no_links_ctx.single_line_signatures = true;
             const sig_ctx: *const RenderContext = &no_links_ctx;
 
             try w.writeAll(" <span class=\"type-ahead-signature\">");
@@ -1706,9 +1711,9 @@ fn writeDocText(w: Writer, ctx: *const RenderContext, text: []const u8) (Allocat
                 } else {
                     try writeMissingDocRefHref(w, ctx, ref.label, bracket_offset);
                 }
-                try w.writeAll("\">");
+                try w.writeAll("\"><code>");
                 try writeHtmlEscaped(w, ref.label);
-                try w.writeAll("</a>");
+                try w.writeAll("</code></a>");
                 i = ref.end;
                 plain_start = i;
             } else {
@@ -1998,21 +2003,46 @@ fn renderDocTypeHtml(
                         try frames.append(gpa, .{ .doc_type = .{ .value = app.constructor, .needs_parens = false } });
                     },
                     .where_clause => |wc| {
-                        try frames.append(gpa, .{ .html = " }" });
-                        var i = wc.constraints.len;
-                        while (i > 0) {
-                            i -= 1;
-                            const constraint = wc.constraints[i];
-                            try frames.append(gpa, .{ .doc_type = .{ .value = constraint.signature, .needs_parens = false } });
-                            try frames.append(gpa, .{ .html = " : " });
-                            try frames.append(gpa, .{ .escaped = constraint.method_name });
-                            try frames.append(gpa, .{ .html = "</span>." });
-                            try frames.append(gpa, .{ .escaped = constraint.type_var });
-                            try frames.append(gpa, .{ .html = "<span class=\"type-var\">" });
-                            if (i > 0) try frames.append(gpa, .{ .html = ", " });
+                        if (ctx.single_line_signatures) {
+                            // Inline layout keeps the whole where clause on one
+                            // line, matching the nowrap search entries.
+                            try frames.append(gpa, .{ .html = "]" });
+                            var i = wc.constraints.len;
+                            while (i > 0) {
+                                i -= 1;
+                                const constraint = wc.constraints[i];
+                                try frames.append(gpa, .{ .doc_type = .{ .value = constraint.signature, .needs_parens = false } });
+                                try frames.append(gpa, .{ .html = " : " });
+                                try frames.append(gpa, .{ .escaped = constraint.method_name });
+                                try frames.append(gpa, .{ .html = "</span>." });
+                                try frames.append(gpa, .{ .escaped = constraint.type_var });
+                                try frames.append(gpa, .{ .html = "<span class=\"type-var\">" });
+                                if (i > 0) try frames.append(gpa, .{ .html = ", " });
+                            }
+                            try frames.append(gpa, .{ .html = " <span class=\"kw\">where</span> [" });
+                            try frames.append(gpa, .{ .doc_type = .{ .value = wc.type, .needs_parens = item.needs_parens } });
+                        } else {
+                            // Multi-line layout mirrors how `roc format` lays
+                            // out where clauses; the enclosing block uses
+                            // white-space: pre-wrap so the literal newlines and
+                            // indentation render as written.
+                            try frames.append(gpa, .{ .html = "    ]" });
+                            var i = wc.constraints.len;
+                            while (i > 0) {
+                                i -= 1;
+                                const constraint = wc.constraints[i];
+                                try frames.append(gpa, .{ .html = ",\n" });
+                                try frames.append(gpa, .{ .doc_type = .{ .value = constraint.signature, .needs_parens = false } });
+                                try frames.append(gpa, .{ .html = " : " });
+                                try frames.append(gpa, .{ .escaped = constraint.method_name });
+                                try frames.append(gpa, .{ .html = "</span>." });
+                                try frames.append(gpa, .{ .escaped = constraint.type_var });
+                                try frames.append(gpa, .{ .html = "<span class=\"type-var\">" });
+                                try frames.append(gpa, .{ .html = "        " });
+                            }
+                            try frames.append(gpa, .{ .html = "\n    <span class=\"kw\">where</span> [\n" });
+                            try frames.append(gpa, .{ .doc_type = .{ .value = wc.type, .needs_parens = item.needs_parens } });
                         }
-                        try frames.append(gpa, .{ .html = " <span class=\"kw\">where</span> { " });
-                        try frames.append(gpa, .{ .doc_type = .{ .value = wc.type, .needs_parens = item.needs_parens } });
                     },
                     .wildcard => {
                         try frames.append(gpa, .{ .html = "_" });
@@ -2358,6 +2388,108 @@ test "doc shorthand refs in package docs resolve builtins and nested type-module
 
     try testing.expect(std.mem.find(u8, html, "href=\"https://roc-lang.org/builtins/main/Str\"") != null);
     try testing.expect(std.mem.find(u8, html, "href=\"#String.Utf8\"") != null);
+
+    // Shorthand `[Name]` refs wrap their label in <code>.
+    try testing.expect(std.mem.find(u8, html, "href=\"https://roc-lang.org/builtins/main/Str\"><code>Str</code></a>") != null);
+    try testing.expect(std.mem.find(u8, html, "href=\"#String.Utf8\"><code>Utf8</code></a>") != null);
+}
+
+test "renderDocTypeHtml renders where clause multi-line with square brackets" {
+    const testing = std.testing;
+    const gpa = testing.allocator;
+
+    const root = try buildWhereClauseFixture(gpa);
+    defer {
+        root.deinit(gpa);
+        gpa.destroy(root);
+    }
+
+    const package_docs = DocModel.PackageDocs{
+        .name = "Test",
+        .modules = &[_]DocModel.ModuleDocs{},
+    };
+    var ctx = try RenderContext.init(&package_docs, gpa);
+    defer ctx.deinit(gpa);
+    ctx.suppress_type_links = true;
+
+    var output: std.Io.Writer.Allocating = .init(gpa);
+    defer output.deinit();
+
+    try renderDocTypeHtml(&output.writer, &ctx, gpa, root, false);
+    try testing.expectEqualStrings(
+        "<span class=\"type\">Bool</span>\n" ++
+            "    <span class=\"kw\">where</span> [\n" ++
+            "        <span class=\"type-var\">k</span>.is_eq : <span class=\"type-var\">k</span>,\n" ++
+            "        <span class=\"type-var\">v</span>.to_hash : <span class=\"type-var\">v</span>,\n" ++
+            "    ]",
+        output.written(),
+    );
+}
+
+test "renderDocTypeHtml renders where clause single-line when single_line_signatures set" {
+    const testing = std.testing;
+    const gpa = testing.allocator;
+
+    const root = try buildWhereClauseFixture(gpa);
+    defer {
+        root.deinit(gpa);
+        gpa.destroy(root);
+    }
+
+    const package_docs = DocModel.PackageDocs{
+        .name = "Test",
+        .modules = &[_]DocModel.ModuleDocs{},
+    };
+    var ctx = try RenderContext.init(&package_docs, gpa);
+    defer ctx.deinit(gpa);
+    ctx.suppress_type_links = true;
+    ctx.single_line_signatures = true;
+
+    var output: std.Io.Writer.Allocating = .init(gpa);
+    defer output.deinit();
+
+    try renderDocTypeHtml(&output.writer, &ctx, gpa, root, false);
+    try testing.expectEqualStrings(
+        "<span class=\"type\">Bool</span> <span class=\"kw\">where</span> [" ++
+            "<span class=\"type-var\">k</span>.is_eq : <span class=\"type-var\">k</span>, " ++
+            "<span class=\"type-var\">v</span>.to_hash : <span class=\"type-var\">v</span>]",
+        output.written(),
+    );
+}
+
+/// Builds a heap-allocated `where` clause DocType for the rendering tests:
+/// `Bool where [ k.is_eq : k, v.to_hash : v ]`.
+fn buildWhereClauseFixture(gpa: Allocator) Allocator.Error!*const DocType {
+    const bool_type = try gpa.create(DocType);
+    bool_type.* = .{ .type_ref = .{
+        .module_path = try gpa.dupe(u8, ""),
+        .type_name = try gpa.dupe(u8, "Bool"),
+    } };
+
+    const k_sig = try gpa.create(DocType);
+    k_sig.* = .{ .type_var = try gpa.dupe(u8, "k") };
+
+    const v_sig = try gpa.create(DocType);
+    v_sig.* = .{ .type_var = try gpa.dupe(u8, "v") };
+
+    const constraints = try gpa.alloc(DocType.Constraint, 2);
+    constraints[0] = .{
+        .type_var = try gpa.dupe(u8, "k"),
+        .method_name = try gpa.dupe(u8, "is_eq"),
+        .signature = k_sig,
+    };
+    constraints[1] = .{
+        .type_var = try gpa.dupe(u8, "v"),
+        .method_name = try gpa.dupe(u8, "to_hash"),
+        .signature = v_sig,
+    };
+
+    const root = try gpa.create(DocType);
+    root.* = .{ .where_clause = .{
+        .type = bool_type,
+        .constraints = constraints,
+    } };
+    return root;
 }
 
 test "builtin_nested_type_owners lists every numeric type under Num" {
