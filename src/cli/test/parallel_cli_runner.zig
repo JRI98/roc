@@ -6671,15 +6671,28 @@ fn rebuildWasmOnlyArchive(
     if (members.items.len == 0)
         return customFailure(allocator, timer, "wasm32 Rust host archive had no wasm members after filtering", .{});
 
-    var argv: std.ArrayListUnmanaged([]const u8) = .empty;
-    argv.appendSlice(allocator, &.{ "zig", "ar", "rcs", out_path }) catch |err|
-        return customInfraFailure(allocator, timer, "failed to allocate glue runtime wasm archive args: {}", .{err});
-    argv.appendSlice(allocator, members.items) catch |err|
-        return customInfraFailure(allocator, timer, "failed to allocate glue runtime wasm archive args: {}", .{err});
-    const owned_argv = argv.toOwnedSlice(allocator) catch |err|
-        return customInfraFailure(allocator, timer, "failed to allocate glue runtime wasm archive args: {}", .{err});
+    // rustc's wasm32 staticlib fans out into hundreds of object members (~420
+    // here), so `zig ar rcs out member...` would build a multi-tens-of-KB
+    // command line. Windows caps a process command line at 32767 chars, past
+    // which CreateProcessW fails with error.NameTooLong, so pass the members
+    // through an llvm-ar response file (@file) to keep the spawned command
+    // line short. Each path is double-quoted so a directory containing spaces
+    // still parses; members always end in a file name (never a separator), so
+    // no trailing backslash can escape the closing quote under the Windows
+    // response-file tokenizer.
+    const rsp_path = std.fmt.allocPrint(allocator, "{s}.rsp", .{out_path}) catch |err|
+        return customInfraFailure(allocator, timer, "failed to allocate glue runtime wasm archive response path: {}", .{err});
+    var rsp_content: std.ArrayListUnmanaged(u8) = .empty;
+    for (members.items) |member| {
+        rsp_content.print(allocator, "\"{s}\"\n", .{member}) catch |err|
+            return customInfraFailure(allocator, timer, "failed to build glue runtime wasm archive response file: {}", .{err});
+    }
+    std.Io.Dir.cwd().writeFile(io, .{ .sub_path = rsp_path, .data = rsp_content.items }) catch |err|
+        return customInfraFailure(allocator, timer, "failed to write glue runtime wasm archive response file: {}", .{err});
+    const rsp_arg = std.fmt.allocPrint(allocator, "@{s}", .{rsp_path}) catch |err|
+        return customInfraFailure(allocator, timer, "failed to allocate glue runtime wasm archive response arg: {}", .{err});
 
-    if (runRawAndCheck(io, allocator, env, timer, timeout_ms, owned_argv, project_root_path, .{ .args = &.{} })) |failure| return failure;
+    if (runRawAndCheck(io, allocator, env, timer, timeout_ms, &.{ "zig", "ar", "rcs", out_path, rsp_arg }, project_root_path, .{ .args = &.{} })) |failure| return failure;
 
     return null;
 }

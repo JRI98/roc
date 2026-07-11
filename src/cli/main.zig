@@ -11998,6 +11998,12 @@ fn rocTest(ctx: *CliCtx, args: cli_args.TestArgs, arg0: []const u8) RocTestError
 fn testReportingConfig(ctx: *CliCtx) Allocator.Error!reporting.ReportingConfig {
     var config = ctx.terminalReportConfig();
     config.is_tty = std.Io.File.stderr().isTty(ctx.io.std_io) catch false;
+    // terminalReportConfig() forces color_preference=.always, which makes
+    // shouldUseColors() ignore is_tty entirely. Fall back to .auto so color
+    // follows the real TTY status: redirected output (pipes/files) stays
+    // uncolored while an attached terminal still gets color. The env vars
+    // below override this either way.
+    config.color_preference = .auto;
 
     if (try envVarNonEmpty(ctx.gpa, "NO_COLOR")) {
         config.color_preference = .never;
