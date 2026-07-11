@@ -136,6 +136,15 @@ const BuildEnv = compile.BuildEnv;
 const Coordinator = compile.coordinator.Coordinator;
 const Mode = compile.package.Mode;
 const TimingInfo = compile.package.TimingInfo;
+
+/// Resolves the worker-thread count from an optional `--max-threads` value,
+/// defaulting to the detected CPU count (or 1 when detection fails), and derives
+/// the single- vs multi-threaded compilation mode from it. Returned as a
+/// `{ thread_count, mode }` tuple for destructuring at the call site.
+fn resolveThreadDefaults(max_threads: ?usize) struct { usize, Mode } {
+    const thread_count: usize = max_threads orelse (std.Thread.getCpuCount() catch 1);
+    return .{ thread_count, if (thread_count <= 1) .single_threaded else .multi_threaded };
+}
 const CacheManager = compile.CacheManager;
 const CacheConfig = compile.CacheConfig;
 const cache_config_mod = compile.config;
@@ -1371,7 +1380,7 @@ fn generatePlatformHostShim(
     const image_header: *const lir.LirImage.Header = @ptrCast(@alignCast(lir_image.ptr + @sizeOf(SharedMemoryAllocator.Header)));
     // The host shim's C-ABI lowering needs layout sizes for the target being
     // built, so resolve the width-independent image for that pointer width.
-    const shim_target_usize: base.target.TargetUsize = if (target.ptrBitWidth() == 64) .u64 else .u32;
+    const shim_target_usize = base.target.TargetUsize.fromPtrBitWidth(target.ptrBitWidth());
     const view = lir.LirImage.viewMappedImageWithAllocator(image_header, lir_image.ptr, lir_image.len, shim_target_usize, ctx.arena) catch |err| {
         return ctx.fail(.{ .shim_generation_failed = .{ .err = err } });
     };
@@ -5496,8 +5505,7 @@ fn lowerLirWithCoordinator(
     defer package_keys.deinit();
     if (reporter) |r| r.end();
 
-    const thread_count: usize = max_threads orelse (std.Thread.getCpuCount() catch 1);
-    const mode: Mode = if (thread_count <= 1) .single_threaded else .multi_threaded;
+    const thread_count, const mode = resolveThreadDefaults(max_threads);
 
     var coord = try Coordinator.init(
         ctx.gpa,
@@ -8099,8 +8107,7 @@ fn rocBuildLlvm(ctx: *CliCtx, args: cli_args.BuildArgs) CliMainError!void {
     else
         try base.module_path.getModuleNameAlloc(ctx.arena, args.path);
 
-    const thread_count: usize = args.max_threads orelse (std.Thread.getCpuCount() catch 1);
-    const mode: Mode = if (thread_count <= 1) .single_threaded else .multi_threaded;
+    const thread_count, const mode = resolveThreadDefaults(args.max_threads);
 
     const cwd = try std.fs.path.resolve(ctx.gpa, &.{"."});
     defer ctx.gpa.free(cwd);
@@ -8228,16 +8235,7 @@ fn rocBuildLlvm(ctx: *CliCtx, args: cli_args.BuildArgs) CliMainError!void {
     const relation_artifacts = try build_env.collectRelationArtifactViews(ctx.gpa, root_artifact);
     defer ctx.gpa.free(relation_artifacts);
 
-    const target_usize: base.target.TargetUsize = switch (target.ptrBitWidth()) {
-        32 => .u32,
-        64 => .u64,
-        else => {
-            if (builtin.mode == .Debug) {
-                std.debug.panic("LLVM build invariant violated: unsupported target pointer width {d}", .{target.ptrBitWidth()});
-            }
-            unreachable;
-        },
-    };
+    const target_usize = base.target.TargetUsize.fromPtrBitWidth(target.ptrBitWidth());
 
     const build_roots = try lir.CheckedPipeline.selectPlatformExportRoots(ctx.gpa, root_artifact.root_requests.runtime_requests);
     defer ctx.gpa.free(build_roots);
@@ -8445,8 +8443,7 @@ fn rocBuildNative(ctx: *CliCtx, args: cli_args.BuildArgs) CliMainError!void {
         else => return err,
     };
 
-    const thread_count: usize = args.max_threads orelse (std.Thread.getCpuCount() catch 1);
-    const mode: Mode = if (thread_count <= 1) .single_threaded else .multi_threaded;
+    const thread_count, const mode = resolveThreadDefaults(args.max_threads);
 
     const cwd = try std.fs.path.resolve(ctx.gpa, &.{"."});
     defer ctx.gpa.free(cwd);
@@ -8566,16 +8563,7 @@ fn rocBuildNative(ctx: *CliCtx, args: cli_args.BuildArgs) CliMainError!void {
     const relation_artifacts = try build_env.collectRelationArtifactViews(ctx.gpa, root_artifact);
     defer ctx.gpa.free(relation_artifacts);
 
-    const target_usize: base.target.TargetUsize = switch (target.ptrBitWidth()) {
-        32 => .u32,
-        64 => .u64,
-        else => {
-            if (builtin.mode == .Debug) {
-                std.debug.panic("native build invariant violated: unsupported target pointer width {d}", .{target.ptrBitWidth()});
-            }
-            unreachable;
-        },
-    };
+    const target_usize = base.target.TargetUsize.fromPtrBitWidth(target.ptrBitWidth());
 
     const build_roots = try lir.CheckedPipeline.selectPlatformExportRoots(ctx.gpa, root_artifact.root_requests.runtime_requests);
     defer ctx.gpa.free(build_roots);
@@ -8801,8 +8789,7 @@ fn rocBuildEmbedded(ctx: *CliCtx, args: cli_args.BuildArgs) CliMainError!void {
         else => return err,
     };
 
-    const thread_count: usize = args.max_threads orelse (std.Thread.getCpuCount() catch 1);
-    const mode: Mode = if (thread_count <= 1) .single_threaded else .multi_threaded;
+    const thread_count, const mode = resolveThreadDefaults(args.max_threads);
 
     const cwd = try std.fs.path.resolve(ctx.gpa, &.{"."});
     defer ctx.gpa.free(cwd);
@@ -11792,8 +11779,7 @@ fn rocTest(ctx: *CliCtx, args: cli_args.TestArgs, arg0: []const u8) RocTestError
     // --- Normal compilation path ---
 
     // Determine threading mode and thread count
-    const thread_count: usize = args.max_threads orelse (std.Thread.getCpuCount() catch 1);
-    const mode: Mode = if (thread_count <= 1) .single_threaded else .multi_threaded;
+    const thread_count, const mode = resolveThreadDefaults(args.max_threads);
 
     // Initialize BuildEnv for compilation
     const cwd = std.Io.Dir.cwd().realPathFileAlloc(ctx.io.std_io, ".", ctx.gpa) catch |err| {
@@ -13461,8 +13447,7 @@ fn checkFileWithBuildEnvPreserved(
 
     // Determine threading mode and thread count
     // Default to multi-threaded with auto-detected CPU count; use -j1 for single-threaded
-    const thread_count: usize = if (max_threads) |t| t else (std.Thread.getCpuCount() catch 1);
-    const mode: compile.package.Mode = if (thread_count <= 1) .single_threaded else .multi_threaded;
+    const thread_count, const mode = resolveThreadDefaults(max_threads);
 
     const cwd = try std.Io.Dir.cwd().realPathFileAlloc(ctx.io.std_io, ".", ctx.gpa);
     defer ctx.gpa.free(cwd);
@@ -13640,8 +13625,7 @@ fn checkFileWithBuildEnv(
     const trace = tracy.trace(@src());
     defer trace.end();
 
-    const thread_count: usize = if (max_threads) |t| t else (std.Thread.getCpuCount() catch 1);
-    const mode: compile.package.Mode = if (thread_count <= 1) .single_threaded else .multi_threaded;
+    const thread_count, const mode = resolveThreadDefaults(max_threads);
 
     const cwd = try std.Io.Dir.cwd().realPathFileAlloc(ctx.io.std_io, ".", ctx.gpa);
     defer ctx.gpa.free(cwd);

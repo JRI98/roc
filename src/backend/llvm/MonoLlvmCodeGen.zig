@@ -1796,16 +1796,13 @@ pub const MonoLlvmCodeGen = struct {
     }
 
     fn allocProcLocalSlot(self: *MonoLlvmCodeGen, local_id: LocalId) Error!void {
-        const builder = self.builder orelse return error.CompilationFailed;
-        const wip = self.wip orelse return error.CompilationFailed;
         const local_slot = &self.local_slots[@intFromEnum(local_id)];
         if (local_slot.allocated) return;
 
         const local = self.store.getLocal(local_id);
         const sa = self.sizeAlignOf(local.layout_idx);
-        const len = builder.intValue(.i32, @max(sa.size, 1)) catch return error.OutOfMemory;
         const alignment = self.llvmAlignment(sa.alignment);
-        const ptr = wip.alloca(.normal, .i8, len, alignment, .default, "local") catch return error.OutOfMemory;
+        const ptr = try self.allocEntryBlockSlot(.i8, @max(sa.size, 1), alignment, "local");
         local_slot.* = .{
             .ptr = ptr,
             .layout_idx = local.layout_idx,
@@ -1813,6 +1810,47 @@ pub const MonoLlvmCodeGen = struct {
             .alignment = alignment,
             .allocated = true,
         };
+    }
+
+    /// Reserve fixed-size storage for one procedure activation.
+    ///
+    /// LLVM releases `alloca` storage only when the containing function
+    /// returns. Emitting one at the current cursor is therefore incorrect when
+    /// codegen is visiting a cyclic block: each trip around the cycle would
+    /// grow the native stack. Keep every fixed-size backend slot in the entry
+    /// block so all control-flow paths reuse the same frame storage.
+    fn allocEntryBlockSlot(
+        self: *MonoLlvmCodeGen,
+        ty: LlvmBuilder.Type,
+        element_count: u32,
+        alignment: LlvmBuilder.Alignment,
+        name: []const u8,
+    ) Error!LlvmBuilder.Value {
+        const builder = self.builder orelse return error.CompilationFailed;
+        const wip = self.wip orelse return error.CompilationFailed;
+
+        var resume_cursor = wip.cursor;
+        const resume_debug_location = wip.debug_location;
+        defer {
+            wip.cursor = resume_cursor;
+            wip.debug_location = resume_debug_location;
+        }
+
+        const entry_block: LlvmBuilder.Function.Block.Index = .entry;
+        wip.cursor = .{ .block = entry_block };
+        wip.debug_location = .no_location;
+        const allocated = wip.alloca(
+            .normal,
+            ty,
+            builder.intValue(.i32, element_count) catch return error.OutOfMemory,
+            alignment,
+            .default,
+            name,
+        ) catch return error.OutOfMemory;
+
+        // Inserting at instruction zero shifts an active entry-block cursor.
+        if (resume_cursor.block == entry_block) resume_cursor.instruction += 1;
+        return allocated;
     }
 
     fn unpackProcArgs(self: *MonoLlvmCodeGen, proc: LirProcSpec) Error!void {
@@ -3161,8 +3199,8 @@ pub const MonoLlvmCodeGen = struct {
     ) Error!LlvmBuilder.Value {
         const builder = self.builder orelse return error.CompilationFailed;
         const wip = self.wip orelse return error.CompilationFailed;
-        const out_low = wip.alloca(.normal, .i64, .@"1", LlvmBuilder.Alignment.fromByteUnits(8), .default, "mul_low") catch return error.OutOfMemory;
-        const out_high = wip.alloca(.normal, .i64, .@"1", LlvmBuilder.Alignment.fromByteUnits(8), .default, "mul_high") catch return error.OutOfMemory;
+        const out_low = try self.allocEntryBlockSlot(.i64, 1, LlvmBuilder.Alignment.fromByteUnits(8), "mul_low");
+        const out_high = try self.allocEntryBlockSlot(.i64, 1, LlvmBuilder.Alignment.fromByteUnits(8), "mul_high");
         const lhs_parts = try self.splitI128Value(lhs);
         const rhs_parts = try self.splitI128Value(rhs);
         const overflowed_i32 = try self.callBuiltin(
@@ -3232,8 +3270,8 @@ pub const MonoLlvmCodeGen = struct {
 
     fn callDecBinaryBuiltin(self: *MonoLlvmCodeGen, name: []const u8, lhs: LlvmBuilder.Value, rhs: LlvmBuilder.Value, pass_roc_ops: bool) Error!LlvmBuilder.Value {
         const wip = self.wip orelse return error.CompilationFailed;
-        const out_low = wip.alloca(.normal, .i64, .@"1", LlvmBuilder.Alignment.fromByteUnits(8), .default, "dec_low") catch return error.OutOfMemory;
-        const out_high = wip.alloca(.normal, .i64, .@"1", LlvmBuilder.Alignment.fromByteUnits(8), .default, "dec_high") catch return error.OutOfMemory;
+        const out_low = try self.allocEntryBlockSlot(.i64, 1, LlvmBuilder.Alignment.fromByteUnits(8), "dec_low");
+        const out_high = try self.allocEntryBlockSlot(.i64, 1, LlvmBuilder.Alignment.fromByteUnits(8), "dec_high");
         const lhs_parts = try self.splitI128Value(lhs);
         const rhs_parts = try self.splitI128Value(rhs);
         if (pass_roc_ops) {
@@ -3257,8 +3295,8 @@ pub const MonoLlvmCodeGen = struct {
 
     fn callDecUnaryBuiltin(self: *MonoLlvmCodeGen, name: []const u8, value: LlvmBuilder.Value) Error!LlvmBuilder.Value {
         const wip = self.wip orelse return error.CompilationFailed;
-        const out_low = wip.alloca(.normal, .i64, .@"1", LlvmBuilder.Alignment.fromByteUnits(8), .default, "dec_low") catch return error.OutOfMemory;
-        const out_high = wip.alloca(.normal, .i64, .@"1", LlvmBuilder.Alignment.fromByteUnits(8), .default, "dec_high") catch return error.OutOfMemory;
+        const out_low = try self.allocEntryBlockSlot(.i64, 1, LlvmBuilder.Alignment.fromByteUnits(8), "dec_low");
+        const out_high = try self.allocEntryBlockSlot(.i64, 1, LlvmBuilder.Alignment.fromByteUnits(8), "dec_high");
         const parts = try self.splitI128Value(value);
         try self.callBuiltinVoid(
             name,
@@ -3564,8 +3602,8 @@ pub const MonoLlvmCodeGen = struct {
         const arg_layout = self.localLayout(arg);
         const value = try self.loadScalar(self.slot(arg).ptr, arg_layout);
         const value64 = try self.coerceScalar(value, .i64, arg_layout.isSigned());
-        const low_ptr = wip.alloca(.normal, .i64, .@"1", LlvmBuilder.Alignment.fromByteUnits(8), .default, "dec_low") catch return error.OutOfMemory;
-        const high_ptr = wip.alloca(.normal, .i64, .@"1", LlvmBuilder.Alignment.fromByteUnits(8), .default, "dec_high") catch return error.OutOfMemory;
+        const low_ptr = try self.allocEntryBlockSlot(.i64, 1, LlvmBuilder.Alignment.fromByteUnits(8), "dec_low");
+        const high_ptr = try self.allocEntryBlockSlot(.i64, 1, LlvmBuilder.Alignment.fromByteUnits(8), "dec_high");
         const fn_name = if (arg_layout.isSigned()) "roc_builtins_i64_to_dec" else "roc_builtins_u64_to_dec";
         try self.callBuiltinVoid(fn_name, &.{ try self.ptrType(), try self.ptrType(), .i64 }, &.{ low_ptr, high_ptr, value64 });
         const low = wip.load(.normal, .i64, low_ptr, LlvmBuilder.Alignment.fromByteUnits(8), "") catch return error.OutOfMemory;
@@ -4004,13 +4042,13 @@ pub const MonoLlvmCodeGen = struct {
             capture_slots[i] = switch (step.capture) {
                 .discard => null,
                 .view => .{
-                    .start_ptr = wip.alloca(.normal, usize_ty, .@"1", usize_alignment, .default, "str_match_capture_start") catch return error.OutOfMemory,
-                    .end_ptr = wip.alloca(.normal, usize_ty, .@"1", usize_alignment, .default, "str_match_capture_end") catch return error.OutOfMemory,
+                    .start_ptr = try self.allocEntryBlockSlot(usize_ty, 1, usize_alignment, "str_match_capture_start"),
+                    .end_ptr = try self.allocEntryBlockSlot(usize_ty, 1, usize_alignment, "str_match_capture_end"),
                 },
             };
         }
 
-        const cursor_ptr = wip.alloca(.normal, usize_ty, .@"1", usize_alignment, .default, "str_match_cursor") catch return error.OutOfMemory;
+        const cursor_ptr = try self.allocEntryBlockSlot(usize_ty, 1, usize_alignment, "str_match_cursor");
         const zero = builder.intValue(usize_ty, 0) catch return error.OutOfMemory;
         try self.storeUsize(cursor_ptr, zero);
 
@@ -5097,7 +5135,7 @@ pub const MonoLlvmCodeGen = struct {
         _ = wip.brCond(len_ok, search_init_block, false_block, .then_likely) catch return error.OutOfMemory;
 
         wip.cursor = .{ .block = search_init_block };
-        const cursor_ptr = wip.alloca(.normal, usize_ty, .@"1", self.targetPointerAlignment(), .default, "str_contains_cursor") catch return error.OutOfMemory;
+        const cursor_ptr = try self.allocEntryBlockSlot(usize_ty, 1, self.targetPointerAlignment(), "str_contains_cursor");
         try self.storeUsize(cursor_ptr, zero);
         const limit = wip.bin(.sub, haystack.len, needle.len, "") catch return error.OutOfMemory;
         const first_byte = wip.load(.normal, .i8, needle.bytes, LlvmBuilder.Alignment.fromByteUnits(1), "") catch return error.OutOfMemory;
@@ -5180,14 +5218,7 @@ pub const MonoLlvmCodeGen = struct {
         const affix = try self.emitStrByteSliceForLocal(GuardedList.at(args, 1));
         const target_slot = self.slot(target);
         const result_ptr = if (target == GuardedList.at(args, 0))
-            wip.alloca(
-                .normal,
-                .i8,
-                builder.intValue(.i32, @max(target_slot.size, 1)) catch return error.OutOfMemory,
-                target_slot.alignment,
-                .default,
-                "str_drop_result",
-            ) catch return error.OutOfMemory
+            try self.allocEntryBlockSlot(.i8, @max(target_slot.size, 1), target_slot.alignment, "str_drop_result")
         else
             target_slot.ptr;
 
@@ -5631,20 +5662,16 @@ pub const MonoLlvmCodeGen = struct {
     }
 
     fn emitStrFindFirst(self: *MonoLlvmCodeGen, target: LocalId, args: anytype) Error!void {
-        const builder = self.builder orelse return error.CompilationFailed;
-        const wip = self.wip orelse return error.CompilationFailed;
         const target_slot = self.slot(target);
         const info = try self.resolveStrFindFirstLayout(target_slot.layout_idx);
         if (target_slot.size > 0) try self.zeroBytes(target_slot.ptr, target_slot.size);
 
-        const layout_ptr = wip.alloca(
-            .normal,
+        const layout_ptr = try self.allocEntryBlockSlot(
             .i8,
-            builder.intValue(.i32, @sizeOf(builtins.dev_wrappers.StrFindFirstLayout)) catch return error.OutOfMemory,
+            @sizeOf(builtins.dev_wrappers.StrFindFirstLayout),
             LlvmBuilder.Alignment.fromByteUnits(@alignOf(builtins.dev_wrappers.StrFindFirstLayout)),
-            .default,
             "str_find_first_layout",
-        ) catch return error.OutOfMemory;
+        );
 
         try self.storeRawInt(layout_ptr, 0, .i32, info.after_offset, 4);
         try self.storeRawInt(layout_ptr, 4, .i32, info.before_offset, 4);
@@ -5659,20 +5686,16 @@ pub const MonoLlvmCodeGen = struct {
     }
 
     fn emitStrDropPrefixCaselessAscii(self: *MonoLlvmCodeGen, target: LocalId, args: anytype) Error!void {
-        const builder = self.builder orelse return error.CompilationFailed;
-        const wip = self.wip orelse return error.CompilationFailed;
         const target_slot = self.slot(target);
         const info = try self.resolveStrDropPrefixCaselessAsciiLayout(target_slot.layout_idx);
         if (target_slot.size > 0) try self.zeroBytes(target_slot.ptr, target_slot.size);
 
-        const layout_ptr = wip.alloca(
-            .normal,
+        const layout_ptr = try self.allocEntryBlockSlot(
             .i8,
-            builder.intValue(.i32, @sizeOf(builtins.dev_wrappers.StrDropPrefixCaselessAsciiLayout)) catch return error.OutOfMemory,
+            @sizeOf(builtins.dev_wrappers.StrDropPrefixCaselessAsciiLayout),
             LlvmBuilder.Alignment.fromByteUnits(@alignOf(builtins.dev_wrappers.StrDropPrefixCaselessAsciiLayout)),
-            .default,
             "str_drop_prefix_caseless_ascii_layout",
-        ) catch return error.OutOfMemory;
+        );
 
         try self.storeRawInt(layout_ptr, 0, .i32, info.after_offset, 4);
         try self.storeRawInt(layout_ptr, 4, .i32, info.found_offset, 4);
@@ -5742,20 +5765,16 @@ pub const MonoLlvmCodeGen = struct {
     }
 
     fn emitStrFromUtf8(self: *MonoLlvmCodeGen, target: LocalId, arg: LocalId) Error!void {
-        const builder = self.builder orelse return error.CompilationFailed;
-        const wip = self.wip orelse return error.CompilationFailed;
         const target_slot = self.slot(target);
         const info = try self.resolveStrFromUtf8Layout(target_slot.layout_idx);
         if (target_slot.size > 0) try self.zeroBytes(target_slot.ptr, target_slot.size);
 
-        const layout_ptr = wip.alloca(
-            .normal,
+        const layout_ptr = try self.allocEntryBlockSlot(
             .i8,
-            builder.intValue(.i32, @sizeOf(builtins.dev_wrappers.StrFromUtf8Layout)) catch return error.OutOfMemory,
+            @sizeOf(builtins.dev_wrappers.StrFromUtf8Layout),
             LlvmBuilder.Alignment.fromByteUnits(@alignOf(builtins.dev_wrappers.StrFromUtf8Layout)),
-            .default,
             "str_from_utf8_layout",
-        ) catch return error.OutOfMemory;
+        );
 
         try self.storeRawInt(layout_ptr, 0, .i64, info.ok_tag, 8);
         try self.storeRawInt(layout_ptr, 8, .i64, info.err_tag, 8);
@@ -6321,7 +6340,6 @@ pub const MonoLlvmCodeGen = struct {
 
     fn emitListSet(self: *MonoLlvmCodeGen, target: LocalId, args: anytype, unique_args: u64) Error!void {
         const builder = self.builder orelse return error.CompilationFailed;
-        const wip = self.wip orelse return error.CompilationFailed;
         const abi = self.layouts().builtinListAbi(self.localLayout(GuardedList.at(args, 0)));
         if (abi.elem_size == 0) {
             try self.copyBytes(self.slot(target).ptr, self.slot(GuardedList.at(args, 0)).ptr, self.slot(target).size, self.slot(target).alignment);
@@ -6333,14 +6351,12 @@ pub const MonoLlvmCodeGen = struct {
         // listReplace copies the displaced element into out_element before
         // overwriting it. list_set discards that value, but the builtin still
         // needs a real slot to write.
-        const old_elem_ptr = wip.alloca(
-            .normal,
+        const old_elem_ptr = try self.allocEntryBlockSlot(
             .i8,
-            builder.intValue(.i32, abi.elem_size) catch return error.OutOfMemory,
+            abi.elem_size,
             LlvmBuilder.Alignment.fromByteUnits(@max(abi.elem_alignment, 1)),
-            .default,
             "list_set_old_elem",
-        ) catch return error.OutOfMemory;
+        );
 
         try call_args.prepend(self.allocator, try self.ptrType(), self.slot(target).ptr);
         try call_args.append(self.allocator, .i32, builder.intValue(.i32, abi.elem_alignment) catch return error.OutOfMemory);
@@ -6467,14 +6483,11 @@ pub const MonoLlvmCodeGen = struct {
 
     /// ptr_alloca: () -> Ptr(T). Reserve a zeroed slot for T and store its
     /// address into the target. TRMC emits this once per proc entry (pre-loop),
-    /// so a .normal alloca at the op site executes once per call.
+    /// and allocEntryBlockSlot keeps the physical slot in the entry frame.
     fn emitPtrAlloca(self: *MonoLlvmCodeGen, target: LocalId) Error!void {
-        const builder = self.builder orelse return error.CompilationFailed;
-        const wip = self.wip orelse return error.CompilationFailed;
         const elem_idx = self.layoutValue(self.localLayout(target)).getIdx();
         const sa = self.sizeAlignOf(elem_idx);
-        const len = builder.intValue(.i32, @max(sa.size, 1)) catch return error.OutOfMemory;
-        const slot_ptr = wip.alloca(.normal, .i8, len, self.llvmAlignment(sa.alignment), .default, "trmc_slot") catch return error.OutOfMemory;
+        const slot_ptr = try self.allocEntryBlockSlot(.i8, @max(sa.size, 1), self.llvmAlignment(sa.alignment), "trmc_slot");
         if (sa.size > 0) try self.zeroBytes(slot_ptr, sa.size);
         try self.storePointer(self.slot(target).ptr, slot_ptr);
     }
@@ -6721,12 +6734,12 @@ pub const MonoLlvmCodeGen = struct {
             return;
         }
 
-        const result_ptr = wip.alloca(.normal, .i8, .@"1", LlvmBuilder.Alignment.fromByteUnits(1), .default, "list_eq") catch return error.OutOfMemory;
+        const result_ptr = try self.allocEntryBlockSlot(.i8, 1, LlvmBuilder.Alignment.fromByteUnits(1), "list_eq");
         try self.storeBool(result_ptr, len_eq);
         const header = wip.block(0, "list_eq_header") catch return error.OutOfMemory;
         const body = wip.block(0, "list_eq_body") catch return error.OutOfMemory;
         const after = wip.block(0, "list_eq_after") catch return error.OutOfMemory;
-        const idx_ptr = wip.alloca(.normal, .i64, .@"1", LlvmBuilder.Alignment.fromByteUnits(8), .default, "list_eq_idx") catch return error.OutOfMemory;
+        const idx_ptr = try self.allocEntryBlockSlot(.i64, 1, LlvmBuilder.Alignment.fromByteUnits(8), "list_eq_idx");
         _ = wip.store(.normal, builder.intValue(.i64, 0) catch return error.OutOfMemory, idx_ptr, LlvmBuilder.Alignment.fromByteUnits(8)) catch return error.OutOfMemory;
         _ = wip.br(header) catch return error.OutOfMemory;
         wip.cursor = .{ .block = header };
@@ -6792,7 +6805,7 @@ pub const MonoLlvmCodeGen = struct {
         const disc_eq = wip.icmp(.eq, lhs_disc, rhs_disc, "") catch return error.OutOfMemory;
         const data = self.layouts().getTagUnionData(self.layoutValue(tag_layout).getTagUnion().idx);
         const variants = self.layouts().getTagUnionVariants(data);
-        const result_ptr = wip.alloca(.normal, .i8, .@"1", LlvmBuilder.Alignment.fromByteUnits(1), .default, "tag_eq") catch return error.OutOfMemory;
+        const result_ptr = try self.allocEntryBlockSlot(.i8, 1, LlvmBuilder.Alignment.fromByteUnits(1), "tag_eq");
         try self.storeBool(result_ptr, disc_eq);
         const after = wip.block(0, "tag_eq_after") catch return error.OutOfMemory;
         const mismatch = wip.block(0, "tag_eq_mismatch") catch return error.OutOfMemory;
@@ -7880,17 +7893,13 @@ pub const MonoLlvmCodeGen = struct {
     }
 
     fn allocArgBuffer(self: *MonoLlvmCodeGen, arg_layouts: []const layout.Idx, rounded_slots: bool) Error!LlvmBuilder.Value {
-        const builder = self.builder orelse return error.CompilationFailed;
-        const wip = self.wip orelse return error.CompilationFailed;
         const size = try self.argBufferSize(arg_layouts, rounded_slots);
-        const ptr = wip.alloca(.normal, .i8, builder.intValue(.i32, size) catch return error.OutOfMemory, LlvmBuilder.Alignment.fromByteUnits(16), .default, "args") catch return error.OutOfMemory;
+        const ptr = try self.allocEntryBlockSlot(.i8, size, LlvmBuilder.Alignment.fromByteUnits(16), "args");
         try self.zeroBytes(ptr, size);
         return ptr;
     }
 
     fn allocHostedArgBuffer(self: *MonoLlvmCodeGen, arg_layouts: []const layout.Idx) Error!LlvmBuilder.Value {
-        const builder = self.builder orelse return error.CompilationFailed;
-        const wip = self.wip orelse return error.CompilationFailed;
         var total: u32 = 0;
         for (arg_layouts) |arg_layout| {
             const sa = self.sizeAlignOf(arg_layout);
@@ -7898,7 +7907,7 @@ pub const MonoLlvmCodeGen = struct {
             total += sa.size;
         }
         total = @max(total, 8);
-        const ptr = wip.alloca(.normal, .i8, builder.intValue(.i32, total) catch return error.OutOfMemory, LlvmBuilder.Alignment.fromByteUnits(16), .default, "host_args") catch return error.OutOfMemory;
+        const ptr = try self.allocEntryBlockSlot(.i8, total, LlvmBuilder.Alignment.fromByteUnits(16), "host_args");
         try self.zeroBytes(ptr, total);
         return ptr;
     }
@@ -8419,9 +8428,19 @@ pub const MonoLlvmCodeGen = struct {
             }
         }
 
-        for (wip.blocks.items) |*block| {
+        for (wip.blocks.items, 0..) |*block, block_idx| {
             for (block.instructions.items) |instruction| {
-                switch (wip.instructions.get(@intFromEnum(instruction)).tag) {
+                const tag = wip.instructions.get(@intFromEnum(instruction)).tag;
+                if (builtin.mode == .Debug and block_idx != 0) {
+                    switch (tag) {
+                        .alloca, .@"alloca inalloca" => std.debug.panic(
+                            "LLVM/codegen invariant violated: fixed-lifetime alloca emitted outside the procedure entry block",
+                            .{},
+                        ),
+                        else => {},
+                    }
+                }
+                switch (tag) {
                     .phi, .@"phi fast" => if (block.incoming != block.branches) return error.CompilationFailed,
                     else => {},
                 }

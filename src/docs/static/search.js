@@ -770,11 +770,14 @@ const setupDocsSoftNavigation = () => {
         const linkUrl = docsUrl(link.getAttribute("href"), window.location.href);
         if (!linkUrl) return;
 
-        link.classList.toggle(
-          "active",
+        const isActive =
           linkUrl.pathname === targetUrl.pathname &&
-            linkUrl.search === targetUrl.search,
-        );
+          linkUrl.search === targetUrl.search;
+
+        link.classList.toggle("active", isActive);
+
+        const details = link.parentElement?.querySelector(":scope > details");
+        if (details) details.open = isActive;
       });
 
     currentSidebar.querySelectorAll(".sidebar-value[href]").forEach((link) => {

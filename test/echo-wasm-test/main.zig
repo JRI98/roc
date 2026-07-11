@@ -247,6 +247,29 @@ pub fn main(init: std.process.Init) anyerror!void {
     requireNotContains(bad_stderr, "/app/main.roc", "diagnostic stderr");
     requireNotContains(bad_stderr, "<div", "diagnostic stderr");
     requireNotContains(bad_stderr, "<span", "diagnostic stderr");
+    requireNotContains(bad_stderr, "echo: step", "diagnostic stderr");
+
+    resetCapturedOutput();
+    try invokeInit(module_instance, init_handle);
+
+    const malformed_src =
+        \\main! = |_| {
+        \\    todo = { name "Call mom", done: False }
+        \\    Ok({})
+        \\}
+    ;
+    const malformed_exit_code = try compileAndRunSource(module_instance, alloc_handle, run_handle, malformed_src);
+    const malformed_stderr = capture_ctx.stderr.items;
+
+    if (malformed_exit_code != 255) {
+        std.debug.print("FAIL: malformed source returned exit code {d}\n", .{malformed_exit_code});
+        std.debug.print("stderr:\n{s}\n", .{malformed_stderr});
+        std.process.exit(1);
+    }
+
+    requireContains(malformed_stderr, "SYNTAX", "syntax diagnostic stderr");
+    requireContains(malformed_stderr, "main.roc", "syntax diagnostic stderr");
+    requireNotContains(malformed_stderr, "echo: step", "syntax diagnostic stderr");
 
     std.debug.print("PASS: echo.wasm tutorial and diagnostic cases produced expected output.\n", .{});
 }

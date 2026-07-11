@@ -1620,7 +1620,7 @@ pub fn getWhereClause(store: *const NodeStore, whereClause: CIR.WhereClause.Idx)
     const payload = node.getPayload();
 
     switch (node.tag) {
-        .where_method => {
+        .where_method, .where_method_effectful => {
             const p = payload.where_clause;
             const var_ = @as(CIR.TypeAnno.Idx, @enumFromInt(p.var_idx));
             const method_name = @as(Ident.Idx, @bitCast(p.name));
@@ -1633,6 +1633,7 @@ pub fn getWhereClause(store: *const NodeStore, whereClause: CIR.WhereClause.Idx)
                 .method_name = method_name,
                 .args = .{ .span = .{ .start = args_ret.start, .len = args_ret.len } },
                 .ret = @enumFromInt(args_ret.node),
+                .effectful = node.tag == .where_method_effectful,
             } };
         },
         .where_alias => {
@@ -2910,7 +2911,7 @@ pub fn addWhereClause(store: *NodeStore, whereClause: CIR.WhereClause, region: b
 
     switch (whereClause) {
         .w_method => |where_method| {
-            node.tag = .where_method;
+            node.tag = if (where_method.effectful) .where_method_effectful else .where_method;
             const args_ret_idx: u32 = @intCast(store.span_with_node_data.len());
             _ = try store.span_with_node_data.append(store.gpa, .{
                 .start = where_method.args.span.start,

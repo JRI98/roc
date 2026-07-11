@@ -4005,15 +4005,7 @@ fn processDevObjectSnapshot(
                 break :target_snapshot;
             }
 
-            const target_usize: base.target.TargetUsize = switch (target.ptrBitWidth()) {
-                32 => .u32,
-                64 => .u64,
-                else => {
-                    hash_results[i].hash_hex = undefined;
-                    hash_results[i].supported = false;
-                    break :target_snapshot;
-                },
-            };
+            const target_usize = base.target.TargetUsize.fromPtrBitWidth(target.ptrBitWidth());
             const build_roots = try lir.CheckedPipeline.selectPlatformExportRoots(allocator, root_artifact.root_requests.runtime_requests);
             defer allocator.free(build_roots);
 

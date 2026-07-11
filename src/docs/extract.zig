@@ -50,7 +50,7 @@ pub fn extractModuleDocComment(gpa: Allocator, source: []const u8) Allocator.Err
         }
 
         // Check for ## doc comment
-        if (pos + 2 <= source.len and source[pos] == '#' and source[pos + 1] == '#') {
+        if (base.doc_comment.startsWithHashHash(source[pos..])) {
             if (lines.items.len == 0) {
                 first_line_byte = @intCast(line_start);
             }
@@ -130,17 +130,13 @@ pub fn extractDocComment(gpa: Allocator, source: []const u8, def_start_offset: u
         const line = source[line_start..pos];
         const trimmed = trimLeft(line);
 
-        if (trimmed.len >= 2 and trimmed[0] == '#' and trimmed[1] == '#') {
+        if (base.doc_comment.startsWithHashHash(trimmed)) {
             // Track the earliest doc-comment line we've seen so far. Since we
             // scan bottom-up and lines are added in reverse, the most recent
             // assignment to this is the topmost ## line of the block.
             first_line_byte = @intCast(line_start);
             // It's a doc comment line
-            var content = trimmed[2..];
-            // Skip optional leading space after ##
-            if (content.len > 0 and content[0] == ' ') {
-                content = content[1..];
-            }
+            const content = base.doc_comment.stripPrefix(trimmed);
             try lines.append(gpa, content);
         } else if (trimmed.len == 0) {
             // Empty/whitespace line — stop looking if we already have doc lines

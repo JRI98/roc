@@ -10,6 +10,8 @@ const bytebox = @import("bytebox");
 const collections = @import("collections");
 const i128h = builtins.compiler_rt_128;
 const is_freestanding = builtin.target.os.tag == .freestanding;
+/// Dec's scaling factor (10^18) as an i128, sourced from the canonical Dec type.
+const dec_one_i128: i128 = builtins.dec.RocDec.one_point_zero_i128;
 
 /// Errors that can occur during WebAssembly evaluation.
 pub const WasmEvalError = error{
@@ -750,7 +752,7 @@ fn hostDecDiv(_: ?*anyopaque, module: *bytebox.ModuleInstance, params: [*]const 
     const buffer = module.store.getMemory(0).buffer();
     const lhs = readI128FromMem(buffer, @intCast(params[0].I32));
     const rhs = readI128FromMem(buffer, @intCast(params[1].I32));
-    const scaled: i256 = @as(i256, lhs) * 1_000_000_000_000_000_000;
+    const scaled: i256 = @as(i256, lhs) * @as(i256, dec_one_i128);
     writeI128ToMem(buffer, @intCast(params[2].I32), @intCast(@divTrunc(scaled, rhs)));
 }
 
@@ -758,7 +760,7 @@ fn hostDecDivTrunc(_: ?*anyopaque, module: *bytebox.ModuleInstance, params: [*]c
     const buffer = module.store.getMemory(0).buffer();
     const lhs = readI128FromMem(buffer, @intCast(params[0].I32));
     const rhs = readI128FromMem(buffer, @intCast(params[1].I32));
-    writeI128ToMem(buffer, @intCast(params[2].I32), @divTrunc(lhs, rhs) * 1_000_000_000_000_000_000);
+    writeI128ToMem(buffer, @intCast(params[2].I32), @divTrunc(lhs, rhs) * dec_one_i128);
 }
 
 const DecUnaryMathOp = enum {
@@ -1017,18 +1019,18 @@ fn hostIntToStr(_: ?*anyopaque, module: *bytebox.ModuleInstance, params: [*]cons
 fn hostU128ToDec(_: ?*anyopaque, module: *bytebox.ModuleInstance, params: [*]const bytebox.Val, results: [*]bytebox.Val) error{}!void {
     const buffer = module.store.getMemory(0).buffer();
     const val = readU128FromMem(buffer, @intCast(params[0].I32));
-    const max_val: u128 = @as(u128, @bitCast(@as(i128, std.math.maxInt(i128)))) / 1_000_000_000_000_000_000;
+    const max_val: u128 = @as(u128, @bitCast(@as(i128, std.math.maxInt(i128)))) / @as(u128, @intCast(dec_one_i128));
     if (val > max_val) {
         results[0] = .{ .I32 = 0 };
         return;
     }
-    writeI128ToMem(buffer, @intCast(params[1].I32), @intCast(val * 1_000_000_000_000_000_000));
+    writeI128ToMem(buffer, @intCast(params[1].I32), @intCast(val * @as(u128, @intCast(dec_one_i128))));
     results[0] = .{ .I32 = 1 };
 }
 
 fn hostI128ToDec(_: ?*anyopaque, module: *bytebox.ModuleInstance, params: [*]const bytebox.Val, results: [*]bytebox.Val) error{}!void {
     const buffer = module.store.getMemory(0).buffer();
-    const wide_result = @as(i256, readI128FromMem(buffer, @intCast(params[0].I32))) * 1_000_000_000_000_000_000;
+    const wide_result = @as(i256, readI128FromMem(buffer, @intCast(params[0].I32))) * @as(i256, dec_one_i128);
     if (wide_result > std.math.maxInt(i128) or wide_result < std.math.minInt(i128)) {
         results[0] = .{ .I32 = 0 };
         return;
@@ -1039,13 +1041,13 @@ fn hostI128ToDec(_: ?*anyopaque, module: *bytebox.ModuleInstance, params: [*]con
 
 fn hostDecToI128(_: ?*anyopaque, module: *bytebox.ModuleInstance, params: [*]const bytebox.Val, results: [*]bytebox.Val) error{}!void {
     const buffer = module.store.getMemory(0).buffer();
-    writeI128ToMem(buffer, @intCast(params[1].I32), @divTrunc(readI128FromMem(buffer, @intCast(params[0].I32)), 1_000_000_000_000_000_000));
+    writeI128ToMem(buffer, @intCast(params[1].I32), @divTrunc(readI128FromMem(buffer, @intCast(params[0].I32)), dec_one_i128));
     results[0] = .{ .I32 = 1 };
 }
 
 fn hostDecToU128(_: ?*anyopaque, module: *bytebox.ModuleInstance, params: [*]const bytebox.Val, results: [*]bytebox.Val) error{}!void {
     const buffer = module.store.getMemory(0).buffer();
-    const result = @divTrunc(readI128FromMem(buffer, @intCast(params[0].I32)), 1_000_000_000_000_000_000);
+    const result = @divTrunc(readI128FromMem(buffer, @intCast(params[0].I32)), dec_one_i128);
     if (result < 0) {
         results[0] = .{ .I32 = 0 };
         return;
@@ -1056,7 +1058,7 @@ fn hostDecToU128(_: ?*anyopaque, module: *bytebox.ModuleInstance, params: [*]con
 
 fn hostDecToF32(_: ?*anyopaque, module: *bytebox.ModuleInstance, params: [*]const bytebox.Val, results: [*]bytebox.Val) error{}!void {
     const buffer = module.store.getMemory(0).buffer();
-    const f64_val: f64 = @as(f64, @floatFromInt(readI128FromMem(buffer, @intCast(params[0].I32)))) / 1_000_000_000_000_000_000.0;
+    const f64_val: f64 = @as(f64, @floatFromInt(readI128FromMem(buffer, @intCast(params[0].I32)))) / @as(f64, @floatFromInt(dec_one_i128));
     results[0] = .{ .F32 = @floatCast(f64_val) };
 }
 

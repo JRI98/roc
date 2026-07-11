@@ -1243,6 +1243,7 @@ pub fn addWhereClause(store: *NodeStore, clause: AST.WhereClause) std.mem.Alloca
             try store.extra_data.append(store.gpa, @intFromEnum(c.args));
             try store.extra_data.append(store.gpa, @intFromEnum(c.ret_anno));
             node.data.lhs = @intCast(ed_start);
+            node.data.rhs = @intFromBool(c.effectful);
         },
         .mod_alias => |c| {
             node.tag = .where_mod_alias;
@@ -2321,6 +2322,7 @@ pub fn getWhereClause(store: *const NodeStore, where_clause_idx: AST.WhereClause
                 .name_tok = name_tok,
                 .args = @enumFromInt(args),
                 .ret_anno = @enumFromInt(ret_anno),
+                .effectful = node.data.rhs != 0,
             } };
         },
         .where_mod_alias => {

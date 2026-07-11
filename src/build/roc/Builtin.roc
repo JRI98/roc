@@ -4452,8 +4452,8 @@ Builtin :: [].{
 			shifts : U8,
 		}
 
-		## Returns `Bool.True` if the two dictionaries contain the same key-value
-		## pairs, and `Bool.False` otherwise.
+		## Returns [True] if the two dictionaries contain the same key-value
+		## pairs, and [False] otherwise.
 		is_eq : Dict(k, v), Dict(k, v) -> Bool
 			where [
 				k.is_eq : k, k -> Bool,

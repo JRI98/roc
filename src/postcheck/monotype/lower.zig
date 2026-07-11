@@ -25253,8 +25253,10 @@ fn constGeneratedCaptureNode(fn_value: check.ConstStore.ConstFn, capture_id: u32
 }
 
 fn monotypePrimitive(primitive: check.ConstStore.Primitive) Type.Primitive {
-    return std.meta.stringToEnum(Type.Primitive, @tagName(primitive)) orelse
-        Common.invariant("ConstStore primitive had no Monotype primitive equivalent");
+    // `check.ConstStore.Primitive` and `Type.Primitive` both alias the same
+    // `CheckedPrimitive` enum, so this is an identity mapping and any future
+    // divergence becomes a compile error here.
+    return primitive;
 }
 
 fn monotypeNamedKind(kind: check.ConstStore.TypeNamedKind) Type.NamedKind {

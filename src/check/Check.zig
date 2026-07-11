@@ -5920,9 +5920,13 @@ fn hoistedRootDependenciesAreKeptInternal(
         .e_call => |call| (try self.hoistedRootCalleeAllowsStoredConst(call.func, context)) and
             (try self.hoistedRootDependenciesAreKeptInternal(call.func, context, keep_oracle)) and
             try self.hoistedRootExprSpanDependenciesAreKept(call.args, context, keep_oracle),
-        .e_method_call => |call| (try self.hoistedRootDependenciesAreKeptInternal(call.receiver, context, keep_oracle)) and
-            try self.hoistedRootExprSpanDependenciesAreKept(call.args, context, keep_oracle),
-        .e_dispatch_call => |call| !self.varIsEffectfulFunction(call.constraint_fn_var) and
+        // Surface method calls must have been rewritten to checked dispatch
+        // calls before the settled hoistability walk can classify them.
+        .e_method_call => false,
+        .e_dispatch_call => |call| (try self.staticDispatchAllowsHoistedRoot(
+            ModuleEnv.varFrom(call.receiver),
+            call.constraint_fn_var,
+        )) and
             (try self.hoistedRootDependenciesAreKeptInternal(call.receiver, context, keep_oracle)) and
             try self.hoistedRootExprSpanDependenciesAreKept(call.args, context, keep_oracle),
         .e_record => |record| self.hoistedRootRecordDependenciesAreKept(record.fields, record.ext, context, keep_oracle),
@@ -5935,9 +5939,11 @@ fn hoistedRootDependenciesAreKeptInternal(
         .e_unary_not => |unary| self.hoistedRootDependenciesAreKeptInternal(unary.expr, context, keep_oracle),
         .e_field_access => |field| self.hoistedRootDependenciesAreKeptInternal(field.receiver, context, keep_oracle),
         .e_interpolation => |interpolation| blk: {
-            if (interpolation.constraint_fn_var) |fn_var| {
-                if (self.varIsEffectfulFunction(fn_var)) break :blk false;
-            }
+            const fn_var = interpolation.constraint_fn_var orelse break :blk false;
+            if (!try self.staticDispatchAllowsHoistedRoot(
+                self.interpolationDispatchOwnerVar(expr),
+                fn_var,
+            )) break :blk false;
             break :blk (try self.hoistedRootDependenciesAreKeptInternal(interpolation.first, context, keep_oracle)) and
                 try self.hoistedRootExprSpanDependenciesAreKept(interpolation.parts, context, keep_oracle);
         },
@@ -5945,11 +5951,19 @@ fn hoistedRootDependenciesAreKeptInternal(
             try self.hoistedRootDependenciesAreKeptInternal(eq.rhs, context, keep_oracle),
         .e_structural_hash => |h| (try self.hoistedRootDependenciesAreKeptInternal(h.value, context, keep_oracle)) and
             try self.hoistedRootDependenciesAreKeptInternal(h.hasher, context, keep_oracle),
-        .e_method_eq => |eq| !self.varIsEffectfulFunction(eq.constraint_fn_var) and
+        .e_method_eq => |eq| (try self.staticDispatchAllowsHoistedRoot(
+            ModuleEnv.varFrom(eq.lhs),
+            eq.constraint_fn_var,
+        )) and
             (try self.hoistedRootDependenciesAreKeptInternal(eq.lhs, context, keep_oracle)) and
             try self.hoistedRootDependenciesAreKeptInternal(eq.rhs, context, keep_oracle),
-        .e_type_method_call => |call| self.hoistedRootExprSpanDependenciesAreKept(call.args, context, keep_oracle),
-        .e_type_dispatch_call => |call| !self.varIsEffectfulFunction(call.constraint_fn_var) and
+        // Like value method calls, surface type-method calls are not checked
+        // dispatch plans and therefore cannot establish compile-time safety.
+        .e_type_method_call => false,
+        .e_type_dispatch_call => |call| (try self.staticDispatchAllowsHoistedRoot(
+            self.typeDispatchOwnerVar(call.type_dispatch_stmt),
+            call.constraint_fn_var,
+        )) and
             try self.hoistedRootExprSpanDependenciesAreKept(call.args, context, keep_oracle),
         .e_tuple_access => |access| self.hoistedRootDependenciesAreKeptInternal(access.tuple, context, keep_oracle),
     };
@@ -7791,6 +7805,18 @@ fn varIsEffectfulFunction(self: *Self, var_: Var) bool {
             .err, .flex, .rigid => return false,
         }
     }
+}
+
+/// A dispatch can be evaluated as one module-level constant only when checking
+/// has fixed both parts that make the operation context-independent: its
+/// checked callable is not effectful and its complete dispatcher type is
+/// concrete.
+/// A constrained or otherwise open dispatcher needs specialization-edge
+/// evidence, so selecting it as a caller-less compile-time root would erase the
+/// evidence scope that gives the dispatch meaning.
+fn staticDispatchAllowsHoistedRoot(self: *Self, dispatcher_var: Var, callable_var: Var) Allocator.Error!bool {
+    if (!self.varIsFunctionType(callable_var) or self.varIsEffectfulFunction(callable_var)) return false;
+    return try self.varIsConcreteHoistedConstType(dispatcher_var);
 }
 
 fn exprHasEffectfulFunctionBody(self: *const Self, expr_idx: CIR.Expr.Idx) bool {
@@ -9695,7 +9721,10 @@ fn generateStaticDispatchConstraintFromWhere(self: *Self, where_idx: CIR.WhereCl
             const ret_var = ModuleEnv.varFrom(method.ret);
 
             // Create the function var
-            const func_content = try self.types.mkFuncUnbound(anno_arg_vars, ret_var);
+            const func_content = if (method.effectful)
+                try self.types.mkFuncEffectful(anno_arg_vars, ret_var)
+            else
+                try self.types.mkFuncPure(anno_arg_vars, ret_var);
             const func_var = try self.freshFromContent(func_content, env, where_region);
 
             // Add to scratch list
@@ -12903,6 +12932,10 @@ fn checkExpr(self: *Self, expr_idx: CIR.Expr.Idx, env: *Env, expected: Expected)
                     constraint_fn_var,
                     .method_call,
                 );
+                if (self.varIsEffectfulFunction(constraint_fn_var)) {
+                    self.markCurrentHoistObservableEffect();
+                    does_fx = true;
+                }
             }
         },
         .e_dispatch_call => |method_call| {
@@ -13014,6 +13047,10 @@ fn checkExpr(self: *Self, expr_idx: CIR.Expr.Idx, env: *Env, expected: Expected)
                     method_call.args,
                     constraint_fn_var,
                 );
+                if (self.varIsEffectfulFunction(constraint_fn_var)) {
+                    self.markCurrentHoistObservableEffect();
+                    does_fx = true;
+                }
             }
         },
         .e_type_dispatch_call => |method_call| {
@@ -14538,6 +14575,19 @@ fn typeDispatchOwnerVar(self: *Self, stmt_idx: CIR.Statement.Idx) Var {
         .s_type_var_alias => |alias| ModuleEnv.varFrom(alias.type_var_anno),
         .s_alias_decl => ModuleEnv.varFrom(stmt_idx),
         else => @panic("type dispatch owner statement was not a type-var alias or type alias"),
+    };
+}
+
+fn interpolationDispatchOwnerVar(self: *Self, expr_idx: CIR.Expr.Idx) Var {
+    const suffix_target = self.cir.numericSuffixTargetForNode(ModuleEnv.nodeIdxFrom(expr_idx)) orelse
+        return ModuleEnv.varFrom(expr_idx);
+
+    return switch (suffix_target.target()) {
+        .local => |stmt_idx| ModuleEnv.varFrom(stmt_idx),
+        .invalid => ModuleEnv.varFrom(expr_idx),
+        .builtin, .external => if (builtin.mode == .Debug) {
+            std.debug.panic("check invariant violated: interpolation suffix target was not a local type", .{});
+        } else unreachable,
     };
 }
 

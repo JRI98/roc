@@ -2101,46 +2101,6 @@ const TypeTable = struct {
         return idx;
     }
 
-    /// Target-independent `SortKey` for a type table entry (see `layout.SortKey`).
-    /// Mirrors `layout.Store.layoutSortKey` over glue's own type representation so
-    /// `roc glue` orders structural records/tuples identically to the layout store
-    /// on both 32-bit and 64-bit targets.
-    fn getSortKey(self: *const TypeTable, type_id: u64) layout.SortKey {
-        if (type_id >= self.entries.items.len) {
-            glueInvariant("type id {d} out of bounds while reading layout sort key", .{type_id});
-        }
-        return self.getSortKeyForRepr(self.entries.items[@intCast(type_id)].repr);
-    }
-
-    fn getSortKeyForRepr(self: *const TypeTable, repr: CollectedTypeRepr) layout.SortKey {
-        return switch (repr) {
-            .bool_, .u8_, .i8_, .unit, .unknown => .align_1,
-            .u16_, .i16_ => .align_2,
-            .u32_, .i32_, .f32_ => .align_4,
-            .u64_, .i64_, .f64_ => .align_8,
-            .u128_, .i128_, .dec => .align_16,
-            .box, .str_, .list, .function => .pointer,
-            .record => |rec| blk: {
-                var key: layout.SortKey = .align_1;
-                for (rec.fields) |field| {
-                    if (field.is_padding) continue;
-                    key = key.max(self.getSortKey(field.type_id));
-                }
-                break :blk key;
-            },
-            .tag_union => |tu| blk: {
-                const disc_size = layout.TagUnionData.discriminantSize(tu.tags.len);
-                var key = layout.SortKey.fromAlignBytes(
-                    layout.TagUnionData.alignmentForDiscriminantSize(disc_size).toByteUnits(),
-                );
-                for (tu.tags) |tag| {
-                    for (tag.payload_ids) |pid| key = key.max(self.getSortKey(pid));
-                }
-                break :blk key;
-            },
-        };
-    }
-
     fn attachAbiLayouts(self: *TypeTable, build_env: *BuildEnv) Allocator.Error!void {
         var artifacts = std.ArrayList(*const CheckedArtifact.CheckedModuleArtifact).empty;
         defer artifacts.deinit(self.gpa);

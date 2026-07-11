@@ -34,6 +34,7 @@ pub const CommonEnv = @import("CommonEnv.zig");
 pub const source_utils = @import("source_utils.zig");
 pub const module_path = @import("module_path.zig");
 pub const url = @import("url.zig");
+pub const doc_comment = @import("doc_comment.zig");
 
 /// The default general-purpose allocator for the current target (fast, not leak-checking).
 /// Prefers libc's malloc (its ASan/Valgrind/LD_PRELOAD tooling, and on LLVM paths
@@ -150,4 +151,5 @@ test "base tests" {
     std.testing.refAllDecls(@import("StringLiteral.zig"));
     std.testing.refAllDecls(@import("target.zig"));
     std.testing.refAllDecls(@import("url.zig"));
+    std.testing.refAllDecls(@import("doc_comment.zig"));
 }

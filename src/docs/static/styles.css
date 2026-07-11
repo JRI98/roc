@@ -1,9 +1,4 @@
 :root {
-  /* Sidebar dropdown triangle, used as a mask on `.entry-toggle::before` so it
-     follows the toggle's color. Two back-to-back right triangles split along the
-     triangle's axis; the lower half is masked to ~55% alpha so it reads a touch
-     lighter than the upper half. */
-  --toggle-triangle: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 8 8'%3E%3Cpath d='M1.5 1L1.5 4L7 4Z'/%3E%3Cpath d='M1.5 4L1.5 7L7 4Z' fill-opacity='.55'/%3E%3C/svg%3E");
   /* WCAG AAA Compliant colors - important that luminance (the l in hsl) is 18% for font colors against the bg's luminance of 96-97% when the font-size is at least 14pt */
   --code-bg: hsl(262 33% 96% / 1);
   --code-color: #000;
@@ -458,6 +453,15 @@ footer p {
   margin-bottom: 0;
 }
 
+.sidebar-entry {
+  position: relative;
+}
+
+.sidebar-entry > .sidebar-module-link {
+  margin-left: 48px;
+  width: calc(100% - 48px);
+}
+
 .sidebar-entry ul {
   list-style-type: none;
   margin: 0;
@@ -478,13 +482,16 @@ footer p {
 
 .sidebar-sub-entries {
     font-size: var(--font-base);
-    display: none;
     list-style: none;
     padding: 0;
     margin: 0;
 }
 
-.active + .sidebar-sub-entries {
+.sidebar-entry details:not([open]) > .sidebar-sub-entries {
+    display: none;
+}
+
+.sidebar-entry details[open] > .sidebar-sub-entries {
     display: block;
 }
 
@@ -492,7 +499,7 @@ footer p {
    (e.g. the builtin type modules under "Builtin Types"), indent its members so
    they sit underneath their type rather than level with it. Top-level modules
    and types are not descendants of a sub-entry list, so they are unaffected. */
-.sidebar-sub-entries .sidebar-entry > .sidebar-sub-entries {
+.sidebar-sub-entries .sidebar-entry > details > .sidebar-sub-entries {
     margin-left: 22px;
 }
 
@@ -525,6 +532,22 @@ footer p {
 .sidebar-sub-entries > li:last-child > a {
     margin-bottom: 8px;
     padding-bottom: 0;
+}
+
+.sidebar-sub-entries > li:first-child.sidebar-entry {
+    margin-top: 8px;
+}
+
+.sidebar-sub-entries > li:first-child.sidebar-entry > a {
+    margin-top: 0;
+}
+
+.sidebar-sub-entries > li:last-child.sidebar-entry {
+    margin-bottom: 8px;
+}
+
+.sidebar-sub-entries > li:last-child.sidebar-entry > a {
+    margin-bottom: 0;
 }
 
 .sidebar-sub-entries a:hover {
@@ -636,6 +659,26 @@ color: inherit;
   color: var(--link-hover-color);
 }
 
+.sidebar-module-summary {
+  align-items: center;
+  display: flex;
+  justify-content: center;
+  left: 0;
+  list-style: none;
+  min-height: 40px;
+  position: absolute;
+  top: 0;
+  width: 48px;
+}
+
+.sidebar-module-summary::marker {
+  content: "";
+}
+
+.sidebar-module-summary::-webkit-details-marker {
+  display: none;
+}
+
 a.sidebar-module-link {
   box-sizing: border-box;
   font-size: var(--font-base);
@@ -643,77 +686,76 @@ a.sidebar-module-link {
   font-family: var(--font-mono);
   font-weight: var(--weight-normal);
   display: flex;
-  flex-direction: row;
-  justify-content: space-between;
   align-items: center;
-  width: 100%;
+  min-width: 0;
   padding: 0;
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
 }
 
-.sidebar-module-link:hover {
-    text-decoration: none;
-
-    span:hover {
-        color: var(--violet);
-    }
+.sidebar-module-link:hover,
+.sidebar-module-link:focus-visible {
+  color: var(--violet);
+  text-decoration: none;
 }
 
 .sidebar-module-link span {
-    display: inline-block;
-    flex-grow: 1;
+  display: inline-block;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
 .sidebar-module-link.active {
   font-weight: var(--weight-bold);
 }
 
-.sidebar-module-link > .entry-toggle {
-    background-color: transparent;
-    appearance: none;
-    border: none;
-    color: transparent;
-    color: rgba(from var(--text-color) r g b / .5);
-    transition: all 80ms linear;
-    text-decoration: none;
-    font-size: 0.8rem;
-    cursor: pointer;
-    padding: 8px 16px;
-
-    &:hover {
-        color: var(--violet);
-    }
+.sidebar-module-summary > .entry-toggle {
+  align-items: center;
+  color: rgba(from var(--text-color) r g b / .5);
+  cursor: pointer;
+  display: inline-flex;
+  flex: 0 0 auto;
+  justify-content: center;
+  padding: 8px 16px;
+  transition: color 80ms linear;
 }
 
-/* The triangle itself: a single SVG (`--toggle-triangle`) masked by the toggle's
-   current color, so it tracks the gray/hover-violet transitions. */
+.sidebar-module-summary > .entry-toggle:hover,
+.sidebar-module-summary:focus-visible > .entry-toggle {
+  color: var(--violet);
+  transition: color 80ms linear, rotate 80ms linear;
+}
+
+/* Draw an outlined chevron in the control's current color. */
 .entry-toggle::before {
-    content: "";
-    display: inline-block;
-    width: 0.85rem;
-    height: 0.85rem;
-    vertical-align: middle;
-    background-color: currentColor;
-    -webkit-mask: var(--toggle-triangle) center / contain no-repeat;
-    mask: var(--toggle-triangle) center / contain no-repeat;
-}
-
-.sidebar-entry:hover > a > .entry-toggle,
-.sidebar-module-link:hover > .entry-toggle {
-    color: var(--text-color);
+  border: solid currentColor;
+  border-width: 0 2px 2px 0;
+  content: "";
+  display: block;
+  height: 0.45rem;
+  transform: rotate(-45deg);
+  width: 0.45rem;
 }
 
 /* Nested module toggles (e.g. the builtin types under "Builtin Types") sit in a
    smaller-font line and read a touch low; nudge them up to center on the label.
    `top` offsets the box before the `rotate` spins it, so both states stay aligned. */
-.sidebar-sub-entries .entry-toggle {
+.sidebar-sub-entries .sidebar-entry {
+    margin-left: 20px;
+}
+
+.sidebar-sub-entries .sidebar-module-summary > .entry-toggle {
     position: relative;
     top: -2px;
 }
 
-.active .entry-toggle {
+.sidebar-sub-entries .sidebar-entry > .sidebar-module-link {
+    border-left: 0;
+    padding-left: 0;
+}
+
+.sidebar-entry details[open] > .sidebar-module-summary > .entry-toggle {
     rotate: 90deg;
 }
 
@@ -975,7 +1017,7 @@ pre>code {
   /* In dark mode "lighter" means more of the near-white text color, i.e. a
      higher alpha (the opposite of light mode, where lighter means fading toward
      the light background). */
-  .sidebar-module-link > .entry-toggle {
+  .sidebar-module-summary > .entry-toggle {
       color: rgba(from var(--text-color) r g b / .8);
   }
 }
