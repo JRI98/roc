@@ -44,3 +44,18 @@ test {
     const tests = @import("test_unbundle.zig");
     std.testing.refAllDecls(tests);
 }
+
+// `base.url.isBase58Char` re-expresses `base58.base58_alphabet` as character
+// ranges because the `base` module cannot import `base58`. This module imports
+// both, so it hosts the guard that the two definitions agree.
+test "base.url.isBase58Char accepts exactly the base58 alphabet" {
+    const base = @import("base");
+    const base58 = @import("base58");
+    var byte: usize = 0;
+    while (byte <= 255) : (byte += 1) {
+        const char: u8 = @intCast(byte);
+        const in_alphabet = std.mem.findScalar(u8, base58.base58_alphabet, char) != null;
+        try std.testing.expectEqual(in_alphabet, base.url.isBase58Char(char));
+    }
+    try std.testing.expectEqual(@as(usize, 58), base58.base58_alphabet.len);
+}

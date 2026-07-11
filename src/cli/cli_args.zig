@@ -77,6 +77,14 @@ pub const OptLevel = enum {
     }
 };
 
+/// Default optimization level for commands that favor fast compilation over
+/// fast output — `run`, `test`, `repl`, and `glue` all default here.
+pub const default_dev_opt: OptLevel = .dev;
+
+/// Default optimization level for `roc build`, which favors execution speed of
+/// the produced binary. Intentionally differs from `default_dev_opt`.
+pub const default_build_opt: OptLevel = .speed;
+
 /// Package download size limits for commands that resolve dependencies.
 /// Values are in megabytes; 0 means unlimited; null uses the default.
 pub const ResolveLimitArgs = struct {
@@ -117,7 +125,7 @@ const resolve_limit_help =
 /// Arguments for the default `roc` command
 pub const RunArgs = struct {
     path: []const u8, // the path of the roc file to be executed
-    opt: OptLevel = .dev, // the optimization level (dev, interpreter, size, speed)
+    opt: OptLevel = default_dev_opt, // the optimization level (dev, interpreter, size, speed)
     target: ?[]const u8 = null, // the target to compile for (e.g., x64musl, x64glibc)
     app_args: []const []const u8 = &[_][]const u8{}, // any arguments to be passed to roc application being run
     no_cache: bool = false, // bypass the executable cache
@@ -237,7 +245,7 @@ pub const ExperimentalLspArgs = struct {
 
 /// Arguments for `roc repl`
 pub const ReplArgs = struct {
-    opt: OptLevel = .dev,
+    opt: OptLevel = default_dev_opt,
     no_color: bool = false,
 };
 
@@ -246,7 +254,7 @@ pub const GlueArgs = struct {
     glue_spec: []const u8, // path to the glue spec .roc file (REQUIRED)
     output_dir: []const u8, // path to the output directory for generated glue files (REQUIRED)
     platform_path: []const u8, // path to the platform .roc file (default: main.roc)
-    opt: OptLevel = .dev,
+    opt: OptLevel = default_dev_opt,
 };
 
 /// Parse a list of arguments.
@@ -417,7 +425,7 @@ fn parseCheck(args: []const []const u8) CliArgs {
 
 fn parseBuild(args: []const []const u8) CliArgs {
     var path: ?[]const u8 = null;
-    var opt: OptLevel = .speed;
+    var opt: OptLevel = default_build_opt;
     var target: ?[]const u8 = null;
     var output: ?[]const u8 = null;
     var debug: bool = false;
@@ -716,7 +724,7 @@ fn parseFormat(alloc: mem.Allocator, args: []const []const u8) std.mem.Allocator
 
 fn parseTest(args: []const []const u8) CliArgs {
     var path: ?[]const u8 = null;
-    var opt: OptLevel = .dev;
+    var opt: OptLevel = default_dev_opt;
     var main: ?[]const u8 = null;
     var verbose: bool = false;
     var no_cache: bool = false;
@@ -805,7 +813,7 @@ fn parseTest(args: []const []const u8) CliArgs {
 }
 
 fn parseRepl(args: []const []const u8) CliArgs {
-    var opt: OptLevel = .dev;
+    var opt: OptLevel = default_dev_opt;
     var no_color: bool = false;
 
     for (args) |arg| {
@@ -844,7 +852,7 @@ fn parseGlue(args: []const []const u8) CliArgs {
     var glue_spec: ?[]const u8 = null;
     var output_dir: ?[]const u8 = null;
     var platform_path: ?[]const u8 = null;
-    var opt: OptLevel = .dev;
+    var opt: OptLevel = default_dev_opt;
 
     for (args) |arg| {
         if (isHelpFlag(arg)) {
@@ -1193,7 +1201,7 @@ fn parseExperimentalLsp(args: []const []const u8) CliArgs {
 
 fn parseRun(alloc: mem.Allocator, args: []const []const u8) std.mem.Allocator.Error!CliArgs {
     var path: ?[]const u8 = null;
-    var opt: OptLevel = .dev;
+    var opt: OptLevel = default_dev_opt;
     var target: ?[]const u8 = null;
     var no_cache: bool = false;
     var allow_errors: bool = false;

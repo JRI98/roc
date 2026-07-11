@@ -131,9 +131,10 @@ fn schemeContentStart(url: []const u8) ?usize {
 }
 
 /// Whether a character is in the Bitcoin base58 alphabet (alphanumerics
-/// without 0, O, I, and l). Must match the alphabet in the base58 module,
-/// which this module cannot import.
-fn isBase58Char(char: u8) bool {
+/// without 0, O, I, and l). Must match `base58.base58_alphabet`, which this
+/// module cannot import; a test in the `unbundle` module (which sees both)
+/// asserts these ranges accept exactly that alphabet.
+pub fn isBase58Char(char: u8) bool {
     return switch (char) {
         '1'...'9', 'A'...'H', 'J'...'N', 'P'...'Z', 'a'...'k', 'm'...'z' => true,
         else => false,

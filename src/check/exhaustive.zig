@@ -33,6 +33,7 @@ const builtins = @import("builtins");
 const i128h = builtins.compiler_rt_128;
 const Can = @import("can");
 const types = @import("types");
+const reporting = @import("reporting");
 const problem = @import("problem.zig");
 
 const Ident = base.Ident;
@@ -424,13 +425,10 @@ pub const Literal = union(enum) {
     }
 };
 
-/// Severity of exhaustiveness errors
-pub const Severity = enum {
-    /// Will crash at runtime if reached
-    runtime_error,
-    /// Suspicious but won't crash
-    warning,
-};
+/// Severity of exhaustiveness errors. The canonical severity enum lives in
+/// `reporting.Severity`; exhaustiveness only ever produces `runtime_error`
+/// (an incomplete match crashes if reached) or `warning`.
+pub const Severity = reporting.Severity;
 
 /// Errors detected during exhaustiveness checking
 pub const Error = union(enum) {

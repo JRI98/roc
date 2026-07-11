@@ -71,7 +71,11 @@ const builtins_docs_base_url = "https://roc-lang.org/builtins/main/";
 /// on their own top-level page, mapped to the owning page. Mirrors the builtins'
 /// structure (the numeric types live under `Num`); an external reference to one
 /// of these resolves to `…/Num#U8`. Types not listed here are assumed to have
-/// their own page. Keep in sync with the builtins.
+/// their own page. The canonical roster of numeric types is the type system's
+/// `types.Int.Precision`/`types.Frac.Precision` enums; the
+/// "builtin_nested_type_owners lists every numeric type under Num" test asserts
+/// every variant appears here, so adding a numeric precision fails CI until it
+/// is listed. `Numeral` has no precision variant and is listed by hand.
 const builtin_nested_type_owners = [_]struct { name: []const u8, owner: []const u8 }{
     .{ .name = "U8", .owner = "Num" },   .{ .name = "U16", .owner = "Num" },
     .{ .name = "U32", .owner = "Num" },  .{ .name = "U64", .owner = "Num" },

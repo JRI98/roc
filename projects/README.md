@@ -64,8 +64,8 @@ Small:
 - [small/glue-consumes-committed-layouts.md](small/glue-consumes-committed-layouts.md)
 - [small/structural-hoist-contexts.md](small/structural-hoist-contexts.md)
 - [small/silent-drift-guards.md](small/silent-drift-guards.md)
-  — pins the remaining intentional mirrors (type digests, escape rules,
-  list decref, SWAR string equality) with shared tables or drift tests.
+  — finishes the monotype identity unification: one identity-field
+  visitor for digest and equality, and alias-transparent cached digests.
 
 Big:
 - [big/decision-tree-match-compiler.md](big/decision-tree-match-compiler.md)
