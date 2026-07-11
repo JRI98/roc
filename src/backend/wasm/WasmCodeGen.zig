@@ -9303,8 +9303,8 @@ fn layoutStorageByteAlign(self: *const Self, layout_idx: layout.Idx) Allocator.E
             },
         },
         .list, .list_of_zst, .box, .box_of_zst => 4,
-        .tag_union => (try WasmLayout.tagUnionLayoutWithStore(l.getTagUnion().idx, ls)).alignment,
-        .struct_ => try WasmLayout.structAlignWithStore(l.getStruct().idx, ls),
+        .tag_union => WasmLayout.layoutAlignWasm(l),
+        .struct_ => WasmLayout.layoutAlignWasm(l),
         else => try self.layoutByteAlign(layout_idx),
     };
 }
@@ -9609,7 +9609,7 @@ fn generateStruct(self: *Self, r: anytype) Allocator.Error!void {
         return;
     }
 
-    const align_val: u32 = try WasmLayout.structAlignWithStore(l.getStruct().idx, ls);
+    const align_val: u32 = WasmLayout.layoutAlignWasm(l);
 
     const frame_offset = try self.allocStackMemory(size, align_val);
 
@@ -9815,7 +9815,7 @@ fn generateTag(self: *Self, t: anytype) Allocator.Error!void {
         return;
     }
 
-    const align_val: u32 = tu_layout.alignment;
+    const align_val: u32 = WasmLayout.layoutAlignWasm(l);
     const frame_offset = try self.allocStackMemory(tu_size, align_val);
 
     const base_local = self.storage.allocAnonymousLocal(.i32) catch return error.OutOfMemory;
