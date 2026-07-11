@@ -5518,6 +5518,14 @@ Builtin :: [].{
 			div_ceil_try : U8, U8 -> Try(U8, [DivByZero, ..])
 			div_ceil_try = |a, b| unsigned_div_ceil_try(0, 1, a, b)
 
+			## Divide the first [U8] by the second, rounding the result toward negative infinity.
+			## For unsigned integers this behaves the same as [U8.div_by].
+			## ```roc
+			## expect U8.div_floor_by(7, 2) == 3
+			## ```
+			div_floor_by : U8, U8 -> U8
+			div_floor_by = |a, b| U8.div_by(a, b)
+
 			## Divide the first [U8] by the second, truncating down (toward zero). For unsigned
 			## integers this behaves the same as [U8.div_by].
 			## ```roc
@@ -6180,6 +6188,27 @@ Builtin :: [].{
 			## ```
 			div_ceil_try : I8, I8 -> Try(I8, [DivByZero, Overflow, ..])
 			div_ceil_try = |a, b| signed_div_ceil_try(I8.lowest, I8.highest, 0, 1, -1, a, b)
+
+			## Divide the first [I8] by the second, rounding the result toward negative infinity.
+			## ```roc
+			## expect I8.div_floor_by(7, 2) == 3
+			##
+			## expect I8.div_floor_by(-7, 2) == -4
+			##
+			## expect I8.div_floor_by(7, -2) == -4
+			##
+			## expect I8.div_floor_by(-7, -2) == 3
+			## ```
+			div_floor_by : I8, I8 -> I8
+			div_floor_by = |a, b| {
+				quotient = I8.div_trunc_by(a, b)
+				remainder = I8.rem_by(a, b)
+				if remainder != 0 and ((a < 0 and b > 0) or (a > 0 and b < 0)) {
+					quotient - 1
+				} else {
+					quotient
+				}
+			}
 
 			## Divide the first [I8] by the second, truncating toward zero.
 			## ```roc
@@ -6854,6 +6883,14 @@ Builtin :: [].{
 			## ```
 			div_ceil_try : U16, U16 -> Try(U16, [DivByZero, ..])
 			div_ceil_try = |a, b| unsigned_div_ceil_try(0, 1, a, b)
+
+			## Divide the first [U16] by the second, rounding the result toward negative infinity.
+			## For unsigned integers this behaves the same as [U16.div_by].
+			## ```roc
+			## expect U16.div_floor_by(7, 2) == 3
+			## ```
+			div_floor_by : U16, U16 -> U16
+			div_floor_by = |a, b| U16.div_by(a, b)
 
 			## Divide the first [U16] by the second, truncating down (toward zero). For unsigned
 			## integers this behaves the same as [U16.div_by].
@@ -7551,6 +7588,27 @@ Builtin :: [].{
 			div_ceil_try : I16, I16 -> Try(I16, [DivByZero, Overflow, ..])
 			div_ceil_try = |a, b| signed_div_ceil_try(I16.lowest, I16.highest, 0, 1, -1, a, b)
 
+			## Divide the first [I16] by the second, rounding the result toward negative infinity.
+			## ```roc
+			## expect I16.div_floor_by(7, 2) == 3
+			##
+			## expect I16.div_floor_by(-7, 2) == -4
+			##
+			## expect I16.div_floor_by(7, -2) == -4
+			##
+			## expect I16.div_floor_by(-7, -2) == 3
+			## ```
+			div_floor_by : I16, I16 -> I16
+			div_floor_by = |a, b| {
+				quotient = I16.div_trunc_by(a, b)
+				remainder = I16.rem_by(a, b)
+				if remainder != 0 and ((a < 0 and b > 0) or (a > 0 and b < 0)) {
+					quotient - 1
+				} else {
+					quotient
+				}
+			}
+
 			## Divide the first [I16] by the second, truncating toward zero.
 			## ```roc
 			## expect I16.div_trunc_by(7, 2) == 3
@@ -8239,6 +8297,14 @@ Builtin :: [].{
 			## ```
 			div_ceil_try : U32, U32 -> Try(U32, [DivByZero, ..])
 			div_ceil_try = |a, b| unsigned_div_ceil_try(0, 1, a, b)
+
+			## Divide the first [U32] by the second, rounding the result toward negative infinity.
+			## For unsigned integers this behaves the same as [U32.div_by].
+			## ```roc
+			## expect U32.div_floor_by(7, 2) == 3
+			## ```
+			div_floor_by : U32, U32 -> U32
+			div_floor_by = |a, b| U32.div_by(a, b)
 
 			## Divide the first [U32] by the second, truncating down (toward zero). For unsigned
 			## integers this behaves the same as [U32.div_by].
@@ -8968,6 +9034,27 @@ Builtin :: [].{
 			div_ceil_try : I32, I32 -> Try(I32, [DivByZero, Overflow, ..])
 			div_ceil_try = |a, b| signed_div_ceil_try(I32.lowest, I32.highest, 0, 1, -1, a, b)
 
+			## Divide the first [I32] by the second, rounding the result toward negative infinity.
+			## ```roc
+			## expect I32.div_floor_by(7, 2) == 3
+			##
+			## expect I32.div_floor_by(-7, 2) == -4
+			##
+			## expect I32.div_floor_by(7, -2) == -4
+			##
+			## expect I32.div_floor_by(-7, -2) == 3
+			## ```
+			div_floor_by : I32, I32 -> I32
+			div_floor_by = |a, b| {
+				quotient = I32.div_trunc_by(a, b)
+				remainder = I32.rem_by(a, b)
+				if remainder != 0 and ((a < 0 and b > 0) or (a > 0 and b < 0)) {
+					quotient - 1
+				} else {
+					quotient
+				}
+			}
+
 			## Divide the first [I32] by the second, truncating toward zero.
 			## ```roc
 			## expect I32.div_trunc_by(7, 2) == 3
@@ -9673,6 +9760,14 @@ Builtin :: [].{
 			## ```
 			div_ceil_try : U64, U64 -> Try(U64, [DivByZero, ..])
 			div_ceil_try = |a, b| unsigned_div_ceil_try(0, 1, a, b)
+
+			## Divide the first [U64] by the second, rounding the result toward negative infinity.
+			## For unsigned integers this behaves the same as [U64.div_by].
+			## ```roc
+			## expect U64.div_floor_by(7, 2) == 3
+			## ```
+			div_floor_by : U64, U64 -> U64
+			div_floor_by = |a, b| U64.div_by(a, b)
 
 			## Divide the first [U64] by the second, truncating down (toward zero). For unsigned
 			## integers this behaves the same as [U64.div_by].
@@ -10441,6 +10536,27 @@ Builtin :: [].{
 			div_ceil_try : I64, I64 -> Try(I64, [DivByZero, Overflow, ..])
 			div_ceil_try = |a, b| signed_div_ceil_try(I64.lowest, I64.highest, 0, 1, -1, a, b)
 
+			## Divide the first [I64] by the second, rounding the result toward negative infinity.
+			## ```roc
+			## expect I64.div_floor_by(7, 2) == 3
+			##
+			## expect I64.div_floor_by(-7, 2) == -4
+			##
+			## expect I64.div_floor_by(7, -2) == -4
+			##
+			## expect I64.div_floor_by(-7, -2) == 3
+			## ```
+			div_floor_by : I64, I64 -> I64
+			div_floor_by = |a, b| {
+				quotient = I64.div_trunc_by(a, b)
+				remainder = I64.rem_by(a, b)
+				if remainder != 0 and ((a < 0 and b > 0) or (a > 0 and b < 0)) {
+					quotient - 1
+				} else {
+					quotient
+				}
+			}
+
 			## Divide the first [I64] by the second, truncating toward zero.
 			## ```roc
 			## expect I64.div_trunc_by(7, 2) == 3
@@ -11171,6 +11287,14 @@ Builtin :: [].{
 			## ```
 			div_ceil_try : U128, U128 -> Try(U128, [DivByZero, ..])
 			div_ceil_try = |a, b| unsigned_div_ceil_try(0, 1, a, b)
+
+			## Divide the first [U128] by the second, rounding the result toward negative infinity.
+			## For unsigned integers this behaves the same as [U128.div_by].
+			## ```roc
+			## expect U128.div_floor_by(7, 2) == 3
+			## ```
+			div_floor_by : U128, U128 -> U128
+			div_floor_by = |a, b| U128.div_by(a, b)
 
 			## Divide the first [U128] by the second, truncating down (toward zero). For unsigned
 			## integers this behaves the same as [U128.div_by].
@@ -11980,6 +12104,27 @@ Builtin :: [].{
 			div_ceil_try : I128, I128 -> Try(I128, [DivByZero, Overflow, ..])
 			div_ceil_try = |a, b| signed_div_ceil_try(I128.lowest, I128.highest, 0, 1, -1, a, b)
 
+			## Divide the first [I128] by the second, rounding the result toward negative infinity.
+			## ```roc
+			## expect I128.div_floor_by(7, 2) == 3
+			##
+			## expect I128.div_floor_by(-7, 2) == -4
+			##
+			## expect I128.div_floor_by(7, -2) == -4
+			##
+			## expect I128.div_floor_by(-7, -2) == 3
+			## ```
+			div_floor_by : I128, I128 -> I128
+			div_floor_by = |a, b| {
+				quotient = I128.div_trunc_by(a, b)
+				remainder = I128.rem_by(a, b)
+				if remainder != 0 and ((a < 0 and b > 0) or (a > 0 and b < 0)) {
+					quotient - 1
+				} else {
+					quotient
+				}
+			}
+
 			## Divide the first [I128] by the second, truncating toward zero.
 			## ```roc
 			## expect I128.div_trunc_by(7, 2) == 3
@@ -12781,6 +12926,15 @@ Builtin :: [].{
 			## expect Dec.div_trunc_by(-7.5, 2.0) == -3.0
 			## ```
 			div_trunc_by : Dec, Dec -> Dec
+
+			## Divide the first [Dec] by the second, rounding the result toward negative infinity.
+			## ```roc
+			## expect Dec.div_floor_by(7.5, 2.0) == 3.0
+			##
+			## expect Dec.div_floor_by(-7.5, 2.0) == -4.0
+			## ```
+			div_floor_by : Dec, Dec -> Dec
+			div_floor_by = |a, b| dec_floor_to_whole(Dec.div_by(a, b))
 
 			## Return the remainder of dividing the first [Dec] by the second.
 			## The sign of the result matches the sign of the dividend.
@@ -13773,6 +13927,15 @@ Builtin :: [].{
 			## ```
 			div_trunc_by : F32, F32 -> F32
 
+			## Divide the first [F32] by the second, rounding the result toward negative infinity.
+			## ```roc
+			## expect F32.div_floor_by(7.5, 2.0).to_str() == "3"
+			##
+			## expect F32.div_floor_by(-7.5, 2.0).to_str() == "-4"
+			## ```
+			div_floor_by : F32, F32 -> F32
+			div_floor_by = |a, b| f32_floor_unsafe(F32.div_by(a, b))
+
 			## Return the remainder of dividing the first [F32] by the second.
 			## The sign of the result matches the sign of the dividend.
 			## ```roc
@@ -14664,6 +14827,15 @@ Builtin :: [].{
 			## expect F64.div_trunc_by(-7.5, 2.0).to_str() == "-3"
 			## ```
 			div_trunc_by : F64, F64 -> F64
+
+			## Divide the first [F64] by the second, rounding the result toward negative infinity.
+			## ```roc
+			## expect F64.div_floor_by(7.5, 2.0).to_str() == "3"
+			##
+			## expect F64.div_floor_by(-7.5, 2.0).to_str() == "-4"
+			## ```
+			div_floor_by : F64, F64 -> F64
+			div_floor_by = |a, b| f64_floor_unsafe(F64.div_by(a, b))
 
 			## Return the remainder of dividing the first [F64] by the second.
 			## The sign of the result matches the sign of the dividend.

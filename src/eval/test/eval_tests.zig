@@ -4245,6 +4245,29 @@ const core_tests = [_]TestCase{
         .expected = .{ .inspect_str = "((Ok(126), Err(Overflow), Ok(-127), Err(Overflow), Ok(127), Err(Overflow), Err(Overflow), Err(Overflow), Err(DivByZero), Ok(8), Err(Underflow), Err(Overflow), Ok(-1), Ok(4), Ok(-3), Err(Overflow)), (Ok(32766), Err(Overflow), Ok(-32767), Err(Overflow), Ok(32767), Err(Overflow), Err(Overflow), Err(Overflow), Err(DivByZero), Ok(8), Err(Underflow), Err(Overflow), Ok(-1), Ok(4), Ok(-3), Err(Overflow)), (Ok(2147483646), Err(Overflow), Ok(-2147483647), Err(Overflow), Ok(2147483647), Err(Overflow), Err(Overflow), Err(Overflow), Err(DivByZero), Ok(8), Err(Underflow), Err(Overflow), Ok(-1), Ok(4), Ok(-3), Err(Overflow)), (Ok(9223372036854775806), Err(Overflow), Ok(-9223372036854775807), Err(Overflow), Ok(9223372036854775807), Err(Overflow), Err(Overflow), Err(Overflow), Err(DivByZero), Ok(8), Err(Underflow), Err(Overflow), Ok(-1), Ok(4), Ok(-3), Err(Overflow)), (Ok(170141183460469231731687303715884105726), Err(Overflow), Ok(-170141183460469231731687303715884105727), Err(Overflow), Ok(170141183460469231731687303715884105727), Err(Overflow), Err(Overflow), Err(Overflow), Err(DivByZero), Ok(8), Err(Underflow), Err(Overflow), Ok(-1), Ok(4), Ok(-3), Err(Overflow)))" },
     },
     .{
+        .name = "inspect: div_floor_by covers every numeric type",
+        .source =
+        \\{
+        \\    (
+        \\        U8.div_floor_by(7, 2) == 3 and U8.div_floor_by(8, 2) == 4,
+        \\        I8.div_floor_by(7, 2) == 3 and I8.div_floor_by(-7, 2) == -4 and I8.div_floor_by(7, -2) == -4 and I8.div_floor_by(-7, -2) == 3 and I8.div_floor_by(-8, 2) == -4,
+        \\        U16.div_floor_by(7, 2) == 3 and U16.div_floor_by(8, 2) == 4,
+        \\        I16.div_floor_by(7, 2) == 3 and I16.div_floor_by(-7, 2) == -4 and I16.div_floor_by(7, -2) == -4 and I16.div_floor_by(-7, -2) == 3 and I16.div_floor_by(-8, 2) == -4,
+        \\        U32.div_floor_by(7, 2) == 3 and U32.div_floor_by(8, 2) == 4,
+        \\        I32.div_floor_by(7, 2) == 3 and I32.div_floor_by(-7, 2) == -4 and I32.div_floor_by(7, -2) == -4 and I32.div_floor_by(-7, -2) == 3 and I32.div_floor_by(-8, 2) == -4,
+        \\        U64.div_floor_by(7, 2) == 3 and U64.div_floor_by(8, 2) == 4,
+        \\        I64.div_floor_by(7, 2) == 3 and I64.div_floor_by(-7, 2) == -4 and I64.div_floor_by(7, -2) == -4 and I64.div_floor_by(-7, -2) == 3 and I64.div_floor_by(-8, 2) == -4,
+        \\        U128.div_floor_by(7, 2) == 3 and U128.div_floor_by(8, 2) == 4,
+        \\        I128.div_floor_by(7, 2) == 3 and I128.div_floor_by(-7, 2) == -4 and I128.div_floor_by(7, -2) == -4 and I128.div_floor_by(-7, -2) == 3 and I128.div_floor_by(-8, 2) == -4,
+        \\        Dec.div_floor_by(7.5, 2.0) == 3.0 and Dec.div_floor_by(-7.5, 2.0) == -4.0 and Dec.div_floor_by(7.5, -2.0) == -4.0 and Dec.div_floor_by(-7.5, -2.0) == 3.0 and Dec.div_floor_by(-8.0, 2.0) == -4.0,
+        \\        F32.div_floor_by(7.5.F32, 2.0.F32).to_str() == "3" and F32.div_floor_by(-7.5.F32, 2.0.F32).to_str() == "-4" and F32.div_floor_by(7.5.F32, -2.0.F32).to_str() == "-4" and F32.div_floor_by(-7.5.F32, -2.0.F32).to_str() == "3" and F32.div_floor_by(-8.0.F32, 2.0.F32).to_str() == "-4",
+        \\        F64.div_floor_by(7.5.F64, 2.0.F64).to_str() == "3" and F64.div_floor_by(-7.5.F64, 2.0.F64).to_str() == "-4" and F64.div_floor_by(7.5.F64, -2.0.F64).to_str() == "-4" and F64.div_floor_by(-7.5.F64, -2.0.F64).to_str() == "3" and F64.div_floor_by(-8.0.F64, 2.0.F64).to_str() == "-4",
+        \\    )
+        \\}
+        ,
+        .expected = .{ .inspect_str = "(True, True, True, True, True, True, True, True, True, True, True, True, True)" },
+    },
+    .{
         .name = "inspect: try APIs unify with open error rows",
         .source =
         \\{
