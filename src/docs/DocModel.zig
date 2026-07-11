@@ -1310,6 +1310,10 @@ pub const DocType = union(enum) {
 /// Documentation for a single exported definition.
 pub const DocEntry = struct {
     name: []const u8,
+    /// The declaration header, including any type parameters (e.g. `List(a)`).
+    /// This is distinct from `name` so opaque declarations can expose their
+    /// public shape without exposing their backing type.
+    type_header: ?[]const u8 = null,
     kind: DocEntryKind,
     type_signature: ?*const DocType,
     doc_comment: ?[]const u8,
@@ -1324,6 +1328,7 @@ pub const DocEntry = struct {
             child.deinit(gpa);
         }
         gpa.free(self.children);
+        if (self.type_header) |header| gpa.free(header);
         if (self.type_signature) |sig| {
             sig.deinit(gpa);
             gpa.destroy(sig);

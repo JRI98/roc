@@ -10,6 +10,7 @@ const ModuleEnv = @import("can").ModuleEnv;
 const types_mod = @import("types").types;
 
 const DocModel = @import("DocModel.zig");
+const render_type = @import("render_type.zig");
 
 const Allocator = std.mem.Allocator;
 const Ident = base.Ident;
@@ -313,11 +314,15 @@ pub fn extractModuleDocs(
                 const duped_name = try gpa.dupe(u8, entry_name);
                 errdefer gpa.free(duped_name);
 
+                const type_header = try render_type.renderTypeHeaderToString(gpa, module_env, decl.header);
+                errdefer gpa.free(type_header);
+
                 const empty_children = try gpa.alloc(DocModel.DocEntry, 0);
                 errdefer gpa.free(empty_children);
 
                 try entries_list.append(gpa, DocModel.DocEntry{
                     .name = duped_name,
+                    .type_header = type_header,
                     .kind = if (decl.is_opaque) .@"opaque" else .nominal,
                     .type_signature = type_sig,
                     .doc_comment = if (doc_extract) |d| d.text else null,
@@ -709,6 +714,9 @@ fn extractDefEntry(
                     const duped_name = try gpa.dupe(u8, entry_name);
                     errdefer gpa.free(duped_name);
 
+                    const type_header = try render_type.renderTypeHeaderToString(gpa, module_env, decl.header);
+                    errdefer gpa.free(type_header);
+
                     // Use the statement region for doc comment scanning
                     const region = module_env.store.getStatementRegion(n.nominal_type_decl);
                     const doc_extract = try extractDocComment(gpa, source, region.start.offset);
@@ -729,6 +737,7 @@ fn extractDefEntry(
 
                     return DocModel.DocEntry{
                         .name = duped_name,
+                        .type_header = type_header,
                         .kind = if (decl.is_opaque) .@"opaque" else .nominal,
                         .type_signature = type_sig,
                         .doc_comment = if (doc_extract) |d| d.text else null,

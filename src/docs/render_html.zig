@@ -681,6 +681,11 @@ fn writeModulePageToDir(ctx: *const RenderContext, gpa: Allocator, io: std.Io, d
                 try w.writeAll("</code>\n");
                 try writeDocsStreamChunk(w);
             }
+        } else if (entry.kind == .@"opaque") {
+            try w.writeAll("        <code class=\"entry-type-def\">");
+            try writeHtmlEscaped(w, entry.type_header orelse entry.name);
+            try w.writeAll(" :: # (opaque)</code>\n");
+            try writeDocsStreamChunk(w);
         }
     }
 
@@ -1075,7 +1080,8 @@ fn renderEntryTree(
                 try w.writeAll("</a>");
                 try w.print("</h{d}>\n", .{heading_level});
 
-                // Nominal types also show their type definition below the heading
+                // Type definitions appear below their heading. Opaque types expose
+                // their public header but not their backing representation.
                 if (entry.kind == .nominal) {
                     if (entry.type_signature) |sig| {
                         try writeIndent(w, base + 1);
@@ -1084,6 +1090,11 @@ fn renderEntryTree(
                         try renderDocTypeHtml(w, ctx, gpa, sig, false);
                         try w.writeAll("</code>\n");
                     }
+                } else if (entry.kind == .@"opaque") {
+                    try writeIndent(w, base + 1);
+                    try w.writeAll("<code class=\"entry-type-def\">");
+                    try writeHtmlEscaped(w, entry.type_header orelse entry.name);
+                    try w.writeAll(" :: # (opaque)</code>\n");
                 }
             } else {
                 // Signature block - styled as code, not a heading
@@ -2337,6 +2348,7 @@ test "doc shorthand refs in package docs resolve builtins and nested type-module
 
     const string_entry = DocModel.DocEntry{
         .name = try gpa.dupe(u8, "String"),
+        .type_header = try gpa.dupe(u8, "String(item)"),
         .kind = .@"opaque",
         .type_signature = null,
         .doc_comment = try gpa.dupe(u8, "Parse a [Str] using a parser."),
@@ -2400,6 +2412,7 @@ test "doc shorthand refs in package docs resolve builtins and nested type-module
     // Shorthand `[Name]` refs wrap their label in <code>.
     try testing.expect(std.mem.find(u8, html, "href=\"https://roc-lang.org/builtins/main/Str\"><code>Str</code></a>") != null);
     try testing.expect(std.mem.find(u8, html, "href=\"#String.Utf8\"><code>Utf8</code></a>") != null);
+    try testing.expect(std.mem.find(u8, html, "String(item) :: # (opaque)") != null);
 }
 
 test "renderDocTypeHtml renders where clause multi-line with square brackets" {
