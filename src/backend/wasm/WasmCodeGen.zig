@@ -1140,6 +1140,21 @@ fn addOwnedLocalFunctionSymbol(
     );
 }
 
+fn addLirProcFunctionSymbol(
+    self: *Self,
+    defined: index_types.DefinedFunction,
+    symbol: LIR.Symbol,
+) Allocator.Error!SymbolIndex {
+    const name = std.fmt.allocPrint(self.allocator, "roc__proc_{x}", .{symbol.raw()}) catch return error.OutOfMemory;
+    errdefer self.allocator.free(name);
+    try self.function_symbol_names.append(self.allocator, name);
+    return try self.addTrackedDefinedFunctionSymbol(
+        defined,
+        name,
+        WasmLinking.SymFlag.BINDING_LOCAL | WasmLinking.SymFlag.VISIBILITY_HIDDEN,
+    );
+}
+
 fn externalCallsUseRelocs(self: *const Self) bool {
     return switch (self.external_calls) {
         .builtin_relocs => true,
@@ -7398,7 +7413,7 @@ fn registerProcSpec(self: *Self, proc_id: LIR.LirProcSpecId, proc: LirProcSpec) 
         const type_idx = try self.internFuncType(&.{ .i32, .i32, .i32, .i32 }, &.{});
         const defined = self.module.addDefinedFunction(type_idx) catch return error.OutOfMemory;
         const func_idx = defined.function.raw();
-        _ = try self.addOwnedLocalFunctionSymbol(defined, "roc_erased_proc", key);
+        _ = try self.addLirProcFunctionSymbol(defined, proc.name);
         const table_idx = self.module.addTableElement(func_idx) catch return error.OutOfMemory;
 
         self.registered_procs.put(key, func_idx) catch return error.OutOfMemory;
@@ -7426,7 +7441,7 @@ fn registerProcSpec(self: *Self, proc_id: LIR.LirProcSpecId, proc: LirProcSpec) 
     const type_idx = try self.internFuncType(param_types.items, &.{ret_vt});
     const defined = self.module.addDefinedFunction(type_idx) catch return error.OutOfMemory;
     const func_idx = defined.function.raw();
-    _ = try self.addOwnedLocalFunctionSymbol(defined, "roc_proc", key);
+    _ = try self.addLirProcFunctionSymbol(defined, proc.name);
     const table_idx = self.module.addTableElement(func_idx) catch return error.OutOfMemory;
 
     self.registered_procs.put(key, func_idx) catch return error.OutOfMemory;

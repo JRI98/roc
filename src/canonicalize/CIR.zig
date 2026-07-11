@@ -434,7 +434,7 @@ pub const WhereClause = union(enum) {
 
                 const method_name_str = cir.getIdent(method.method_name);
                 try tree.pushStringPair("name", method_name_str);
-                try tree.pushBoolPair("effectful", method.effectful);
+                if (method.effectful) try tree.pushBoolPair("effectful", true);
 
                 const attrs = tree.beginNode();
 

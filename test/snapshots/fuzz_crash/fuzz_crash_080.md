@@ -58,7 +58,7 @@ EndOfFile,
 		(s-type-anno (name "c")
 			(ty (name "L"))
 			(where
-				(method (module-of "o") (name "h") (effectful false)
+				(method (module-of "o") (name "h")
 					(args)
 					(ty-var (raw "a")))))))
 ~~~
@@ -79,7 +79,7 @@ c : L
 		(annotation
 			(ty-malformed)
 			(where
-				(method (ty-rigid-var (name "o")) (name "h") (effectful false)
+				(method (ty-rigid-var (name "o")) (name "h")
 					(args)
 					(ty-rigid-var (name "a")))))))
 ~~~

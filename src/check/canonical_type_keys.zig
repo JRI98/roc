@@ -308,7 +308,6 @@ const Builder = struct {
     }
 
     fn writeFunc(self: *Builder, func: types.Func) Allocator.Error!void {
-        self.writeBool(func.needs_instantiation);
         try self.writeVarRange(func.args);
         try self.writeVar(func.ret);
     }

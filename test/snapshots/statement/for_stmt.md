@@ -88,7 +88,7 @@ foo = {
 				(e-block
 					(s-reassign
 						(p-assign (ident "result"))
-						(e-dispatch-call (method "plus") (constraint-fn-var 305)
+						(e-dispatch-call (method "plus") (constraint-fn-var 267)
 							(receiver
 								(e-lookup-local
 									(p-assign (ident "result"))))

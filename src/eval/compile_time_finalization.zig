@@ -390,11 +390,7 @@ const RootCompletionState = struct {
         const_use: checked.ConstUseTemplate,
     ) bool {
         const root_id = self.rootForConstRef(const_use.const_ref) orelse return true;
-        const own_hoisted_root = switch (const_use.const_ref.owner) {
-            .hoisted_expr => true,
-            .top_level_binding => false,
-        };
-        if (self.current_root_id != null and root_id == self.current_root_id.? and own_hoisted_root) return true;
+        if (self.current_root_id != null and root_id == self.current_root_id.?) return true;
         return !self.requested_roots[@intFromEnum(root_id)] or self.isDone(root_id);
     }
 
@@ -447,6 +443,7 @@ const RootCompletionState = struct {
             .direct_template => |direct| self.callableTemplateDependenciesComplete(direct.template),
             .callable_eval_template => |template_id| blk: {
                 const template = self.module.callable_eval_templates.get(template_id);
+                if (self.current_root_id != null and template.root == self.current_root_id.?) break :blk true;
                 break :blk !self.requested_roots[@intFromEnum(template.root)] or self.isDone(template.root);
             },
         };

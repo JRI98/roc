@@ -17,6 +17,7 @@ const CanonicalNameStore = check.CanonicalNames.CanonicalNameStore;
 const Checked = check.CheckedArtifact;
 const CheckedModule = check.CheckedModule;
 const ConstFn = check.ConstStore.ConstFn;
+const ConstFnDef = check.ConstStore.FnDef;
 const ConstStrDataId = check.ConstStore.ConstStrDataId;
 const ConstValue = CheckedModule.ConstValue;
 const StaticDataExport = backend.StaticDataExport;
@@ -344,7 +345,11 @@ const StaticDataBuilder = struct {
                 };
                 try self.writeValue(bytes, relocations, base_offset, source, source.store.get(backing), named.backing, layout_idx);
             },
-            .fn_value => staticDataInvariant("provided function-valued data export reached finite callable static materialization"),
+            .fn_value => |set| {
+                if (!try self.writeBoxedSemanticValue(bytes, relocations, base_offset, source, value, plan_id, layout_idx)) {
+                    try self.writeFnValue(bytes, relocations, base_offset, source, value, set, layout_idx);
+                }
+            },
             .erased_fn => |set| try self.writeErasedFn(bytes, relocations, base_offset, source, value, set, layout_idx),
         }
     }
@@ -715,6 +720,78 @@ const StaticDataBuilder = struct {
 
         const tag_data = self.layouts().getTagUnionData(tag_layout.getTagUnion().idx);
         tag_data.writeDiscriminant(bytes[base_offset..].ptr, variant.discriminant, self.layouts().targetUsize());
+    }
+
+    fn writeFnValue(
+        self: *StaticDataBuilder,
+        bytes: []u8,
+        relocations: *std.ArrayList(StaticDataRelocation),
+        base_offset: u32,
+        source: ConstModule,
+        value: ConstValue,
+        set_id: lir.Program.FnSetId,
+        callable_layout_idx: layout.Idx,
+    ) MaterializationError!void {
+        const fn_id = switch (value) {
+            .fn_value => |fn_id| fn_id,
+            else => staticDataInvariant("finite callable const plan received non-function ConstStore node"),
+        };
+        const raw = @intFromEnum(fn_id);
+        if (raw >= source.store.fns.items.len) staticDataInvariant("ConstStore function id is out of range");
+        const fn_value = source.store.getFn(@enumFromInt(raw));
+        const set = self.lowered.lir_result.fn_sets.items[@intFromEnum(set_id)];
+        if (set.layout != callable_layout_idx) {
+            staticDataInvariant("finite callable const plan layout differed from requested static data layout");
+        }
+        const variant = fnVariantForConstFn(set, fn_value);
+
+        const callable_layout = self.layoutValue(callable_layout_idx);
+        if (callable_layout.tag == .zst) {
+            if (self.layouts().layoutSize(self.layoutValue(variant.payload_layout)) != 0) {
+                staticDataInvariant("ZST finite callable layout had non-ZST capture payload");
+            }
+            return;
+        }
+
+        if (callable_layout.tag == .tag_union) {
+            const tag_info = self.layouts().getTagUnionInfo(callable_layout);
+            const active_payload_layout_idx = tag_info.variants.get(@intCast(variant.discriminant)).payload_layout;
+            if (active_payload_layout_idx != variant.payload_layout) {
+                staticDataInvariant("finite callable variant payload layout differed from committed tag-union payload layout");
+            }
+            try self.writeCaptures(
+                bytes,
+                relocations,
+                base_offset,
+                source,
+                fn_value,
+                variant.captures,
+                active_payload_layout_idx,
+            );
+            const tag_data = self.layouts().getTagUnionData(callable_layout.getTagUnion().idx);
+            tag_data.writeDiscriminant(bytes[base_offset..].ptr, variant.discriminant, self.layouts().targetUsize());
+            return;
+        }
+
+        try self.writeCaptures(
+            bytes,
+            relocations,
+            base_offset,
+            source,
+            fn_value,
+            variant.captures,
+            callable_layout_idx,
+        );
+    }
+
+    fn fnVariantForConstFn(
+        set: lir.Program.FnSet,
+        fn_value: ConstFn,
+    ) lir.Program.FnVariant {
+        for (set.variants) |variant| {
+            if (sameFnTemplate(fn_value, variant.template)) return variant;
+        }
+        staticDataInvariant("finite callable ConstStore function was absent from LIR callable variants");
     }
 
     fn writeErasedFn(
@@ -1088,9 +1165,35 @@ fn staticDataPtrOffset(word_size: u32, element_alignment: u32, contains_refcount
 }
 
 fn sameFnTemplate(fn_value: ConstFn, template: lir.Program.FnTemplate) bool {
-    return std.meta.eql(fn_value.fn_def, template.fn_def) and
+    return sameFnDef(fn_value.fn_def, template.fn_def) and
         fn_value.source_fn_ty == template.source_fn_ty and
         std.mem.eql(u8, fn_value.source_fn_key.bytes[0..], template.source_fn_key.bytes[0..]);
+}
+
+fn sameFnDef(a: ConstFnDef, b: ConstFnDef) bool {
+    if (std.meta.activeTag(a) != std.meta.activeTag(b)) return false;
+    return switch (a) {
+        .local_template => |template| sameProcTemplate(template, b.local_template),
+        .imported_template => |template| sameProcTemplate(template, b.imported_template),
+        // Restored nested functions have fresh specialization contexts. Their
+        // checked owner/site is the durable source identity; sameFnTemplate
+        // separately compares the function's checked source type key.
+        .nested => |nested| sameProcTemplate(nested.owner, b.nested.owner) and
+            nested.site == b.nested.site,
+        .local_hosted => |template| sameProcTemplate(template, b.local_hosted),
+        .imported_hosted => |template| sameProcTemplate(template, b.imported_hosted),
+        .checked_generated => |template| sameProcTemplate(template, b.checked_generated),
+        .parser_runtime => |runtime| sameProcTemplate(runtime.owner, b.parser_runtime.owner) and
+            runtime.expr == b.parser_runtime.expr,
+        .encoder_for_runtime => |runtime| sameProcTemplate(runtime.owner, b.encoder_for_runtime.owner) and
+            runtime.expr == b.encoder_for_runtime.expr,
+    };
+}
+
+fn sameProcTemplate(a: check.CanonicalNames.ProcTemplate, b: check.CanonicalNames.ProcTemplate) bool {
+    return std.mem.eql(u8, a.artifact.bytes[0..], b.artifact.bytes[0..]) and
+        a.proc_base == b.proc_base and
+        a.template == b.template;
 }
 
 fn alignForwardU32(value: u32, alignment: u32) u32 {

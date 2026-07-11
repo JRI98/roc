@@ -4214,6 +4214,37 @@ test "check type - recursive type - anonymous recursion" {
     );
 }
 
+test "check type - local binding anonymous recursion is rejected even when hidden from enclosing def" {
+    const source =
+        \\outer = {
+        \\  bad = |linked_list|
+        \\    match linked_list {
+        \\      Cons(_a, rest) => 1 + bad(rest)
+        \\      Nil => 0.U8
+        \\    }
+        \\
+        \\  0.U8
+        \\}
+    ;
+    try checkTypesModule(source, .fail, "Anonymous Recursion");
+}
+
+test "check type - uninitialized local var anonymous recursion is rejected even when hidden from enclosing def" {
+    const source =
+        \\outer = {
+        \\  var $bad
+        \\  $bad = |linked_list|
+        \\    match linked_list {
+        \\      Cons(_a, rest) => 1 + $bad(rest)
+        \\      Nil => 0.U8
+        \\    }
+        \\
+        \\  0.U8
+        \\}
+    ;
+    try checkTypesModule(source, .fail, "Anonymous Recursion");
+}
+
 // equirecursive static dispatch //
 
 test "check type - equirecursive static dispatch" {
@@ -5008,8 +5039,8 @@ test "check type - issue8934 recursive nominal type unification" {
         \\  flatten_aux = |l, acc| {
         \\    match l {
         \\      [] => acc
-        \\      [One(e), .. as rest] => flatten_aux(rest, List.append(acc, e))
-        \\      [Many(e), .. as rest] => flatten_aux(rest, flatten_aux(e, acc))
+        \\      [Node.One(e), .. as rest] => flatten_aux(rest, List.append(acc, e))
+        \\      [Node.Many(e), .. as rest] => flatten_aux(rest, flatten_aux(e, acc))
         \\    }
         \\  }
         \\  flatten_aux(input, [])

@@ -2435,7 +2435,7 @@ fn computeTransformedExprType(
 
             // Build function type
             const args_range = try can_ir.types.appendVars(arg_types.items);
-            const func = types.Func{ .args = args_range, .ret = ret_type, .needs_instantiation = false };
+            const func = types.Func{ .args = args_range, .ret = ret_type };
             const content = types.Content{ .structure = .{ .fn_pure = func } };
             try can_ir.types.setVarContent(expr_var, content);
             return expr_var;

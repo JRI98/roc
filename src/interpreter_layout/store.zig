@@ -111,6 +111,14 @@ pub const Store = struct {
     /// When set, getMutableEnv() returns this instead of null.
     mutable_env: ?*ModuleEnv = null,
 
+    /// Mutable view of the type store consulted by `fromTypeVar`, required by
+    /// the declaration-backed nominal opening operation (issue #9983): a
+    /// nominal application carries no backing, so computing its layout
+    /// instantiates the declaration's backing template with the application's
+    /// args, which mints fresh type vars. Callers that compute layouts from
+    /// type vars must provide this via `setMutableTypesStore`.
+    mutable_types_store: ?*types_store.Store = null,
+
     layouts: collections.SafeList(Layout),
     tuple_elems: collections.SafeList(Idx),
     struct_fields: StructField.SafeMultiList,
@@ -322,6 +330,26 @@ pub const Store = struct {
     /// Set a mutable env reference for runtime identifier insertion (used by interpreter).
     pub fn setMutableEnv(self: *Self, env: *ModuleEnv) void {
         self.mutable_env = env;
+    }
+
+    /// Provide a mutable view of the type store `fromTypeVar` resolves in, so
+    /// it can open nominal declarations. Must alias the store `getTypesStore`
+    /// returns for the module being processed.
+    pub fn setMutableTypesStore(self: *Self, store: *types_store.Store) void {
+        self.mutable_types_store = store;
+    }
+
+    /// The mutable type store — required to open a nominal declaration
+    /// (instantiate its backing template).
+    fn mutableTypesStoreForOpen(self: *Self) *types_store.Store {
+        const store = self.mutable_types_store orelse {
+            if (@import("builtin").mode == .Debug) {
+                std.debug.panic("interpreter layout invariant violated: opening a nominal declaration requires a mutable type store (setMutableTypesStore)", .{});
+            }
+            unreachable;
+        };
+        std.debug.assert(store == self.getTypesStore());
+        return store;
     }
 
     pub fn deinit(self: *Self) void {
@@ -2115,9 +2143,38 @@ pub const Store = struct {
                                 .origin_module = nominal_type.origin_module,
                             };
 
-                            // Get the backing var before we modify current
-                            const backing_var = self.getTypesStore().getNominalBackingVar(nominal_type);
-                            const resolved_backing = self.getTypesStore().resolveVar(backing_var);
+                            // The explicit declaration-backed opening operation
+                            // (issue #9983): the application carries no backing,
+                            // so instantiate the declaration's backing template
+                            // with the application's actual args. The fresh copy
+                            // recreates exactly the per-use backing graph this
+                            // walk was built around (including the recursive
+                            // reference resolving back to this application's
+                            // own var via the substituted args).
+                            const opened_backing = opened: {
+                                const ts = self.getTypesStore();
+                                const decl_idx = ts.lookupNominalDecl(nominal_type) orelse {
+                                    if (@import("builtin").mode == .Debug) {
+                                        std.debug.panic("interpreter layout invariant violated: nominal application has no declaration table entry in its store", .{});
+                                    }
+                                    unreachable;
+                                };
+                                const decl = ts.getNominalDecl(decl_idx);
+                                std.debug.assert(decl.isValid());
+
+                                const mutable_ts = self.mutableTypesStoreForOpen();
+                                var open_var_map = std.AutoHashMap(Var, Var).init(self.allocator);
+                                defer open_var_map.deinit();
+                                break :opened try types.instantiate.instantiateNominalBacking(
+                                    mutable_ts,
+                                    self.currentEnv().getIdentStoreConst(),
+                                    &open_var_map,
+                                    decl,
+                                    ts.sliceNominalArgs(nominal_type),
+                                    .outermost,
+                                );
+                            };
+                            const resolved_backing = self.getTypesStore().resolveVar(opened_backing);
 
                             // Reserve a placeholder layout and cache it for the nominal's var.
                             // This allows recursive references to find this layout index.

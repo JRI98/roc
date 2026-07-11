@@ -1103,11 +1103,11 @@ MISSING METHOD - fuzz_crash_020.md:105:55:105:72
 
     It has the type:
 
-        (f, j, Error, [O, ..], (Error, Error), List(k))
+        (f, j, Error, [O, ..], (Error, Error), List(l))
           where [
             f.from_numeral : Numeral -> Try(f, [InvalidNumeral(Str)]),
             j.from_quote : Str -> Try(j, [BadQuotedBytes(Str)]),
-            k.from_numeral : Numeral -> Try(k, [InvalidNumeral(Str)]),
+            l.from_numeral : Numeral -> Try(l, [InvalidNumeral(Str)]),
           ]
 
     Since this expression is used as a statement, it must evaluate to `{}`.
@@ -1985,7 +1985,7 @@ expect {
 				(s-return
 					(e-runtime-error (tag "expr_not_canonicalized")))
 				(s-expr
-					(e-call (constraint-fn-var 2320)
+					(e-call (constraint-fn-var 1148)
 						(e-lookup-local
 							(p-assign (ident "me")))
 						(e-not-implemented)))
@@ -2033,7 +2033,7 @@ expect {
 										(p-assign (ident "#interp_2"))
 										(e-lookup-local
 											(p-assign (ident "er"))))
-									(e-interpolation (constraint-fn-var 2604)
+									(e-interpolation (constraint-fn-var 1244)
 										(first
 											(e-literal (string "Ag ")))
 										(parts
@@ -2043,7 +2043,7 @@ expect {
 											(e-lookup-local
 												(p-assign (ident "#interp_2")))
 											(e-literal (string "")))))))
-						(e-dispatch-call (method "plus") (constraint-fn-var 2607)
+						(e-dispatch-call (method "plus") (constraint-fn-var 1247)
 							(receiver
 								(e-runtime-error (tag "ident_not_in_scope")))
 							(args
@@ -2107,7 +2107,7 @@ expect {
 					(e-if
 						(if-branches
 							(if-branch
-								(e-dispatch-call (method "is_gt") (constraint-fn-var 3053)
+								(e-dispatch-call (method "is_gt") (constraint-fn-var 1375)
 									(receiver
 										(e-match
 											(match
@@ -2141,18 +2141,18 @@ expect {
 										(e-if
 											(if-branches
 												(if-branch
-													(e-dispatch-call (method "is_lt") (constraint-fn-var 3170)
+													(e-dispatch-call (method "is_lt") (constraint-fn-var 1408)
 														(receiver
-															(e-dispatch-call (method "plus") (constraint-fn-var 3132)
+															(e-dispatch-call (method "plus") (constraint-fn-var 1398)
 																(receiver
 																	(e-num (value "13")))
 																(args
 																	(e-num (value "2")))))
 														(args
 															(e-num (value "5"))))
-													(e-dispatch-call (method "is_gte") (constraint-fn-var 3279)
+													(e-dispatch-call (method "is_gte") (constraint-fn-var 1435)
 														(receiver
-															(e-dispatch-call (method "minus") (constraint-fn-var 3241)
+															(e-dispatch-call (method "minus") (constraint-fn-var 1425)
 																(receiver
 																	(e-num (value "10")))
 																(args
@@ -2167,7 +2167,7 @@ expect {
 											(builtin)
 											(e-tag (name "True")))))
 								(if-else
-									(e-dispatch-call (method "is_lte") (constraint-fn-var 3363)
+									(e-dispatch-call (method "is_lte") (constraint-fn-var 1463)
 										(receiver
 											(e-num (value "12")))
 										(args
@@ -2181,12 +2181,12 @@ expect {
 										(e-match
 											(match
 												(cond
-													(e-dispatch-call (method "ned") (constraint-fn-var 3430)
+													(e-dispatch-call (method "ned") (constraint-fn-var 1524)
 														(receiver
 															(e-match
 																(match
 																	(cond
-																		(e-dispatch-call (method "od") (constraint-fn-var 3397)
+																		(e-dispatch-call (method "od") (constraint-fn-var 1495)
 																			(receiver
 																				(e-match
 																					(match

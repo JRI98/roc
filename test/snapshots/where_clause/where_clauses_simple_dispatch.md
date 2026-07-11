@@ -28,7 +28,7 @@ EndOfFile,
 				(ty-var (raw "a"))
 				(ty (name "Str")))
 			(where
-				(method (module-of "a") (name "to_str") (effectful false)
+				(method (module-of "a") (name "to_str")
 					(args
 						(ty-var (raw "a")))
 					(ty (name "Str")))))
@@ -54,7 +54,7 @@ NO CHANGE
 		(e-lambda
 			(args
 				(p-assign (ident "value")))
-			(e-dispatch-call (method "to_str") (constraint-fn-var 60)
+			(e-dispatch-call (method "to_str") (constraint-fn-var 204)
 				(receiver
 					(e-lookup-local
 						(p-assign (ident "value"))))
@@ -64,7 +64,7 @@ NO CHANGE
 				(ty-rigid-var (name "a"))
 				(ty-lookup (name "Str") (builtin)))
 			(where
-				(method (ty-rigid-var-lookup (ty-rigid-var (name "a"))) (name "to_str") (effectful false)
+				(method (ty-rigid-var-lookup (ty-rigid-var (name "a"))) (name "to_str")
 					(args
 						(ty-rigid-var-lookup (ty-rigid-var (name "a"))))
 					(ty-lookup (name "Str") (builtin)))))))

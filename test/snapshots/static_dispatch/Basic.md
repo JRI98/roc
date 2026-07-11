@@ -90,7 +90,7 @@ EndOfFile,
 				(ty-var (raw "a"))
 				(ty-var (raw "b")))
 			(where
-				(method (module-of "a") (name "to_str") (effectful false)
+				(method (module-of "a") (name "to_str")
 					(args
 						(ty-var (raw "a")))
 					(ty-var (raw "b")))))
@@ -108,7 +108,7 @@ EndOfFile,
 				(ty-var (raw "a"))
 				(ty-var (raw "b")))
 			(where
-				(method (module-of "a") (name "to_str2") (effectful false)
+				(method (module-of "a") (name "to_str2")
 					(args
 						(ty-var (raw "a")))
 					(ty-var (raw "b")))))
@@ -185,7 +185,7 @@ main = (helper1(val), helper2(val))
 		(e-lambda
 			(args
 				(p-assign (ident "test")))
-			(e-dispatch-call (method "to_str") (constraint-fn-var 214)
+			(e-dispatch-call (method "to_str") (constraint-fn-var 296)
 				(receiver
 					(e-lookup-local
 						(p-assign (ident "test"))))
@@ -199,7 +199,7 @@ main = (helper1(val), helper2(val))
 		(e-lambda
 			(args
 				(p-assign (ident "x")))
-			(e-dispatch-call (method "to_str") (constraint-fn-var 222)
+			(e-dispatch-call (method "to_str") (constraint-fn-var 304)
 				(receiver
 					(e-lookup-local
 						(p-assign (ident "x"))))
@@ -209,7 +209,7 @@ main = (helper1(val), helper2(val))
 				(ty-rigid-var (name "a"))
 				(ty-rigid-var (name "b")))
 			(where
-				(method (ty-rigid-var-lookup (ty-rigid-var (name "a"))) (name "to_str") (effectful false)
+				(method (ty-rigid-var-lookup (ty-rigid-var (name "a"))) (name "to_str")
 					(args
 						(ty-rigid-var-lookup (ty-rigid-var (name "a"))))
 					(ty-rigid-var-lookup (ty-rigid-var (name "b")))))))
@@ -218,7 +218,7 @@ main = (helper1(val), helper2(val))
 		(e-lambda
 			(args
 				(p-assign (ident "x")))
-			(e-dispatch-call (method "to_str2") (constraint-fn-var 230)
+			(e-dispatch-call (method "to_str2") (constraint-fn-var 312)
 				(receiver
 					(e-lookup-local
 						(p-assign (ident "x"))))
@@ -228,7 +228,7 @@ main = (helper1(val), helper2(val))
 				(ty-rigid-var (name "a"))
 				(ty-rigid-var (name "b")))
 			(where
-				(method (ty-rigid-var-lookup (ty-rigid-var (name "a"))) (name "to_str2") (effectful false)
+				(method (ty-rigid-var-lookup (ty-rigid-var (name "a"))) (name "to_str2")
 					(args
 						(ty-rigid-var-lookup (ty-rigid-var (name "a"))))
 					(ty-rigid-var-lookup (ty-rigid-var (name "b")))))))
@@ -245,12 +245,12 @@ main = (helper1(val), helper2(val))
 		(p-assign (ident "main"))
 		(e-tuple
 			(elems
-				(e-call (constraint-fn-var 310)
+				(e-call (constraint-fn-var 355)
 					(e-lookup-local
 						(p-assign (ident "helper1")))
 					(e-lookup-local
 						(p-assign (ident "val"))))
-				(e-call (constraint-fn-var 315)
+				(e-call (constraint-fn-var 360)
 					(e-lookup-local
 						(p-assign (ident "helper2")))
 					(e-lookup-local

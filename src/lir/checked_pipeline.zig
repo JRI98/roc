@@ -444,8 +444,11 @@ fn checkedTypeContainsFunctionInner(
         .function => true,
         .alias => |alias| (try checkedTypeContainsFunctionInner(types, alias.backing, active)) or
             try checkedTypeSliceContainsFunction(types, alias.args, active),
-        .nominal => |nominal| (try checkedTypeSliceContainsFunction(types, nominal.args, active)) or
-            try checkedTypeContainsFunctionInner(types, nominal.backing, active),
+        .nominal => |nominal| blk: {
+            if (try checkedTypeSliceContainsFunction(types, nominal.args, active)) break :blk true;
+            const backing = types.nominalBackingTemplateForPayload(nominal) orelse break :blk false;
+            break :blk try checkedTypeContainsFunctionInner(types, backing, active);
+        },
         .record => |record| (try checkedFieldsContainFunction(types, record.fields, active)) or
             try checkedTypeContainsFunctionInner(types, record.ext, active),
         .record_unbound => |fields| checkedFieldsContainFunction(types, fields, active),

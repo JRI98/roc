@@ -207,6 +207,14 @@ platform_required_defs: std.AutoHashMapUnmanaged(CIR.Def.Idx, PlatformRequiredDe
 /// mutual recursion, are rejected during canonicalization (local defs are
 /// sequentially scoped), so this is always a single self/enclosing chain.
 local_processing_ptrns: std.AutoHashMapUnmanaged(CIR.Pattern.Idx, LocalDefProcessed) = .{},
+
+/// Every local binding root (`x = ..` / `var x = ..` statement pattern)
+/// encountered while checking, in solve order. The settled-state occurs sweep
+/// checks these alongside the top-level defs: a local binding's cyclic type
+/// may never be reachable from the enclosing def's root type, and checking
+/// earlier would be premature because later constraints in the same statement
+/// can still determine the root's final graph.
+local_binding_roots: std.ArrayListUnmanaged(CIR.Pattern.Idx) = .empty,
 /// The name of the enclosing function, if known.
 /// Used to provide better error messages when type checking lambda arguments.
 enclosing_func_name: ?Ident.Idx,
@@ -1565,6 +1573,7 @@ pub fn deinit(self: *Self) void {
     self.top_level_ptrns.deinit(self.gpa);
     self.platform_required_defs.deinit(self.gpa);
     self.local_processing_ptrns.deinit(self.gpa);
+    self.local_binding_roots.deinit(self.gpa);
     self.type_writer.deinit();
     self.instantiation_dispatchers.deinit(self.gpa);
     self.ambiguity_candidates.deinit(self.gpa);
@@ -3349,14 +3358,17 @@ fn unifyInContext(self: *Self, a: Var, b: Var, env: *Env, ctx: problem.Context) 
     return self.runUnify(a, b, env, .{ .context = ctx });
 }
 
-/// Check if a variable contains an infinite type after solving a definition.
+/// Check if a variable contains an infinite type after solving a binding.
 /// This catches cases like `f = |x| f([x])` which creates `a = List(a)`.
-/// Similar to Rust's check_for_infinite_type called after LetCon.
+///
+/// Runs at binding roots: top-level defs (`CIR.Def.Idx`, the settled-state
+/// sweep), local bindings (`CIR.Pattern.Idx`, when their statement finishes
+/// solving), and standalone checked expressions (`CIR.Expr.Idx`, REPL roots).
 fn checkForInfiniteType(self: *Self, comptime Idx: anytype, idx: Idx) std.mem.Allocator.Error!void {
     const trace = tracy.trace(@src());
     defer trace.end();
 
-    std.debug.assert(Idx == CIR.Def.Idx or Idx == CIR.Expr.Idx);
+    std.debug.assert(Idx == CIR.Def.Idx or Idx == CIR.Expr.Idx or Idx == CIR.Pattern.Idx);
 
     const var_ = ModuleEnv.varFrom(idx);
     const occurs_result = try occurs.occurs(self.types, &self.occurs_scratch, var_);
@@ -3366,20 +3378,20 @@ fn checkForInfiniteType(self: *Self, comptime Idx: anytype, idx: Idx) std.mem.Al
             // This is fine - no cycle, or valid recursion through a nominal type
         },
         .recursive_anonymous => {
+            // Anonymous recursion (a recursive type not routed through a
+            // nominal) is always disallowed, at every binding root — top-level
+            // defs, checked expression roots, and local bindings alike. A
+            // recursive type must go through a nominal to be valid. The
+            // `.recursive_anonymous` vs `.infinite` classification only selects
+            // a clearer error message; it never permits the type.
             std.debug.assert(self.occurs_scratch.err_var != null);
             const err_var = self.occurs_scratch.err_var.?;
 
-            // Anonymous recursion (recursive type not through a nominal type)
             const snapshot = try self.snapshots.snapshotVarForError(self.types, &self.type_writer, err_var);
             _ = try self.problems.appendProblem(self.gpa, .{ .anonymous_recursion = .{
                 .var_ = var_,
                 .snapshot = snapshot,
-                .def_name = if (comptime Idx == CIR.Def.Idx) blk: {
-                    const def = self.cir.store.getDef(idx);
-                    break :blk self.getPatternIdent(def.pattern);
-                } else blk: {
-                    break :blk null;
-                },
+                .def_name = self.bindingRootName(Idx, idx),
             } });
             try self.types.setVarContent(var_, .err);
         },
@@ -3392,15 +3404,106 @@ fn checkForInfiniteType(self: *Self, comptime Idx: anytype, idx: Idx) std.mem.Al
             _ = try self.problems.appendProblem(self.gpa, .{ .infinite_recursion = .{
                 .var_ = var_,
                 .snapshot = snapshot,
-                .def_name = if (comptime Idx == CIR.Def.Idx) blk: {
-                    const def = self.cir.store.getDef(idx);
-                    break :blk self.getPatternIdent(def.pattern);
-                } else blk: {
-                    break :blk null;
-                },
+                .def_name = self.bindingRootName(Idx, idx),
             } });
             try self.types.setVarContent(var_, .err);
         },
+    }
+}
+
+/// The settled-state occurs sweep: check every binding root — top-level defs
+/// and recorded local bindings — for infinite/anonymous-recursive types, after
+/// all deferred constraints have been solved.
+fn checkBindingRootsForInfiniteTypes(self: *Self) std.mem.Allocator.Error!void {
+    const trace = tracy.trace(@src());
+    defer trace.end();
+
+    // Local bindings first: when a local binding's cycle is also reachable
+    // from the enclosing top-level def's type, reporting (and poisoning) the
+    // local binding attributes the error to the tighter root and suppresses a
+    // duplicate report at the def.
+    for (self.local_binding_roots.items) |pattern_idx| {
+        try self.checkForInfiniteType(CIR.Pattern.Idx, pattern_idx);
+    }
+    for (0..self.cir.all_defs.span.len) |def_offset| {
+        const def_idx = self.cir.store.defAt(self.cir.all_defs, def_offset);
+        try self.checkForInfiniteType(CIR.Def.Idx, def_idx);
+    }
+}
+
+/// The display name for a binding root being occurs-checked, when it has one.
+fn bindingRootName(self: *const Self, comptime Idx: anytype, idx: Idx) ?Ident.Idx {
+    if (comptime Idx == CIR.Def.Idx) {
+        const def = self.cir.store.getDef(idx);
+        return self.getPatternIdent(def.pattern);
+    }
+    if (comptime Idx == CIR.Pattern.Idx) {
+        return self.getPatternIdent(idx);
+    }
+    return null;
+}
+
+/// Validate every local nominal type declaration's backing recursion, after
+/// all type declarations have been generated and before any value checking.
+///
+/// The traversal resolves nominal backings through the store's declaration
+/// table by key (`occurs.occursDeclarationGraph`), so recursive references
+/// close cycles by declaration identity — including mutual recursion that
+/// per-use instantiation copies disconnect. Classification matches the
+/// value-graph occurs rules: a cycle is valid only when it passes through
+/// both a recursion-allowed position (tag payload / record field) and a
+/// nominal backing.
+///
+/// An invalid declaration is reported once, here, at the declaration; the
+/// declaration is marked invalid in the table and its decl var and backing
+/// template are poisoned to `.err`, so every use is suppressed instead of
+/// re-reporting the same cycle.
+fn validateNominalDeclRecursion(self: *Self) std.mem.Allocator.Error!void {
+    const trace = tracy.trace(@src());
+    defer trace.end();
+
+    const self_origin = self.cir.selfModuleIdentity();
+    const decl_count = self.types.nominalDeclCount();
+    var decl_int: u32 = 0;
+    while (decl_int < decl_count) : (decl_int += 1) {
+        const decl_idx: types_mod.NominalDecl.Idx = @enumFromInt(decl_int);
+        const decl = self.types.getNominalDecl(decl_idx);
+
+        // Imported declarations were validated by their own module; module
+        // imports are acyclic, so no cycle involving a local declaration can
+        // route through them except via type arguments, which the local
+        // traversal covers.
+        if (decl.origin_module != self_origin) continue;
+
+        const decl_var: Var = @enumFromInt(decl.statement());
+        const resolved = self.types.resolveVar(decl_var).desc.content;
+        // A declaration whose generation already failed (malformed backing)
+        // has nothing further to validate.
+        if (resolved != .structure or resolved.structure != .nominal_type) continue;
+
+        const occurs_result = try occurs.occursDeclarationGraph(self.types, &self.occurs_scratch, decl_var);
+        const kind: problem.InvalidNominalDeclRecursion.Kind = switch (occurs_result) {
+            .valid => continue,
+            .infinite => .infinite,
+            .recursive_anonymous => .anonymous,
+        };
+
+        // Snapshot the declaration's backing template (not the cycle var,
+        // which resolves to the bare nominal application and would render as
+        // just the type's name).
+        const snapshot = try self.snapshots.snapshotVarForError(self.types, &self.type_writer, decl.backing);
+        _ = try self.problems.appendProblem(self.gpa, .{ .invalid_nominal_decl_recursion = .{
+            .decl_var = decl_var,
+            .snapshot = snapshot,
+            .type_name = decl.ident.ident_idx,
+            .kind = kind,
+        } });
+
+        // Poison the declaration: uses instantiate `.err` and are suppressed,
+        // and no later stage can walk the cyclic template graph.
+        self.types.markNominalDeclInvalid(decl_idx);
+        try self.types.setVarContent(decl_var, .err);
+        try self.types.setVarContent(decl.backing, .err);
     }
 }
 
@@ -3589,7 +3692,6 @@ fn tryResolveStructuralRecordFieldDispatch(
     const published_constraint_func = Func{
         .args = published_constraint_args,
         .ret = constraint_fn.ret,
-        .needs_instantiation = false,
     };
     const published_constraint_fn_var = try self.freshFromContent(.{ .structure = .{
         .fn_unbound = published_constraint_func,
@@ -4219,7 +4321,7 @@ fn sourceDeclForBuiltinParseSpec(self: *const Self, decl: BuiltinParseSpecDecl) 
 }
 
 /// Create a nominal List type with the given element type
-fn mkListContent(self: *Self, elem_var: Var, env: *Env) Allocator.Error!Content {
+fn mkListContent(self: *Self, elem_var: Var) Allocator.Error!Content {
     const trace = tracy.trace(@src());
     defer trace.end();
 
@@ -4227,27 +4329,12 @@ fn mkListContent(self: *Self, elem_var: Var, env: *Env) Allocator.Error!Content 
         .ident_idx = self.cir.idents.list,
     };
 
-    // List's backing is [ProvidedByCompiler] with closed extension
-    // The element type is a type parameter, not the backing
-    const empty_tag_union_content = Content{ .structure = .empty_tag_union };
-    const ext_var = try self.freshFromContent(empty_tag_union_content, env, Region.zero());
-
-    // Create the [ProvidedByCompiler] tag
-    const provided_tag_ident = try @constCast(self.cir).insertIdent(base.Ident.for_text("ProvidedByCompiler"));
-    const provided_tag = try self.types.mkTag(provided_tag_ident, &.{});
-
-    const tag_union = types_mod.TagUnion{
-        .tags = try self.types.appendTags(&[_]types_mod.Tag{provided_tag}),
-        .ext = ext_var,
-    };
-    const backing_content = Content{ .structure = .{ .tag_union = tag_union } };
-    const backing_var = try self.freshFromContent(backing_content, env, Region.zero());
-
+    // The application carries only identity + the element arg; List's backing
+    // ([ProvidedByCompiler]) lives in the declaration table.
     const type_args = [_]Var{elem_var};
 
     return try self.types.mkNominalWithSourceDeclAndBuiltinOrigin(
         list_ident,
-        backing_var,
         &type_args,
         self.builtinOriginModule(),
         self.sourceDeclForBuiltinNominal(.list),
@@ -4343,7 +4430,7 @@ fn mkIteratorStepContent(self: *Self, item_var: Var, iter_var: Var, env: *Env) A
 /// Create a nominal number type content (e.g., U8, I32, Dec)
 /// Number types are defined in Builtin.roc nested inside Num module: Num.U8 :: [].{...}
 /// They have no type parameters and their backing is the empty tag union []
-fn mkNumberTypeContent(self: *Self, num_kind: CIR.NumKind, env: *Env) Allocator.Error!Content {
+fn mkNumberTypeContent(self: *Self, num_kind: CIR.NumKind) Allocator.Error!Content {
     const trace = tracy.trace(@src());
     defer trace.end();
 
@@ -4351,22 +4438,12 @@ fn mkNumberTypeContent(self: *Self, num_kind: CIR.NumKind, env: *Env) Allocator.
         .ident_idx = self.builtinNumTypeIdent(num_kind),
     };
 
-    // Number types backing is [] (empty tag union with closed extension)
-    const empty_tag_union_content = Content{ .structure = .empty_tag_union };
-    const ext_var = try self.freshFromContent(empty_tag_union_content, env, Region.zero());
-    const empty_tag_union = types_mod.TagUnion{
-        .tags = types_mod.Tag.SafeMultiList.Range.empty(),
-        .ext = ext_var,
-    };
-    const backing_content = Content{ .structure = .{ .tag_union = empty_tag_union } };
-    const backing_var = try self.freshFromContent(backing_content, env, Region.zero());
-
-    // Number types have no type arguments
+    // Number types have no type arguments; their backing lives in the
+    // declaration table.
     const no_type_args: []const Var = &.{};
 
     return try self.types.mkNominalWithSourceDeclAndBuiltinOrigin(
         type_ident,
-        backing_var,
         no_type_args,
         self.builtinOriginModule(),
         self.sourceDeclForBuiltinNominal(.{ .num = num_kind }),
@@ -4480,11 +4557,10 @@ fn builtinNumKindFromBuiltinSourceDecl(self: *const Self, source_decl: ?u32) ?CI
 fn mkBuiltinNumberTypeContentFromKind(
     self: *Self,
     num_kind: CIR.NumKind,
-    env: *Env,
 ) Allocator.Error!Content {
     return switch (num_kind) {
         .num_unbound, .int_unbound => unreachable,
-        else => try self.mkNumberTypeContent(num_kind, env),
+        else => try self.mkNumberTypeContent(num_kind),
     };
 }
 
@@ -4532,7 +4608,7 @@ fn unifyTypedLiteralWithExplicitType(
 
     switch (suffix_target.target()) {
         .builtin => |num_kind| {
-            try self.unifyWith(flex_var, try self.mkBuiltinNumberTypeContentFromKind(num_kind, env), env);
+            try self.unifyWith(flex_var, try self.mkBuiltinNumberTypeContentFromKind(num_kind), env);
         },
         .local => |stmt_idx| {
             const local_decl_var = ModuleEnv.varFrom(stmt_idx);
@@ -4572,7 +4648,7 @@ fn explicitTypeSuffixVar(
 
     switch (suffix_target.target()) {
         .builtin => |num_kind| {
-            try self.unifyWith(suffix_var, try self.mkBuiltinNumberTypeContentFromKind(num_kind, env), env);
+            try self.unifyWith(suffix_var, try self.mkBuiltinNumberTypeContentFromKind(num_kind), env);
         },
         .local => |stmt_idx| {
             const local_decl_var = ModuleEnv.varFrom(stmt_idx);
@@ -4660,7 +4736,7 @@ fn mkFlexWithFromNumeralConstraint(
 
     // Create the argument type: Numeral (from Builtin.Num.Numeral)
     // For from_numeral, the actual method signature is: Numeral -> Try(a, [InvalidNumeral(Str)])
-    const numeral_content = try self.mkNumeralContent(env);
+    const numeral_content = try self.mkNumeralContent();
     const arg_var = try self.freshFromContent(numeral_content, env, num_literal_info.region);
 
     // Create the error type: [InvalidNumeral(Str)] (closed tag union).
@@ -4685,7 +4761,7 @@ fn mkFlexWithFromNumeralConstraint(
 
     // Create Try(flex_var, err_var) as the return type
     // Try is a nominal type with two type args: the success type and the error type
-    const try_type_content = try self.mkTryContent(flex_var, err_var, env);
+    const try_type_content = try self.mkTryContent(flex_var, err_var);
     const ret_var = try self.freshFromContent(try_type_content, env, num_literal_info.region);
 
     const func_content = types_mod.Content{
@@ -4693,7 +4769,6 @@ fn mkFlexWithFromNumeralConstraint(
             .fn_unbound = types_mod.Func{
                 .args = try self.types.appendVars(&.{arg_var}),
                 .ret = ret_var,
-                .needs_instantiation = false,
             },
         },
     };
@@ -4766,7 +4841,7 @@ fn mkFlexWithFromQuoteConstraint(
     const err_var = try self.freshFromContent(err_type, env, region);
 
     // Create Try(flex_var, err_var) as the return type
-    const try_type_content = try self.mkTryContent(flex_var, err_var, env);
+    const try_type_content = try self.mkTryContent(flex_var, err_var);
     const ret_var = try self.freshFromContent(try_type_content, env, region);
 
     const func_content = types_mod.Content{
@@ -4774,7 +4849,6 @@ fn mkFlexWithFromQuoteConstraint(
             .fn_unbound = types_mod.Func{
                 .args = try self.types.appendVars(&.{arg_var}),
                 .ret = ret_var,
-                .needs_instantiation = false,
             },
         },
     };
@@ -4887,13 +4961,12 @@ fn mkBoxContent(self: *Self, elem_var: Var) Allocator.Error!Content {
         .ident_idx = self.cir.idents.box,
     };
 
-    // The backing var is the element type var
-    const backing_var = elem_var;
+    // The application carries only identity + the element arg; Box's backing
+    // (the element itself) lives in the declaration table.
     const type_args = [_]Var{elem_var};
 
     return try self.types.mkNominalWithSourceDeclAndBuiltinOrigin(
         box_ident,
-        backing_var,
         &type_args,
         self.builtinOriginModule(),
         self.sourceDeclForBuiltinNominal(.box),
@@ -4904,7 +4977,7 @@ fn mkBoxContent(self: *Self, elem_var: Var) Allocator.Error!Content {
 
 /// Create a nominal Try type with the given success and error types.
 /// This is used for creating Try types in function signatures (e.g., from_numeral).
-fn mkTryContent(self: *Self, ok_var: Var, err_var: Var, env: *Env) Allocator.Error!Content {
+fn mkTryContent(self: *Self, ok_var: Var, err_var: Var) Allocator.Error!Content {
     const trace = tracy.trace(@src());
     defer trace.end();
 
@@ -4912,22 +4985,12 @@ fn mkTryContent(self: *Self, ok_var: Var, err_var: Var, env: *Env) Allocator.Err
         .ident_idx = self.cir.idents.builtin_try,
     };
 
-    // Create the backing tag union [Ok(ok), Err(err)]
-    // Tags are created in source order (matching Try definition in Builtin.roc).
-    // The layout generator will sort them alphabetically later.
-    const ok_ident = try @constCast(self.cir).insertIdent(base.Ident.for_text("Ok"));
-    const err_ident = try @constCast(self.cir).insertIdent(base.Ident.for_text("Err"));
-    const ok_tag = try self.types.mkTag(ok_ident, &.{ok_var});
-    const err_tag = try self.types.mkTag(err_ident, &.{err_var});
-    const ext_var = try self.freshFromContent(.{ .structure = .empty_tag_union }, env, Region.zero());
-    const backing_content = try self.types.mkTagUnion(&.{ ok_tag, err_tag }, ext_var);
-    const backing_var = try self.freshFromContent(backing_content, env, Region.zero());
-
+    // The application carries only identity + the ok/err args; Try's backing
+    // ([Ok(ok), Err(err)]) lives in the declaration table.
     const type_args = [_]Var{ ok_var, err_var };
 
     return try self.types.mkNominalWithSourceDeclAndBuiltinOrigin(
         try_ident,
-        backing_var,
         &type_args,
         self.builtinOriginModule(),
         self.sourceDeclForBuiltinNominal(.try_type),
@@ -4952,10 +5015,8 @@ fn mkParseSpecVar(
             unreachable;
         },
     };
-    const backing_var = try self.freshFromContent(.{ .structure = .empty_record }, env, region);
     return try self.freshFromContent(try self.types.mkNominalWithSourceDeclAndBuiltinOrigin(
         .{ .ident_idx = ident_idx },
-        backing_var,
         &.{shape_var},
         self.builtinOriginModule(),
         self.sourceDeclForBuiltinParseSpec(decl),
@@ -4989,10 +5050,8 @@ fn mkBuiltinShapeHandleVar(
     env: *Env,
     region: Region,
 ) Allocator.Error!Var {
-    const backing_var = try self.freshFromContent(.{ .structure = .empty_record }, env, region);
     return try self.freshFromContent(try self.types.mkNominalWithSourceDeclAndBuiltinOrigin(
         .{ .ident_idx = self.builtinNominalIdent(decl) },
-        backing_var,
         &.{shape_var},
         self.builtinOriginModule(),
         self.sourceDeclForBuiltinNominal(decl),
@@ -5002,7 +5061,7 @@ fn mkBuiltinShapeHandleVar(
 }
 
 /// Create the transparent builtin Numeral type used by from_numeral.
-fn mkNumeralContent(self: *Self, env: *Env) Allocator.Error!Content {
+fn mkNumeralContent(self: *Self) Allocator.Error!Content {
     const trace = tracy.trace(@src());
     defer trace.end();
 
@@ -5011,34 +5070,11 @@ fn mkNumeralContent(self: *Self, env: *Env) Allocator.Error!Content {
         .ident_idx = self.cir.idents.builtin_numeral,
     };
 
-    const u8_before = try self.freshFromContent(try self.mkNumberTypeContent(.u8, env), env, Region.zero());
-    const u8_after = try self.freshFromContent(try self.mkNumberTypeContent(.u8, env), env, Region.zero());
-    const digits_before = try self.freshFromContent(try self.mkListContent(u8_before, env), env, Region.zero());
-    const digits_after = try self.freshFromContent(try self.mkListContent(u8_after, env), env, Region.zero());
-    const digit_count = try self.freshFromContent(try self.mkNumberTypeContent(.u64, env), env, Region.zero());
-    const is_negative = try self.freshBool(env, Region.zero());
-
-    const record_ext = try self.freshFromContent(.{ .structure = .empty_record }, env, Region.zero());
-    const fields = try self.types.appendRecordFields(&[_]types_mod.RecordField{
-        .{ .name = self.cir.idents.is_negative, .var_ = is_negative },
-        .{ .name = self.cir.idents.digits_before_pt, .var_ = digits_before },
-        .{ .name = self.cir.idents.digits_after_pt, .var_ = digits_after },
-        .{ .name = self.cir.idents.digits_after_pt_count, .var_ = digit_count },
-    });
-    const record_var = try self.freshFromContent(.{ .structure = .{ .record = .{
-        .fields = fields,
-        .ext = record_ext,
-    } } }, env, Region.zero());
-
-    const literal_ident = try @constCast(self.cir).insertIdent(base.Ident.for_text("Literal"));
-    const literal_tag = try self.types.mkTag(literal_ident, &.{record_var});
-    const union_ext = try self.freshFromContent(.{ .structure = .empty_tag_union }, env, Region.zero());
-    const backing_content = try self.types.mkTagUnion(&.{literal_tag}, union_ext);
-    const backing_var = try self.freshFromContent(backing_content, env, Region.zero());
-
+    // The application carries only identity; Numeral's backing (the Literal
+    // record) lives in the declaration table, where custom from_numeral
+    // implementations open it (Numeral is transparent).
     return try self.types.mkNominalWithSourceDeclAndBuiltinOrigin(
         numeral_ident,
-        backing_var,
         &.{}, // No type args
         self.builtinOriginModule(),
         self.sourceDeclForBuiltinNominal(.numeral),
@@ -5201,7 +5237,49 @@ fn copyBuiltinTypes(self: *Self) Allocator.Error!void {
     }
 
     // Try type is accessed via external references, no need to copy it here
+
+    // Ensure this module's type store carries a declaration-table entry for
+    // every builtin nominal declaration. The checker synthesizes applications
+    // of these directly (List, Box, Try, number types, ...) without going
+    // through copyVar, so the entries must be present up front for keyed
+    // declaration lookups to resolve.
+    try self.ensureBuiltinNominalDeclEntries();
+
     self.builtin_types_copied = true;
+}
+
+/// Copy the declaration-table entries for all builtin nominal declarations
+/// from the Builtin module env into this module's type store. No-op when
+/// checking the Builtin module itself (its declarations register locally
+/// during type-decl processing).
+fn ensureBuiltinNominalDeclEntries(self: *Self) Allocator.Error!void {
+    const trace = tracy.trace(@src());
+    defer trace.end();
+
+    if (self.isCheckingBuiltinModuleDirectly()) return;
+    const builtin_env = self.builtin_ctx.builtin_module orelse return;
+    const indices = self.builtin_ctx.builtin_indices orelse {
+        if (builtin.mode == .Debug) {
+            std.debug.panic("type checker invariant violated: builtin module env present without builtin indices", .{});
+        }
+        unreachable;
+    };
+
+    self.var_map.clearRetainingCapacity();
+
+    inline for (CIR.builtin_type_specs) |spec| {
+        try copy_import.ensureNominalDeclForStatement(
+            &builtin_env.types,
+            self.types,
+            @intFromEnum(@field(indices, spec.type_field)),
+            &self.var_map,
+            builtin_env,
+            self.cir,
+            self.gpa,
+        );
+    }
+
+    try self.postProcessCopiedVars(Region.zero());
 }
 
 /// Public `checkFile` function.
@@ -5283,6 +5361,10 @@ fn checkFileInternal(self: *Self, skip_numeric_defaults: bool) std.mem.Allocator
             },
         }
     }
+
+    // With every declaration generated, validate nominal declaration
+    // recursion before any value checking consumes the declarations.
+    try self.validateNominalDeclRecursion();
 
     // Next, capture all top level defs
     // This is used to support out-of-order defs
@@ -5371,11 +5453,9 @@ fn checkFileInternal(self: *Self, skip_numeric_defaults: bool) std.mem.Allocator
 
     try self.finalizeTypes(&env, .{ .module = .{ .skip_numeric_defaults = skip_numeric_defaults } });
 
-    // After solving all deferred constraints, check for infinite types
-    for (0..self.cir.all_defs.span.len) |def_offset| {
-        const def_idx = self.cir.store.defAt(self.cir.all_defs, def_offset);
-        try self.checkForInfiniteType(CIR.Def.Idx, def_idx);
-    }
+    // After solving all deferred constraints, check every binding root
+    // (top-level defs and local bindings) for infinite types
+    try self.checkBindingRootsForInfiniteTypes();
 
     if (!self.has_can_error_diagnostics()) {
         try self.poisonErroneousValueUses();
@@ -5403,6 +5483,40 @@ fn checkFileInternal(self: *Self, skip_numeric_defaults: bool) std.mem.Allocator
     try self.reportNonExhaustiveLambdaParams(&env);
 
     try self.pruneSelectedHoistedRootsAfterSolving();
+
+    self.debugAssertNominalDeclTableComplete();
+}
+
+/// Debug-only invariant check: every nominal application in this store that
+/// carries a source declaration can resolve its declaration in this store's
+/// declaration table. Local declarations register during type-decl
+/// processing; imported ones are copied in by `copy_import`; builtin ones are
+/// ensured up front by `ensureBuiltinNominalDeclEntries`. A miss here means a
+/// nominal application was minted without its declaration being reachable.
+fn debugAssertNominalDeclTableComplete(self: *const Self) void {
+    if (builtin.mode != .Debug) return;
+
+    var var_int: u32 = 0;
+    const num_vars: u32 = @intCast(self.types.len());
+    while (var_int < num_vars) : (var_int += 1) {
+        const resolved = self.types.resolveVar(@enumFromInt(var_int));
+        if (!resolved.is_root) continue;
+        const content = resolved.desc.content;
+        if (content != .structure) continue;
+        if (content.structure != .nominal_type) continue;
+        const nominal = content.structure.nominal_type;
+        if (!nominal.sourceDecl().present) continue;
+        if (self.types.lookupNominalDecl(nominal) == null) {
+            std.debug.panic(
+                "type checker invariant violated: nominal application '{s}' (origin {}, statement {}) has no declaration table entry in its store",
+                .{
+                    self.cir.getIdentStoreConst().getText(nominal.ident.ident_idx),
+                    @intFromEnum(nominal.origin_module),
+                    nominal.sourceDecl().statement,
+                },
+            );
+        }
+    }
 }
 
 fn pruneSelectedHoistedRootsAfterSolving(self: *Self) Allocator.Error!void {
@@ -5501,11 +5615,43 @@ fn debugVerifyKeptHoistedRootDependencies(self: *Self) Allocator.Error!void {
 
 fn varIsConcreteHoistedConstType(self: *Self, var_: Var) Allocator.Error!bool {
     self.var_set.clearRetainingCapacity();
-    return try self.varIsConcreteHoistedConstTypeInternal(var_, &self.var_set);
+    return try self.varIsConcreteHoistedConstTypeInternal(.value_graph, var_, &self.var_set);
 }
+
+/// Resolve a nominal application's declaration backing TEMPLATE for read-only
+/// structural queries, or null when the declaration is invalid or source-less.
+/// A source-backed nominal missing from the declaration table is a checker
+/// invariant violation. In the template, the declaration's formals (rigid vars)
+/// stand at exactly the positions where the application's args are substituted,
+/// so a query that checks the args separately can walk the template as long as
+/// its rigid handling is neutral (or explicitly template-aware).
+fn nominalDeclBackingTemplate(self: *const Self, nominal: types_mod.NominalType) ?Var {
+    const decl_idx = self.types.lookupNominalDecl(nominal) orelse {
+        if (nominal.sourceDecl().present) {
+            if (builtin.mode == .Debug) {
+                std.debug.panic(
+                    "type checker invariant violated: nominal application '{s}' has a source declaration but no declaration table entry",
+                    .{self.cir.getIdentStoreConst().getText(nominal.ident.ident_idx)},
+                );
+            }
+            unreachable;
+        }
+        return null;
+    };
+    const decl = self.types.getNominalDecl(decl_idx);
+    if (!decl.isValid()) return null;
+    return decl.backing;
+}
+
+/// Which graph a hoisted-const concreteness walk is inspecting: the value
+/// graph (rigids are NOT concrete) or a declaration backing template (rigids
+/// are the declaration's formals, standing for args the caller has already
+/// checked, so they count as concrete).
+const HoistedConstWalk = enum { value_graph, decl_template };
 
 fn varIsConcreteHoistedConstTypeInternal(
     self: *Self,
+    comptime walk: HoistedConstWalk,
     var_: Var,
     visited: *std.AutoHashMap(Var, void),
 ) Allocator.Error!bool {
@@ -5516,27 +5662,29 @@ fn varIsConcreteHoistedConstTypeInternal(
     return switch (resolved.desc.content) {
         .err,
         .flex,
-        .rigid,
         => false,
-        .alias => |alias| (try self.varsAreConcreteHoistedConstTypes(self.types.sliceAliasArgs(alias), visited)) and
-            try self.varIsConcreteHoistedConstTypeInternal(self.types.getAliasBackingVar(alias), visited),
-        .structure => |flat| try self.flatTypeIsConcreteHoistedConst(flat, visited),
+        .rigid => walk == .decl_template,
+        .alias => |alias| (try self.varsAreConcreteHoistedConstTypes(walk, self.types.sliceAliasArgs(alias), visited)) and
+            try self.varIsConcreteHoistedConstTypeInternal(walk, self.types.getAliasBackingVar(alias), visited),
+        .structure => |flat| try self.flatTypeIsConcreteHoistedConst(walk, flat, visited),
     };
 }
 
 fn varsAreConcreteHoistedConstTypes(
     self: *Self,
+    comptime walk: HoistedConstWalk,
     vars: []const Var,
     visited: *std.AutoHashMap(Var, void),
 ) Allocator.Error!bool {
     for (vars) |var_| {
-        if (!try self.varIsConcreteHoistedConstTypeInternal(var_, visited)) return false;
+        if (!try self.varIsConcreteHoistedConstTypeInternal(walk, var_, visited)) return false;
     }
     return true;
 }
 
 fn flatTypeIsConcreteHoistedConst(
     self: *Self,
+    comptime walk: HoistedConstWalk,
     flat: FlatType,
     visited: *std.AutoHashMap(Var, void),
 ) Allocator.Error!bool {
@@ -5550,23 +5698,23 @@ fn flatTypeIsConcreteHoistedConst(
         => false,
         .record => |record| blk: {
             const fields = self.types.getRecordFieldsSlice(record.fields);
-            if (!try self.varsAreConcreteHoistedConstTypes(fields.items(.var_), visited)) break :blk false;
-            break :blk try self.varIsConcreteHoistedConstTypeInternal(record.ext, visited);
+            if (!try self.varsAreConcreteHoistedConstTypes(walk, fields.items(.var_), visited)) break :blk false;
+            break :blk try self.varIsConcreteHoistedConstTypeInternal(walk, record.ext, visited);
         },
         .record_unbound => |fields| blk: {
             const fields_slice = self.types.getRecordFieldsSlice(fields);
-            break :blk try self.varsAreConcreteHoistedConstTypes(fields_slice.items(.var_), visited);
+            break :blk try self.varsAreConcreteHoistedConstTypes(walk, fields_slice.items(.var_), visited);
         },
-        .tuple => |tuple| try self.varsAreConcreteHoistedConstTypes(self.types.sliceVars(tuple.elems), visited),
+        .tuple => |tuple| try self.varsAreConcreteHoistedConstTypes(walk, self.types.sliceVars(tuple.elems), visited),
         .tag_union => |tag_union| blk: {
             const tags = self.types.getTagsSlice(tag_union.tags);
             for (tags.items(.args)) |tag_args| {
-                if (!try self.varsAreConcreteHoistedConstTypes(self.types.sliceVars(tag_args), visited)) break :blk false;
+                if (!try self.varsAreConcreteHoistedConstTypes(walk, self.types.sliceVars(tag_args), visited)) break :blk false;
             }
-            break :blk try self.varIsConcreteHoistedConstTypeInternal(tag_union.ext, visited);
+            break :blk try self.varIsConcreteHoistedConstTypeInternal(walk, tag_union.ext, visited);
         },
         .nominal_type => |nominal| blk: {
-            if (!try self.varsAreConcreteHoistedConstTypes(self.types.sliceNominalArgs(nominal), visited)) break :blk false;
+            if (!try self.varsAreConcreteHoistedConstTypes(walk, self.types.sliceNominalArgs(nominal), visited)) break :blk false;
             if (self.builtinNominalDeclForBuiltinSourceDecl(nominal.sourceDeclOptional())) |builtin_decl| {
                 switch (builtin_decl) {
                     .list,
@@ -5583,7 +5731,11 @@ fn flatTypeIsConcreteHoistedConst(
                 }
             }
             if (nominal.isOpaque()) break :blk true;
-            break :blk try self.varIsConcreteHoistedConstTypeInternal(self.types.getNominalBackingVar(nominal), visited);
+            // Transparent non-builtin nominal: inspect the declaration's
+            // backing template. Formals in the template stand for the args
+            // checked above, so the template walk admits rigids.
+            const template = self.nominalDeclBackingTemplate(nominal) orelse break :blk false;
+            break :blk try self.varIsConcreteHoistedConstTypeInternal(.decl_template, template, visited);
         },
     };
 }
@@ -5767,9 +5919,13 @@ fn hoistedRootDependenciesAreKeptInternal(
         .e_call => |call| (try self.hoistedRootCalleeAllowsStoredConst(call.func, context)) and
             (try self.hoistedRootDependenciesAreKeptInternal(call.func, context, keep_oracle)) and
             try self.hoistedRootExprSpanDependenciesAreKept(call.args, context, keep_oracle),
-        .e_method_call => |call| (try self.hoistedRootDependenciesAreKeptInternal(call.receiver, context, keep_oracle)) and
-            try self.hoistedRootExprSpanDependenciesAreKept(call.args, context, keep_oracle),
-        .e_dispatch_call => |call| !self.varIsEffectfulFunction(call.constraint_fn_var) and
+        // Surface method calls must have been rewritten to checked dispatch
+        // calls before the settled hoistability walk can classify them.
+        .e_method_call => false,
+        .e_dispatch_call => |call| (try self.staticDispatchAllowsHoistedRoot(
+            ModuleEnv.varFrom(call.receiver),
+            call.constraint_fn_var,
+        )) and
             (try self.hoistedRootDependenciesAreKeptInternal(call.receiver, context, keep_oracle)) and
             try self.hoistedRootExprSpanDependenciesAreKept(call.args, context, keep_oracle),
         .e_record => |record| self.hoistedRootRecordDependenciesAreKept(record.fields, record.ext, context, keep_oracle),
@@ -5782,9 +5938,11 @@ fn hoistedRootDependenciesAreKeptInternal(
         .e_unary_not => |unary| self.hoistedRootDependenciesAreKeptInternal(unary.expr, context, keep_oracle),
         .e_field_access => |field| self.hoistedRootDependenciesAreKeptInternal(field.receiver, context, keep_oracle),
         .e_interpolation => |interpolation| blk: {
-            if (interpolation.constraint_fn_var) |fn_var| {
-                if (self.varIsEffectfulFunction(fn_var)) break :blk false;
-            }
+            const fn_var = interpolation.constraint_fn_var orelse break :blk false;
+            if (!try self.staticDispatchAllowsHoistedRoot(
+                self.interpolationDispatchOwnerVar(expr),
+                fn_var,
+            )) break :blk false;
             break :blk (try self.hoistedRootDependenciesAreKeptInternal(interpolation.first, context, keep_oracle)) and
                 try self.hoistedRootExprSpanDependenciesAreKept(interpolation.parts, context, keep_oracle);
         },
@@ -5792,11 +5950,19 @@ fn hoistedRootDependenciesAreKeptInternal(
             try self.hoistedRootDependenciesAreKeptInternal(eq.rhs, context, keep_oracle),
         .e_structural_hash => |h| (try self.hoistedRootDependenciesAreKeptInternal(h.value, context, keep_oracle)) and
             try self.hoistedRootDependenciesAreKeptInternal(h.hasher, context, keep_oracle),
-        .e_method_eq => |eq| !self.varIsEffectfulFunction(eq.constraint_fn_var) and
+        .e_method_eq => |eq| (try self.staticDispatchAllowsHoistedRoot(
+            ModuleEnv.varFrom(eq.lhs),
+            eq.constraint_fn_var,
+        )) and
             (try self.hoistedRootDependenciesAreKeptInternal(eq.lhs, context, keep_oracle)) and
             try self.hoistedRootDependenciesAreKeptInternal(eq.rhs, context, keep_oracle),
-        .e_type_method_call => |call| self.hoistedRootExprSpanDependenciesAreKept(call.args, context, keep_oracle),
-        .e_type_dispatch_call => |call| !self.varIsEffectfulFunction(call.constraint_fn_var) and
+        // Like value method calls, surface type-method calls are not checked
+        // dispatch plans and therefore cannot establish compile-time safety.
+        .e_type_method_call => false,
+        .e_type_dispatch_call => |call| (try self.staticDispatchAllowsHoistedRoot(
+            self.typeDispatchOwnerVar(call.type_dispatch_stmt),
+            call.constraint_fn_var,
+        )) and
             try self.hoistedRootExprSpanDependenciesAreKept(call.args, context, keep_oracle),
         .e_tuple_access => |access| self.hoistedRootDependenciesAreKeptInternal(access.tuple, context, keep_oracle),
     };
@@ -7641,6 +7807,18 @@ fn varIsEffectfulFunction(self: *Self, var_: Var) bool {
     }
 }
 
+/// A dispatch can be evaluated as one module-level constant only when checking
+/// has fixed both parts that make the operation context-independent: its
+/// checked callable is not effectful and its complete dispatcher type is
+/// concrete.
+/// A constrained or otherwise open dispatcher needs specialization-edge
+/// evidence, so selecting it as a caller-less compile-time root would erase the
+/// evidence scope that gives the dispatch meaning.
+fn staticDispatchAllowsHoistedRoot(self: *Self, dispatcher_var: Var, callable_var: Var) Allocator.Error!bool {
+    if (!self.varIsFunctionType(callable_var) or self.varIsEffectfulFunction(callable_var)) return false;
+    return try self.varIsConcreteHoistedConstType(dispatcher_var);
+}
+
 fn exprHasEffectfulFunctionBody(self: *const Self, expr_idx: CIR.Expr.Idx) bool {
     return switch (self.cir.store.getExpr(expr_idx)) {
         .e_lambda => self.effectful_lambda_bodies.contains(expr_idx),
@@ -8419,6 +8597,9 @@ pub fn checkExprRepl(self: *Self, expr_idx: CIR.Expr.Idx) std.mem.Allocator.Erro
         try self.generateStmtTypeDeclType(stmt_idx, &env);
     }
 
+    // Validate nominal declaration recursion before checking values.
+    try self.validateNominalDeclRecursion();
+
     // Set the rank to be outermost
     try env.var_pool.pushRank();
     std.debug.assert(env.rank() == .outermost);
@@ -8429,8 +8610,12 @@ pub fn checkExprRepl(self: *Self, expr_idx: CIR.Expr.Idx) std.mem.Allocator.Erro
     try self.finalizeTypes(&env, .{ .repl_expr = expr_idx });
     try self.reportPolymorphicConstrainedExpr(expr_idx);
 
-    // Check for infinite types
+    // Check for infinite types, at the expression root and at every binding
+    // root the expression contains
     try self.checkForInfiniteType(CIR.Expr.Idx, expr_idx);
+    try self.checkBindingRootsForInfiniteTypes();
+
+    self.debugAssertNominalDeclTableComplete();
 }
 
 /// Check a REPL expression, also type-checking any definitions (for local type declarations)
@@ -8456,6 +8641,9 @@ pub fn checkExprReplWithDefs(self: *Self, expr_idx: CIR.Expr.Idx) std.mem.Alloca
         const stmt_idx = self.cir.store.statementAt(self.cir.builtin_statements, stmt_offset);
         try self.generateStmtTypeDeclType(stmt_idx, &env);
     }
+
+    // Validate nominal declaration recursion before checking values.
+    try self.validateNominalDeclRecursion();
 
     // Initialize top_level_ptrns with any defs from local type declarations
     for (0..self.cir.all_defs.span.len) |def_offset| {
@@ -8486,20 +8674,41 @@ pub fn checkExprReplWithDefs(self: *Self, expr_idx: CIR.Expr.Idx) std.mem.Alloca
     // Check the expr
     _ = try self.checkExpr(expr_idx, &env, Expected.none());
 
-    try self.finalizeTypes(&env, .{ .repl_expr = expr_idx });
+    // Check any accumulated constraints
+    try self.checkAllConstraints(&env);
+    try self.resolvePendingTupleAccesses(&env, false);
+    try self.checkAllConstraints(&env);
+    try self.resolveNumericLiteralsFromContext(&env);
+    try self.finalizeLiteralDefaults(&env);
 
-    // After solving all deferred constraints, check for infinite types —
-    // per-def AND for the result expression itself, matching checkExprRepl
-    // (its type may be infinite/anonymously recursive, which the per-def
-    // checks above don't cover).
-    for (0..self.cir.all_defs.span.len) |def_offset| {
-        const def_idx = self.cir.store.defAt(self.cir.all_defs, def_offset);
-        try self.checkForInfiniteType(CIR.Def.Idx, def_idx);
+    // After finalizing literal defaults, resolve any remaining deferred static
+    // dispatch constraints: committing a default can generate deferred
+    // method_call constraints (e.g. Dec.to_str returns Str). Without this step,
+    // the return type of methods on numerics stays an unconstrained flex var,
+    // causing incorrect .zst layouts.
+    if (env.deferred_static_dispatch_constraints.items.items.len > 0) {
+        try self.checkStaticDispatchConstraints(&env, true);
+        try self.checkAllConstraints(&env);
     }
+
+    // After solving all deferred constraints, check every binding root
+    // (top-level defs and local bindings) for infinite types
+    try self.checkBindingRootsForInfiniteTypes();
+
+    // Check the result expression itself, matching checkExprRepl: its type may
+    // have incompatible constraints (e.g. !3) or be infinite/anonymously
+    // recursive, neither of which is covered by the per-def checks above.
+    const expr_var = ModuleEnv.varFrom(expr_idx);
+    try self.checkFlexVarConstraintCompatibility(expr_var, &env, true);
+    try self.validateResolvedOpenNumeralLiterals(&env);
+    try self.resolvePendingTupleAccesses(&env, true);
+    try self.checkAllConstraints(&env);
     try self.checkForInfiniteType(CIR.Expr.Idx, expr_idx);
 
     try self.reportPolymorphicConstrainedExpr(expr_idx);
     try self.poisonErroneousValueUses();
+
+    self.debugAssertNominalDeclTableComplete();
 }
 
 // defs //
@@ -9165,7 +9374,6 @@ fn predeclareNominalDecl(
         decl_var,
         try self.types.mkNominalWithSourceDeclAndBuiltinOrigin(
             .{ .ident_idx = header.relative_name },
-            backing_var,
             header_vars,
             self.cir.selfModuleIdentity(),
             @intFromEnum(decl_var),
@@ -9174,6 +9382,41 @@ fn predeclareNominalDecl(
         ),
         env,
     );
+
+    try self.registerLocalNominalDecl(
+        @intFromEnum(decl_var),
+        header.relative_name,
+        header_vars,
+        backing_var,
+        nominal.is_opaque,
+    );
+}
+
+/// Register (or refresh) the declaration-table entry for a local nominal
+/// type declaration. The entry carries exactly the identity bits that nominal
+/// applications of this declaration embed, so keyed lookups resolve for every
+/// application in this store.
+fn registerLocalNominalDecl(
+    self: *Self,
+    decl_statement: u32,
+    name: Ident.Idx,
+    header_vars: []const Var,
+    backing_var: Var,
+    is_opaque: bool,
+) Allocator.Error!void {
+    const builtin_origin = self.cir.module_role == .builtin;
+    _ = try self.types.registerNominalDecl(.{
+        .ident = .{ .ident_idx = name },
+        .origin_module = self.cir.selfModuleIdentity(),
+        .source = try types_mod.NominalType.Source.initChecked(
+            try types_mod.SourceDecl.fromStatementWithBuiltinOriginChecked(decl_statement, builtin_origin),
+            is_opaque,
+            builtin_origin,
+        ),
+        .formals = try self.types.appendVars(header_vars),
+        .backing = backing_var,
+        .flags = .{ .valid = true },
+    });
 }
 
 fn predeclaredAliasArgs(self: *const Self, decl_var: Var) ?[]Var {
@@ -9272,7 +9515,6 @@ fn generateNominalDecl(
             decl_var,
             try self.types.mkNominalWithSourceDeclAndBuiltinOrigin(
                 .{ .ident_idx = header.relative_name },
-                ModuleEnv.varFrom(nominal.anno),
                 header_vars,
                 self.cir.selfModuleIdentity(),
                 @intFromEnum(decl_idx),
@@ -9280,6 +9522,14 @@ fn generateNominalDecl(
                 self.cir.module_role == .builtin,
             ),
             env,
+        );
+
+        try self.registerLocalNominalDecl(
+            @intFromEnum(decl_idx),
+            header.relative_name,
+            header_vars,
+            ModuleEnv.varFrom(nominal.anno),
+            nominal.is_opaque,
         );
     }
 
@@ -9304,6 +9554,18 @@ fn generateNominalDecl(
         .is_opaque = nominal.is_opaque,
         .num_args = @intCast(header_args.len),
     } });
+
+    // A malformed backing (its error was already reported while generating
+    // the annotation) invalidates the declaration: mark it in the table and
+    // poison the decl var so every use instantiates `.err` and is suppressed
+    // (declaration validity replaced the unifier's err-backed-nominal
+    // short-circuit).
+    if (self.types.resolveVar(backing_var).desc.content == .err) {
+        if (self.types.lookupNominalDeclByKey(self.cir.selfModuleIdentity(), @intFromEnum(decl_idx))) |table_idx| {
+            self.types.markNominalDeclInvalid(table_idx);
+        }
+        try self.unifyWithTargetRank(decl_var, .err, env);
+    }
 }
 
 /// Generate types for a standalone type annotation (one without a corresponding definition).
@@ -9459,7 +9721,10 @@ fn generateStaticDispatchConstraintFromWhere(self: *Self, where_idx: CIR.WhereCl
             const ret_var = ModuleEnv.varFrom(method.ret);
 
             // Create the function var
-            const func_content = try self.types.mkFuncUnbound(anno_arg_vars, ret_var);
+            const func_content = if (method.effectful)
+                try self.types.mkFuncEffectful(anno_arg_vars, ret_var)
+            else
+                try self.types.mkFuncPure(anno_arg_vars, ret_var);
             const func_var = try self.freshFromContent(func_content, env, where_region);
 
             // Add to scratch list
@@ -9596,7 +9861,6 @@ fn generateAnnoTypeInPlace(self: *Self, anno_idx: CIR.TypeAnno.Idx, env: *Env, c
                                         // Nominal types can be recursive
                                         try self.unifyWith(anno_var, try self.types.mkNominalWithSourceDeclAndBuiltinOrigin(
                                             .{ .ident_idx = this_decl.name },
-                                            this_decl.backing_var,
                                             &.{},
                                             self.cir.selfModuleIdentity(),
                                             @intFromEnum(this_decl.idx),
@@ -9712,7 +9976,6 @@ fn generateAnnoTypeInPlace(self: *Self, anno_idx: CIR.TypeAnno.Idx, env: *Env, c
                                         // Nominal types can be recursive
                                         try self.unifyWith(anno_var, try self.types.mkNominalWithSourceDeclAndBuiltinOrigin(
                                             .{ .ident_idx = this_decl.name },
-                                            this_decl.backing_var,
                                             anno_arg_vars,
                                             self.cir.selfModuleIdentity(),
                                             @intFromEnum(this_decl.idx),
@@ -10336,19 +10599,19 @@ fn setBuiltinTypeContent(
 
     switch (anno_builtin_type) {
         // Phase 5: Use nominal types from Builtin instead of special .num content
-        .u8 => try self.unifyWith(anno_var, try self.mkNumberTypeContent(.u8, env), env),
-        .u16 => try self.unifyWith(anno_var, try self.mkNumberTypeContent(.u16, env), env),
-        .u32 => try self.unifyWith(anno_var, try self.mkNumberTypeContent(.u32, env), env),
-        .u64 => try self.unifyWith(anno_var, try self.mkNumberTypeContent(.u64, env), env),
-        .u128 => try self.unifyWith(anno_var, try self.mkNumberTypeContent(.u128, env), env),
-        .i8 => try self.unifyWith(anno_var, try self.mkNumberTypeContent(.i8, env), env),
-        .i16 => try self.unifyWith(anno_var, try self.mkNumberTypeContent(.i16, env), env),
-        .i32 => try self.unifyWith(anno_var, try self.mkNumberTypeContent(.i32, env), env),
-        .i64 => try self.unifyWith(anno_var, try self.mkNumberTypeContent(.i64, env), env),
-        .i128 => try self.unifyWith(anno_var, try self.mkNumberTypeContent(.i128, env), env),
-        .f32 => try self.unifyWith(anno_var, try self.mkNumberTypeContent(.f32, env), env),
-        .f64 => try self.unifyWith(anno_var, try self.mkNumberTypeContent(.f64, env), env),
-        .dec => try self.unifyWith(anno_var, try self.mkNumberTypeContent(.dec, env), env),
+        .u8 => try self.unifyWith(anno_var, try self.mkNumberTypeContent(.u8), env),
+        .u16 => try self.unifyWith(anno_var, try self.mkNumberTypeContent(.u16), env),
+        .u32 => try self.unifyWith(anno_var, try self.mkNumberTypeContent(.u32), env),
+        .u64 => try self.unifyWith(anno_var, try self.mkNumberTypeContent(.u64), env),
+        .u128 => try self.unifyWith(anno_var, try self.mkNumberTypeContent(.u128), env),
+        .i8 => try self.unifyWith(anno_var, try self.mkNumberTypeContent(.i8), env),
+        .i16 => try self.unifyWith(anno_var, try self.mkNumberTypeContent(.i16), env),
+        .i32 => try self.unifyWith(anno_var, try self.mkNumberTypeContent(.i32), env),
+        .i64 => try self.unifyWith(anno_var, try self.mkNumberTypeContent(.i64), env),
+        .i128 => try self.unifyWith(anno_var, try self.mkNumberTypeContent(.i128), env),
+        .f32 => try self.unifyWith(anno_var, try self.mkNumberTypeContent(.f32), env),
+        .f64 => try self.unifyWith(anno_var, try self.mkNumberTypeContent(.f64), env),
+        .dec => try self.unifyWith(anno_var, try self.mkNumberTypeContent(.dec), env),
         .list => {
             // Then check arity
             if (anno_args.len != 1) {
@@ -10365,7 +10628,7 @@ fn setBuiltinTypeContent(
             }
 
             // Create the nominal List type
-            const list_content = try self.mkListContent(anno_args[0], env);
+            const list_content = try self.mkListContent(anno_args[0]);
             try self.unifyWith(anno_var, list_content, env);
         },
         .box => {
@@ -10667,7 +10930,7 @@ fn checkPatternHelp(
             if (elems.len == 0) {
                 // Create a nominal List with a fresh unbound element type
                 const elem_var = try self.fresh(env, pattern_region);
-                const list_content = try self.mkListContent(elem_var, env);
+                const list_content = try self.mkListContent(elem_var);
                 try self.unifyWith(pattern_var, list_content, env);
             } else {
 
@@ -10704,7 +10967,7 @@ fn checkPatternHelp(
                 }
 
                 // Create a nominal List type with the inferred element type
-                const list_content = try self.mkListContent(elem_var, env);
+                const list_content = try self.mkListContent(elem_var);
                 try self.unifyWith(pattern_var, list_content, env);
             }
 
@@ -10877,21 +11140,21 @@ fn checkPatternHelp(
                 // For unannotated literals, create a flex var with from_numeral constraint
                 .num_unbound, .int_unbound => try self.checkOpenNumeralLiteralPattern(pattern_idx, pattern_var, pattern_region, env),
                 // Phase 5: For explicitly typed literals, use nominal types from Builtin
-                else => try self.unifyWith(pattern_var, try self.mkNumberTypeContent(num.kind, env), env),
+                else => try self.unifyWith(pattern_var, try self.mkNumberTypeContent(num.kind), env),
             }
         },
         .frac_f32_literal => {
             // Phase 5: Use nominal F32 type
-            try self.unifyWith(pattern_var, try self.mkNumberTypeContent(.f32, env), env);
+            try self.unifyWith(pattern_var, try self.mkNumberTypeContent(.f32), env);
         },
         .frac_f64_literal => {
             // Phase 5: Use nominal F64 type
-            try self.unifyWith(pattern_var, try self.mkNumberTypeContent(.f64, env), env);
+            try self.unifyWith(pattern_var, try self.mkNumberTypeContent(.f64), env);
         },
         .dec_literal => |dec| {
             if (dec.has_suffix) {
                 // Explicit suffix like `3.14dec` - use nominal Dec type
-                try self.unifyWith(pattern_var, try self.mkNumberTypeContent(.dec, env), env);
+                try self.unifyWith(pattern_var, try self.mkNumberTypeContent(.dec), env);
             } else {
                 try self.checkOpenNumeralLiteralPattern(pattern_idx, pattern_var, pattern_region, env);
             }
@@ -10899,7 +11162,7 @@ fn checkPatternHelp(
         .small_dec_literal => |dec| {
             if (dec.has_suffix) {
                 // Explicit suffix - use nominal Dec type
-                try self.unifyWith(pattern_var, try self.mkNumberTypeContent(.dec, env), env);
+                try self.unifyWith(pattern_var, try self.mkNumberTypeContent(.dec), env);
             } else {
                 try self.checkOpenNumeralLiteralPattern(pattern_idx, pattern_var, pattern_region, env);
             }
@@ -11500,9 +11763,9 @@ fn checkExpr(self: *Self, expr_idx: CIR.Expr.Idx, env: *Env, expected: Expected)
         },
         .e_bytes_literal => {
             // Create List(U8) type
-            const u8_content = try self.mkNumberTypeContent(.u8, env);
+            const u8_content = try self.mkNumberTypeContent(.u8);
             const u8_var = try self.freshFromContent(u8_content, env, expr_region);
-            const list_content = try self.mkListContent(u8_var, env);
+            const list_content = try self.mkListContent(u8_var);
             try self.unifyWith(expr_var, list_content, env);
         },
         .e_str => |str| {
@@ -11566,7 +11829,7 @@ fn checkExpr(self: *Self, expr_idx: CIR.Expr.Idx, env: *Env, expected: Expected)
             switch (num.kind) {
                 // For unannotated literals, create a flex var with from_numeral constraint
                 .num_unbound, .int_unbound => try self.checkOpenNumeralLiteralExpr(expr_idx, expr_var, expr_region, env),
-                else => try self.unifyWith(expr_var, try self.mkNumberTypeContent(num.kind, env), env),
+                else => try self.unifyWith(expr_var, try self.mkNumberTypeContent(num.kind), env),
             }
         },
         .e_num_from_numeral => {
@@ -11574,14 +11837,14 @@ fn checkExpr(self: *Self, expr_idx: CIR.Expr.Idx, env: *Env, expected: Expected)
         },
         .e_frac_f32 => |frac| {
             if (frac.has_suffix) {
-                try self.unifyWith(expr_var, try self.mkNumberTypeContent(.f32, env), env);
+                try self.unifyWith(expr_var, try self.mkNumberTypeContent(.f32), env);
             } else {
                 try self.checkOpenNumeralLiteralExpr(expr_idx, expr_var, expr_region, env);
             }
         },
         .e_frac_f64 => |frac| {
             if (frac.has_suffix) {
-                try self.unifyWith(expr_var, try self.mkNumberTypeContent(.f64, env), env);
+                try self.unifyWith(expr_var, try self.mkNumberTypeContent(.f64), env);
             } else {
                 try self.checkOpenNumeralLiteralExpr(expr_idx, expr_var, expr_region, env);
             }
@@ -11590,7 +11853,7 @@ fn checkExpr(self: *Self, expr_idx: CIR.Expr.Idx, env: *Env, expected: Expected)
             if (frac.has_suffix) {
                 const num_literal_info = try self.exactNumeralInfoForExpr(expr_idx, expr_region);
                 _ = try self.reportInvalidBuiltinFromNumeralInfo(expr_var, .dec, num_literal_info, env);
-                try self.unifyWith(expr_var, try self.mkNumberTypeContent(.dec, env), env);
+                try self.unifyWith(expr_var, try self.mkNumberTypeContent(.dec), env);
             } else {
                 try self.checkOpenNumeralLiteralExpr(expr_idx, expr_var, expr_region, env);
             }
@@ -11599,7 +11862,7 @@ fn checkExpr(self: *Self, expr_idx: CIR.Expr.Idx, env: *Env, expected: Expected)
             if (frac.has_suffix) {
                 const num_literal_info = try self.exactNumeralInfoForExpr(expr_idx, expr_region);
                 _ = try self.reportInvalidBuiltinFromNumeralInfo(expr_var, .dec, num_literal_info, env);
-                try self.unifyWith(expr_var, try self.mkNumberTypeContent(.dec, env), env);
+                try self.unifyWith(expr_var, try self.mkNumberTypeContent(.dec), env);
             } else {
                 try self.checkOpenNumeralLiteralExpr(expr_idx, expr_var, expr_region, env);
             }
@@ -11619,7 +11882,7 @@ fn checkExpr(self: *Self, expr_idx: CIR.Expr.Idx, env: *Env, expected: Expected)
         .e_empty_list => {
             // Create a nominal List with a fresh unbound element type
             const elem_var = try self.fresh(env, expr_region);
-            const list_content = try self.mkListContent(elem_var, env);
+            const list_content = try self.mkListContent(elem_var);
             try self.unifyWith(expr_var, list_content, env);
         },
         .e_list => |list| {
@@ -11628,7 +11891,7 @@ fn checkExpr(self: *Self, expr_idx: CIR.Expr.Idx, env: *Env, expected: Expected)
             if (elems.len == 0) {
                 // Create a nominal List with a fresh unbound element type
                 const elem_var = try self.fresh(env, expr_region);
-                const list_content = try self.mkListContent(elem_var, env);
+                const list_content = try self.mkListContent(elem_var);
                 try self.unifyWith(expr_var, list_content, env);
             } else {
                 // Here, we use the list's 1st element as the element var to
@@ -11666,7 +11929,7 @@ fn checkExpr(self: *Self, expr_idx: CIR.Expr.Idx, env: *Env, expected: Expected)
                 }
 
                 // Create a nominal List type with the inferred element type
-                const list_content = try self.mkListContent(elem_var, env);
+                const list_content = try self.mkListContent(elem_var);
                 try self.unifyWith(expr_var, list_content, env);
             }
         },
@@ -12218,7 +12481,12 @@ fn checkExpr(self: *Self, expr_idx: CIR.Expr.Idx, env: *Env, expected: Expected)
             try self.processReturnConstraints(env, expr_idx);
             return_constraints_processed = true;
 
-            try self.checkForInfiniteType(CIR.Expr.Idx, lambda.body);
+            // NOTE: no occurs check here. Infinite/anonymous-recursive types
+            // are detected at binding roots (top-level defs, local bindings,
+            // REPL roots) — a cyclic type constructed while checking this
+            // body is reachable from the enclosing binding's root type, and
+            // running occurs per syntactic lambda re-traversed the whole body
+            // type graph once per nesting level.
 
             // Create the function type
             if (body_does_fx) {
@@ -12496,7 +12764,6 @@ fn checkExpr(self: *Self, expr_idx: CIR.Expr.Idx, env: *Env, expected: Expected)
                         const published_constraint_func = Func{
                             .args = try self.types.appendVars(published_constraint_args),
                             .ret = expr_var,
-                            .needs_instantiation = false,
                         };
                         const published_constraint_flat: FlatType = if (mb_func_info) |info|
                             if (info.is_effectful)
@@ -12598,7 +12865,6 @@ fn checkExpr(self: *Self, expr_idx: CIR.Expr.Idx, env: *Env, expected: Expected)
             const step_fn_var = try self.freshFromContent(.{ .structure = .{ .fn_unbound = Func{
                 .args = empty_args,
                 .ret = step_ret_var,
-                .needs_instantiation = false,
             } } }, env, expr_region);
 
             if (did_err) {
@@ -12666,6 +12932,10 @@ fn checkExpr(self: *Self, expr_idx: CIR.Expr.Idx, env: *Env, expected: Expected)
                     constraint_fn_var,
                     .method_call,
                 );
+                if (self.varIsEffectfulFunction(constraint_fn_var)) {
+                    self.markCurrentHoistObservableEffect();
+                    does_fx = true;
+                }
             }
         },
         .e_dispatch_call => |method_call| {
@@ -12777,6 +13047,10 @@ fn checkExpr(self: *Self, expr_idx: CIR.Expr.Idx, env: *Env, expected: Expected)
                     method_call.args,
                     constraint_fn_var,
                 );
+                if (self.varIsEffectfulFunction(constraint_fn_var)) {
+                    self.markCurrentHoistObservableEffect();
+                    does_fx = true;
+                }
             }
         },
         .e_type_dispatch_call => |method_call| {
@@ -13139,7 +13413,6 @@ fn validateToInspectMethodVar(
     const expected_fn_var = try self.freshFromContent(.{ .structure = .{ .fn_unbound = Func{
         .args = args_range,
         .ret = str_var,
-        .needs_instantiation = false,
     } } }, env, region);
 
     const result = try self.unifyInContext(method_var, expected_fn_var, env, .{ .method_type = .{
@@ -13538,8 +13811,10 @@ fn exprIsAllCrashConditional(self: *const Self, expr_idx: CIR.Expr.Idx) bool {
     };
 }
 
-fn exhaustiveBuiltinIdents(self: *const Self) exhaustive.BuiltinIdents {
+fn exhaustiveBuiltinIdents(self: *const Self, open_cache: *exhaustive.NominalOpenCache) exhaustive.BuiltinIdents {
     return .{
+        .idents = self.cir.getIdentStoreConst(),
+        .open_cache = open_cache,
         .builtin_module = self.cir.idents.builtin_module,
         .u8_type = self.cir.idents.u8_type,
         .i8_type = self.cir.idents.i8_type,
@@ -13646,14 +13921,27 @@ fn collectAbsentCtorPayloadBlockers(
     var arena = std.heap.ArenaAllocator.init(self.gpa);
     defer arena.deinit();
 
+    var open_cache = exhaustive.NominalOpenCache.init(self.gpa);
+    defer open_cache.deinit();
+
     try exhaustive.collectAbsentCtorPayloadBlockersForConstructedTags(
         arena.allocator(),
         self.types,
-        self.exhaustiveBuiltinIdents(),
+        self.exhaustiveBuiltinIdents(&open_cache),
         target_var,
         constructed_tags,
         out,
     );
+
+    try self.backfillRegionsForAnalysisVars();
+}
+
+/// Exhaustiveness analysis opens nominal declarations, minting analysis-only
+/// vars in the type store; keep the parallel regions array in sync with them.
+fn backfillRegionsForAnalysisVars(self: *Self) Allocator.Error!void {
+    const num_vars = self.types.len();
+    if (num_vars == 0) return;
+    try self.fillInRegionsThrough(@enumFromInt(num_vars - 1));
 }
 
 fn payloadVarCanResolveToEmpty(content: Content) bool {
@@ -13722,17 +14010,21 @@ fn checkDestructureExhaustiveness(
     self.known_empty_payload_vars_destructure.clearRetainingCapacity();
     const value_constructors_known = try self.collectKnownEmptyPayloadVarsForExpr(value_expr_idx, value_var, &self.known_empty_payload_vars_destructure);
 
-    const result = exhaustive.checkDestructure(
+    var open_cache = exhaustive.NominalOpenCache.init(self.gpa);
+    defer open_cache.deinit();
+    const result_or_err = exhaustive.checkDestructure(
         self.cir.gpa,
         self.types,
         self.cir,
         &self.cir.store,
-        self.exhaustiveBuiltinIdents(),
+        self.exhaustiveBuiltinIdents(&open_cache),
         pattern_idx,
         value_var,
         self.known_empty_payload_vars_destructure.items,
         value_constructors_known,
-    ) catch |err| switch (err) {
+    );
+    try self.backfillRegionsForAnalysisVars();
+    const result = result_or_err catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         error.TypeError => return,
     };
@@ -13795,17 +14087,21 @@ fn checkParamPatternExhaustiveness(
     if (!self.patternNeedsExhaustiveness(pattern_idx)) return;
 
     const value_var = ModuleEnv.varFrom(pattern_idx);
-    const result = exhaustive.checkDestructure(
+    var open_cache = exhaustive.NominalOpenCache.init(self.gpa);
+    defer open_cache.deinit();
+    const result_or_err = exhaustive.checkDestructure(
         self.cir.gpa,
         self.types,
         self.cir,
         &self.cir.store,
-        self.exhaustiveBuiltinIdents(),
+        self.exhaustiveBuiltinIdents(&open_cache),
         pattern_idx,
         value_var,
         &.{},
         false,
-    ) catch |err| switch (err) {
+    );
+    try self.backfillRegionsForAnalysisVars();
+    const result = result_or_err catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         error.TypeError => return,
     };
@@ -13991,6 +14287,12 @@ fn checkBlockStatements(self: *Self, statements: CIR.Statement.Span, env: *Env, 
                     _ = self.local_processing_ptrns.remove(decl_stmt.pattern);
                     _ = self.predeclared_local_scheme_vars.remove(decl_stmt.pattern);
                 }
+
+                // This statement is a binding root whose type may never be
+                // reachable from the enclosing def's root type. Record it for
+                // the settled-state occurs sweep after this statement's
+                // constraints have fully determined the root graph.
+                try self.local_binding_roots.append(self.gpa, decl_stmt.pattern);
             },
             .s_var => |var_stmt| {
                 self.markCurrentHoistRuntimeDependency();
@@ -14032,6 +14334,10 @@ fn checkBlockStatements(self: *Self, statements: CIR.Statement.Span, env: *Env, 
                 if (var_pattern_result.isOk()) {
                     try self.checkDestructureExhaustiveness(var_stmt.pattern_idx, var_stmt.expr, var_expr, env, stmt_region);
                 }
+
+                // `var` statements are binding roots too (they never
+                // generalize, but their type can still be made cyclic).
+                try self.local_binding_roots.append(self.gpa, var_stmt.pattern_idx);
             },
             .s_var_uninitialized => |var_stmt| {
                 self.markCurrentHoistRuntimeDependency();
@@ -14056,6 +14362,11 @@ fn checkBlockStatements(self: *Self, statements: CIR.Statement.Span, env: *Env, 
 
                 const empty_rec = try self.freshFromContent(.{ .structure = .empty_record }, env, stmt_region);
                 _ = try self.unify(stmt_var, empty_rec, env);
+
+                // Uninitialized `var` statements are binding roots too; their
+                // type is determined by later reassignments rather than an
+                // initializer, but it can still become cyclic.
+                try self.local_binding_roots.append(self.gpa, var_stmt.pattern_idx);
             },
             .s_reassign => |reassign| {
                 self.markCurrentHoistRuntimeDependency();
@@ -14268,6 +14579,19 @@ fn typeDispatchOwnerVar(self: *Self, stmt_idx: CIR.Statement.Idx) Var {
     };
 }
 
+fn interpolationDispatchOwnerVar(self: *Self, expr_idx: CIR.Expr.Idx) Var {
+    const suffix_target = self.cir.numericSuffixTargetForNode(ModuleEnv.nodeIdxFrom(expr_idx)) orelse
+        return ModuleEnv.varFrom(expr_idx);
+
+    return switch (suffix_target.target()) {
+        .local => |stmt_idx| ModuleEnv.varFrom(stmt_idx),
+        .invalid => ModuleEnv.varFrom(expr_idx),
+        .builtin, .external => if (builtin.mode == .Debug) {
+            std.debug.panic("check invariant violated: interpolation suffix target was not a local type", .{});
+        } else unreachable,
+    };
+}
+
 fn enforceRecordBuilderMap2Return(
     self: *Self,
     func: Func,
@@ -14367,7 +14691,7 @@ fn widenTryConditionForExpectedReturn(
     // tag-union unification still rejects closed-vs-open rigid rows; this use-site
     // rewrite runs only after proving the callee's visible errors are included.
     const widened_try_var = try self.freshFromContent(
-        try self.mkTryContent(actual_try.ok, expected_try.err, env),
+        try self.mkTryContent(actual_try.ok, expected_try.err),
         env,
         region,
     );
@@ -14919,18 +15243,22 @@ fn checkMatchExpr(
         self.known_empty_payload_vars_match.clearRetainingCapacity();
         const cond_constructors_known = try self.collectKnownEmptyPayloadVarsForExpr(match.cond, cond_var, &self.known_empty_payload_vars_match);
 
-        const result = exhaustive.checkMatch(
+        var open_cache = exhaustive.NominalOpenCache.init(self.gpa);
+        defer open_cache.deinit();
+        const result_or_err = exhaustive.checkMatch(
             self.cir.gpa,
             self.types,
             self.cir,
             &self.cir.store,
-            self.exhaustiveBuiltinIdents(),
+            self.exhaustiveBuiltinIdents(&open_cache),
             match.branches,
             cond_var,
             match_region,
             self.known_empty_payload_vars_match.items,
             cond_constructors_known,
-        ) catch |err| switch (err) {
+        );
+        try self.backfillRegionsForAnalysisVars();
+        const result = result_or_err catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
             error.TypeError => {
                 // Type error in pattern - exhaustiveness checking can't proceed
@@ -15317,7 +15645,7 @@ fn reportDefinitelyInvalidNumericBinopOperand(
 ) Allocator.Error!bool {
     if (!self.varIsDefinitelyNonNumericOperand(operand_var)) return false;
 
-    const expected_num = try self.freshFromContent(try self.mkBuiltinNumberTypeContentFromKind(.dec, env), env, region);
+    const expected_num = try self.freshFromContent(try self.mkBuiltinNumberTypeContentFromKind(.dec), env, region);
     const binop_ctx: problem.Context.BinopContext.Binop = switch (op) {
         .add => .plus,
         .sub => .minus,
@@ -15408,7 +15736,6 @@ fn reportMissingNominalMethodForBinopConstraint(
     const constraint_fn_var = try self.freshFromContent(.{ .structure = .{ .fn_unbound = Func{
         .args = args_range,
         .ret = ret_var,
-        .needs_instantiation = false,
     } } }, env, region);
 
     const constraint = StaticDispatchConstraint{
@@ -15468,7 +15795,6 @@ fn mkBinopConstraint(
     const constraint_fn_var = try self.freshFromContent(.{ .structure = .{ .fn_unbound = Func{
         .args = args_range,
         .ret = ret_var,
-        .needs_instantiation = false,
     } } }, env, region);
 
     // Create the static dispatch constraint
@@ -15551,7 +15877,6 @@ fn mkUnaryOp(
     const constraint_fn_var = try self.freshFromContent(.{ .structure = .{ .fn_unbound = Func{
         .args = args_range,
         .ret = ret_var,
-        .needs_instantiation = false,
     } } }, env, region);
 
     // Create the static dispatch constraint
@@ -15735,7 +16060,6 @@ fn mkReceiverDispatchConstraint(
     const constraint_fn_var = try self.freshFromContent(.{ .structure = .{ .fn_unbound = Func{
         .args = args_range,
         .ret = ret_var,
-        .needs_instantiation = false,
     } } }, env, region);
 
     const constraint = StaticDispatchConstraint{
@@ -15771,7 +16095,6 @@ fn mkTypeMethodCallConstraint(
     const constraint_fn_var = try self.freshFromContent(.{ .structure = .{ .fn_unbound = Func{
         .args = args_range,
         .ret = ret_var,
-        .needs_instantiation = false,
     } } }, env, region);
 
     const constraint = StaticDispatchConstraint{
@@ -15808,7 +16131,6 @@ fn mkInterpolationConstraint(
     const constraint_fn_var = try self.freshFromContent(.{ .structure = .{ .fn_unbound = Func{
         .args = args_range,
         .ret = ret_var,
-        .needs_instantiation = false,
     } } }, env, region);
 
     const constraint = StaticDispatchConstraint{
@@ -16024,6 +16346,16 @@ fn copyVar(self: *Self, other_module_var: Var, other_module_env: *const ModuleEn
 
     const region = if (mb_region) |region| region else base.Region.zero();
 
+    try self.postProcessCopiedVars(region);
+
+    return copied_var;
+}
+
+/// Bookkeeping for vars newly minted in this store by a cross-module copy
+/// (`self.var_map` holds source var -> fresh local var): fill in regions for
+/// error reporting and register copied open literals on the defaulting
+/// worklist.
+fn postProcessCopiedVars(self: *Self, region: Region) std.mem.Allocator.Error!void {
     // If we had to insert any new type variables, ensure that we have
     // corresponding regions for them. This is essential for error reporting.
     if (self.var_map.count() > 0) {
@@ -16053,8 +16385,6 @@ fn copyVar(self: *Self, other_module_var: Var, other_module_env: *const ModuleEn
 
     // Assert that we have regions for every type variable
     self.debugAssertArraysInSync();
-
-    return copied_var;
 }
 
 // nominal type checking helpers //
@@ -16068,6 +16398,58 @@ const NominalCheckResult = enum {
 };
 
 /// Check a nominal type usage (either in pattern or expression context).
+/// The checker-side explicit opening operation (issue #9983): resolve the
+/// application's declaration in this module's declaration table and
+/// instantiate its backing template, substituting the application's actual
+/// args for the declaration's formals (by rigid name, mirroring the type-
+/// application annotation path). Returns null when the declaration is
+/// invalid or unresolvable — callers poison the use.
+fn openNominalBackingForApp(
+    self: *Self,
+    nominal_type: types_mod.NominalType,
+    env: *Env,
+    region: Region,
+) std.mem.Allocator.Error!?Var {
+    const decl_idx = self.types.lookupNominalDecl(nominal_type) orelse {
+        if (nominal_type.sourceDecl().present) {
+            if (builtin.mode == .Debug) {
+                std.debug.panic(
+                    "type checker invariant violated: nominal application '{s}' has a source declaration but no declaration table entry",
+                    .{self.cir.getIdentStoreConst().getText(nominal_type.ident.ident_idx)},
+                );
+            }
+            unreachable;
+        }
+        return null;
+    };
+    const decl = self.types.getNominalDecl(decl_idx);
+    if (!decl.isValid()) return null;
+
+    // Substitute the application's args for the declaration's formals by
+    // rigid name (formals are rigid vars with distinct names; the same
+    // mapping the annotation application path builds).
+    const formals = self.types.sliceVars(decl.formals);
+    const args = self.types.sliceNominalArgs(nominal_type);
+    std.debug.assert(formals.len == args.len);
+
+    self.rigid_var_substitutions.clearRetainingCapacity();
+    for (formals, args) |formal_var, arg_var| {
+        const formal_resolved = self.types.resolveVar(formal_var).desc.content;
+        // A malformed header arg (underscore/malformed anno) is err, not
+        // rigid; the template cannot reference it by name, so it has no
+        // substitution entry.
+        if (formal_resolved != .rigid) continue;
+        try self.rigid_var_substitutions.put(self.gpa, formal_resolved.rigid.name, arg_var);
+    }
+
+    return try self.instantiateVarWithSubs(
+        decl.backing,
+        &self.rigid_var_substitutions,
+        env,
+        .{ .explicit = region },
+    );
+}
+
 /// This is the shared logic for `.nominal`, `.nominal_external`, `.e_nominal`, and `.e_nominal_external`.
 ///
 /// Parameters:
@@ -16109,10 +16491,17 @@ fn checkNominalTypeUsage(
             return .err;
         }
 
-        // Extract the backing type variable from the nominal type
+        // The explicit opening operation: resolve the declaration and
+        // instantiate its backing template with the fresh application's args
+        // substituted for the declaration's formals.
         // E.g. ConList(a) := [Cons(a, ConstList), Nil]
         //                    ^^^^^^^^^^^^^^^^^^^^^^^^^
-        const nominal_backing_var = self.types.getNominalBackingVar(nominal_type);
+        const nominal_backing_var = (try self.openNominalBackingForApp(nominal_type, env, region)) orelse {
+            // The declaration is invalid (already reported) or unresolvable;
+            // poison this use silently.
+            try self.unifyWith(target_var, .err, env);
+            return .err;
+        };
 
         // Unify what the user wrote with the backing type of the nominal
         // E.g. ConList.Cons(...) <-> [Cons(a, ConsList(a)), Nil]
@@ -16141,6 +16530,12 @@ fn checkNominalTypeUsage(
                 return .err;
             },
         }
+    } else if (nominal_resolved == .err) {
+        // The declaration itself is poisoned (malformed backing or invalid
+        // recursion) and that error was already reported at the declaration.
+        // Poison this use silently instead of piling on a resolution error.
+        try self.unifyWith(target_var, .err, env);
+        return .err;
     } else {
         // If the nominal type resolves to something other than a nominal_type structure,
         // report the error and set the expression to error type
@@ -16941,7 +17336,7 @@ fn commitLiteralGroupDefault(self: *Self, drivers: []const Var, component_fits: 
         for (drivers, self.literal_defaulting_kinds.items) |driver, kind| {
             const candidate_var = switch (kind) {
                 .numeral => try self.freshFromContent(
-                    try self.mkBuiltinNumberTypeContentFromKind(candidate_kind, env),
+                    try self.mkBuiltinNumberTypeContentFromKind(candidate_kind),
                     env,
                     self.getRegionAt(driver),
                 ),
@@ -17447,7 +17842,7 @@ fn commitLiteralDefaultHead(self: *Self, literal_var: Var, env: *Env) Allocator.
     // — the useless 1:1.
     const literal_region = self.getRegionAt(literal_var);
     const default_var = try self.freshFromContent(
-        try self.mkBuiltinNumberTypeContentFromKind(numeral_default_candidates[0], env),
+        try self.mkBuiltinNumberTypeContentFromKind(numeral_default_candidates[0]),
         env,
         literal_region,
     );
@@ -17625,7 +18020,7 @@ fn tryCommitNumeralCandidate(
     // failure.) Region: the literal's own, so vars the probe stamps stay anchored
     // to the real source span.
     const candidate_var = try self.freshFromContent(
-        try self.mkBuiltinNumberTypeContentFromKind(candidate_kind, env),
+        try self.mkBuiltinNumberTypeContentFromKind(candidate_kind),
         env,
         self.getRegionAt(literal_var),
     );
@@ -19041,12 +19436,18 @@ fn typeSupportsStructuralDeriveInternal(
             return true;
         },
 
-        // Nominal types qualify if their backing type qualifies (builtin
-        // numbers/Str/Bool/List declare both derivations; Box declares neither).
+        // Nominal types qualify if their args and their declaration's backing
+        // template qualify (builtin numbers/Str/Bool/List declare both
+        // derivations; Box declares neither). Formals in the template are
+        // optimistically admitted like any rigid; the args are checked
+        // directly.
         .nominal_type => |nominal| {
             if (self.nominalIsBoxType(nominal)) return false;
-            const backing_var = self.types.getNominalBackingVar(nominal);
-            return try self.varSupportsStructuralDeriveInternal(backing_var, visited);
+            for (self.types.sliceNominalArgs(nominal)) |arg_var| {
+                if (!try self.varSupportsStructuralDeriveInternal(arg_var, visited)) return false;
+            }
+            const template = self.nominalDeclBackingTemplate(nominal) orelse return true;
+            return try self.varSupportsStructuralDeriveInternal(template, visited);
         },
 
         // Unbound records: check each field.
@@ -19223,7 +19624,11 @@ fn flatTypeContainsOpenRowInHostBoundary(
         },
         .nominal_type => |nominal| blk: {
             if (try self.varsContainOpenRowInHostBoundary(self.types.sliceNominalArgs(nominal), visited)) break :blk true;
-            break :blk try self.varContainsOpenRowInHostBoundaryInternal(self.types.getNominalBackingVar(nominal), visited);
+            // The declaration's backing template covers the structural rows;
+            // its formals are rigid leaves (never open rows) standing for the
+            // args checked above.
+            const template = self.nominalDeclBackingTemplate(nominal) orelse break :blk false;
+            break :blk try self.varContainsOpenRowInHostBoundaryInternal(template, visited);
         },
     };
 }
@@ -19384,8 +19789,13 @@ fn flatTypeContainsUnboxedFunction(
         },
         .nominal_type => |nominal| blk: {
             if (self.nominalIsBoxType(nominal)) break :blk false;
-            const backing_var = self.types.getNominalBackingVar(nominal);
-            break :blk try self.varContainsUnboxedFunctionInternal(backing_var, boxed_allowed, visited);
+            for (self.types.sliceNominalArgs(nominal)) |arg_var| {
+                if (try self.varContainsUnboxedFunctionInternal(arg_var, boxed_allowed, visited)) break :blk true;
+            }
+            // Formals in the template are rigid leaves (never functions)
+            // standing for the args checked above.
+            const template = self.nominalDeclBackingTemplate(nominal) orelse break :blk false;
+            break :blk try self.varContainsUnboxedFunctionInternal(template, boxed_allowed, visited);
         },
     };
 }
@@ -19425,7 +19835,11 @@ fn nominalSupportsStructuralDerive(self: *Self, nominal_type: types_mod.NominalT
     if (self.nominalIsBuiltinNumberType(nominal_type)) return true;
     if (self.nominalIsBoxType(nominal_type)) return false;
     self.var_set.clearRetainingCapacity();
-    return try self.varSupportsStructuralDeriveInternal(self.types.getNominalBackingVar(nominal_type), &self.var_set);
+    for (self.types.sliceNominalArgs(nominal_type)) |arg_var| {
+        if (!try self.varSupportsStructuralDeriveInternal(arg_var, &self.var_set)) return false;
+    }
+    const template = self.nominalDeclBackingTemplate(nominal_type) orelse return true;
+    return try self.varSupportsStructuralDeriveInternal(template, &self.var_set);
 }
 
 /// Check if a type variable supports is_eq. See
@@ -20352,7 +20766,7 @@ fn satisfyImplicitEncoderForConstraint(
     }
 
     const err_var = try self.fresh(env, region);
-    const encode_result_var = try self.freshFromContent(try self.mkTryContent(state_var, err_var, env), env, region);
+    const encode_result_var = try self.freshFromContent(try self.mkTryContent(state_var, err_var), env, region);
     const ret_result = try self.unifyInContext(encode_result_var, runtime_func.ret, env, .none);
     if (ret_result.isProblem()) {
         try self.markConstraintFunctionAsError(constraint, env);
@@ -20385,7 +20799,7 @@ fn freshParseResultTryVar(
     region: Region,
 ) Allocator.Error!Var {
     const ok_var = try self.freshParseResultOkVar(value_var, rest_var, env, region);
-    return try self.freshFromContent(try self.mkTryContent(ok_var, err_var, env), env, region);
+    return try self.freshFromContent(try self.mkTryContent(ok_var, err_var), env, region);
 }
 
 fn freshParseResultOkVar(
@@ -20476,7 +20890,7 @@ fn freshParseRecordFieldTryVar(
     region: Region,
 ) Allocator.Error!Var {
     const event_var = try self.freshParseRecordFieldEventVar(shape_var, state_var, env, region);
-    return try self.freshFromContent(try self.mkTryContent(event_var, err_var, env), env, region);
+    return try self.freshFromContent(try self.mkTryContent(event_var, err_var), env, region);
 }
 
 fn freshParseObjectNextEventVar(
@@ -20526,7 +20940,7 @@ fn freshParseObjectNextTryVar(
     region: Region,
 ) Allocator.Error!Var {
     const event_var = try self.freshParseObjectNextEventVar(state_var, env, region);
-    return try self.freshFromContent(try self.mkTryContent(event_var, err_var, env), env, region);
+    return try self.freshFromContent(try self.mkTryContent(event_var, err_var), env, region);
 }
 
 fn freshParseArrayEventVar(
@@ -20557,7 +20971,7 @@ fn freshParseArrayEventTryVar(
     region: Region,
 ) Allocator.Error!Var {
     const event_var = try self.freshParseArrayEventVar(state_var, first_tag_text, second_tag_text, env, region);
-    return try self.freshFromContent(try self.mkTryContent(event_var, err_var, env), env, region);
+    return try self.freshFromContent(try self.mkTryContent(event_var, err_var), env, region);
 }
 
 const DerivedParseContext = enum {
@@ -20904,7 +21318,7 @@ fn validateParseFormatMethod(
     };
     const expected_ret = switch (spec_decl) {
         .bool, .str, .u8, .i8, .u16, .i16, .u32, .i32, .u64, .i64, .u128, .i128, .dec, .f32, .f64, .tag_union => try self.freshParseResultTryVar(shape_var, state_var, err_var, env, region),
-        .null, .array_start => try self.freshFromContent(try self.mkTryContent(state_var, err_var, env), env, region),
+        .null, .array_start => try self.freshFromContent(try self.mkTryContent(state_var, err_var), env, region),
         .array_next => try self.freshParseArrayEventTryVar(state_var, err_var, "Element", "Done", env, region),
         .array_after_element => try self.freshParseArrayEventTryVar(state_var, err_var, "Continue", "Done", env, region),
         .record_field => try self.freshParseRecordFieldTryVar(shape_var, state_var, err_var, env, region),
@@ -20945,7 +21359,7 @@ fn validateEncodeFormatMethod(
     const method = try self.parseFormatMethodVarForEncoding(encoding_var, method_name, env, region) orelse {
         return try self.reportDerivedParseMissingMethod(encoding_var, method_name, constraint, env);
     };
-    const expected_ret = try self.freshFromContent(try self.mkTryContent(state_var, err_var, env), env, region);
+    const expected_ret = try self.freshFromContent(try self.mkTryContent(state_var, err_var), env, region);
     const expected_fn = switch (spec_decl) {
         .bool, .str, .u8, .i8, .u16, .i16, .u32, .i32, .u64, .i64, .u128, .i128, .dec, .f32, .f64 => try self.freshFromContent(try self.types.mkFuncUnbound(&.{ value_var, state_var }, expected_ret), env, region),
         .null => try self.freshFromContent(try self.types.mkFuncUnbound(&.{state_var}, expected_ret), env, region),
@@ -21015,7 +21429,7 @@ fn validateParseKeyMethod(
         return try self.reportDerivedParseMissingMethod(encoding_var, method_name, constraint, env);
     };
     const str_var = try self.freshStr(env, region);
-    const expected_ret = try self.freshFromContent(try self.mkTryContent(key_var, err_var, env), env, region);
+    const expected_ret = try self.freshFromContent(try self.mkTryContent(key_var, err_var), env, region);
     const expected_fn = try self.freshFromContent(try self.types.mkFuncUnbound(&.{ encoding_var, str_var }, expected_ret), env, region);
     const result = try self.unifyInContext(method.var_, expected_fn, env, .{
         .method_type = .{
@@ -21042,7 +21456,7 @@ fn validateEncodeKeyMethod(
         return try self.reportDerivedParseMissingMethod(encoding_var, method_name, constraint, env);
     };
     const str_var = try self.freshStr(env, region);
-    const expected_ret = try self.freshFromContent(try self.mkTryContent(str_var, err_var, env), env, region);
+    const expected_ret = try self.freshFromContent(try self.mkTryContent(str_var, err_var), env, region);
     const expected_fn = try self.freshFromContent(try self.types.mkFuncUnbound(&.{ encoding_var, key_var }, expected_ret), env, region);
     const result = try self.unifyInContext(method.var_, expected_fn, env, .{
         .method_type = .{
@@ -21141,7 +21555,7 @@ fn validateSkipRecordFieldMethod(
     const method = try self.parseFormatMethodVarForEncoding(encoding_var, method_name, env, region) orelse {
         return try self.reportDerivedParseMissingMethod(encoding_var, method_name, constraint, env);
     };
-    const expected_ret = try self.freshFromContent(try self.mkTryContent(state_var, err_var, env), env, region);
+    const expected_ret = try self.freshFromContent(try self.mkTryContent(state_var, err_var), env, region);
     const expected_fn = try self.freshFromContent(try self.types.mkFuncUnbound(&.{ encoding_var, state_var }, expected_ret), env, region);
     const result = try self.unifyInContext(method.var_, expected_fn, env, .{
         .method_type = .{
@@ -21948,7 +22362,7 @@ fn validateDerivedEncodeNominal(
         break :blk try self.instantiateVar(copied_var, env, .{ .explicit = region });
     };
 
-    const expected_ret = try self.freshFromContent(try self.mkTryContent(state_var, err_var, env), env, region);
+    const expected_ret = try self.freshFromContent(try self.mkTryContent(state_var, err_var), env, region);
     const expected_runtime_fn = try self.freshFromContent(try self.types.mkFuncUnbound(&.{ nominal_var, state_var }, expected_ret), env, region);
     const expected_fn = try self.freshFromContent(try self.types.mkFuncUnbound(&.{encoding_var}, expected_runtime_fn), env, region);
     const result = try self.unifyInContext(method_var, expected_fn, env, .{
@@ -22206,7 +22620,9 @@ fn flatTypeContainsError(self: *Self, flat_type: FlatType, visited: *std.AutoHas
             while (arg_iter.next()) |arg_var| {
                 if (try self.varContainsError(arg_var, visited)) break :blk true;
             }
-            break :blk try self.varContainsError(self.types.getNominalBackingVar(nominal), visited);
+            // An application of an invalid declaration is erroneous; a valid
+            // declaration's backing contains no errors by construction.
+            break :blk self.types.nominalDeclIsInvalid(nominal);
         },
         .fn_pure, .fn_effectful, .fn_unbound => |func| blk: {
             if (try self.varsContainError(self.types.sliceVars(func.args), visited)) break :blk true;

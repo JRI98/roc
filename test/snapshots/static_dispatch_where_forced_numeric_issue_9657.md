@@ -80,11 +80,11 @@ EndOfFile,
 					(ty (name "I64"))
 					(ty (name "I64"))))
 			(where
-				(method (module-of "a") (name "decode") (effectful false)
+				(method (module-of "a") (name "decode")
 					(args
 						(ty (name "I64")))
 					(ty-var (raw "a")))
-				(method (module-of "b") (name "encode") (effectful false)
+				(method (module-of "b") (name "encode")
 					(args
 						(ty-var (raw "b")))
 					(ty (name "I64")))))
@@ -193,13 +193,13 @@ use_it = {
 									(ty-rigid-var (name "a")))
 								(s-let
 									(p-assign (ident "value"))
-									(e-type-dispatch-call (method "decode") (type-dispatch-stmt 28) (constraint-fn-var 164)
+									(e-type-dispatch-call (method "decode") (type-dispatch-stmt 28) (constraint-fn-var 276)
 										(args
 											(e-lookup-local
 												(p-assign (ident "input"))))))
 								(s-let
 									(p-assign (ident "output"))
-									(e-call (constraint-fn-var 172)
+									(e-call (constraint-fn-var 282)
 										(e-lookup-local
 											(p-assign (ident "f")))
 										(e-lookup-local
@@ -218,11 +218,11 @@ use_it = {
 						(ty-lookup (name "I64") (builtin))
 						(ty-lookup (name "I64") (builtin)))))
 			(where
-				(method (ty-rigid-var-lookup (ty-rigid-var (name "a"))) (name "decode") (effectful false)
+				(method (ty-rigid-var-lookup (ty-rigid-var (name "a"))) (name "decode")
 					(args
 						(ty-lookup (name "I64") (builtin)))
 					(ty-rigid-var-lookup (ty-rigid-var (name "a"))))
-				(method (ty-rigid-var-lookup (ty-rigid-var (name "b"))) (name "encode") (effectful false)
+				(method (ty-rigid-var-lookup (ty-rigid-var (name "b"))) (name "encode")
 					(args
 						(ty-rigid-var-lookup (ty-rigid-var (name "b"))))
 					(ty-lookup (name "I64") (builtin))))))
@@ -231,19 +231,19 @@ use_it = {
 		(e-block
 			(s-let
 				(p-assign (ident "transform"))
-				(e-call (constraint-fn-var 216)
+				(e-call (constraint-fn-var 300)
 					(e-lookup-local
 						(p-assign (ident "make_map")))
 					(e-lambda
 						(args
 							(p-assign (ident "n")))
-						(e-dispatch-call (method "plus") (constraint-fn-var 214)
+						(e-dispatch-call (method "plus") (constraint-fn-var 298)
 							(receiver
 								(e-lookup-local
 									(p-assign (ident "n"))))
 							(args
 								(e-num (value "1")))))))
-			(e-call (constraint-fn-var 250)
+			(e-call (constraint-fn-var 308)
 				(e-lookup-local
 					(p-assign (ident "transform")))
 				(e-num (value "41"))))))

@@ -26,6 +26,7 @@
 //! - Original Rust implementation in `crates/compiler/exhaustive/`
 
 const std = @import("std");
+const builtin = @import("builtin");
 const Allocator = std.mem.Allocator;
 const base = @import("base");
 const builtins = @import("builtins");
@@ -40,9 +41,54 @@ const StringLiteral = base.StringLiteral;
 const TypeStore = types.Store;
 const Var = types.Var;
 
+fn exhaustiveInvariant(comptime message: []const u8, args: anytype) noreturn {
+    if (builtin.mode == .Debug) {
+        std.debug.panic(message, args);
+    }
+    unreachable;
+}
+
 /// Builtin type identifiers needed for special-casing in exhaustiveness checking.
 /// These types have special backing representations that would incorrectly appear uninhabited.
+/// Memo of declaration openings performed during one exhaustiveness entry
+/// point: one instantiated backing per (declaration, resolved arg roots).
+/// Without it, walkers that follow a recursive nominal's backing would open a
+/// FRESH copy at every level (each containing a new recursive application),
+/// so their seen-sets never converge.
+pub const NominalOpenCache = struct {
+    entries: std.ArrayListUnmanaged(Entry) = .empty,
+    args: std.ArrayListUnmanaged(Var) = .empty,
+    allocator: std.mem.Allocator,
+
+    const Entry = struct {
+        decl: types.NominalDecl.Idx,
+        args_start: u32,
+        args_len: u32,
+        opened: Var,
+    };
+
+    /// An empty cache; owns nothing until an opening is recorded.
+    pub fn init(allocator: std.mem.Allocator) NominalOpenCache {
+        return .{ .allocator = allocator };
+    }
+
+    /// Free the cache's entry and argument lists.
+    pub fn deinit(self: *NominalOpenCache) void {
+        self.entries.deinit(self.allocator);
+        self.args.deinit(self.allocator);
+    }
+};
+
+/// Identifiers and per-entry-point state the exhaustiveness analysis needs
+/// from its caller: builtin type names for classifying nominal types, the
+/// module's identifier store, and the nominal opening memo.
 pub const BuiltinIdents = struct {
+    /// The module's identifier store (needed by the declaration-backed
+    /// opening operation, which instantiates backing templates).
+    idents: *const Ident.Store,
+    /// Opening memo for this exhaustiveness entry point (see
+    /// `NominalOpenCache`).
+    open_cache: *NominalOpenCache,
     /// The Builtin module identifier
     builtin_module: Ident.Idx,
     /// Numeric type identifiers (Builtin.Num.*)
@@ -826,6 +872,66 @@ const UnionResult = union(enum) {
 
 /// Extract union information from a type variable.
 /// Filters out uninhabited constructors at construction time.
+/// The explicit declaration-backed opening operation (issue #9983) for
+/// exhaustiveness analysis: instantiate the nominal application's backing
+/// template with its actual args substituted for the declaration's formals.
+/// The instantiated copy is analysis-only scratch in the type store (the
+/// checker backfills regions for it after each exhaustiveness entry point).
+/// Returns null only for invalid declarations whose error was already reported.
+fn openNominalBacking(
+    type_store: *TypeStore,
+    builtin_idents: BuiltinIdents,
+    nominal: types.NominalType,
+) error{OutOfMemory}!?Var {
+    const decl_idx = type_store.lookupNominalDecl(nominal) orelse
+        exhaustiveInvariant("exhaustiveness nominal opening referenced a missing declaration", .{});
+    const decl = type_store.getNominalDecl(decl_idx);
+    if (!decl.isValid()) return null;
+
+    const args = type_store.sliceNominalArgs(nominal);
+    const cache = builtin_idents.open_cache;
+
+    // One opening per (declaration, resolved arg roots) per entry point, so
+    // recursive backings converge onto a fixed graph the walkers' seen-sets
+    // can terminate on.
+    memo_check: for (cache.entries.items) |entry| {
+        if (entry.decl != decl_idx) continue;
+        if (entry.args_len != args.len) continue;
+        const memo_args = cache.args.items[entry.args_start..][0..entry.args_len];
+        for (memo_args, args) |memo_arg, arg| {
+            if (type_store.resolveVar(memo_arg).var_ != type_store.resolveVar(arg).var_) {
+                continue :memo_check;
+            }
+        }
+        return entry.opened;
+    }
+
+    const args_start: u32 = @intCast(cache.args.items.len);
+    for (args) |arg| {
+        try cache.args.append(cache.allocator, type_store.resolveVar(arg).var_);
+    }
+
+    var var_map = std.AutoHashMap(Var, Var).init(type_store.gpa);
+    defer var_map.deinit();
+    const opened = try types.instantiate.instantiateNominalBacking(
+        type_store,
+        builtin_idents.idents,
+        &var_map,
+        decl,
+        args,
+        .outermost,
+    );
+
+    try cache.entries.append(cache.allocator, .{
+        .decl = decl_idx,
+        .args_start = args_start,
+        .args_len = @intCast(args.len),
+        .opened = opened,
+    });
+
+    return opened;
+}
+
 fn getUnionFromType(
     allocator: std.mem.Allocator,
     type_store: *TypeStore,
@@ -859,7 +965,7 @@ fn getUnionFromType(
                 // Nominal types (like Try, Result) are user-defined types that wrap other types
                 // We need to unwrap them to find the underlying tag union
                 .nominal_type => |nominal| {
-                    const backing_var = type_store.getNominalBackingVar(nominal);
+                    const backing_var = (try openNominalBacking(type_store, builtin_idents, nominal)) orelse return .not_a_union;
                     return getUnionFromType(allocator, type_store, builtin_idents, backing_var);
                 },
                 else => return .not_a_union,
@@ -1148,10 +1254,12 @@ fn isTypeInhabitedWithKnownEmpty(
                             // These have [] as backing type but are inhabited primitives.
                             if (builtin_idents.isBuiltinNumericType(nominal)) {
                                 try results.append(gpa, true);
-                            } else {
-                                // For other nominal types, check the backing var
-                                const backing_var = type_store.getNominalBackingVar(nominal);
+                            } else if (try openNominalBacking(type_store, builtin_idents, nominal)) |backing_var| {
+                                // For other nominal types, check the opened backing
                                 try work_list.append(gpa, .{ .check_type = backing_var });
+                            } else {
+                                // Unresolvable/invalid declaration: treat as inhabited
+                                try results.append(gpa, true);
                             }
                         },
 
@@ -1302,10 +1410,11 @@ fn isCtorPayloadTypeInhabitedHelp(
                 if (builtin_idents.isBuiltinNumericType(nominal)) {
                     break :blk true;
                 }
+                const backing_var = (try openNominalBacking(type_store, builtin_idents, nominal)) orelse break :blk true;
                 break :blk try isCtorPayloadTypeInhabitedHelp(
                     type_store,
                     builtin_idents,
-                    type_store.getNominalBackingVar(nominal),
+                    backing_var,
                     seen,
                 );
             },
@@ -1453,10 +1562,11 @@ fn collectCtorPayloadBlockersHelp(
             ),
             .nominal_type => |nominal| {
                 if (builtin_idents.isBuiltinNumericType(nominal)) return;
+                const backing_var = (try openNominalBacking(type_store, builtin_idents, nominal)) orelse return;
                 try collectCtorPayloadBlockersHelp(
                     type_store,
                     builtin_idents,
-                    type_store.getNominalBackingVar(nominal),
+                    backing_var,
                     out,
                     seen,
                 );
@@ -1614,7 +1724,7 @@ fn isKnownAbsentCtorPayloadTypeInhabitedHelp(
                 };
 
                 for (union_info.alternatives) |alt| {
-                    const arg_types = try getCtorArgTypes(allocator, type_store, type_var, alt.tag_id);
+                    const arg_types = try getCtorArgTypes(allocator, type_store, builtin_idents, type_var, alt.tag_id);
                     var all_args_inhabited = true;
                     for (arg_types) |arg_var| {
                         if (!try isKnownAbsentCtorPayloadTypeInhabitedHelp(
@@ -1751,7 +1861,7 @@ fn collectKnownAbsentCtorPayloadBlockersHelp(
                 };
 
                 for (union_info.alternatives) |alt| {
-                    const arg_types = try getCtorArgTypes(allocator, type_store, type_var, alt.tag_id);
+                    const arg_types = try getCtorArgTypes(allocator, type_store, builtin_idents, type_var, alt.tag_id);
                     var all_args_inhabited = true;
                     for (arg_types) |arg_var| {
                         if (!try isKnownAbsentCtorPayloadTypeInhabitedHelp(
@@ -2013,7 +2123,7 @@ fn isSketchedPatternInhabited(
             const tag_id = findTagId(union_info, c.tag_name) orelse return error.TypeError;
 
             // Get the constructor's argument types
-            const arg_types = try getCtorArgTypes(allocator, type_store, first_col_type, tag_id);
+            const arg_types = try getCtorArgTypes(allocator, type_store, builtin_idents, first_col_type, tag_id);
 
             // Check if any argument type is uninhabited
             const known_empty_vars = if (payload_vars_to_close) |vars| vars.items else &.{};
@@ -2153,123 +2263,13 @@ pub fn collectAbsentCtorPayloadBlockersForConstructedTags(
         const name = ctorNameIdent(alt.name) orelse continue;
         if (identSetContains(constructed_tags, name)) continue;
 
-        const arg_types = try getCtorArgTypes(allocator, type_store, target_var, alt.tag_id);
+        const arg_types = try getCtorArgTypes(allocator, type_store, builtin_idents, target_var, alt.tag_id);
         for (arg_types) |arg_type| {
             if (!try isKnownAbsentCtorPayloadTypeInhabited(allocator, type_store, builtin_idents, arg_type)) {
                 try collectKnownAbsentCtorPayloadBlockers(allocator, type_store, builtin_idents, arg_type, out);
             }
         }
     }
-}
-
-/// Collect unique type parameter variables from a backing type structure.
-/// Type parameters are flex or rigid vars that appear in the type.
-/// Returns them in order of first encounter (declaration order for well-formed types).
-///
-/// This is used for type parameter substitution in nominal types:
-/// given `Try a e : [Ok(a), Err(e)]` and `Try(I64, Str)`, we need to know
-/// that `a` is the first parameter and `e` is the second.
-fn collectTypeParamsFromBackingType(
-    type_store: *TypeStore,
-    backing_var: Var,
-) error{OutOfMemory}![]const Var {
-    const gpa = type_store.gpa;
-
-    var params: std.ArrayList(Var) = .empty;
-    errdefer params.deinit(gpa);
-
-    var seen: std.AutoHashMapUnmanaged(Var, void) = .empty;
-    defer seen.deinit(gpa);
-
-    var stack: std.ArrayList(Var) = .empty;
-    defer stack.deinit(gpa);
-
-    try stack.append(gpa, backing_var);
-
-    while (stack.pop()) |var_| {
-        const resolved = type_store.resolveVar(var_);
-        const root_var = resolved.var_;
-
-        // Skip if already seen
-        const gop = try seen.getOrPut(gpa, root_var);
-        if (gop.found_existing) continue;
-
-        switch (resolved.desc.content) {
-            .flex, .rigid => {
-                // This is a type parameter - add to our list
-                try params.append(gpa, root_var);
-            },
-            .structure => |flat_type| {
-                switch (flat_type) {
-                    .tag_union => |tu| {
-                        // Add tag args in order (first tag's args, then second tag's args, etc.)
-                        const tags_slice = type_store.getTagsSlice(tu.tags);
-                        const all_args = tags_slice.items(.args);
-
-                        // Process tags in reverse order so they come out in correct order from stack
-                        var tag_idx = all_args.len;
-                        while (tag_idx > 0) {
-                            tag_idx -= 1;
-                            const args = type_store.sliceVars(all_args[tag_idx]);
-                            // Process args in reverse order
-                            var arg_idx = args.len;
-                            while (arg_idx > 0) {
-                                arg_idx -= 1;
-                                try stack.append(gpa, args[arg_idx]);
-                            }
-                        }
-                        // Extension last
-                        try stack.append(gpa, tu.ext);
-                    },
-                    .tuple => |tuple| {
-                        const elems = type_store.sliceVars(tuple.elems);
-                        var i = elems.len;
-                        while (i > 0) {
-                            i -= 1;
-                            try stack.append(gpa, elems[i]);
-                        }
-                    },
-                    .record => |record| {
-                        const fields = getRecordFieldTypes(type_store, record.fields);
-                        var i = fields.len;
-                        while (i > 0) {
-                            i -= 1;
-                            try stack.append(gpa, fields[i]);
-                        }
-                    },
-                    .record_unbound => |fields| {
-                        const field_types = getRecordFieldTypes(type_store, fields);
-                        var i = field_types.len;
-                        while (i > 0) {
-                            i -= 1;
-                            try stack.append(gpa, field_types[i]);
-                        }
-                    },
-                    .fn_pure, .fn_effectful, .fn_unbound => |func| {
-                        // Add return first, then args in order
-                        const args = type_store.sliceVars(func.args);
-                        var i = args.len;
-                        while (i > 0) {
-                            i -= 1;
-                            try stack.append(gpa, args[i]);
-                        }
-                        try stack.append(gpa, func.ret);
-                    },
-                    .nominal_type => |nominal| {
-                        // For nested nominal types, traverse the backing type
-                        try stack.append(gpa, type_store.getNominalBackingVar(nominal));
-                    },
-                    .empty_record, .empty_tag_union => {},
-                }
-            },
-            .alias => |alias| {
-                try stack.append(gpa, type_store.getAliasBackingVar(alias));
-            },
-            else => {},
-        }
-    }
-
-    return try params.toOwnedSlice(gpa);
 }
 
 /// Get the argument types for a constructor.
@@ -2279,7 +2279,7 @@ fn collectTypeParamsFromBackingType(
 /// IMPORTANT: This function follows extension chains to find the tag at the given index.
 /// Tag unions from unification may have tags split across the main union
 /// and its extension chain (e.g., [Normal, ..ext] where ext = [HasEmpty, ..]).
-fn getCtorArgTypes(allocator: std.mem.Allocator, type_store: *TypeStore, type_var: Var, tag_id: TagId) std.mem.Allocator.Error![]const Var {
+fn getCtorArgTypes(allocator: std.mem.Allocator, type_store: *TypeStore, builtin_idents: BuiltinIdents, type_var: Var, tag_id: TagId) std.mem.Allocator.Error![]const Var {
     const resolved = type_store.resolveVar(type_var);
     const content = resolved.desc.content;
 
@@ -2338,75 +2338,17 @@ fn getCtorArgTypes(allocator: std.mem.Allocator, type_store: *TypeStore, type_va
     switch (content) {
         .alias => |alias| {
             const backing_var = type_store.getAliasBackingVar(alias);
-            return try getCtorArgTypes(allocator, type_store, backing_var, tag_id);
+            return try getCtorArgTypes(allocator, type_store, builtin_idents, backing_var, tag_id);
         },
         .structure => |flat_type| switch (flat_type) {
             .nominal_type => |nominal| {
-                // For parametric nominal types like Try(I64, Str), we need to:
-                // 1. Get the backing type's constructor args (which may be type parameters)
-                // 2. Substitute any type parameters with the nominal type's arguments
-                const backing_var = type_store.getNominalBackingVar(nominal);
-                const nom_args = type_store.sliceNominalArgs(nominal);
-                const backing_args = try getCtorArgTypes(allocator, type_store, backing_var, tag_id);
-
-                // If no nominal args or no backing args, nothing to substitute
-                if (nom_args.len == 0 or backing_args.len == 0) {
-                    return backing_args;
-                }
-
-                // Check if any backing args need substitution (are still type parameters)
-                var needs_substitution = false;
-                for (backing_args) |arg| {
-                    const arg_resolved = type_store.resolveVar(arg);
-                    if (arg_resolved.desc.content == .flex or arg_resolved.desc.content == .rigid) {
-                        needs_substitution = true;
-                        break;
-                    }
-                }
-
-                if (!needs_substitution) {
-                    return backing_args;
-                }
-
-                // Collect type parameters from the backing type to build substitution map
-                const type_params = try collectTypeParamsFromBackingType(type_store, backing_var);
-                defer type_store.gpa.free(type_params);
-
-                // Build substitution: param[i] -> nom_args[i]
-                // Only substitute if we have the same number of params and args
-                if (type_params.len != nom_args.len) {
-                    return backing_args;
-                }
-
-                // Allocate result with substituted vars (uses arena allocator, freed at end of check)
-                const result = try allocator.alloc(Var, backing_args.len);
-
-                for (backing_args, 0..) |arg, i| {
-                    const arg_resolved = type_store.resolveVar(arg);
-                    const arg_root = arg_resolved.var_;
-
-                    // Check if this is a type parameter that should be substituted
-                    if (arg_resolved.desc.content == .flex or arg_resolved.desc.content == .rigid) {
-                        // Find which parameter index this is
-                        var found_idx: ?usize = null;
-                        for (type_params, 0..) |param, param_idx| {
-                            if (type_store.resolveVar(param).var_ == arg_root) {
-                                found_idx = param_idx;
-                                break;
-                            }
-                        }
-
-                        if (found_idx) |idx| {
-                            result[i] = nom_args[idx];
-                        } else {
-                            result[i] = arg;
-                        }
-                    } else {
-                        result[i] = arg;
-                    }
-                }
-
-                return result;
+                // The opening operation instantiates the declaration's
+                // backing template with the application's actual args already
+                // substituted for its formals, so the constructor args it
+                // yields are the concrete payload types — no positional
+                // substitution needed.
+                const backing_var = (try openNominalBacking(type_store, builtin_idents, nominal)) orelse return &[_]Var{};
+                return try getCtorArgTypes(allocator, type_store, builtin_idents, backing_var, tag_id);
             },
             .tuple => |tuple| {
                 // Tuples are single-constructor types, return the element types
@@ -2568,7 +2510,7 @@ pub const ColumnTypes = struct {
         std.debug.assert(self.types.len > 0);
 
         // Look up the tag's payload types from types[0]
-        const payload_types = try getCtorArgTypes(allocator, self.type_store, self.types[0], tag_id);
+        const payload_types = try getCtorArgTypes(allocator, self.type_store, self.builtin_idents, self.types[0], tag_id);
 
         // For tag unions, the arity should match exactly.
         // For records, the pattern might destructure fewer fields than the actual type has.
@@ -3133,7 +3075,7 @@ fn recurseIntoAllCtors(
 ) PatternResolveError![]const Pattern {
     for (alternatives) |alt| {
         // Skip uninhabited constructors
-        const arg_types = try getCtorArgTypes(allocator, type_store, first_col_type, alt.tag_id);
+        const arg_types = try getCtorArgTypes(allocator, type_store, builtin_idents, first_col_type, alt.tag_id);
         if (!try areAllTypesInhabitedWithKnownEmpty(type_store, builtin_idents, arg_types, payload_vars_to_close.items)) {
             continue;
         }
@@ -3265,7 +3207,7 @@ pub fn checkExhaustiveSketched(
             var all_inhabited_real_ctors_found = true;
             if (ctor_info.union_info.has_flex_extension or close_open_extension) {
                 for (real_alternatives) |alt| {
-                    const arg_types = try getCtorArgTypes(allocator, type_store, first_col_type, alt.tag_id);
+                    const arg_types = try getCtorArgTypes(allocator, type_store, builtin_idents, first_col_type, alt.tag_id);
                     if (!try areAllTypesInhabitedWithKnownEmpty(type_store, builtin_idents, arg_types, payload_vars_to_close.items)) {
                         continue;
                     }
@@ -3322,7 +3264,7 @@ pub fn checkExhaustiveSketched(
                     if (!found) {
                         // Skip uninhabited constructors - they don't need to be matched
                         // because no values of that constructor can exist.
-                        const arg_types = try getCtorArgTypes(allocator, type_store, first_col_type, alt.tag_id);
+                        const arg_types = try getCtorArgTypes(allocator, type_store, builtin_idents, first_col_type, alt.tag_id);
                         if (!try areAllTypesInhabitedWithKnownEmpty(type_store, builtin_idents, arg_types, payload_vars_to_close.items)) {
                             continue;
                         }
@@ -3657,7 +3599,7 @@ pub fn isUsefulSketched(
                                 }
 
                                 // This constructor is missing - check if it's inhabited
-                                const arg_types = try getCtorArgTypes(allocator, type_store, first_col_type, alt.tag_id);
+                                const arg_types = try getCtorArgTypes(allocator, type_store, builtin_idents, first_col_type, alt.tag_id);
                                 var ctor_uninhabited = false;
                                 for (arg_types) |arg_type| {
                                     if (!try isTypeInhabitedWithKnownEmpty(type_store, builtin_idents, arg_type, payload_vars_to_close.items)) {
@@ -3685,7 +3627,7 @@ pub fn isUsefulSketched(
                     // All constructors covered - check each one
                     for (ctor_info.union_info.alternatives) |alt| {
                         // Skip uninhabited constructors
-                        const arg_types = try getCtorArgTypes(allocator, type_store, first_col_type, alt.tag_id);
+                        const arg_types = try getCtorArgTypes(allocator, type_store, builtin_idents, first_col_type, alt.tag_id);
                         if (!try areAllTypesInhabitedWithKnownEmpty(type_store, builtin_idents, arg_types, payload_vars_to_close.items)) {
                             continue;
                         }

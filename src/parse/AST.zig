@@ -2670,7 +2670,7 @@ pub const WhereClause = union(enum) {
                 // remove preceding dot
                 const method_name = ast.resolve(m.name_tok)[1..];
                 try tree.pushStringPair("name", method_name);
-                try tree.pushBoolPair("effectful", m.effectful);
+                if (m.effectful) try tree.pushBoolPair("effectful", true);
                 const attrs = tree.beginNode();
 
                 const args_begin = tree.beginNode();

@@ -38,7 +38,7 @@ EndOfFile,
 				(ty-var (raw "a"))
 				(ty (name "Str")))
 			(where
-				(method (module-of "a") (name "to_str") (effectful false)
+				(method (module-of "a") (name "to_str")
 					(args
 						(ty-var (raw "a")))
 					(ty (name "Str")))))
@@ -83,7 +83,7 @@ _ = function(value)
 			(args
 				(p-assign (ident "convertible")))
 			(e-block
-				(e-dispatch-call (method "to_str") (constraint-fn-var 70)
+				(e-dispatch-call (method "to_str") (constraint-fn-var 214)
 					(receiver
 						(e-lookup-local
 							(p-assign (ident "convertible"))))
@@ -93,7 +93,7 @@ _ = function(value)
 				(ty-rigid-var (name "a"))
 				(ty-lookup (name "Str") (builtin)))
 			(where
-				(method (ty-rigid-var-lookup (ty-rigid-var (name "a"))) (name "to_str") (effectful false)
+				(method (ty-rigid-var-lookup (ty-rigid-var (name "a"))) (name "to_str")
 					(args
 						(ty-rigid-var-lookup (ty-rigid-var (name "a"))))
 					(ty-lookup (name "Str") (builtin))))))
@@ -103,7 +103,7 @@ _ = function(value)
 			(e-literal (string "my string"))))
 	(d-let
 		(p-underscore)
-		(e-call (constraint-fn-var 91)
+		(e-call (constraint-fn-var 227)
 			(e-lookup-local
 				(p-assign (ident "function")))
 			(e-lookup-local

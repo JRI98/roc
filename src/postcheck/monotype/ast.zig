@@ -112,6 +112,11 @@ pub const NestedFn = struct {
     owner: names.ProcTemplate,
     site: names.ProcSiteId,
     context_fn_key: names.TypeDigest,
+    /// Digest of every local-procedure declaration context visible inside this
+    /// nested function. ConstStore restoration combines it with the restored
+    /// function identity and a direct call's checked binder to derive stable
+    /// local-procedure specialization identities.
+    local_proc_context_digest: ?names.TypeDigest = null,
 };
 
 /// Function template plus source and monomorphic type identities.
@@ -233,6 +238,12 @@ fn writeFnDef(hasher: *std.crypto.hash.sha2.Sha256, fn_def: FnDef) void {
             writeProcTemplate(hasher, nested.owner);
             writeU32(hasher, @intFromEnum(nested.site));
             writeBytes(hasher, &nested.context_fn_key.bytes);
+            if (nested.local_proc_context_digest) |digest| {
+                writeBytes(hasher, "local_proc_contexts");
+                writeBytes(hasher, &digest.bytes);
+            } else {
+                writeBytes(hasher, "no_local_proc_contexts");
+            }
         },
         .local_hosted => |hosted| {
             writeBytes(hasher, "local_hosted");

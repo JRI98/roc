@@ -178,6 +178,7 @@ pub const FnDef = union(enum) {
         owner: names.ProcTemplate,
         site: names.ProcSiteId,
         context_fn_key: names.TypeDigest,
+        local_proc_context_digest: ?names.TypeDigest = null,
     },
     local_hosted: names.ProcTemplate,
     imported_hosted: names.ProcTemplate,

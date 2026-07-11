@@ -288,10 +288,8 @@ test "ModuleEnv pushExprTypesToSExprTree extracts and formats types" {
     const expr_var = try env.types.freshFromContent(.err);
     try std.testing.expectEqual(ModuleEnv.varFrom(expr_idx), expr_var);
 
-    const str_backing_var = try env.types.freshFromContent(.{ .structure = .empty_record });
     const str_content = try env.types.mkNominal(
         types.TypeIdent{ .ident_idx = str_ident },
-        str_backing_var,
         &.{},
         builtin_ident,
         false,

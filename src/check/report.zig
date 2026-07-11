@@ -63,6 +63,7 @@ const ComptimeCondition = problem_mod.ComptimeCondition;
 const TypeApplyArityMismatch = problem_mod.TypeApplyArityMismatch;
 const RecursiveAlias = problem_mod.RecursiveAlias;
 const UnsupportedAliasWhereClause = problem_mod.UnsupportedAliasWhereClause;
+const InvalidNominalDeclRecursion = problem_mod.InvalidNominalDeclRecursion;
 
 // Nominal type errors
 const CannotAccessOpaqueNominal = problem_mod.CannotAccessOpaqueNominal;
@@ -879,6 +880,9 @@ pub const ReportBuilder = struct {
             },
             .unsupported_alias_where_clause => |data| {
                 return self.buildUnsupportedAliasWhereClauseReport(data);
+            },
+            .invalid_nominal_decl_recursion => |data| {
+                return self.buildInvalidNominalDeclRecursionReport(data);
             },
             .infinite_recursion => |data| {
                 return self.buildInfiniteTypeReport(data);
@@ -3347,6 +3351,65 @@ pub const ReportBuilder = struct {
     }
 
     /// Build a report for infinite type recursion (e.g., `func = |a| func([a])` creates `a = List(a)`)
+    /// Build a report for a nominal type declaration whose backing recursion
+    /// is invalid (structurally infinite, or anonymous recursion that never
+    /// passes back through a nominal declaration).
+    fn buildInvalidNominalDeclRecursionReport(self: *Self, data: InvalidNominalDeclRecursion) Allocator.Error!Report {
+        // Look up display name in import mapping (handles auto-imported builtin types)
+        const type_name_ident = if (self.import_mapping.get(data.type_name)) |display_ident|
+            display_ident
+        else
+            data.type_name;
+
+        var report = try Report.init(self.gpa, "Invalid Recursive Type", "", .runtime_error);
+        errdefer report.deinit();
+
+        switch (data.kind) {
+            .infinite => try D.renderSliceInto(&.{
+                D.bytes("The nominal type"),
+                D.ident(type_name_ident).withAnnotation(.type_variable),
+                D.bytes("refers to itself in a way that would make it infinite."),
+            }, self, &report, &report.headline),
+            .anonymous => try D.renderSliceInto(&.{
+                D.bytes("The nominal type"),
+                D.ident(type_name_ident).withAnnotation(.type_variable),
+                D.bytes("contains recursion that never passes back through a nominal type."),
+            }, self, &report, &report.headline),
+        }
+
+        if (self.getRegionSafe(@enumFromInt(@intFromEnum(data.decl_var)))) |region| {
+            const region_info = self.module_env.calcRegionInfo(region.*);
+            try report.document.addSourceRegion(
+                region_info,
+                .error_highlight,
+                self.filename,
+                self.source,
+                self.module_env.getLineStarts(),
+            );
+            try report.document.addLineBreak();
+        }
+
+        try D.renderSlice(&.{
+            D.bytes("Its definition is:"),
+        }, self, &report);
+        try report.document.addLineBreak();
+        try report.document.addLineBreak();
+
+        const actual_type_str = try report.addOwnedString(self.getFormattedString(data.snapshot));
+        try report.document.addCodeBlock(actual_type_str);
+        try report.document.addLineBreak();
+        try report.document.addLineBreak();
+
+        try D.renderSlice(&.{
+            D.bytes("Hint:").withAnnotation(.emphasized),
+            D.bytes("Recursion in a nominal type is only allowed inside a tag union payload or record field — for example"),
+            D.bytes("ConsList(a) := [Nil, Cons(a, ConsList(a))]").withAnnotation(.inline_code),
+            D.bytes(".").withNoPrecedingSpace(),
+        }, self, &report);
+
+        return report;
+    }
+
     fn buildInfiniteTypeReport(self: *Self, data: VarWithSnapshot) Allocator.Error!Report {
         var report = try Report.init(self.gpa, "Infinite Type", "I am inferring a weird self-referential type.", .runtime_error);
         errdefer report.deinit();

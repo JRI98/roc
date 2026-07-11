@@ -118,28 +118,7 @@ c_record_fields_decl = |type_table, duplicate_record_names, duplicate_tag_names,
 }
 
 duplicate_record_names : TypeTable -> List(Str)
-duplicate_record_names = |type_table| {
-	var $seen_names = []
-	var $duplicates = []
-
-	for type_info in type_table.entries() {
-		match type_info.repr {
-			RocRecord(rec) =>
-				if rec.name != "" {
-					if List.contains($seen_names, rec.name) {
-						if !(List.contains($duplicates, rec.name)) {
-							$duplicates = $duplicates.append(rec.name)
-						}
-					} else {
-						$seen_names = $seen_names.append(rec.name)
-					}
-				}
-			_ => {}
-		}
-	}
-
-	$duplicates
-}
+duplicate_record_names = |type_table| type_table.duplicate_record_names()
 
 record_struct_name : List(Str), U64, RecordRepr -> Str
 record_struct_name = |duplicate_names, type_id, rec| {

@@ -42,6 +42,10 @@ pub const DeferredTemplate = struct {
     template_ref: names.ProcTemplate,
     source_fn_ty: checked.CheckedTypeId,
     source_fn_key: names.TypeDigest,
+    /// The requester's live function type cell. `fn_ty` may be replaced by a
+    /// sealed specialization-key snapshot, but callee body evidence must flow
+    /// back through this node before the requester seals its body draft.
+    requester_fn_node: NodeId,
     fn_ty: Type.TypeId,
     source_region_override: ?base.Region,
     current_entry_root: ?EntryRoot,
@@ -423,6 +427,40 @@ pub const InstGraph = struct {
 
     pub fn content(self: *InstGraph, id: NodeId) InstNode {
         return self.nodes.items[@intFromEnum(self.find(id))];
+    }
+
+    /// Return the graph node for one field of a record-shaped node. Field
+    /// access is a type relation, so callers use this node directly instead of
+    /// selecting a field from a temporary Monotype view and losing later row
+    /// evidence.
+    pub fn recordFieldNode(self: *InstGraph, raw_record: NodeId, name: names.RecordFieldNameId) Allocator.Error!NodeId {
+        var seen = std.AutoHashMap(NodeId, void).init(self.allocator);
+        defer seen.deinit();
+
+        var current = self.find(raw_record);
+        while (true) {
+            const entry = try seen.getOrPut(current);
+            if (entry.found_existing) {
+                Common.invariant("instantiation record field access encountered a recursive named backing");
+            }
+
+            switch (self.nodes.items[@intFromEnum(current)]) {
+                .named => |named| {
+                    const backing = named.backing orelse
+                        Common.invariant("instantiation record field access reached a named type without backing");
+                    current = self.find((try self.structuralBackingNode(backing.node, named)).node);
+                },
+                .record => {
+                    const row = try self.flattenRecordRow(current);
+                    const wanted = self.fieldLabelText(name);
+                    for (row.fields) |field| {
+                        if (Ident.textEql(wanted, self.fieldLabelText(field.name))) return self.find(field.ty);
+                    }
+                    Common.invariant("instantiation record field access was absent from the receiver type");
+                },
+                else => Common.invariant("instantiation record field access had a non-record receiver type"),
+            }
+        }
     }
 
     /// Queue the views of a changed root and of every row whose flattened view
@@ -1786,8 +1824,6 @@ pub const InstGraph = struct {
     /// drain. Run only when no constraint walk holds slices into the type
     /// store.
     pub fn drainDirty(self: *InstGraph) Allocator.Error!void {
-        self.types.beginDigestCacheInvalidationBatch();
-        defer self.types.endDigestCacheInvalidationBatch();
         while (self.dirty.pop()) |raw_root| {
             const root = self.find(raw_root);
             if (!self.dirty_set.remove(root)) continue;
@@ -2409,6 +2445,68 @@ test "issue 9647: row refills do not duplicate dependencies or materialized span
         return error.TestExpectedEqual;
     try std.testing.expectEqual(@as(usize, 1), parents.items.len);
     try std.testing.expectEqual(@as(usize, 1), type_store.view().fields.len);
+}
+
+test "record field node carries contextual row evidence into receiver" {
+    const gpa = std.testing.allocator;
+
+    var type_store = Type.Store.init(gpa);
+    defer type_store.deinit();
+
+    var name_store = names.NameStore.init(gpa);
+    defer name_store.deinit();
+
+    var unsolved_monos = std.AutoHashMap(Type.TypeId, void).init(gpa);
+    defer unsolved_monos.deinit();
+
+    const graph = try InstGraph.create(gpa, &type_store, &name_store, &unsolved_monos);
+    defer graph.destroy();
+
+    const field_name = try name_store.internRecordFieldLabel("shout!");
+    const emit_failed = try name_store.internTagLabel("EmitFailed");
+    const exit = try name_store.internTagLabel("Exit");
+
+    const narrow_tags = try graph.arena().alloc(InstTag, 1);
+    narrow_tags[0] = .{ .name = emit_failed, .checked_name = emit_failed, .payloads = try graph.arena().alloc(NodeId, 0) };
+    const narrow_ret = try graph.newNode(.{ .tag_union = .{
+        .tags = narrow_tags,
+        .ext = try graph.newNode(.{ .unresolved = InstVariable.row(.empty_tag_union) }),
+    } });
+    const field_fn = try graph.newNode(.{ .func = .{
+        .args = try graph.arena().alloc(NodeId, 0),
+        .ret = narrow_ret,
+    } });
+
+    const fields = try graph.arena().alloc(InstField, 1);
+    fields[0] = .{ .name = field_name, .ty = field_fn };
+    const record = try graph.newNode(.{ .record = .{
+        .fields = fields,
+        .ext = try graph.newNode(.empty_record),
+    } });
+
+    const contextual_tags = try graph.arena().alloc(InstTag, 2);
+    contextual_tags[0] = .{ .name = emit_failed, .checked_name = emit_failed, .payloads = try graph.arena().alloc(NodeId, 0) };
+    contextual_tags[1] = .{ .name = exit, .checked_name = exit, .payloads = try graph.arena().alloc(NodeId, 0) };
+    const contextual_ret = try graph.newNode(.{ .tag_union = .{
+        .tags = contextual_tags,
+        .ext = try graph.newNode(.{ .unresolved = InstVariable.row(.empty_tag_union) }),
+    } });
+    const contextual_fn = try graph.newNode(.{ .func = .{
+        .args = try graph.arena().alloc(NodeId, 0),
+        .ret = contextual_ret,
+    } });
+
+    const selected_field = try graph.recordFieldNode(record, field_name);
+    try graph.unify(selected_field, contextual_fn);
+
+    const sealed_record = try graph.sealNode(record);
+    const sealed_fields = type_store.fieldSpan(type_store.get(sealed_record).record);
+    try std.testing.expectEqual(@as(usize, 1), sealed_fields.len);
+    const sealed_fn = type_store.get(GuardedList.at(sealed_fields, 0).ty).func;
+    const sealed_tags = type_store.tagSpan(type_store.get(sealed_fn.ret).tag_union);
+    try std.testing.expectEqual(@as(usize, 2), sealed_tags.len);
+    try std.testing.expectEqual(emit_failed, GuardedList.at(sealed_tags, 0).name);
+    try std.testing.expectEqual(exit, GuardedList.at(sealed_tags, 1).name);
 }
 
 test "alias unification does not make the alias its own backing" {

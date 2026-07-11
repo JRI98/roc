@@ -69,7 +69,7 @@ EndOfFile,
 							(ty-var (raw "a")))
 						(ty (name "Str")))
 					(where
-						(method (module-of "a") (name "frobnicate") (effectful false)
+						(method (module-of "a") (name "frobnicate")
 							(args
 								(ty-var (raw "a")))
 							(ty (name "Str")))))
@@ -88,7 +88,7 @@ EndOfFile,
 				(ty-var (raw "b"))
 				(ty (name "Str")))
 			(where
-				(method (module-of "b") (name "unwrap") (effectful false)
+				(method (module-of "b") (name "unwrap")
 					(args
 						(ty-var (raw "b")))
 					(ty (name "Str")))))
@@ -133,7 +133,7 @@ main = run(Wrap.W(42.U8))
 			(args
 				(p-nominal
 					(p-applied-tag)))
-			(e-dispatch-call (method "frobnicate") (constraint-fn-var 134)
+			(e-dispatch-call (method "frobnicate") (constraint-fn-var 258)
 				(receiver
 					(e-lookup-local
 						(p-assign (ident "x"))))
@@ -144,7 +144,7 @@ main = run(Wrap.W(42.U8))
 					(ty-rigid-var (name "a")))
 				(ty-lookup (name "Str") (builtin)))
 			(where
-				(method (ty-rigid-var-lookup (ty-rigid-var (name "a"))) (name "frobnicate") (effectful false)
+				(method (ty-rigid-var-lookup (ty-rigid-var (name "a"))) (name "frobnicate")
 					(args
 						(ty-rigid-var-lookup (ty-rigid-var (name "a"))))
 					(ty-lookup (name "Str") (builtin))))))
@@ -153,7 +153,7 @@ main = run(Wrap.W(42.U8))
 		(e-lambda
 			(args
 				(p-assign (ident "v")))
-			(e-dispatch-call (method "unwrap") (constraint-fn-var 153)
+			(e-dispatch-call (method "unwrap") (constraint-fn-var 269)
 				(receiver
 					(e-lookup-local
 						(p-assign (ident "v"))))
@@ -163,13 +163,13 @@ main = run(Wrap.W(42.U8))
 				(ty-rigid-var (name "b"))
 				(ty-lookup (name "Str") (builtin)))
 			(where
-				(method (ty-rigid-var-lookup (ty-rigid-var (name "b"))) (name "unwrap") (effectful false)
+				(method (ty-rigid-var-lookup (ty-rigid-var (name "b"))) (name "unwrap")
 					(args
 						(ty-rigid-var-lookup (ty-rigid-var (name "b"))))
 					(ty-lookup (name "Str") (builtin))))))
 	(d-let
 		(p-assign (ident "main"))
-		(e-call (constraint-fn-var 205)
+		(e-call (constraint-fn-var 289)
 			(e-lookup-local
 				(p-assign (ident "run")))
 			(e-nominal (nominal "Wrap")
