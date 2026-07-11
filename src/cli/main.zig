@@ -2332,7 +2332,7 @@ fn rocRunSharedMemoryShim(ctx: *CliCtx, args: cli_args.RunArgs, arg0: []const u8
                 null,
                 false,
                 args.max_threads,
-                inlineExpectModeForOpt(args.opt),
+                args.opt,
                 resolutionConfigFromLimits(args.resolve_limits),
                 &cache_manager,
                 &reporter,
@@ -2352,7 +2352,7 @@ fn rocRunSharedMemoryShim(ctx: *CliCtx, args: cli_args.RunArgs, arg0: []const u8
                 null,
                 false,
                 args.max_threads,
-                inlineExpectModeForOpt(args.opt),
+                args.opt,
                 resolutionConfigFromLimits(args.resolve_limits),
                 &cache_manager,
                 &reporter,
@@ -2983,7 +2983,7 @@ fn rocRunDefaultApp(ctx: *CliCtx, args: cli_args.RunArgs, original_source: []con
     var reporter = makeReporter(ctx, "roc", args.timings);
     defer reporter.deinit();
     reporter.start();
-    const shm_result = try buildLirImageWithCoordinator(ctx, app_path, original_source_dir, true, args.max_threads, inlineExpectModeForOpt(args.opt), resolutionConfigFromLimits(args.resolve_limits), &cache_manager, &reporter, true);
+    const shm_result = try buildLirImageWithCoordinator(ctx, app_path, original_source_dir, true, args.max_threads, args.opt, resolutionConfigFromLimits(args.resolve_limits), &cache_manager, &reporter, true);
     defer closeSharedMemoryHandle(shm_result.handle);
 
     if (shm_result.error_count > 0 and shm_result.entrypoint_names.len == 0) {
@@ -3100,7 +3100,7 @@ fn rocRunDefaultAppSharedMemoryShim(ctx: *CliCtx, args: cli_args.RunArgs, origin
         original_source_dir,
         true,
         args.max_threads,
-        inlineExpectModeForOpt(args.opt),
+        args.opt,
         resolutionConfigFromLimits(args.resolve_limits),
         &cache_manager,
         &reporter,
@@ -5149,7 +5149,7 @@ fn rocInternalHotReloadDev(ctx: *CliCtx, raw_args: []const []const u8) CliMainEr
         if (source_rewrite) |rewrite| rewrite.source_dir_override else null,
         source_rewrite != null,
         args.max_threads,
-        inlineExpectModeForOpt(.dev),
+        .dev,
         resolutionConfigFromLimits(args.resolve_limits),
         null,
         null,
@@ -5456,7 +5456,7 @@ fn lowerLirWithCoordinator(
     source_dir_override: ?[]const u8,
     synthetic_default_app: bool,
     max_threads: ?usize,
-    inline_expects: lir.CheckedPipeline.InlineExpectMode,
+    opt: cli_args.OptLevel,
     resolution_config: compile.package_resolution.Config,
     cache_manager: ?*CacheManager,
     reporter: ?*progress.Reporter,
@@ -5664,21 +5664,17 @@ fn lowerLirWithCoordinator(
     const relation_artifacts = try coord.collectRelationArtifactViews(ctx.gpa, root_artifact);
     defer ctx.gpa.free(relation_artifacts);
 
-    const lir_roots = try lir.CheckedPipeline.selectPlatformEntrypointRoots(ctx.gpa, root_artifact.root_requests.runtime_requests);
-    defer ctx.gpa.free(lir_roots);
-
     if (reporter) |r| r.begin("Specializing");
-    var lowered = try lir.CheckedPipeline.lowerCheckedModulesToLir(
+    var lowered = try lowerCheckedSourceToLir(
         lir_allocator,
-        .{
-            .root = check.CheckedArtifact.loweringViewWithRelations(root_artifact, relation_artifacts),
-            .imports = imported_artifacts,
-        },
-        .{ .requests = lir_roots },
-        .{
-            .target_usize = base.target.TargetUsize.native,
-            .inline_expects = inline_expects,
-        },
+        ctx.gpa,
+        root_artifact,
+        imported_artifacts,
+        relation_artifacts,
+        .platform_entrypoints,
+        opt,
+        base.target.TargetUsize.native,
+        false,
     );
     errdefer lowered.deinit();
     if (reporter) |r| r.end();
@@ -5726,7 +5722,7 @@ pub fn buildLirImageWithCoordinator(
     source_dir_override: ?[]const u8,
     synthetic_default_app: bool,
     max_threads: ?usize,
-    inline_expects: lir.CheckedPipeline.InlineExpectMode,
+    opt: cli_args.OptLevel,
     resolution_config: compile.package_resolution.Config,
     cache_manager: ?*CacheManager,
     reporter: ?*progress.Reporter,
@@ -5748,7 +5744,7 @@ pub fn buildLirImageWithCoordinator(
         source_dir_override,
         synthetic_default_app,
         max_threads,
-        inline_expects,
+        opt,
         resolution_config,
         cache_manager,
         reporter,
@@ -5789,7 +5785,7 @@ pub fn buildLirImageWithCoordinator(
 /// Wrapper around buildLirImageWithCoordinator for callers that pass allow_errors.
 /// The allow_errors flag is handled by the caller; this function ignores it.
 pub fn setupSharedMemoryWithCoordinator(ctx: *CliCtx, roc_file_path: []const u8, _: bool) CliMainError!SharedMemoryResult {
-    return buildLirImageWithCoordinator(ctx, roc_file_path, null, false, null, .run, .{}, null, null, true);
+    return buildLirImageWithCoordinator(ctx, roc_file_path, null, false, null, .interpreter, .{}, null, null, true);
 }
 
 /// Platform resolution result containing the platform source path
@@ -8243,25 +8239,17 @@ fn rocBuildLlvm(ctx: *CliCtx, args: cli_args.BuildArgs) CliMainError!void {
 
     const target_usize = base.target.TargetUsize.fromPtrBitWidth(target.ptrBitWidth());
 
-    const build_roots = try lir.CheckedPipeline.selectPlatformExportRoots(ctx.gpa, root_artifact.root_requests.runtime_requests);
-    defer ctx.gpa.free(build_roots);
-
     reporter.begin("Specializing");
-    var lowered = try lir.CheckedPipeline.lowerCheckedModulesToLir(
+    var lowered = try lowerCheckedSourceToLir(
         ctx.gpa,
-        .{
-            .root = check.CheckedArtifact.loweringViewWithRelations(root_artifact, relation_artifacts),
-            .imports = imported_artifacts,
-        },
-        .{ .requests = build_roots, .include_static_data_exports = true },
-        .{
-            .target_usize = target_usize,
-            .inline_mode = postCheckInlineModeForOpt(args.opt),
-            .inline_expects = inlineExpectModeForOpt(args.opt),
-            .list_in_place_map = listInPlaceMapForOpt(args.opt),
-            .tag_reachability = tagReachabilityForOpt(args.opt),
-            .proc_debug_names = args.synthetic_default_platform,
-        },
+        ctx.gpa,
+        root_artifact,
+        imported_artifacts,
+        relation_artifacts,
+        .platform_exports,
+        args.opt,
+        target_usize,
+        args.synthetic_default_platform,
     );
     defer lowered.deinit();
     reporter.end();
@@ -8571,25 +8559,17 @@ fn rocBuildNative(ctx: *CliCtx, args: cli_args.BuildArgs) CliMainError!void {
 
     const target_usize = base.target.TargetUsize.fromPtrBitWidth(target.ptrBitWidth());
 
-    const build_roots = try lir.CheckedPipeline.selectPlatformExportRoots(ctx.gpa, root_artifact.root_requests.runtime_requests);
-    defer ctx.gpa.free(build_roots);
-
     reporter.begin("Specializing");
-    var lowered = try lir.CheckedPipeline.lowerCheckedModulesToLir(
+    var lowered = try lowerCheckedSourceToLir(
         ctx.gpa,
-        .{
-            .root = check.CheckedArtifact.loweringViewWithRelations(root_artifact, relation_artifacts),
-            .imports = imported_artifacts,
-        },
-        .{ .requests = build_roots, .include_static_data_exports = true },
-        .{
-            .target_usize = target_usize,
-            .inline_mode = postCheckInlineModeForOpt(args.opt),
-            .inline_expects = inlineExpectModeForOpt(args.opt),
-            .list_in_place_map = listInPlaceMapForOpt(args.opt),
-            .tag_reachability = tagReachabilityForOpt(args.opt),
-            .proc_debug_names = args.synthetic_default_platform,
-        },
+        ctx.gpa,
+        root_artifact,
+        imported_artifacts,
+        relation_artifacts,
+        .platform_exports,
+        args.opt,
+        target_usize,
+        args.synthetic_default_platform,
     );
     defer lowered.deinit();
     reporter.end();
@@ -8910,20 +8890,17 @@ fn rocBuildEmbedded(ctx: *CliCtx, args: cli_args.BuildArgs) CliMainError!void {
     const shm_allocator = shm.allocator();
     const image_header = try shm_allocator.create(lir.LirImage.Header);
 
-    const lir_roots = try lir.CheckedPipeline.selectPlatformEntrypointRoots(ctx.gpa, root_artifact.root_requests.runtime_requests);
-    defer ctx.gpa.free(lir_roots);
-
     reporter.begin("Specializing");
-    const lowered = try lir.CheckedPipeline.lowerCheckedModulesToLir(
+    const lowered = try lowerCheckedSourceToLir(
         shm_allocator,
-        .{
-            .root = check.CheckedArtifact.loweringViewWithRelations(root_artifact, relation_artifacts),
-            .imports = imported_artifacts,
-        },
-        .{ .requests = lir_roots },
-        .{
-            .target_usize = base.target.TargetUsize.native,
-        },
+        ctx.gpa,
+        root_artifact,
+        imported_artifacts,
+        relation_artifacts,
+        .platform_entrypoints,
+        args.opt,
+        base.target.TargetUsize.native,
+        false,
     );
     reporter.end();
 
@@ -9821,6 +9798,82 @@ fn inlineExpectModeForOpt(opt: cli_args.OptLevel) lir.CheckedPipeline.InlineExpe
     };
 }
 
+/// Which checked root definitions become LIR roots for a backend.
+const CheckedLirRoots = union(enum) {
+    /// Provided exports plus platform-required bindings: LIR consumed by host
+    /// shims and interpreters (run, embedded builds, hot reload, glue).
+    platform_entrypoints,
+    /// Provided exports only: ABI roots for linked outputs (native/LLVM builds).
+    platform_exports,
+    /// Pre-selected expect/test roots with their plan metadata (roc test).
+    test_plan: struct {
+        requests: []const check.CheckedArtifact.RootRequest,
+        metadata: []const postcheck.Common.RootTestPlanMetadata,
+    },
+};
+
+/// The single "checked artifacts → LIR" adapter shared by every backend: run,
+/// build-LLVM, build-native, embedded, and test lowering all go through here.
+///
+/// Owns platform-root selection and the optimization-derived lowering option
+/// list so a new lowering option lands in every backend at once instead of in
+/// whichever hand-copied option lists remembered it.
+fn lowerCheckedSourceToLir(
+    lir_allocator: Allocator,
+    gpa: Allocator,
+    root_artifact: *const check.CheckedArtifact.CheckedModuleArtifact,
+    imported_artifacts: []const check.CheckedArtifact.ImportedModuleView,
+    relation_artifacts: []const check.CheckedArtifact.ImportedModuleView,
+    roots: CheckedLirRoots,
+    opt: cli_args.OptLevel,
+    target_usize: base.target.TargetUsize,
+    proc_debug_names: bool,
+) Allocator.Error!lir.CheckedPipeline.LoweredProgram {
+    const selected_roots: []const check.CheckedArtifact.RootRequest = switch (roots) {
+        .platform_entrypoints => try lir.CheckedPipeline.selectPlatformEntrypointRoots(gpa, root_artifact.root_requests.runtime_requests),
+        .platform_exports => try lir.CheckedPipeline.selectPlatformExportRoots(gpa, root_artifact.root_requests.runtime_requests),
+        .test_plan => |plan| plan.requests,
+    };
+    defer switch (roots) {
+        .platform_entrypoints, .platform_exports => gpa.free(selected_roots),
+        .test_plan => {},
+    };
+
+    return lir.CheckedPipeline.lowerCheckedModulesToLir(
+        lir_allocator,
+        .{
+            .root = check.CheckedArtifact.loweringViewWithRelations(root_artifact, relation_artifacts),
+            .imports = imported_artifacts,
+        },
+        .{
+            .requests = selected_roots,
+            // Static data exports exist only in linked outputs, which lower
+            // from export roots.
+            .include_static_data_exports = switch (roots) {
+                .platform_exports => true,
+                else => false,
+            },
+            .test_plan_metadata = switch (roots) {
+                .test_plan => |plan| plan.metadata,
+                else => &.{},
+            },
+        },
+        .{
+            .target_usize = target_usize,
+            .inline_mode = postCheckInlineModeForOpt(opt),
+            // Test lowering executes inline expects at every opt level; other
+            // backends omit them from optimized output.
+            .inline_expects = switch (roots) {
+                .test_plan => .run,
+                else => inlineExpectModeForOpt(opt),
+            },
+            .list_in_place_map = listInPlaceMapForOpt(opt),
+            .tag_reachability = tagReachabilityForOpt(opt),
+            .proc_debug_names = proc_debug_names,
+        },
+    );
+}
+
 const CliTestRootRun = struct {
     root: check.CheckedArtifact.RootRequest,
     env: *const ModuleEnv,
@@ -10435,22 +10488,19 @@ fn lowerPlannedTestModule(
         };
     }
 
-    var lowered = try lir.CheckedPipeline.lowerCheckedModulesToLir(
+    var lowered = try lowerCheckedSourceToLir(
         ctx.gpa,
-        .{
-            .root = check.CheckedArtifact.loweringViewWithRelations(planned.artifact, relation_artifacts),
-            .imports = imported_artifacts,
-        },
-        .{
+        ctx.gpa,
+        planned.artifact,
+        imported_artifacts,
+        relation_artifacts,
+        .{ .test_plan = .{
             .requests = planned.test_roots,
-            .test_plan_metadata = root_plan_metadata,
-        },
-        .{
-            .target_usize = base.target.TargetUsize.native,
-            .inline_mode = postCheckInlineModeForOpt(opt),
-            .list_in_place_map = listInPlaceMapForOpt(opt),
-            .tag_reachability = tagReachabilityForOpt(opt),
-        },
+            .metadata = root_plan_metadata,
+        } },
+        opt,
+        base.target.TargetUsize.native,
+        false,
     );
     errdefer lowered.deinit();
 
