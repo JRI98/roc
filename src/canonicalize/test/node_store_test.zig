@@ -1522,4 +1522,10 @@ test "where clause span records canonical rigid ownership by annotation scope" {
     try testing.expectEqual(@intFromEnum(enclosing), owners[2].rigid_var);
     try testing.expect(!owners[2].introduced_in_scope);
     try testing.expectEqualSlices(CIR.WhereClause.Idx, &.{enclosing_method}, store.sliceWhereClausesForOwner(owners[2]));
+
+    var cloned = try store.clone(gpa);
+    defer cloned.deinit();
+    const cloned_owners = cloned.sliceWhereClauseOwners(where);
+    try testing.expectEqualSlices(NodeStore.WhereClauseOwnerData, owners, cloned_owners);
+    try testing.expectEqualSlices(CIR.WhereClause.Idx, &.{item_method}, cloned.sliceWhereClausesForOwner(cloned_owners[1]));
 }

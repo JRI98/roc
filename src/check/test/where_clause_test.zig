@@ -160,6 +160,20 @@ test "where clause - issue 10084 nested iterator constraint resolves" {
     );
 }
 
+test "where clause - cyclic constraint signatures resolve through canonical owners" {
+    const source =
+        \\cycle : a -> a where [a.next : a -> b, b.prev : b -> a]
+        \\cycle = |value| value.next().prev()
+    ;
+    var test_env = try TestEnv.init("CyclicConstraintOwners", source);
+    defer test_env.deinit();
+
+    try test_env.assertDefType(
+        "cycle",
+        "a -> a where [a.next : a -> b, b.prev : b -> a]",
+    );
+}
+
 test "where clause - multiple constraints on same variable" {
     const source_a =
         \\A := [D(Str, U64)].{
