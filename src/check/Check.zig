@@ -1205,6 +1205,7 @@ const ValueLookupEntry = struct {
 
 /// A struct scratch info about a static dispatch constraint
 const ScratchStaticDispatchConstraint = struct {
+    where_clause: CIR.WhereClause.Idx,
     var_: Var,
     constraint: types_mod.StaticDispatchConstraint,
     state: enum { declared, completed },
@@ -8317,7 +8318,7 @@ fn processRequiresTypes(self: *Self, env: *Env) std.mem.Allocator.Error!void {
         // Then, generate the type for the actual required type
         //   { [Model : model] for main : { init : model, ... } }
         //                                ^^^^^^^^^^^^^^^^^^^^^^
-        try self.generateAnnoTypeInPlace(required_type.type_anno, env, .annotation);
+        try self.generateAnnoTypeInPlace(required_type.type_anno, env, .{ .annotation = null });
     }
 }
 
@@ -9574,16 +9575,14 @@ fn generateStandaloneTypeAnno(
     const scratch_static_dispatch_constraints_top = self.scratch_static_dispatch_constraints.top();
     defer self.scratch_static_dispatch_constraints.clearFrom(scratch_static_dispatch_constraints_top);
 
-    // Declare every where constraint before generating any of their type
-    // annotations. A rigid variable may occur only inside the where signatures,
-    // so its first occurrence must already see the complete constraint set.
-    if (type_anno.where) |where_span| {
-        try self.generateStaticDispatchConstraintsFromWhere(where_span, env);
-    }
-
     // Generate the type from the annotation
     const anno_var: Var = ModuleEnv.varFrom(type_anno.anno);
-    try self.generateAnnoTypeInPlace(type_anno.anno, env, .annotation);
+    const ctx = GenTypeAnnoCtx{ .annotation = type_anno.where };
+    try self.generateAnnoTypeInPlace(type_anno.anno, env, ctx);
+    if (type_anno.where) |where_span| {
+        try self.generateRemainingWhereConstraintOwners(where_span, env, ctx);
+        try self.reportUnsupportedWhereAliases(where_span);
+    }
 
     // Unify the statement variable with the generated annotation type
     _ = try self.unify(stmt_var, anno_var, env);
@@ -9640,7 +9639,7 @@ const OutVar = enum {
 
 /// The context use for free var generation
 const GenTypeAnnoCtx = union(enum) {
-    annotation,
+    annotation: ?CIR.WhereClause.Span,
     type_decl: struct {
         idx: CIR.Statement.Idx,
         name: Ident.Idx,
@@ -9667,60 +9666,32 @@ fn generateAnnotationType(self: *Self, annotation_idx: CIR.Annotation.Idx, env: 
     const scratch_static_dispatch_constraints_top = self.scratch_static_dispatch_constraints.top();
     defer self.scratch_static_dispatch_constraints.clearFrom(scratch_static_dispatch_constraints_top);
 
-    // Declare every where constraint before generating any of their type
-    // annotations. A rigid variable may occur only inside the where signatures,
-    // so its first occurrence must already see the complete constraint set.
-    if (annotation.where) |where_span| {
-        try self.generateStaticDispatchConstraintsFromWhere(where_span, env);
-    }
-
     // Then, generate the type for the annotation
-    try self.generateAnnoTypeInPlace(annotation.anno, env, .annotation);
+    const ctx = GenTypeAnnoCtx{ .annotation = annotation.where };
+    try self.generateAnnoTypeInPlace(annotation.anno, env, ctx);
+    if (annotation.where) |where_span| {
+        try self.generateRemainingWhereConstraintOwners(where_span, env, ctx);
+        try self.reportUnsupportedWhereAliases(where_span);
+    }
 
     // Redirect the root annotation to inner annotation
     _ = try self.unify(annotation_var, ModuleEnv.varFrom(annotation.anno), env);
 }
 
-/// Declare every method relation first, then complete each function signature.
-/// Constraint-only rigid variables can be first encountered in any signature;
-/// predeclaration ensures that encounter sees every constraint on the variable.
-fn generateStaticDispatchConstraintsFromWhere(self: *Self, where_span: CIR.WhereClause.Span, env: *Env) std.mem.Allocator.Error!void {
-    const trace = tracy.trace(@src());
-    defer trace.end();
-
-    const constraints_start = self.scratch_static_dispatch_constraints.top();
-    const where_slice = self.cir.store.sliceWhereClauses(where_span);
-
-    for (where_slice) |where_idx| {
-        try self.declareStaticDispatchConstraintFromWhere(where_idx, env);
-    }
-
-    var constraint_index = constraints_start;
-    for (where_slice) |where_idx| {
-        switch (self.cir.store.getWhereClause(where_idx)) {
-            .w_method => |method| {
-                try self.completeStaticDispatchConstraintFromWhere(method, constraint_index, env);
-                constraint_index += 1;
-            },
-            .w_alias, .w_malformed => {},
-        }
-    }
-
-    std.debug.assert(constraint_index == self.scratch_static_dispatch_constraints.top());
-}
-
-fn declareStaticDispatchConstraintFromWhere(self: *Self, where_idx: CIR.WhereClause.Idx, env: *Env) std.mem.Allocator.Error!void {
-    const where = self.cir.store.getWhereClause(where_idx);
+fn declareOwnedStaticDispatchConstraint(
+    self: *Self,
+    where_idx: CIR.WhereClause.Idx,
+    owner_var: Var,
+    env: *Env,
+) std.mem.Allocator.Error!void {
     const where_region = self.cir.store.getNodeRegion(ModuleEnv.nodeIdxFrom(where_idx));
-
-    switch (where) {
+    switch (self.cir.store.getWhereClause(where_idx)) {
         .w_method => |method| {
-            try self.declareStaticDispatchReceiver(method.var_, env);
-            const method_var = ModuleEnv.varFrom(method.var_);
             const func_var = try self.fresh(env, where_region);
 
             try self.scratch_static_dispatch_constraints.append(ScratchStaticDispatchConstraint{
-                .var_ = method_var,
+                .where_clause = where_idx,
+                .var_ = owner_var,
                 .constraint = StaticDispatchConstraint{
                     .fn_name = method.method_name,
                     .fn_var = func_var,
@@ -9729,61 +9700,36 @@ fn declareStaticDispatchConstraintFromWhere(self: *Self, where_idx: CIR.WhereCla
                 .state = .declared,
             });
         },
-        .w_alias => |alias| {
-            // Alias syntax in where clauses (e.g., `where [a.Decode]`) was used for abilities,
-            // which have been removed from Roc. Emit an error.
-            _ = try self.problems.appendProblem(self.gpa, .{ .unsupported_alias_where_clause = .{
-                .alias_name = alias.alias_name,
-                .region = where_region,
-            } });
-        },
-        .w_malformed => {
-            // If it's malformed, just ignore
-        },
+        .w_alias, .w_malformed => {},
     }
 }
 
-/// Establish the explicit identity edge from a where-clause receiver lookup to
-/// its rigid declaration without materializing that declaration yet. Phase A
-/// must link every receiver before phase B can encounter a constraint-only
-/// rigid in any signature.
-fn declareStaticDispatchReceiver(self: *Self, receiver_anno: CIR.TypeAnno.Idx, env: *Env) std.mem.Allocator.Error!void {
-    const receiver_var = ModuleEnv.varFrom(receiver_anno);
-    try self.setVarRank(receiver_var, env);
-
-    switch (self.cir.store.getTypeAnno(receiver_anno)) {
-        .rigid_var => {},
-        .rigid_var_lookup => |lookup| {
-            _ = try self.unify(receiver_var, ModuleEnv.varFrom(lookup.ref), env);
-        },
-        else => try self.unifyWith(receiver_var, .err, env),
-    }
-}
-
-fn completeStaticDispatchConstraintFromWhere(
+fn completeOwnedStaticDispatchConstraint(
     self: *Self,
+    where_idx: CIR.WhereClause.Idx,
     method: std.meta.fieldInfo(CIR.WhereClause, .w_method).type,
+    owner_var: Var,
     constraint_index: usize,
     env: *Env,
+    ctx: GenTypeAnnoCtx,
 ) std.mem.Allocator.Error!void {
     const entry = self.scratch_static_dispatch_constraints.items.items[constraint_index];
-    const expected_receiver = ModuleEnv.varFrom(method.var_);
-    if (entry.state != .declared or entry.var_ != expected_receiver) {
+    if (entry.state != .declared or entry.where_clause != where_idx or entry.var_ != owner_var) {
         try self.unifyWith(entry.var_, .err, env);
         try self.unifyWith(entry.constraint.fn_var, .err, env);
         self.scratch_static_dispatch_constraints.items.items[constraint_index].state = .completed;
         return;
     }
 
-    try self.generateAnnoTypeInPlace(method.var_, env, .annotation);
+    try self.generateAnnoTypeInPlace(method.var_, env, ctx);
 
     const args_anno_slice = self.cir.store.sliceTypeAnnos(method.args);
     for (args_anno_slice) |arg_anno_idx| {
-        try self.generateAnnoTypeInPlace(arg_anno_idx, env, .annotation);
+        try self.generateAnnoTypeInPlace(arg_anno_idx, env, ctx);
     }
     const anno_arg_vars: []Var = @ptrCast(args_anno_slice);
 
-    try self.generateAnnoTypeInPlace(method.ret, env, .annotation);
+    try self.generateAnnoTypeInPlace(method.ret, env, ctx);
     const ret_var = ModuleEnv.varFrom(method.ret);
 
     const func_content = if (method.effectful)
@@ -9792,6 +9738,32 @@ fn completeStaticDispatchConstraintFromWhere(
         try self.types.mkFuncPure(anno_arg_vars, ret_var);
     try self.unifyWith(entry.constraint.fn_var, func_content, env);
     self.scratch_static_dispatch_constraints.items.items[constraint_index].state = .completed;
+}
+
+fn generateRemainingWhereConstraintOwners(
+    self: *Self,
+    where_span: CIR.WhereClause.Span,
+    env: *Env,
+    ctx: GenTypeAnnoCtx,
+) std.mem.Allocator.Error!void {
+    for (self.cir.store.sliceWhereClauseOwners(where_span)) |owner| {
+        if (!owner.introduced_in_scope) continue;
+        try self.generateAnnoTypeInPlace(@enumFromInt(owner.rigid_var), env, ctx);
+    }
+}
+
+fn reportUnsupportedWhereAliases(self: *Self, where_span: CIR.WhereClause.Span) std.mem.Allocator.Error!void {
+    for (self.cir.store.sliceWhereClauses(where_span)) |where_idx| {
+        switch (self.cir.store.getWhereClause(where_idx)) {
+            .w_alias => |alias| {
+                _ = try self.problems.appendProblem(self.gpa, .{ .unsupported_alias_where_clause = .{
+                    .alias_name = alias.alias_name,
+                    .region = self.cir.store.getNodeRegion(ModuleEnv.nodeIdxFrom(where_idx)),
+                } });
+            },
+            .w_method, .w_malformed => {},
+        }
+    }
 }
 
 /// Given an annotation, generate the corresponding type based on the CIR
@@ -9834,19 +9806,28 @@ fn generateAnnoTypeInPlace(self: *Self, anno_idx: CIR.TypeAnno.Idx, env: *Env, c
                     return;
                 }
             }
-            const static_dispatch_constraints_start = self.types.static_dispatch_constraints.len();
-            switch (ctx) {
-                .annotation => {
-                    // If this an annotation, then check all where constraints
-                    // and see if any reference this rigid var
-                    for (self.scratch_static_dispatch_constraints.items.items) |scratch_constraint| {
-                        const resolved_scratch_var = self.types.resolveVar(scratch_constraint.var_).var_;
-                        if (resolved_scratch_var == anno_var) {
-                            _ = try self.types.static_dispatch_constraints.append(self.types.gpa, scratch_constraint.constraint);
+            const owned_where_clauses: []const CIR.WhereClause.Idx = switch (ctx) {
+                .annotation => |mb_where| blk: {
+                    const where_span = mb_where orelse break :blk &.{};
+                    for (self.cir.store.sliceWhereClauseOwners(where_span)) |owner| {
+                        if (owner.rigid_var == @intFromEnum(anno_idx) and owner.introduced_in_scope) {
+                            break :blk self.cir.store.sliceWhereClausesForOwner(owner);
                         }
                     }
+                    break :blk &.{};
                 },
-                .type_decl => {},
+                .type_decl => &.{},
+            };
+
+            const scratch_constraints_start = self.scratch_static_dispatch_constraints.top();
+            for (owned_where_clauses) |where_idx| {
+                try self.declareOwnedStaticDispatchConstraint(where_idx, anno_var, env);
+            }
+
+            const static_dispatch_constraints_start = self.types.static_dispatch_constraints.len();
+            for (0..owned_where_clauses.len) |offset| {
+                const scratch_constraint = self.scratch_static_dispatch_constraints.items.items[scratch_constraints_start + offset];
+                _ = try self.types.static_dispatch_constraints.append(self.types.gpa, scratch_constraint.constraint);
             }
             const static_dispatch_constraints_end = self.types.static_dispatch_constraints.len();
             const static_dispatch_constraints_range = StaticDispatchConstraint.SafeList.Range{ .start = @enumFromInt(static_dispatch_constraints_start), .count = @intCast(static_dispatch_constraints_end - static_dispatch_constraints_start) };
@@ -9855,6 +9836,22 @@ fn generateAnnoTypeInPlace(self: *Self, anno_idx: CIR.TypeAnno.Idx, env: *Env, c
                 .name = rigid.name,
                 .constraints = static_dispatch_constraints_range,
             } }, env);
+
+            for (owned_where_clauses, 0..) |where_idx, offset| {
+                switch (self.cir.store.getWhereClause(where_idx)) {
+                    .w_method => |method| try self.completeOwnedStaticDispatchConstraint(
+                        where_idx,
+                        method,
+                        anno_var,
+                        scratch_constraints_start + offset,
+                        env,
+                        ctx,
+                    ),
+                    .w_alias, .w_malformed => {
+                        try self.unifyWith(anno_var, .err, env);
+                    },
+                }
+            }
         },
         .rigid_var_lookup => |rigid_lookup| {
             _ = try self.unify(anno_var, ModuleEnv.varFrom(rigid_lookup.ref), env);
