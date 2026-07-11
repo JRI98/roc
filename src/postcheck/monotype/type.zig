@@ -894,14 +894,14 @@ pub const Store = struct {
                 } else {
                     writeBytes(hasher, "not-builtin");
                 }
-                self.writeIdentitySpan(name_store, hasher, named.args, named_mode, strategy);
+                self.writeIdentitySpan(hasher, named.args, named_mode, strategy);
                 if (named_mode == .full) {
-                    self.writeIdentityBacking(name_store, hasher, named.backing, strategy);
+                    self.writeIdentityBacking(hasher, named.backing, strategy);
                     self.writeIdentityDeclaredOrder(name_store, hasher, named.declared_order, strategy);
                 } else if (named.builtin_owner) |owner| {
                     if (generatedEvidenceOwnerUsesBacking(owner)) {
                         writeBytes(hasher, "specialization-builtin-backing");
-                        self.writeIdentityBacking(name_store, hasher, named.backing, strategy);
+                        self.writeIdentityBacking(hasher, named.backing, strategy);
                     } else {
                         writeBytes(hasher, "specialization-named-identity");
                     }
@@ -921,7 +921,7 @@ pub const Store = struct {
             },
             .tuple => |items| {
                 writeBytes(hasher, "tuple");
-                self.writeIdentitySpan(name_store, hasher, items, named_mode, strategy);
+                self.writeIdentitySpan(hasher, items, named_mode, strategy);
             },
             .tag_union => |tags| {
                 writeBytes(hasher, "tag_union");
@@ -930,7 +930,7 @@ pub const Store = struct {
                 for (0..tag_slice.len) |index| {
                     const tag = GuardedList.at(tag_slice, index);
                     writeBytes(hasher, name_store.tagLabelText(tag.name));
-                    self.writeIdentitySpan(name_store, hasher, tag.payloads, named_mode, strategy);
+                    self.writeIdentitySpan(hasher, tag.payloads, named_mode, strategy);
                 }
             },
             .list => |elem| {
@@ -943,7 +943,7 @@ pub const Store = struct {
             },
             .func => |function| {
                 writeBytes(hasher, "func");
-                self.writeIdentitySpan(name_store, hasher, function.args, named_mode, strategy);
+                self.writeIdentitySpan(hasher, function.args, named_mode, strategy);
                 strategy.child(hasher, function.ret, named_mode);
             },
             .erased => |erased| {
@@ -956,13 +956,11 @@ pub const Store = struct {
 
     fn writeIdentitySpan(
         self: *const Store,
-        name_store: *const names.NameStore,
         hasher: *std.crypto.hash.sha2.Sha256,
         span_: Span,
         named_mode: NamedDigestMode,
         strategy: anytype,
     ) void {
-        _ = name_store;
         const values = self.span(span_);
         writeU32(hasher, @intCast(values.len));
         for (0..values.len) |index| {
@@ -973,12 +971,10 @@ pub const Store = struct {
 
     fn writeIdentityBacking(
         _: *const Store,
-        name_store: *const names.NameStore,
         hasher: *std.crypto.hash.sha2.Sha256,
         backing: ?NamedBacking,
         strategy: anytype,
     ) void {
-        _ = name_store;
         writeBytes(hasher, "backing");
         if (backing) |named_backing| {
             writeBytes(hasher, @tagName(named_backing.use));
