@@ -144,6 +144,73 @@ fn resolveThreadDefaults(max_threads: ?usize) struct { usize, Mode } {
     const thread_count: usize = max_threads orelse (std.Thread.getCpuCount() catch 1);
     return .{ thread_count, if (thread_count <= 1) .single_threaded else .multi_threaded };
 }
+
+/// Options for constructing the orchestration core (`BuildEnv`) for a CLI
+/// command. Every entry path — check, build, run, test, docs, bundle — wires
+/// the core through `initCliBuildEnv`, so thread defaults, the working
+/// directory, cache attachment, and the publication mode are configured in
+/// exactly one place.
+const CliBuildEnvOptions = struct {
+    max_threads: ?usize = null,
+    /// Explicit `--no-cache`; the only way a pipeline opts out of the
+    /// checked-module cache.
+    no_cache: bool = false,
+    verbose_cache: bool = false,
+    resolution_config: compile.package_resolution.Config = .{},
+    track_watch_inputs: bool = false,
+    /// Identity-only synthetic marking for staged default-app roots (check
+    /// sites). Sites that also need diagnostics remapped call
+    /// `setSyntheticRootSourceMappingWithLineOffset` themselves, which
+    /// implies these identities.
+    synthetic_default_app: bool = false,
+    source_dir_override: ?[]const u8 = null,
+    post_check_publication_mode: compile.build.PostCheckPublicationMode = .executable_artifacts,
+    /// Root path tested against the compiler-owned builtin sources; matches
+    /// are compiled with the `.builtin` module role (check sites).
+    builtin_role_path: ?[]const u8 = null,
+};
+
+const InitCliBuildEnvError = Allocator.Error ||
+    compile.build.InitError ||
+    std.Io.Dir.RealPathFileAllocError;
+
+/// Construct the orchestration core for a CLI command. This is the single
+/// place the CLI creates a `BuildEnv`: every pipeline caches unless the user
+/// passed an explicit `--no-cache`, and no entry path configures the core ad
+/// hoc.
+fn initCliBuildEnv(ctx: *CliCtx, opts: CliBuildEnvOptions) InitCliBuildEnvError!BuildEnv {
+    const thread_count, const mode = resolveThreadDefaults(opts.max_threads);
+
+    // Arena-owned so the path outlives the returned BuildEnv, which borrows it.
+    const cwd = try std.Io.Dir.cwd().realPathFileAlloc(ctx.io.std_io, ".", ctx.arena);
+
+    var build_env = try BuildEnv.init(ctx.gpa, mode, thread_count, RocTarget.detectNative(), cwd, ctx.io.std_io);
+    errdefer build_env.deinit();
+
+    build_env.compiler_version = build_options.compiler_version;
+    build_env.resolution_config = opts.resolution_config;
+    build_env.setWatchInputTracking(opts.track_watch_inputs);
+    build_env.setPostCheckPublicationMode(opts.post_check_publication_mode);
+    if (opts.synthetic_default_app) {
+        // Staged default-app roots and their synthesized platform live in a
+        // per-invocation temp dir; identity must be the stable synthetic one
+        // so cache keys and nominal identity match across runs and pipelines.
+        build_env.setSyntheticRootPackageIdentity();
+        build_env.setSyntheticRootPlatformPackageIdentity();
+    }
+    if (opts.source_dir_override) |source_dir| {
+        build_env.setRootSourceDirOverride(source_dir);
+    }
+    if (opts.builtin_role_path) |path| {
+        if (isCompilerOwnedBuiltinSourcePath(ctx.gpa, ctx.io.std_io, path)) {
+            build_env.setRootModuleRole(.builtin);
+        }
+    }
+    if (!opts.no_cache) try build_env.enableDefaultCacheManager(opts.verbose_cache);
+
+    return build_env;
+}
+
 const CacheManager = compile.CacheManager;
 const CacheConfig = compile.CacheConfig;
 const cache_config_mod = compile.config;
@@ -5456,38 +5523,28 @@ fn lowerLirWithBuildEnv(
     reporter: ?*progress.Reporter,
     allow_user_errors: bool,
 ) CliMainError!LoweredCoordinatorResult {
-    const thread_count, const mode = resolveThreadDefaults(max_threads);
-
-    const cwd = try std.fs.path.resolve(ctx.gpa, &.{"."});
-    defer ctx.gpa.free(cwd);
-
-    var build_env = try BuildEnv.init(ctx.gpa, mode, thread_count, RocTarget.detectNative(), cwd, ctx.io.std_io);
+    var build_env = try initCliBuildEnv(ctx, .{
+        .max_threads = max_threads,
+        .no_cache = !enable_checked_cache,
+        .resolution_config = resolution_config,
+        .track_watch_inputs = true,
+        .source_dir_override = source_dir_override,
+        .post_check_publication_mode = if (allow_user_errors)
+            .executable_artifacts_allow_user_errors
+        else
+            .executable_artifacts,
+    });
     defer build_env.deinit();
-    build_env.setWatchInputTracking(true);
-    build_env.resolution_config = resolution_config;
-    build_env.compiler_version = build_options.compiler_version;
-    build_env.setPostCheckPublicationMode(if (allow_user_errors)
-        .executable_artifacts_allow_user_errors
-    else
-        .executable_artifacts);
-    if (source_dir_override) |source_dir| {
-        build_env.setRootSourceDirOverride(source_dir);
-    }
     if (synthetic_default_app) |mapping| {
-        // Staged default-app roots and their synthesized platform live in a
-        // per-invocation temp dir; identity must be the stable synthetic one
-        // so cache keys and nominal identity match across runs and pipelines,
-        // and diagnostics must point at the user's real file (and its real
-        // line numbers) rather than the staged copy.
+        // Diagnostics for a staged default app must point at the user's real
+        // file (and its real line numbers) rather than the staged copy; the
+        // mapping also pins the stable synthetic package identities.
         build_env.setSyntheticRootSourceMappingWithLineOffset(
             mapping.original_path,
             mapping.original_source,
             default_app_run_header.len,
             countNewlines(default_app_run_header),
         );
-    }
-    if (enable_checked_cache) {
-        try build_env.enableDefaultCacheManager(false);
     }
 
     const display_path = if (synthetic_default_app) |mapping| mapping.original_path else roc_file_path;
@@ -6091,14 +6148,11 @@ fn discoverAndAddBundleModules(
     };
     defer ctx.gpa.free(abs_entry);
 
-    // Create a BuildEnv to parse headers and discover modules via the Coordinator
-    const cwd = try std.Io.Dir.cwd().realPathFileAlloc(ctx.io.std_io, ".", ctx.gpa);
-    defer ctx.gpa.free(cwd);
-    var build_env = try BuildEnv.init(ctx.gpa, .single_threaded, 1, RocTarget.detectNative(), cwd, ctx.io.std_io);
+    // Create a BuildEnv to parse headers and discover modules via the
+    // Coordinator. Bundling compiles the workspace to discover transitive
+    // modules; it uses the checked-module cache like every other pipeline.
+    var build_env = try initCliBuildEnv(ctx, .{ .max_threads = 1 });
     defer build_env.deinit();
-    // Bundling compiles the workspace to discover transitive modules; it uses
-    // the checked-module cache like every other pipeline.
-    try build_env.enableDefaultCacheManager(false);
 
     // Run the build — the Coordinator discovers all transitive module dependencies
     build_env.build(abs_entry) catch {
@@ -6149,7 +6203,7 @@ fn discoverAndAddBundleModules(
                 if (!build_env.isBundleableModule(pkg_entry.key_ptr.*, abs_path)) continue;
                 if (bundled_set.contains(abs_path)) continue;
 
-                const rel_path = std.fs.path.relative(ctx.arena, cwd, null, cwd, abs_path) catch {
+                const rel_path = std.fs.path.relative(ctx.arena, build_env.cwd, null, build_env.cwd, abs_path) catch {
                     try stderr.print("Error: Discovered module path is outside the current directory and cannot be bundled: {s}\n", .{abs_path});
                     return error.MissingBundleFiles;
                 };
@@ -7963,28 +8017,23 @@ fn rocBuildLlvm(ctx: *CliCtx, args: cli_args.BuildArgs) CliMainError!void {
     else
         try base.module_path.getModuleNameAlloc(ctx.arena, args.path);
 
-    const thread_count, const mode = resolveThreadDefaults(args.max_threads);
-
-    const cwd = try std.fs.path.resolve(ctx.gpa, &.{"."});
-    defer ctx.gpa.free(cwd);
-    var build_env = try BuildEnv.init(ctx.gpa, mode, thread_count, RocTarget.detectNative(), cwd, ctx.io.std_io);
-    build_env.setWatchInputTracking(args.watch_inputs_file != null);
-    if (args.source_dir_override) |source_dir| {
-        build_env.setRootSourceDirOverride(source_dir);
-    }
+    var build_env = try initCliBuildEnv(ctx, .{
+        .max_threads = args.max_threads,
+        .no_cache = args.no_cache,
+        .verbose_cache = args.verbose,
+        .resolution_config = resolutionConfigFromLimits(args.resolve_limits),
+        .track_watch_inputs = args.watch_inputs_file != null,
+        .source_dir_override = args.source_dir_override,
+    });
     if (args.synthetic_root_original_path) |original_path| {
         if (args.synthetic_root_original_source) |original_source| {
             build_env.setSyntheticRootSourceMappingWithLineOffset(original_path, original_source, args.synthetic_root_header_len, args.synthetic_root_header_lines);
         }
     }
-    build_env.resolution_config = resolutionConfigFromLimits(args.resolve_limits);
-    build_env.compiler_version = build_options.compiler_version;
     defer build_env.deinit();
     // Registered after build_env.deinit() so it runs first (LIFO), while build_env is still
     // valid: records discovered source inputs for `roc build --watch` on every exit path.
     defer writeBuildWatchInputsOnExit(ctx, args, &build_env);
-
-    if (!args.no_cache) try build_env.enableDefaultCacheManager(args.verbose);
 
     reporter.begin("Resolving Dependencies");
     build_env.discoverDependencies(args.path) catch |err| {
@@ -8283,28 +8332,23 @@ fn rocBuildNative(ctx: *CliCtx, args: cli_args.BuildArgs) CliMainError!void {
         else => return err,
     };
 
-    const thread_count, const mode = resolveThreadDefaults(args.max_threads);
-
-    const cwd = try std.fs.path.resolve(ctx.gpa, &.{"."});
-    defer ctx.gpa.free(cwd);
-    var build_env = try BuildEnv.init(ctx.gpa, mode, thread_count, RocTarget.detectNative(), cwd, ctx.io.std_io);
-    build_env.setWatchInputTracking(args.watch_inputs_file != null);
-    if (args.source_dir_override) |source_dir| {
-        build_env.setRootSourceDirOverride(source_dir);
-    }
+    var build_env = try initCliBuildEnv(ctx, .{
+        .max_threads = args.max_threads,
+        .no_cache = args.no_cache,
+        .verbose_cache = args.verbose,
+        .resolution_config = resolutionConfigFromLimits(args.resolve_limits),
+        .track_watch_inputs = args.watch_inputs_file != null,
+        .source_dir_override = args.source_dir_override,
+    });
     if (args.synthetic_root_original_path) |original_path| {
         if (args.synthetic_root_original_source) |original_source| {
             build_env.setSyntheticRootSourceMappingWithLineOffset(original_path, original_source, args.synthetic_root_header_len, args.synthetic_root_header_lines);
         }
     }
-    build_env.resolution_config = resolutionConfigFromLimits(args.resolve_limits);
-    build_env.compiler_version = build_options.compiler_version;
     defer build_env.deinit();
     // Registered after build_env.deinit() so it runs first (LIFO), while build_env is still
     // valid: records discovered source inputs for `roc build --watch` on every exit path.
     defer writeBuildWatchInputsOnExit(ctx, args, &build_env);
-
-    if (!args.no_cache) try build_env.enableDefaultCacheManager(args.verbose);
 
     reporter.begin("Resolving Dependencies");
     build_env.discoverDependencies(args.path) catch |err| {
@@ -8613,28 +8657,23 @@ fn rocBuildEmbedded(ctx: *CliCtx, args: cli_args.BuildArgs) CliMainError!void {
         else => return err,
     };
 
-    const thread_count, const mode = resolveThreadDefaults(args.max_threads);
-
-    const cwd = try std.fs.path.resolve(ctx.gpa, &.{"."});
-    defer ctx.gpa.free(cwd);
-    var build_env = try BuildEnv.init(ctx.gpa, mode, thread_count, RocTarget.detectNative(), cwd, ctx.io.std_io);
-    build_env.setWatchInputTracking(args.watch_inputs_file != null);
-    if (args.source_dir_override) |source_dir| {
-        build_env.setRootSourceDirOverride(source_dir);
-    }
+    var build_env = try initCliBuildEnv(ctx, .{
+        .max_threads = args.max_threads,
+        .no_cache = args.no_cache,
+        .verbose_cache = args.verbose,
+        .resolution_config = resolutionConfigFromLimits(args.resolve_limits),
+        .track_watch_inputs = args.watch_inputs_file != null,
+        .source_dir_override = args.source_dir_override,
+    });
     if (args.synthetic_root_original_path) |original_path| {
         if (args.synthetic_root_original_source) |original_source| {
             build_env.setSyntheticRootSourceMappingWithLineOffset(original_path, original_source, args.synthetic_root_header_len, args.synthetic_root_header_lines);
         }
     }
-    build_env.resolution_config = resolutionConfigFromLimits(args.resolve_limits);
-    build_env.compiler_version = build_options.compiler_version;
     defer build_env.deinit();
     // Registered after build_env.deinit() so it runs first (LIFO), while build_env is still
     // valid: records discovered source inputs for `roc build --watch` on every exit path.
     defer writeBuildWatchInputsOnExit(ctx, args, &build_env);
-
-    if (!args.no_cache) try build_env.enableDefaultCacheManager(args.verbose);
 
     reporter.begin("Resolving Dependencies");
     build_env.discoverDependencies(args.path) catch |err| {
@@ -11663,40 +11702,16 @@ fn rocTest(ctx: *CliCtx, args: cli_args.TestArgs, arg0: []const u8) RocTestError
     const stdout = ctx.io.stdout();
     const stderr = ctx.io.stderr();
 
-    // Set up cache configuration based on command line args
-    const cache_config = CacheConfig{
-        .enabled = !args.no_cache,
-        .verbose = args.verbose,
-        .roc_ctx = ctx.coreCtx(),
-    };
-
     // --- Normal compilation path ---
 
-    // Determine threading mode and thread count
-    const thread_count, const mode = resolveThreadDefaults(args.max_threads);
-
-    // Initialize BuildEnv for compilation
-    const cwd = std.Io.Dir.cwd().realPathFileAlloc(ctx.io.std_io, ".", ctx.gpa) catch |err| {
-        try stderr.print("Failed to get current working directory: {}\n", .{err});
-        return err;
-    };
-    defer ctx.gpa.free(cwd);
-
-    var build_env = BuildEnv.init(ctx.gpa, mode, thread_count, RocTarget.detectNative(), cwd, ctx.io.std_io) catch |err| {
-        return err;
-    };
-    build_env.setWatchInputTracking(args.watch_inputs_file != null);
-    build_env.resolution_config = resolutionConfigFromLimits(args.resolve_limits);
-    build_env.compiler_version = build_options.compiler_version;
+    var build_env = try initCliBuildEnv(ctx, .{
+        .max_threads = args.max_threads,
+        .no_cache = args.no_cache,
+        .verbose_cache = args.verbose,
+        .resolution_config = resolutionConfigFromLimits(args.resolve_limits),
+        .track_watch_inputs = args.watch_inputs_file != null,
+    });
     defer build_env.deinit();
-
-    // Set up cache manager if caching is enabled
-    if (cache_config.enabled) {
-        build_env.enableDefaultCacheManager(cache_config.verbose) catch |err| {
-            try stderr.print("Failed to create cache manager: {}\n", .{err});
-            return err;
-        };
-    }
 
     var extra_buf: [2][]const u8 = undefined;
     const extra_paths = appendExtraWatchPaths(.{ .test_cmd = args }, &extra_buf);
@@ -13341,34 +13356,18 @@ fn checkFileWithBuildEnvPreserved(
     const trace = tracy.trace(@src());
     defer trace.end();
 
-    // Determine threading mode and thread count
-    // Default to multi-threaded with auto-detected CPU count; use -j1 for single-threaded
-    const thread_count, const mode = resolveThreadDefaults(max_threads);
-
-    const cwd = try std.Io.Dir.cwd().realPathFileAlloc(ctx.io.std_io, ".", ctx.gpa);
-    defer ctx.gpa.free(cwd);
-    var build_env = try BuildEnv.init(ctx.gpa, mode, thread_count, RocTarget.detectNative(), cwd, ctx.io.std_io);
-    build_env.setWatchInputTracking(track_watch_inputs);
-    build_env.resolution_config = resolution_config;
-    if (synthetic_default_app) {
-        // Staged default-app roots and their synthesized platform live in a
-        // per-invocation temp dir; identity must be the stable synthetic one
-        // so cache keys and nominal identity match across runs and pipelines.
-        build_env.setSyntheticRootPackageIdentity();
-        build_env.setSyntheticRootPlatformPackageIdentity();
-    }
-    if (source_dir_override) |source_dir| {
-        build_env.setRootSourceDirOverride(source_dir);
-    }
-    if (isCompilerOwnedBuiltinSourcePath(ctx.gpa, ctx.io.std_io, filepath)) {
-        build_env.setRootModuleRole(.builtin);
-    }
-
-    build_env.compiler_version = build_options.compiler_version;
-    // Note: We do NOT defer build_env.deinit() here because we're returning it
-
-    // Set up cache manager if caching is enabled; BuildEnv.deinit() cleans it up.
-    if (cache_config.enabled) try build_env.enableDefaultCacheManager(cache_config.verbose);
+    // Note: no defer build_env.deinit() here because the env is returned;
+    // the caller owns its lifetime (and the cache manager it carries).
+    var build_env = try initCliBuildEnv(ctx, .{
+        .max_threads = max_threads,
+        .no_cache = !cache_config.enabled,
+        .verbose_cache = cache_config.verbose,
+        .resolution_config = resolution_config,
+        .track_watch_inputs = track_watch_inputs,
+        .synthetic_default_app = synthetic_default_app,
+        .source_dir_override = source_dir_override,
+        .builtin_role_path = filepath,
+    });
 
     buildForCheckWithOptionalMain(&build_env, filepath, main_filepath) catch |err| {
         switch (err) {
@@ -13516,32 +13515,17 @@ fn checkFileWithBuildEnv(
     const trace = tracy.trace(@src());
     defer trace.end();
 
-    const thread_count, const mode = resolveThreadDefaults(max_threads);
-
-    const cwd = try std.Io.Dir.cwd().realPathFileAlloc(ctx.io.std_io, ".", ctx.gpa);
-    defer ctx.gpa.free(cwd);
-    var build_env = try BuildEnv.init(ctx.gpa, mode, thread_count, RocTarget.detectNative(), cwd, ctx.io.std_io);
-    build_env.resolution_config = resolution_config;
-    if (synthetic_default_app) {
-        // Staged default-app roots and their synthesized platform live in a
-        // per-invocation temp dir; identity must be the stable synthetic one
-        // so cache keys and nominal identity match across runs and pipelines.
-        build_env.setSyntheticRootPackageIdentity();
-        build_env.setSyntheticRootPlatformPackageIdentity();
-    }
-    if (source_dir_override) |source_dir| {
-        build_env.setRootSourceDirOverride(source_dir);
-    }
-
-    build_env.compiler_version = build_options.compiler_version;
-    build_env.setPostCheckPublicationMode(.platform_relations);
+    var build_env = try initCliBuildEnv(ctx, .{
+        .max_threads = max_threads,
+        .no_cache = !cache_config.enabled,
+        .verbose_cache = cache_config.verbose,
+        .resolution_config = resolution_config,
+        .source_dir_override = source_dir_override,
+        .synthetic_default_app = synthetic_default_app,
+        .post_check_publication_mode = .platform_relations,
+        .builtin_role_path = filepath,
+    });
     defer build_env.deinit();
-
-    if (cache_config.enabled) try build_env.enableDefaultCacheManager(cache_config.verbose);
-
-    if (isCompilerOwnedBuiltinSourcePath(ctx.gpa, ctx.io.std_io, filepath)) {
-        build_env.setRootModuleRole(.builtin);
-    }
 
     buildForCheckWithOptionalMain(&build_env, filepath, main_filepath) catch |err| {
         switch (err) {
