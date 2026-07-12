@@ -157,8 +157,7 @@ verifiable by diffing `nm` output on the static library before/after.
 
 ## Related projects
 
-- [Complete the Checked Dispatch Evidence
-  Migration](complete-dispatch-evidence-migration.md) — same disease
+- The completed checked-dispatch-evidence migration — same disease
   (hand-synced parallel encodings), different subsystem.
 - [Silent-Drift Guards for Mirrored Semantic
   Pairs](../small/silent-drift-guards.md) — the small-scale companion for

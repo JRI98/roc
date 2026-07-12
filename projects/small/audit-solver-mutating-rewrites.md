@@ -156,6 +156,6 @@ evaluated under that project's own performance criteria.
 
 - [../small/hosted-extern-declared-abi.md](../small/hosted-extern-declared-abi.md)
   — the structural fix that makes the #9966 rewrite non-load-bearing.
-- [../big/complete-dispatch-evidence-migration.md](../big/complete-dispatch-evidence-migration.md)
-  — deletes the biggest consumer of re-derived dispatch facts; fewer
-  places for restamps to corrupt.
+- The completed checked-dispatch-evidence migration — deleted the biggest
+  consumer of re-derived dispatch facts; fewer places for restamps to
+  corrupt.

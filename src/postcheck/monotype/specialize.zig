@@ -46,10 +46,6 @@ pub const Counters = struct {
     specialization_type_digest_cache_misses: u64 = 0,
     specialization_type_digest_nodes_visited: u64 = 0,
     exact_type_checks: u64 = 0,
-    /// Total-dispatch migration audit: requirements still resolved by owner
-    /// derivation instead of checked evidence. Must reach zero before the
-    /// derivation path is deleted.
-    evidence_missing: u64 = 0,
 };
 
 /// Result of reserving or reusing a specialization record.

@@ -151,7 +151,7 @@ and after on a corpus sweep).
 
 ## Related projects
 
-- [../big/complete-dispatch-evidence-migration.md](../big/complete-dispatch-evidence-migration.md)
-  — the postcheck side of the same principle: dispatch facts are consumed
-  from checked evidence, never re-derived. This project is the checker's
-  own consumption of its own evidence.
+- The completed checked-dispatch-evidence migration — the postcheck side
+  of the same principle: dispatch facts are consumed from checked
+  evidence, never re-derived. This project is the checker's own
+  consumption of its own evidence.
