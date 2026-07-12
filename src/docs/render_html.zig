@@ -1886,61 +1886,140 @@ fn validateAnchor(
     try ctx.reportBrokenLink(label, anchor, bracket_offset);
 }
 
-fn tagWillRenderMultiline(tag: DocType.Tag) bool {
-    if (tag.layout == .multiline and tag.args.len > 0) return true;
-    for (tag.args) |arg| {
-        if (docTypeWillRenderMultiline(arg)) return true;
-    }
-    return false;
-}
+const MultilineLayoutSet = struct {
+    values: std.AutoHashMapUnmanaged(*const DocType, void) = .empty,
 
-fn docTypeWillRenderMultiline(doc_type: *const DocType) bool {
-    return switch (doc_type.*) {
-        .type_ref, .type_var, .wildcard, .@"error" => false,
-        .function => |func| blk: {
-            for (func.args) |arg| {
-                if (docTypeWillRenderMultiline(arg)) break :blk true;
+    fn init(gpa: Allocator, root: *const DocType) Allocator.Error!MultilineLayoutSet {
+        const Frame = struct {
+            value: *const DocType,
+            children_visited: bool,
+        };
+
+        var result = MultilineLayoutSet{};
+        errdefer result.deinit(gpa);
+
+        var frames = std.ArrayList(Frame).empty;
+        defer frames.deinit(gpa);
+        try frames.append(gpa, .{ .value = root, .children_visited = false });
+
+        while (frames.pop()) |frame| {
+            if (frame.children_visited) {
+                if (result.nodeIsMultiline(frame.value)) {
+                    try result.values.put(gpa, frame.value, {});
+                }
+                continue;
             }
-            break :blk docTypeWillRenderMultiline(func.ret);
-        },
-        .record => |rec| blk: {
-            if (rec.layout == .multiline and (rec.fields.len > 0 or rec.is_open)) break :blk true;
-            for (rec.fields) |field| {
-                if (docTypeWillRenderMultiline(field.type)) break :blk true;
+
+            try frames.append(gpa, .{ .value = frame.value, .children_visited = true });
+            switch (frame.value.*) {
+                .type_ref, .type_var, .wildcard, .@"error" => {},
+                .function => |func| {
+                    try frames.append(gpa, .{ .value = func.ret, .children_visited = false });
+                    for (func.args) |arg| {
+                        try frames.append(gpa, .{ .value = arg, .children_visited = false });
+                    }
+                },
+                .record => |rec| {
+                    if (rec.ext) |ext| try frames.append(gpa, .{ .value = ext, .children_visited = false });
+                    for (rec.fields) |field| {
+                        try frames.append(gpa, .{ .value = field.type, .children_visited = false });
+                    }
+                },
+                .tag_union => |tu| {
+                    if (tu.ext) |ext| try frames.append(gpa, .{ .value = ext, .children_visited = false });
+                    for (tu.tags) |tag| {
+                        for (tag.args) |arg| {
+                            try frames.append(gpa, .{ .value = arg, .children_visited = false });
+                        }
+                    }
+                },
+                .tuple => |tup| {
+                    for (tup.elems) |elem| {
+                        try frames.append(gpa, .{ .value = elem, .children_visited = false });
+                    }
+                },
+                .apply => |app| {
+                    try frames.append(gpa, .{ .value = app.constructor, .children_visited = false });
+                    for (app.args) |arg| {
+                        try frames.append(gpa, .{ .value = arg, .children_visited = false });
+                    }
+                },
+                .where_clause => |wc| {
+                    try frames.append(gpa, .{ .value = wc.type, .children_visited = false });
+                    for (wc.constraints) |constraint| {
+                        try frames.append(gpa, .{ .value = constraint.signature, .children_visited = false });
+                    }
+                },
             }
-            break :blk if (rec.ext) |ext| docTypeWillRenderMultiline(ext) else false;
-        },
-        .tag_union => |tu| blk: {
-            if (tu.layout == .multiline and (tu.tags.len > 0 or tu.is_open)) break :blk true;
-            for (tu.tags) |tag| {
-                if (tagWillRenderMultiline(tag)) break :blk true;
-            }
-            break :blk if (tu.ext) |ext| docTypeWillRenderMultiline(ext) else false;
-        },
-        .tuple => |tup| blk: {
-            if (tup.layout == .multiline and tup.elems.len > 0) break :blk true;
-            for (tup.elems) |elem| {
-                if (docTypeWillRenderMultiline(elem)) break :blk true;
-            }
-            break :blk false;
-        },
-        .apply => |app| blk: {
-            if (app.layout == .multiline and app.args.len > 0) break :blk true;
-            for (app.args) |arg| {
-                if (docTypeWillRenderMultiline(arg)) break :blk true;
-            }
-            break :blk false;
-        },
-        .where_clause => |wc| blk: {
-            if (wc.layout == .multiline and wc.constraints.len > 0) break :blk true;
-            if (docTypeWillRenderMultiline(wc.type)) break :blk true;
-            for (wc.constraints) |constraint| {
-                if (docTypeWillRenderMultiline(constraint.signature)) break :blk true;
-            }
-            break :blk false;
-        },
-    };
-}
+        }
+
+        return result;
+    }
+
+    fn deinit(self: *MultilineLayoutSet, gpa: Allocator) void {
+        self.values.deinit(gpa);
+    }
+
+    fn contains(self: *const MultilineLayoutSet, value: *const DocType) bool {
+        return self.values.contains(value);
+    }
+
+    fn tagIsMultiline(self: *const MultilineLayoutSet, tag: DocType.Tag) bool {
+        if (tag.layout == .multiline and tag.args.len > 0) return true;
+        for (tag.args) |arg| {
+            if (self.contains(arg)) return true;
+        }
+        return false;
+    }
+
+    fn nodeIsMultiline(self: *const MultilineLayoutSet, value: *const DocType) bool {
+        return switch (value.*) {
+            .type_ref, .type_var, .wildcard, .@"error" => false,
+            .function => |func| blk: {
+                for (func.args) |arg| {
+                    if (self.contains(arg)) break :blk true;
+                }
+                break :blk self.contains(func.ret);
+            },
+            .record => |rec| blk: {
+                if (rec.layout == .multiline and (rec.fields.len > 0 or rec.is_open)) break :blk true;
+                for (rec.fields) |field| {
+                    if (self.contains(field.type)) break :blk true;
+                }
+                break :blk if (rec.ext) |ext| self.contains(ext) else false;
+            },
+            .tag_union => |tu| blk: {
+                if (tu.layout == .multiline and (tu.tags.len > 0 or tu.is_open)) break :blk true;
+                for (tu.tags) |tag| {
+                    if (self.tagIsMultiline(tag)) break :blk true;
+                }
+                break :blk if (tu.ext) |ext| self.contains(ext) else false;
+            },
+            .tuple => |tup| blk: {
+                if (tup.layout == .multiline and tup.elems.len > 0) break :blk true;
+                for (tup.elems) |elem| {
+                    if (self.contains(elem)) break :blk true;
+                }
+                break :blk false;
+            },
+            .apply => |app| blk: {
+                if (app.layout == .multiline and app.args.len > 0) break :blk true;
+                for (app.args) |arg| {
+                    if (self.contains(arg)) break :blk true;
+                }
+                break :blk false;
+            },
+            .where_clause => |wc| blk: {
+                if (wc.layout == .multiline and wc.constraints.len > 0) break :blk true;
+                if (self.contains(wc.type)) break :blk true;
+                for (wc.constraints) |constraint| {
+                    if (self.contains(constraint.signature)) break :blk true;
+                }
+                break :blk false;
+            },
+        };
+    }
+};
 
 fn renderDocTypeHtml(
     w: Writer,
@@ -1964,6 +2043,9 @@ fn renderDocTypeHtml(
         escaped: []const u8,
         type_ref: DocType.TypeRef,
     };
+
+    var multiline_layouts = try MultilineLayoutSet.init(gpa, doc_type);
+    defer multiline_layouts.deinit(gpa);
 
     var frames = std.ArrayList(RenderFrame).empty;
     defer frames.deinit(gpa);
@@ -2030,7 +2112,7 @@ fn renderDocTypeHtml(
                         if (item.needs_parens) try frames.append(gpa, .{ .html = "(" });
                     },
                     .record => |rec| {
-                        const multiline = !ctx.single_line_signatures and docTypeWillRenderMultiline(item.value);
+                        const multiline = !ctx.single_line_signatures and multiline_layouts.contains(item.value);
                         if (multiline) {
                             try frames.append(gpa, .{ .html = "}" });
                             try frames.append(gpa, .{ .indent = item.indent });
@@ -2091,7 +2173,7 @@ fn renderDocTypeHtml(
                         }
                     },
                     .tag_union => |tu| {
-                        const multiline = !ctx.single_line_signatures and docTypeWillRenderMultiline(item.value);
+                        const multiline = !ctx.single_line_signatures and multiline_layouts.contains(item.value);
                         if (multiline) {
                             try frames.append(gpa, .{ .html = "]" });
                             try frames.append(gpa, .{ .indent = item.indent });
@@ -2145,7 +2227,7 @@ fn renderDocTypeHtml(
                     },
                     .tuple => |tup| {
                         try frames.append(gpa, .{ .html = ")" });
-                        const multiline = !ctx.single_line_signatures and docTypeWillRenderMultiline(item.value);
+                        const multiline = !ctx.single_line_signatures and multiline_layouts.contains(item.value);
                         if (multiline) {
                             try frames.append(gpa, .{ .indent = item.indent });
                             var i = tup.elems.len;
@@ -2176,7 +2258,7 @@ fn renderDocTypeHtml(
                     },
                     .apply => |app| {
                         try frames.append(gpa, .{ .html = ")" });
-                        const multiline = !ctx.single_line_signatures and docTypeWillRenderMultiline(item.value);
+                        const multiline = !ctx.single_line_signatures and multiline_layouts.contains(item.value);
                         if (multiline) {
                             try frames.append(gpa, .{ .indent = item.indent });
                             var i = app.args.len;
@@ -2211,7 +2293,7 @@ fn renderDocTypeHtml(
                         } });
                     },
                     .where_clause => |wc| {
-                        const multiline = !ctx.single_line_signatures and docTypeWillRenderMultiline(item.value);
+                        const multiline = !ctx.single_line_signatures and multiline_layouts.contains(item.value);
                         if (!multiline) {
                             // Inline layout keeps the whole where clause on one
                             // line, matching the nowrap search entries.
@@ -2281,7 +2363,7 @@ fn renderDocTypeHtml(
                 }
             },
             .tag => |item| {
-                const multiline = !ctx.single_line_signatures and tagWillRenderMultiline(item.value);
+                const multiline = !ctx.single_line_signatures and multiline_layouts.tagIsMultiline(item.value);
                 if (item.value.args.len > 0) {
                     try frames.append(gpa, .{ .html = ")" });
                     if (multiline) {
