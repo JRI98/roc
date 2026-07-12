@@ -2227,9 +2227,6 @@ fn callLlvmBoolRoot(
     }
     runtime_env.resetObservation();
     runtime_env.resetAllocationTracker();
-    // LLVM and dev code both report an expect-error region through the
-    // host-side wrapper. Clear the thread-local record before each invocation.
-    _ = builtins.dev_wrappers.takeExpectErrRegion();
     var test_context: TestInvocationContext = .{};
 
     const arg_buffer = try zeroedEntrypointArgBufferForLayouts(allocator, layouts, root.arg_layouts);
@@ -2252,11 +2249,16 @@ fn callLlvmBoolRoot(
 
     const outcome: BoolRootEvalOutcome = switch (runtime_env.crashState()) {
         .did_not_crash => .{ .passed = ret_buf[0] != 0 },
-        .crashed => if (builtins.dev_wrappers.takeExpectErrRegion()) |region| .{ .expect_err = .{
-            .message = try copyRuntimeCrashMessage(allocator, &runtime_env),
-            .region_start = region.start,
-            .region_end = region.end,
-        } } else .{ .crashed = try copyRuntimeCrashMessage(allocator, &runtime_env) },
+        .crashed => blk: {
+            if (test_context.expect_err_set != 0) {
+                break :blk .{ .expect_err = .{
+                    .message = try copyRuntimeCrashMessage(allocator, &runtime_env),
+                    .region_start = test_context.expect_err_start,
+                    .region_end = test_context.expect_err_end,
+                } };
+            }
+            break :blk .{ .crashed = try copyRuntimeCrashMessage(allocator, &runtime_env) };
+        },
     };
     errdefer deinitBoolRootEvalOutcome(allocator, outcome);
     const events = try copyRuntimeHostEvents(allocator, &runtime_env);
