@@ -5104,6 +5104,7 @@ const Cloner = struct {
             const values = try self.pass.allocator.alloc(Value, args.len);
             defer self.pass.allocator.free(values);
             const callee_uses = self.pass.plans[raw].used_args;
+            const pending_before = self.pending.items.len;
             for (args, 0..) |arg, index| {
                 values[index] = if (callee_uses[index])
                     try self.cloneExprValueDemandingShape(arg)
@@ -5124,6 +5125,27 @@ const Cloner = struct {
                         .is_cold = call.is_cold,
                     } };
                 }
+            }
+
+            // No specialization matched, so the call stays residual. Reuse the
+            // argument values already produced above instead of re-cloning the
+            // source arguments: a second clone re-descends every argument, so a
+            // nested call chain (e.g. a long `+` sum) would clone each level
+            // twice and expand exponentially with depth. The reuse is exact when
+            // producing the values created no pending bindings, since a plain
+            // re-clone would then also create none and yield the same result.
+            if (self.pending.items.len == pending_before) {
+                const residual_args = try self.pass.allocator.alloc(Ast.ExprId, values.len);
+                defer self.pass.allocator.free(residual_args);
+                for (values, 0..) |value, index| {
+                    residual_args[index] = try self.materialize(value);
+                }
+                return .{ .call_proc = .{
+                    .callee = call.callee,
+                    .args = try self.pass.program.addExprSpan(residual_args),
+                    .captures = try self.cloneCaptureOperandSpan(call.captures),
+                    .is_cold = call.is_cold,
+                } };
             }
         }
         return .{ .call_proc = .{
