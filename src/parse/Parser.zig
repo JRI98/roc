@@ -2650,6 +2650,7 @@ const TypeRecordState = struct {
 const TypeRecordExtState = struct {
     start: Token.Idx,
     scratch_top: u32,
+    double_dot: Token.Idx,
     looking_for_args: TyFnArgs,
 };
 
@@ -2672,6 +2673,7 @@ const TypeTagUnionState = struct {
 const TypeTagUnionExtState = struct {
     start: Token.Idx,
     scratch_top: u32,
+    double_dot: Token.Idx,
     looking_for_args: TyFnArgs,
 };
 
@@ -4564,7 +4566,10 @@ fn runExprStatementKernel(
                         type_record_state = .{
                             .start = state.start,
                             .scratch_top = state.scratch_top,
-                            .ext = .{ .named = .{ .anno = completed, .region = anno_region } },
+                            .ext = .{ .named = .{ .anno = completed, .region = .{
+                                .start = state.double_dot,
+                                .end = anno_region.end,
+                            } } },
                             .looking_for_args = state.looking_for_args,
                         };
                         continue :expr_kernel .type_record_finish;
@@ -4605,7 +4610,10 @@ fn runExprStatementKernel(
                         type_tag_union_state = .{
                             .start = state.start,
                             .scratch_top = state.scratch_top,
-                            .ext = .{ .named = .{ .anno = completed, .region = anno_region } },
+                            .ext = .{ .named = .{ .anno = completed, .region = .{
+                                .start = state.double_dot,
+                                .end = anno_region.end,
+                            } } },
                             .looking_for_args = state.looking_for_args,
                         };
                         continue :expr_kernel .type_tag_union_finish;
@@ -4849,6 +4857,7 @@ fn runExprStatementKernel(
                     try open_syntax.pushType(open_allocator, .type_record_ext, TypeRecordExtState, .{
                         .start = type_record_state.start,
                         .scratch_top = type_record_state.scratch_top,
+                        .double_dot = double_dot_start,
                         .looking_for_args = type_record_state.looking_for_args,
                     });
                     type_args = .looking_for_args;
@@ -4932,6 +4941,7 @@ fn runExprStatementKernel(
                     try open_syntax.pushType(open_allocator, .type_tag_union_ext, TypeTagUnionExtState, .{
                         .start = type_tag_union_state.start,
                         .scratch_top = type_tag_union_state.scratch_top,
+                        .double_dot = double_dot_pos,
                         .looking_for_args = type_tag_union_state.looking_for_args,
                     });
                     type_args = .looking_for_args;

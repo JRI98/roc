@@ -1054,6 +1054,10 @@ const Formatter = struct {
                     try fmt.pushIndent();
                 }
                 try fmt.pushAll("..");
+                const anno_region = fmt.nodeRegion(@intFromEnum(named.anno));
+                if (try fmt.flushCommentsBefore(anno_region.start)) {
+                    try fmt.pushIndent();
+                }
                 try fmt.formatTypeAnnoDiscard(named.anno);
             },
             .open => |tok| {
@@ -2892,7 +2896,13 @@ const Formatter = struct {
                         }
                         try fmt.pushAll("..");
                         switch (t.ext) {
-                            .named => |named| try fmt.formatTypeAnnoDiscard(named.anno),
+                            .named => |named| {
+                                const anno_region = fmt.nodeRegion(@intFromEnum(named.anno));
+                                if (try fmt.flushCommentsBefore(anno_region.start)) {
+                                    try fmt.pushIndent();
+                                }
+                                try fmt.formatTypeAnnoDiscard(named.anno);
+                            },
                             .open => {},
                             .closed => unreachable,
                         }
