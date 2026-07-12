@@ -78,7 +78,7 @@ pub fn regionIsMultiline(self: *AST, region: TokenizedRegion) bool {
                 const after_bar = tags[i + 2];
                 // If what follows is a lambda parameter, the bar is opening (not a trailing comma)
                 const is_opening_bar = switch (after_bar) {
-                    .LowerIdent, .UpperIdent, .Underscore, .OpenRound, .OpenSquare, .OpenCurly => true,
+                    .LowerIdent, .UpperIdent, .Underscore, .OpenRound, .OpenSquare, .OpenCurly, .OpBar => true,
                     else => false,
                 };
                 if (!is_opening_bar) {
