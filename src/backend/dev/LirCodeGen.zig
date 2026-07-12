@@ -260,6 +260,7 @@ pub const BuiltinFn = enum {
     erased_callable_incref,
     erased_callable_decref,
     erased_callable_decref_single_thread,
+    erased_callable_repack,
     erased_callable_free,
     hot_reload_enter,
     hot_reload_leave,
@@ -414,6 +415,7 @@ pub const BuiltinFn = enum {
             .erased_callable_incref => "roc_builtins_erased_callable_incref",
             .erased_callable_decref => "roc_builtins_erased_callable_decref",
             .erased_callable_decref_single_thread => "roc_builtins_erased_callable_decref_single_thread",
+            .erased_callable_repack => "roc_builtins_erased_callable_repack",
             .erased_callable_free => "roc_builtins_erased_callable_free",
             .hot_reload_enter => "roc_builtins_hot_reload_enter",
             .hot_reload_leave => "roc_builtins_hot_reload_leave",
@@ -6266,6 +6268,9 @@ pub fn LirCodeGen(comptime target: RocTarget) type {
                         if (assign.capture) |capture| {
                             try locals.put(localKey(capture), capture);
                         }
+                        if (assign.reuse) |reuse| {
+                            try locals.put(localKey(reuse), reuse);
+                        }
                         try stack.append(sa, assign.next);
                     },
                     .assign_low_level => |assign| {
@@ -6439,6 +6444,7 @@ pub fn LirCodeGen(comptime target: RocTarget) type {
                     .assign_packed_erased_fn => |assign| {
                         try locals.put(localKey(assign.target), assign.target);
                         if (assign.capture) |capture| try locals.put(localKey(capture), capture);
+                        if (assign.reuse) |reuse| try locals.put(localKey(reuse), reuse);
                         try stack.append(sa, assign.next);
                     },
                     .assign_low_level => |assign| {
@@ -11763,6 +11769,8 @@ pub fn LirCodeGen(comptime target: RocTarget) type {
             target_layout: layout.Idx,
             capture_layout: ?layout.Idx,
             on_drop: lir.LIR.ErasedCallableOnDrop,
+            reuse: ?LocalId,
+            reuse_unique: bool,
         ) Allocator.Error!ValueLocation {
             const target_layout_val = self.layout_store.getLayout(target_layout);
             if (builtin.mode == .Debug and target_layout_val.tag != .erased_callable) {
@@ -11791,8 +11799,140 @@ pub fn LirCodeGen(comptime target: RocTarget) type {
                 builtins.erased_callable.hot_reload_capture_prefix_size
             else
                 0;
-            const payload_size = builtins.erased_callable.payloadSize(capture_prefix_size + capture_size);
             const roc_ops_reg = self.roc_ops_reg orelse unreachable;
+
+            if (reuse) |reuse_local| {
+                // The statement consumes `reuse_local` (an existing boxed erased
+                // callable of identical payload shape) and no separate decref is
+                // emitted for it: releasing the old allocation is the repack's
+                // job. Assemble the replacement payload's capture image (the
+                // hot-reload prefix, when present, followed by the Roc capture
+                // bytes) in a scratch buffer, then hand the old pointer plus that
+                // image to the repack builtin. The builtin reuses the old
+                // allocation in place when uniqueness permits (running the old
+                // capture's drop callback first) and otherwise allocates a fresh
+                // payload and decrefs the shared old one.
+                const total_capture_size: u32 = capture_prefix_size + capture_size;
+                const capture_src_slot: i32 = if (total_capture_size == 0)
+                    0
+                else
+                    self.codegen.allocStackSlot(total_capture_size);
+
+                if (self.enable_hot_reload) {
+                    var builder = try Builder.init(&self.codegen.emit, &self.codegen.stack_offset);
+                    try builder.addRegArg(roc_ops_reg);
+                    try self.callBuiltin(
+                        &builder,
+                        @intFromPtr(&dev_wrappers.roc_builtins_hot_reload_retain_current),
+                        .hot_reload_retain_current,
+                    );
+                    try self.emitStore(
+                        .w64,
+                        frame_ptr,
+                        capture_src_slot + @as(i32, @intCast(@offsetOf(builtins.erased_callable.HotReloadCaptureHeader, "code_ref"))),
+                        ret_reg_0,
+                    );
+
+                    const original_on_drop_reg = try self.materializeErasedCallableOnDrop(on_drop);
+                    try self.emitStore(
+                        .w64,
+                        frame_ptr,
+                        capture_src_slot + @as(i32, @intCast(@offsetOf(builtins.erased_callable.HotReloadCaptureHeader, "original_on_drop"))),
+                        original_on_drop_reg,
+                    );
+                    self.codegen.freeGeneral(original_on_drop_reg);
+                }
+
+                if (capture) |capture_local| {
+                    const layout_idx = capture_layout orelse unreachable;
+                    if (capture_size > 0) {
+                        const capture_loc = self.requireExactValueLocationToLayout(
+                            try self.emitValueLocal(capture_local),
+                            self.localLayout(capture_local),
+                            layout_idx,
+                            "packed_erased_fn.capture",
+                        );
+                        const capture_stack = try self.ensureOnStack(capture_loc, capture_size);
+                        const temp = try self.allocTempGeneral();
+                        try self.copyChunked(
+                            temp,
+                            frame_ptr,
+                            capture_stack,
+                            frame_ptr,
+                            capture_src_slot + @as(i32, @intCast(capture_prefix_size)),
+                            capture_size,
+                        );
+                        self.codegen.freeGeneral(temp);
+                    }
+                }
+
+                const proc_addr_slot = self.codegen.allocStackSlot(8);
+                {
+                    const proc_addr = try self.allocTempGeneral();
+                    const proc = self.proc_registry.get(@intFromEnum(proc_id)) orelse unreachable;
+                    if (proc.code_start == unresolved_proc_code_start)
+                        try self.emitPendingProcAddress(proc_id, proc_addr)
+                    else
+                        try self.emitInternalCodeAddress(proc.code_start, proc_addr);
+                    try self.emitStore(.w64, frame_ptr, proc_addr_slot, proc_addr);
+                    self.codegen.freeGeneral(proc_addr);
+                }
+
+                // The repack's stored drop callback is the hot-reload shim when
+                // hot reloading (the real drop lives in the prefix above),
+                // otherwise the statement's own drop callback.
+                const on_drop_slot = self.codegen.allocStackSlot(8);
+                {
+                    const on_drop_reg = if (self.enable_hot_reload) blk: {
+                        const reg = try self.allocTempGeneral();
+                        try self.emitBuiltinAddress(
+                            reg,
+                            @intFromPtr(&dev_wrappers.roc_builtins_hot_reload_erased_callable_drop),
+                            .hot_reload_erased_callable_drop,
+                        );
+                        break :blk reg;
+                    } else try self.materializeErasedCallableOnDrop(on_drop);
+                    try self.emitStore(.w64, frame_ptr, on_drop_slot, on_drop_reg);
+                    self.codegen.freeGeneral(on_drop_reg);
+                }
+
+                const reuse_ptr_slot = self.codegen.allocStackSlot(8);
+                {
+                    const reuse_loc = try self.emitValueLocal(reuse_local);
+                    const reuse_reg = try self.ensureInGeneralReg(reuse_loc);
+                    try self.emitStore(.w64, frame_ptr, reuse_ptr_slot, reuse_reg);
+                    self.codegen.freeGeneral(reuse_reg);
+                }
+
+                const update_mode = if (reuse_unique)
+                    builtins.utils.UpdateMode.InPlace
+                else
+                    builtins.utils.UpdateMode.Immutable;
+
+                {
+                    var builder = try Builder.init(&self.codegen.emit, &self.codegen.stack_offset);
+                    try builder.addMemArg(frame_ptr, reuse_ptr_slot);
+                    try builder.addMemArg(frame_ptr, proc_addr_slot);
+                    try builder.addMemArg(frame_ptr, on_drop_slot);
+                    if (total_capture_size == 0)
+                        try builder.addImmArg(0)
+                    else
+                        try builder.addLeaArg(frame_ptr, capture_src_slot);
+                    try builder.addImmArg(@intCast(total_capture_size));
+                    try builder.addImmArg(@intFromEnum(update_mode));
+                    try builder.addRegArg(roc_ops_reg);
+                    try self.callBuiltin(
+                        &builder,
+                        @intFromPtr(&dev_wrappers.roc_builtins_erased_callable_repack),
+                        .erased_callable_repack,
+                    );
+                }
+                const heap_ptr = try self.allocTempGeneral();
+                try self.codegen.emit.movRegReg(.w64, heap_ptr, ret_reg_0);
+                return .{ .general_reg = heap_ptr };
+            }
+
+            const payload_size = builtins.erased_callable.payloadSize(capture_prefix_size + capture_size);
             const heap_ptr_slot: i32 = self.codegen.allocStackSlot(8);
 
             {
@@ -15808,6 +15948,8 @@ pub fn LirCodeGen(comptime target: RocTarget) type {
                                 self.localLayout(assign.target),
                                 assign.capture_layout,
                                 assign.on_drop,
+                                assign.reuse,
+                                assign.reuse_unique,
                             );
                             try self.bindAssignedLocal(assign.target, value_loc);
                             try work.append(wa, .{ .node = assign.next });
