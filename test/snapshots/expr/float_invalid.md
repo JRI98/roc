@@ -8,7 +8,7 @@ type=expr
 3.14.15
 ~~~
 # EXPECTED
-TYPE MISMATCH - float_invalid.md:1:1:1:8
+INVALID TUPLE ACCESS - float_invalid.md:1:1:1:8
 # PROBLEMS
 
 ┌──────────────────────┐

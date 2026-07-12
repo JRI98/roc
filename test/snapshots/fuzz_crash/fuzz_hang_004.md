@@ -9,7 +9,11 @@ source_escapes=true
 s={match 0{[]=>[][]=>{{()}{}.70000}}}a=||{}
 ~~~
 # EXPECTED
-NIL
+EMPTY TUPLE NOT ALLOWED - fuzz_hang_004.md:1:24:1:26
+TYPE MISMATCH - fuzz_hang_004.md:1:10:1:11
+INVALID TUPLE ACCESS - fuzz_hang_004.md:1:27:1:35
+REDUNDANT PATTERN - fuzz_hang_004.md:1:4:1:37
+NON EXHAUSTIVE MATCH - fuzz_hang_004.md:1:4:1:37
 # PROBLEMS
 
 ┌─────────────────────────┐

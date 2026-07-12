@@ -10,7 +10,7 @@ T := [].{
 }
 ~~~
 # EXPECTED
-NIL
+MISSING NESTED TYPE - fuzz_crash_096.md:2:6:2:9
 # PROBLEMS
 
 ┌─────────────────────┐

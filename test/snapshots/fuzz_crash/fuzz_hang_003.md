@@ -12,7 +12,10 @@ b:F
 b=G.70000c:c=0
 ~~~
 # EXPECTED
-NIL
+UNEXPECTED STATEMENT - fuzz_hang_003.md:4:4:4:11
+UNEXPECTED STATEMENT - fuzz_hang_003.md:4:11:4:12
+UNDECLARED TYPE - fuzz_hang_003.md:1:3:1:4
+UNDECLARED TYPE - fuzz_hang_003.md:3:3:3:4
 # PROBLEMS
 
 ┌──────────────────────┐

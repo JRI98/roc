@@ -8,7 +8,7 @@ type=expr
 I.5
 ~~~
 # EXPECTED
-TYPE MISMATCH - module_dot_tuple.md:1:1:1:4
+INVALID TUPLE ACCESS - module_dot_tuple.md:1:1:1:4
 # PROBLEMS
 
 ┌──────────────────────┐
