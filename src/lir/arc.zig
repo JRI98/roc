@@ -1231,11 +1231,14 @@ const Inserter = struct {
                     return;
                 },
                 .jump => |jump_stmt| {
-                    const keep = keepForJoin(path.options.join_keeps, jump_stmt.target) orelse
-                        arcInvariant("ARC jump reached a join without an active ownership target");
-                    if (comptime differential_liveness) self.assertJumpKeepMatches(jump_stmt.target, keep);
+                    const summary = self.solveSummaryOf(jump_stmt.target);
+                    if (comptime differential_liveness) {
+                        const keep = keepForJoin(path.options.join_keeps, jump_stmt.target) orelse
+                            arcInvariant("ARC jump reached a join without an active ownership target");
+                        self.assertJumpKeepMatches(jump_stmt.target, keep);
+                    }
                     const jump = try self.store.addCFStmt(.{ .jump = .{ .target = jump_stmt.target } });
-                    const tail = try self.releaseDifference(&path.owned, keep, jump);
+                    const tail = try self.releaseDifference(&path.owned, &summary.body_keep, jump);
                     path.result.* = try self.finishLinearRewrite(&path.frames, tail);
                     self.destroyRewritePath(path);
                     return;
@@ -1573,10 +1576,30 @@ const Inserter = struct {
             }
         }
 
+        const summary = self.solveSummaryOf(join_stmt.id);
+        if (comptime differential_liveness) {
+            var old_reachable = false;
+            var old_entry = try self.joinEntryOwnedSet(&path.owned, join_stmt.remainder);
+            defer old_entry.deinit();
+            var old_body = try self.joinBodyOwnedSet(
+                &path.owned,
+                join_stmt.id,
+                join_stmt.params,
+                join_stmt.maybe_uninitialized_params,
+                join_stmt.remainder,
+                join_stmt.body,
+                &old_reachable,
+            );
+            defer old_body.deinit();
+            var old_carried = try old_body.clone();
+            defer old_carried.deinit();
+            old_carried.intersect(&path.owned);
+            old_entry.unionWith(&old_carried);
+            self.assertJoinSummaryMatches(join_stmt.id, &path.owned, &old_entry, &old_body, old_reachable);
+        }
         const state = try self.store.allocator.create(RewriteJoinTask);
         var queued = false;
         errdefer if (!queued) self.store.allocator.destroy(state);
-        var body_reachable = false;
         state.* = .{
             .start = start,
             .id = join_stmt.id,
@@ -1585,29 +1608,13 @@ const Inserter = struct {
             .maybe_uninitialized_conditions = join_stmt.maybe_uninitialized_conditions,
             .maybe_uninitialized_condition_masks = join_stmt.maybe_uninitialized_condition_masks,
             .incoming_owned = try path.owned.clone(),
-            .entry_keep = try self.joinEntryOwnedSet(&path.owned, join_stmt.remainder),
-            .body_keep = try self.joinBodyOwnedSet(
-                &path.owned,
-                join_stmt.id,
-                join_stmt.params,
-                join_stmt.maybe_uninitialized_params,
-                join_stmt.remainder,
-                join_stmt.body,
-                &body_reachable,
-            ),
-            .body_reachable = body_reachable,
-            .loop_keep_id = self.next_loop_keep_id,
+            .entry_keep = try cloneOwnedSetWith(self.store.allocator, &summary.entry_keep),
+            .body_keep = try cloneOwnedSetWith(self.store.allocator, &summary.body_keep),
+            .body_reachable = summary.body_reachable,
+            .loop_keep_id = summary.loop_keep_id,
             .frames = takeRewriteFrames(path),
             .result = path.result,
         };
-        self.next_loop_keep_id += 1;
-        var carried_body_keep = try state.body_keep.clone();
-        defer carried_body_keep.deinit();
-        carried_body_keep.intersect(&state.incoming_owned);
-        state.entry_keep.unionWith(&carried_body_keep);
-        if (comptime differential_liveness) {
-            self.assertJoinSummaryMatches(join_stmt.id, &path.owned, &state.entry_keep, &state.body_keep, state.body_reachable);
-        }
         errdefer if (!queued) state.incoming_owned.deinit();
         errdefer if (!queued) state.entry_keep.deinit();
         errdefer if (!queued) state.body_keep.deinit();
@@ -1679,30 +1686,36 @@ const Inserter = struct {
         switch_stmt: anytype,
     ) ResourceError!void {
         if (switch_stmt.continuation) |continuation| {
-            var exit_states = std.ArrayList(OwnedSet).empty;
-            defer {
-                for (exit_states.items) |*state| state.deinit();
-                exit_states.deinit(self.store.allocator);
+            const summaries = self.switch_summaries orelse arcInvariant("ARC rewrite ran without switch summaries");
+            const summary = summaries.get(start) orelse arcInvariant("ARC rewrite reached a switch without a summary");
+
+            if (comptime differential_liveness) {
+                var exit_states = std.ArrayList(OwnedSet).empty;
+                defer {
+                    for (exit_states.items) |*state| state.deinit();
+                    exit_states.deinit(self.store.allocator);
+                }
+                const branches = self.store.getCFSwitchBranches(switch_stmt.branches);
+                for (0..GuardedList.borrowLen(branches)) |branch_index| {
+                    const branch = GuardedList.at(branches, branch_index);
+                    try self.analyzeUntil(branch.body, &path.owned, continuation, &exit_states, path.options.loop_keep);
+                }
+                try self.analyzeUntil(switch_stmt.default_branch, &path.owned, continuation, &exit_states, path.options.loop_keep);
+                if (exit_states.items.len == 0) {
+                    self.assertSwitchSummaryMatches(start, null);
+                } else {
+                    var common = try exit_states.items[0].clone();
+                    defer common.deinit();
+                    for (exit_states.items[1..]) |*state| common.intersect(state);
+                    self.assertSwitchSummaryMatches(start, &common);
+                }
             }
 
-            const branches = self.store.getCFSwitchBranches(switch_stmt.branches);
-            for (0..GuardedList.borrowLen(branches)) |branch_index| {
-                const branch = GuardedList.at(branches, branch_index);
-                try self.analyzeUntil(branch.body, &path.owned, continuation, &exit_states, path.options.loop_keep);
-            }
-            try self.analyzeUntil(switch_stmt.default_branch, &path.owned, continuation, &exit_states, path.options.loop_keep);
-
-            if (exit_states.items.len == 0) {
-                if (comptime differential_liveness) self.assertSwitchSummaryMatches(start, null);
+            if (!summary.reached) {
                 try self.scheduleRewriteSwitchNoContinuation(tasks, path, start, switch_stmt.cond, switch_stmt.branches, switch_stmt.default_branch, switch_stmt.default_is_cold, switch_stmt.continuation);
                 return;
             }
-
-            var common = try exit_states.items[0].clone();
-            defer common.deinit();
-            for (exit_states.items[1..]) |*state| common.intersect(state);
-            if (comptime differential_liveness) self.assertSwitchSummaryMatches(start, &common);
-            try self.scheduleRewriteSwitchContinuation(tasks, path, start, switch_stmt.cond, switch_stmt.branches, switch_stmt.default_is_cold, continuation, &common);
+            try self.scheduleRewriteSwitchContinuation(tasks, path, start, switch_stmt.cond, switch_stmt.branches, switch_stmt.default_is_cold, continuation, &summary.common);
             return;
         }
 
