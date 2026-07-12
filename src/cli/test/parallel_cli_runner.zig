@@ -2466,13 +2466,20 @@ const NativeMuslTarget = struct {
     roc_target: []const u8,
     zig_target: []const u8,
     rust_target: []const u8,
+    /// Whether the C glue host must bundle compiler_rt into `libhost.a`.
+    /// Only aarch64 needs it: its `long double` is IEEE-128, so musl's
+    /// `libc.a` references f128 soft-float libcalls (`__addtf3`, ...) that the
+    /// final `-nostdlib -static` link would otherwise leave undefined. x86_64
+    /// `long double` is 80-bit x87, so those libcalls never appear and the
+    /// host object links cleanly on its own. See `compileGlueRuntimeCHost`.
+    c_host_needs_compiler_rt: bool,
 };
 
 fn nativeMuslTarget() ?NativeMuslTarget {
     if (builtin.os.tag != .linux) return null;
     return switch (builtin.cpu.arch) {
-        .x86_64 => .{ .roc_target = "x64musl", .zig_target = "x86_64-linux-musl", .rust_target = "x86_64-unknown-linux-musl" },
-        .aarch64 => .{ .roc_target = "arm64musl", .zig_target = "aarch64-linux-musl", .rust_target = "aarch64-unknown-linux-musl" },
+        .x86_64 => .{ .roc_target = "x64musl", .zig_target = "x86_64-linux-musl", .rust_target = "x86_64-unknown-linux-musl", .c_host_needs_compiler_rt = false },
+        .aarch64 => .{ .roc_target = "arm64musl", .zig_target = "aarch64-linux-musl", .rust_target = "aarch64-unknown-linux-musl", .c_host_needs_compiler_rt = true },
         else => null,
     };
 }
@@ -6442,12 +6449,81 @@ fn compileGlueRuntimeCHost(
         host_o_path,
     }, project_root_path, .{ .args = &.{} })) |failure| return failure;
 
+    // `zig cc -c` emits only the host translation unit; unlike the Zig host
+    // (`zig build-obj -fcompiler-rt`) and the Rust host (`rustc --crate-type
+    // staticlib`, which bundles compiler-builtins), it carries no compiler_rt.
+    // roc's final static link (`-nostdlib -static`, adding no compiler_rt) then
+    // leaves the soft-float libcalls that musl's `libc.a` references undefined.
+    // On aarch64 `long double` is IEEE-128, so `vfprintf` pulls in `__addtf3`,
+    // `__extenddftf2`, `__netf2`, ... and the link fails. (On x86_64 `long
+    // double` is 80-bit x87, so those f128 libcalls are never referenced.)
+    //
+    // So the merge is needed only on aarch64. On x86_64 the host object links
+    // cleanly on its own, so we archive it directly — which also matters
+    // because the merge itself is broken there: `zig cc -r` (and the LLD `-r`
+    // it drives) aborts when fed the `-fcompiler-rt` object on x86_64, so
+    // merging would be both pointless and a hard crash.
+    if (!target.c_host_needs_compiler_rt) {
+        if (runRawAndCheck(io, allocator, env, timer, timeout_ms, &.{
+            "zig",
+            "ar",
+            "rcs",
+            host_lib_path,
+            host_o_path,
+        }, project_root_path, .{ .args = &.{} })) |failure| return failure;
+
+        return null;
+    }
+
+    // aarch64: merge a compiler_rt object into the host object so `libhost.a`
+    // is self-contained, exactly like the Zig host. A separate archive member
+    // would not suffice: `libhost.a` is linked before `libc.a` (and lazily for
+    // symbol-ABI hosts), so its compiler_rt member would never be pulled to
+    // satisfy `libc.a`'s later references.
+    const target_dir = std.fs.path.dirname(host_o_path) orelse project_root_path;
+    const compiler_rt_root_path = std.fs.path.join(allocator, &.{ target_dir, "compiler_rt_root.zig" }) catch |err|
+        return customInfraFailure(allocator, timer, "failed to allocate glue runtime compiler_rt root path: {}", .{err});
+    const compiler_rt_o_path = std.fs.path.join(allocator, &.{ target_dir, "compiler_rt.o" }) catch |err|
+        return customInfraFailure(allocator, timer, "failed to allocate glue runtime compiler_rt object path: {}", .{err});
+    const host_combined_o_path = std.fs.path.join(allocator, &.{ target_dir, "host_combined.o" }) catch |err|
+        return customInfraFailure(allocator, timer, "failed to allocate glue runtime combined host object path: {}", .{err});
+
+    // An empty root module is enough: `-fcompiler-rt` emits the full compiler_rt
+    // (as weak symbols) regardless of what the module itself references.
+    std.Io.Dir.cwd().writeFile(io, .{ .sub_path = compiler_rt_root_path, .data = "" }) catch |err|
+        return customInfraFailure(allocator, timer, "failed to write glue runtime compiler_rt root: {}", .{err});
+    const compiler_rt_emit_flag = std.fmt.allocPrint(allocator, "-femit-bin={s}", .{compiler_rt_o_path}) catch |err|
+        return customInfraFailure(allocator, timer, "failed to allocate glue runtime compiler_rt emit flag: {}", .{err});
+    if (runRawAndCheck(io, allocator, env, timer, timeout_ms, &.{
+        "zig",
+        "build-obj",
+        "-target",
+        target.zig_target,
+        "-fcompiler-rt",
+        compiler_rt_root_path,
+        compiler_rt_emit_flag,
+    }, project_root_path, .{ .args = &.{} })) |failure| return failure;
+
+    // Relocatable-link the host object and compiler_rt into a single object so
+    // one `libhost.a` member carries both.
+    if (runRawAndCheck(io, allocator, env, timer, timeout_ms, &.{
+        "zig",
+        "cc",
+        "-target",
+        target.zig_target,
+        "-r",
+        host_o_path,
+        compiler_rt_o_path,
+        "-o",
+        host_combined_o_path,
+    }, project_root_path, .{ .args = &.{} })) |failure| return failure;
+
     if (runRawAndCheck(io, allocator, env, timer, timeout_ms, &.{
         "zig",
         "ar",
         "rcs",
         host_lib_path,
-        host_o_path,
+        host_combined_o_path,
     }, project_root_path, .{ .args = &.{} })) |failure| return failure;
 
     return null;
@@ -6581,6 +6657,100 @@ fn compileGlueRuntimeRustHost(
     return null;
 }
 
+/// Whether the file at `path` is a WebAssembly object (magic "\x00asm").
+/// Used to tell real wasm archive members apart from the host-arch ELF
+/// objects rustc mixes into the wasm32 `rust-std`. Any open/read failure
+/// reads as "not wasm" so a bad member is dropped rather than force-linked.
+fn fileHasWasmMagic(io: std.Io, path: []const u8) bool {
+    var file = std.Io.Dir.cwd().openFile(io, path, .{ .mode = .read_only }) catch return false;
+    defer file.close(io);
+    var magic: [4]u8 = undefined;
+    const bytes_read = file.readPositionalAll(io, &magic, 0) catch return false;
+    return bytes_read == magic.len and std.mem.eql(u8, &magic, "\x00asm");
+}
+
+/// Rebuild `staticlib_path` into `out_path` keeping only its real wasm object
+/// members. rustc's precompiled `wasm32-unknown-unknown` `rust-std` bundles
+/// some compiler_builtins intrinsics as host-arch (x86_64) ELF objects rather
+/// than wasm; `wasm-ld --whole-archive` force-includes every member and aborts
+/// on those ("Bitcode section not found in object file"). The dropped
+/// intrinsics are unreferenced by the glue contract apps — if a future app
+/// needed one, the final wasm link would report it undefined rather than
+/// miscompile.
+fn rebuildWasmOnlyArchive(
+    io: std.Io,
+    allocator: Allocator,
+    env: *const CaseEnv,
+    timer: *harness.Timer,
+    timeout_ms: u64,
+    staticlib_path: []const u8,
+    out_path: []const u8,
+) ?TestResult {
+    const extract_dir = std.fmt.allocPrint(allocator, "{s}.members", .{out_path}) catch |err|
+        return customInfraFailure(allocator, timer, "failed to allocate glue runtime wasm member dir: {}", .{err});
+    std.Io.Dir.cwd().createDirPath(io, extract_dir) catch |err|
+        return customInfraFailure(allocator, timer, "failed to create glue runtime wasm member dir: {}", .{err});
+
+    if (runRawAndCheck(io, allocator, env, timer, timeout_ms, &.{
+        "zig",
+        "ar",
+        "x",
+        "--output",
+        extract_dir,
+        staticlib_path,
+    }, project_root_path, .{ .args = &.{} })) |failure| return failure;
+
+    var members: std.ArrayListUnmanaged([]const u8) = .empty;
+    {
+        var dir = std.Io.Dir.cwd().openDir(io, extract_dir, .{ .iterate = true }) catch |err|
+            return customInfraFailure(allocator, timer, "failed to open glue runtime wasm member dir: {}", .{err});
+        defer dir.close(io);
+        var walker = dir.walk(allocator) catch |err|
+            return customInfraFailure(allocator, timer, "failed to walk glue runtime wasm member dir: {}", .{err});
+        defer walker.deinit();
+        while (walker.next(io) catch |err|
+            return customInfraFailure(allocator, timer, "failed to iterate glue runtime wasm member dir: {}", .{err})) |entry|
+        {
+            if (entry.kind != .file) continue;
+            // path.join returns a fresh allocation, so it outlives the walker's
+            // transient entry buffer.
+            const member_path = std.fs.path.join(allocator, &.{ extract_dir, entry.basename }) catch |err|
+                return customInfraFailure(allocator, timer, "failed to allocate glue runtime wasm member path: {}", .{err});
+            if (!fileHasWasmMagic(io, member_path)) continue;
+            members.append(allocator, member_path) catch |err|
+                return customInfraFailure(allocator, timer, "failed to record glue runtime wasm member: {}", .{err});
+        }
+    }
+
+    if (members.items.len == 0)
+        return customFailure(allocator, timer, "wasm32 Rust host archive had no wasm members after filtering", .{});
+
+    // rustc's wasm32 staticlib fans out into hundreds of object members (~420
+    // here), so `zig ar rcs out member...` would build a multi-tens-of-KB
+    // command line. Windows caps a process command line at 32767 chars, past
+    // which CreateProcessW fails with error.NameTooLong, so pass the members
+    // through an llvm-ar response file (@file) to keep the spawned command
+    // line short. Each path is double-quoted so a directory containing spaces
+    // still parses; members always end in a file name (never a separator), so
+    // no trailing backslash can escape the closing quote under the Windows
+    // response-file tokenizer.
+    const rsp_path = std.fmt.allocPrint(allocator, "{s}.rsp", .{out_path}) catch |err|
+        return customInfraFailure(allocator, timer, "failed to allocate glue runtime wasm archive response path: {}", .{err});
+    var rsp_content: std.ArrayListUnmanaged(u8) = .empty;
+    for (members.items) |member| {
+        rsp_content.print(allocator, "\"{s}\"\n", .{member}) catch |err|
+            return customInfraFailure(allocator, timer, "failed to build glue runtime wasm archive response file: {}", .{err});
+    }
+    std.Io.Dir.cwd().writeFile(io, .{ .sub_path = rsp_path, .data = rsp_content.items }) catch |err|
+        return customInfraFailure(allocator, timer, "failed to write glue runtime wasm archive response file: {}", .{err});
+    const rsp_arg = std.fmt.allocPrint(allocator, "@{s}", .{rsp_path}) catch |err|
+        return customInfraFailure(allocator, timer, "failed to allocate glue runtime wasm archive response arg: {}", .{err});
+
+    if (runRawAndCheck(io, allocator, env, timer, timeout_ms, &.{ "zig", "ar", "rcs", out_path, rsp_arg }, project_root_path, .{ .args = &.{} })) |failure| return failure;
+
+    return null;
+}
+
 fn compileGlueRuntimeRustWasmHost(
     io: std.Io,
     allocator: Allocator,
@@ -6609,12 +6779,18 @@ fn compileGlueRuntimeRustWasmHost(
         host_staticlib_path,
     }, project_root_path, .{ .args = &.{} })) |failure| return failure;
 
+    // Drop the host-arch ELF compiler_builtins objects rustc bundles into the
+    // wasm32 staticlib before the relocatable merge; see rebuildWasmOnlyArchive.
+    const wasm_only_staticlib_path = std.fmt.allocPrint(allocator, "{s}.wasm-only.a", .{host_wasm_path}) catch |err|
+        return customInfraFailure(allocator, timer, "failed to allocate glue runtime wasm-only staticlib path: {}", .{err});
+    if (rebuildWasmOnlyArchive(io, allocator, env, timer, timeout_ms, host_staticlib_path, wasm_only_staticlib_path)) |failure| return failure;
+
     if (runRawAndCheck(io, allocator, env, timer, timeout_ms, &.{
         "zig",
         "wasm-ld",
         "-r",
         "--whole-archive",
-        host_staticlib_path,
+        wasm_only_staticlib_path,
         "-o",
         host_wasm_path,
     }, project_root_path, .{ .args = &.{} })) |failure| return failure;

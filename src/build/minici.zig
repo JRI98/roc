@@ -1,12 +1,16 @@
 //! MiniCI runner for split build/run jobs.
 
 const std = @import("std");
+const builtin = @import("builtin");
 
 const out_dir = "zig-out/minici";
 const raw_dir = out_dir ++ "/raw";
 const logs_dir = out_dir ++ "/logs";
 const heartbeat_env = "MINICI_HEARTBEAT_INTERVAL_MS";
 const default_heartbeat_interval_ms: u64 = 30_000;
+/// Override for the auto-detected CPU budget on memory-constrained hosts.
+/// See `applyMemoryAwareCpuLimit`. `MINICI_MAX_CPUS=0` or unset means auto.
+const cpu_limit_env = "MINICI_MAX_CPUS";
 
 /// How many bytes from the start and end of a failing step's log to echo to
 /// the console. Compiler and test errors land near the top of the output, while
@@ -1056,6 +1060,114 @@ fn writeHtml(
 }
 
 /// Runs build-ci followed by each named MiniCI run job and writes reports.
+/// CPUs this process may run on, honoring any inherited affinity (e.g. an outer
+/// `taskset`). Null if it cannot be determined.
+fn onlineCpuCount() ?usize {
+    const set = std.posix.sched_getaffinity(0) catch return null;
+    return std.posix.CPU_COUNT(set);
+}
+
+/// Total physical RAM in bytes, or null if it cannot be determined.
+fn totalRamBytes() ?u64 {
+    var info: std.os.linux.Sysinfo = undefined;
+    if (@as(isize, @bitCast(std.os.linux.sysinfo(&info))) != 0) return null;
+    return @as(u64, info.totalram) * @as(u64, @max(1, info.mem_unit));
+}
+
+/// How many heavy `zig build` compilations of the roc/LLVM sources fit in RAM at
+/// once. Each needs several GiB (observed peak RSS 3.5-4.9 GiB), so we reserve
+/// headroom for the OS/desktop and divide the rest. Never returns fewer than 1.
+fn cpuBudgetForRam(total_ram_bytes: u64, online_cpus: usize) usize {
+    const total_mib = total_ram_bytes / (1024 * 1024);
+    const reserve_mib: u64 = 2048; // ~2 GiB for the OS/desktop + MiniCI itself
+    const per_compile_mib: u64 = 4096; // ~4 GiB budget per concurrent compile
+    if (total_mib <= reserve_mib + per_compile_mib) return 1;
+    const fits: u64 = (total_mib - reserve_mib) / per_compile_mib;
+    return @intCast(@min(@max(fits, 1), @as(u64, online_cpus)));
+}
+
+/// Whether we're running on Raspberry Pi hardware, per the firmware board name
+/// exposed in the device tree (e.g. "Raspberry Pi 5 Model B Rev 1.0"). The auto
+/// CPU limit is scoped to these boards: their limited RAM and slow SD-card swap
+/// turn an over-parallel build into an OOM that can hard-reboot the machine,
+/// whereas other hosts (including CI runners) have headroom and are left alone.
+fn isRaspberryPi(io: std.Io, allocator: std.mem.Allocator) bool {
+    const model = std.Io.Dir.cwd().readFileAlloc(io, "/sys/firmware/devicetree/base/model", allocator, .limited(256)) catch return false;
+    return std.mem.find(u8, model, "Raspberry Pi") != null;
+}
+
+/// Parses `MINICI_MAX_CPUS`. Null when unset/empty/invalid or `<1` (auto). An
+/// explicit value applies on any host, overriding the Raspberry Pi heuristic.
+fn envCpuOverride(env: *const std.process.Environ.Map) ?usize {
+    const raw = env.get(cpu_limit_env) orelse return null;
+    const trimmed = std.mem.trim(u8, raw, " \t");
+    if (trimmed.len == 0) return null;
+    const n = std.fmt.parseInt(usize, trimmed, 10) catch |err| {
+        std.debug.print("invalid {s}='{s}': {s}; auto-detecting instead\n", .{ cpu_limit_env, raw, @errorName(err) });
+        return null;
+    };
+    return if (n >= 1) n else null;
+}
+
+/// Restricts this process (and thus the children it forks) to CPUs `[0, count)`.
+fn setCpuAffinity(count: usize) !void {
+    var set: std.os.linux.cpu_set_t = [_]usize{0} ** (std.os.linux.CPU_SETSIZE / @sizeOf(usize));
+    const word_bits = @bitSizeOf(usize);
+    var cpu: usize = 0;
+    while (cpu < count) : (cpu += 1) {
+        set[cpu / word_bits] |= @as(usize, 1) << @intCast(cpu % word_bits);
+    }
+    try std.os.linux.sched_setaffinity(0, &set);
+}
+
+/// On a Raspberry Pi with little RAM, pin this process to a CPU subset so the
+/// `zig build` and test-worker children it spawns don't run one multi-GiB
+/// compile per core and exhaust RAM — which OOM-kills build jobs and, once swap
+/// starts thrashing, can hang the machine hard enough to reboot it.
+///
+/// Zig sizes compile parallelism (and the CLI test runner sizes its worker pool)
+/// to the visible CPU count, and children inherit our affinity: MiniCI forks
+/// every child from this (main) thread via an inline `std.process.run`, so
+/// restricting this thread restricts them all. `MINICI_MAX_CPUS=N` overrides the
+/// heuristic and applies on any host.
+fn applyMemoryAwareCpuLimit(io: std.Io, allocator: std.mem.Allocator, env: *const std.process.Environ.Map) void {
+    if (builtin.os.tag != .linux) return;
+
+    const online = onlineCpuCount() orelse return;
+    if (online <= 1) return;
+
+    const override = envCpuOverride(env);
+    const budget = if (override) |n|
+        @min(n, online)
+    else blk: {
+        // Auto-limiting only targets Raspberry Pi hardware.
+        if (!isRaspberryPi(io, allocator)) return;
+        break :blk cpuBudgetForRam(totalRamBytes() orelse return, online);
+    };
+    if (budget >= online) return;
+
+    setCpuAffinity(budget) catch |err| {
+        std.debug.print("note: could not limit CPUs ({s}); continuing at full parallelism\n", .{@errorName(err)});
+        return;
+    };
+
+    if (override != null) {
+        std.debug.print(
+            "Limiting build to {d} of {d} CPUs ({s}).\n",
+            .{ budget, online, cpu_limit_env },
+        );
+    } else {
+        const total_mib = (totalRamBytes() orelse 0) / (1024 * 1024);
+        std.debug.print(
+            "Raspberry Pi with {d} MiB RAM detected: limiting build to {d} of {d} CPUs to avoid OOM (set {s}=N to override).\n",
+            .{ total_mib, budget, online, cpu_limit_env },
+        );
+    }
+}
+
+/// Entry point: build the CI artifacts, then run each `run-*` job in order,
+/// streaming heartbeats and a machine-readable report. Restricts CPU usage first
+/// on memory-constrained hosts (see `applyMemoryAwareCpuLimit`).
 pub fn main(init: std.process.Init) !void {
     const io = init.io;
     var gpa_impl = std.heap.DebugAllocator(.{}){};
@@ -1077,6 +1189,7 @@ pub fn main(init: std.process.Init) !void {
     try std.Io.Dir.cwd().createDirPath(io, logs_dir);
 
     std.debug.print("=== MINICI ORCHESTRATOR ===\n", .{});
+    applyMemoryAwareCpuLimit(io, allocator, init.environ_map);
     const run_started_ns = nowNs(io);
     const run_started_unix_ms = unixMs(io);
     const total_phases = jobs.len + 1;
