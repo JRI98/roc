@@ -13655,7 +13655,10 @@ fn checkFileWithBuildEnv(
     }
 
     build_env.compiler_version = build_options.compiler_version;
-    build_env.setPostCheckPublicationMode(.platform_relations);
+    // Checking is not complete until the platform/app relation output completes,
+    // so `roc check` finalizes the relation-bearing platform root once (which also
+    // resolves the platform target config constants the check flow depends on).
+    build_env.setPostCheckPublicationMode(.executable_artifacts);
     defer build_env.deinit();
 
     if (cache_config.enabled) {

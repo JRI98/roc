@@ -334,13 +334,45 @@ pub const PlatformRequirementContextKey = struct {
         platform_identity: ModuleIdentity,
         platform_required_declarations_hash: [32]u8,
     ) PlatformRequirementContextKey {
+        return computeFromParts(
+            hashModuleIdentity(platform_identity),
+            platform_required_declarations_hash,
+        );
+    }
+
+    /// Compute the requirement context directly from the platform module's stable
+    /// content-identity hash and the identity hash of its required declarations.
+    /// `compute` folds these same two inputs through a `ModuleIdentity`, so the two
+    /// entry points always agree byte-for-byte.
+    pub fn computeFromParts(
+        platform_content_identity_hash: [32]u8,
+        platform_required_declarations_hash: [32]u8,
+    ) PlatformRequirementContextKey {
         var hasher = std.crypto.hash.sha2.Sha256.init(.{});
-        const platform_identity_hash = hashModuleIdentity(platform_identity);
-        hasher.update(&platform_identity_hash);
+        hasher.update(&platform_content_identity_hash);
         hasher.update(&platform_required_declarations_hash);
         return .{ .bytes = hasher.finalResult() };
     }
 };
+
+/// Compute a platform module's requirement context from its checked `ModuleEnv`
+/// alone, matching the artifact-derived context byte-for-byte. Builds the required
+/// declaration table (scheme keys, interned declaration names, for-clause hashes)
+/// exactly as `PlatformRequiredDeclarationTable.fromModule` does, then folds its
+/// identity hash together with the env's stable content identity.
+pub fn platformRequirementContextKeyFromEnv(
+    allocator: Allocator,
+    env: *const ModuleEnv,
+) Allocator.Error!PlatformRequirementContextKey {
+    var names = canonical.CanonicalNameStore.init(allocator);
+    defer names.deinit();
+    var declarations = try PlatformRequiredDeclarationTable.fromEnv(allocator, env, &names, 0);
+    defer declarations.deinit(allocator);
+    return PlatformRequirementContextKey.computeFromParts(
+        computeStableModuleIdentityHash(env),
+        declarations.identityHash(&names),
+    );
+}
 
 /// Public `CheckingContextIdentity` declaration.
 pub const CheckingContextIdentity = struct {
@@ -5151,18 +5183,6 @@ fn checkedTypePayloadKeyBuild(
     var builder = SubstitutedCheckedTypeKeyBuilder.init(allocator, names, store, &.{}, &.{});
     defer builder.deinit();
     try builder.writePayloadBuild(payload);
-    return .{ .bytes = builder.hasher.finalResult() };
-}
-
-fn checkedTypePayloadKey(
-    allocator: Allocator,
-    names: *const canonical.CanonicalNameStore,
-    store: *const CheckedTypeStore,
-    payload: CheckedTypePayload,
-) Allocator.Error!canonical.CanonicalTypeKey {
-    var builder = SubstitutedCheckedTypeKeyBuilder.init(allocator, names, store, &.{}, &.{});
-    defer builder.deinit();
-    try builder.writePayload(payload);
     return .{ .bytes = builder.hasher.finalResult() };
 }
 
@@ -14824,24 +14844,36 @@ pub const PlatformRequiredDeclarationTable = struct {
         module: TypedCIR.Module,
         names: *canonical.CanonicalNameStore,
     ) Allocator.Error!PlatformRequiredDeclarationTable {
-        const required_types = module.requiresTypes();
+        return fromEnv(allocator, module.moduleEnvConst(), names, module.moduleIndex());
+    }
+
+    /// Build the required declaration table from a platform module's checked
+    /// `ModuleEnv`. `fromModule` delegates here so the artifact-derived and
+    /// env-derived declaration hashes share a single implementation.
+    pub fn fromEnv(
+        allocator: Allocator,
+        module_env: *const ModuleEnv,
+        names: *canonical.CanonicalNameStore,
+        module_idx: u32,
+    ) Allocator.Error!PlatformRequiredDeclarationTable {
+        const required_types = module_env.requires_types.items.items;
         const declarations = try allocator.alloc(PlatformRequiredDeclaration, required_types.len);
         errdefer allocator.free(declarations);
 
         for (required_types, 0..) |required_type, i| {
             declarations[i] = .{
                 .id = @enumFromInt(@as(u32, @intCast(i))),
-                .module_idx = module.moduleIndex(),
+                .module_idx = module_idx,
                 .requires_idx = @intCast(i),
-                .platform_name = try names.internExportIdent(module.identStoreConst(), required_type.ident),
+                .platform_name = try names.internExportIdent(module_env.getIdentStoreConst(), required_type.ident),
                 .declared_source_ty = try canonical_type_keys.schemeFromVar(
                     allocator,
-                    module.typeStoreConst(),
-                    module.moduleEnvConst(),
+                    &module_env.types,
+                    module_env,
                     ModuleEnv.varFrom(required_type.type_anno),
                 ),
                 .type_anno = required_type.type_anno,
-                .for_clause_aliases_hash = hashRequiredTypeForClauseAliases(module.moduleEnvConst(), required_type),
+                .for_clause_aliases_hash = hashRequiredTypeForClauseAliases(module_env, required_type),
             };
         }
 
@@ -16866,11 +16898,21 @@ pub fn platformRequirementContextKey(artifact: *const CheckedModuleArtifact) Pla
 /// Public `buildPlatformAppRelation` function.
 pub fn buildPlatformAppRelation(
     allocator: Allocator,
-    platform_declaration_artifact: *const CheckedModuleArtifact,
-    platform_module_env: *const ModuleEnv,
+    platform_module: TypedCIR.Module,
     app_artifact: *const CheckedModuleArtifact,
 ) Allocator.Error!PlatformAppRelationBuildResult {
-    const declarations = platform_declaration_artifact.platform_required_declarations.declarations;
+    const platform_module_env = platform_module.moduleEnvConst();
+
+    // Derive the platform's required declarations and requirement context from the
+    // typed platform module directly (a scratch name store the table interns into),
+    // so finalization consumes the platform root's checked module rather than a
+    // previously-published declaration artifact.
+    var declaration_names = canonical.CanonicalNameStore.init(allocator);
+    defer declaration_names.deinit();
+    var declaration_table = try PlatformRequiredDeclarationTable.fromModule(allocator, platform_module, &declaration_names);
+    defer declaration_table.deinit(allocator);
+    const declarations = declaration_table.declarations;
+
     const relations = try allocator.alloc(PlatformRequirementRelationInput, declarations.len);
     errdefer allocator.free(relations);
     const bindings = try allocator.alloc(PlatformRequiredBindingInput, declarations.len);
@@ -16883,7 +16925,10 @@ pub fn buildPlatformAppRelation(
     var identity_solutions_app = std.ArrayList(CheckedTypeId).empty;
     errdefer identity_solutions_app.deinit(allocator);
 
-    const requirement_context = platformRequirementContextKey(platform_declaration_artifact);
+    const requirement_context = PlatformRequirementContextKey.computeFromParts(
+        computeStableModuleIdentityHash(platform_module_env),
+        declaration_table.identityHash(&declaration_names),
+    );
     const relation_key = PlatformAppRelationKey.compute(app_artifact.key, requirement_context);
 
     for (declarations, 0..) |declaration, i| {
@@ -17001,7 +17046,7 @@ pub fn buildPlatformAppRelation(
     return .{ .relation = .{
         .key = relation_key,
         .requirement_context = requirement_context,
-        .platform_module_idx = platform_declaration_artifact.module_identity.module_idx,
+        .platform_module_idx = platform_module.moduleIndex(),
         .app_artifact = app_artifact.key,
         .relations = relations,
         .bindings = bindings,
@@ -17106,16 +17151,6 @@ fn platformRequirementPayload(store: *const CheckedTypeStore, root: CheckedTypeI
         checkedArtifactInvariant("platform requirement referenced missing checked type payload", .{});
     }
     return store.payload(@enumFromInt(index));
-}
-
-fn findTagById(
-    tags: []const CheckedTag,
-    name: canonical.TagLabelId,
-) ?CheckedTag {
-    for (tags) |tag| {
-        if (tag.name == name) return tag;
-    }
-    return null;
 }
 
 const RelationTagUnionParts = struct {
