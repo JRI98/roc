@@ -501,8 +501,9 @@ pub const UnsupportedAliasWhereClause = struct {
 };
 
 /// Error when a where clause attempts to add a constraint to a rigid type
-/// variable introduced by an enclosing annotation.
+/// variable introduced by a different annotation.
 pub const WhereClauseReceiverNotIntroduced = struct {
+    type_var_name: base.Ident.Idx,
     method_name: base.Ident.Idx,
     region: base.Region,
 };

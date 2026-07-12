@@ -186,7 +186,7 @@ test "where clause - cannot constrain rigid introduced by enclosing annotation" 
     var test_env = try TestEnv.init("EnclosingWhereReceiver", source);
     defer test_env.deinit();
 
-    try test_env.assertOneTypeError("Invalid Where Constraint");
+    try test_env.assertOneTypeError("Constraint in Wrong Annotation");
     try std.testing.expectEqual(
         .where_clause_receiver_not_introduced,
         std.meta.activeTag(test_env.checker.problems.problems.items[0]),

@@ -9758,10 +9758,14 @@ fn generateRemainingWhereConstraintOwners(
         }
 
         invalid_receiver = true;
+        const rigid_anno = self.cir.store.getTypeAnno(@enumFromInt(owner.rigid_var));
+        std.debug.assert(rigid_anno == .rigid_var);
+        const type_var_name = rigid_anno.rigid_var.name;
         for (self.cir.store.sliceWhereClausesForOwner(owner)) |where_idx| {
             switch (self.cir.store.getWhereClause(where_idx)) {
                 .w_method => |method| {
                     _ = try self.problems.appendProblem(self.gpa, .{ .where_clause_receiver_not_introduced = .{
+                        .type_var_name = type_var_name,
                         .method_name = method.method_name,
                         .region = self.cir.store.getNodeRegion(ModuleEnv.nodeIdxFrom(where_idx)),
                     } });
