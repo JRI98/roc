@@ -1211,10 +1211,13 @@ pub const MonoLlvmCodeGen = struct {
     fn declareProcSpec(self: *MonoLlvmCodeGen, proc_id: LirProcSpecId, proc: LirProcSpec) Error!void {
         const builder = self.builder orelse return error.CompilationFailed;
         const ptr_ty = builder.ptrType(.default) catch return error.OutOfMemory;
-        // Erased-callable procs keep the host-facing callable convention
-        // (ops, ret, args, capture). Other procs carry no RocOps under the
-        // symbol ABI; only in-process evaluation threads a real one.
-        const params: []const LlvmBuilder.Type = if (proc.abi == .erased_callable)
+        // In-process evaluation threads its explicit test invocation context
+        // through erased callables as well as ordinary procedures. The symbol
+        // ABI has no such context, so its callable convention remains
+        // (ops, ret, args, capture).
+        const params: []const LlvmBuilder.Type = if (proc.abi == .erased_callable and self.host_call_mode == .vtable)
+            &.{ ptr_ty, ptr_ty, ptr_ty, ptr_ty, ptr_ty }
+        else if (proc.abi == .erased_callable)
             &.{ ptr_ty, ptr_ty, ptr_ty, ptr_ty }
         else if (self.host_call_mode == .extern_symbols)
             &.{ ptr_ty, ptr_ty }
@@ -1376,10 +1379,17 @@ pub const MonoLlvmCodeGen = struct {
         } else {
             self.roc_ops_arg = wip.arg(0);
             if (proc.abi == .erased_callable) {
-                self.test_context_arg = null;
-                self.ret_ptr_arg = wip.arg(1);
-                self.args_ptr_arg = wip.arg(2);
-                self.capture_ptr_arg = wip.arg(3);
+                if (self.host_call_mode == .vtable) {
+                    self.test_context_arg = wip.arg(1);
+                    self.ret_ptr_arg = wip.arg(2);
+                    self.args_ptr_arg = wip.arg(3);
+                    self.capture_ptr_arg = wip.arg(4);
+                } else {
+                    self.test_context_arg = null;
+                    self.ret_ptr_arg = wip.arg(1);
+                    self.args_ptr_arg = wip.arg(2);
+                    self.capture_ptr_arg = wip.arg(3);
+                }
             } else {
                 self.test_context_arg = wip.arg(1);
                 self.ret_ptr_arg = wip.arg(2);
@@ -2469,8 +2479,13 @@ pub const MonoLlvmCodeGen = struct {
             builder.nullValue(ptr_ty) catch return error.OutOfMemory
         else
             self.slot(target).ptr;
-        const fn_ty = builder.fnType(.void, &.{ ptr_ty, ptr_ty, ptr_ty, ptr_ty }, .normal) catch return error.OutOfMemory;
-        _ = wip.call(.normal, .ccc, .none, fn_ty, fn_ptr, &.{ self.rocOps(), ret_ptr, args_buf, capture_ptr }, "") catch return error.OutOfMemory;
+        if (self.host_call_mode == .vtable) {
+            const fn_ty = builder.fnType(.void, &.{ ptr_ty, ptr_ty, ptr_ty, ptr_ty, ptr_ty }, .normal) catch return error.OutOfMemory;
+            _ = wip.call(.normal, .ccc, .none, fn_ty, fn_ptr, &.{ self.rocOps(), self.testInvocationContext(), ret_ptr, args_buf, capture_ptr }, "") catch return error.OutOfMemory;
+        } else {
+            const fn_ty = builder.fnType(.void, &.{ ptr_ty, ptr_ty, ptr_ty, ptr_ty }, .normal) catch return error.OutOfMemory;
+            _ = wip.call(.normal, .ccc, .none, fn_ty, fn_ptr, &.{ self.rocOps(), ret_ptr, args_buf, capture_ptr }, "") catch return error.OutOfMemory;
+        }
     }
 
     fn emitPackedErasedFn(
