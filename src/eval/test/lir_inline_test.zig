@@ -2857,13 +2857,14 @@ test "compiler-generated dispatch classes lower via checked evidence" {
         \\    }
         \\    lhs = { speed: Speed.Mph($sum), label: "total" }
         \\    rhs = { speed: Speed.Mph(6), label: "total" }
+        \\    other = { speed: Speed.Mph(7), label: "total" }
         \\    parsed : Try({ names : Set(Str) }, Json.ParseErr)
         \\    parsed = Json.parse("{ \"names\": [\"a\", \"b\"] }")
         \\    parsed_count = match parsed {
         \\        Ok(rec) => rec.names.len()
         \\        Err(_) => 0
         \\    }
-        \\    lhs == rhs and parsed_count == 2 and Str.inspect(lhs.speed) == "6"
+        \\    lhs == rhs and lhs != other and parsed_count == 2 and Str.inspect(lhs.speed) == "6"
         \\}
     ;
 
