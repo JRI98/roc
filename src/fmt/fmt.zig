@@ -3570,17 +3570,17 @@ fn parseAndFmt(gpa: std.mem.Allocator, input: []const u8, debug: bool) FormatPar
 // produces the same output as formatting once.
 
 test "issue 8851: arrow call with space before field access is idempotent" {
-    // a=0->b .c() should format stably with newline to disambiguate
+    // a=0->b .c() should format stably with parentheses to disambiguate
     const result = try moduleFmtsStable(std.testing.allocator, "a=0->b .c()", false);
     defer std.testing.allocator.free(result);
-    try std.testing.expectEqualStrings("a = 0->b()\n\t.c()\n", result);
+    try std.testing.expectEqualStrings("a = (0->b()).c()\n", result);
 }
 
 test "issue 8851: arrow call with chained zero-arg applies is idempotent" {
     // a = 0->b()().c() should format stably - must preserve ALL levels of function application
     const result = try moduleFmtsStable(std.testing.allocator, "a = 0->b()().c()", false);
     defer std.testing.allocator.free(result);
-    try std.testing.expectEqualStrings("a = 0->b()().c()\n", result);
+    try std.testing.expectEqualStrings("a = (0->(b())()).c()\n", result);
 }
 
 test "issue 8851: multiline arrow call with field access is idempotent" {
@@ -3590,29 +3590,29 @@ test "issue 8851: multiline arrow call with field access is idempotent" {
         \\      .c()
     , false);
     defer std.testing.allocator.free(result);
-    try std.testing.expectEqualStrings("a = 0->b()\n\t.c()\n", result);
+    try std.testing.expectEqualStrings("a = (0->b()).c()\n", result);
 }
 
 test "issue 8851: tuple dispatch with chained zero-arg applies is idempotent" {
     // ()->b()()() from issue comment 2
     const result = try moduleFmtsStable(std.testing.allocator, "a=()->b()()()", false);
     defer std.testing.allocator.free(result);
-    try std.testing.expectEqualStrings("a = ()->b()()()\n", result);
+    try std.testing.expectEqualStrings("a = ()->(b()())()\n", result);
 }
 
 test "issue 8851: chained field access after arrow call is idempotent" {
-    // 0->b .c .d() - multiple field accesses, newline to disambiguate
+    // 0->b .c .d() - multiple field accesses, parentheses disambiguate
     const result = try moduleFmtsStable(std.testing.allocator, "a=0->b .c .d()", false);
     defer std.testing.allocator.free(result);
-    try std.testing.expectEqualStrings("a = 0->b()\n\t.c.d()\n", result);
+    try std.testing.expectEqualStrings("a = (0->b()).c.d()\n", result);
 }
 
 test "issue 8851: arrow call with uppercase tag (module-like) is idempotent" {
     // 0->M .c - uppercase identifier parses as tag, not ident
-    // Dispatching to a tag is invalid, newline disambiguates from qualified identifier
+    // Dispatching to a tag is invalid, parentheses disambiguate the field access
     const result = try moduleFmtsStable(std.testing.allocator, "a=0->M .c", false);
     defer std.testing.allocator.free(result);
-    try std.testing.expectEqualStrings("a = 0->M\n\t.c\n", result);
+    try std.testing.expectEqualStrings("a = (0->M).c\n", result);
 }
 
 test "issue 9785: multiline string followed by tuple access formats to valid source" {
