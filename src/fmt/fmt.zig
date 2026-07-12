@@ -1333,24 +1333,13 @@ const Formatter = struct {
                 try fmt.pushTokenText(i.token);
             },
             .field_access => |fa| {
-                // Check if left side is an arrow_call with a plain ident or tag
-                // e.g., `0->M .c` should format as multiline to avoid ambiguity with qualified ident
                 const left_expr = fmt.ast.store.getExpr(fa.left);
-                const needs_newline_before_dot = if (left_expr == .arrow_call) blk: {
-                    const ld = left_expr.arrow_call;
-                    const ld_right = fmt.ast.store.getExpr(ld.right);
-                    break :blk ld_right == .ident or ld_right == .tag;
-                } else false;
-
+                const parenthesize_receiver = left_expr == .arrow_call;
+                if (parenthesize_receiver) try fmt.push('(');
                 const left = try fmt.formatExprWithInfo(fa.left);
+                if (parenthesize_receiver) try fmt.push(')');
                 const right_region = fmt.nodeRegion(@intFromEnum(fa.right));
-                if (needs_newline_before_dot) {
-                    // Force newline to disambiguate from qualified identifier
-                    // `0->M .c` becomes `0->M\n\t.c` not `0->M.c` (which parses differently)
-                    fmt.curr_indent += 1;
-                    try fmt.ensureNewline();
-                    try fmt.pushIndent();
-                } else {
+                if (!parenthesize_receiver) {
                     const continued = try fmt.continueAfterMultilineStringLine(left);
                     if (!continued and multiline and try fmt.flushCommentsBefore(right_region.start)) {
                         fmt.curr_indent += 1;
@@ -1361,22 +1350,12 @@ const Formatter = struct {
                 try fmt.formatExprInnerDiscard(fa.right, .no_indent_on_access);
             },
             .method_call => |mc| {
-                // Check if left side is an arrow_call with a plain ident or tag
-                // e.g., `0->M .c()` should format as multiline to avoid ambiguity with qualified ident
                 const left_expr = fmt.ast.store.getExpr(mc.receiver);
-                const needs_newline_before_dot = if (left_expr == .arrow_call) blk: {
-                    const ld = left_expr.arrow_call;
-                    const ld_right = fmt.ast.store.getExpr(ld.right);
-                    break :blk ld_right == .ident or ld_right == .tag;
-                } else false;
-
+                const parenthesize_receiver = left_expr == .arrow_call;
+                if (parenthesize_receiver) try fmt.push('(');
                 const receiver = try fmt.formatExprWithInfo(mc.receiver);
-                if (needs_newline_before_dot) {
-                    // Force newline to disambiguate from qualified identifier.
-                    fmt.curr_indent += 1;
-                    try fmt.ensureNewline();
-                    try fmt.pushIndent();
-                } else {
+                if (parenthesize_receiver) try fmt.push(')');
+                if (!parenthesize_receiver) {
                     const continued = try fmt.continueAfterMultilineStringLine(receiver);
                     if (!continued and multiline and try fmt.flushCommentsBefore(mc.method_token)) {
                         fmt.curr_indent += 1;
