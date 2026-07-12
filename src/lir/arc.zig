@@ -116,6 +116,9 @@ pub fn insert(store: *LirStore, layouts: *const layout_mod.Store, options: Inser
     var loop_keep_reads_consumed = std.AutoHashMap(u32, void).init(store.allocator);
     defer loop_keep_reads_consumed.deinit();
     inserter.loop_keep_reads_consumed = &loop_keep_reads_consumed;
+    var reaches_loop_edge = std.AutoHashMap(LIR.CFStmtId, void).init(store.allocator);
+    defer reaches_loop_edge.deinit();
+    inserter.reaches_loop_edge = &reaches_loop_edge;
 
     // Original (ownership-neutral) bodies stay valid after each proc's base
     // emission because rewriting clones statements; specialized variants
@@ -548,6 +551,12 @@ const Inserter = struct {
     /// Loop keep identities whose cached liveness rows read keep-set bits at
     /// a loop edge; only these need purging when their keep-set shrinks.
     loop_keep_reads_consumed: *std.AutoHashMap(u32, void) = undefined,
+    /// Statements from which a `loop_continue`/`loop_break` is reachable,
+    /// discovered by keep-free liveness builds. Only these statements' rows
+    /// depend on a loop keep-set; every other loop-keyed query is answered
+    /// by the shared keep-free row, which keeps the row cache linear in
+    /// proc size instead of growing per join nesting level.
+    reaches_loop_edge: *std.AutoHashMap(LIR.CFStmtId, void) = undefined,
     next_loop_keep_id: u32 = 1,
     current_proc_body: LIR.CFStmtId = undefined,
     join_bodies: ?*const JoinBodyMap = null,
@@ -3619,6 +3628,7 @@ const Inserter = struct {
     fn clearReadsBeforeRebindCache(self: *Inserter) void {
         self.reads_before_rebind_cache.clearRetainingCapacity();
         self.loop_keep_reads_consumed.clearRetainingCapacity();
+        self.reaches_loop_edge.clearRetainingCapacity();
         _ = self.read_cache_arena.reset(.retain_capacity);
     }
 
@@ -3789,6 +3799,10 @@ const Inserter = struct {
 
         var graph = ReadBeforeRebindGraph.init(graph_allocator);
         var work = std.ArrayList(LIR.CFStmtId).empty;
+        // Loop-edge nodes found by a keep-free build seed the backward
+        // reachability sweep that decides which statements ever need
+        // loop-keyed rows.
+        var loop_edge_nodes = std.ArrayList(usize).empty;
 
         // Without a loop keep-set, start from the whole proc so one dataflow
         // run answers most repeated local/group liveness questions. With a
@@ -3946,6 +3960,8 @@ const Inserter = struct {
                 => if (loop_keep) |keep| {
                     self.noteLivenessLoopKeep(&graph.nodes.items[node_index].reads, keep);
                     try self.loop_keep_reads_consumed.put(loop_keep_id, {});
+                } else {
+                    try loop_edge_nodes.append(graph_allocator, node_index);
                 },
                 .runtime_error,
                 .comptime_exhaustiveness_failed,
@@ -3984,6 +4000,21 @@ const Inserter = struct {
                 const write_index = pred_writes[successor_index];
                 predecessors[write_index] = predecessor_index;
                 pred_writes[successor_index] += 1;
+            }
+        }
+
+        if (loop_edge_nodes.items.len != 0) {
+            var reached = try std.bit_set.DynamicBitSetUnmanaged.initEmpty(graph_allocator, node_count);
+            for (loop_edge_nodes.items) |edge_node| reached.set(edge_node);
+            while (loop_edge_nodes.pop()) |reach_index| {
+                try self.reaches_loop_edge.put(graph.nodes.items[reach_index].stmt, {});
+                const pred_start = pred_starts[reach_index];
+                const pred_end = pred_starts[reach_index + 1];
+                for (predecessors[pred_start..pred_end]) |predecessor_index| {
+                    if (reached.isSet(predecessor_index)) continue;
+                    reached.set(predecessor_index);
+                    try loop_edge_nodes.append(graph_allocator, predecessor_index);
+                }
             }
         }
 
@@ -4064,14 +4095,9 @@ const Inserter = struct {
         needle: LIR.LocalId,
         loop_keep: ?*const OwnedSet,
     ) ResourceError!bool {
-        const loop_keep_id: u32 = if (loop_keep) |keep|
-            self.active_loop_keep_ids.get(@intFromPtr(keep)) orelse
-                arcInvariant("ARC liveness query used an unregistered loop keep-set")
-        else
-            0;
         const bit = self.valueUseBitOf(needle) orelse
             arcInvariant("ARC value-use query for a local without a value-use bit");
-        const reads = try self.computeReadsBeforeRebind(start, loop_keep, loop_keep_id);
+        const reads = try self.livenessRow(start, loop_keep);
         return reads.isSet(bit);
     }
 
@@ -4087,18 +4113,33 @@ const Inserter = struct {
     /// Liveness for one owned local extended over its borrow group: the
     /// local's value must stay live while the local itself or any borrow
     /// anchored on it is still used.
+    /// Liveness row for a query start under an optional loop keep-set. A
+    /// loop-keyed row differs from the keep-free row only when a loop edge
+    /// is reachable from the start, so everything else shares the keep-free
+    /// row and the cache stays linear in proc size.
+    fn livenessRow(
+        self: *Inserter,
+        start: LIR.CFStmtId,
+        loop_keep: ?*const OwnedSet,
+    ) ResourceError!*const std.bit_set.DynamicBitSetUnmanaged {
+        const loop_keep_id: u32 = if (loop_keep) |keep|
+            self.active_loop_keep_ids.get(@intFromPtr(keep)) orelse
+                arcInvariant("ARC liveness query used an unregistered loop keep-set")
+        else
+            0;
+        if (loop_keep_id == 0) return self.computeReadsBeforeRebind(start, null, 0);
+        const keep_free = try self.computeReadsBeforeRebind(start, null, 0);
+        if (!self.reaches_loop_edge.contains(start)) return keep_free;
+        return self.computeReadsBeforeRebind(start, loop_keep, loop_keep_id);
+    }
+
     fn groupUsedInPath(
         self: *Inserter,
         start: LIR.CFStmtId,
         local: LIR.LocalId,
         loop_keep: ?*const OwnedSet,
     ) ResourceError!bool {
-        const loop_keep_id: u32 = if (loop_keep) |keep|
-            self.active_loop_keep_ids.get(@intFromPtr(keep)) orelse
-                arcInvariant("ARC liveness query used an unregistered loop keep-set")
-        else
-            0;
-        const reads = try self.computeReadsBeforeRebind(start, loop_keep, loop_keep_id);
+        const reads = try self.livenessRow(start, loop_keep);
         const leader = self.solution.leaderOf(local);
         if (self.solution.groupMembers(leader).len <= 1) {
             return reads.isSet(@intFromEnum(local));
