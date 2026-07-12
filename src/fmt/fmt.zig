@@ -1079,15 +1079,24 @@ const Formatter = struct {
         try fmt.push('}');
     }
 
-    fn formatRecordField(fmt: *Formatter, idx: AST.RecordField.Idx) FormatAstError!AST.TokenizedRegion {
+    fn formatRecordFieldWithInfo(fmt: *Formatter, idx: AST.RecordField.Idx) FormatAstError!FormattedExpr {
         const field = fmt.ast.store.getRecordField(idx);
+        var ends_with_multiline_string_line = false;
         try fmt.pushTokenText(field.name);
         if (field.value) |v| {
             try fmt.pushAll(": ");
-            try fmt.formatExprDiscard(v);
+            const formatted_value = try fmt.formatExprWithInfo(v);
+            ends_with_multiline_string_line = formatted_value.ends_with_multiline_string_line;
         }
 
-        return field.region;
+        return .{
+            .region = field.region,
+            .ends_with_multiline_string_line = ends_with_multiline_string_line,
+        };
+    }
+
+    fn formatRecordField(fmt: *Formatter, idx: AST.RecordField.Idx) FormatAstError!AST.TokenizedRegion {
+        return (try fmt.formatRecordFieldWithInfo(idx)).region;
     }
 
     const ExprFormatBehavior = enum {
@@ -1529,14 +1538,14 @@ const Formatter = struct {
                     if (!record_multiline) {
                         try fmt.push(' ');
                     }
-                    const field_region = try fmt.formatRecordField(field_idx);
+                    const formatted_field = try fmt.formatRecordFieldWithInfo(field_idx);
                     if (record_multiline) {
-                        if (fmt.has_multiline_string) {
+                        if (formatted_field.ends_with_multiline_string_line or fmt.has_multiline_string) {
                             try fmt.ensureNewline();
                             try fmt.pushIndent();
                         }
                         try fmt.push(',');
-                        try fmt.flushCommentsAfterDiscard(field_region.end);
+                        try fmt.flushCommentsAfterDiscard(formatted_field.region.end);
                         if (i == fields.len - 1) {
                             fmt.curr_indent -= 1;
                         }
@@ -1844,18 +1853,27 @@ const Formatter = struct {
                     if (!record_multiline) {
                         try fmt.push(' ');
                     }
-                    const field_region = try fmt.formatRecordField(field_idx);
+                    const formatted_field = try fmt.formatRecordFieldWithInfo(field_idx);
+                    const ends_with_multiline_string_line = formatted_field.ends_with_multiline_string_line or fmt.has_multiline_string;
 
                     if (i < fields.len - 1) {
+                        if (ends_with_multiline_string_line) {
+                            try fmt.ensureNewline();
+                            try fmt.pushIndent();
+                        }
                         try fmt.push(',');
                         if (record_multiline) {
-                            try fmt.flushCommentsAfterDiscard(field_region.end);
+                            try fmt.flushCommentsAfterDiscard(formatted_field.region.end);
                             try fmt.ensureNewline();
                             try fmt.pushIndent();
                         }
                     } else if (record_multiline) {
+                        if (ends_with_multiline_string_line) {
+                            try fmt.ensureNewline();
+                            try fmt.pushIndent();
+                        }
                         try fmt.push(',');
-                        try fmt.flushCommentsAfterDiscard(field_region.end);
+                        try fmt.flushCommentsAfterDiscard(formatted_field.region.end);
                         fmt.curr_indent -= 1;
                         try fmt.ensureNewline();
                         try fmt.pushIndent();
@@ -2450,9 +2468,13 @@ const Formatter = struct {
                         try fmt.ensureNewline();
                         try fmt.pushIndent();
                     }
-                    const field_region = try fmt.formatRecordField(field_idx);
-                    Formatter.discardRegion(field_region);
+                    const formatted_field = try fmt.formatRecordFieldWithInfo(field_idx);
+                    Formatter.discardRegion(formatted_field.region);
                     if (packages_multiline) {
+                        if (formatted_field.ends_with_multiline_string_line or fmt.has_multiline_string) {
+                            try fmt.ensureNewline();
+                            try fmt.pushIndent();
+                        }
                         try fmt.push(',');
                     } else if (i < package_fields.len - 1) {
                         try fmt.pushAll(", ");
