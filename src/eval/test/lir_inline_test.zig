@@ -2727,3 +2727,73 @@ test "shared callees are lifted once and never gain spurious captures" {
         try std.testing.expectEqual(@as(u32, 0), func.captures.len);
     }
 }
+
+const dispatch_boundary_source =
+    \\module [main]
+    \\
+    \\Thing := [Val(Str)].{
+    \\    to_str : Thing -> Str
+    \\    to_str = |Thing.Val(s)| s
+    \\}
+    \\
+    \\main : Str
+    \\main = Thing.Val("hi").to_str()
+;
+
+test "dispatch evidence boundary validator accepts a published artifact" {
+    const allocator = std.testing.allocator;
+    var resources = try helpers.parseAndCanonicalizeProgramWithBuiltin(allocator, .module, dispatch_boundary_source, &.{}, try sharedPrePublishedBuiltin());
+    defer helpers.cleanupParseAndCanonical(allocator, resources);
+
+    try std.testing.expect(resources.checked_artifact.validateDispatchEvidence() == null);
+}
+
+test "dispatch evidence boundary validator reports a removed dispatch plan by expression" {
+    const allocator = std.testing.allocator;
+    var resources = try helpers.parseAndCanonicalizeProgramWithBuiltin(allocator, .module, dispatch_boundary_source, &.{}, try sharedPrePublishedBuiltin());
+    defer helpers.cleanupParseAndCanonical(allocator, resources);
+
+    var removed: ?check.CheckedArtifact.CheckedExprId = null;
+    for (resources.checked_artifact.checked_bodies.stored_exprs.items) |*expr| {
+        switch (expr.data) {
+            .dispatch_call => |maybe_plan| if (maybe_plan != null) {
+                expr.data = .{ .dispatch_call = null };
+                removed = expr.id;
+                break;
+            },
+            else => {},
+        }
+    }
+    try std.testing.expect(removed != null);
+
+    const failure = resources.checked_artifact.validateDispatchEvidence() orelse
+        return error.TestUnexpectedResult;
+    try std.testing.expectEqual(check.CheckedArtifact.DispatchEvidenceFailure.Kind.dispatch_expr_missing_plan, failure.kind);
+    try std.testing.expectEqual(removed.?, failure.expr.?);
+}
+
+test "dispatch evidence boundary validator names the method of a dangling evidence node" {
+    const allocator = std.testing.allocator;
+    var resources = try helpers.parseAndCanonicalizeProgramWithBuiltin(allocator, .module, dispatch_boundary_source, &.{}, try sharedPrePublishedBuiltin());
+    defer helpers.cleanupParseAndCanonical(allocator, resources);
+
+    const table = &resources.checked_artifact.static_dispatch_plans;
+    var corrupted_method: ?[]const u8 = null;
+    for (table.plans) |*plan| {
+        switch (plan.resolution) {
+            .direct => {
+                plan.resolution = .{ .direct = @enumFromInt(table.evidence_nodes.len) };
+                corrupted_method = resources.checked_artifact.canonical_names.methodNameText(plan.method);
+                break;
+            },
+            else => {},
+        }
+    }
+    try std.testing.expect(corrupted_method != null);
+
+    const failure = resources.checked_artifact.validateDispatchEvidence() orelse
+        return error.TestUnexpectedResult;
+    try std.testing.expectEqual(check.CheckedArtifact.DispatchEvidenceFailure.Kind.plan_evidence_node_out_of_bounds, failure.kind);
+    const named_method = resources.checked_artifact.canonical_names.methodNameText(failure.method orelse return error.TestUnexpectedResult);
+    try std.testing.expectEqualStrings(corrupted_method.?, named_method);
+}
