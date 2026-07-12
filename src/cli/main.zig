@@ -2695,10 +2695,7 @@ fn rocRunSharedMemoryShim(ctx: *CliCtx, args: cli_args.RunArgs, arg0: []const u8
     std.log.debug("Interpreter execution completed", .{});
 
     // Exit with code 2 if there were warnings (but no errors)
-    if (warning_count > 0) {
-        ctx.io.flush();
-        std.process.exit(2);
-    }
+    exitOnWarnings(ctx, warning_count);
 }
 
 fn rocRunBuildAndExec(ctx: *CliCtx, args: cli_args.RunArgs, arg0: []const u8) CliMainError!void {
@@ -3001,10 +2998,7 @@ fn rocRunDefaultApp(ctx: *CliCtx, args: cli_args.RunArgs, original_source: []con
     const exit_code = result_buf[0];
     if (exit_code != 0) std.process.exit(exit_code);
     if (echo_env.inline_expect_failed) std.process.exit(1);
-    if (shm_result.warning_count > 0) {
-        ctx.io.flush();
-        std.process.exit(2);
-    }
+    exitOnWarnings(ctx, shm_result.warning_count);
 }
 
 fn rocRunDefaultAppSharedMemoryShim(ctx: *CliCtx, args: cli_args.RunArgs, original_source: []const u8) CliMainError!void {
@@ -3241,10 +3235,7 @@ fn rocRunDefaultAppSharedMemoryShim(ctx: *CliCtx, args: cli_args.RunArgs, origin
     }
     cleanup_temp_dir = false;
 
-    if (lowered_result.counts.warnings > 0) {
-        ctx.io.flush();
-        std.process.exit(2);
-    }
+    exitOnWarnings(ctx, lowered_result.counts.warnings);
 }
 
 /// Append an argument to a command line buffer with proper Windows quoting.
@@ -7984,15 +7975,7 @@ fn rocBuildLlvm(ctx: *CliCtx, args: cli_args.BuildArgs) CliMainError!void {
     // valid: records discovered source inputs for `roc build --watch` on every exit path.
     defer writeBuildWatchInputsOnExit(ctx, args, &build_env);
 
-    if (!args.no_cache) {
-        const build_cache_manager = try ctx.gpa.create(CacheManager);
-        build_cache_manager.* = CacheManager.init(ctx.gpa, .{
-            .enabled = true,
-            .verbose = args.verbose,
-            .roc_ctx = ctx.coreCtx(),
-        }, ctx.coreCtx());
-        build_env.setCacheManager(build_cache_manager);
-    }
+    if (!args.no_cache) try build_env.enableDefaultCacheManager(args.verbose);
 
     reporter.begin("Resolving Dependencies");
     build_env.discoverDependencies(args.path) catch |err| {
@@ -8312,15 +8295,7 @@ fn rocBuildNative(ctx: *CliCtx, args: cli_args.BuildArgs) CliMainError!void {
     // valid: records discovered source inputs for `roc build --watch` on every exit path.
     defer writeBuildWatchInputsOnExit(ctx, args, &build_env);
 
-    if (!args.no_cache) {
-        const build_cache_manager = try ctx.gpa.create(CacheManager);
-        build_cache_manager.* = CacheManager.init(ctx.gpa, .{
-            .enabled = true,
-            .verbose = args.verbose,
-            .roc_ctx = ctx.coreCtx(),
-        }, ctx.coreCtx());
-        build_env.setCacheManager(build_cache_manager);
-    }
+    if (!args.no_cache) try build_env.enableDefaultCacheManager(args.verbose);
 
     reporter.begin("Resolving Dependencies");
     build_env.discoverDependencies(args.path) catch |err| {
@@ -8650,15 +8625,7 @@ fn rocBuildEmbedded(ctx: *CliCtx, args: cli_args.BuildArgs) CliMainError!void {
     // valid: records discovered source inputs for `roc build --watch` on every exit path.
     defer writeBuildWatchInputsOnExit(ctx, args, &build_env);
 
-    if (!args.no_cache) {
-        const build_cache_manager = try ctx.gpa.create(CacheManager);
-        build_cache_manager.* = CacheManager.init(ctx.gpa, .{
-            .enabled = true,
-            .verbose = args.verbose,
-            .roc_ctx = ctx.coreCtx(),
-        }, ctx.coreCtx());
-        build_env.setCacheManager(build_cache_manager);
-    }
+    if (!args.no_cache) try build_env.enableDefaultCacheManager(args.verbose);
 
     reporter.begin("Resolving Dependencies");
     build_env.discoverDependencies(args.path) catch |err| {
@@ -11189,11 +11156,19 @@ fn writeBuildWatchInputsOnExit(ctx: *CliCtx, args: cli_args.BuildArgs, build_env
     };
 }
 
-fn exitBuildOnWarningsIfRequested(ctx: *CliCtx, args: cli_args.BuildArgs, build_env: *BuildEnv, total_warning_count: usize) void {
-    if (!args.exit_on_warnings or total_warning_count == 0) return;
-    writeBuildWatchInputsOnExit(ctx, args, build_env);
+/// The one warning exit policy: a command that finished its primary job with
+/// warnings (and no errors) exits 2. Every verb routes through here so no
+/// back half invents its own variant (the PR 9759 shim divergence class).
+fn exitOnWarnings(ctx: *CliCtx, warning_count: usize) void {
+    if (warning_count == 0) return;
     ctx.io.flush();
     std.process.exit(2);
+}
+
+fn exitBuildOnWarningsIfRequested(ctx: *CliCtx, args: cli_args.BuildArgs, build_env: *BuildEnv, total_warning_count: usize) void {
+    if (!args.exit_on_warnings) return;
+    if (total_warning_count > 0) writeBuildWatchInputsOnExit(ctx, args, build_env);
+    exitOnWarnings(ctx, total_warning_count);
 }
 
 fn writeHotReloadWatchPathsFile(
@@ -11708,12 +11683,10 @@ fn rocTest(ctx: *CliCtx, args: cli_args.TestArgs, arg0: []const u8) RocTestError
 
     // Set up cache manager if caching is enabled
     if (cache_config.enabled) {
-        const cache_manager = ctx.gpa.create(CacheManager) catch |err| {
+        build_env.enableDefaultCacheManager(cache_config.verbose) catch |err| {
             try stderr.print("Failed to create cache manager: {}\n", .{err});
             return err;
         };
-        cache_manager.* = CacheManager.init(ctx.gpa, cache_config, ctx.coreCtx());
-        build_env.setCacheManager(cache_manager);
     }
 
     var extra_buf: [2][]const u8 = undefined;
@@ -11769,7 +11742,7 @@ fn rocTest(ctx: *CliCtx, args: cli_args.TestArgs, arg0: []const u8) RocTestError
     for (test_plan.modules) |*planned| {
         if (try loadCachedCliTestResults(
             ctx,
-            if (args.no_cache) null else build_env.cache_manager,
+            build_env.cache_manager,
             planned.artifact,
             planned.module,
             planned.test_roots,
@@ -11819,7 +11792,7 @@ fn rocTest(ctx: *CliCtx, args: cli_args.TestArgs, arg0: []const u8) RocTestError
             &test_plan,
             args.opt,
             args.max_threads,
-            if (args.no_cache) null else build_env.cache_manager,
+            build_env.cache_manager,
             &module_results,
             &total,
             if (live_output) |*output| output else null,
@@ -11836,7 +11809,7 @@ fn rocTest(ctx: *CliCtx, args: cli_args.TestArgs, arg0: []const u8) RocTestError
                     planned,
                     test_plan.entries,
                     args.opt,
-                    if (args.no_cache) null else build_env.cache_manager,
+                    build_env.cache_manager,
                     &module_results,
                 );
                 total.passed += summary.passed;
@@ -11880,6 +11853,9 @@ fn rocTest(ctx: *CliCtx, args: cli_args.TestArgs, arg0: []const u8) RocTestError
         try stdout.writeAll(stdout_body.written());
         try stderr.writeAll(stderr_body.written());
         try stdout.print("All ({}) tests passed in {d:.1} ms.{s}\n", .{ total.passed, elapsed_ms, cached_suffix });
+        // Same warning exit policy as check/build/run: passing tests with
+        // compile warnings exit 2.
+        exitOnWarnings(ctx, diag.warnings);
         return;
     }
 
@@ -13381,13 +13357,8 @@ fn checkFileWithBuildEnvPreserved(
     build_env.compiler_version = build_options.compiler_version;
     // Note: We do NOT defer build_env.deinit() here because we're returning it
 
-    // Set up cache manager if caching is enabled
-    if (cache_config.enabled) {
-        const cache_manager = try ctx.gpa.create(CacheManager);
-        cache_manager.* = CacheManager.init(ctx.gpa, cache_config, ctx.coreCtx());
-        build_env.setCacheManager(cache_manager);
-        // Note: BuildEnv.deinit() will clean up the cache manager when caller calls deinit
-    }
+    // Set up cache manager if caching is enabled; BuildEnv.deinit() cleans it up.
+    if (cache_config.enabled) try build_env.enableDefaultCacheManager(cache_config.verbose);
 
     buildForCheckWithOptionalMain(&build_env, filepath, main_filepath) catch |err| {
         switch (err) {
@@ -13556,11 +13527,7 @@ fn checkFileWithBuildEnv(
     build_env.setPostCheckPublicationMode(.platform_relations);
     defer build_env.deinit();
 
-    if (cache_config.enabled) {
-        const cache_manager = try ctx.gpa.create(CacheManager);
-        cache_manager.* = CacheManager.init(ctx.gpa, cache_config, ctx.coreCtx());
-        build_env.setCacheManager(cache_manager);
-    }
+    if (cache_config.enabled) try build_env.enableDefaultCacheManager(cache_config.verbose);
 
     if (isCompilerOwnedBuiltinSourcePath(ctx.gpa, ctx.io.std_io, filepath)) {
         build_env.setRootModuleRole(.builtin);
@@ -13690,7 +13657,7 @@ fn finishRocCheck(
         if (check_result.error_count > 0) {
             return error.CheckFailed;
         } else {
-            std.process.exit(2);
+            exitOnWarnings(ctx, check_result.warning_count);
         }
     } else {
         stdout.print("No errors found in ", .{}) catch {};
