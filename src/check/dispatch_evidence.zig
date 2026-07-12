@@ -146,21 +146,6 @@ pub fn enumerateEvidenceParams(
     }
 }
 
-/// The canonical index of `dispatcher_root`'s `fn_name` constraint within
-/// `params`, or null.
-pub fn paramIndex(
-    params: []const EvidenceParam,
-    dispatcher_root: Var,
-    fn_name: anytype,
-) ?u32 {
-    for (params, 0..) |param, k| {
-        if (param.dispatcher_var == dispatcher_root and param.constraint.fn_name.eql(fn_name)) {
-            return @intCast(k);
-        }
-    }
-    return null;
-}
-
 fn walk(
     gpa: Allocator,
     store: *const types_mod.Store,
@@ -217,9 +202,9 @@ fn walk(
                 .nominal_type => |nominal| {
                     // A nominal application's structure is its args; backing
                     // structure is declaration data and is not part of the
-                    // scheme's type graph. (`.nominal_backing` path steps are
-                    // no longer produced; the kind remains for alias-style
-                    // walkers and old artifacts.)
+                    // scheme's type graph, so this enumerator never emits a
+                    // `.nominal_backing` step (consumers treat that kind
+                    // exactly like `.alias_backing`).
                     scratch.children.clearRetainingCapacity();
                     for (store.sliceNominalArgs(nominal), 0..) |arg, i| {
                         try scratch.children.append(gpa, .{ .var_ = arg, .step = step(.nominal_arg, @intCast(i)) });

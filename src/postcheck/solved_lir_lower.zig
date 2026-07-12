@@ -6573,7 +6573,7 @@ const Lowerer = struct {
         }
 
         if (lhs.builtin_owner) |owner| {
-            if (generatedEvidenceOwnerUsesBacking(owner)) {
+            if (MonoType.generatedEvidenceOwnerUsesBacking(owner)) {
                 const lhs_backing = lhs.backing orelse return rhs.backing == null;
                 const rhs_backing = rhs.backing orelse return false;
                 return try self.publicTypesEquivalent(lhs_backing.ty, rhs_backing.ty, visited);
@@ -6581,15 +6581,6 @@ const Lowerer = struct {
         }
 
         return true;
-    }
-
-    fn generatedEvidenceOwnerUsesBacking(owner: check.StaticDispatchRegistry.BuiltinOwner) bool {
-        return switch (owner) {
-            .fields,
-            .parse_tag_union_spec,
-            => true,
-            else => false,
-        };
     }
 
     fn publicTypeSpansEquivalent(

@@ -1984,7 +1984,11 @@ fn writeBytes(hasher: *std.crypto.hash.sha2.Sha256, bytes: []const u8) void {
     hasher.update(bytes);
 }
 
-fn generatedEvidenceOwnerUsesBacking(owner: static_dispatch.BuiltinOwner) bool {
+/// Whether a builtin owner is a compiler-generated evidence carrier whose
+/// backing structure distinguishes otherwise same-named applications: the
+/// backing then participates in type digests, identity comparison, and
+/// public-type equivalence. One definition serves every postcheck stage.
+pub fn generatedEvidenceOwnerUsesBacking(owner: static_dispatch.BuiltinOwner) bool {
     return switch (owner) {
         .fields,
         .field,

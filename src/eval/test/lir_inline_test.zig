@@ -2798,6 +2798,37 @@ test "dispatch evidence boundary validator names the method of a dangling eviden
     try std.testing.expectEqualStrings(corrupted_method.?, named_method);
 }
 
+test "dispatch evidence boundary validator reports a site-evidence key outside the body store" {
+    const allocator = std.testing.allocator;
+    // A where-constrained helper instantiated at a concrete type gives the
+    // instantiation site a site-evidence entry to corrupt.
+    const source =
+        \\module [main]
+        \\
+        \\Thing := [Val(Str)].{
+        \\    to_str : Thing -> Str
+        \\    to_str = |Thing.Val(s)| s
+        \\}
+        \\
+        \\helper : a -> Str where [a.to_str : a -> Str]
+        \\helper = |x| x.to_str()
+        \\
+        \\main : Str
+        \\main = helper(Thing.Val("hi"))
+    ;
+    var resources = try helpers.parseAndCanonicalizeProgramWithBuiltin(allocator, .module, source, &.{}, try sharedPrePublishedBuiltin());
+    defer helpers.cleanupParseAndCanonical(allocator, resources);
+
+    const table = &resources.checked_artifact.static_dispatch_plans;
+    try std.testing.expect(table.site_evidence.len > 0);
+    table.site_evidence[0].key = @intCast(resources.checked_artifact.checked_bodies.exprCount());
+
+    const failure = resources.checked_artifact.validateDispatchEvidence() orelse
+        return error.TestUnexpectedResult;
+    try std.testing.expectEqual(check.CheckedArtifact.DispatchEvidenceFailure.Kind.site_evidence_key_out_of_bounds, failure.kind);
+    try std.testing.expectEqual(@as(?u32, 0), failure.index);
+}
+
 test "compiler-generated dispatch classes lower via checked evidence" {
     const allocator = std.testing.allocator;
     // One program exercising every compiler-generated dispatch class served

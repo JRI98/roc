@@ -17728,11 +17728,13 @@ const BodyContext = struct {
             .structural => null,
         };
     }
+    /// Text-keyed view of `static_dispatch.structural_method_kinds`, for
+    /// classifying a checked module view's method names during component
+    /// synthesis.
     fn structuralKindForMethodText(method_text: []const u8) ?static_dispatch.StructuralKind {
-        if (std.mem.eql(u8, method_text, "is_eq")) return .equality;
-        if (std.mem.eql(u8, method_text, "to_hash")) return .hash;
-        if (std.mem.eql(u8, method_text, "parser_for")) return .parser;
-        if (std.mem.eql(u8, method_text, "encoder_for")) return .encoder;
+        inline for (static_dispatch.structural_method_kinds) |entry| {
+            if (std.mem.eql(u8, method_text, entry.name)) return entry.kind;
+        }
         return null;
     }
 

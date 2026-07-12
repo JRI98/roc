@@ -1767,14 +1767,7 @@ fn generatedBackingScore(content: Type.Content) ?u8 {
 }
 
 fn isGeneratedOpaqueEvidenceOwner(owner: ?static_dispatch.BuiltinOwner) bool {
-    const actual = owner orelse return false;
-    return switch (actual) {
-        .fields,
-        .field,
-        .parse_tag_union_spec,
-        => true,
-        else => false,
-    };
+    return MonoType.generatedEvidenceOwnerUsesBacking(owner orelse return false);
 }
 
 fn sameMonoTypeDef(left: MonoType.TypeDef, right: MonoType.TypeDef) bool {
