@@ -61,33 +61,6 @@ pub fn regionIsMultiline(self: *AST, region: TokenizedRegion) bool {
         }
     }
 
-    // Also check for trailing comma patterns that indicate multiline
-    var i = region.start;
-    const tags = self.tokens.tokens.items(.tag);
-    while (i < region.end) {
-        if (tags[i] == .Comma and i + 1 < self.tokens.tokens.len) {
-            const next_tag = tags[i + 1];
-            if (next_tag == .CloseSquare or next_tag == .CloseRound or next_tag == .CloseCurly) {
-                return true;
-            }
-            // For OpBar, we need to distinguish between:
-            // - Closing bar (trailing comma): |x, y,| body
-            // - Opening bar (NOT trailing): fn(a, |x| body)
-            // Check the token after the bar to determine which case this is
-            if (next_tag == .OpBar and i + 2 < self.tokens.tokens.len) {
-                const after_bar = tags[i + 2];
-                // If what follows is a lambda parameter, the bar is opening (not a trailing comma)
-                const is_opening_bar = switch (after_bar) {
-                    .LowerIdent, .UpperIdent, .Underscore, .OpenRound, .OpenSquare, .OpenCurly => true,
-                    else => false,
-                };
-                if (!is_opening_bar) {
-                    return true;
-                }
-            }
-        }
-        i += 1;
-    }
     return false;
 }
 
@@ -1721,9 +1694,17 @@ pub const Unary = struct {
 };
 
 /// Represents a delimited collection of other nodes
+/// Records the source-requested layout of a comma-separated construct.
+pub const CollectionLayout = enum(u8) {
+    compact,
+    expanded,
+};
+
+/// A delimited span of AST nodes and its explicitly requested layout.
 pub const Collection = struct {
     span: base.DataSpan,
     region: TokenizedRegion,
+    layout: CollectionLayout = .compact,
 
     pub const Idx = enum(u32) { _ };
 };
@@ -2227,6 +2208,7 @@ pub const SymbolMapEntry = struct {
     pub const Span = struct {
         span: base.DataSpan,
         region: TokenizedRegion = TokenizedRegion.empty(),
+        layout: CollectionLayout = .compact,
     };
 };
 
@@ -2242,7 +2224,7 @@ pub const TargetEntry = struct {
 
 /// File item in target list
 pub const TargetFile = union(enum) {
-    string_literal: Token.Idx, // "crt1.o"
+    string_literal: ?Token.Idx, // Content token for "crt1.o"; null for ""
     special_ident: Token.Idx, // app, win_gui
     malformed: struct { reason: Diagnostic.Tag, region: TokenizedRegion },
 
@@ -2271,7 +2253,7 @@ pub const TargetConfigEntry = struct {
 /// Literal or top-level identifier syntax accepted in target configuration.
 pub const TargetConfigValue = union(enum) {
     int_literal: Token.Idx,
-    string_literal: Token.Idx,
+    string_literal: ?Token.Idx,
     tag_literal: Token.Idx,
     ident: Token.Idx,
     list: TargetConfigValue.Span,

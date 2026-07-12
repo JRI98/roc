@@ -297,11 +297,7 @@ MyList : List(Str)
 MyDict : Dict(Str, U64)
 
 # Complex nested type using multiple declared types
-Complex : {
-	person : Person,
-	result : Try(Bool, Str),
-	tree : Tree(U64),
-}
+Complex : { person : Person, result : Try(Bool, Str), tree : Tree(U64) }
 ~~~
 # CANONICALIZE
 ~~~clojure

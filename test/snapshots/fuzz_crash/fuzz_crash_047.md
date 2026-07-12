@@ -45,10 +45,7 @@ EndOfFile,
 ~~~roc
 person = { name: "Alice", age: 30 }
 
-updated = {
-	..person,
-	age: 31,
-}
+updated = { ..person, age: 31 }
 ~~~
 # CANONICALIZE
 ~~~clojure

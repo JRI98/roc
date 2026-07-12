@@ -411,6 +411,7 @@ pub fn addCollection(store: *NodeStore, tag: Node.Tag, collection: AST.Collectio
             .rhs = collection.span.len,
         },
         .region = collection.region,
+        .collection_layout = collection.layout,
     });
     return @enumFromInt(@intFromEnum(nid));
 }
@@ -456,7 +457,7 @@ pub fn addHeader(store: *NodeStore, header: AST.Header) std.mem.Allocator.Error!
             node.tag = .platform_header;
             node.main_token = platform.name;
 
-            const ed_start = try store.reserveExtraDataStart(13);
+            const ed_start = try store.reserveExtraDataStart(14);
             // Store requires_entries span (start and len)
             store.extra_data.appendAssumeCapacity(platform.requires_entries.span.start);
             store.extra_data.appendAssumeCapacity(platform.requires_entries.span.len);
@@ -470,10 +471,13 @@ pub fn addHeader(store: *NodeStore, header: AST.Header) std.mem.Allocator.Error!
             store.extra_data.appendAssumeCapacity(platform.hosted.span.len);
             store.extra_data.appendAssumeCapacity(platform.hosted.region.start);
             store.extra_data.appendAssumeCapacity(platform.hosted.region.end);
+            const symbol_map_layouts: u32 = @intFromEnum(platform.provides.layout) |
+                (@as(u32, @intFromEnum(platform.hosted.layout)) << 8);
+            store.extra_data.appendAssumeCapacity(symbol_map_layouts);
             store.extra_data.appendAssumeCapacity(try packOptionalIndex(platform.targets));
 
             node.data.lhs = ed_start;
-            node.data.rhs = 13;
+            node.data.rhs = 14;
 
             node.region = platform.region;
         },
@@ -1422,7 +1426,18 @@ pub fn getCollection(store: *const NodeStore, collection_idx: AST.Collection.Idx
             .len = node.data.rhs,
         },
         .region = node.region,
+        .layout = node.collection_layout,
     };
+}
+
+/// Sets the parser-produced layout fact for a collection-owning node.
+pub fn setCollectionLayout(store: *NodeStore, idx: anytype, layout: AST.CollectionLayout) void {
+    store.nodes.items.items(.collection_layout)[@intFromEnum(idx)] = layout;
+}
+
+/// Returns the parser-produced layout fact for a collection-owning node.
+pub fn getCollectionLayout(store: *const NodeStore, idx: anytype) AST.CollectionLayout {
+    return store.nodes.items.items(.collection_layout)[@intFromEnum(idx)];
 }
 
 /// Retrieves header data from a stored header node, reconstructing the appropriate header type.
@@ -1458,9 +1473,10 @@ pub fn getHeader(store: *const NodeStore, header_idx: AST.Header.Idx) AST.Header
         },
         .platform_header => {
             const ed_start = node.data.lhs;
-            std.debug.assert(node.data.rhs == 13);
+            std.debug.assert(node.data.rhs == 14);
 
-            const targets_val = store.extra_data.items[ed_start + 12];
+            const symbol_map_layouts = store.extra_data.items[ed_start + 12];
+            const targets_val = store.extra_data.items[ed_start + 13];
             const targets = unpackOptionalIndex(AST.TargetsSection.Idx, targets_val);
 
             return .{ .platform = .{
@@ -1477,14 +1493,14 @@ pub fn getHeader(store: *const NodeStore, header_idx: AST.Header.Idx) AST.Header
                 }, .region = .{
                     .start = store.extra_data.items[ed_start + 6],
                     .end = store.extra_data.items[ed_start + 7],
-                } },
+                }, .layout = @enumFromInt(symbol_map_layouts & 0xff) },
                 .hosted = .{ .span = .{
                     .start = store.extra_data.items[ed_start + 8],
                     .len = store.extra_data.items[ed_start + 9],
                 }, .region = .{
                     .start = store.extra_data.items[ed_start + 10],
                     .end = store.extra_data.items[ed_start + 11],
-                } },
+                }, .layout = @enumFromInt((symbol_map_layouts >> 8) & 0xff) },
                 .targets = targets,
                 .region = node.region,
             } };
@@ -3008,9 +3024,10 @@ pub fn addTargetFile(store: *NodeStore, file: AST.TargetFile) std.mem.Allocator.
     };
 
     switch (file) {
-        .string_literal => |tok| {
+        .string_literal => |maybe_tok| {
             node.tag = .target_file_string;
-            node.main_token = tok;
+            node.data.lhs = @intFromBool(maybe_tok != null);
+            if (maybe_tok) |tok| node.main_token = tok;
         },
         .special_ident => |tok| {
             node.tag = .target_file_ident;
@@ -3071,8 +3088,9 @@ pub fn addTargetConfigValue(store: *NodeStore, value: AST.TargetConfigValue) std
             node.main_token = tok;
             node.data.lhs = @intFromEnum(TargetConfigValueNodeTag.int_literal);
         },
-        .string_literal => |tok| {
-            node.main_token = tok;
+        .string_literal => |maybe_tok| {
+            node.data.rhs = @intFromBool(maybe_tok != null);
+            if (maybe_tok) |tok| node.main_token = tok;
             node.data.lhs = @intFromEnum(TargetConfigValueNodeTag.string_literal);
         },
         .tag_literal => |tok| {
@@ -3246,7 +3264,7 @@ pub fn clearScratchSymbolMapEntriesFrom(store: *NodeStore, start: u32) void {
 }
 
 /// Creates a SymbolMapEntry span from scratch entries added since start.
-pub fn symbolMapEntrySpanFrom(store: *NodeStore, start: u32, region: AST.TokenizedRegion) std.mem.Allocator.Error!AST.SymbolMapEntry.Span {
+pub fn symbolMapEntrySpanFrom(store: *NodeStore, start: u32, region: AST.TokenizedRegion, layout: AST.CollectionLayout) std.mem.Allocator.Error!AST.SymbolMapEntry.Span {
     const end = store.scratch_symbol_map_entries.top();
     defer store.scratch_symbol_map_entries.clearFrom(start);
     var i = @as(usize, @intCast(start));
@@ -3255,7 +3273,7 @@ pub fn symbolMapEntrySpanFrom(store: *NodeStore, start: u32, region: AST.Tokeniz
         try store.extra_data.append(store.gpa, @intFromEnum(store.scratch_symbol_map_entries.items.items[i]));
         i += 1;
     }
-    return .{ .span = .{ .start = ed_start, .len = @as(u32, @intCast(end)) - start }, .region = region };
+    return .{ .span = .{ .start = ed_start, .len = @as(u32, @intCast(end)) - start }, .region = region, .layout = layout };
 }
 
 /// Returns a SymbolMapEntry slice for iteration over a span.
@@ -3318,7 +3336,7 @@ pub fn getTargetFile(store: *const NodeStore, idx: AST.TargetFile.Idx) AST.Targe
 
     switch (node.tag) {
         .target_file_string => {
-            return .{ .string_literal = node.main_token };
+            return .{ .string_literal = if (node.data.lhs != 0) node.main_token else null };
         },
         .target_file_ident => {
             return .{ .special_ident = node.main_token };
@@ -3366,7 +3384,7 @@ pub fn getTargetConfigValue(store: *const NodeStore, idx: AST.TargetConfigValue.
     const tag: TargetConfigValueNodeTag = @enumFromInt(node.data.lhs);
     return switch (tag) {
         .int_literal => .{ .int_literal = node.main_token },
-        .string_literal => .{ .string_literal = node.main_token },
+        .string_literal => .{ .string_literal = if (node.data.rhs != 0) node.main_token else null },
         .tag_literal => .{ .tag_literal = node.main_token },
         .ident => .{ .ident = node.main_token },
         .list => blk: {

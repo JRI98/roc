@@ -98,10 +98,7 @@ EndOfFile,
 ~~~
 # FORMATTED
 ~~~roc
-hosted [
-	a!,
-	b!,
-]
+hosted [a!, b!]
 
 a! : Str => Str
 

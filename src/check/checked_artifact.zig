@@ -20828,10 +20828,15 @@ fn topLevelDefSourceName(
     names: *canonical.CanonicalNameStore,
     def: TypedCIR.Def,
 ) Allocator.Error!?canonical.ExportNameId {
-    switch (def.pattern.data) {
-        .assign => |assign| return try names.internExportIdent(module.identStoreConst(), assign.ident),
-        else => return null,
-    }
+    const ident = topLevelDefSourceIdent(def) orelse return null;
+    return try names.internExportIdent(module.identStoreConst(), ident);
+}
+
+fn topLevelDefSourceIdent(def: TypedCIR.Def) ?base.Ident.Idx {
+    return switch (def.pattern.data) {
+        .assign => |assign| assign.ident,
+        else => null,
+    };
 }
 
 fn publishProvidesMetadata(
@@ -21564,6 +21569,7 @@ pub const CompileTimeRootTable = struct {
         const module_env = module.moduleEnvConst();
         for (global_value_defs) |def_idx| {
             const def = module.def(def_idx);
+            if (topLevelDefSourceIdent(def) == null) continue;
             if (procedure_templates.lookupByDef(def_idx) != null) continue;
 
             const source_ty = module.defType(def_idx);

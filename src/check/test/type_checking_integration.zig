@@ -2001,7 +2001,7 @@ test "check type - tuple access on non-tuple does not cascade" {
         \\z : U64
         \\z = x
     ;
-    try checkTypesModule(source, .fail, "Type Mismatch");
+    try checkTypesModule(source, .fail, "Invalid Tuple Access");
 }
 
 test "check type - if else - annotated branch mismatch reports error" {

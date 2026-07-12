@@ -115,15 +115,7 @@ EndOfFile,
 ~~~
 # FORMATTED
 ~~~roc
-package
-	[
-		a!,
-		b!,
-	]
-	{
-		a: "a",
-		b: "b",
-	}
+package [a!, b!] { a: "a", b: "b" }
 
 a! : Str => Str
 

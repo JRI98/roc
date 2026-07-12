@@ -1,29 +1,29 @@
 # META
 ~~~ini
-description=Formatter idempotence test for issue 8851 comment 3 - dispatch with space before field access
-type=snippet
+description=parser formatter output instability (stable idempotence)
+type=file
 ~~~
 # SOURCE
 ~~~roc
-a=0->b .c()
+a=(0->b .c())
 ~~~
 # EXPECTED
-NAME NOT IN SCOPE - formatter_idempotence_issue_8851_comment3.md:1:6:1:7
+NAME NOT IN SCOPE - fuzz_crash_087.md:1:7:1:8
 # PROBLEMS
 
 ┌───────────────────┐
 │ NAME NOT IN SCOPE ├─ Nothing is named `b` in this scope. ───────────────────┐
 └┬──────────────────┘                                                         │
  │                                                                            │
- │  a=0->b .c()                                                               │
- │       ‾                                                                    │
- └────────────────────────── formatter_idempotence_issue_8851_comment3.md:1:6 ┘
+ │  a=(0->b .c())                                                             │
+ │        ‾                                                                   │
+ └───────────────────────────────────────────────────── fuzz_crash_087.md:1:7 ┘
 
     Is it misspelled, or is there an import missing?
 
 # TOKENS
 ~~~zig
-LowerIdent,OpAssign,Int,OpArrow,LowerIdent,DotLowerIdent,NoSpaceOpenRound,CloseRound,
+LowerIdent,OpAssign,NoSpaceOpenRound,Int,OpArrow,LowerIdent,DotLowerIdent,NoSpaceOpenRound,CloseRound,CloseRound,
 EndOfFile,
 ~~~
 # PARSE
@@ -33,16 +33,17 @@ EndOfFile,
 	(statements
 		(s-decl
 			(p-ident (raw "a"))
-			(e-method-call (method ".c")
-				(receiver
-					(e-arrow-call
-						(e-int (raw "0"))
-						(e-ident (raw "b"))))
-				(args)))))
+			(e-tuple
+				(e-method-call (method ".c")
+					(receiver
+						(e-arrow-call
+							(e-int (raw "0"))
+							(e-ident (raw "b"))))
+					(args))))))
 ~~~
 # FORMATTED
 ~~~roc
-a = (0->b()).c()
+a = ((0->b()).c())
 ~~~
 # CANONICALIZE
 ~~~clojure

@@ -3508,25 +3508,6 @@ fn validateNominalDeclRecursion(self: *Self) std.mem.Allocator.Error!void {
     }
 }
 
-fn expectedTupleVarForAccess(
-    self: *Self,
-    min_elems: u32,
-    env: *Env,
-    region: Region,
-) Allocator.Error!Var {
-    const scratch_vars_top = self.scratch_vars.top();
-    defer self.scratch_vars.clearFrom(scratch_vars_top);
-
-    for (0..min_elems) |_| {
-        const fresh_var = try self.fresh(env, region);
-        try self.scratch_vars.append(fresh_var);
-    }
-    const elem_vars = try self.types.appendVars(self.scratch_vars.sliceFromStart(scratch_vars_top));
-    return try self.freshFromContent(.{ .structure = .{
-        .tuple = .{ .elems = elem_vars },
-    } }, env, region);
-}
-
 fn resolvePendingTupleAccess(
     self: *Self,
     pending: PendingTupleAccess,
@@ -3541,15 +3522,21 @@ fn resolvePendingTupleAccess(
                 if (pending.elem_index < elems.len) {
                     _ = try self.unify(pending.result_var, elems[pending.elem_index], env);
                 } else {
-                    const expected_tuple_var = try self.expectedTupleVarForAccess(pending.elem_index + 1, env, pending.region);
-                    _ = try self.unify(expected_tuple_var, pending.tuple_var, env);
+                    _ = try self.problems.appendProblem(self.gpa, .{ .invalid_tuple_access = .{
+                        .region = pending.region,
+                        .elem_index = pending.elem_index,
+                        .reason = .{ .index_out_of_bounds = @intCast(elems.len) },
+                    } });
                     try self.unifyWith(pending.result_var, .err, env);
                 }
                 return true;
             },
             else => {
-                const expected_tuple_var = try self.expectedTupleVarForAccess(pending.elem_index + 1, env, pending.region);
-                _ = try self.unify(pending.tuple_var, expected_tuple_var, env);
+                _ = try self.problems.appendProblem(self.gpa, .{ .invalid_tuple_access = .{
+                    .region = pending.region,
+                    .elem_index = pending.elem_index,
+                    .reason = .not_tuple,
+                } });
                 try self.unifyWith(pending.result_var, .err, env);
                 return true;
             },

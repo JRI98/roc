@@ -1402,7 +1402,16 @@ pub const Tokenizer = struct {
                         } else if (n >= '0' and n <= '9') {
                             self.cursor.pos += 1;
                             self.cursor.chompInteger();
-                            try self.pushTokenNormalHere(gpa, if (sp) .DotInt else .NoSpaceDotInt, start);
+                            var tag: Token.Tag = if (sp) .DotInt else .NoSpaceDotInt;
+                            const suffix_start = self.cursor.pos;
+                            const suffix_tag = self.cursor.chompNumberSuffix(tag);
+                            if (self.cursor.pos != suffix_start) {
+                                tag = if (suffix_tag == .MalformedNumberUnicodeSuffix)
+                                    .MalformedNumberUnicodeSuffix
+                                else
+                                    .MalformedNumberBadSuffix;
+                            }
+                            try self.pushTokenNormalHere(gpa, tag, start);
                         } else if (n >= 'a' and n <= 'z') {
                             var tag: Token.Tag = if (sp) .DotLowerIdent else .NoSpaceDotLowerIdent;
                             self.cursor.pos += 1;
@@ -3023,6 +3032,11 @@ test "number suffixes" {
     // unknown suffix rather than silently accepted and ignored.
     try testTokenization(gpa, "123nat", &[_]Token.Tag{.MalformedNumberBadSuffix});
     try testTokenization(gpa, "123xyz", &[_]Token.Tag{.MalformedNumberBadSuffix});
+
+    // Tuple indexes cannot have numeric-literal suffixes. Consume the whole
+    // malformed token so the digit prefix cannot become a tuple access.
+    try testTokenization(gpa, "x.70000c", &[_]Token.Tag{ .LowerIdent, .MalformedNumberBadSuffix });
+    try testTokenization(gpa, "x.0u8", &[_]Token.Tag{ .LowerIdent, .MalformedNumberBadSuffix });
 }
 
 test "malformed unicode identifiers" {

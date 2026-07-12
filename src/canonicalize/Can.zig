@@ -1306,15 +1306,18 @@ fn activeDeclScopeDeclaresType(self: *Self, ident: Ident.Idx) ?ActiveDeclTypeEnt
         // The alias whose annotation is being canonicalized never satisfies
         // that annotation's own lookups; fall through to any shadowed
         // declaration of the same name.
-        if (self.defining_assoc_alias) |defining| {
-            if (entry.decl_idx == defining.parser_decl_idx) {
-                maybe_entry_idx = entry.previous;
-                continue;
-            }
+        if (self.parserDeclIsDefiningAssocAlias(entry.decl_idx)) {
+            maybe_entry_idx = entry.previous;
+            continue;
         }
         return entry;
     }
     return null;
+}
+
+fn parserDeclIsDefiningAssocAlias(self: *const Self, decl_idx: AST.DeclIndex.DeclIdx) bool {
+    const defining = self.defining_assoc_alias orelse return false;
+    return decl_idx == defining.parser_decl_idx;
 }
 
 fn parserTypeDeclCanPrepare(self: *const Self, decl: AST.DeclIndex.Decl) bool {
@@ -2740,6 +2743,7 @@ fn ensureParserTypeBinding(
     if (try self.parserTypePathForQualifiedIdent(ident_idx)) |path| {
         var decl_iter = self.parse_ir.decl_index.typeDeclsForPath(path).iter();
         while (decl_iter.next()) |decl_idx| {
+            if (self.parserDeclIsDefiningAssocAlias(decl_idx)) continue;
             const decl = self.parse_ir.decl_index.decls.items[@intFromEnum(decl_idx)];
             if (!self.parserTypeDeclCanPrepare(decl)) continue;
             if (self.activeWholeScopeBindingForDeclScope(decl.scope)) |binding| {
@@ -2755,6 +2759,7 @@ fn ensureParserTypeBinding(
         if (self.visibleParserTypePathForSegments(&segments)) |path| {
             var decl_iter = self.parse_ir.decl_index.typeDeclsForPath(path).iter();
             while (decl_iter.next()) |decl_idx| {
+                if (self.parserDeclIsDefiningAssocAlias(decl_idx)) continue;
                 const decl = self.parse_ir.decl_index.decls.items[@intFromEnum(decl_idx)];
                 if (!self.parserTypeDeclCanPrepare(decl)) continue;
                 if (self.activeWholeScopeBindingForDeclScope(decl.scope)) |binding| {

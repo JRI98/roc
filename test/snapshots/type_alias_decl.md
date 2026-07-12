@@ -276,10 +276,7 @@ Color : [Red, Green, Blue, Custom(U8, U8, U8)]
 Letters : [A, B, ..]
 
 # Type declaration with records and generics
-Container(item) : {
-	contents : List(item),
-	metadata : { size : U64, created : Str },
-}
+Container(item) : { contents : List(item), metadata : { size : U64, created : Str } }
 
 main! = |_| {
 	# Use the types to validate they work

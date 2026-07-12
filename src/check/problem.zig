@@ -39,6 +39,7 @@ pub const NumberDoesNotFit = types.NumberDoesNotFit;
 pub const NegativeUnsignedInt = types.NegativeUnsignedInt;
 pub const InvalidNumericLiteral = types.InvalidNumericLiteral;
 pub const TupleAccessNeedsAnnotation = types.TupleAccessNeedsAnnotation;
+pub const InvalidTupleAccess = types.InvalidTupleAccess;
 pub const LiteralDefaulted = types.LiteralDefaulted;
 pub const UnusedValue = types.UnusedValue;
 

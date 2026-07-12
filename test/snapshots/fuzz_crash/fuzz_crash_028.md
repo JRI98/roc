@@ -2621,9 +2621,7 @@ ma = |_| { # Yee
 	return # d
 		tag
 	
-	match_time(
-		...,
-	)
+	match_time(...)
 	nc(
 		dbg # bug
 			2,

@@ -16,6 +16,7 @@ tag: Tag,
 data: Data,
 main_token: TokenIdx,
 region: AST.TokenizedRegion,
+collection_layout: AST.CollectionLayout = .compact,
 
 /// A SafeMultiList of Nodes
 pub const List = collections.SafeMultiList(Node);

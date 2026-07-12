@@ -91,6 +91,7 @@ const ComptimeEvalError = problem_mod.ComptimeEvalError;
 // Number errors
 const InvalidNumericLiteral = problem_mod.InvalidNumericLiteral;
 const TupleAccessNeedsAnnotation = problem_mod.TupleAccessNeedsAnnotation;
+const InvalidTupleAccess = problem_mod.InvalidTupleAccess;
 const LiteralDefaulted = problem_mod.LiteralDefaulted;
 
 // Generic errors
@@ -930,6 +931,7 @@ pub const ReportBuilder = struct {
             .comptime_eval_error => |data| return self.buildComptimeEvalErrorReport(data),
             .invalid_numeric_literal => |data| return self.buildInvalidNumericLiteralReport(data),
             .tuple_access_needs_annotation => |data| return self.buildTupleAccessNeedsAnnotationReport(data),
+            .invalid_tuple_access => |data| return self.buildInvalidTupleAccessReport(data),
             .literal_defaulted => |data| return self.buildLiteralDefaultedReport(data),
             .non_exhaustive_match => |data| return self.buildNonExhaustiveMatchReport(data),
             .non_exhaustive_destructure => |data| return self.buildNonExhaustiveDestructureReport(data),
@@ -2492,6 +2494,41 @@ pub const ReportBuilder = struct {
         try D.renderSlice(&.{
             D.bytes("The tuple's type is ambiguous here. One way to make it unambiguous is to add a type annotation for the tuple somewhere."),
         }, self, &report);
+
+        return report;
+    }
+
+    fn buildInvalidTupleAccessReport(
+        self: *Self,
+        data: InvalidTupleAccess,
+    ) Allocator.Error!Report {
+        var report = try Report.init(self.gpa, "Invalid Tuple Access", "", .runtime_error);
+        errdefer report.deinit();
+
+        const message = switch (data.reason) {
+            .not_tuple => try std.fmt.allocPrint(
+                self.gpa,
+                "This value is not a tuple, so it has no .{d} element.",
+                .{data.elem_index},
+            ),
+            .index_out_of_bounds => |tuple_length| try std.fmt.allocPrint(
+                self.gpa,
+                "This tuple has {d} elements, so it has no .{d} element.",
+                .{ tuple_length, data.elem_index },
+            ),
+        };
+        defer self.gpa.free(message);
+        const owned_message = try report.addOwnedString(message);
+        try D.renderSliceInto(&.{D.bytes(owned_message)}, self, &report, &report.headline);
+
+        const region_info = self.module_env.calcRegionInfo(data.region);
+        try report.document.addSourceRegion(
+            region_info,
+            .error_highlight,
+            self.filename,
+            self.source,
+            self.module_env.getLineStarts(),
+        );
 
         return report;
     }
