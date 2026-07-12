@@ -93,7 +93,7 @@ test "URL dependency resolves from a warm cache with no network, and its modules
     try std.testing.expect(!found_url_package_file);
 }
 
-test "issue 9509: transitive URL dependency compiles through the orchestration core from a warm cache" {
+test "transitive URL dependency compiles through the orchestration core from a warm cache" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
 
