@@ -3473,6 +3473,10 @@ const Formatter = struct {
                         fmt.nodesWillBeMultiline(AST.AnnoRecordField.Idx, fmt.ast.store.annoRecordFieldSlice(r.fields)),
                     .tag_union => |t| type_has_comment or fmt.ast.store.getCollectionLayout(item) == .expanded or
                         fmt.nodesWillBeMultiline(AST.TypeAnno.Idx, fmt.ast.store.typeAnnoSlice(t.tags)),
+                    .@"fn" => |f| type_has_comment or
+                        fmt.nodesWillBeMultiline(AST.TypeAnno.Idx, fmt.ast.store.typeAnnoSlice(f.args)) or
+                        fmt.nodeWillBeMultiline(AST.TypeAnno.Idx, f.ret),
+                    .parens => |p| type_has_comment or fmt.nodeWillBeMultiline(AST.TypeAnno.Idx, p.anno),
                     else => fmt.ast.regionIsMultiline(typeAnno.to_tokenized_region()),
                 };
             },
@@ -3621,6 +3625,24 @@ fn parseAndFmt(gpa: std.mem.Allocator, input: []const u8, debug: bool) FormatPar
 // Issue #8851: Formatter idempotence tests for arrow call with field access
 // These test cases verify that formatting is stable (idempotent) - formatting twice
 // produces the same output as formatting once.
+
+test "function type expands when its return type is multiline" {
+    const result = try moduleFmtsStable(
+        std.testing.allocator,
+        "r:(),(->c),(->d)->(c,)",
+        false,
+    );
+    defer std.testing.allocator.free(result);
+
+    try std.testing.expectEqualStrings(
+        \\r : (),
+        \\(() -> c),
+        \\(() -> d) -> (
+        \\    c,
+        \\)
+        \\
+    , result);
+}
 
 test "issue 8851: arrow call with space before field access is idempotent" {
     // a=0->b .c() should format stably with parentheses to disambiguate
