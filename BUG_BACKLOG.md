@@ -82,3 +82,71 @@
 - Repro command: `timeout 2s ./zig-out/bin/repro-canonicalize /tmp/canonicalize-min/min-id000013`
 - Minimal repro snapshot added:
   - `test/snapshots/fuzz_crash/fuzz_crash_088.md`
+
+## Unresolved GitHub parser/formatting issues (reproducible)
+- Date: 2026-07-12
+
+### [P3] GH-10097 unstable formatting
+- Severity: High
+- Issue: https://github.com/roc-lang/roc/issues/10097
+- Repro command: `zig build run-repro-parse -- -b ZT17MCMKLnt9fQ== -v`
+- Signature: `panic("Formatting not stable")` (`FormattingNotStable`)
+- Minimal repro snapshot added:
+  - `test/snapshots/fuzz_crash/fuzz_crash_089.md`
+
+### [P4] GH-10096 invalid formatting (`e={()\\` input)
+- Severity: High
+- Issue: https://github.com/roc-lang/roc/issues/10096
+- Repro command: `zig build run-repro-parse -- -b ZT17KClcXAoue2Z9e319 -v`
+- Signature: `panic("Parsing of formatter output failed")` (`SecondParseFailed`)
+- Minimal repro snapshot added:
+  - `test/snapshots/fuzz_crash/fuzz_crash_090.md`
+
+### [P5] GH-10055 unstable formatting (`a=(0->X .a)`)
+- Severity: High
+- Issue: https://github.com/roc-lang/roc/issues/10055
+- Repro command: `zig build run-repro-parse -- -b YT0oMC0+WCAuYSk= -v`
+- Signature: `panic("Formatting not stable")` (`FormattingNotStable`)
+- Minimal repro snapshot added:
+  - `test/snapshots/fuzz_crash/fuzz_crash_091.md`
+
+### [P6] GH-10056 unstable formatting (`d=(0->X .a)`)
+- Severity: High
+- Issue: https://github.com/roc-lang/roc/issues/10056
+- Repro command: `zig build run-repro-parse -- -b ZD0oMC0+WCAuYSk= -v`
+- Signature: `panic("Formatting not stable")` (`FormattingNotStable`)
+- Minimal repro snapshot added:
+  - `test/snapshots/fuzz_crash/fuzz_crash_092.md`
+
+### [P7] GH-10047 unstable formatting (`d=(0||())`)
+- Severity: High
+- Issue: https://github.com/roc-lang/roc/issues/10047
+- Repro command: `zig build run-repro-parse -- -b ZD0oMHx8KCkp -v`
+- Signature: `panic("Formatting not stable")` (`FormattingNotStable`)
+- Minimal repro snapshot added:
+  - `test/snapshots/fuzz_crash/fuzz_crash_093.md`
+
+### [P8] GH-10094 invalid formatting (`dapkage[e,E.a.*]{}`)
+- Severity: High
+- Issue: https://github.com/roc-lang/roc/issues/10094
+- Repro command: `zig build run-repro-parse -- -b ZGFwa2FnZVtlLEUuYS4qXXt9 -v`
+- Signature: formatter roundtrip returns parse diagnostics after formatter output (`statement_unexpected_token`, `expected_colon_after_type_annotation`)
+- Minimal repro snapshot added:
+  - `test/snapshots/fuzz_crash/fuzz_crash_094.md`
+
+### [P9] GH-10095 invalid formatting (`t=0->(0)()`)
+- Severity: High
+- Issue: https://github.com/roc-lang/roc/issues/10095
+- Repro command: `zig build run-repro-parse -- -b dD0wLT4oMCkoKQ== -v`
+- Signature: `panic("Parsing of formatter output failed")` (`SecondParseFailed`)
+- Minimal repro snapshot added:
+  - `test/snapshots/fuzz_crash/fuzz_crash_095.md`
+
+### [P10] GH-10092 parser/typecheck panic
+- Severity: High
+- Issue: https://github.com/roc-lang/roc/issues/10092
+- Repro command: `printf 'T := [].{\\n\\tA : T.A\\n}\\n' > /tmp/roc-10092.roc && ./zig-out/bin/roc check /tmp/roc-10092.roc`
+- Signature: `panic("unreachable, node is not a type annotation tag: .type_header")` (`unreachable`)
+- Note: this repro is not snapshot-tool generated because it currently panics during snapshot generation path; source is still captured in `fuzz_crash_096.md`.
+- Minimal repro snapshot added:
+  - `test/snapshots/fuzz_crash/fuzz_crash_096.md`
