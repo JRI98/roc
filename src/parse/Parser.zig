@@ -792,6 +792,7 @@ fn parseExposedItemTokens(self: *Parser) std.mem.Allocator.Error!AST.ExposedItem
                 return try self.store.addExposedItem(.{ .upper_ident_star = .{
                     .region = .{ .start = start, .end = self.pos },
                     .ident = ident,
+                    .qualifiers = qual_result.qualifiers,
                 } });
             }
             return try self.store.addExposedItem(.{ .upper_ident = .{

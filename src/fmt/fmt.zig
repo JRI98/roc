@@ -2153,6 +2153,10 @@ const Formatter = struct {
             },
             .upper_ident_star => |i| {
                 region = i.region;
+                for (fmt.ast.store.tokenSlice(i.qualifiers)) |qualifier| {
+                    try fmt.pushTokenText(qualifier);
+                    try fmt.push('.');
+                }
                 try fmt.pushTokenText(i.ident);
                 try fmt.pushAll(".*");
             },
