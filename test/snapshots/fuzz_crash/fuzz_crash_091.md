@@ -47,8 +47,7 @@ EndOfFile,
 ~~~
 # FORMATTED
 ~~~roc
-a = (0->X
-	.a)
+a = ((0->X).a)
 ~~~
 # CANONICALIZE
 ~~~clojure
