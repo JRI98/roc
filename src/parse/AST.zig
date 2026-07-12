@@ -2242,7 +2242,7 @@ pub const TargetEntry = struct {
 
 /// File item in target list
 pub const TargetFile = union(enum) {
-    string_literal: Token.Idx, // "crt1.o"
+    string_literal: ?Token.Idx, // Content token for "crt1.o"; null for ""
     special_ident: Token.Idx, // app, win_gui
     malformed: struct { reason: Diagnostic.Tag, region: TokenizedRegion },
 
@@ -2271,7 +2271,7 @@ pub const TargetConfigEntry = struct {
 /// Literal or top-level identifier syntax accepted in target configuration.
 pub const TargetConfigValue = union(enum) {
     int_literal: Token.Idx,
-    string_literal: Token.Idx,
+    string_literal: ?Token.Idx,
     tag_literal: Token.Idx,
     ident: Token.Idx,
     list: TargetConfigValue.Span,

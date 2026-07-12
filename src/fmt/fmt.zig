@@ -2284,9 +2284,9 @@ const Formatter = struct {
             .int_literal, .tag_literal, .ident => |token| {
                 try fmt.pushTokenText(token);
             },
-            .string_literal => |token| {
+            .string_literal => |maybe_token| {
                 try fmt.push('"');
-                try fmt.pushTokenText(token);
+                if (maybe_token) |token| try fmt.pushTokenText(token);
                 try fmt.push('"');
             },
             .list => |span| {
@@ -2319,9 +2319,9 @@ const Formatter = struct {
     fn formatTargetFile(fmt: *Formatter, file_idx: AST.TargetFile.Idx) error{WriteFailed}!void {
         const file = fmt.ast.store.getTargetFile(file_idx);
         switch (file) {
-            .string_literal => |token| {
+            .string_literal => |maybe_token| {
                 try fmt.push('"');
-                try fmt.pushTokenText(token);
+                if (maybe_token) |token| try fmt.pushTokenText(token);
                 try fmt.push('"');
             },
             .special_ident => |token| {

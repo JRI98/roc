@@ -329,8 +329,8 @@ pub const TargetsConfig = struct {
             const target_file = store.getTargetFile(file_idx);
 
             switch (target_file) {
-                .string_literal => |tok| {
-                    const path = ast.resolve(tok);
+                .string_literal => |maybe_tok| {
+                    const path = if (maybe_tok) |tok| ast.resolve(tok) else "";
                     try link_items.append(.{ .file_path = try allocator.dupe(u8, path) });
                 },
                 .special_ident => |tok| {
@@ -405,8 +405,8 @@ pub const TargetsConfig = struct {
                 if (std.mem.eql(u8, tag, "False")) break :blk false;
                 break :blk null;
             },
-            .string_literal => |tok| blk: {
-                const value = ast.resolve(tok);
+            .string_literal => |maybe_tok| blk: {
+                const value = if (maybe_tok) |tok| ast.resolve(tok) else "";
                 if (std.mem.eql(u8, value, "env.memory")) break :blk true;
                 break :blk null;
             },

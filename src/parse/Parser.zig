@@ -1487,8 +1487,11 @@ fn parseTargetFileTokens(self: *Parser) std.mem.Allocator.Error!AST.TargetFile.I
     switch (self.peek()) {
         .StringStart => {
             self.advance();
-            var content_tok = start;
-            if (self.peek() == .StringPart) {
+            var content_tok: ?Token.Idx = null;
+            if (switch (self.peek()) {
+                .StringPart, .MalformedStringPart, .MalformedInvalidUnicodeEscapeSequence, .MalformedInvalidEscapeSequence => true,
+                else => false,
+            }) {
                 content_tok = self.pos;
                 self.advance();
             }
@@ -1538,8 +1541,11 @@ fn parseTargetConfigValueTokens(self: *Parser) std.mem.Allocator.Error!AST.Targe
         },
         .StringStart => {
             self.advance();
-            var content_tok = start;
-            if (self.peek() == .StringPart) {
+            var content_tok: ?Token.Idx = null;
+            if (switch (self.peek()) {
+                .StringPart, .MalformedStringPart, .MalformedInvalidUnicodeEscapeSequence, .MalformedInvalidEscapeSequence => true,
+                else => false,
+            }) {
                 content_tok = self.pos;
                 self.advance();
             }

@@ -3008,9 +3008,10 @@ pub fn addTargetFile(store: *NodeStore, file: AST.TargetFile) std.mem.Allocator.
     };
 
     switch (file) {
-        .string_literal => |tok| {
+        .string_literal => |maybe_tok| {
             node.tag = .target_file_string;
-            node.main_token = tok;
+            node.data.lhs = @intFromBool(maybe_tok != null);
+            if (maybe_tok) |tok| node.main_token = tok;
         },
         .special_ident => |tok| {
             node.tag = .target_file_ident;
@@ -3071,8 +3072,9 @@ pub fn addTargetConfigValue(store: *NodeStore, value: AST.TargetConfigValue) std
             node.main_token = tok;
             node.data.lhs = @intFromEnum(TargetConfigValueNodeTag.int_literal);
         },
-        .string_literal => |tok| {
-            node.main_token = tok;
+        .string_literal => |maybe_tok| {
+            node.data.rhs = @intFromBool(maybe_tok != null);
+            if (maybe_tok) |tok| node.main_token = tok;
             node.data.lhs = @intFromEnum(TargetConfigValueNodeTag.string_literal);
         },
         .tag_literal => |tok| {
@@ -3318,7 +3320,7 @@ pub fn getTargetFile(store: *const NodeStore, idx: AST.TargetFile.Idx) AST.Targe
 
     switch (node.tag) {
         .target_file_string => {
-            return .{ .string_literal = node.main_token };
+            return .{ .string_literal = if (node.data.lhs != 0) node.main_token else null };
         },
         .target_file_ident => {
             return .{ .special_ident = node.main_token };
@@ -3366,7 +3368,7 @@ pub fn getTargetConfigValue(store: *const NodeStore, idx: AST.TargetConfigValue.
     const tag: TargetConfigValueNodeTag = @enumFromInt(node.data.lhs);
     return switch (tag) {
         .int_literal => .{ .int_literal = node.main_token },
-        .string_literal => .{ .string_literal = node.main_token },
+        .string_literal => .{ .string_literal = if (node.data.rhs != 0) node.main_token else null },
         .tag_literal => .{ .tag_literal = node.main_token },
         .ident => .{ .ident = node.main_token },
         .list => blk: {
