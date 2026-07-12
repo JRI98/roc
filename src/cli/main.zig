@@ -1916,7 +1916,6 @@ fn checkedInterpreterHostIdentity(
     return hasher.finalResult();
 }
 
-
 fn updateInterpreterExeFileLinkInput(
     hasher: *std.crypto.hash.sha2.Sha256,
     declared_path: []const u8,
@@ -2977,7 +2976,6 @@ fn writeDefaultAppSyntheticRunSource(ctx: *CliCtx, app_path: []const u8, origina
 
     try std.Io.Dir.cwd().writeFile(ctx.io.std_io, .{ .sub_path = app_path, .data = synthetic_source });
 }
-
 
 /// Run a default_app (headerless file with main! and echo platform).
 /// This compiles the app through checked artifacts and executes the resulting
@@ -5730,7 +5728,6 @@ pub fn buildLirImageWithBuildEnv(
     );
 }
 
-
 /// Platform resolution result containing the platform source path
 pub const PlatformPaths = struct {
     platform_source_path: ?[]const u8, // Optional - may not exist for some platforms
@@ -5955,7 +5952,6 @@ fn resolutionConfigFromLimits(limits: cli_args.ResolveLimitArgs) compile.package
     }
     return config;
 }
-
 
 const ResolvedUrlBundle = struct {
     source_path: []const u8,
