@@ -202,10 +202,12 @@ pub const BuildEnv = struct {
     /// declarations that are not part of a valid executable program.
     post_check_publication_mode: PostCheckPublicationMode = .executable_artifacts,
 
-    /// Whether executable artifacts were published for this build. Consumers
-    /// that lower to LIR must gate on this rather than re-deriving it from
-    /// error state: report ownership moves out of the coordinator when
-    /// compilation finishes, so coordinator error queries go stale.
+    /// Whether executable artifacts were published for this build AND every
+    /// accumulated error (if any) still permits lowering. Consumers that
+    /// lower to LIR must gate on this rather than re-deriving it from error
+    /// state: report ownership moves out of the coordinator when compilation
+    /// finishes, so coordinator error queries go stale. Recomputed after
+    /// finalization because finalization itself may append reports.
     executable_artifacts_finalized: bool = false,
 
     /// Compiler role to assign to the root module of this build.
@@ -851,23 +853,47 @@ pub const BuildEnv = struct {
             }
         }
 
-        // Run coordinator loop
-        try coord.coordinatorLoop();
+        // Run coordinator loop. On failure, still move whatever reports have
+        // accumulated into the ordered sink so callers can drain and render
+        // them before propagating the error.
+        self.executable_artifacts_finalized = false;
+        coord.coordinatorLoop() catch |err| {
+            self.emitAccumulatedReportsForError();
+            return err;
+        };
+        const allow_user_errors =
+            self.post_check_publication_mode == .executable_artifacts_allow_user_errors;
+        var finalized_executable = false;
         if (!coord.hasUserErrors()) {
             switch (self.post_check_publication_mode) {
                 .none => {},
-                .platform_relations => try coord.validatePlatformAppRelationsForCheck(),
+                .platform_relations => coord.validatePlatformAppRelationsForCheck() catch |err| {
+                    self.emitAccumulatedReportsForError();
+                    return err;
+                },
                 .executable_artifacts, .executable_artifacts_allow_user_errors => {
-                    try coord.finalizeExecutableArtifacts();
-                    self.executable_artifacts_finalized = true;
+                    coord.finalizeExecutableArtifacts() catch |err| {
+                        self.emitAccumulatedReportsForError();
+                        return err;
+                    };
+                    finalized_executable = true;
                 },
             }
-        } else if (self.post_check_publication_mode == .executable_artifacts_allow_user_errors and
-            coord.userErrorsAllowExecutableLowering())
-        {
-            try coord.finalizeExecutableArtifactsAllowUserErrors();
-            self.executable_artifacts_finalized = true;
+        } else if (allow_user_errors and coord.userErrorsAllowExecutableLowering()) {
+            coord.finalizeExecutableArtifactsAllowUserErrors() catch |err| {
+                self.emitAccumulatedReportsForError();
+                return err;
+            };
+            finalized_executable = true;
         }
+
+        // Finalization may append new reports (unresolved dispatch,
+        // non-lowerable defs, relation mismatches). Decide whether executable
+        // lowering may proceed now, before result transfer drains the
+        // Coordinator's per-module reports.
+        self.executable_artifacts_finalized = finalized_executable and
+            (!coord.hasUserErrors() or
+                (allow_user_errors and coord.userErrorsAllowExecutableLowering()));
 
         if (comptime trace_build) {
             std.debug.print("[BUILD] Coordinator loop complete, transferring results...\n", .{});
@@ -2064,6 +2090,14 @@ pub const BuildEnv = struct {
                 .import_name = try self.gpa.dupe(u8, qualified_name),
             });
         }
+    }
+
+    /// Move accumulated Coordinator reports into the ordered sink so callers
+    /// can still drain and render them after a hard compilation error.
+    /// Emission problems are ignored here - the original error propagates.
+    fn emitAccumulatedReportsForError(self: *BuildEnv) void {
+        self.transferCoordinatorResults() catch return;
+        self.emitDeterministic() catch return;
     }
 
     fn emitWorkspaceReport(self: *BuildEnv, title: []const u8, msg: []const u8) Allocator.Error!void {

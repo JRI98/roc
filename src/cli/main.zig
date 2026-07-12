@@ -3781,6 +3781,7 @@ fn buildHotReloadChildArgv(
         try appendOwnedArg(ctx.gpa, &argv, &owned, "--source-dir={s}", .{rewrite.source_dir_override});
     }
     if (args.max_threads) |jobs| try appendOwnedArg(ctx.gpa, &argv, &owned, "--jobs={}", .{jobs});
+    if (args.no_cache) try appendOwnedArg(ctx.gpa, &argv, &owned, "--no-cache={}", .{@as(u8, 1)});
     try appendResolveLimitArgs(ctx.gpa, &argv, &owned, args.resolve_limits);
 
     return .{
@@ -4967,6 +4968,7 @@ const HotReloadDevWorkerArgs = struct {
     synthetic_output_path: ?[]const u8,
     source_dir_override: ?[]const u8,
     max_threads: ?usize,
+    no_cache: bool,
     resolve_limits: cli_args.ResolveLimitArgs,
 };
 
@@ -5012,6 +5014,7 @@ fn parseHotReloadDevWorkerArgs(args: []const []const u8) error{InvalidArguments}
     var synthetic_output_path: ?[]const u8 = null;
     var source_dir_override: ?[]const u8 = null;
     var max_threads: ?usize = null;
+    var no_cache: bool = false;
     var resolve_limits = cli_args.ResolveLimitArgs{};
 
     for (args) |arg| {
@@ -5049,6 +5052,8 @@ fn parseHotReloadDevWorkerArgs(args: []const []const u8) error{InvalidArguments}
             source_dir_override = value;
         } else if (hotReloadFlagValue(arg, "--jobs")) |value| {
             max_threads = std.fmt.parseInt(usize, value, 10) catch return error.InvalidArguments;
+        } else if (hotReloadFlagValue(arg, "--no-cache")) |value| {
+            no_cache = try parseHotReloadBool(value);
         } else if (hotReloadFlagValue(arg, "--max-package-mb")) |value| {
             resolve_limits.max_package_mb = std.fmt.parseInt(u32, value, 10) catch return error.InvalidArguments;
         } else if (hotReloadFlagValue(arg, "--max-transitive-mb")) |value| {
@@ -5076,6 +5081,7 @@ fn parseHotReloadDevWorkerArgs(args: []const []const u8) error{InvalidArguments}
         .synthetic_output_path = synthetic_output_path,
         .source_dir_override = source_dir_override,
         .max_threads = max_threads,
+        .no_cache = no_cache,
         .resolve_limits = resolve_limits,
     };
 }
@@ -5132,7 +5138,7 @@ fn rocInternalHotReloadDev(ctx: *CliCtx, raw_args: []const []const u8) CliMainEr
         args.max_threads,
         .dev,
         resolutionConfigFromLimits(args.resolve_limits),
-        true,
+        !args.no_cache,
         null,
         false,
     );
@@ -6090,6 +6096,9 @@ fn discoverAndAddBundleModules(
     defer ctx.gpa.free(cwd);
     var build_env = try BuildEnv.init(ctx.gpa, .single_threaded, 1, RocTarget.detectNative(), cwd, ctx.io.std_io);
     defer build_env.deinit();
+    // Bundling compiles the workspace to discover transitive modules; it uses
+    // the checked-module cache like every other pipeline.
+    try build_env.enableDefaultCacheManager(false);
 
     // Run the build — the Coordinator discovers all transitive module dependencies
     build_env.build(abs_entry) catch {
@@ -12917,6 +12926,7 @@ fn rocGlue(ctx: *CliCtx, args: cli_args.GlueArgs) glue.GlueError!void {
         .glue_spec = args.glue_spec,
         .output_dir = args.output_dir,
         .platform_path = args.platform_path,
+        .no_cache = args.no_cache,
         .opt = switch (args.opt) {
             .dev => .dev,
             .interpreter => .interpreter,

@@ -63,6 +63,7 @@ pub const GlueArgs = struct {
     output_dir: []const u8,
     platform_path: []const u8,
     opt: GlueOpt = .dev,
+    no_cache: bool = false,
 };
 
 /// Error types for glue generation operations.
@@ -198,6 +199,10 @@ fn rocGlueInner(gpa: Allocator, stderr: *std.Io.Writer, stdout: *std.Io.Writer, 
     };
     defer build_env.deinit();
     build_env.setSyntheticRootPackageIdentity();
+    // Glue caches by default like every other pipeline; --no-cache opts out.
+    if (!args.no_cache) build_env.enableDefaultCacheManager(false) catch {
+        return error.BuildEnvInit;
+    };
 
     build_env.build(synthetic_app_path) catch {
         _ = try build_env.renderDiagnostics(stderr);
@@ -339,6 +344,9 @@ fn rocGlueInner(gpa: Allocator, stderr: *std.Io.Writer, stdout: *std.Io.Writer, 
         return error.BuildEnvInit;
     };
     defer glue_build_env.deinit();
+    if (!args.no_cache) glue_build_env.enableDefaultCacheManager(false) catch {
+        return error.BuildEnvInit;
+    };
 
     glue_build_env.build(glue_spec_abs) catch {
         _ = try glue_build_env.renderDiagnostics(stderr);
