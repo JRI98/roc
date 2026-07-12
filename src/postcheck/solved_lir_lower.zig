@@ -1283,6 +1283,20 @@ const Lowerer = struct {
     fn constPlanOfType(self: *Lowerer, ty: Type.TypeId) Common.LowerError!LirProgram.ConstPlanId {
         if (self.const_plan_map.get(ty)) |existing| return existing;
 
+        switch (self.types.get(ty)) {
+            .named => |named| {
+                if (named.kind == .alias) {
+                    // Aliases are transparent values. Reuse the backing plan so
+                    // ConstStore never records an alias as a nominal wrapper.
+                    const backing = named.backing orelse Common.invariant("alias without backing reached ConstStore plan output");
+                    const backing_plan = try self.constPlanOfType(backing.ty);
+                    try self.const_plan_map.put(ty, backing_plan);
+                    return backing_plan;
+                }
+            },
+            else => {},
+        }
+
         const id: LirProgram.ConstPlanId = @enumFromInt(@as(u32, @intCast(self.result.const_plans.items.len)));
         try self.result.const_plans.append(self.allocator, .pending);
         try self.const_plan_map.put(ty, id);
@@ -1367,6 +1381,7 @@ const Lowerer = struct {
                 break :blk .{ .tag_union = variants };
             },
             .named => |named| blk: {
+                if (named.kind == .alias) Common.invariant("alias reached named ConstStore plan construction");
                 const backing = named.backing orelse Common.invariant("named type without backing reached ConstStore plan output");
                 break :blk .{ .named = .{
                     .named_type = .{
