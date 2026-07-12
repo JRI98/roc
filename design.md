@@ -2347,8 +2347,9 @@ const DispatchOwnerHead = union(enum) {
 };
 ```
 
-`DispatchOwnerHead` is not stored as a duplicate field on every type node. It is
-the result of a total function over Monotype type content:
+`DispatchOwnerHead` is not stored as a duplicate field on every type node. It
+is read from type content on demand (the alias-transparent
+`dispatchHeadContent` accessor plus the component-lookup seam's key builder):
 
 ```zig
 fn dispatchOwnerHead(types: *const TypeStore, ty: TypeId) DispatchOwnerHead
@@ -2358,6 +2359,12 @@ Builtin type content returns the corresponding builtin owner. `named` type
 content returns `type_def` when the definition can own methods, even if
 its runtime representation later uses a transparent backing. Anonymous
 structural types and non-owning internal nodes return `none`.
+
+This head is only ever a lookup KEY for the exact `(MethodOwner,
+MethodNameId)` registry table, consulted for compiler-generated call edges —
+it is checked type identity carried on the monotype, not a dispatch decision.
+Plan-resolved user dispatch never reads it; those targets come from checked
+evidence alone.
 
 Record fields and tag variants are stored in lexicographic order by name. Tag
 payloads are stored in payload position order. The index of a field or tag
@@ -3077,6 +3084,12 @@ its plan:
 Nothing else exists. Monotype lowering never derives a method owner from type
 content, never searches a registry by method name, and never intersects
 constraints to guess a target.
+
+Totality is enforced at the boundary: `validateDispatchEvidence`, run by the
+checked module's `verifyComplete`, asserts that every dispatch-bearing
+checked expression names a plan and that every plan and evidence reference
+lands inside the checked module data's evidence tables. A missing or corrupt
+record is a compiler bug reported at the boundary, not a lowering panic.
 
 **Evidence params.** Every type scheme with dispatch requirements has one
 deterministic ordered list of (dispatcher var, constraint) pairs —
