@@ -10,7 +10,7 @@
 //! - Compiles Roc source through ARC-inserted LIR and publishes a viewable LIR image in shared memory
 //! - Spawns interpreter host as child process that maps the shared memory
 //! - Fast startup, same-architecture only
-//! - See: `buildLirImageWithCoordinator`
+//! - See: `buildLirImageWithBuildEnv`
 //!
 //! ### Embedded Interpreter Mode (`roc build --opt=interpreter path/to/app.roc`)
 //! - Compiles Roc source through the same checked-artifact to LIR path as IPC mode
@@ -133,7 +133,6 @@ const CoreCtx = ctx_mod.CoreCtx;
 const CIR = can.CIR;
 const ModuleEnv = can.ModuleEnv;
 const BuildEnv = compile.BuildEnv;
-const Coordinator = compile.coordinator.Coordinator;
 const Mode = compile.package.Mode;
 const TimingInfo = compile.package.TimingInfo;
 
@@ -1850,16 +1849,6 @@ fn checkedInterpreterHostIdentity(
     return hasher.finalResult();
 }
 
-fn currentCompilerWatchInputState(ctx: *CliCtx, path: []const u8) Allocator.Error!compile.watch_inputs.State {
-    const bytes = ctx.coreCtx().readFile(path, ctx.gpa) catch |err| switch (err) {
-        error.FileNotFound => return .missing,
-        error.AccessDenied, error.StreamTooLong, error.IoError => return .unreadable,
-        error.OutOfMemory => return error.OutOfMemory,
-    };
-    defer ctx.gpa.free(bytes);
-
-    return .{ .hash = compile.watch_inputs.hashBytes(bytes) };
-}
 
 fn updateInterpreterExeFileLinkInput(
     hasher: *std.crypto.hash.sha2.Sha256,
@@ -2325,16 +2314,16 @@ fn rocRunSharedMemoryShim(ctx: *CliCtx, args: cli_args.RunArgs, arg0: []const u8
 
     switch (args.opt) {
         .dev => {
-            lowered_result = try lowerLirWithCoordinator(
+            lowered_result = try lowerLirWithBuildEnv(
                 ctx,
                 ctx.gpa,
                 args.path,
                 null,
-                false,
+                null,
                 args.max_threads,
                 args.opt,
                 resolutionConfigFromLimits(args.resolve_limits),
-                &cache_manager,
+                !args.no_cache,
                 &reporter,
                 true,
             );
@@ -2346,15 +2335,15 @@ fn rocRunSharedMemoryShim(ctx: *CliCtx, args: cli_args.RunArgs, arg0: []const u8
             warning_count = result.counts.warnings;
         },
         .interpreter => {
-            const shm_result = try buildLirImageWithCoordinator(
+            const shm_result = try buildLirImageWithBuildEnv(
                 ctx,
                 args.path,
                 null,
-                false,
+                null,
                 args.max_threads,
                 args.opt,
                 resolutionConfigFromLimits(args.resolve_limits),
-                &cache_manager,
+                !args.no_cache,
                 &reporter,
                 true,
             );
@@ -2925,13 +2914,6 @@ fn writeDefaultAppSyntheticRunSource(ctx: *CliCtx, app_path: []const u8, origina
     try std.Io.Dir.cwd().writeFile(ctx.io.std_io, .{ .sub_path = app_path, .data = synthetic_source });
 }
 
-fn rewriteDefaultAppSyntheticRunSourceFromFile(ctx: *CliCtx, app_path: []const u8, original_source_path: []const u8) CliMainError!void {
-    const max_source_size = 256 * 1024 * 1024;
-    const original_source = try std.Io.Dir.cwd().readFileAlloc(ctx.io.std_io, original_source_path, ctx.gpa, .limited(max_source_size));
-    defer ctx.gpa.free(original_source);
-
-    try writeDefaultAppSyntheticRunSource(ctx, app_path, original_source);
-}
 
 /// Run a default_app (headerless file with main! and echo platform).
 /// This compiles the app through checked artifacts and executes the resulting
@@ -2974,16 +2956,21 @@ fn rocRunDefaultApp(ctx: *CliCtx, args: cli_args.RunArgs, original_source: []con
     };
 
     const original_source_dir = std.fs.path.dirname(args.path) orelse ".";
-    const cache_config = CacheConfig{
-        .enabled = !args.no_cache,
-        .verbose = false,
-        .roc_ctx = ctx.coreCtx(),
-    };
-    var cache_manager = CacheManager.init(ctx.gpa, cache_config, ctx.coreCtx());
     var reporter = makeReporter(ctx, "roc", args.timings);
     defer reporter.deinit();
     reporter.start();
-    const shm_result = try buildLirImageWithCoordinator(ctx, app_path, original_source_dir, true, args.max_threads, args.opt, resolutionConfigFromLimits(args.resolve_limits), &cache_manager, &reporter, true);
+    const shm_result = try buildLirImageWithBuildEnv(
+        ctx,
+        app_path,
+        original_source_dir,
+        .{ .original_path = args.path, .original_source = original_source },
+        args.max_threads,
+        args.opt,
+        resolutionConfigFromLimits(args.resolve_limits),
+        !args.no_cache,
+        &reporter,
+        true,
+    );
     defer closeSharedMemoryHandle(shm_result.handle);
 
     if (shm_result.error_count > 0 and shm_result.entrypoint_names.len == 0) {
@@ -3093,16 +3080,16 @@ fn rocRunDefaultAppSharedMemoryShim(ctx: *CliCtx, args: cli_args.RunArgs, origin
     var reporter = makeReporter(ctx, "roc", args.timings);
     defer reporter.deinit();
     reporter.start();
-    var lowered_result = try lowerLirWithCoordinator(
+    var lowered_result = try lowerLirWithBuildEnv(
         ctx,
         ctx.gpa,
         app_path,
         original_source_dir,
-        true,
+        .{ .original_path = args.path, .original_source = original_source },
         args.max_threads,
         args.opt,
         resolutionConfigFromLimits(args.resolve_limits),
-        &cache_manager,
+        !args.no_cache,
         &reporter,
         true,
     );
@@ -4862,31 +4849,27 @@ fn successfulLoweredProgram(result: *LoweredCoordinatorResult, label: []const u8
     };
 }
 
-fn renderCoordinatorReports(ctx: *CliCtx, coord: *Coordinator, roc_file_path: []const u8) CoordinatorReportCounts {
+/// Render every report drained from the core and print the run-path summary
+/// trailer. Draining moves the reports out of the core, so calling this again
+/// renders nothing new — re-rendering a report is structurally impossible
+/// rather than a call-site convention (the PR 9759 bug class). Version-bump
+/// notes and synthetic default-app path remapping are applied by the core
+/// during the drain.
+fn renderDrainedBuildEnvReports(ctx: *CliCtx, build_env: *BuildEnv, display_path: []const u8) Allocator.Error!CoordinatorReportCounts {
     var counts = CoordinatorReportCounts{ .errors = 0, .warnings = 0 };
 
-    var it = coord.iterReports();
-    while (it.next()) |entry| {
-        const rep = entry.report;
-        if (rep.severity == .fatal or rep.severity == .runtime_error) {
-            counts.errors += 1;
-            // When a package compiled against a bumped dependency version has
-            // errors, attach its version note to the first one. Consuming the
-            // note keeps re-renders from attaching it twice.
-            if (coord.version_notes.fetchRemove(entry.package_name)) |note_entry| {
-                if (rep.addOwnedString(note_entry.value)) |owned| {
-                    rep.addNote(owned) catch {};
-                } else |_| {}
-                ctx.gpa.free(@constCast(note_entry.key));
-                ctx.gpa.free(@constCast(note_entry.value));
+    const drained = try build_env.drainReports();
+    defer build_env.freeDrainedReports(drained);
+
+    for (drained) |mod| {
+        for (mod.reports) |*report| {
+            switch (report.severity) {
+                .info => continue,
+                .fatal, .runtime_error => counts.errors += 1,
+                .warning => counts.warnings += 1,
             }
             if (!builtin.is_test) {
-                reporting.renderReportToTerminal(rep, ctx.io.stderr(), ColorPalette.ANSI, ctx.terminalReportConfig()) catch {};
-            }
-        } else if (rep.severity == .warning) {
-            counts.warnings += 1;
-            if (!builtin.is_test) {
-                reporting.renderReportToTerminal(rep, ctx.io.stderr(), ColorPalette.ANSI, ctx.terminalReportConfig()) catch {};
+                reporting.renderReportToTerminal(report, ctx.io.stderr(), ColorPalette.ANSI, ctx.terminalReportConfig()) catch {};
             }
         }
     }
@@ -4897,7 +4880,7 @@ fn renderCoordinatorReports(ctx: *CliCtx, coord: *Coordinator, roc_file_path: []
         stderr.print("Found {} error(s) and {} warning(s) for {s}.\n", .{
             counts.errors,
             counts.warnings,
-            roc_file_path,
+            display_path,
         }) catch {};
     }
 
@@ -5128,10 +5111,14 @@ fn rocInternalHotReloadDev(ctx: *CliCtx, raw_args: []const []const u8) CliMainEr
         return error.InvalidSharedMemory;
     }
 
+    var original_source_owned: ?[]const u8 = null;
+    defer if (original_source_owned) |source| ctx.gpa.free(source);
     const source_rewrite: ?HotReloadSourceRewrite = if (args.synthetic_source_path) |source_path| blk: {
         const synthetic_output_path = args.synthetic_output_path orelse return error.InvalidArguments;
         const source_dir_override = args.source_dir_override orelse return error.InvalidArguments;
-        try rewriteDefaultAppSyntheticRunSourceFromFile(ctx, synthetic_output_path, source_path);
+        const max_source_size = 256 * 1024 * 1024;
+        original_source_owned = try std.Io.Dir.cwd().readFileAlloc(ctx.io.std_io, source_path, ctx.gpa, .limited(max_source_size));
+        try writeDefaultAppSyntheticRunSource(ctx, synthetic_output_path, original_source_owned.?);
         break :blk .{
             .source_path = source_path,
             .synthetic_app_path = synthetic_output_path,
@@ -5142,16 +5129,19 @@ fn rocInternalHotReloadDev(ctx: *CliCtx, raw_args: []const []const u8) CliMainEr
         break :blk null;
     };
 
-    var lowered_result = try lowerLirWithCoordinator(
+    var lowered_result = try lowerLirWithBuildEnv(
         ctx,
         ctx.gpa,
         args.path,
         if (source_rewrite) |rewrite| rewrite.source_dir_override else null,
-        source_rewrite != null,
+        if (source_rewrite) |rewrite| .{
+            .original_path = rewrite.source_path,
+            .original_source = original_source_owned.?,
+        } else null,
         args.max_threads,
         .dev,
         resolutionConfigFromLimits(args.resolve_limits),
-        null,
+        true,
         null,
         false,
     );
@@ -5449,176 +5439,107 @@ fn evaluateLirImageEntrypoint(
     };
 }
 
-fn lowerLirWithCoordinator(
+/// Source mapping for a headerless default app staged into a temp dir: the
+/// core remaps diagnostics from the synthetic file back to the user's file.
+const SyntheticDefaultAppMapping = struct {
+    original_path: []const u8,
+    original_source: []const u8,
+};
+
+fn lowerLirWithBuildEnv(
     ctx: *CliCtx,
     lir_allocator: Allocator,
     roc_file_path: []const u8,
     source_dir_override: ?[]const u8,
-    synthetic_default_app: bool,
+    synthetic_default_app: ?SyntheticDefaultAppMapping,
     max_threads: ?usize,
     opt: cli_args.OptLevel,
     resolution_config: compile.package_resolution.Config,
-    cache_manager: ?*CacheManager,
+    enable_checked_cache: bool,
     reporter: ?*progress.Reporter,
     allow_user_errors: bool,
 ) CliMainError!LoweredCoordinatorResult {
-    if (reporter) |r| r.begin("Resolving Dependencies");
-
-    var builtin_modules = try eval.BuiltinModules.init(ctx.gpa);
-    defer builtin_modules.deinit();
-
-    const app_dir = std.fs.path.dirname(roc_file_path) orelse ".";
-
-    // Parse the app header
-    const header_info = compile.app_header.parseAppHeader(
-        ctx.coreCtx(),
-        ctx.gpa,
-        ctx.arena,
-        roc_file_path,
-    ) catch |err| switch (err) {
-        error.NotAnAppHeader => return ctx.fail(.{ .expected_app_header = .{
-            .path = roc_file_path,
-            .found = "non-app header",
-        } }),
-        error.FileNotFound => return ctx.fail(.{ .file_not_found = .{
-            .path = roc_file_path,
-            .context = .source_file,
-        } }),
-        else => |e| return e,
-    };
-    try validatePlatformSpec(ctx, header_info.platform_spec);
-
-    // Run global package version resolution: downloads every (transitive)
-    // URL dependency, solves versions, and yields the final package graph.
-    // Resolution works on logical absolute paths; canonical (realpath)
-    // forms are used only for package identity, via compile.package_identity.
-    const roc_file_abs = std.fs.path.resolve(ctx.arena, &.{roc_file_path}) catch
-        try ctx.arena.dupe(u8, roc_file_path);
-    var resolved = try resolvePackages(ctx, roc_file_abs, resolution_config);
-    defer resolved.deinit();
-    const resolved_packages = resolved.packages;
-
-    var package_keys = try compile.package_identity.buildPackageKeys(ctx.gpa, ctx.coreCtx(), &resolved, .{
-        .synthetic_root = synthetic_default_app,
-        .synthetic_platform = synthetic_default_app,
-    });
-    defer package_keys.deinit();
-    if (reporter) |r| r.end();
-
     const thread_count, const mode = resolveThreadDefaults(max_threads);
 
-    var coord = try Coordinator.init(
-        ctx.gpa,
-        mode,
-        thread_count,
-        RocTarget.detectNative(),
-        &builtin_modules,
-        build_options.compiler_version,
-        cache_manager,
-        ctx.coreCtx(),
-    );
-    defer coord.deinit();
-    coord.enable_hosted_transform = true;
-    coord.setWatchInputTracking(true);
+    const cwd = try std.fs.path.resolve(ctx.gpa, &.{"."});
+    defer ctx.gpa.free(cwd);
 
-    try coord.start();
-
-    const app_pkg = try coord.ensurePackage(package_keys.identity(compile.package_resolution.Resolved.root_index), app_dir);
-    coord.markAppPackage(app_pkg.name);
-    const root_package = resolved_packages[compile.package_resolution.Resolved.root_index];
-    try app_pkg.setRootInput(ctx.gpa, root_package.root_file, try currentCompilerWatchInputState(ctx, root_package.root_file));
-    const app_module_name = base.module_path.getModuleName(roc_file_path);
-    const app_module_id = try app_pkg.ensureModule(ctx.gpa, app_module_name, roc_file_path);
+    var build_env = try BuildEnv.init(ctx.gpa, mode, thread_count, RocTarget.detectNative(), cwd, ctx.io.std_io);
+    defer build_env.deinit();
+    build_env.setWatchInputTracking(true);
+    build_env.resolution_config = resolution_config;
+    build_env.compiler_version = build_options.compiler_version;
+    build_env.setPostCheckPublicationMode(if (allow_user_errors)
+        .executable_artifacts_allow_user_errors
+    else
+        .executable_artifacts);
     if (source_dir_override) |source_dir| {
-        app_pkg.modules.items[app_module_id].source_dir_override = try ctx.gpa.dupe(u8, source_dir);
+        build_env.setRootSourceDirOverride(source_dir);
     }
-    app_pkg.root_module_id = app_module_id;
-    app_pkg.modules.items[app_module_id].depth = 0;
-    app_pkg.remaining_modules += 1;
-    coord.total_remaining += 1;
-
-    // Register resolved packages under the package identities that participate
-    // in checked module identity.
-    for (resolved_packages[1..], 1..) |package, package_idx| {
-        const package_name = package_keys.identity(package_idx);
-        const url_view: ?package_source.UrlSourceView = if (package.url) |url| .{
-            .url = url.url,
-            .url_id = url.url_id,
-        } else null;
-        const pkg = try coord.ensurePackageWithUrl(package_name, package.root_dir, url_view);
-        const root_file_state: compile.watch_inputs.State = if (url_view == null)
-            try currentCompilerWatchInputState(ctx, package.root_file)
-        else
-            .{ .hash = package.root_source_hash };
-        try pkg.setRootInput(ctx.gpa, package.root_file, root_file_state);
+    if (synthetic_default_app) |mapping| {
+        // Staged default-app roots and their synthesized platform live in a
+        // per-invocation temp dir; identity must be the stable synthetic one
+        // so cache keys and nominal identity match across runs and pipelines,
+        // and diagnostics must point at the user's real file (and its real
+        // line numbers) rather than the staged copy.
+        build_env.setSyntheticRootSourceMappingWithLineOffset(
+            mapping.original_path,
+            mapping.original_source,
+            default_app_run_header.len,
+            countNewlines(default_app_run_header),
+        );
+    }
+    if (enable_checked_cache) {
+        try build_env.enableDefaultCacheManager(false);
     }
 
-    {
-        // Record notes for packages whose declared dependency versions were
-        // bumped by solving, so errors inside them can explain the bump.
-        const bump_notes = try compile.package_resolution.versionBumpNotes(&resolved, package_keys.identities, ctx.gpa);
-        defer ctx.gpa.free(bump_notes);
-        for (bump_notes) |note| {
-            const gop = try coord.version_notes.getOrPut(note.package_identity);
-            if (gop.found_existing) {
-                // One note per package is enough; keep the first.
-                ctx.gpa.free(@constCast(note.package_identity));
-                ctx.gpa.free(@constCast(note.message));
-            } else {
-                gop.value_ptr.* = note.message;
-            }
-        }
-    }
+    const display_path = if (synthetic_default_app) |mapping| mapping.original_path else roc_file_path;
 
-    for (resolved_packages, 0..) |package, i| {
-        const from_pkg = if (i == compile.package_resolution.Resolved.root_index)
-            app_pkg
-        else
-            coord.packages.get(package_keys.identity(i)) orelse return error.CliError;
-
-        for (package.deps) |dep| {
-            const target_name = package_keys.identity(dep.target);
-            try from_pkg.shorthands.put(
-                try ctx.gpa.dupe(u8, dep.alias),
-                try ctx.gpa.dupe(u8, target_name),
-            );
-        }
-    }
-
-    // Eagerly parse every resolved platform package's root module so its
-    // provides/hosted declarations are available to the build. Scanning by
-    // package kind matches the BuildEnv path; for an app root the sole
-    // platform is the root's direct platform dependency, but scanning keeps
-    // the two paths in lockstep. The module name is derived from the platform's
-    // actual root file rather than assumed to be "main".
-    for (resolved_packages, 0..) |package, i| {
-        if (package.kind != .platform) continue;
-        const platform_name = package_keys.identity(i);
-        const pf_pkg = coord.packages.get(platform_name) orelse return error.CliError;
-        coord.markPlatformPackage(pf_pkg.name);
-        if (pf_pkg.root_module_id == null) {
-            const pf_module_name = base.module_path.getModuleName(package.root_file);
-            const pf_module_id = try pf_pkg.ensureModule(ctx.gpa, pf_module_name, package.root_file);
-            pf_pkg.root_module_id = pf_module_id;
-            pf_pkg.modules.items[pf_module_id].depth = 1;
-            pf_pkg.remaining_modules += 1;
-            coord.total_remaining += 1;
-            try coord.enqueueParseTask(platform_name, pf_module_id);
-        }
-    }
-
-    if (reporter) |r| r.begin("Type Checking");
-    try coord.enqueueParseTask(app_pkg.name, app_module_id);
-    coord.coordinatorLoop() catch |err| {
+    if (reporter) |r| r.begin("Resolving Dependencies");
+    build_env.discoverDependencies(roc_file_path) catch |err| {
         if (reporter) |r| r.fail();
-        _ = renderCoordinatorReports(ctx, &coord, roc_file_path);
-        return err;
+        _ = try renderDrainedBuildEnvReports(ctx, &build_env, display_path);
+        return switch (err) {
+            error.OutOfMemory => error.OutOfMemory,
+            error.FileNotFound => ctx.fail(.{ .file_not_found = .{
+                .path = roc_file_path,
+                .context = .source_file,
+            } }),
+            else => |e| e,
+        };
     };
 
-    if (coord.hasUserErrors() and (!allow_user_errors or !coord.userErrorsAllowExecutableLowering())) {
-        const counts = renderCoordinatorReports(ctx, &coord, roc_file_path);
+    // `roc run` executes apps. Reject other roots before compiling so the
+    // executable-artifact machinery below never sees an app-less workspace.
+    {
+        const pkg_name = build_env.discovered_pkg_name orelse return error.CliError;
+        const root_pkg = build_env.packages.get(pkg_name) orelse return error.CliError;
+        if (root_pkg.kind != .app and root_pkg.kind != .default_app) {
+            if (reporter) |r| r.fail();
+            return ctx.fail(.{ .expected_app_header = .{
+                .path = display_path,
+                .found = @tagName(root_pkg.kind),
+            } });
+        }
+    }
+    if (reporter) |r| r.end();
+
+    if (reporter) |r| r.begin("Type Checking");
+    build_env.compileDiscovered() catch |err| {
         if (reporter) |r| r.fail();
-        const watch_inputs = try coord.collectWatchInputStates();
+        _ = try renderDrainedBuildEnvReports(ctx, &build_env, display_path);
+        return switch (err) {
+            error.OutOfMemory => error.OutOfMemory,
+            else => |e| e,
+        };
+    };
+
+    const counts = try renderDrainedBuildEnvReports(ctx, &build_env, display_path);
+    const watch_inputs = try build_env.collectWatchInputStates();
+    errdefer compile.watch_inputs.deinit(ctx.gpa, watch_inputs);
+
+    if (!build_env.executable_artifacts_finalized) {
+        if (reporter) |r| r.fail();
         return .{
             .lowered = null,
             .entrypoint_names = &.{},
@@ -5629,39 +5550,12 @@ fn lowerLirWithCoordinator(
             .counts = counts,
         };
     }
+    if (reporter) |r| r.endWithBreakdown(&frontEndBreakdown(build_env.getTimingInfo()));
 
-    if (allow_user_errors) {
-        try coord.finalizeExecutableArtifactsAllowUserErrors();
-    } else {
-        try coord.finalizeExecutableArtifacts();
-    }
-    const finalized_counts = renderCoordinatorReports(ctx, &coord, roc_file_path);
-    const watch_inputs = try coord.collectWatchInputStates();
-    errdefer coord.freeWatchInputStates(watch_inputs);
-    if (finalized_counts.errors > 0 and (!allow_user_errors or !coord.userErrorsAllowExecutableLowering())) {
-        if (reporter) |r| r.fail();
-        return .{
-            .lowered = null,
-            .entrypoint_names = &.{},
-            .hosted_symbols = &.{},
-            .checked_host_identity = null,
-            .watch_inputs = watch_inputs,
-            .watch_inputs_allocator = ctx.gpa,
-            .counts = finalized_counts,
-        };
-    }
-    if (reporter) |r| {
-        r.endWithBreakdown(&.{
-            .{ .name = "Parsing", .ns = coord.total_parse_ns },
-            .{ .name = "Name Resolution", .ns = coord.total_canonicalize_ns + coord.total_canonicalize_diag_ns },
-            .{ .name = "Type Inference", .ns = coord.total_typecheck_ns + coord.total_typecheck_diag_ns },
-        });
-    }
-
-    const root_artifact = coord.executableRootCheckedArtifact();
-    const imported_artifacts = try coord.collectImportedArtifactViews(ctx.gpa, root_artifact);
+    const root_artifact = build_env.executableRootCheckedArtifact();
+    const imported_artifacts = try build_env.collectImportedArtifactViews(ctx.gpa, root_artifact);
     defer ctx.gpa.free(imported_artifacts);
-    const relation_artifacts = try coord.collectRelationArtifactViews(ctx.gpa, root_artifact);
+    const relation_artifacts = try build_env.collectRelationArtifactViews(ctx.gpa, root_artifact);
     defer ctx.gpa.free(relation_artifacts);
 
     if (reporter) |r| r.begin("Specializing");
@@ -5706,7 +5600,7 @@ fn lowerLirWithCoordinator(
         .checked_host_identity = checked_host_identity,
         .watch_inputs = watch_inputs,
         .watch_inputs_allocator = ctx.gpa,
-        .counts = finalized_counts,
+        .counts = counts,
     };
 }
 
@@ -5716,15 +5610,15 @@ fn lowerLirWithCoordinator(
 /// publication, post-check lowering, LIR lowering, and ARC insertion. The child
 /// process maps only the LIR image and never sees `ModuleEnv`, CIR, checked
 /// modules, or post-check IRs.
-pub fn buildLirImageWithCoordinator(
+pub fn buildLirImageWithBuildEnv(
     ctx: *CliCtx,
     roc_file_path: []const u8,
     source_dir_override: ?[]const u8,
-    synthetic_default_app: bool,
+    synthetic_default_app: ?SyntheticDefaultAppMapping,
     max_threads: ?usize,
     opt: cli_args.OptLevel,
     resolution_config: compile.package_resolution.Config,
-    cache_manager: ?*CacheManager,
+    enable_checked_cache: bool,
     reporter: ?*progress.Reporter,
     allow_user_errors: bool,
 ) CliMainError!SharedMemoryResult {
@@ -5737,7 +5631,7 @@ pub fn buildLirImageWithCoordinator(
     const shm_allocator = shm.allocator();
     const image_header = try shm_allocator.create(lir.LirImage.Header);
 
-    var lowered_result = try lowerLirWithCoordinator(
+    var lowered_result = try lowerLirWithBuildEnv(
         ctx,
         shm_allocator,
         roc_file_path,
@@ -5746,7 +5640,7 @@ pub fn buildLirImageWithCoordinator(
         max_threads,
         opt,
         resolution_config,
-        cache_manager,
+        enable_checked_cache,
         reporter,
         allow_user_errors,
     );
@@ -5782,11 +5676,6 @@ pub fn buildLirImageWithCoordinator(
     );
 }
 
-/// Wrapper around buildLirImageWithCoordinator for callers that pass allow_errors.
-/// The allow_errors flag is handled by the caller; this function ignores it.
-pub fn setupSharedMemoryWithCoordinator(ctx: *CliCtx, roc_file_path: []const u8, _: bool) CliMainError!SharedMemoryResult {
-    return buildLirImageWithCoordinator(ctx, roc_file_path, null, false, null, .interpreter, .{}, null, null, true);
-}
 
 /// Platform resolution result containing the platform source path
 pub const PlatformPaths = struct {
@@ -6013,39 +5902,6 @@ fn resolutionConfigFromLimits(limits: cli_args.ResolveLimitArgs) compile.package
     return config;
 }
 
-/// Run global package version resolution rooted at `roc_file_abs`. On
-/// failure, renders every resolution diagnostic to stderr and fails.
-fn resolvePackages(ctx: *CliCtx, roc_file_abs: []const u8, resolution_config: compile.package_resolution.Config) (CliError || error{OutOfMemory})!compile.package_resolution.Resolved {
-    var fs_ctx = ctx.coreCtx();
-    if (compile.build.nativeFetchUrl) |fetch_fn| {
-        fs_ctx.vtable.fetchUrl = fetch_fn;
-    }
-
-    const cache_dir: ?[]const u8 = getRocCacheDir(ctx.arena) catch null;
-
-    var ctx_fetcher = compile.package_resolution.CtxFetcher{
-        .fs = fs_ctx,
-        .gpa = ctx.gpa,
-        .cache_packages_dir = cache_dir,
-    };
-    var resolver = compile.package_resolution.Resolver.init(ctx.gpa, ctx_fetcher.fetcher(), resolution_config);
-    defer resolver.deinit();
-
-    return resolver.resolve(roc_file_abs) catch |err| switch (err) {
-        error.OutOfMemory => error.OutOfMemory,
-        error.ResolutionFailed => {
-            for (resolver.diagnostics.items) |diagnostic| {
-                var report = reporting.Report.init(ctx.gpa, diagnostic.title, diagnostic.message, .runtime_error) catch break;
-                defer report.deinit();
-                if (!builtin.is_test) {
-                    reporting.renderReportToTerminal(&report, ctx.io.stderr(), ColorPalette.ANSI, ctx.terminalReportConfig()) catch {};
-                }
-            }
-            ctx.io.flush();
-            return error.CliError;
-        },
-    };
-}
 
 const ResolvedUrlBundle = struct {
     source_path: []const u8,
@@ -6764,10 +6620,7 @@ fn rocBuildDefaultApp(ctx: *CliCtx, args: cli_args.BuildArgs, original_source: [
     const platform_main_path = try std.fs.path.join(ctx.arena, &.{ platform_dir, "main.roc" });
     const echo_module_path = try std.fs.path.join(ctx.arena, &.{ platform_dir, "Echo.roc" });
 
-    const header =
-        "app [main!] { pf: platform \"./.roc_echo_platform/main.roc\" }\n\n" ++
-        "import pf.Echo\n\n" ++
-        "echo! = |msg| Echo.line!(msg)\n\n";
+    const header = default_app_run_header;
     const normalized_original_source = try base.source_utils.normalizeLineEndingsAlloc(ctx.gpa, original_source);
     defer if (normalized_original_source.allocated) ctx.gpa.free(normalized_original_source.data);
 
@@ -6785,6 +6638,7 @@ fn rocBuildDefaultApp(ctx: *CliCtx, args: cli_args.BuildArgs, original_source: [
     synthetic_args.synthetic_root_original_path = args.path;
     synthetic_args.synthetic_root_original_source = normalized_original_source.data;
     synthetic_args.synthetic_root_header_len = header.len;
+    synthetic_args.synthetic_root_header_lines = countNewlines(header);
     if (synthetic_args.output == null) {
         synthetic_args.output = try base.module_path.getModuleNameAlloc(ctx.arena, args.path);
     }
@@ -8120,7 +7974,7 @@ fn rocBuildLlvm(ctx: *CliCtx, args: cli_args.BuildArgs) CliMainError!void {
     }
     if (args.synthetic_root_original_path) |original_path| {
         if (args.synthetic_root_original_source) |original_source| {
-            build_env.setSyntheticRootSourceMapping(original_path, original_source, args.synthetic_root_header_len);
+            build_env.setSyntheticRootSourceMappingWithLineOffset(original_path, original_source, args.synthetic_root_header_len, args.synthetic_root_header_lines);
         }
     }
     build_env.resolution_config = resolutionConfigFromLimits(args.resolve_limits);
@@ -8448,7 +8302,7 @@ fn rocBuildNative(ctx: *CliCtx, args: cli_args.BuildArgs) CliMainError!void {
     }
     if (args.synthetic_root_original_path) |original_path| {
         if (args.synthetic_root_original_source) |original_source| {
-            build_env.setSyntheticRootSourceMapping(original_path, original_source, args.synthetic_root_header_len);
+            build_env.setSyntheticRootSourceMappingWithLineOffset(original_path, original_source, args.synthetic_root_header_len, args.synthetic_root_header_lines);
         }
     }
     build_env.resolution_config = resolutionConfigFromLimits(args.resolve_limits);
@@ -8786,7 +8640,7 @@ fn rocBuildEmbedded(ctx: *CliCtx, args: cli_args.BuildArgs) CliMainError!void {
     }
     if (args.synthetic_root_original_path) |original_path| {
         if (args.synthetic_root_original_source) |original_source| {
-            build_env.setSyntheticRootSourceMapping(original_path, original_source, args.synthetic_root_header_len);
+            build_env.setSyntheticRootSourceMappingWithLineOffset(original_path, original_source, args.synthetic_root_header_len, args.synthetic_root_header_lines);
         }
     }
     build_env.resolution_config = resolutionConfigFromLimits(args.resolve_limits);

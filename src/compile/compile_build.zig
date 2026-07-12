@@ -140,6 +140,10 @@ pub const PostCheckPublicationMode = enum {
     platform_relations,
     /// Full executable artifact publication including MIR/LIR lowering (for `roc build`).
     executable_artifacts,
+    /// Executable artifact publication that tolerates user errors when every
+    /// erroring module still permits lowering (checked runtime-error nodes
+    /// the interpreter can execute). Used by the `roc run` interpreter path.
+    executable_artifacts_allow_user_errors,
 };
 
 // BuildEnv: workspace-level orchestrator for multi-package builds with local-only shorthands.
@@ -197,6 +201,12 @@ pub const BuildEnv = struct {
     /// diagnostic-only checking must not force post-check lowering of
     /// declarations that are not part of a valid executable program.
     post_check_publication_mode: PostCheckPublicationMode = .executable_artifacts,
+
+    /// Whether executable artifacts were published for this build. Consumers
+    /// that lower to LIR must gate on this rather than re-deriving it from
+    /// error state: report ownership moves out of the coordinator when
+    /// compilation finishes, so coordinator error queries go stale.
+    executable_artifacts_finalized: bool = false,
 
     /// Compiler role to assign to the root module of this build.
     root_module_role: ModuleEnv.ModuleRole = .user,
@@ -430,6 +440,22 @@ pub const BuildEnv = struct {
     /// Set the cache manager for this build environment
     pub fn setCacheManager(self: *BuildEnv, cache_manager: *CacheManager) void {
         self.cache_manager = cache_manager;
+    }
+
+    /// Create and attach the standard checked-module cache manager, owned by
+    /// this BuildEnv (destroyed in deinit). Call before compilation starts so
+    /// the Coordinator is constructed with it. Skipping cache attachment is
+    /// an explicit `--no-cache` decision, never a default.
+    pub fn enableDefaultCacheManager(self: *BuildEnv, verbose: bool) Allocator.Error!void {
+        std.debug.assert(self.coordinator == null);
+        std.debug.assert(self.cache_manager == null);
+        const manager = try self.gpa.create(CacheManager);
+        manager.* = CacheManager.init(self.gpa, .{
+            .enabled = true,
+            .verbose = verbose,
+            .roc_ctx = self.filesystem,
+        }, self.filesystem);
+        self.cache_manager = manager;
     }
 
     /// Set the I/O implementation.
@@ -831,8 +857,16 @@ pub const BuildEnv = struct {
             switch (self.post_check_publication_mode) {
                 .none => {},
                 .platform_relations => try coord.validatePlatformAppRelationsForCheck(),
-                .executable_artifacts => try coord.finalizeExecutableArtifacts(),
+                .executable_artifacts, .executable_artifacts_allow_user_errors => {
+                    try coord.finalizeExecutableArtifacts();
+                    self.executable_artifacts_finalized = true;
+                },
             }
+        } else if (self.post_check_publication_mode == .executable_artifacts_allow_user_errors and
+            coord.userErrorsAllowExecutableLowering())
+        {
+            try coord.finalizeExecutableArtifactsAllowUserErrors();
+            self.executable_artifacts_finalized = true;
         }
 
         if (comptime trace_build) {

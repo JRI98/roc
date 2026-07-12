@@ -177,6 +177,7 @@ pub const BuildArgs = struct {
     synthetic_root_original_path: ?[]const u8 = null, // internal: original path for a synthetic default-app root
     synthetic_root_original_source: ?[]const u8 = null, // internal: normalized original source for synthetic-root diagnostics
     synthetic_root_header_len: usize = 0, // internal: byte length of the header prepended to synthetic_root_original_source
+    synthetic_root_header_lines: u32 = 0, // internal: newline count of that header, for diagnostic line remapping
 };
 
 /// Arguments for `roc test`
