@@ -161,8 +161,9 @@ PR 9707's counting methodology — so exponential regressions fail loudly.
 Migration order:
 
 1. Extract the shared module (e.g. src/postcheck/match_tree.zig) with the
-   accessor interface; coordinate with ../big/unify-build-pipelines.md — if
-   that lands first, only one call site exists.
+   accessor interface; the build-pipeline unification has landed (one
+   BuildEnv core, one checked-to-LIR adapter), so only one executable
+   lowering call site exists.
 2. Implement tree construction + LIR emission with statement-count tests.
 3. Switch solved_lir_lower.zig to it behind a flag; differential-test old
    vs new across all five executors on a generated pattern corpus.
@@ -234,6 +235,6 @@ Migration order:
 
 ## Related projects
 
-- [Unify the two build pipelines](../big/unify-build-pipelines.md) — removes
-  the second copy of match lowering; this project's shared module is the
-  fallback if that lands later.
+- Unify the two build pipelines — landed: every entry path drives one
+  BuildEnv orchestration core and one checked-to-LIR adapter, so this
+  project's shared module has a single integration point.
