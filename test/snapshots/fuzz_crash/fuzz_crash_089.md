@@ -46,8 +46,7 @@ EndOfFile,
 ~~~roc
 e = {
 	0 #
-	.{
-	}
+	.{}
 }
 ~~~
 # CANONICALIZE
