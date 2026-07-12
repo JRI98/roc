@@ -548,11 +548,11 @@ const Builder = struct {
     equality_defs: std.AutoHashMap(GeneratedHelperDefAddress, GeneratedHelperDefEntry),
     hash_defs: std.AutoHashMap(GeneratedHelperDefAddress, GeneratedHelperDefEntry),
     hosted_catalog: []HostedCatalogEntry = &.{},
-    /// Exact `(owner, method)` -> target map over every reachable module's
-    /// method registry, for compiler-generated component lookups (structural
-    /// derivation internals, inspect/parser/encode helpers, path synthesis).
-    /// Built once; keys use the same program-name interning as `typeDef`, so
-    /// owners derived from monomorphic type content correlate directly.
+    /// Exact `(owner, method)` -> target index over every reachable module's
+    /// checked method registry, consulted only through the
+    /// `componentMethodTargetByName`/`ForView` seam. Built once; keys use the
+    /// same program-name interning as `typeDef`, so the checked type identity
+    /// carried on monotypes correlates directly.
     component_method_targets: std.AutoHashMapUnmanaged(MethodDispatch, MethodLookup) = .{},
     u64_ty: ?Type.TypeId = null,
     bool_ty: ?Type.TypeId = null,
