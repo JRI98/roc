@@ -52,6 +52,7 @@ packages can define and require their own methods with `where` clauses.
 | `to_hash : T, Hasher -> Hasher` | `Dict`, `Set`, and hash-based APIs | Values of the type should participate in hashing. |
 | `plus`, `minus`, `times`, `div_by`, `div_trunc_by`, `rem_by` | `+`, `-`, `*`, `/`, `//`, `%` | The type has arithmetic-like operations. |
 | `is_lt`, `is_lte`, `is_gt`, `is_gte` | `<`, `<=`, `>`, `>=` | The type has an ordering. |
+| `range_exclusive : T, T -> Iter(T)`, `range_inclusive : T, T -> Iter(T)` | `..<`, `..=` | The type supports range syntax. |
 | `negate`, `not` | Unary `-`, unary `!` | The type has a unary negation or complement operation. |
 | `from_numeral : Num.Numeral -> Try(T, [InvalidNumeral(Str)])` | Number literals with target type `T` | Plain numeric literal syntax should construct the type. |
 | `from_quote : Str -> Try(T, [BadQuotedBytes(Str)])` | Quoted string literals with target type `T` | Plain quoted literal syntax should construct the type. |
@@ -174,6 +175,29 @@ must have the same type.
 | `<=` | `is_lte` |
 | `>` | `is_gt` |
 | `>=` | `is_gte` |
+
+Range operators dispatch to methods whose result is an `Iter` of the operand
+type. Both operands must have the same type.
+
+| Operator | Method |
+| --- | --- |
+| `..<` | `range_exclusive` |
+| `..=` | `range_inclusive` |
+
+All the builtin number types have these methods, and a custom type can support
+range syntax by defining them:
+
+```roc
+PageNum := { num : U32 }.{
+    range_exclusive : PageNum, PageNum -> Iter(PageNum)
+    range_exclusive = |start, end|
+        Iter.map(start.num..<end.num, |num| PageNum.{ num })
+}
+
+for page in first_page..<last_page {
+    render(page)
+}
+```
 
 Unary operators dispatch to methods whose argument and return type are the same:
 

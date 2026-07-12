@@ -9,12 +9,12 @@ A `for` loop lets you run code on each item in an [iterator](iterators). For exa
 ```roc
 var $sum = 0
 
-for n in 1.to(5) {
+for n in 1..<5 {
     $sum = $sum + n
 }
 ```
 
-> The `to` method returns a [range](numbers#ranges) which is an `Iter` of the number in question. For example, `I64.to` returns `Iter(I64)`, and so `n` in this example would be an `I64`.
+> `1..<5` is a [range](numbers#ranges): an `Iter` of the numbers from 1 up to (but not including) 5. Writing `1..=5` instead would include the 5. A range is an `Iter` of its bounds' type — for example, if the bounds are `I64` values, the range is an `Iter(I64)`, and so `n` in this example would be an `I64`.
 
 A loop body only includes statements; it does not have a final expression. The loop itself evaluates to `{}`.
 
@@ -34,7 +34,7 @@ for n in [1, 2, 3, 4] {
 }
 ```
 
-At runtime, this `[1, 2, 3, 4]` code snippet is exactly as efficient as the earlier `1.to(5)` one. In one case, `1.to(5)` will be evaluated to an `Iter` at compile time, and in the other, `[1, 2, 3, 4].iter()` will be evaluated at compile time to an identical `Iter`. By the time either program actually runs, they will have the same memory contents and will be executing the same instructions.
+At runtime, this `[1, 2, 3, 4]` code snippet is exactly as efficient as the earlier `1..<5` one. In one case, `1..<5` will be evaluated to an `Iter` at compile time, and in the other, `[1, 2, 3, 4].iter()` will be evaluated at compile time to an identical `Iter`. By the time either program actually runs, they will have the same memory contents and will be executing the same instructions.
 
 ### Pattern matching in `for`
 

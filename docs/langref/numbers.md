@@ -115,6 +115,36 @@ general trade-offs are:
 * Smaller integer sizes take up less memory. These savings rarely matter in variables and function arguments, but the sizes of integers that you use in data structures can add up. This can also affect whether those data structures fit in [cache lines](https://en.wikipedia.org/wiki/CPU_cache#Cache_performance), which can be a performance bottleneck.
 * Certain CPUs work faster on some numeric sizes than others. If the CPU is taking too long to run numeric calculations, you may find a performance improvement by experimenting with numeric sizes that are larger than otherwise necessary. However, in practice, doing this typically degrades overall performance, so be careful to measure properly!
 
+## Ranges
+
+The range operators build an [iterator](iterators) over a span of numbers.
+`start..<end` counts up from `start` to `end` without including `end`, and
+`start..=end` includes `end`:
+
+```roc
+var $sum = 0
+
+for n in 0..<3 {
+    $sum = $sum + n  # runs with n = 0, then 1, then 2
+}
+```
+
+Both bounds must have the same type, and the range is an `Iter` of that type:
+a `U8` range is an `Iter(U8)`, a `Dec` range is an `Iter(Dec)`, and so on.
+When nothing pins the bounds' type, range literals [default](#defaulting-to-dec)
+the same way other number literals do.
+
+A range counts up in steps of 1, and is empty when `start` is not below (`..<`)
+or at (`..=`) `end` — there are no reversed ranges. All the builtin number
+types support ranges, including the fractional ones: `0.5..<3.5` yields `0.5`,
+`1.5`, and `2.5`. For `F32` and `F64`, once the values are large enough that
+adding 1 can no longer produce a bigger float, the range yields that value once
+and then ends.
+
+Like the other operators, ranges use [static dispatch](static-dispatch#operators):
+`start..<end` calls the `range_exclusive` method on the bounds' type, and
+`start..=end` calls `range_inclusive`, so custom number types can support range
+syntax by defining those methods.
 
 ## Custom Number Types
 
