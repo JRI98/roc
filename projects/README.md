@@ -121,9 +121,6 @@ Big:
   — applies the certifier's finite-summary/dataflow discipline to
   production ARC insertion, replacing the join and liveness re-walks that
   make generated structural encoders compile in minutes.
-- [big/unify-build-pipelines.md](big/unify-build-pipelines.md)
-  — one orchestration core behind check/run/test; lands best after
-  Chain B step 3 shrinks what finalization does.
 - [big/single-source-builtin-registration.md](big/single-source-builtin-registration.md)
   — collapses the seven hand-typed `roc_builtins_*` symbol/ABI tables onto
   one comptime-generated registry.
@@ -147,6 +144,5 @@ front-loads leverage and keeps prerequisites satisfied:
 10. `small/frame-partitioned-checker-state.md`
 11. `small/compact-constant-aggregates.md`
 12. `big/arc-inserter-join-summaries.md`
-13. `big/unify-build-pipelines.md`
-14. `big/single-source-builtin-registration.md`
-15. `big/decision-tree-match-compiler.md`
+13. `big/single-source-builtin-registration.md`
+14. `big/decision-tree-match-compiler.md`

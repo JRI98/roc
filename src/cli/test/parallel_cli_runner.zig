@@ -337,6 +337,8 @@ fn glueRuntimeHostFileName(language: GlueLanguage, target: GlueRuntimeTarget) []
 const CustomCase = enum {
     noop,
     default_app_all_syntax_checked_cache,
+    pipeline_parity_diagnostics,
+    pipeline_parity_shared_cache,
     cli_cache_roots_distinct,
     watch_inputs_reject_absolute_import,
     watch_completed_run_refresh_reruns,
@@ -872,6 +874,11 @@ const subcommand_cases = [_]CliCase{
     .{ .id = 0, .suite = .subcommands, .name = "issue 9815: roc run turns discarded user where-clause error into ordinary crash", .body = .{ .command = .{ .args = &.{"--no-cache"}, .roc_file = "test/cli/issue_9815_discarded_user_where_clause_output.roc", .exit = .failure, .contains = &.{ .{ .stream = .stderr, .text = "MISSING METHOD" }, .{ .stream = .stderr, .text = "from_thing" }, .{ .stream = .stderr, .text = "Roc application crashed with this message:" } }, .not_contains = &.{ .{ .stream = .stderr, .text = "unresolved `where`-clause method dispatch on a polymorphic value" }, .{ .stream = .stderr, .text = "dispatch plan had no method owner" }, .{ .stream = .stderr, .text = "panic" } } } } },
     .{ .id = 0, .suite = .subcommands, .name = "issue 9864: platform methods dispatch on package-owned nominal receivers", .body = .{ .command = .{ .args = &.{ "check", "--no-cache" }, .roc_file = "test/cli/issue_9864_static_dispatch_package_nominal/app.roc", .exit = .success, .contains_any = &.{.{ .needles = &no_errors_needles }}, .not_contains = &.{ .{ .stream = .stderr, .text = "MISSING METHOD" }, .{ .stream = .stderr, .text = "panic" } } } } },
     .{ .id = 0, .suite = .subcommands, .name = "issue 9858: default app args.get value times reports missing method without panic", .body = .{ .command = .{ .args = &.{"--no-cache"}, .roc_file = "test/cli/issue_9858_default_app_args_get_times.roc", .exit = .failure, .contains = &.{ .{ .stream = .stderr, .text = "MISSING METHOD" }, .{ .stream = .stderr, .text = "times" } }, .not_contains = &.{ .{ .stream = .stderr, .text = "checked method registry is missing resolved dispatch target" }, .{ .stream = .stderr, .text = "postcheck invariant violated" }, .{ .stream = .stderr, .text = "panic" } } } } },
+    .{ .id = 0, .suite = .subcommands, .name = "pipeline parity: identical diagnostics and exit codes across check/build/run/test", .body = .{ .custom = .pipeline_parity_diagnostics } },
+    .{ .id = 0, .suite = .subcommands, .name = "pipeline parity: check/build/run/test share one checked-module cache (issue 9788)", .body = .{ .custom = .pipeline_parity_shared_cache } },
+    .{ .id = 0, .suite = .subcommands, .name = "issue 9509: run renders each diagnostic exactly once (PR 9759)", .body = .{ .command = .{ .args = &.{"--no-cache"}, .roc_file = "test/cli/pipeline_parity/error_app/main.roc", .exit = .{ .code = 1 }, .occurrences = &.{.{ .stream = .stderr, .text = "TYPE MISMATCH", .count = 1 }} } } },
+    .{ .id = 0, .suite = .subcommands, .name = "transitive package dependency runs exactly when it builds", .body = .{ .command = .{ .args = &.{"--no-cache"}, .roc_file = "test/cli/pipeline_parity/app/main.roc", .contains = &.{.{ .stream = .stdout, .text = "alpha[beta:parity]" }} } } },
+    .{ .id = 0, .suite = .subcommands, .name = "issue 9694: --opt=speed run compiles a binary instead of interpreting", .body = .{ .command = .{ .args = &.{ "--opt=speed", "--no-cache" }, .roc_file = "test/cli/pipeline_parity/dbg_app/main.roc", .exit = .{ .code = 2 }, .contains = &.{ .{ .stream = .stderr, .text = "OPTIMIZED BUILD" }, .{ .stream = .stdout, .text = "done 9694" } } } } },
     .{ .id = 0, .suite = .subcommands, .name = "issue 9971: unannotated polymorphic eq used at two types runs (interpreter)", .backend = .interpreter, .body = .{ .command = .{ .args = &.{ "test", "--opt=interpreter", "--no-cache" }, .roc_file = "test/cli/issue_9971_unannotated_polymorphic_eq.roc", .exit = .success, .contains = &.{.{ .stream = .stdout, .text = "passed" }}, .not_contains = &.{ .{ .stream = .stdout, .text = "failed" }, .{ .stream = .stderr, .text = "postcheck invariant violated" }, .{ .stream = .stderr, .text = "panic" } } } } },
     .{ .id = 0, .suite = .subcommands, .name = "issue 9971: unannotated polymorphic eq used at two types runs (dev)", .backend = .dev, .body = .{ .command = .{ .args = &.{ "test", "--opt=dev", "--no-cache" }, .roc_file = "test/cli/issue_9971_unannotated_polymorphic_eq.roc", .exit = .success, .contains = &.{.{ .stream = .stdout, .text = "passed" }}, .not_contains = &.{ .{ .stream = .stdout, .text = "failed" }, .{ .stream = .stderr, .text = "postcheck invariant violated" }, .{ .stream = .stderr, .text = "panic" } } } } },
     .{ .id = 0, .suite = .subcommands, .name = "issue 9971: unannotated polymorphic eq used at two types builds and runs", .body = .{ .command = .{ .args = &.{"--no-cache"}, .roc_file = "test/cli/issue_9971_unannotated_polymorphic_eq.roc", .exit = .success, .not_contains = &.{ .{ .stream = .stderr, .text = "postcheck invariant violated" }, .{ .stream = .stderr, .text = "panic" } } } } },
@@ -2074,6 +2081,8 @@ fn runCustomCase(
     const result: ?TestResult = switch (custom) {
         .noop => null,
         .default_app_all_syntax_checked_cache => customDefaultAppAllSyntaxCheckedCache(io, allocator, &env, &timer, timeout_ms),
+        .pipeline_parity_diagnostics => customPipelineParityDiagnostics(io, allocator, &env, &timer, timeout_ms),
+        .pipeline_parity_shared_cache => customPipelineParitySharedCache(io, allocator, &env, &timer, timeout_ms),
         .cli_cache_roots_distinct => customCliCacheRootsDistinct(io, allocator, &timer),
         .watch_inputs_reject_absolute_import => customWatchInputsRejectAbsoluteImport(io, allocator, &env, &timer, timeout_ms),
         .watch_completed_run_refresh_reruns => customWatchCompletedRunRefreshReruns(io, allocator, &env, &timer, timeout_ms),
@@ -4899,6 +4908,162 @@ fn customDefaultAppAllSyntaxCheckedCache(io: std.Io, allocator: Allocator, env: 
         return customFailure(allocator, timer, "expected second default app run to reuse {d} checked module cache entries, found {d}", .{ cached_module_count_after_first_run, cached_module_count_after_second_run });
     }
 
+    return null;
+}
+
+/// Normalize one verb's stderr for cross-verb comparison: strip ANSI, cut the
+/// per-verb summary trailer ("Found N error(s) ..."), reduce source-location
+/// lines to basename:line:col (check prints absolute paths where the other
+/// verbs embed workspace-relative ones), and drop trailing blank lines.
+fn parityNormalizedReports(allocator: Allocator, stderr_bytes: []const u8) Allocator.Error![]u8 {
+    const stripped = try stripAnsiEscapes(allocator, stderr_bytes);
+    const pre_trailer = if (std.mem.find(u8, stripped, "\nFound ")) |idx| stripped[0..idx] else stripped;
+
+    var out = std.ArrayList(u8).empty;
+    errdefer out.deinit(allocator);
+    var lines = std.mem.splitScalar(u8, pre_trailer, '\n');
+    while (lines.next()) |line| {
+        const trimmed = std.mem.trimEnd(u8, line, " \t\r");
+        if (std.mem.find(u8, trimmed, ".roc:") != null) {
+            if (std.mem.findScalarLast(u8, trimmed, '/')) |slash| {
+                try out.appendSlice(allocator, std.mem.trimStart(u8, trimmed[slash + 1 ..], " "));
+                try out.append(allocator, '\n');
+                continue;
+            }
+        }
+        try out.appendSlice(allocator, trimmed);
+        try out.append(allocator, '\n');
+    }
+    while (std.mem.endsWith(u8, out.items, "\n\n")) _ = out.pop();
+    return out.toOwnedSlice(allocator);
+}
+
+fn parityCompareVerbs(
+    io: std.Io,
+    allocator: Allocator,
+    env: *const CaseEnv,
+    timer: *harness.Timer,
+    timeout_ms: u64,
+    fixture: []const u8,
+    expected_exit: u32,
+) ?TestResult {
+    const build_out = std.fs.path.join(allocator, &.{ env.dirs.work_dir, "parity-build-out" }) catch |err|
+        return customInfraFailure(allocator, timer, "failed to allocate build output path: {}", .{err});
+    const build_out_arg = std.fmt.allocPrint(allocator, "--output={s}", .{build_out}) catch |err|
+        return customInfraFailure(allocator, timer, "failed to allocate build output arg: {}", .{err});
+
+    const verbs = [_]struct {
+        name: []const u8,
+        args: []const []const u8,
+    }{
+        .{ .name = "check", .args = &.{ "check", "--no-cache" } },
+        .{ .name = "build", .args = &.{ "build", "--no-cache", build_out_arg } },
+        .{ .name = "run", .args = &.{"--no-cache"} },
+        .{ .name = "test", .args = &.{ "test", "--no-cache" } },
+    };
+
+    var normalized: [verbs.len][]u8 = undefined;
+    for (verbs, 0..) |verb, i| {
+        const captured = captureRocRun(io, allocator, env, timer, timeout_ms, .{
+            .args = verb.args,
+            .roc_file = fixture,
+            .exit = .{ .code = expected_exit },
+        });
+        const result = switch (captured) {
+            .failure => |failure| return failure,
+            .result => |result| result,
+        };
+        normalized[i] = parityNormalizedReports(allocator, result.stderr) catch |err|
+            return customInfraFailure(allocator, timer, "parity normalization failed: {}", .{err});
+    }
+
+    for (verbs[1..], 1..) |verb, i| {
+        if (!std.mem.eql(u8, normalized[0], normalized[i])) {
+            return customFailure(
+                allocator,
+                timer,
+                "pipeline parity violated for {s}: `roc {s}` diagnostics differ from `roc check`\n--- check ---\n{s}\n--- {s} ---\n{s}",
+                .{ fixture, verb.name, normalized[0], verb.name, normalized[i] },
+            );
+        }
+    }
+    return null;
+}
+
+fn customPipelineParityDiagnostics(io: std.Io, allocator: Allocator, env: *const CaseEnv, timer: *harness.Timer, timeout_ms: u64) ?TestResult {
+    // One warning: every verb exits 2 and renders the same report.
+    if (parityCompareVerbs(io, allocator, env, timer, timeout_ms, "test/cli/pipeline_parity/warn_app/main.roc", 2)) |failure| return failure;
+    // One error: every verb exits 1 and renders the same report.
+    if (parityCompareVerbs(io, allocator, env, timer, timeout_ms, "test/cli/pipeline_parity/error_app/main.roc", 1)) |failure| return failure;
+    return null;
+}
+
+/// Count only checked-module cache entries (`.../mod/...`), excluding the shim
+/// and linked-executable caches that the run verb also writes under the root.
+fn countCheckedModuleCacheFiles(io: std.Io, allocator: Allocator, cache_path: []const u8) CliRunnerError!usize {
+    var cache_dir = std.Io.Dir.cwd().openDir(io, cache_path, .{ .iterate = true }) catch |err| switch (err) {
+        error.FileNotFound => return 0,
+        else => return err,
+    };
+    defer cache_dir.close(io);
+
+    var walker = try cache_dir.walk(allocator);
+    defer walker.deinit();
+
+    const mod_segment = std.fs.path.sep_str ++ "mod" ++ std.fs.path.sep_str;
+    var count: usize = 0;
+    while (try walker.next(io)) |entry| {
+        if (entry.kind != .file) continue;
+        if (std.mem.find(u8, entry.path, mod_segment) == null) continue;
+        if (std.mem.endsWith(u8, entry.basename, ".meta")) continue;
+        if (std.mem.endsWith(u8, entry.basename, ".tmp")) continue;
+        count += 1;
+    }
+    return count;
+}
+
+fn customPipelineParitySharedCache(io: std.Io, allocator: Allocator, env: *const CaseEnv, timer: *harness.Timer, timeout_ms: u64) ?TestResult {
+    const fixture = "test/cli/pipeline_parity/app/main.roc";
+    const build_out = std.fs.path.join(allocator, &.{ env.dirs.work_dir, "parity-cache-build-out" }) catch |err|
+        return customInfraFailure(allocator, timer, "failed to allocate build output path: {}", .{err});
+    const build_out_arg = std.fmt.allocPrint(allocator, "--output={s}", .{build_out}) catch |err|
+        return customInfraFailure(allocator, timer, "failed to allocate build output arg: {}", .{err});
+
+    // roc check populates the checked-module cache.
+    if (runRocAndCheck(io, allocator, env, timer, timeout_ms, .{ .args = &.{"check"}, .roc_file = fixture })) |failure| return failure;
+    const after_check = countCheckedModuleCacheFiles(io, allocator, env.dirs.roc_cache_dir) catch |err|
+        return customInfraFailure(allocator, timer, "failed to count module cache files: {}", .{err});
+    if (after_check == 0) {
+        return customFailure(allocator, timer, "expected roc check to populate checked-module cache entries, found 0", .{});
+    }
+
+    // The first executable-mode compile may add finalized platform-relation
+    // artifacts on top of check's entries; afterwards every pipeline must hit
+    // the shared cache with zero new checked-module writes (issue 9788).
+    if (runRocAndCheck(io, allocator, env, timer, timeout_ms, .{ .args = &.{}, .roc_file = fixture, .contains = &.{.{ .stream = .stdout, .text = "alpha[beta:parity]" }} })) |failure| return failure;
+    const after_first_run = countCheckedModuleCacheFiles(io, allocator, env.dirs.roc_cache_dir) catch |err|
+        return customInfraFailure(allocator, timer, "failed to count module cache files after run: {}", .{err});
+    if (after_first_run < after_check) {
+        return customFailure(allocator, timer, "run lost checked-module cache entries: {d} -> {d}", .{ after_check, after_first_run });
+    }
+
+    const follow_ups = [_]struct {
+        name: []const u8,
+        args: []const []const u8,
+    }{
+        .{ .name = "run (second)", .args = &.{} },
+        .{ .name = "build", .args = &.{ "build", build_out_arg } },
+        .{ .name = "test", .args = &.{"test"} },
+        .{ .name = "check (second)", .args = &.{"check"} },
+    };
+    for (follow_ups) |step| {
+        if (runRocAndCheck(io, allocator, env, timer, timeout_ms, .{ .args = step.args, .roc_file = fixture })) |failure| return failure;
+        const after = countCheckedModuleCacheFiles(io, allocator, env.dirs.roc_cache_dir) catch |err|
+            return customInfraFailure(allocator, timer, "failed to count module cache files after {s}: {}", .{ step.name, err });
+        if (after != after_first_run) {
+            return customFailure(allocator, timer, "`roc {s}` did not reuse the shared checked-module cache: {d} entries -> {d}", .{ step.name, after_first_run, after });
+        }
+    }
     return null;
 }
 
