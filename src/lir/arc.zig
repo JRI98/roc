@@ -29,6 +29,64 @@ const GuardedList = collections.GuardedList;
 
 pub const ResourceError = std.mem.Allocator.Error;
 
+/// Temporary migration counters for the join-summary project
+/// (projects/big/arc-inserter-join-summaries.md). Debug builds accumulate
+/// them across every `insert` call and dump cumulative totals to stderr
+/// after each call when `ROC_ARC_COUNTERS` is set in the environment.
+/// Deleted with the old analysis walkers at the end of the migration.
+pub const MigrationCounters = struct {
+    join_body_owned_set_calls: u64 = 0,
+    join_body_memo_hits: u64 = 0,
+    analysis_path_tasks: u64 = 0,
+    analysis_owned_clones: u64 = 0,
+    local_value_scans: u64 = 0,
+    any_needle_scans: u64 = 0,
+    liveness_graph_builds: u64 = 0,
+    summary_solver_iterations: u64 = 0,
+    max_emission_stmts: u64 = 0,
+    max_emission_joins: u64 = 0,
+    emissions: u64 = 0,
+
+    fn noteEmission(self: *MigrationCounters, stmts: u64, joins: u64) void {
+        self.emissions += 1;
+        self.max_emission_stmts = @max(self.max_emission_stmts, stmts);
+        self.max_emission_joins = @max(self.max_emission_joins, joins);
+    }
+
+    fn dump(self: *const MigrationCounters) void {
+        std.debug.print(
+            "arc-counters: joinBodyOwnedSet={d} (memo_hits={d}) analysis_paths={d} " ++
+                "analysis_clones={d} local_value_scans={d} any_needle_scans={d} " ++
+                "liveness_builds={d} solver_iterations={d} emissions={d} " ++
+                "max_stmts={d} max_joins={d}\n",
+            .{
+                self.join_body_owned_set_calls,
+                self.join_body_memo_hits,
+                self.analysis_path_tasks,
+                self.analysis_owned_clones,
+                self.local_value_scans,
+                self.any_needle_scans,
+                self.liveness_graph_builds,
+                self.summary_solver_iterations,
+                self.emissions,
+                self.max_emission_stmts,
+                self.max_emission_joins,
+            },
+        );
+    }
+};
+
+/// Cumulative migration counters; meaningful in debug builds only.
+pub var migration_counters: MigrationCounters = .{};
+
+const count_migration = builtin.mode == .Debug;
+
+fn migrationCountersRequested() bool {
+    if (comptime !builtin.link_libc) return false;
+    const value = std.c.getenv("ROC_ARC_COUNTERS") orelse return false;
+    return value[0] != 0;
+}
+
 /// Options for ARC insertion.
 pub const InsertOptions = struct {
     /// Root procs whose ownership signature is pinned all-owned by ABI.
@@ -174,6 +232,7 @@ pub fn insert(store: *LirStore, layouts: *const layout_mod.Store, options: Inser
         var join_visit = std.AutoHashMap(LIR.CFStmtId, void).init(store.allocator);
         defer join_visit.deinit();
         try inserter.collectJoinBodies(body, &join_bodies, &join_visit);
+        if (count_migration) migration_counters.noteEmission(join_visit.count(), join_bodies.count());
         inserter.join_bodies = &join_bodies;
         defer inserter.join_bodies = null;
         var rewritten_joins = RewrittenJoinMap.init(store.allocator);
@@ -200,6 +259,10 @@ pub fn insert(store: *LirStore, layouts: *const layout_mod.Store, options: Inser
         const rewritten_body = try inserter.rewritePath(body, &owned, .{});
         const join_points = try inserter.procJoinPoints(rewritten_body);
         store.setProcSpecBodyAndJoinPoints(emit_proc, rewritten_body, join_points);
+    }
+
+    if (comptime count_migration and builtin.link_libc) {
+        if (migrationCountersRequested()) migration_counters.dump();
     }
 
     if (builtin.mode == .Debug) {
@@ -1818,6 +1881,10 @@ const Inserter = struct {
         scoped_joins: ?*AnalysisScopedJoinMap,
         seen: ?*AnalysisSeen,
     ) ResourceError!void {
+        if (count_migration) {
+            migration_counters.analysis_path_tasks += 1;
+            migration_counters.analysis_owned_clones += 1;
+        }
         const task = try self.store.allocator.create(AnalysisPathTask);
         errdefer self.store.allocator.destroy(task);
         task.* = .{
@@ -1838,6 +1905,7 @@ const Inserter = struct {
 
         while (true) {
             if (path.stop == .stmt and path.cursor == path.stop.stmt) {
+                if (count_migration) migration_counters.analysis_owned_clones += 1;
                 try path.exits.append(self.store.allocator, try path.owned.clone());
                 self.destroyAnalysisPath(path);
                 return;
@@ -2098,6 +2166,7 @@ const Inserter = struct {
                 },
                 .jump => |jump_stmt| {
                     if (path.stop == .jump_to and jump_stmt.target == path.stop.jump_to) {
+                        if (count_migration) migration_counters.analysis_owned_clones += 1;
                         try path.exits.append(self.store.allocator, try path.owned.clone());
                     } else if (path.stop == .jump_to) {
                         if (path.scoped_joins) |scoped_joins| {
@@ -2263,6 +2332,7 @@ const Inserter = struct {
             if (entry.owned.eql(owned)) return true;
         }
 
+        if (count_migration) migration_counters.analysis_owned_clones += 1;
         var owned_clone = try owned.clone();
         errdefer owned_clone.deinit();
         try seen_entry.value_ptr.entries.append(self.store.allocator, .{
@@ -2763,7 +2833,9 @@ const Inserter = struct {
         body: LIR.CFStmtId,
         body_reachable: ?*bool,
     ) ResourceError!OwnedSet {
+        if (count_migration) migration_counters.join_body_owned_set_calls += 1;
         if (try self.cachedJoinBodyOwnedSet(entry_owned, join_id, params, maybe_uninitialized_params, remainder, body, body_reachable)) |cached| {
+            if (count_migration) migration_counters.join_body_memo_hits += 1;
             return cached;
         }
 
@@ -3700,6 +3772,7 @@ const Inserter = struct {
             .loop_keep_id = loop_keep_id,
         };
         if (self.reads_before_rebind_cache.getPtr(key)) |cached| return cached;
+        if (count_migration) migration_counters.liveness_graph_builds += 1;
 
         var graph_arena = std.heap.ArenaAllocator.init(self.store.allocator);
         defer graph_arena.deinit();
@@ -3958,6 +4031,7 @@ const Inserter = struct {
         needle: LIR.LocalId,
         loop_keep: ?*const OwnedSet,
     ) ResourceError!bool {
+        if (count_migration) migration_counters.local_value_scans += 1;
         var visited = self.scan_visited;
         visited.clearRetainingCapacity();
         var stack = self.scan_stack;
@@ -4173,6 +4247,7 @@ const Inserter = struct {
         start: LIR.CFStmtId,
         loop_keep: ?*const OwnedSet,
     ) ResourceError!bool {
+        if (count_migration) migration_counters.any_needle_scans += 1;
         const needles = self.scan_needles;
         var visited = self.scan_visited;
         visited.clearRetainingCapacity();
