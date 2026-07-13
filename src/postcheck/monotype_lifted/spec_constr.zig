@@ -458,6 +458,11 @@ const Pass = struct {
     /// so it no longer reads as branch-chosen, but its base loop still needs the
     /// whole-body scalarizing clone.
     peeled: []bool,
+    /// Per source function: whether the whole-body value clone has already
+    /// satisfied value-aware call rewriting, shape demand, and known-loop
+    /// scalarization. Those analyses can all request the same clone, but the
+    /// clone is one normalization pass and must run at most once per body.
+    whole_body_cloned: []bool,
     /// Functions containing a field read, tuple-item read, match scrutinee, or
     /// inspected argument that demands the structural result of a local call.
     shape_demand_fns: []bool,
@@ -529,6 +534,10 @@ const Pass = struct {
         errdefer allocator.free(peeled);
         @memset(peeled, false);
 
+        const whole_body_cloned = try allocator.alloc(bool, program.fnCount());
+        errdefer allocator.free(whole_body_cloned);
+        @memset(whole_body_cloned, false);
+
         const shape_demand_fns = try allocator.alloc(bool, program.fnCount());
         errdefer allocator.free(shape_demand_fns);
         @memset(shape_demand_fns, false);
@@ -552,6 +561,7 @@ const Pass = struct {
             .fn_effect_free = fn_effect_free,
             .fn_may_crash = fn_may_crash,
             .peeled = peeled,
+            .whole_body_cloned = whole_body_cloned,
             .shape_demand_fns = shape_demand_fns,
             .self_recursive_fns = self_recursive_fns,
         };
@@ -563,6 +573,7 @@ const Pass = struct {
         self.allocator.free(self.fn_may_crash);
         self.allocator.free(self.fn_effect_free);
         self.allocator.free(self.peeled);
+        self.allocator.free(self.whole_body_cloned);
         for (self.plans) |*plan| plan.deinit(self.allocator);
         self.allocator.free(self.plans);
         self.arena.deinit();
@@ -1871,20 +1882,6 @@ const Pass = struct {
         }
     }
 
-    /// Unwrap to a block's final expression regardless of intervening
-    /// statements. Used only to classify a function's shape, never to move
-    /// code, so discarding the statements is sound here.
-    fn blockFinal(self: *Pass, expr_id: Ast.ExprId) Ast.ExprId {
-        var current = expr_id;
-        while (true) {
-            const expr = self.program.getExpr(current);
-            switch (expr.data) {
-                .block => |block| current = block.final_expr,
-                else => return current,
-            }
-        }
-    }
-
     const DirectCall = struct { fn_id: Ast.FnId, args: Ast.ProgramSpanBorrow(Ast.ExprId, "expr_ids") };
 
     fn asDirectCall(self: *Pass, expr_id: Ast.ExprId) ?DirectCall {
@@ -2086,126 +2083,20 @@ const Pass = struct {
         return .{ .base = inner.base, .items = items };
     }
 
-    /// Whether a two-argument function is a suffix `append` adapter: it builds
-    /// an iterator whose step, when its inner iterator is exhausted, yields one
-    /// held item and then finishes. Detected by that step's structure — the
-    /// exhausted arm of a pull over the inner iterator producing a held value —
-    /// not by the function's name.
+    /// Whether a two-argument function returns the internal representation
+    /// Monotype minted for `Iter.append`. The producer records the adapter kind
+    /// on the nominal; specialization consumes that evidence directly instead
+    /// of reverse-engineering a generated step function's body shape.
     fn fnIsSuffixAppend(self: *Pass, fn_id: Ast.FnId) bool {
         const raw = @intFromEnum(fn_id);
         if (raw >= self.program.fnCount()) return false;
         const fn_ = self.program.getFnAt(raw);
         if (self.program.typedLocalSpan(fn_.args).len != 2) return false;
-        const body = switch (fn_.body) {
-            .roc => |b| b,
-            .hosted => return false,
+        return switch (self.program.types.get(fn_.ret)) {
+            .named => |named| named.def.iterator_representation == .minted and
+                named.def.iterator_kind == .append,
+            else => false,
         };
-        // The body constructs the adapter through a `make`-style helper.
-        const make_call = self.asDirectCall(self.blockFinal(body)) orelse return false;
-        const make_raw = @intFromEnum(make_call.fn_id);
-        if (make_raw >= self.program.fnCount()) return false;
-        const make_body = switch (self.program.getFnAt(make_raw).body) {
-            .roc => |b| b,
-            .hosted => return false,
-        };
-        // The helper builds the iterator record with a step callable; find that
-        // step function reference among its arguments.
-        const record_call = self.asDirectCall(self.blockFinal(make_body)) orelse return false;
-        var step_fn: ?Ast.FnId = null;
-        for (0..record_call.args.len) |index| {
-            const arg = GuardedList.at(record_call.args, index);
-            switch (self.program.getExpr(arg).data) {
-                .fn_ref => |fn_ref| step_fn = fn_ref.fn_id,
-                else => {},
-            }
-        }
-        const step = step_fn orelse return false;
-        return self.stepYieldsHeldItemWhenExhausted(step);
-    }
-
-    /// Whether a step function's pull over its inner iterator has an exhausted
-    /// arm (a nullary-tag pattern) that yields a held item — the structural
-    /// signature of a suffix append, distinguishing it from prepend (item
-    /// yielded immediately) or map (item transformed from the inner element).
-    fn stepYieldsHeldItemWhenExhausted(self: *Pass, fn_id: Ast.FnId) bool {
-        const raw = @intFromEnum(fn_id);
-        if (raw >= self.program.fnCount()) return false;
-        const body = switch (self.program.getFnAt(raw).body) {
-            .roc => |b| b,
-            .hosted => return false,
-        };
-        return self.exprHasExhaustedYield(body, 0);
-    }
-
-    fn exprHasExhaustedYield(self: *Pass, expr_id: Ast.ExprId, depth: usize) bool {
-        if (depth > 64) return false;
-        const expr = self.program.getExpr(expr_id);
-        switch (expr.data) {
-            .match_ => |match| {
-                // A pull over the inner iterator: a match with a nullary-tag
-                // (exhausted) arm yielding a held item.
-                if (self.asDirectCall(match.scrutinee) != null) {
-                    const branches = self.program.branchSpan(match.branches);
-                    for (0..branches.len) |branch_index| {
-                        const branch = GuardedList.at(branches, branch_index);
-                        const tag = switch (self.program.getPat(branch.pat).data) {
-                            .tag => |t| t,
-                            else => continue,
-                        };
-                        if (self.program.patSpan(tag.payloads).len != 0) continue;
-                        if (self.armYieldsHeldItem(branch.body)) return true;
-                    }
-                }
-                if (self.exprHasExhaustedYield(match.scrutinee, depth + 1)) return true;
-                const branches = self.program.branchSpan(match.branches);
-                for (0..branches.len) |branch_index| {
-                    if (self.exprHasExhaustedYield(GuardedList.at(branches, branch_index).body, depth + 1)) return true;
-                }
-                return false;
-            },
-            .if_ => |if_| {
-                const branches = self.program.ifBranchSpan(if_.branches);
-                for (0..branches.len) |branch_index| {
-                    if (self.exprHasExhaustedYield(GuardedList.at(branches, branch_index).body, depth + 1)) return true;
-                }
-                return self.exprHasExhaustedYield(if_.final_else, depth + 1);
-            },
-            .block => |block| {
-                const statements = self.program.stmtSpan(block.statements);
-                for (0..statements.len) |stmt_index| {
-                    const stmt_id = GuardedList.at(statements, stmt_index);
-                    switch (self.program.getStmt(stmt_id)) {
-                        .let_ => |let_| if (self.exprHasExhaustedYield(let_.value, depth + 1)) return true,
-                        else => {},
-                    }
-                }
-                return self.exprHasExhaustedYield(block.final_expr, depth + 1);
-            },
-            .static_data_candidate => |candidate| return self.exprHasExhaustedYield(candidate.runtime_expr, depth + 1),
-            .let_ => |let_| return self.exprHasExhaustedYield(let_.value, depth + 1) or
-                self.exprHasExhaustedYield(let_.rest, depth + 1),
-            else => return false,
-        }
-    }
-
-    /// Whether an exhausted-arm body yields a `One`-style item whose held value
-    /// is a plain (captured) local — the appended item.
-    fn armYieldsHeldItem(self: *Pass, expr_id: Ast.ExprId) bool {
-        const yielded = self.stripArmBlock(expr_id);
-        const tag = switch (self.program.getExpr(yielded).data) {
-            .tag => |t| t,
-            else => return false,
-        };
-        const payloads = self.program.exprSpan(tag.payloads);
-        if (payloads.len != 1) return false;
-        const fields = switch (self.program.getExpr(GuardedList.at(payloads, 0)).data) {
-            .record => |f| self.program.fieldExprSpan(f),
-            else => return false,
-        };
-        for (0..fields.len) |index| {
-            if (localExpr(self.program, GuardedList.at(fields, index).value) != null) return true;
-        }
-        return false;
     }
 
     /// Build the loop so its iterator slot iterates the shared base, keeping
@@ -2713,6 +2604,9 @@ const Pass = struct {
     /// branch, sinks the consuming loop into those branches, and scalarizes each
     /// sunk loop's carried state.
     fn cloneFnBodyInPlace(self: *Pass, fn_id: Ast.FnId, body: Ast.ExprId) Common.LowerError!void {
+        const fn_index = @intFromEnum(fn_id);
+        if (fn_index < self.whole_body_cloned.len and self.whole_body_cloned[fn_index]) return;
+
         var cloner = Cloner.initForRewrite(self);
         defer cloner.deinit();
         // The branch-chosen iterator's construction chain (its source `List.iter`,
@@ -2736,6 +2630,7 @@ const Pass = struct {
             .body = .{ .roc = cloned },
             .ret = fn_.ret,
         });
+        if (fn_index < self.whole_body_cloned.len) self.whole_body_cloned[fn_index] = true;
     }
 
     /// Collect outermost loops with an explicitly known constructor in their

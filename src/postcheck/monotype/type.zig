@@ -60,6 +60,10 @@ pub const TypeDef = struct {
     /// Representation decision produced when an internal iterator nominal is
     /// created. Later stages consume the recorded tier and mint depth directly.
     iterator_representation: IteratorRepresentation = .none,
+    /// Exact producer or adapter that minted this iterator representation.
+    /// Consumers use this evidence instead of reconstructing an operation from
+    /// the generated function body's shape.
+    iterator_kind: IteratorKind = .none,
     /// Producer-computed minted-chain depth. Meaningful only for `.minted`.
     iterator_depth: u8 = 0,
 };
@@ -68,6 +72,24 @@ pub const TypeDef = struct {
 pub const IteratorRepresentation = enum(u8) {
     none,
     minted,
+    forced_dynamic,
+};
+
+/// Producer-owned identity of an internal iterator representation.
+pub const IteratorKind = enum(u8) {
+    none,
+    custom,
+    list,
+    single,
+    range_exclusive,
+    range_inclusive,
+    map,
+    keep_if,
+    drop_if,
+    take_first,
+    drop_first,
+    concat,
+    append,
     forced_dynamic,
 };
 
@@ -919,6 +941,7 @@ pub const Store = struct {
                 }
                 writeOptionalDigest(hasher, named.def.generated);
                 writeBytes(hasher, @tagName(named.def.iterator_representation));
+                writeBytes(hasher, @tagName(named.def.iterator_kind));
                 writeU32(hasher, named.def.iterator_depth);
                 writeBytes(hasher, @tagName(named.kind));
                 if (named.builtin_owner) |owner| {
@@ -1144,6 +1167,7 @@ fn namedTypeViewEql(
     }
     if (!optionalDigestEql(lhs.def.generated, rhs.def.generated)) return false;
     if (lhs.def.iterator_representation != rhs.def.iterator_representation) return false;
+    if (lhs.def.iterator_kind != rhs.def.iterator_kind) return false;
     if (lhs.def.iterator_depth != rhs.def.iterator_depth) return false;
     if (lhs.builtin_owner != rhs.builtin_owner) return false;
     if (!try typeSpanViewEql(type_view, name_store, lhs.args, rhs.args, visited)) return false;
@@ -1463,6 +1487,7 @@ fn namedTypeEqlAcrossStores(
     }
     if (!optionalDigestEql(lhs.def.generated, rhs.def.generated)) return false;
     if (lhs.def.iterator_representation != rhs.def.iterator_representation) return false;
+    if (lhs.def.iterator_kind != rhs.def.iterator_kind) return false;
     if (lhs.def.iterator_depth != rhs.def.iterator_depth) return false;
     if (lhs.builtin_owner != rhs.builtin_owner) return false;
     if (!try typeSpanEqlAcrossStores(name_store, lhs_view, lhs.args, rhs_view, rhs.args, visited)) return false;

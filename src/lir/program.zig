@@ -121,6 +121,10 @@ pub const ConstRootPlan = struct {
     request: check.CheckedModule.RootRequest,
     proc: LIR.LirProcSpecId,
     ret_layout: layout.Idx,
+    /// Exact producer-owned Monotype representation of the evaluated root.
+    /// ConstStore restoration consumes this instead of reconstructing
+    /// representation evidence from the public checked type.
+    ret_type: const_store.ConstTypeId,
     plan: ConstPlanId,
 };
 

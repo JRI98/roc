@@ -1451,7 +1451,7 @@ test "issue 9802 same-type map2 specialization counters are bounded" {
         .exact_type_checks = 22,
         .nominal_backing_reuses = 1,
         .nominal_backing_instantiations = 73,
-        .evidence_walks = 716,
+        .evidence_walks = 708,
         .evidence_walk_memo_hits = 514,
     }, counters);
 }
