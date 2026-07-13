@@ -5,6 +5,7 @@
 //! compiler's canonical internal representation (CIR).
 
 const std = @import("std");
+const build_options = @import("build_options");
 const testing = std.testing;
 const base = @import("base");
 const parse = @import("parse");
@@ -563,8 +564,8 @@ test "hexadecimal integer literals" {
         .{ .literal = "-0x8000000000000001", .expected_value = @as(i128, -9223372036854775809) },
     };
 
-    var gpa_state = std.heap.DebugAllocator(.{ .safety = true }){};
-    defer std.debug.assert(gpa_state.deinit() == .ok);
+    var gpa_state = std.heap.DebugAllocator(.{ .safety = true, .stack_trace_frames = build_options.debug_gpa_stack_trace_frames }){};
+    defer std.debug.assert(build_options.debugGpaOk(gpa_state.deinit()));
     const gpa = gpa_state.allocator();
     var builtin_ctx = try BuiltinTestContext.init(gpa);
     defer builtin_ctx.deinit();
@@ -626,8 +627,8 @@ test "binary integer literals" {
         .{ .literal = "-0b1000000000000001", .expected_value = -32769 },
     };
 
-    var gpa_state = std.heap.DebugAllocator(.{ .safety = true }){};
-    defer std.debug.assert(gpa_state.deinit() == .ok);
+    var gpa_state = std.heap.DebugAllocator(.{ .safety = true, .stack_trace_frames = build_options.debug_gpa_stack_trace_frames }){};
+    defer std.debug.assert(build_options.debugGpaOk(gpa_state.deinit()));
     const gpa = gpa_state.allocator();
     var builtin_ctx = try BuiltinTestContext.init(gpa);
     defer builtin_ctx.deinit();
@@ -689,8 +690,8 @@ test "octal integer literals" {
         .{ .literal = "-0o100001", .expected_value = -32769 },
     };
 
-    var gpa_state = std.heap.DebugAllocator(.{ .safety = true }){};
-    defer std.debug.assert(gpa_state.deinit() == .ok);
+    var gpa_state = std.heap.DebugAllocator(.{ .safety = true, .stack_trace_frames = build_options.debug_gpa_stack_trace_frames }){};
+    defer std.debug.assert(build_options.debugGpaOk(gpa_state.deinit()));
     const gpa = gpa_state.allocator();
     var builtin_ctx = try BuiltinTestContext.init(gpa);
     defer builtin_ctx.deinit();
@@ -752,8 +753,8 @@ test "integer literals with uppercase base prefixes" {
         .{ .literal = "0XaBcD", .expected_value = 43981 },
     };
 
-    var gpa_state = std.heap.DebugAllocator(.{ .safety = true }){};
-    defer std.debug.assert(gpa_state.deinit() == .ok);
+    var gpa_state = std.heap.DebugAllocator(.{ .safety = true, .stack_trace_frames = build_options.debug_gpa_stack_trace_frames }){};
+    defer std.debug.assert(build_options.debugGpaOk(gpa_state.deinit()));
     const gpa = gpa_state.allocator();
     var builtin_ctx = try BuiltinTestContext.init(gpa);
     defer builtin_ctx.deinit();
@@ -788,8 +789,8 @@ test "integer literals with uppercase base prefixes" {
 }
 
 test "numeric literal patterns use pattern idx as type var" {
-    var gpa_state = std.heap.DebugAllocator(.{ .safety = true }){};
-    defer std.debug.assert(gpa_state.deinit() == .ok);
+    var gpa_state = std.heap.DebugAllocator(.{ .safety = true, .stack_trace_frames = build_options.debug_gpa_stack_trace_frames }){};
+    defer std.debug.assert(build_options.debugGpaOk(gpa_state.deinit()));
     const gpa = gpa_state.allocator();
 
     // Test that int literal patterns work and use the pattern index as the type variable
@@ -841,8 +842,8 @@ test "numeric literal patterns use pattern idx as type var" {
 }
 
 test "pattern numeric literal value edge cases" {
-    var gpa_state = std.heap.DebugAllocator(.{ .safety = true }){};
-    defer std.debug.assert(gpa_state.deinit() == .ok);
+    var gpa_state = std.heap.DebugAllocator(.{ .safety = true, .stack_trace_frames = build_options.debug_gpa_stack_trace_frames }){};
+    defer std.debug.assert(build_options.debugGpaOk(gpa_state.deinit()));
     const gpa = gpa_state.allocator();
 
     // Test max/min integer values
