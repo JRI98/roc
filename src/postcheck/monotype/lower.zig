@@ -467,22 +467,6 @@ const ParseIntrinsic = enum {
 ///
 /// These are not source-visible nominal declarations like `MapIter`. The
 /// distinct compiler-owned nominal identity is the `TypeDef.generated` digest
-/// minted from this kind plus the concrete component types. That digest is the
-/// identity; display names stay the public `Iter` provenance.
-const GeneratedIteratorKind = enum {
-    custom,
-    single,
-    range_exclusive,
-    range_inclusive,
-    map,
-    keep_if,
-    drop_if,
-    take_first,
-    drop_first,
-    concat,
-    append,
-};
-
 const FieldNameBound = enum {
     shortest,
     longest,
@@ -2433,9 +2417,10 @@ const Builder = struct {
         for (tags) |tag| {
             const payloads = try self.lowerTypeSlice(view, tag.argsSlice(view.types));
             defer self.allocator.free(payloads);
+            const tag_name = try self.tagName(view, tag.name);
             try out.append(self.allocator, .{
-                .name = try self.tagName(view, tag.name),
-                .checked_name = tag.name,
+                .name = tag_name,
+                .checked_name = tag_name,
                 .payloads = try self.program.types.addSpan(payloads),
             });
         }
@@ -3368,7 +3353,7 @@ const Builder = struct {
         for (fn_value.captures) |capture| {
             if (!capture.id.isCanonical()) continue;
             const binder = capture.id.binder();
-            const lowered_ty = try fn_ctx.lowerConstCaptureType(store_view, capture.ty);
+            const lowered_ty = try fn_ctx.lowerConstType(store_view, capture.ty);
             const local = try fn_ctx.addLocalWithBinder(self.symbols.fresh(), lowered_ty, binder);
             try fn_ctx.bindLocalName(local, binder);
             const previous = fn_ctx.binders.get(binder);
@@ -3944,7 +3929,7 @@ const Builder = struct {
 
         for (fn_value.captures, 0..) |capture, index| {
             const binder = constCaptureBinder(capture.id);
-            const lowered_ty = try fn_ctx.lowerConstCaptureType(store_view, capture.ty);
+            const lowered_ty = try fn_ctx.lowerConstType(store_view, capture.ty);
             const capture_cell = try fn_ctx.draftTypeCell(lowered_ty);
             const local = try fn_ctx.addLocalWithBinderCell(self.symbols.fresh(), capture_cell, binder);
             try fn_ctx.bindLocalName(local, binder);
@@ -9190,11 +9175,14 @@ const BodyContext = struct {
         entry: checked.HoistedConstEntry,
         ty: Type.TypeId,
     ) Allocator.Error!DraftExprId {
-        try self.constrainTypeToMono(entry.checked_type, ty);
         const template = self.view.const_templates.get(entry.const_ref);
         const source_region = self.hoistedConstSourceRegion(entry);
         return switch (template.state) {
             .stored_const => |stored| blk: {
+                const stored_ty = try self.storedConstRootMonoType(self.view, stored, entry.checked_type);
+                if (!try self.sameTypeOrPublicOpaque(ty, stored_ty)) {
+                    Common.invariant("stored hoisted const representation differed from its expected Monotype type");
+                }
                 const saved_loc = self.builder.program.current_loc;
                 defer self.builder.program.current_loc = saved_loc;
                 const saved_region = self.builder.program.current_region;
@@ -9205,13 +9193,16 @@ const BodyContext = struct {
                     self.view,
                     self.view,
                     stored.node,
-                    ty,
+                    stored_ty,
                     entry.const_ref,
                     entry.checked_type,
                     .disallow,
                 );
             },
-            .eval_template => |eval| try self.lowerConstEvalTemplateUse(self.view, eval, ty, source_region, .{ .module = self.view.key, .root = entry.root }),
+            .eval_template => |eval| blk: {
+                try self.constrainTypeToMono(entry.checked_type, ty);
+                break :blk try self.lowerConstEvalTemplateUse(self.view, eval, ty, source_region, .{ .module = self.view.key, .root = entry.root });
+            },
             .reserved => Common.invariant("reserved hoisted const template reached Monotype"),
         };
     }
@@ -9260,7 +9251,12 @@ const BodyContext = struct {
     ) Allocator.Error!?Type.TypeId {
         const entry = self.selectedHoistedConstEntry(selected);
         if (self.loweringOwnHoistedConstRoot(entry)) return null;
-        const hoisted_ty = try self.lowerTypeView(entry.checked_type);
+        const template = self.view.const_templates.get(entry.const_ref);
+        const hoisted_ty = switch (template.state) {
+            .stored_const => |stored| try self.storedConstRootMonoType(self.view, stored, entry.checked_type),
+            .eval_template => try self.lowerTypeView(entry.checked_type),
+            .reserved => Common.invariant("reserved hoisted const template reached Monotype type selection"),
+        };
         try self.constrainTypeToMono(checked_ty, hoisted_ty);
         return hoisted_ty;
     }
@@ -9891,6 +9887,10 @@ const BodyContext = struct {
 
     fn isBuiltinIterSingleText(text: []const u8) bool {
         return Ident.textEql(text, "Builtin.Iter.single");
+    }
+
+    fn isBuiltinListIterText(text: []const u8) bool {
+        return Ident.textEql(text, "Builtin.List.iter");
     }
 
     fn isBuiltinIterMapText(text: []const u8) bool {
@@ -10941,6 +10941,7 @@ const BodyContext = struct {
                 var public_def = ctx.named.def;
                 public_def.generated = null;
                 public_def.iterator_representation = .none;
+                public_def.iterator_kind = .none;
                 public_def.iterator_depth = 0;
                 const args = ctx.body.builder.program.types.span(ctx.named.args);
                 if (args.len == 0) Common.invariant("generated iterator evidence had no public item argument");
@@ -10979,6 +10980,7 @@ const BodyContext = struct {
         var public_def = named.def;
         public_def.generated = null;
         public_def.iterator_representation = .none;
+        public_def.iterator_kind = .none;
         public_def.iterator_depth = 0;
         return try self.builder.program.types.add(.{ .named = .{
             .named_type = named.named_type,
@@ -11052,10 +11054,6 @@ const BodyContext = struct {
             }
         }
 
-        if (expected_ret_ty) |expected| {
-            if (!try self.builder.monoTypeHasGeneratedOpaqueEvidence(expected)) return null;
-        }
-
         if (isBuiltinIterNextText(text)) {
             if (checked_args.len != 1 or arg_tys.len != 1) Common.invariant("Iter.next reached Monotype with an unexpected arity");
             if (self.isGeneratedIteratorEvidenceType(arg_tys[0])) {
@@ -11082,6 +11080,23 @@ const BodyContext = struct {
                 const components = [_]Type.TypeId{ arg_tys[0], arg_tys[2] };
                 return try self.functionTypeWithReturn(arg_tys, try self.generatedIteratorType(.custom, fn_data.ret, &components, try self.callableArgumentEvidenceDigest(checked_args[2])));
             }
+        }
+
+        if (isBuiltinListIterText(text)) {
+            if (checked_args.len != 1 or arg_tys.len != 1) Common.invariant("List.iter reached Monotype with an unexpected arity");
+            if (expected_ret_ty) |expected| {
+                if (self.isGeneratedIteratorEvidenceType(expected)) {
+                    const stable_expected = try self.stableGeneratedIteratorEvidenceType(expected);
+                    if (self.isForcedDynamicIteratorType(stable_expected)) {
+                        return try self.functionTypeWithReturn(arg_tys, stable_expected);
+                    }
+                    const expected_args = try self.generatedIteratorComponentArgs(stable_expected, 1);
+                    defer self.allocator.free(expected_args);
+                    return try self.functionTypeWithReturn(expected_args, stable_expected);
+                }
+            }
+            const components = [_]Type.TypeId{arg_tys[0]};
+            return try self.functionTypeWithReturn(arg_tys, try self.generatedIteratorType(.list, fn_data.ret, &components, null));
         }
 
         if (isBuiltinIterSingleText(text)) {
@@ -11546,7 +11561,7 @@ const BodyContext = struct {
 
     fn generatedIteratorType(
         self: *BodyContext,
-        kind: GeneratedIteratorKind,
+        kind: Type.IteratorKind,
         public_iter_ty: Type.TypeId,
         components: []const Type.TypeId,
         callable_evidence: ?names.TypeDigest,
@@ -11585,10 +11600,11 @@ const BodyContext = struct {
             item_ty: Type.TypeId,
             args: []const Type.TypeId,
             digest: names.TypeDigest,
+            kind: Type.IteratorKind,
             chain_depth: u32,
 
             fn fill(ctx: @This(), self_ty: Type.TypeId) Allocator.Error!Type.Content {
-                return try ctx.body.generatedIteratorContent(ctx.public_named, ctx.item_ty, ctx.args, ctx.digest, ctx.chain_depth, self_ty);
+                return try ctx.body.generatedIteratorContent(ctx.public_named, ctx.item_ty, ctx.args, ctx.digest, ctx.kind, ctx.chain_depth, self_ty);
             }
         };
 
@@ -11598,6 +11614,7 @@ const BodyContext = struct {
             .item_ty = item_ty,
             .args = args,
             .digest = digest,
+            .kind = kind,
             .chain_depth = chain_depth,
         };
         const generated = try self.builder.program.types.addRecursive(context, Context.fill);
@@ -11683,7 +11700,7 @@ const BodyContext = struct {
 
     fn generatedIteratorDigest(
         self: *BodyContext,
-        kind: GeneratedIteratorKind,
+        kind: Type.IteratorKind,
         item_ty: Type.TypeId,
         components: []const Type.TypeId,
         callable_evidence: ?names.TypeDigest,
@@ -11784,6 +11801,7 @@ const BodyContext = struct {
         item_ty: Type.TypeId,
         args: []const Type.TypeId,
         digest: names.TypeDigest,
+        kind: Type.IteratorKind,
         chain_depth: u32,
         self_ty: Type.TypeId,
     ) Allocator.Error!Type.Content {
@@ -11792,6 +11810,7 @@ const BodyContext = struct {
         var def = public_named.def;
         def.generated = digest;
         def.iterator_representation = .minted;
+        def.iterator_kind = kind;
         def.iterator_depth = @intCast(chain_depth);
         return .{ .named = .{
             .named_type = public_named.named_type,
@@ -11830,6 +11849,7 @@ const BodyContext = struct {
                 var def = ctx.public_named.def;
                 def.generated = null;
                 def.iterator_representation = .forced_dynamic;
+                def.iterator_kind = .forced_dynamic;
                 def.iterator_depth = max_minted_iterator_chain_depth;
                 const args = [_]Type.TypeId{ctx.item_ty};
                 return .{ .named = .{
@@ -17212,7 +17232,24 @@ const BodyContext = struct {
     fn constUseMonoType(self: *BodyContext, const_use: checked.ConstUseTemplate) Allocator.Error!Type.TypeId {
         const requested_ty = const_use.requested_source_ty_payload orelse
             Common.invariant("checked const use reached Monotype without a requested checked type");
-        return try self.lowerTypeView(requested_ty);
+        const store_view = self.builder.moduleForId(checked.constModuleId(const_use.const_ref));
+        const template = store_view.const_templates.get(const_use.const_ref);
+        return switch (template.state) {
+            .stored_const => |stored| try self.storedConstRootMonoType(store_view, stored, requested_ty),
+            .eval_template => try self.lowerTypeView(requested_ty),
+            .reserved => Common.invariant("reserved checked const template reached Monotype type selection"),
+        };
+    }
+
+    fn storedConstRootMonoType(
+        self: *BodyContext,
+        store_view: ModuleView,
+        stored: checked.StoredConstTemplate,
+        requested_ty: checked.CheckedTypeId,
+    ) Allocator.Error!Type.TypeId {
+        const stored_ty = try self.lowerConstType(store_view, stored.root_type);
+        try self.constrainTypeToMono(requested_ty, try self.publicOpaqueUnificationType(stored_ty));
+        return stored_ty;
     }
 
     fn restoreConstUseAtType(
@@ -17223,8 +17260,6 @@ const BodyContext = struct {
     ) Allocator.Error!DraftExprId {
         const requested_ty = const_use.requested_source_ty_payload orelse
             Common.invariant("checked const use reached Monotype without a requested checked type");
-        try self.constrainTypeToMono(requested_ty, ty);
-
         const previous_restore_evidence = self.restore_evidence;
         self.restore_evidence = .{ .vector = use_evidence };
         defer self.restore_evidence = previous_restore_evidence;
@@ -17232,17 +17267,26 @@ const BodyContext = struct {
         const store_view = self.builder.moduleForId(checked.constModuleId(const_use.const_ref));
         const template = store_view.const_templates.get(const_use.const_ref);
         return switch (template.state) {
-            .stored_const => |stored| try self.restoredStaticDataCandidateNode(
-                store_view,
-                self.view,
-                stored.node,
-                ty,
-                const_use.const_ref,
-                requested_ty,
-                .disallow,
-            ),
+            .stored_const => |stored| blk: {
+                const stored_ty = try self.storedConstRootMonoType(store_view, stored, requested_ty);
+                if (!try self.sameTypeOrPublicOpaque(ty, stored_ty)) {
+                    Common.invariant("stored const representation differed from its expected Monotype type");
+                }
+                break :blk try self.restoredStaticDataCandidateNode(
+                    store_view,
+                    self.view,
+                    stored.node,
+                    stored_ty,
+                    const_use.const_ref,
+                    requested_ty,
+                    .disallow,
+                );
+            },
             .reserved => Common.invariant("reserved checked const template reached Monotype"),
-            .eval_template => |eval| try self.lowerConstEvalTemplateUse(store_view, eval, ty, null, null),
+            .eval_template => |eval| blk: {
+                try self.constrainTypeToMono(requested_ty, ty);
+                break :blk try self.lowerConstEvalTemplateUse(store_view, eval, ty, null, null);
+            },
         };
     }
 
@@ -17544,17 +17588,17 @@ const BodyContext = struct {
         };
     }
 
-    fn lowerConstCaptureType(
+    fn lowerConstType(
         self: *BodyContext,
         store_view: ModuleView,
         ty: check.ConstStore.ConstTypeId,
     ) Allocator.Error!Type.TypeId {
         var map = std.AutoHashMap(check.ConstStore.ConstTypeId, Type.TypeId).init(self.allocator);
         defer map.deinit();
-        return try self.lowerConstCaptureTypeInner(store_view, ty, &map);
+        return try self.lowerConstTypeInner(store_view, ty, &map);
     }
 
-    fn lowerConstCaptureTypeInner(
+    fn lowerConstTypeInner(
         self: *BodyContext,
         store_view: ModuleView,
         ty: check.ConstStore.ConstTypeId,
@@ -17581,11 +17625,11 @@ const BodyContext = struct {
 
         fn fill(self: ConstTypeLowerContext, reserved: Type.TypeId) Allocator.Error!Type.Content {
             try self.map.put(self.ty, reserved);
-            return try self.body.lowerConstCaptureTypeContent(self.store_view, self.ty, self.map);
+            return try self.body.lowerConstTypeContent(self.store_view, self.ty, self.map);
         }
     };
 
-    fn lowerConstCaptureTypeContent(
+    fn lowerConstTypeContent(
         self: *BodyContext,
         store_view: ModuleView,
         ty: check.ConstStore.ConstTypeId,
@@ -17596,14 +17640,14 @@ const BodyContext = struct {
             .primitive => |primitive| .{ .primitive = monotypePrimitive(primitive) },
             .zst => .zst,
             .erased => |erased| .{ .erased = erased },
-            .list => |elem| .{ .list = try self.lowerConstCaptureTypeInner(store_view, elem, map) },
-            .box => |elem| .{ .box = try self.lowerConstCaptureTypeInner(store_view, elem, map) },
+            .list => |elem| .{ .list = try self.lowerConstTypeInner(store_view, elem, map) },
+            .box => |elem| .{ .box = try self.lowerConstTypeInner(store_view, elem, map) },
             .tuple => |items| blk: {
                 const source = type_store.typeSpan(items);
                 const out = try self.allocator.alloc(Type.TypeId, source.len);
                 defer self.allocator.free(out);
                 for (source, 0..) |item, index| {
-                    out[index] = try self.lowerConstCaptureTypeInner(store_view, item, map);
+                    out[index] = try self.lowerConstTypeInner(store_view, item, map);
                 }
                 break :blk .{ .tuple = try self.builder.program.types.addSpan(out) };
             },
@@ -17612,11 +17656,11 @@ const BodyContext = struct {
                 const out = try self.allocator.alloc(Type.TypeId, source.len);
                 defer self.allocator.free(out);
                 for (source, 0..) |arg, index| {
-                    out[index] = try self.lowerConstCaptureTypeInner(store_view, arg, map);
+                    out[index] = try self.lowerConstTypeInner(store_view, arg, map);
                 }
                 break :blk .{ .func = .{
                     .args = try self.builder.program.types.addSpan(out),
-                    .ret = try self.lowerConstCaptureTypeInner(store_view, func.ret, map),
+                    .ret = try self.lowerConstTypeInner(store_view, func.ret, map),
                 } };
             },
             .record => |fields| blk: {
@@ -17626,7 +17670,7 @@ const BodyContext = struct {
                 for (source, 0..) |field, index| {
                     out[index] = .{
                         .name = try self.constRecordFieldName(store_view, field.name),
-                        .ty = try self.lowerConstCaptureTypeInner(store_view, field.ty, map),
+                        .ty = try self.lowerConstTypeInner(store_view, field.ty, map),
                     };
                 }
                 break :blk .{ .record = try self.builder.program.types.addRecordFields(&self.builder.program.names, out) };
@@ -17640,7 +17684,7 @@ const BodyContext = struct {
                     const out_payloads = try self.allocator.alloc(Type.TypeId, payloads.len);
                     defer self.allocator.free(out_payloads);
                     for (payloads, 0..) |payload, payload_index| {
-                        out_payloads[payload_index] = try self.lowerConstCaptureTypeInner(store_view, payload, map);
+                        out_payloads[payload_index] = try self.lowerConstTypeInner(store_view, payload, map);
                     }
                     out[index] = .{
                         .name = try self.constTagName(store_view, tag.name),
@@ -17655,7 +17699,7 @@ const BodyContext = struct {
                 const out_args = try self.allocator.alloc(Type.TypeId, args.len);
                 defer self.allocator.free(out_args);
                 for (args, 0..) |arg, index| {
-                    out_args[index] = try self.lowerConstCaptureTypeInner(store_view, arg, map);
+                    out_args[index] = try self.lowerConstTypeInner(store_view, arg, map);
                 }
 
                 const declared = type_store.declaredFieldSpan(named.declared_order);
@@ -17664,7 +17708,7 @@ const BodyContext = struct {
                 for (declared, 0..) |entry, index| {
                     out_declared[index] = switch (entry) {
                         .named => |name| .{ .named = try self.constRecordFieldName(store_view, name) },
-                        .padding => |padding| .{ .padding = try self.lowerConstCaptureTypeInner(store_view, padding, map) },
+                        .padding => |padding| .{ .padding = try self.lowerConstTypeInner(store_view, padding, map) },
                     };
                 }
 
@@ -17678,7 +17722,7 @@ const BodyContext = struct {
                     .builtin_owner = named.builtin_owner,
                     .args = try self.builder.program.types.addSpan(out_args),
                     .backing = if (named.backing) |backing| .{
-                        .ty = try self.lowerConstCaptureTypeInner(store_view, backing.ty, map),
+                        .ty = try self.lowerConstTypeInner(store_view, backing.ty, map),
                         .use = monotypeBackingUse(backing.use),
                     } else null,
                     .declared_order = try self.builder.program.types.addDeclaredFields(out_declared),
@@ -17714,6 +17758,7 @@ const BodyContext = struct {
             .source_decl = def.source_decl,
             .generated = def.generated,
             .iterator_representation = @enumFromInt(@intFromEnum(def.iterator_representation)),
+            .iterator_kind = @enumFromInt(@intFromEnum(def.iterator_kind)),
             .iterator_depth = def.iterator_depth,
         };
     }
@@ -17842,7 +17887,7 @@ const BodyContext = struct {
 
         for (fn_value.captures, 0..) |capture, index| {
             const binder = constCaptureBinder(capture.id);
-            const lowered_ty = try fn_ctx.lowerConstCaptureType(store_view, capture.ty);
+            const lowered_ty = try fn_ctx.lowerConstType(store_view, capture.ty);
             const capture_cell = try fn_ctx.draftTypeCell(lowered_ty);
             const local = try fn_ctx.addLocalWithBinderCell(self.builder.symbols.fresh(), capture_cell, binder);
             try fn_ctx.bindLocalName(local, binder);
@@ -18851,6 +18896,7 @@ const BodyContext = struct {
         if (expected.def.source_decl == null and expected.def.type_name != actual.def.type_name) return false;
         if (!optionalDigestEql(expected.def.generated, actual.def.generated)) return false;
         if (expected.def.iterator_representation != actual.def.iterator_representation) return false;
+        if (expected.def.iterator_kind != actual.def.iterator_kind) return false;
         if (expected.def.iterator_depth != actual.def.iterator_depth) return false;
         if (expected.kind != actual.kind) return false;
         if (expected.builtin_owner != actual.builtin_owner) return false;
@@ -28037,6 +28083,7 @@ fn sameTypeDef(left: Type.TypeDef, right: Type.TypeDef) bool {
         left.source_decl == right.source_decl and
         optionalDigestEql(left.generated, right.generated) and
         left.iterator_representation == right.iterator_representation and
+        left.iterator_kind == right.iterator_kind and
         left.iterator_depth == right.iterator_depth;
 }
 
