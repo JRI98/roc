@@ -170,6 +170,11 @@ pub const Store = struct {
     specialization_digests: StoreList(?names.TypeDigest, "specialization_digests"),
     type_digest_generations: StoreList(u64, "type_digest_generations"),
     specialization_digest_generations: StoreList(u64, "specialization_digest_generations"),
+    /// Unique allocation epoch for each live TypeId. Store restoration can
+    /// recycle an id after discarding an interner candidate, so caches keyed
+    /// by TypeId validate this epoch as well as mutable-view generations.
+    type_epochs: StoreList(u64, "type_epochs"),
+    next_type_epoch: u64,
     digest_cache_generation: u64,
     spans: StoreList(TypeId, "spans"),
     fields: StoreList(Field, "fields"),
@@ -185,6 +190,8 @@ pub const Store = struct {
             .specialization_digests = .empty,
             .type_digest_generations = .empty,
             .specialization_digest_generations = .empty,
+            .type_epochs = .empty,
+            .next_type_epoch = 1,
             .digest_cache_generation = 1,
             .spans = .empty,
             .fields = .empty,
@@ -201,6 +208,7 @@ pub const Store = struct {
         self.spans.deinit(self.allocator);
         self.specialization_digest_generations.deinit(self.allocator);
         self.type_digest_generations.deinit(self.allocator);
+        self.type_epochs.deinit(self.allocator);
         self.specialization_digests.deinit(self.allocator);
         self.type_digests.deinit(self.allocator);
         self.types.deinit(self.allocator);
@@ -270,6 +278,10 @@ pub const Store = struct {
         try self.type_digest_generations.append(self.allocator, 0);
         errdefer _ = self.type_digest_generations.pop();
         try self.specialization_digest_generations.append(self.allocator, 0);
+        errdefer _ = self.specialization_digest_generations.pop();
+        if (self.next_type_epoch == std.math.maxInt(u64)) Common.invariant("Monotype type epoch exhausted");
+        try self.type_epochs.append(self.allocator, self.next_type_epoch);
+        self.next_type_epoch += 1;
         return @enumFromInt(@as(u32, @intCast(index)));
     }
 
@@ -311,6 +323,10 @@ pub const Store = struct {
         return self.types.unsafeRawItemsForView()[@intFromEnum(ty)];
     }
 
+    pub fn typeEpoch(self: *const Store, ty: TypeId) u64 {
+        return self.type_epochs.unsafeRawItemsForView()[@intFromEnum(ty)];
+    }
+
     pub fn span(self: *const Store, span_: Span) StoreSpanBorrow(TypeId, "spans") {
         return self.spans.borrowSpan(span_.start, span_.len);
     }
@@ -341,6 +357,7 @@ pub const Store = struct {
         specialization_digests_len: usize,
         type_digest_generations_len: usize,
         specialization_digest_generations_len: usize,
+        type_epochs_len: usize,
         spans_len: usize,
         fields_len: usize,
         tags_len: usize,
@@ -354,6 +371,7 @@ pub const Store = struct {
             .specialization_digests_len = self.specialization_digests.len(),
             .type_digest_generations_len = self.type_digest_generations.len(),
             .specialization_digest_generations_len = self.specialization_digest_generations.len(),
+            .type_epochs_len = self.type_epochs.len(),
             .spans_len = self.spans.len(),
             .fields_len = self.fields.len(),
             .tags_len = self.tags.len(),
@@ -368,6 +386,7 @@ pub const Store = struct {
         self.specialization_digests.restoreLen(mark_.specialization_digests_len);
         self.type_digest_generations.restoreLen(mark_.type_digest_generations_len);
         self.specialization_digest_generations.restoreLen(mark_.specialization_digest_generations_len);
+        self.type_epochs.restoreLen(mark_.type_epochs_len);
         self.spans.restoreLen(mark_.spans_len);
         self.fields.restoreLen(mark_.fields_len);
         self.tags.restoreLen(mark_.tags_len);
@@ -2073,6 +2092,22 @@ pub fn builtinOwnerForPrimitive(primitive: Primitive) static_dispatch.BuiltinOwn
 
 test "monotype type declarations are referenced" {
     std.testing.refAllDecls(@This());
+}
+
+test "monotype type epochs distinguish recycled ids" {
+    var store = Store.init(std.testing.allocator);
+    defer store.deinit();
+
+    _ = try store.add(.{ .primitive = .u64 });
+    const mark_ = store.mark();
+    const discarded = try store.add(.{ .primitive = .i64 });
+    const discarded_epoch = store.typeEpoch(discarded);
+
+    store.restore(mark_);
+    const replacement = try store.add(.{ .primitive = .str });
+
+    try std.testing.expectEqual(discarded, replacement);
+    try std.testing.expect(discarded_epoch != store.typeEpoch(replacement));
 }
 
 test "monotype type interner reuses child-first function nodes" {

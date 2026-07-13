@@ -56,62 +56,6 @@ pub const DeferredTemplate = struct {
 /// Identity of a node in a specialization's instantiation graph.
 pub const NodeId = enum(u32) { _ };
 
-/// Deterministic operation counters for Monotype instantiation-graph work.
-/// Incremented unconditionally (plain adds; the pass is single-threaded) and
-/// reported by the lowering driver when `ROC_MONOTYPE_STATS` is set.
-pub const Stats = struct {
-    graphs_created: u64 = 0,
-    new_nodes: u64 = 0,
-    unify_calls: u64 = 0,
-    unify_pairs: u64 = 0,
-    unify_pairs_processed: u64 = 0,
-    unions: u64 = 0,
-    mark_dirty_calls: u64 = 0,
-    mark_dirty_visits: u64 = 0,
-    dirty_queued: u64 = 0,
-    drain_refills: u64 = 0,
-    fill_mono_calls: u64 = 0,
-    flatten_tag_rows: u64 = 0,
-    flatten_tag_volume: u64 = 0,
-    flatten_record_rows: u64 = 0,
-    flatten_record_volume: u64 = 0,
-    unify_tag_rows: u64 = 0,
-    unify_record_rows: u64 = 0,
-    import_mono_calls: u64 = 0,
-    import_mono_hits: u64 = 0,
-    import_mono_nodes: u64 = 0,
-    views_created: u64 = 0,
-    seal_node_calls: u64 = 0,
-    seal_type_calls: u64 = 0,
-    seal_content_fills: u64 = 0,
-    seal_store_fills: u64 = 0,
-    structural_backing_calls: u64 = 0,
-    nominal_backing_hits: u64 = 0,
-    nominal_backing_misses: u64 = 0,
-    // Producer-side counters (incremented from lower.zig).
-    inst_node_calls: u64 = 0,
-    inst_node_hits: u64 = 0,
-    constrain_calls: u64 = 0,
-    call_instantiations: u64 = 0,
-    dispatch_instantiations: u64 = 0,
-    call_arg_mono_types: u64 = 0,
-    public_opaque_calls: u64 = 0,
-    public_opaque_clones: u64 = 0,
-    evidence_walk_calls: u64 = 0,
-    evidence_walk_hits: u64 = 0,
-    evidence_seals: u64 = 0,
-
-    pub fn dump(self: *const Stats) void {
-        inline for (@typeInfo(Stats).@"struct".fields) |field| {
-            std.debug.print("monotype_stat {s} {d}\n", .{ field.name, @field(self, field.name) });
-        }
-    }
-};
-
-/// Global counter sink. Monotype lowering runs single-threaded; plain
-/// increments are sufficient for deterministic operation counts.
-pub var stats: Stats = .{};
-
 // Current mutable Monotype output points to remove during graph sealing:
 // `addMonoView`, `monoFor`, `fillMono`, `importMono`, row
 // flattening, and the span materializers below. Completed Monotype views must
@@ -343,7 +287,6 @@ pub const InstGraph = struct {
         name_store: *const names.NameStore,
         unsolved_monos: *const std.AutoHashMap(Type.TypeId, void),
     ) Allocator.Error!*InstGraph {
-        stats.graphs_created += 1;
         const graph = try allocator.create(InstGraph);
         graph.* = .{
             .allocator = allocator,
@@ -410,7 +353,6 @@ pub const InstGraph = struct {
     }
 
     pub fn newNode(self: *InstGraph, node_content: InstNode) Allocator.Error!NodeId {
-        stats.new_nodes += 1;
         const id: NodeId = @enumFromInt(@as(u32, @intCast(self.nodes.items.len)));
         try self.nodes.append(self.allocator, node_content);
         try self.versions.append(self.allocator, 0);
@@ -427,10 +369,7 @@ pub const InstGraph = struct {
         const bucket = self.nominal_backings.getPtr(.{
             .module_bytes = module_bytes,
             .declaration_id = declaration_id,
-        }) orelse {
-            stats.nominal_backing_misses += 1;
-            return null;
-        };
+        }) orelse return null;
         instances: for (bucket.items) |*instance| {
             if (instance.args.len != args.len) continue;
             for (instance.args, args) |*stored, wanted| {
@@ -439,10 +378,8 @@ pub const InstGraph = struct {
                 stored.* = self.find(stored.*);
                 if (stored.* != self.find(wanted)) continue :instances;
             }
-            stats.nominal_backing_hits += 1;
             return instance.node;
         }
-        stats.nominal_backing_misses += 1;
         return null;
     }
 
@@ -588,7 +525,6 @@ pub const InstGraph = struct {
     /// Queue the views of a changed root and of every row whose flattened view
     /// chains through it for a content refill.
     fn markDirty(self: *InstGraph, changed: NodeId) Allocator.Error!void {
-        stats.mark_dirty_calls += 1;
         self.dirty_mark_pending.clearRetainingCapacity();
         self.dirty_mark_visited.clearRetainingCapacity();
         try self.dirty_mark_pending.append(self.allocator, changed);
@@ -596,7 +532,6 @@ pub const InstGraph = struct {
             const root = self.find(raw);
             if (self.dirty_mark_visited.contains(root)) continue;
             try self.dirty_mark_visited.put(root, {});
-            stats.mark_dirty_visits += 1;
             if (self.node_monos.contains(root)) {
                 try self.queueDirty(root);
             }
@@ -613,7 +548,6 @@ pub const InstGraph = struct {
         const root = self.find(raw_root);
         const entry = try self.dirty_set.getOrPut(root);
         if (entry.found_existing) return;
-        stats.dirty_queued += 1;
         try self.dirty.append(self.allocator, root);
     }
 
@@ -623,7 +557,6 @@ pub const InstGraph = struct {
         const winner = self.find(raw_winner);
         const loser = self.find(raw_loser);
         if (winner == loser) return;
-        stats.unions += 1;
         _ = self.dirty_set.remove(loser);
         try self.unregisterRowParent(loser);
         self.nodes.items[@intFromEnum(loser)] = .{ .redirect = winner };
@@ -668,7 +601,6 @@ pub const InstGraph = struct {
     }
 
     pub fn unify(self: *InstGraph, a: NodeId, b: NodeId) Allocator.Error!void {
-        stats.unify_calls += 1;
         try self.unify_pending.append(self.allocator, .{ .left = a, .right = b });
         // A unify issued while a walk is draining (a row-empty collapse inside
         // `unifyConcrete`) joins the active walk: constraints resolve
@@ -682,7 +614,6 @@ pub const InstGraph = struct {
             self.unify_related.clearRetainingCapacity();
         }
         while (self.unify_pending.pop()) |pair| {
-            stats.unify_pairs += 1;
             try self.unifyRoots(pair.left, pair.right, &self.unify_pending, &self.unify_related);
         }
     }
@@ -703,7 +634,6 @@ pub const InstGraph = struct {
         const relation = self.relationStamp(left, right);
         if (self.processed_relations.contains(relation)) return;
         try self.processed_relations.put(relation, {});
-        stats.unify_pairs_processed += 1;
 
         const left_content = self.nodes.items[@intFromEnum(left)];
         const right_content = self.nodes.items[@intFromEnum(right)];
@@ -987,7 +917,6 @@ pub const InstGraph = struct {
     };
 
     fn structuralBackingNode(self: *InstGraph, raw: NodeId, owner: InstNamed) Allocator.Error!StructuralBacking {
-        stats.structural_backing_calls += 1;
         const result = try self.findStructuralBackingNode(raw, owner);
         if (!result.recursive) {
             try self.compressStructuralBacking(raw, owner, result.node);
@@ -1114,13 +1043,11 @@ pub const InstGraph = struct {
     /// flattened row. The returned extension is unresolved (open), an empty tag
     /// union (closed), or compressed out.
     fn flattenTagRow(self: *InstGraph, raw_root: NodeId) Allocator.Error!FlatTagRow {
-        stats.flatten_tag_rows += 1;
         const root = self.find(raw_root);
         const row = switch (self.nodes.items[@intFromEnum(root)]) {
             .tag_union => |row| row,
             else => Common.invariant("instantiation flattened a non-tag-union row"),
         };
-        stats.flatten_tag_volume += row.tags.len;
 
         var ext = self.find(row.ext);
         switch (self.nodes.items[@intFromEnum(ext)]) {
@@ -1172,13 +1099,11 @@ pub const InstGraph = struct {
     }
 
     fn flattenRecordRow(self: *InstGraph, raw_root: NodeId) Allocator.Error!FlatRecordRow {
-        stats.flatten_record_rows += 1;
         const root = self.find(raw_root);
         const row = switch (self.nodes.items[@intFromEnum(root)]) {
             .record => |row| row,
             else => Common.invariant("instantiation flattened a non-record row"),
         };
-        stats.flatten_record_volume += row.fields.len;
 
         var ext = self.find(row.ext);
         switch (self.nodes.items[@intFromEnum(ext)]) {
@@ -1236,7 +1161,6 @@ pub const InstGraph = struct {
     }
 
     fn unifyTagRows(self: *InstGraph, left: NodeId, right: NodeId, pending: *std.ArrayList(NodePair)) Allocator.Error!void {
-        stats.unify_tag_rows += 1;
         const flat_left = try self.flattenTagRow(left);
         const flat_right = try self.flattenTagRow(right);
 
@@ -1345,7 +1269,6 @@ pub const InstGraph = struct {
     }
 
     fn unifyRecordRows(self: *InstGraph, left: NodeId, right: NodeId, pending: *std.ArrayList(NodePair)) Allocator.Error!void {
-        stats.unify_record_rows += 1;
         const flat_left = try self.flattenRecordRow(left);
         const flat_right = try self.flattenRecordRow(right);
 
@@ -1452,12 +1375,7 @@ pub const InstGraph = struct {
     /// later attempt to widen it is a unification conflict rather than a silent
     /// mutation of another specialization's final type.
     pub fn importMono(self: *InstGraph, ty: Type.TypeId) Allocator.Error!NodeId {
-        stats.import_mono_calls += 1;
-        if (self.mono_nodes.get(ty)) |existing| {
-            stats.import_mono_hits += 1;
-            return existing;
-        }
-        stats.import_mono_nodes += 1;
+        if (self.mono_nodes.get(ty)) |existing| return existing;
         const node = try self.newNode(.{ .unresolved = InstVariable.placeholder() });
         // One-way memo: every import is a finished Monotype from outside this
         // graph (ids materialized here hit the memo above), so it enters as a
@@ -1592,7 +1510,6 @@ pub const InstGraph = struct {
         if (self.node_monos.get(root)) |views| {
             if (views.items.len != 0) return views.items[0];
         }
-        stats.views_created += 1;
         const ty = try self.types.add(.zst);
         const entry = try self.node_monos.getOrPut(root);
         if (!entry.found_existing) entry.value_ptr.* = .empty;
@@ -1605,7 +1522,6 @@ pub const InstGraph = struct {
     /// Materialize a graph node directly into a final TypeId without first
     /// exposing or copying a mutable Monotype view.
     pub fn sealNode(self: *InstGraph, node: NodeId) Allocator.Error!Type.TypeId {
-        stats.seal_node_calls += 1;
         try self.drainDirty();
         var sealer = GraphTypeFinals.init(self);
         defer sealer.deinit();
@@ -1616,7 +1532,6 @@ pub const InstGraph = struct {
     /// this snapshots its current solved node instead of returning the mutable
     /// view id.
     pub fn sealType(self: *InstGraph, ty: Type.TypeId) Allocator.Error!Type.TypeId {
-        stats.seal_type_calls += 1;
         try self.drainDirty();
         var sealer = GraphTypeFinals.init(self);
         defer sealer.deinit();
@@ -1729,7 +1644,6 @@ pub const InstGraph = struct {
 
     /// Write a node's current content into one of its Monotype views.
     fn fillMono(self: *InstGraph, raw_root: NodeId, ty: Type.TypeId) Allocator.Error!void {
-        stats.fill_mono_calls += 1;
         const root = self.find(raw_root);
         const types = self.types;
         const previous = types.get(ty);
@@ -1988,7 +1902,6 @@ pub const InstGraph = struct {
             if (!self.dirty_set.remove(root)) continue;
             const views = self.node_monos.get(root) orelse continue;
             for (views.items) |ty| {
-                stats.drain_refills += 1;
                 try self.fillMono(root, ty);
             }
         }
@@ -2063,7 +1976,6 @@ pub const GraphTypeFinals = struct {
     }
 
     fn sealContent(self: *GraphTypeFinals, node: NodeId) Allocator.Error!Type.Content {
-        stats.seal_content_fills += 1;
         return switch (self.graph.nodes.items[@intFromEnum(node)]) {
             .redirect => unreachable,
             .unresolved => |variable| materializeUnresolved(variable),
@@ -2121,7 +2033,6 @@ pub const GraphTypeFinals = struct {
     }
 
     fn sealStoreContent(self: *GraphTypeFinals, ty: Type.TypeId) Allocator.Error!Type.Content {
-        stats.seal_store_fills += 1;
         return switch (self.graph.types.get(ty)) {
             .primitive => |primitive| .{ .primitive = primitive },
             .list => |elem| .{ .list = try self.sealType(elem) },
@@ -2878,6 +2789,35 @@ test "unconstrained checked graph node seals to empty tag union" {
     const sealed = try graph.sealNode(node);
     const content = type_store.get(sealed);
     try std.testing.expectEqual(Type.Span.empty(), content.tag_union);
+}
+
+test "issue 10128: nominal backing cache follows argument roots" {
+    const gpa = std.testing.allocator;
+
+    var type_store = Type.Store.init(gpa);
+    defer type_store.deinit();
+
+    var name_store = names.NameStore.init(gpa);
+    defer name_store.deinit();
+
+    var unsolved_monos = std.AutoHashMap(Type.TypeId, void).init(gpa);
+    defer unsolved_monos.deinit();
+
+    const graph = try InstGraph.create(gpa, &type_store, &name_store, &unsolved_monos);
+    defer graph.destroy();
+
+    const original_arg = try graph.newNode(.{ .unresolved = InstVariable.placeholder() });
+    const resolved_arg = try graph.newNode(.{ .primitive = .u64 });
+    const backing = try graph.newNode(.empty_record);
+    const module_bytes = [_]u8{0xA1} ** 32;
+
+    try graph.putNominalBackingNode(module_bytes, 17, &.{original_arg}, backing);
+    try graph.unify(original_arg, resolved_arg);
+
+    try std.testing.expectEqual(
+        backing,
+        graph.nominalBackingNode(module_bytes, 17, &.{resolved_arg}),
+    );
 }
 
 test "minted iterator unification with its public type preserves the minted backing" {
