@@ -48,7 +48,8 @@ pub const Constants = struct {
     /// 22: Checked function serialization no longer carries instantiation stamps.
     /// 23: Stored nested functions carry durable local-procedure context identity.
     /// 24: CommonIdents carries the range_exclusive/range_inclusive method idents.
-    pub const CACHE_VERSION = 24;
+    /// 25: Canonical node storage records where-clause rigid ownership.
+    pub const CACHE_VERSION = 25;
 };
 
 /// Configuration for the Roc cache system.

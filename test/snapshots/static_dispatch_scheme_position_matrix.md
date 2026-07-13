@@ -39,26 +39,9 @@ parse_show = |s| {
 roundtrip = parse_show("hi")
 ~~~
 # EXPECTED
-MISSING METHOD - static_dispatch_scheme_position_matrix.md:28:9:28:19
 POLYMORPHIC VALUE - static_dispatch_scheme_position_matrix.md:22:1:22:13
 MISSING METHOD - static_dispatch_scheme_position_matrix.md:19:5:19:14
 # PROBLEMS
-
-┌────────────────┐
-│ MISSING METHOD ├─ This `parse` method is being called on a value whose ─────┐
-└┬───────────────┘  type doesn't have that method.                            │
- │                                                                            │
- │  v = A.parse(s)                                                            │
- │      ‾‾‾‾‾‾‾‾‾‾                                                            │
- └──────────────────────────── static_dispatch_scheme_position_matrix.md:28:9 ┘
-
-    The value's type, which does not have a method named `parse`, is:
-
-        a
-
-    Hint: For this to work, the type would need to have a method named `parse`
-    associated with it in the type's declaration.
-
 
 ┌───────────────────┐
 │ POLYMORPHIC VALUE ├─ This top-level value still has an unresolved ──────────┐
@@ -394,7 +377,20 @@ roundtrip = parse_show("hi")
 		(e-lambda
 			(args
 				(p-assign (ident "s")))
-			(e-runtime-error (tag "erroneous_value_expr")))
+			(e-block
+				(s-type-var-alias (alias "A") (type-var "a")
+					(ty-rigid-var (name "a")))
+				(s-let
+					(p-assign (ident "v"))
+					(e-type-dispatch-call (method "parse") (type-dispatch-stmt 88) (constraint-fn-var 422)
+						(args
+							(e-lookup-local
+								(p-assign (ident "s"))))))
+				(e-dispatch-call (method "show") (constraint-fn-var 424)
+					(receiver
+						(e-lookup-local
+							(p-assign (ident "v"))))
+					(args))))
 		(annotation
 			(ty-fn (effectful false)
 				(ty-lookup (name "Str") (builtin))
@@ -410,7 +406,7 @@ roundtrip = parse_show("hi")
 					(ty-lookup (name "Str") (builtin))))))
 	(d-let
 		(p-assign (ident "roundtrip"))
-		(e-call (constraint-fn-var 429)
+		(e-call (constraint-fn-var 434)
 			(e-lookup-local
 				(p-assign (ident "parse_show")))
 			(e-string
