@@ -167,8 +167,9 @@ pub const CallableIdentity = union(enum(u8)) {
     generated: GeneratedId,
 };
 
-/// Full specialization identity: callable plus source function type and the
-/// closed monomorphic function type the reserving call site REQUESTED.
+/// Full specialization identity: callable, method lookup scope, source
+/// function type, and the closed monomorphic function type the reserving call
+/// site REQUESTED.
 ///
 /// The identity is immutable: it is written once when the record is reserved
 /// and never rewritten. Body evidence that refines the requested type is data
@@ -176,6 +177,7 @@ pub const CallableIdentity = union(enum(u8)) {
 /// through additional lookup aliases — never a rekey of this identity.
 pub const SpecIdentity = struct {
     callable: CallableIdentity,
+    method_scope: names.CheckedModuleDigest,
     source_fn_ty_digest: names.TypeDigest,
     request_fn_ty_digest: names.TypeDigest,
     request_fn_ty: Type.TypeId,
@@ -1787,6 +1789,7 @@ test "monotype program view exposes read-only side arrays" {
     _ = try program.addSpec(.{
         .identity = .{
             .callable = .{ .proc_template = .{ .module = .{}, .proc_base = 0, .template = 0 } },
+            .method_scope = .{},
             .source_fn_ty_digest = .{},
             .request_fn_ty_digest = .{},
             .request_fn_ty = unit_ty,

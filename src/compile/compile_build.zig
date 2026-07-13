@@ -177,6 +177,9 @@ pub const BuildEnv = struct {
 
     // Actor model coordinator (owns all mutable compilation state)
     coordinator: ?*Coordinator = null,
+    /// Exact older checked outputs referenced by content-addressed ids in
+    /// current artifacts after coordinator republishing.
+    retired_checked_artifacts: std.ArrayList(coordinator_mod.RetiredCheckedArtifact) = .empty,
 
     // Cache manager for compiled modules
     cache_manager: ?*CacheManager = null,
@@ -356,6 +359,8 @@ pub const BuildEnv = struct {
             coord.deinit();
             self.gpa.destroy(coord);
         }
+        for (self.retired_checked_artifacts.items) |*retired| retired.deinit();
+        self.retired_checked_artifacts.deinit(self.gpa);
 
         if (comptime trace_build) {
             std.debug.print("[DEINIT] coordinator done\n", .{});
@@ -1105,6 +1110,7 @@ pub const BuildEnv = struct {
                 }
             }
         }
+        try coord.transferRetiredCheckedArtifacts(&self.retired_checked_artifacts, self.gpa);
     }
 
     const ResolverCtx = struct { ws: *BuildEnv };
@@ -3098,7 +3104,7 @@ pub const BuildEnv = struct {
 
         for (root_artifact.lowering_visibility.module_ids) |key| {
             if (rootRelationContainsArtifact(root_artifact, key)) continue;
-            const artifact = artifactByKey(modules, key) orelse {
+            const artifact = self.artifactByKey(modules, key) orelse {
                 if (builtin.mode == .Debug) {
                     std.debug.panic("build env invariant violated: missing lowering visibility artifact", .{});
                 }
@@ -3122,7 +3128,7 @@ pub const BuildEnv = struct {
         errdefer views.deinit(allocator);
 
         for (root_artifact.platform_required_bindings.bindings) |binding| {
-            const artifact = artifactByKey(modules, binding.app_value.artifact) orelse {
+            const artifact = self.artifactByKey(modules, binding.app_value.artifact) orelse {
                 if (builtin.mode == .Debug) {
                     std.debug.panic("build env invariant violated: missing relation artifact", .{});
                 }
@@ -3172,12 +3178,16 @@ pub const BuildEnv = struct {
     }
 
     fn artifactByKey(
+        self: *const BuildEnv,
         modules: []const CompiledModuleInfo,
         key: check.CheckedArtifact.CheckedModuleArtifactKey,
     ) ?*const check.CheckedArtifact.CheckedModuleArtifact {
         for (modules) |module| {
             const artifact = module.semantic.checked_artifact orelse continue;
             if (checkedArtifactKeysEqual(artifact.key, key)) return artifact;
+        }
+        for (self.retired_checked_artifacts.items) |retired| {
+            if (checkedArtifactKeysEqual(retired.artifact.key, key)) return retired.artifact;
         }
         return null;
     }

@@ -1733,7 +1733,7 @@ pub fn lookupCheckedMethodTarget(
 /// component crosses by 32-byte content identity (one map probe, full-value
 /// comparison), the type-name component by declared-name interning. This is
 /// the single cross-artifact owner resolution point — no module name text.
-fn methodOwnerInImportedStore(
+pub fn methodOwnerInImportedStore(
     source_names: *const canonical.CanonicalNameStore,
     imported_names: *const canonical.CanonicalNameStore,
     owner: MethodOwner,

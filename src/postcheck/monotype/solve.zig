@@ -40,6 +40,8 @@ pub const EntryRoot = struct {
 pub const DeferredTemplate = struct {
     fn_id: Ast.FnId,
     template_ref: names.ProcTemplate,
+    /// Checked module whose method registry scope the specialization must use.
+    method_scope: checked.ModuleId,
     source_fn_ty: checked.CheckedTypeId,
     source_fn_key: names.TypeDigest,
     /// The requester's live function type cell. `fn_ty` may be replaced by a

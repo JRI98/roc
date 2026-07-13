@@ -157,11 +157,14 @@ const OwnedSemanticModuleData = struct {
     }
 };
 
-const RetiredCheckedArtifact = struct {
+/// A superseded checked artifact whose published module id can still appear in
+/// another artifact's exact dependency scope.
+pub const RetiredCheckedArtifact = struct {
     artifact: *CheckedModuleArtifact,
     retain_module_env: bool,
 
-    fn deinit(self: *RetiredCheckedArtifact) void {
+    /// Release the retired artifact and its optionally retained module state.
+    pub fn deinit(self: *RetiredCheckedArtifact) void {
         destroyCheckedArtifact(self.artifact, self.retain_module_env);
         self.artifact = undefined;
     }
@@ -2332,7 +2335,12 @@ pub const Coordinator = struct {
             return &self.builtin_modules.checked_artifact;
         }
 
-        const location = self.checked_artifact_index.get(key.bytes) orelse return null;
+        const location = self.checked_artifact_index.get(key.bytes) orelse {
+            for (self.retired_checked_artifacts.items) |retired| {
+                if (std.mem.eql(u8, &retired.artifact.key.bytes, &key.bytes)) return retired.artifact;
+            }
+            return null;
+        };
         const pkg = self.packages.get(location.pkg_name) orelse {
             if (builtin.mode == .Debug) {
                 std.debug.panic("compile.coordinator checked artifact registry points at missing package {s}", .{location.pkg_name});
@@ -2358,6 +2366,17 @@ pub const Coordinator = struct {
             unreachable;
         }
         return artifact;
+    }
+
+    /// Move exact older checked outputs still referenced by published module
+    /// ids into the build owner that will outlive this coordinator.
+    pub fn transferRetiredCheckedArtifacts(
+        self: *Coordinator,
+        destination: *std.ArrayList(RetiredCheckedArtifact),
+        allocator: Allocator,
+    ) Allocator.Error!void {
+        try destination.appendSlice(allocator, self.retired_checked_artifacts.items);
+        self.retired_checked_artifacts.clearRetainingCapacity();
     }
 
     fn unregisterCheckedArtifact(self: *Coordinator, mod: *ModuleState) void {

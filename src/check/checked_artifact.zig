@@ -488,6 +488,112 @@ pub const LoweringVisibility = struct {
     }
 };
 
+/// Ordered checked-module registries visible to method lookup after the
+/// current module's local registry. Checking owns this ordering, and later
+/// stages consume the published scope directly.
+pub const MethodLookupScope = struct {
+    module_ids: []const CheckedModuleArtifactKey = &.{},
+
+    pub const Serialized = extern struct {
+        module_ids: SerializedSlice(CheckedModuleArtifactKey) = .{},
+        const Serde = artifact_serialize.SliceStoreSerde(MethodLookupScope, @This());
+        pub const serialize = Serde.serialize;
+        pub const deserialize = Serde.deserialize;
+    };
+
+    pub fn deinit(self: *MethodLookupScope, allocator: Allocator) void {
+        allocator.free(self.module_ids);
+        self.* = .{};
+    }
+};
+
+const MethodLookupScopeBuilder = struct {
+    allocator: Allocator,
+    current: CheckedModuleArtifactKey,
+    module_ids: std.ArrayList(CheckedModuleArtifactKey) = .empty,
+    seen: std.AutoHashMap(CheckedModuleArtifactKey, void),
+    seen_module_hashes: std.AutoHashMap([32]u8, void),
+
+    fn init(allocator: Allocator, current: CheckedModuleArtifactKey) MethodLookupScopeBuilder {
+        return .{
+            .allocator = allocator,
+            .current = current,
+            .seen = std.AutoHashMap(CheckedModuleArtifactKey, void).init(allocator),
+            .seen_module_hashes = std.AutoHashMap([32]u8, void).init(allocator),
+        };
+    }
+
+    fn deinit(self: *MethodLookupScopeBuilder) void {
+        self.seen.deinit();
+        self.seen_module_hashes.deinit();
+        self.module_ids.deinit(self.allocator);
+    }
+
+    fn append(self: *MethodLookupScopeBuilder, module_id: CheckedModuleArtifactKey) Allocator.Error!void {
+        if (checkedArtifactKeyEql(module_id, self.current)) return;
+        const entry = try self.seen.getOrPut(module_id);
+        if (entry.found_existing) return;
+        entry.value_ptr.* = {};
+        try self.module_ids.append(self.allocator, module_id);
+    }
+
+    fn appendView(self: *MethodLookupScopeBuilder, view: ImportedModuleView) Allocator.Error!void {
+        const entry = try self.seen_module_hashes.getOrPut(view.module_identity.stable_hash);
+        if (entry.found_existing) return;
+        entry.value_ptr.* = {};
+        try self.append(view.key);
+    }
+
+    fn finish(self: *MethodLookupScopeBuilder) Allocator.Error!MethodLookupScope {
+        return .{ .module_ids = try self.module_ids.toOwnedSlice(self.allocator) };
+    }
+};
+
+fn collectMethodLookupScope(
+    allocator: Allocator,
+    current: CheckedModuleArtifactKey,
+    current_module_identity: ModuleIdentity,
+    available_artifacts: []const ImportedModuleView,
+    relation_artifacts: []const ImportedModuleView,
+    direct_imports: []const PublishImportArtifact,
+) Allocator.Error!MethodLookupScope {
+    var builder = MethodLookupScopeBuilder.init(allocator, current);
+    defer builder.deinit();
+    try builder.seen_module_hashes.put(current_module_identity.stable_hash, {});
+
+    // This is the same first-match order used by EvidencePass:
+    // available views, platform-relation views, then direct-import views that
+    // are not otherwise present (needed by small/snapshot-style compilations).
+    for (available_artifacts) |artifact| {
+        if (moduleViewIsSuperseded(artifact, relation_artifacts, direct_imports)) continue;
+        if (artifact.method_registry.entries.len != 0) try builder.appendView(artifact);
+    }
+    for (relation_artifacts) |artifact| {
+        if (artifact.method_registry.entries.len != 0) try builder.appendView(artifact);
+    }
+    for (direct_imports) |artifact| {
+        if (artifact.view.method_registry.entries.len != 0) try builder.appendView(artifact.view);
+    }
+
+    return try builder.finish();
+}
+
+fn moduleViewIsSuperseded(
+    view: ImportedModuleView,
+    relation_artifacts: []const ImportedModuleView,
+    direct_imports: []const PublishImportArtifact,
+) bool {
+    for (relation_artifacts) |relation| {
+        if (base.ModuleIdentity.eql(&view.module_identity.stable_hash, &relation.module_identity.stable_hash) and
+            !checkedArtifactKeyEql(view.key, relation.key)) return true;
+    }
+    for (direct_imports) |direct| {
+        if (base.ModuleIdentity.eql(&view.module_identity.stable_hash, &direct.view.module_identity.stable_hash) and
+            !checkedArtifactKeyEql(view.key, direct.key)) return true;
+    }
+    return false;
+}
+
 /// Public `PublishInputs` declaration.
 pub const PublishInputs = struct {
     module_env_storage: ModuleEnvStorage,
@@ -13022,16 +13128,26 @@ const EvidencePass = struct {
     /// direct import, so searching `available` alone misses every
     /// builtin-owned method.)
     fn lookupMethodTargetAcrossViews(self: *EvidencePass, owner: static_dispatch.MethodOwner, method: canonical.MethodNameId) ?static_dispatch.MethodTarget {
-        if (static_dispatch.lookupCheckedMethodTarget(self.names, self.local_method_registry, self.import_views.available, owner, method)) |target| {
+        if (static_dispatch.lookupCheckedMethodTarget(self.names, self.local_method_registry, &.{}, owner, method)) |target| {
             return target;
         }
-        if (static_dispatch.lookupCheckedMethodTarget(self.names, self.local_method_registry, self.import_views.relations, owner, method)) |target| {
-            return target;
+        var one_view: [1]ImportedModuleView = undefined;
+        for (self.import_views.available) |available| {
+            if (moduleViewIsSuperseded(available, self.import_views.relations, self.import_views.direct)) continue;
+            one_view[0] = available;
+            if (static_dispatch.lookupCheckedMethodTarget(self.names, self.local_method_registry, one_view[0..1], owner, method)) |target| {
+                return target;
+            }
         }
-        var direct_views_buf: [1]ImportedModuleView = undefined;
+        for (self.import_views.relations) |relation| {
+            one_view[0] = relation;
+            if (static_dispatch.lookupCheckedMethodTarget(self.names, self.local_method_registry, one_view[0..1], owner, method)) |target| {
+                return target;
+            }
+        }
         for (self.import_views.direct) |import| {
-            direct_views_buf[0] = import.view;
-            if (static_dispatch.lookupCheckedMethodTarget(self.names, self.local_method_registry, direct_views_buf[0..1], owner, method)) |target| {
+            one_view[0] = import.view;
+            if (static_dispatch.lookupCheckedMethodTarget(self.names, self.local_method_registry, one_view[0..1], owner, method)) |target| {
                 return target;
             }
         }
@@ -20825,6 +20941,7 @@ const LoweringVisibilityBuilder = struct {
         };
         for (view.public_api_dependencies.artifacts) |dependency| try self.appendKey(dependency);
         for (view.public_api_dependencies.type_owner_artifacts) |dependency| try self.appendKey(dependency);
+        for (view.method_lookup_scope) |dependency| try self.appendKey(dependency);
     }
 
     fn appendRootRequest(self: *LoweringVisibilityBuilder, request: RootRequest) Allocator.Error!void {
@@ -20925,6 +21042,7 @@ fn collectLoweringVisibility(
     allocator: Allocator,
     artifact_key: CheckedModuleArtifactKey,
     direct_import_artifact_keys: []const CheckedModuleArtifactKey,
+    method_lookup_scope: MethodLookupScope,
     public_api_dependencies: PublicApiDependencies,
     checked_types: *const CheckedTypeStore,
     checked_templates: *const CheckedProcedureTemplateTable,
@@ -20953,6 +21071,7 @@ fn collectLoweringVisibility(
     defer builder.deinit();
 
     for (direct_import_artifact_keys) |key| try builder.appendKey(key);
+    for (method_lookup_scope.module_ids) |key| try builder.appendKey(key);
     for (public_api_dependencies.artifacts) |key| try builder.appendKey(key);
     for (public_api_dependencies.type_owner_artifacts) |key| try builder.appendKey(key);
     for (root_requests.requests) |request| try builder.appendRootRequest(request);
@@ -22545,6 +22664,7 @@ pub const CheckedModuleArtifact = struct {
     direct_import_artifact_keys: []CheckedModuleArtifactKey = &.{},
     public_api_dependencies: PublicApiDependencies = .{},
     lowering_visibility: LoweringVisibility = .{},
+    method_lookup_scope: MethodLookupScope = .{},
     module_env: ModuleEnvStorage,
     exports: ExportTable,
     checked_types: CheckedTypeStore = .{},
@@ -22708,6 +22828,7 @@ pub const CheckedModuleArtifact = struct {
         checking_context_identity: CheckingContextIdentity.Serialized,
         public_api_dependencies: PublicApiDependencies.Serialized,
         lowering_visibility: LoweringVisibility.Serialized,
+        method_lookup_scope: MethodLookupScope.Serialized,
         exports: ExportTable.Serialized,
         checked_types: CheckedTypeStore.Serialized,
         checked_bodies: CheckedBodyStore.Serialized,
@@ -22760,7 +22881,7 @@ pub const CheckedModuleArtifact = struct {
             // `proc_bases`; `checked_types` includes its `var_names` interner = 3).
             // POD inline `key`/`module_identity` contribute 0. Fixed at compile time,
             // independent of stored data size.
-            std.debug.assert(artifact_serialize.relocatablePointerCount(Serialized) == 193);
+            std.debug.assert(artifact_serialize.relocatablePointerCount(Serialized) == 194);
         }
 
         /// Append every sub-store's bytes to `writer` in field order, recording
@@ -22779,6 +22900,7 @@ pub const CheckedModuleArtifact = struct {
             try self.checking_context_identity.serialize(&artifact.checking_context_identity, gpa, writer);
             try self.public_api_dependencies.serialize(&artifact.public_api_dependencies, gpa, writer);
             try self.lowering_visibility.serialize(&artifact.lowering_visibility, gpa, writer);
+            try self.method_lookup_scope.serialize(&artifact.method_lookup_scope, gpa, writer);
             try self.exports.serialize(&artifact.exports, gpa, writer);
             try self.checked_types.serialize(&artifact.checked_types, gpa, writer);
             try self.checked_bodies.serialize(&artifact.checked_bodies, gpa, writer);
@@ -22868,6 +22990,7 @@ pub const CheckedModuleArtifact = struct {
                 .checking_context_identity = self.checking_context_identity.deserialize(base_addr),
                 .public_api_dependencies = self.public_api_dependencies.deserialize(base_addr),
                 .lowering_visibility = self.lowering_visibility.deserialize(base_addr),
+                .method_lookup_scope = self.method_lookup_scope.deserialize(base_addr),
                 .exports = self.exports.deserialize(base_addr),
                 .checked_types = self.checked_types.deserialize(base_addr),
                 .checked_bodies = self.checked_bodies.deserialize(base_addr),
@@ -23025,6 +23148,7 @@ pub const CheckedModuleArtifact = struct {
         self.checked_bodies.deinit(allocator);
         self.checked_types.deinit(allocator);
         self.exports.deinit(allocator);
+        self.method_lookup_scope.deinit(allocator);
         self.lowering_visibility.deinit(allocator);
         self.public_api_dependencies.deinit(allocator);
         allocator.free(self.direct_import_artifact_keys);
@@ -23736,6 +23860,7 @@ pub const ImportedModuleView = struct {
     direct_import_artifact_keys: []const CheckedModuleArtifactKey = &.{},
     public_api_dependencies: PublicApiDependencies = .{},
     lowering_visibility: LoweringVisibility = .{},
+    method_lookup_scope: []const CheckedModuleArtifactKey = &.{},
     exports: ExportTableView,
     checked_types: CheckedTypeStoreView,
     checked_bodies: CheckedBodyStoreView,
@@ -23781,6 +23906,7 @@ pub fn importedView(artifact: *const CheckedModuleArtifact) ImportedModuleView {
         .direct_import_artifact_keys = artifact.direct_import_artifact_keys,
         .public_api_dependencies = artifact.public_api_dependencies,
         .lowering_visibility = artifact.lowering_visibility,
+        .method_lookup_scope = artifact.method_lookup_scope.module_ids,
         .exports = artifact.exports.view(),
         .checked_types = artifact.checked_types.view(),
         .checked_bodies = artifact.checked_bodies.view(),
@@ -25634,10 +25760,21 @@ pub fn publishFromTypedModule(
     );
     errdefer public_api_dependencies.deinit(allocator);
 
+    var method_lookup_scope = try collectMethodLookupScope(
+        allocator,
+        artifact_key,
+        module_identity,
+        inputs.available_artifacts,
+        inputs.relation_artifacts,
+        inputs.imports,
+    );
+    errdefer method_lookup_scope.deinit(allocator);
+
     var lowering_visibility = try collectLoweringVisibility(
         allocator,
         artifact_key,
         direct_import_artifact_keys,
+        method_lookup_scope,
         public_api_dependencies,
         checked_types,
         &checked_procedure_templates,
@@ -25670,6 +25807,7 @@ pub fn publishFromTypedModule(
         .direct_import_artifact_keys = direct_import_artifact_keys,
         .public_api_dependencies = public_api_dependencies,
         .lowering_visibility = lowering_visibility,
+        .method_lookup_scope = method_lookup_scope,
         .module_env = inputs.module_env_storage,
         .exports = .{ .defs = exports },
         .checked_types = checked_types.*,
@@ -26767,6 +26905,7 @@ test "transform-A stores: serialize/deserialize round-trip preserves every slice
     try expectAllSliceStoreRoundTrips(ProvidesRequiresMetadata);
     try expectAllSliceStoreRoundTrips(PublicApiDependencies);
     try expectAllSliceStoreRoundTrips(LoweringVisibility);
+    try expectAllSliceStoreRoundTrips(MethodLookupScope);
     try expectAllSliceStoreRoundTrips(CheckedProcedureTemplateTable);
     try expectAllSliceStoreRoundTrips(static_dispatch.MethodRegistry);
     // Total-dispatch plans: resolutions, evidence nodes/refs, site evidence,
@@ -26783,6 +26922,29 @@ fn testCheckedArtifactKey(byte: u8) CheckedModuleArtifactKey {
     return key;
 }
 
+test "method lookup scope preserves first-seen checking order without duplicates" {
+    const gpa = std.testing.allocator;
+    const current = testCheckedArtifactKey(0xF0);
+    const available = testCheckedArtifactKey(0x01);
+    const relation = testCheckedArtifactKey(0x02);
+    const direct_only = testCheckedArtifactKey(0x03);
+
+    var builder = MethodLookupScopeBuilder.init(gpa, current);
+    defer builder.deinit();
+    try builder.append(available);
+    try builder.append(relation);
+    try builder.append(available);
+    try builder.append(current);
+    try builder.append(direct_only);
+
+    var scope = try builder.finish();
+    defer scope.deinit(gpa);
+    try std.testing.expectEqual(@as(usize, 3), scope.module_ids.len);
+    try std.testing.expect(checkedArtifactKeyEql(available, scope.module_ids[0]));
+    try std.testing.expect(checkedArtifactKeyEql(relation, scope.module_ids[1]));
+    try std.testing.expect(checkedArtifactKeyEql(direct_only, scope.module_ids[2]));
+}
+
 fn testVisibilityImportedView(
     key: CheckedModuleArtifactKey,
     module_env: *const ModuleEnv,
@@ -26792,7 +26954,15 @@ fn testVisibilityImportedView(
         .key = key,
         .module_env = module_env,
         .canonical_names = undefined,
-        .module_identity = undefined,
+        .module_identity = .{
+            .stable_hash = key.bytes,
+            .module_idx = 0,
+            // Method-scope collection reads only the stable identity hash.
+            .module_name = undefined,
+            .display_module_name = undefined,
+            .qualified_module_name = undefined,
+            .kind = .package,
+        },
         .public_api_dependencies = public_api_dependencies,
         .exports = undefined,
         .checked_types = undefined,
@@ -26821,6 +26991,58 @@ fn testVisibilityImportedView(
         .interface_capabilities = undefined,
         .const_store = undefined,
     };
+}
+
+test "method lookup scope keeps only registry-bearing modules in checking order" {
+    const gpa = std.testing.allocator;
+    var env = try ModuleEnv.init(gpa, "");
+    defer env.deinit();
+
+    const current = testCheckedArtifactKey(0xF0);
+    const empty_key = testCheckedArtifactKey(0x01);
+    const available_key = testCheckedArtifactKey(0x02);
+    const relation_key = testCheckedArtifactKey(0x03);
+    const previous_publication_key = testCheckedArtifactKey(0x04);
+    const previous_relation_key = testCheckedArtifactKey(0x05);
+    const dummy_entries = [_]static_dispatch.MethodRegistryEntry{undefined};
+    const empty_registry = static_dispatch.MethodRegistry{};
+    const nonempty_registry = static_dispatch.MethodRegistry{ .entries = @constCast(&dummy_entries) };
+
+    var empty_view = testVisibilityImportedView(empty_key, &env, .{});
+    empty_view.method_registry = &empty_registry;
+    var available_view = testVisibilityImportedView(available_key, &env, .{});
+    available_view.method_registry = &nonempty_registry;
+    var relation_view = testVisibilityImportedView(relation_key, &env, .{});
+    relation_view.method_registry = &nonempty_registry;
+    var previous_publication_view = testVisibilityImportedView(previous_publication_key, &env, .{});
+    previous_publication_view.module_identity.stable_hash = current.bytes;
+    previous_publication_view.method_registry = &nonempty_registry;
+    var previous_relation_view = testVisibilityImportedView(previous_relation_key, &env, .{});
+    previous_relation_view.module_identity.stable_hash = relation_view.module_identity.stable_hash;
+    previous_relation_view.method_registry = &nonempty_registry;
+
+    const available = [_]ImportedModuleView{ previous_publication_view, previous_relation_view, empty_view, available_view };
+    const relations = [_]ImportedModuleView{ available_view, relation_view };
+    const direct = [_]PublishImportArtifact{.{
+        .module_idx = 1,
+        .key = relation_key,
+        .view = relation_view,
+    }};
+    const current_identity = ModuleIdentity{
+        .stable_hash = current.bytes,
+        .module_idx = 0,
+        // Method-scope collection reads only the stable identity hash.
+        .module_name = undefined,
+        .display_module_name = undefined,
+        .qualified_module_name = undefined,
+        .kind = .package,
+    };
+    var scope = try collectMethodLookupScope(gpa, current, current_identity, &available, &relations, &direct);
+    defer scope.deinit(gpa);
+
+    try std.testing.expectEqual(@as(usize, 2), scope.module_ids.len);
+    try std.testing.expect(checkedArtifactKeyEql(available_key, scope.module_ids[0]));
+    try std.testing.expect(checkedArtifactKeyEql(relation_key, scope.module_ids[1]));
 }
 
 test "lowering visibility follows recursive public API and type-owner dependencies deterministically" {
@@ -26857,17 +27079,18 @@ test "lowering visibility follows recursive public API and type-owner dependenci
 
     const a_public = [_]CheckedModuleArtifactKey{ key_c, key_builtin };
     const a_type_owners = [_]CheckedModuleArtifactKey{key_e};
-    const b_type_owners = [_]CheckedModuleArtifactKey{key_e};
+    const b_method_lookup_scope = [_]CheckedModuleArtifactKey{key_e};
     const d_type_owners = [_]CheckedModuleArtifactKey{key_b};
 
-    const views = [_]ImportedModuleView{
+    var views = [_]ImportedModuleView{
         testVisibilityImportedView(key_a, &env_a, .{ .artifacts = &a_public, .type_owner_artifacts = &a_type_owners }),
-        testVisibilityImportedView(key_b, &env_b, .{ .type_owner_artifacts = &b_type_owners }),
+        testVisibilityImportedView(key_b, &env_b, .{}),
         testVisibilityImportedView(key_c, &env_c, .{}),
         testVisibilityImportedView(key_d, &env_d, .{ .type_owner_artifacts = &d_type_owners }),
         testVisibilityImportedView(key_e, &env_e, .{}),
         testVisibilityImportedView(key_builtin, &env_builtin, .{}),
     };
+    views[1].method_lookup_scope = &b_method_lookup_scope;
 
     var checked_types = CheckedTypeStore{};
     defer checked_types.deinit(gpa);
@@ -26899,6 +27122,7 @@ test "lowering visibility follows recursive public API and type-owner dependenci
         gpa,
         root_key,
         &direct_imports,
+        .{},
         root_deps,
         &checked_types,
         &checked_templates,
@@ -27409,8 +27633,8 @@ test "SERIALIZED_VERSION_HASH golden value" {
     // change, bump `serialized_layout_version` and replace the golden bytes below with
     // the ones this assertion prints.
     const golden: [32]u8 = .{
-        0xB6, 0xDF, 0xFB, 0x94, 0xCF, 0xAB, 0x33, 0x96, 0x00, 0x57, 0xCD, 0xFE, 0x77, 0x7E, 0xF1, 0xD3,
-        0x71, 0xB0, 0x26, 0x9F, 0x61, 0xA1, 0x4C, 0xD2, 0xCD, 0x34, 0xE9, 0xC1, 0x34, 0x1C, 0xC7, 0x7A,
+        0x7A, 0x9A, 0xFC, 0x33, 0xC3, 0x17, 0x47, 0x9C, 0xDD, 0xDA, 0xEA, 0x68, 0xF2, 0x52, 0x65, 0x3C,
+        0x9F, 0x27, 0x0E, 0xE1, 0xAE, 0x37, 0x69, 0xBC, 0x8E, 0x05, 0xBA, 0xFB, 0x37, 0x08, 0x5C, 0x71,
     };
     try std.testing.expectEqualSlices(u8, &golden, &CheckedModuleArtifact.SERIALIZED_VERSION_HASH);
 }
