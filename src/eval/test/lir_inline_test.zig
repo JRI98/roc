@@ -235,6 +235,108 @@ fn monotypeCountersForModuleWithImports(
     return counters;
 }
 
+const StructuralJsonMonotypeStats = struct {
+    functions: usize,
+    definitions: usize,
+    expressions: usize,
+    locals: usize,
+    template_misses: u64,
+    nested_misses: u64,
+};
+
+const StructuralJsonOperation = enum { parse, encode };
+
+fn structuralJsonSource(
+    allocator: Allocator,
+    field_count: usize,
+    field_ty: []const u8,
+    operation: StructuralJsonOperation,
+) Allocator.Error![]u8 {
+    var source = std.ArrayList(u8).empty;
+    errdefer source.deinit(allocator);
+
+    try source.appendSlice(allocator,
+        \\module [main]
+        \\
+        \\Shape : {
+        \\
+    );
+    for (0..field_count) |field_index| {
+        const field = try std.fmt.allocPrint(
+            allocator,
+            "    f{d} : {s},\n",
+            .{ field_index, field_ty },
+        );
+        defer allocator.free(field);
+        try source.appendSlice(allocator, field);
+    }
+    try source.appendSlice(allocator, "}\n\n");
+    switch (operation) {
+        .parse => try source.appendSlice(allocator,
+            \\main : Str -> Try(Shape, Json.ParseErr)
+            \\main = |json| Json.parse(json)
+            \\
+        ),
+        .encode => try source.appendSlice(allocator,
+            \\main : Shape -> Str
+            \\main = |value| Json.to_str(value)
+            \\
+        ),
+    }
+
+    return try source.toOwnedSlice(allocator);
+}
+
+fn structuralJsonMonotypeStats(
+    allocator: Allocator,
+    field_count: usize,
+    field_ty: []const u8,
+    operation: StructuralJsonOperation,
+) TestError!StructuralJsonMonotypeStats {
+    const source = try structuralJsonSource(allocator, field_count, field_ty, operation);
+    defer allocator.free(source);
+
+    var counters: MonoLower.SpecializationCounters = .{};
+    var lowered = try lowerMonotypeModuleWithOptions(allocator, source, .{
+        .specialization_counters = &counters,
+    });
+    defer lowered.deinit(allocator);
+
+    return .{
+        .functions = lowered.mono.view().fns.len,
+        .definitions = lowered.mono.view().defs.len,
+        .expressions = lowered.mono.view().exprs.len,
+        .locals = lowered.mono.view().locals.len,
+        .template_misses = counters.template_misses,
+        .nested_misses = counters.nested_misses,
+    };
+}
+
+const StructuralJsonLirStats = struct {
+    procedures: usize,
+    statements: usize,
+    locals: usize,
+};
+
+fn structuralJsonLirStats(
+    allocator: Allocator,
+    field_count: usize,
+    field_ty: []const u8,
+    operation: StructuralJsonOperation,
+) TestError!StructuralJsonLirStats {
+    const source = try structuralJsonSource(allocator, field_count, field_ty, operation);
+    defer allocator.free(source);
+
+    var lowered = try lowerModule(allocator, source, .wrappers);
+    defer lowered.deinit(allocator);
+    const store = &lowered.lowered.lir_result.store;
+    return .{
+        .procedures = store.getProcSpecs().len,
+        .statements = store.getCFStmts().len,
+        .locals = store.getLocals().len,
+    };
+}
+
 fn expectEquivalentMonotypeProgramViews(lhs: postcheck.Monotype.Ast.ProgramView, rhs: postcheck.Monotype.Ast.ProgramView) error{TestExpectedEqual}!void {
     try std.testing.expectEqual(lhs.next_symbol, rhs.next_symbol);
 
@@ -1435,6 +1537,148 @@ fn sameNestedSourceSite(
         lhs.owner.proc_base == rhs.owner.proc_base and
         lhs.owner.template == rhs.owner.template and
         lhs.site == rhs.site;
+}
+
+test "issue 10121 optional JSON record encoder has linear Monotype function growth" {
+    // Repro for https://github.com/roc-lang/roc/issues/10121: generated
+    // functions should grow at most linearly with the encoded record shape.
+    const allocator = std.testing.allocator;
+    const four_fields = try structuralJsonMonotypeStats(allocator, 4, "Try(Str, [Missing])", .encode);
+    const eight_fields = try structuralJsonMonotypeStats(allocator, 8, "Try(Str, [Missing])", .encode);
+
+    const linear_bound = four_fields.functions * 2;
+    if (eight_fields.functions > linear_bound) {
+        std.debug.print(
+            "optional JSON encoder generated {d} functions for 4 fields but {d} for 8 fields " ++
+                "(template misses {d}->{d}, nested misses {d}->{d})\n",
+            .{
+                four_fields.functions,
+                eight_fields.functions,
+                four_fields.template_misses,
+                eight_fields.template_misses,
+                four_fields.nested_misses,
+                eight_fields.nested_misses,
+            },
+        );
+    }
+    try std.testing.expect(eight_fields.functions <= linear_bound);
+}
+
+test "issue 10121 repeated nested JSON record fields share encoder helpers" {
+    const allocator = std.testing.allocator;
+    const four_fields = try structuralJsonMonotypeStats(allocator, 4, "{ bar : Str, count : U64 }", .encode);
+    const eight_fields = try structuralJsonMonotypeStats(allocator, 8, "{ bar : Str, count : U64 }", .encode);
+
+    if (eight_fields.functions > four_fields.functions + 4) {
+        std.debug.print("nested JSON encoder functions 4={d} 8={d}\n", .{ four_fields.functions, eight_fields.functions });
+    }
+    try std.testing.expect(eight_fields.functions <= four_fields.functions + 4);
+}
+
+test "issue 10121 repeated nested JSON record fields share parser helpers" {
+    const allocator = std.testing.allocator;
+    const four_fields = try structuralJsonMonotypeStats(allocator, 4, "{ bar : Str, count : U64 }", .parse);
+    const eight_fields = try structuralJsonMonotypeStats(allocator, 8, "{ bar : Str, count : U64 }", .parse);
+
+    const linear_expression_bound = four_fields.expressions * 2;
+    if (eight_fields.expressions > linear_expression_bound) {
+        std.debug.print(
+            "nested JSON parser Monotype size grew nonlinearly: " ++
+                "defs {d}->{d}, exprs {d}->{d}, locals {d}->{d}\n",
+            .{
+                four_fields.definitions,
+                eight_fields.definitions,
+                four_fields.expressions,
+                eight_fields.expressions,
+                four_fields.locals,
+                eight_fields.locals,
+            },
+        );
+    }
+    try std.testing.expect(eight_fields.expressions <= linear_expression_bound);
+}
+
+test "issue 10121 structural JSON helper sharing survives LIR lowering" {
+    const allocator = std.testing.allocator;
+    const encoder_four = try structuralJsonLirStats(allocator, 4, "Try(Str, [Missing])", .encode);
+    const encoder_eight = try structuralJsonLirStats(allocator, 8, "Try(Str, [Missing])", .encode);
+    const parser_four = try structuralJsonLirStats(allocator, 4, "{ bar : Str, count : U64 }", .parse);
+    const parser_eight = try structuralJsonLirStats(allocator, 8, "{ bar : Str, count : U64 }", .parse);
+
+    const encoder_is_linear = encoder_eight.procedures <= encoder_four.procedures * 2 and
+        encoder_eight.statements <= encoder_four.statements * 2;
+    const parser_is_linear = parser_eight.procedures <= parser_four.procedures * 2 and
+        parser_eight.statements <= parser_four.statements * 2;
+    if (!encoder_is_linear or !parser_is_linear) {
+        std.debug.print(
+            "structural JSON LIR grew nonlinearly: encoder " ++
+                "procs {d}->{d}, stmts {d}->{d}, locals {d}->{d}; parser " ++
+                "procs {d}->{d}, stmts {d}->{d}, locals {d}->{d}\n",
+            .{
+                encoder_four.procedures,
+                encoder_eight.procedures,
+                encoder_four.statements,
+                encoder_eight.statements,
+                encoder_four.locals,
+                encoder_eight.locals,
+                parser_four.procedures,
+                parser_eight.procedures,
+                parser_four.statements,
+                parser_eight.statements,
+                parser_four.locals,
+                parser_eight.locals,
+            },
+        );
+    }
+    try std.testing.expect(encoder_is_linear);
+    try std.testing.expect(parser_is_linear);
+}
+
+test "issue 10121 shared JSON helpers preserve optional nested round trips" {
+    const allocator = std.testing.allocator;
+    const source =
+        \\module [main]
+        \\
+        \\Shape : {
+        \\    first : Try({ bar : Str, count : U64 }, [Missing]),
+        \\    second : Try({ bar : Str, count : U64 }, [Missing]),
+        \\    third : Try({ bar : Str, count : U64 }, [Missing]),
+        \\}
+        \\
+        \\main : Bool
+        \\main = {
+        \\    original : Shape
+        \\    original = {
+        \\        first: Ok({ bar: "one", count: 1 }),
+        \\        second: Err(Missing),
+        \\        third: Ok({ bar: "three", count: 3 }),
+        \\    }
+        \\    encoded = Json.to_str(original)
+        \\    parsed : Try(Shape, Json.ParseErr)
+        \\    parsed = Json.parse(encoded)
+        \\
+        \\    match parsed {
+        \\        Ok(value) => Json.to_str(value) == encoded
+        \\        Err(_) => False
+        \\    }
+        \\}
+    ;
+
+    var compiled = try helpers.compileInspectedProgramWithBuiltin(
+        allocator,
+        std.testing.io,
+        .module,
+        source,
+        &.{},
+        try sharedPrePublishedBuiltin(),
+        null,
+    );
+    defer compiled.deinit(allocator);
+
+    try std.testing.expectEqual(@as(usize, 0), compiled.resources.checker.problems.problems.items.len);
+    const output = try helpers.lirInterpreterInspectedStr(allocator, &compiled.lowered);
+    defer allocator.free(output);
+    try std.testing.expectEqualStrings("True", output);
 }
 
 test "issue 9802 same-type map2 specialization counters are bounded" {

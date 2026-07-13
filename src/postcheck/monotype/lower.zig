@@ -456,6 +456,24 @@ const GeneratedHelperDefAddress = struct {
     result_ty: u32,
 };
 
+/// Exact Monotype inputs for one generated structural encoder helper. These
+/// helpers belong to the active body draft: they capture that encoder
+/// construction's encoding value and precomputed field names, while their
+/// value and state are explicit arguments.
+const GeneratedEncoderDefAddress = struct {
+    value_ty: u32,
+    encoding_ty: u32,
+    state_ty: u32,
+    result_ty: u32,
+};
+
+const GeneratedParserDefAddress = struct {
+    value_ty: u32,
+    encoding_ty: u32,
+    state_ty: u32,
+    result_ty: u32,
+};
+
 /// Tracks a memoized structural-derivation helper def (is_eq / inspect /
 /// to_hash). `reserved` means the def id is allocated but its body has not yet
 /// been filled in (used to break recursion); `ready` means the body is complete.
@@ -6408,6 +6426,8 @@ const BodyContext = struct {
     inspect_defs: std.AutoHashMap(GeneratedHelperDefAddress, DraftGeneratedHelperDefEntry),
     equality_defs: std.AutoHashMap(GeneratedHelperDefAddress, DraftGeneratedHelperDefEntry),
     hash_defs: std.AutoHashMap(GeneratedHelperDefAddress, DraftGeneratedHelperDefEntry),
+    encoder_defs: std.AutoHashMap(GeneratedEncoderDefAddress, DraftGeneratedHelperDefEntry),
+    parser_defs: std.AutoHashMap(GeneratedParserDefAddress, DraftGeneratedHelperDefEntry),
     /// Source region to use while inlining a compile-time const eval template.
     /// The template body can be lowered from a lookup site, but diagnostics
     /// must point at the original const root.
@@ -6487,6 +6507,40 @@ const BodyContext = struct {
         }
     };
 
+    const SerializationPlanKind = enum { parser, encoder };
+
+    const SerializationHelperPlan = struct {
+        plan: ParserPrecomputedPlan,
+        args: []BodyTypedLocal,
+
+        fn deinit(self: *SerializationHelperPlan, allocator: Allocator) void {
+            allocator.free(self.args);
+            self.plan.deinit();
+        }
+    };
+
+    const SerializationPlanInputs = struct {
+        locals: std.ArrayList(DraftLocalId) = .empty,
+        record_keys: std.AutoHashMap(names.TypeDigest, void),
+        seen_types: std.AutoHashMap(Type.TypeId, void),
+        seen_locals: std.AutoHashMap(DraftLocalId, void),
+
+        fn init(allocator: Allocator) SerializationPlanInputs {
+            return .{
+                .record_keys = std.AutoHashMap(names.TypeDigest, void).init(allocator),
+                .seen_types = std.AutoHashMap(Type.TypeId, void).init(allocator),
+                .seen_locals = std.AutoHashMap(DraftLocalId, void).init(allocator),
+            };
+        }
+
+        fn deinit(self: *SerializationPlanInputs, allocator: Allocator) void {
+            self.seen_locals.deinit();
+            self.seen_types.deinit();
+            self.record_keys.deinit();
+            self.locals.deinit(allocator);
+        }
+    };
+
     fn parserPlanKey(self: *BodyContext, shape_ty: Type.TypeId) names.TypeDigest {
         var hasher = std.crypto.hash.sha2.Sha256.init(.{});
         hasher.update("roc.parser_precomputed_record");
@@ -6518,6 +6572,170 @@ const BodyContext = struct {
         record: ParserPrecomputedRecord,
     ) Allocator.Error!void {
         try plan.records.put(self.parserPlanKey(shape_ty), record);
+    }
+
+    fn collectSerializationPlanInputs(
+        self: *BodyContext,
+        kind: SerializationPlanKind,
+        shape_ty: Type.TypeId,
+        encoding_ty: Type.TypeId,
+        plan: *const ParserPrecomputedPlan,
+        inputs: *SerializationPlanInputs,
+    ) Allocator.Error!void {
+        if (inputs.seen_types.contains(shape_ty)) return;
+        try inputs.seen_types.put(shape_ty, {});
+
+        switch (kind) {
+            .parser => {
+                if (self.tryJsonInfo(shape_ty)) |info| {
+                    return try self.collectSerializationPlanInputs(kind, info.ok_payload_ty, encoding_ty, plan, inputs);
+                }
+                if (self.optionalParseTryInfo(shape_ty)) |info| {
+                    return try self.collectSerializationPlanInputs(kind, info.ok_ty, encoding_ty, plan, inputs);
+                }
+                if (self.customParserLookup(shape_ty) != null or self.jsonParseScalarMethodName(shape_ty) != null) return;
+            },
+            .encoder => {
+                if (self.tryJsonInfo(shape_ty)) |info| {
+                    return try self.collectSerializationPlanInputs(kind, info.ok_payload_ty, encoding_ty, plan, inputs);
+                }
+                if (self.customEncoderForLookup(shape_ty) != null or self.jsonEncodeScalarMethodName(shape_ty) != null) return;
+            },
+        }
+        if (self.setPayloadType(shape_ty)) |payload_ty| {
+            return try self.collectSerializationPlanInputs(kind, payload_ty, encoding_ty, plan, inputs);
+        }
+        if (self.dictEntryShape(shape_ty)) |dict| {
+            return try self.collectSerializationPlanInputs(kind, dict.value_ty, encoding_ty, plan, inputs);
+        }
+
+        switch (self.builder.shapeContent(shape_ty)) {
+            .list => |elem_ty| try self.collectSerializationPlanInputs(kind, elem_ty, encoding_ty, plan, inputs),
+            .box => |payload_ty| try self.collectSerializationPlanInputs(kind, payload_ty, encoding_ty, plan, inputs),
+            .tuple => |span| {
+                const item_tys = try GuardedList.dupe(self.allocator, Type.TypeId, self.builder.program.types.span(span));
+                defer self.allocator.free(item_tys);
+                for (item_tys) |item_ty| {
+                    try self.collectSerializationPlanInputs(kind, item_ty, encoding_ty, plan, inputs);
+                }
+            },
+            .record, .zst => {
+                const key = self.parserPlanKey(shape_ty);
+                const record = plan.records.get(key) orelse
+                    Common.invariant("structural serialization helper was missing precomputed record fields");
+                try inputs.record_keys.put(key, {});
+                for (record.renamed_field_locals) |local| {
+                    if (inputs.seen_locals.contains(local)) continue;
+                    try inputs.seen_locals.put(local, {});
+                    try inputs.locals.append(self.allocator, local);
+                }
+
+                const fields = try self.dupeRecordFieldsForShape(shape_ty);
+                defer self.allocator.free(fields);
+                for (fields) |field| {
+                    const child_ty = switch (kind) {
+                        .parser => field.ty,
+                        .encoder => self.encodeRecordFieldPayloadType(field.ty, encoding_ty),
+                    };
+                    try self.collectSerializationPlanInputs(kind, child_ty, encoding_ty, plan, inputs);
+                }
+            },
+            .tag_union => |span| {
+                const tags = try GuardedList.dupe(self.allocator, Type.Tag, self.builder.program.types.tagSpan(span));
+                defer self.allocator.free(tags);
+                for (tags) |tag| {
+                    const payload_tys = try GuardedList.dupe(self.allocator, Type.TypeId, self.builder.program.types.span(tag.payloads));
+                    defer self.allocator.free(payload_tys);
+                    for (payload_tys) |payload_ty| {
+                        try self.collectSerializationPlanInputs(kind, payload_ty, encoding_ty, plan, inputs);
+                    }
+                }
+            },
+            else => {},
+        }
+    }
+
+    fn serializationPlanInputs(
+        self: *BodyContext,
+        kind: SerializationPlanKind,
+        shape_ty: Type.TypeId,
+        encoding_ty: Type.TypeId,
+        plan: ?*const ParserPrecomputedPlan,
+    ) Allocator.Error!SerializationPlanInputs {
+        var inputs = SerializationPlanInputs.init(self.allocator);
+        errdefer inputs.deinit(self.allocator);
+        if (plan) |precomputed| {
+            try self.collectSerializationPlanInputs(kind, shape_ty, encoding_ty, precomputed, &inputs);
+        }
+        return inputs;
+    }
+
+    fn cloneSerializationHelperPlan(
+        self: *BodyContext,
+        source: *const ParserPrecomputedPlan,
+        inputs: *const SerializationPlanInputs,
+        str_ty: Type.TypeId,
+    ) Allocator.Error!SerializationHelperPlan {
+        var helper = SerializationHelperPlan{
+            .plan = ParserPrecomputedPlan.init(self.allocator),
+            .args = try self.allocator.alloc(BodyTypedLocal, inputs.locals.items.len),
+        };
+        errdefer helper.deinit(self.allocator);
+        helper.plan.next_capture_id = source.next_capture_id;
+
+        var local_map = std.AutoHashMap(DraftLocalId, DraftLocalId).init(self.allocator);
+        defer local_map.deinit();
+        var expr_map = std.AutoHashMap(DraftLocalId, DraftExprId).init(self.allocator);
+        defer expr_map.deinit();
+        for (inputs.locals.items, 0..) |source_local, index| {
+            const helper_local = try self.addLocal(self.builder.symbols.fresh(), str_ty);
+            const helper_expr = try self.localExpr(helper_local, str_ty);
+            try local_map.put(source_local, helper_local);
+            try expr_map.put(source_local, helper_expr);
+            helper.args[index] = .{ .local = helper_local, .ty = str_ty };
+            try helper.plan.captures.append(self.allocator, .{
+                .local = helper_local,
+                .value = helper_expr,
+            });
+        }
+
+        var key_iter = inputs.record_keys.keyIterator();
+        while (key_iter.next()) |key| {
+            const source_record = source.records.get(key.*) orelse
+                Common.invariant("structural serialization helper record key was absent from source plan");
+            const locals = try self.allocator.alloc(DraftLocalId, source_record.renamed_field_locals.len);
+            const values = try self.allocator.alloc(DraftExprId, source_record.renamed_field_locals.len);
+            var inserted = false;
+            errdefer if (!inserted) {
+                self.allocator.free(locals);
+                self.allocator.free(values);
+            };
+            for (source_record.renamed_field_locals, 0..) |source_local, index| {
+                const helper_local = local_map.get(source_local) orelse
+                    Common.invariant("structural serialization helper record local was absent from input map");
+                locals[index] = helper_local;
+                values[index] = expr_map.get(source_local) orelse
+                    Common.invariant("structural serialization helper record expression was absent from input map");
+            }
+            const lengths = if (source_record.renamed_field_lengths) |source_lengths|
+                try self.allocator.dupe(u32, source_lengths)
+            else
+                null;
+            errdefer if (!inserted) if (lengths) |owned| self.allocator.free(owned);
+            const texts = if (source_record.renamed_field_texts) |source_texts|
+                try self.allocator.dupe([]const u8, source_texts)
+            else
+                null;
+            errdefer if (!inserted) if (texts) |owned| self.allocator.free(owned);
+            try helper.plan.records.put(key.*, .{
+                .renamed_field_locals = locals,
+                .renamed_field_values = values,
+                .renamed_field_lengths = lengths,
+                .renamed_field_texts = texts,
+            });
+            inserted = true;
+        }
+        return helper;
     }
 
     const MaterializedArg = struct {
@@ -6657,10 +6875,14 @@ const BodyContext = struct {
             .inspect_defs = std.AutoHashMap(GeneratedHelperDefAddress, DraftGeneratedHelperDefEntry).init(allocator),
             .equality_defs = std.AutoHashMap(GeneratedHelperDefAddress, DraftGeneratedHelperDefEntry).init(allocator),
             .hash_defs = std.AutoHashMap(GeneratedHelperDefAddress, DraftGeneratedHelperDefEntry).init(allocator),
+            .encoder_defs = std.AutoHashMap(GeneratedEncoderDefAddress, DraftGeneratedHelperDefEntry).init(allocator),
+            .parser_defs = std.AutoHashMap(GeneratedParserDefAddress, DraftGeneratedHelperDefEntry).init(allocator),
         };
     }
 
     fn deinit(self: *BodyContext) void {
+        self.parser_defs.deinit();
+        self.encoder_defs.deinit();
         self.hash_defs.deinit();
         self.equality_defs.deinit();
         self.inspect_defs.deinit();
@@ -12272,7 +12494,7 @@ const BodyContext = struct {
             field.ty;
         const parse_ok_ty = try self.parseResultOkType(field_parse_ty, state_ty);
         const parse_ret_ty = try self.tryTypeLike(ret_ty, parse_ok_ty, ret_info.err_ty);
-        const parse_expr = try self.lowerParseResultFromState(
+        const parse_expr = try self.lowerParseShapeHelperCall(
             field_parse_ty,
             encoding_expr,
             encoding_ty,
@@ -12298,6 +12520,112 @@ const BodyContext = struct {
         const ok_body = try self.continueRecordLoopWithUpdatedField(ret_ty, try self.localExpr(parsed_rest_local, state_ty), record_slots, field_value_local, field.ty, field_index);
         const with_field_value = try self.wrapLet(field_value_local, field.ty, field_value, ok_body, ret_ty);
         return try self.sequenceTryRecord(parse_expr, parse_ret_ty, parsed_value_local, value_name, parsed_rest_local, rest_name, with_field_value, ret_ty);
+    }
+
+    fn lowerParseShapeHelperCall(
+        self: *BodyContext,
+        shape_ty: Type.TypeId,
+        encoding_expr: DraftExprId,
+        encoding_ty: Type.TypeId,
+        state_expr: DraftExprId,
+        state_ty: Type.TypeId,
+        ret_ty: Type.TypeId,
+        precomputed_plan: ?*const ParserPrecomputedPlan,
+    ) Allocator.Error!DraftExprId {
+        const def_id = try self.parseShapeDefForType(
+            shape_ty,
+            encoding_ty,
+            state_ty,
+            ret_ty,
+            precomputed_plan,
+        );
+        var plan_inputs = try self.serializationPlanInputs(.parser, shape_ty, encoding_ty, precomputed_plan);
+        defer plan_inputs.deinit(self.allocator);
+        const str_ty = try self.builder.primitiveType(.str);
+        const arg_tys = try self.allocator.alloc(Type.TypeId, 2 + plan_inputs.locals.items.len);
+        defer self.allocator.free(arg_tys);
+        const args = try self.allocator.alloc(DraftExprId, arg_tys.len);
+        defer self.allocator.free(args);
+        arg_tys[0] = state_ty;
+        arg_tys[1] = encoding_ty;
+        args[0] = state_expr;
+        args[1] = encoding_expr;
+        for (plan_inputs.locals.items, 0..) |local, index| {
+            arg_tys[2 + index] = str_ty;
+            args[2 + index] = try self.localExpr(local, str_ty);
+        }
+        const fn_ty = try self.functionType(arg_tys, ret_ty);
+        const callee = try self.addExpr(.{
+            .ty = fn_ty,
+            .data = .{ .def_ref = .{ .draft = def_id } },
+        });
+        return try self.addExpr(.{
+            .ty = ret_ty,
+            .data = .{ .call_value = .{
+                .callee = callee,
+                .args = try self.addExprSpan(args),
+            } },
+        });
+    }
+
+    fn parseShapeDefForType(
+        self: *BodyContext,
+        shape_ty: Type.TypeId,
+        encoding_ty: Type.TypeId,
+        state_ty: Type.TypeId,
+        ret_ty: Type.TypeId,
+        precomputed_plan: ?*const ParserPrecomputedPlan,
+    ) Allocator.Error!DraftDefId {
+        const address = GeneratedParserDefAddress{
+            .value_ty = @intFromEnum(shape_ty),
+            .encoding_ty = @intFromEnum(encoding_ty),
+            .state_ty = @intFromEnum(state_ty),
+            .result_ty = @intFromEnum(ret_ty),
+        };
+        if (self.parser_defs.get(address)) |entry| return entry.id();
+
+        const def_id = try self.draft.reserveDef();
+        try self.parser_defs.put(address, .{ .reserved = def_id });
+
+        var plan_inputs = try self.serializationPlanInputs(.parser, shape_ty, encoding_ty, precomputed_plan);
+        defer plan_inputs.deinit(self.allocator);
+        const str_ty = try self.builder.primitiveType(.str);
+        var helper_plan: ?SerializationHelperPlan = if (precomputed_plan) |plan|
+            try self.cloneSerializationHelperPlan(plan, &plan_inputs, str_ty)
+        else
+            null;
+        defer if (helper_plan) |*plan| plan.deinit(self.allocator);
+
+        const state_local = try self.addLocal(self.builder.symbols.fresh(), state_ty);
+        const encoding_local = try self.addLocal(self.builder.symbols.fresh(), encoding_ty);
+        const body = try self.lowerParseResultFromState(
+            shape_ty,
+            try self.localExpr(encoding_local, encoding_ty),
+            encoding_ty,
+            try self.localExpr(state_local, state_ty),
+            state_ty,
+            ret_ty,
+            if (helper_plan) |*plan| &plan.plan else null,
+        );
+        const args = try self.allocator.alloc(BodyTypedLocal, 2 + plan_inputs.locals.items.len);
+        defer self.allocator.free(args);
+        args[0] = .{ .local = state_local, .ty = state_ty };
+        args[1] = .{ .local = encoding_local, .ty = encoding_ty };
+        if (helper_plan) |*plan| {
+            @memcpy(args[2..], plan.args);
+        } else if (plan_inputs.locals.items.len != 0) {
+            Common.invariant("structural parser helper had plan inputs without a precomputed plan");
+        }
+        self.draft.setDef(def_id, .{
+            .symbol = self.builder.symbols.fresh(),
+            .fn_def = null,
+            .fn_id = null,
+            .args = try self.addTypedLocalSpan(args),
+            .body = .{ .roc = body },
+            .ret = try self.draftTypeCell(ret_ty),
+        });
+        try self.parser_defs.put(address, .{ .ready = def_id });
+        return def_id;
     }
 
     fn lowerParseResultFromState(
@@ -12491,7 +12819,7 @@ const BodyContext = struct {
         const item_ty = item_tys[item_index];
         const item_parse_ok_ty = try self.parseResultOkType(item_ty, state_ty);
         const item_parse_ret_ty = try self.tryTypeLike(ret_ty, item_parse_ok_ty, ret_info.err_ty);
-        const item_parse = try self.lowerParseResultFromState(
+        const item_parse = try self.lowerParseShapeHelperCall(
             item_ty,
             encoding_expr,
             encoding_ty,
@@ -12879,7 +13207,7 @@ const BodyContext = struct {
 
         const value_parse_ok_ty = try self.parseResultOkType(value_ty, state_ty);
         const value_parse_ret_ty = try self.tryTypeLike(ret_ty, value_parse_ok_ty, ret_info.err_ty);
-        const value_parse = try self.lowerParseResultFromState(
+        const value_parse = try self.lowerParseShapeHelperCall(
             value_ty,
             encoding_expr,
             encoding_ty,
@@ -13078,7 +13406,7 @@ const BodyContext = struct {
         const ret_info = self.tryInfo(ret_ty);
         const elem_parse_ok_ty = try self.parseResultOkType(elem_ty, state_ty);
         const elem_parse_ret_ty = try self.tryTypeLike(ret_ty, elem_parse_ok_ty, ret_info.err_ty);
-        const elem_parse = try self.lowerParseResultFromState(
+        const elem_parse = try self.lowerParseShapeHelperCall(
             elem_ty,
             encoding_expr,
             encoding_ty,
@@ -13185,7 +13513,7 @@ const BodyContext = struct {
         const ret_info = self.tryInfo(ret_ty);
         const payload_parse_ok_ty = try self.parseResultOkType(payload_ty, state_ty);
         const payload_parse_ret_ty = try self.tryTypeLike(ret_ty, payload_parse_ok_ty, ret_info.err_ty);
-        const payload_parse = try self.lowerParseResultFromState(
+        const payload_parse = try self.lowerParseShapeHelperCall(
             payload_ty,
             encoding_expr,
             encoding_ty,
@@ -13248,7 +13576,7 @@ const BodyContext = struct {
 
         const child_parse_ok_ty = try self.parseResultOkType(info.ok_payload_ty, state_ty);
         const child_parse_ty = try self.tryTypeLike(ret_ty, child_parse_ok_ty, ret_info.err_ty);
-        const child_parse = try self.lowerParseResultFromState(
+        const child_parse = try self.lowerParseShapeHelperCall(
             info.ok_payload_ty,
             encoding_expr,
             encoding_ty,
@@ -13840,7 +14168,7 @@ const BodyContext = struct {
                         .field = rest_name,
                     } },
                 });
-            const payload_parse = try self.lowerParseResultFromState(
+            const payload_parse = try self.lowerParseShapeHelperCall(
                 payload_tys[index],
                 try self.localExpr(encoding_local, encoding_ty),
                 encoding_ty,
@@ -18193,7 +18521,7 @@ const BodyContext = struct {
             str_ty,
         );
 
-        const parsed = try self.lowerParseResultFromState(
+        const parsed = try self.lowerParseShapeHelperCall(
             shape_ty,
             try self.localExpr(encoding_local, arg_tys[0]),
             arg_tys[0],
@@ -18437,7 +18765,7 @@ const BodyContext = struct {
     ) Allocator.Error!DraftExprId {
         const thunk_ty = try self.encodeValueThunkType(state_ty, ret_ty);
         const state_local = try self.addLocal(self.builder.symbols.fresh(), state_ty);
-        const body = try self.lowerEncodeShapeToState(
+        const body = try self.lowerEncodeShapeHelperCall(
             value_ty,
             value_expr,
             encoding_expr,
@@ -18452,6 +18780,118 @@ const BodyContext = struct {
             &.{.{ .local = state_local, .ty = state_ty }},
             body,
         );
+    }
+
+    fn lowerEncodeShapeHelperCall(
+        self: *BodyContext,
+        value_ty: Type.TypeId,
+        value_expr: DraftExprId,
+        encoding_expr: DraftExprId,
+        encoding_ty: Type.TypeId,
+        state_expr: DraftExprId,
+        state_ty: Type.TypeId,
+        ret_ty: Type.TypeId,
+        precomputed_plan: ?*const ParserPrecomputedPlan,
+    ) Allocator.Error!DraftExprId {
+        const def_id = try self.encodeShapeDefForType(
+            value_ty,
+            encoding_ty,
+            state_ty,
+            ret_ty,
+            precomputed_plan,
+        );
+        var plan_inputs = try self.serializationPlanInputs(.encoder, value_ty, encoding_ty, precomputed_plan);
+        defer plan_inputs.deinit(self.allocator);
+        const str_ty = try self.builder.primitiveType(.str);
+        const arg_tys = try self.allocator.alloc(Type.TypeId, 3 + plan_inputs.locals.items.len);
+        defer self.allocator.free(arg_tys);
+        const args = try self.allocator.alloc(DraftExprId, arg_tys.len);
+        defer self.allocator.free(args);
+        arg_tys[0] = value_ty;
+        arg_tys[1] = state_ty;
+        arg_tys[2] = encoding_ty;
+        args[0] = value_expr;
+        args[1] = state_expr;
+        args[2] = encoding_expr;
+        for (plan_inputs.locals.items, 0..) |local, index| {
+            arg_tys[3 + index] = str_ty;
+            args[3 + index] = try self.localExpr(local, str_ty);
+        }
+        const fn_ty = try self.functionType(arg_tys, ret_ty);
+        const callee = try self.addExpr(.{
+            .ty = fn_ty,
+            .data = .{ .def_ref = .{ .draft = def_id } },
+        });
+        return try self.addExpr(.{
+            .ty = ret_ty,
+            .data = .{ .call_value = .{
+                .callee = callee,
+                .args = try self.addExprSpan(args),
+            } },
+        });
+    }
+
+    fn encodeShapeDefForType(
+        self: *BodyContext,
+        value_ty: Type.TypeId,
+        encoding_ty: Type.TypeId,
+        state_ty: Type.TypeId,
+        ret_ty: Type.TypeId,
+        precomputed_plan: ?*const ParserPrecomputedPlan,
+    ) Allocator.Error!DraftDefId {
+        const address = GeneratedEncoderDefAddress{
+            .value_ty = @intFromEnum(value_ty),
+            .encoding_ty = @intFromEnum(encoding_ty),
+            .state_ty = @intFromEnum(state_ty),
+            .result_ty = @intFromEnum(ret_ty),
+        };
+        if (self.encoder_defs.get(address)) |entry| return entry.id();
+
+        const def_id = try self.draft.reserveDef();
+        try self.encoder_defs.put(address, .{ .reserved = def_id });
+
+        var plan_inputs = try self.serializationPlanInputs(.encoder, value_ty, encoding_ty, precomputed_plan);
+        defer plan_inputs.deinit(self.allocator);
+        const str_ty = try self.builder.primitiveType(.str);
+        var helper_plan: ?SerializationHelperPlan = if (precomputed_plan) |plan|
+            try self.cloneSerializationHelperPlan(plan, &plan_inputs, str_ty)
+        else
+            null;
+        defer if (helper_plan) |*plan| plan.deinit(self.allocator);
+
+        const value_local = try self.addLocal(self.builder.symbols.fresh(), value_ty);
+        const state_local = try self.addLocal(self.builder.symbols.fresh(), state_ty);
+        const encoding_local = try self.addLocal(self.builder.symbols.fresh(), encoding_ty);
+        const body = try self.lowerEncodeShapeToState(
+            value_ty,
+            try self.localExpr(value_local, value_ty),
+            try self.localExpr(encoding_local, encoding_ty),
+            encoding_ty,
+            try self.localExpr(state_local, state_ty),
+            state_ty,
+            ret_ty,
+            if (helper_plan) |*plan| &plan.plan else null,
+        );
+        const args = try self.allocator.alloc(BodyTypedLocal, 3 + plan_inputs.locals.items.len);
+        defer self.allocator.free(args);
+        args[0] = .{ .local = value_local, .ty = value_ty };
+        args[1] = .{ .local = state_local, .ty = state_ty };
+        args[2] = .{ .local = encoding_local, .ty = encoding_ty };
+        if (helper_plan) |*plan| {
+            @memcpy(args[3..], plan.args);
+        } else if (plan_inputs.locals.items.len != 0) {
+            Common.invariant("structural encoder helper had plan inputs without a precomputed plan");
+        }
+        self.draft.setDef(def_id, .{
+            .symbol = self.builder.symbols.fresh(),
+            .fn_def = null,
+            .fn_id = null,
+            .args = try self.addTypedLocalSpan(args),
+            .body = .{ .roc = body },
+            .ret = try self.draftTypeCell(ret_ty),
+        });
+        try self.encoder_defs.put(address, .{ .ready = def_id });
+        return def_id;
     }
 
     fn lowerEncodeTupleToState(
@@ -19199,24 +19639,19 @@ const BodyContext = struct {
         field_value_ty: Type.TypeId,
         field_value_expr: DraftExprId,
     ) Allocator.Error!DraftExprId {
-        const str_ty = try self.builder.primitiveType(.str);
-        const renamed_field_expr = try self.localExpr(renamed_field_locals[field_index], str_ty);
-        const value_writer = try self.lowerEncodeValueThunk(
-            field_value_ty,
-            field_value_expr,
+        const value_try = try self.lowerEncodePresentRecordField(
             encoding_expr,
             encoding_ty,
+            state_expr,
             state_ty,
             ret_ty,
             precomputed_plan,
+            renamed_field_locals,
+            field_writer_expr,
+            field_index,
+            field_value_ty,
+            field_value_expr,
         );
-        const value_try = try self.addExpr(.{
-            .ty = ret_ty,
-            .data = .{ .call_value = .{
-                .callee = field_writer_expr,
-                .args = try self.addExprSpan(&[_]DraftExprId{ state_expr, renamed_field_expr, value_writer }),
-            } },
-        });
         const after_value_local = try self.addLocal(self.builder.symbols.fresh(), state_ty);
         const rest_body = try self.lowerEncodeRecordFieldNamesFrom(
             shape_ty,
@@ -19235,17 +19670,47 @@ const BodyContext = struct {
         return try self.sequenceEncodeTry(value_try, ret_ty, after_value_local, rest_body, ret_ty);
     }
 
-    fn lowerEncodeNullRecordFieldFrom(
+    fn lowerEncodePresentRecordField(
         self: *BodyContext,
-        shape_ty: Type.TypeId,
-        value_expr: DraftExprId,
         encoding_expr: DraftExprId,
         encoding_ty: Type.TypeId,
         state_expr: DraftExprId,
         state_ty: Type.TypeId,
         ret_ty: Type.TypeId,
         precomputed_plan: ?*const ParserPrecomputedPlan,
-        record_fields: []const Type.Field,
+        renamed_field_locals: []const DraftLocalId,
+        field_writer_expr: DraftExprId,
+        field_index: usize,
+        field_value_ty: Type.TypeId,
+        field_value_expr: DraftExprId,
+    ) Allocator.Error!DraftExprId {
+        const str_ty = try self.builder.primitiveType(.str);
+        const renamed_field_expr = try self.localExpr(renamed_field_locals[field_index], str_ty);
+        const value_writer = try self.lowerEncodeValueThunk(
+            field_value_ty,
+            field_value_expr,
+            encoding_expr,
+            encoding_ty,
+            state_ty,
+            ret_ty,
+            precomputed_plan,
+        );
+        const value_try = try self.addExpr(.{
+            .ty = ret_ty,
+            .data = .{ .call_value = .{
+                .callee = field_writer_expr,
+                .args = try self.addExprSpan(&[_]DraftExprId{ state_expr, renamed_field_expr, value_writer }),
+            } },
+        });
+        return value_try;
+    }
+
+    fn lowerEncodeNullRecordField(
+        self: *BodyContext,
+        encoding_ty: Type.TypeId,
+        state_expr: DraftExprId,
+        state_ty: Type.TypeId,
+        ret_ty: Type.TypeId,
         renamed_field_locals: []const DraftLocalId,
         field_writer_expr: DraftExprId,
         field_index: usize,
@@ -19266,22 +19731,7 @@ const BodyContext = struct {
                 .args = try self.addExprSpan(&[_]DraftExprId{ state_expr, renamed_field_expr, null_value_writer }),
             } },
         });
-        const after_null_local = try self.addLocal(self.builder.symbols.fresh(), state_ty);
-        const rest_body = try self.lowerEncodeRecordFieldNamesFrom(
-            shape_ty,
-            value_expr,
-            encoding_expr,
-            encoding_ty,
-            try self.localExpr(after_null_local, state_ty),
-            state_ty,
-            ret_ty,
-            precomputed_plan,
-            record_fields,
-            renamed_field_locals,
-            field_writer_expr,
-            field_index + 1,
-        );
-        return try self.sequenceEncodeTry(null_try, ret_ty, after_null_local, rest_body, ret_ty);
+        return null_try;
     }
 
     fn lowerEncodeOptionalRecordFieldFrom(
@@ -19316,16 +19766,13 @@ const BodyContext = struct {
             .ty = field_ty,
             .data = .{ .nominal = ok_backing_pat },
         });
-        const ok_body = try self.lowerEncodePresentRecordFieldFrom(
-            shape_ty,
-            value_expr,
+        const ok_body = try self.lowerEncodePresentRecordField(
             encoding_expr,
             encoding_ty,
             state_expr,
             state_ty,
             ret_ty,
             precomputed_plan,
-            record_fields,
             renamed_field_locals,
             field_writer_expr,
             field_index,
@@ -19347,20 +19794,7 @@ const BodyContext = struct {
             .ty = field_ty,
             .data = .{ .nominal = missing_backing_pat },
         });
-        const missing_body = try self.lowerEncodeRecordFieldNamesFrom(
-            shape_ty,
-            value_expr,
-            encoding_expr,
-            encoding_ty,
-            state_expr,
-            state_ty,
-            ret_ty,
-            precomputed_plan,
-            record_fields,
-            renamed_field_locals,
-            field_writer_expr,
-            field_index + 1,
-        );
+        const missing_body = try self.tryOk(ret_ty, state_expr);
 
         var branches = std.ArrayList(DraftBranch).empty;
         defer branches.deinit(self.allocator);
@@ -19382,16 +19816,11 @@ const BodyContext = struct {
                 .ty = field_ty,
                 .data = .{ .nominal = null_backing_pat },
             });
-            const null_body = try self.lowerEncodeNullRecordFieldFrom(
-                shape_ty,
-                value_expr,
-                encoding_expr,
+            const null_body = try self.lowerEncodeNullRecordField(
                 encoding_ty,
                 state_expr,
                 state_ty,
                 ret_ty,
-                precomputed_plan,
-                record_fields,
                 renamed_field_locals,
                 field_writer_expr,
                 field_index,
@@ -19399,10 +19828,26 @@ const BodyContext = struct {
             try branches.append(self.allocator, .{ .pat = null_pat, .body = null_body });
         }
 
-        return try self.addExpr(.{ .ty = ret_ty, .data = .{ .match_ = .{
+        const field_try = try self.addExpr(.{ .ty = ret_ty, .data = .{ .match_ = .{
             .scrutinee = field_value_expr,
             .branches = try self.addBranchSpan(branches.items),
         } } });
+        const after_field_local = try self.addLocal(self.builder.symbols.fresh(), state_ty);
+        const rest_body = try self.lowerEncodeRecordFieldNamesFrom(
+            shape_ty,
+            value_expr,
+            encoding_expr,
+            encoding_ty,
+            try self.localExpr(after_field_local, state_ty),
+            state_ty,
+            ret_ty,
+            precomputed_plan,
+            record_fields,
+            renamed_field_locals,
+            field_writer_expr,
+            field_index + 1,
+        );
+        return try self.sequenceEncodeTry(field_try, ret_ty, after_field_local, rest_body, ret_ty);
     }
 
     fn lowerEncodeTagUnionToState(
