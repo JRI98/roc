@@ -3304,8 +3304,18 @@ const Cloner = struct {
     /// whole-body clone, where the iterator source must inline for the branch to
     /// become a known value the loop can sink into.
     inline_list_source_construction: bool = false,
+    /// Work left for case-of-case distribution in this clone. Each produced
+    /// branch body spends one unit before it is cloned, so nested distribution
+    /// cannot multiply the expression store without bound. Depth is bounded
+    /// separately so a narrow rewrite cannot exhaust the compiler stack before
+    /// spending this total work budget.
+    case_of_case_work_remaining: u32,
+    case_of_case_depth: u8,
     current_loc: SourceLoc,
     current_region: Region,
+
+    const case_of_case_work_budget: u32 = 256;
+    const case_of_case_depth_limit: u8 = 64;
 
     fn init(pass: *Pass, source_fn: Ast.FnId, pattern: CallPattern) Cloner {
         return .{
@@ -3327,6 +3337,8 @@ const Cloner = struct {
             .value_aware_rewrite_changed = false,
             .value_aware_detect_only = false,
             .allow_nonrecursive_value_patterns = false,
+            .case_of_case_work_remaining = case_of_case_work_budget,
+            .case_of_case_depth = 0,
             .current_loc = SourceLoc.none,
             .current_region = Region.zero(),
         };
@@ -3352,6 +3364,8 @@ const Cloner = struct {
             .value_aware_rewrite_changed = false,
             .value_aware_detect_only = false,
             .allow_nonrecursive_value_patterns = false,
+            .case_of_case_work_remaining = case_of_case_work_budget,
+            .case_of_case_depth = 0,
             .current_loc = SourceLoc.none,
             .current_region = Region.zero(),
         };
@@ -6106,6 +6120,16 @@ const Cloner = struct {
             if (branch.guard != null) return null;
         }
 
+        const branch_work = switch (scrutinee_data) {
+            .match_ => |inner_match| self.pass.program.branchSpan(inner_match.branches).len,
+            .if_ => |inner_if| self.pass.program.ifBranchSpan(inner_if.branches).len + 1,
+            else => return null,
+        };
+        if (self.case_of_case_depth == case_of_case_depth_limit) return null;
+        if (!self.spendCaseOfCaseWork(branch_work)) return null;
+        self.case_of_case_depth += 1;
+        defer self.case_of_case_depth -= 1;
+
         switch (scrutinee_data) {
             .match_ => |inner_match| {
                 const inner_branches = try GuardedList.dupe(self.pass.allocator, Ast.Branch, self.pass.program.branchSpan(inner_match.branches));
@@ -6184,8 +6208,14 @@ const Cloner = struct {
                     .final_else = final_else,
                 } } }) };
             },
-            else => return null,
+            else => unreachable,
         }
+    }
+
+    fn spendCaseOfCaseWork(self: *Cloner, amount: usize) bool {
+        if (amount > @as(usize, self.case_of_case_work_remaining)) return false;
+        self.case_of_case_work_remaining -= @intCast(amount);
+        return true;
     }
 
     /// Collapse an outer match against one inner-branch result: a known
