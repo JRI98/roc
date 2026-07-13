@@ -19211,13 +19211,16 @@ pub const ConstRef = struct {
     source_scheme: canonical.CanonicalTypeSchemeKey,
 };
 
+/// Public checked constant locator declaration.
+pub const ConstLocator = ConstRef;
+
 /// Return the checked module id that owns a compile-time constant.
 pub fn constModuleId(ref: ConstRef) ModuleId {
     return ref.artifact;
 }
 
 /// Public `ConstOwner` declaration.
-pub const ConstOwner = union(enum) {
+pub const ConstOwner = union(enum(u8)) {
     top_level_binding: ConstTopLevelOwner,
     hoisted_expr: ConstHoistedOwner,
 };
@@ -27395,8 +27398,8 @@ test "SERIALIZED_VERSION_HASH golden value" {
     // change, bump `serialized_layout_version` and replace the golden bytes below with
     // the ones this assertion prints.
     const golden: [32]u8 = .{
-        0x21, 0xA0, 0x3A, 0x66, 0x88, 0x94, 0x61, 0xCF, 0xAA, 0xF9, 0x81, 0xFD, 0x05, 0xE4, 0x6C, 0xF5,
-        0x0A, 0xAC, 0x33, 0xC8, 0xA2, 0xDD, 0xC8, 0xE6, 0x32, 0x28, 0xA0, 0x7A, 0x8C, 0xD5, 0xF5, 0x7C,
+        0xB6, 0xDF, 0xFB, 0x94, 0xCF, 0xAB, 0x33, 0x96, 0x00, 0x57, 0xCD, 0xFE, 0x77, 0x7E, 0xF1, 0xD3,
+        0x71, 0xB0, 0x26, 0x9F, 0x61, 0xA1, 0x4C, 0xD2, 0xCD, 0x34, 0xE9, 0xC1, 0x34, 0x1C, 0xC7, 0x7A,
     };
     try std.testing.expectEqualSlices(u8, &golden, &CheckedModuleArtifact.SERIALIZED_VERSION_HASH);
 }

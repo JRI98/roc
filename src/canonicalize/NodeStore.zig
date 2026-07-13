@@ -2935,6 +2935,7 @@ pub fn addWhereClause(store: *NodeStore, whereClause: CIR.WhereClause, region: b
                 .var_idx = @intFromEnum(where_method.var_),
                 .name = @bitCast(where_method.method_name),
                 .args_ret_idx = args_ret_idx,
+                .effectful = @intFromBool(where_method.effectful),
             } });
         },
         .w_alias => |mod_alias| {

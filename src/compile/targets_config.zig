@@ -34,9 +34,35 @@ pub const LinkItem = union(enum) {
     win_gui,
 };
 
+/// How a wasm target obtains linear memory.
+pub const WasmImportMemory = enum {
+    no,
+    uninitialized,
+    zeroed,
+
+    pub fn importsMemory(self: WasmImportMemory) bool {
+        return self != .no;
+    }
+
+    pub fn importedMemoryIsZeroed(self: WasmImportMemory) bool {
+        return self == .zeroed;
+    }
+
+    pub fn fromTagName(name: []const u8) ?WasmImportMemory {
+        if (std.mem.eql(u8, name, "No")) return .no;
+        if (std.mem.eql(u8, name, "Uninitialized")) return .uninitialized;
+        if (std.mem.eql(u8, name, "Zeroed")) return .zeroed;
+        return null;
+    }
+};
+
 /// Optional wasm-specific settings from a target record in a platform header.
 pub const WasmTargetConfig = struct {
-    import_memory: bool = false,
+    /// Final host-visible function exports. `null` preserves the legacy
+    /// contract where public symbols are read from the platform object; a
+    /// present slice, including an empty one, is the complete export set.
+    exports: ?[]const []const u8 = null,
+    import_memory: WasmImportMemory = .no,
     minimum_memory: ?usize = null,
     maximum_memory: ?usize = null,
     initial_stack_size: ?usize = null,
@@ -48,6 +74,10 @@ pub const WasmTargetConfig = struct {
     global_base_ident: ?[]const u8 = null,
 
     fn deinit(self: WasmTargetConfig, allocator: Allocator) void {
+        if (self.exports) |exports| {
+            for (exports) |name| allocator.free(name);
+            allocator.free(exports);
+        }
         if (self.import_memory_ident) |ident| allocator.free(ident);
         if (self.minimum_memory_ident) |ident| allocator.free(ident);
         if (self.maximum_memory_ident) |ident| allocator.free(ident);
@@ -70,7 +100,7 @@ pub const TargetConfigResolveReason = enum {
     missing_top_level_value,
     not_constant,
     unevaluated_constant,
-    expected_bool,
+    expected_import_memory,
     expected_unsigned_integer,
     integer_out_of_range,
 
@@ -79,7 +109,7 @@ pub const TargetConfigResolveReason = enum {
             .missing_top_level_value => "does not name a top-level value in the platform module",
             .not_constant => "names a function, but target configuration requires a constant",
             .unevaluated_constant => "does not have a stored compile-time constant value",
-            .expected_bool => "must resolve to True or False",
+            .expected_import_memory => "must resolve to Zeroed, Uninitialized, or No",
             .expected_unsigned_integer => "must resolve to a non-negative whole number",
             .integer_out_of_range => "resolves to a number outside the supported range",
         };
@@ -354,6 +384,37 @@ pub const TargetsConfig = struct {
         link_items.clearRetainingCapacity();
     }
 
+    fn replaceWasmExports(
+        allocator: Allocator,
+        store: *const parse.NodeStore,
+        ast: anytype,
+        values: parse.AST.TargetConfigValue.Span,
+        wasm: *WasmTargetConfig,
+    ) Allocator.Error!void {
+        if (wasm.exports) |old_exports| {
+            for (old_exports) |name| allocator.free(name);
+            allocator.free(old_exports);
+            wasm.exports = null;
+        }
+
+        var exports = std.array_list.Managed([]const u8).init(allocator);
+        errdefer {
+            for (exports.items) |name| allocator.free(name);
+            exports.deinit();
+        }
+
+        for (store.targetConfigValueSlice(values)) |value_idx| {
+            switch (store.getTargetConfigValue(value_idx)) {
+                .string_literal => |maybe_tok| {
+                    const name = maybe_tok orelse continue;
+                    try exports.append(try allocator.dupe(u8, ast.resolve(name)));
+                },
+                else => {},
+            }
+        }
+        wasm.exports = try exports.toOwnedSlice();
+    }
+
     fn storeIdent(
         allocator: Allocator,
         ast: anytype,
@@ -393,23 +454,13 @@ pub const TargetsConfig = struct {
         };
     }
 
-    fn parseBoolValue(
+    fn parseWasmImportMemoryValue(
         store: *const parse.NodeStore,
         ast: anytype,
         value_idx: parse.AST.TargetConfigValue.Idx,
-    ) ?bool {
+    ) ?WasmImportMemory {
         return switch (store.getTargetConfigValue(value_idx)) {
-            .tag_literal => |tok| blk: {
-                const tag = ast.resolve(tok);
-                if (std.mem.eql(u8, tag, "True")) break :blk true;
-                if (std.mem.eql(u8, tag, "False")) break :blk false;
-                break :blk null;
-            },
-            .string_literal => |maybe_tok| blk: {
-                const value = if (maybe_tok) |tok| ast.resolve(tok) else "";
-                if (std.mem.eql(u8, value, "env.memory")) break :blk true;
-                break :blk null;
-            },
+            .tag_literal => |tok| WasmImportMemory.fromTagName(ast.resolve(tok)),
             else => null,
         };
     }
@@ -440,8 +491,16 @@ pub const TargetsConfig = struct {
                     },
                     else => {},
                 }
+            } else if (std.mem.eql(u8, name, "exports")) {
+                switch (value) {
+                    .list => |values| {
+                        try replaceWasmExports(allocator, store, ast, values, &wasm);
+                        has_wasm_config = true;
+                    },
+                    else => {},
+                }
             } else if (std.mem.eql(u8, name, "import_memory")) {
-                if (parseBoolValue(store, ast, entry.value)) |import_memory| {
+                if (parseWasmImportMemoryValue(store, ast, entry.value)) |import_memory| {
                     wasm.import_memory = import_memory;
                     has_wasm_config = true;
                 } else if (targetConfigIdentToken(value)) |ident| {
@@ -634,20 +693,20 @@ fn resolveWasmCheckedConstants(
     wasm: *WasmTargetConfig,
     diagnostic: *TargetConfigResolveDiagnostic,
 ) error{TargetConfigInvalid}!void {
-    try resolveWasmBoolField(allocator, checked_module, target, output, "import_memory", &wasm.import_memory, &wasm.import_memory_ident, diagnostic);
+    try resolveWasmImportMemoryField(allocator, checked_module, target, output, "import_memory", &wasm.import_memory, &wasm.import_memory_ident, diagnostic);
     try resolveWasmUsizeField(allocator, checked_module, target, output, "minimum_memory", &wasm.minimum_memory, &wasm.minimum_memory_ident, diagnostic);
     try resolveWasmUsizeField(allocator, checked_module, target, output, "maximum_memory", &wasm.maximum_memory, &wasm.maximum_memory_ident, diagnostic);
     try resolveWasmUsizeField(allocator, checked_module, target, output, "initial_stack_size", &wasm.initial_stack_size, &wasm.initial_stack_size_ident, diagnostic);
     try resolveWasmU32Field(allocator, checked_module, target, output, "global_base", &wasm.global_base, &wasm.global_base_ident, diagnostic);
 }
 
-fn resolveWasmBoolField(
+fn resolveWasmImportMemoryField(
     allocator: Allocator,
     checked_module: *const checked.CheckedModuleArtifact,
     target: RocTarget,
     output: OutputKind,
     field_name: []const u8,
-    out: *bool,
+    out: *WasmImportMemory,
     ident_slot: *?[]const u8,
     diagnostic: *TargetConfigResolveDiagnostic,
 ) error{TargetConfigInvalid}!void {
@@ -657,8 +716,8 @@ fn resolveWasmBoolField(
         diagnostic.* = .{ .target = target, .output = output, .field_name = field_name, .ident_name = ident, .reason = reason };
         return error.TargetConfigInvalid;
     };
-    const value = constBool(checked_module, node) orelse {
-        diagnostic.* = .{ .target = target, .output = output, .field_name = field_name, .ident_name = ident, .reason = .expected_bool };
+    const value = constWasmImportMemory(checked_module, node) orelse {
+        diagnostic.* = .{ .target = target, .output = output, .field_name = field_name, .ident_name = ident, .reason = .expected_import_memory };
         return error.TargetConfigInvalid;
     };
     out.* = value;
@@ -750,19 +809,12 @@ fn topLevelConstNode(
     return null;
 }
 
-fn constBool(checked_module: *const checked.CheckedModuleArtifact, node: checked.ConstNodeId) ?bool {
+fn constWasmImportMemory(checked_module: *const checked.CheckedModuleArtifact, node: checked.ConstNodeId) ?WasmImportMemory {
     return switch (checked_module.const_store.get(node)) {
-        .nominal => |nominal| constBool(checked_module, nominal.backing),
+        .nominal => |nominal| constWasmImportMemory(checked_module, nominal.backing),
         .tag => |tag| blk: {
             if (tag.payloads.len != 0) break :blk null;
-            if (std.mem.eql(u8, tag.tag_name, "True")) break :blk true;
-            if (std.mem.eql(u8, tag.tag_name, "False")) break :blk false;
-            break :blk null;
-        },
-        .str => |str| blk: {
-            const bytes = checked_module.const_store.strBytes(str);
-            if (std.mem.eql(u8, bytes, "env.memory")) break :blk true;
-            break :blk null;
+            break :blk WasmImportMemory.fromTagName(tag.tag_name);
         },
         else => null,
     };
@@ -940,6 +992,50 @@ test "fromAST accepts explicit hostless targets section" {
     try testing.expectEqual(@as(usize, 0), config.targets.len);
 }
 
+test "fromAST captures explicit wasm exports" {
+    const allocator = testing.allocator;
+
+    const source =
+        \\platform ""
+        \\    requires { main : {} }
+        \\    exposes []
+        \\    packages {}
+        \\    provides { "roc_main": main_for_host }
+        \\    targets: {
+        \\        inputs_dir: "targets/",
+        \\        wasm32: {
+        \\            inputs: ["host.wasm", app],
+        \\            output: Shared,
+        \\            exports: ["start", "update"],
+        \\        },
+        \\    }
+        \\
+    ;
+
+    const source_copy = try allocator.dupe(u8, source);
+    defer allocator.free(source_copy);
+
+    var env = try base.CommonEnv.init(allocator, source_copy);
+    defer env.deinit(allocator);
+
+    const ast = try parse.file(allocator, &env);
+    defer ast.deinit();
+
+    try testing.expectEqual(@as(usize, 0), ast.parse_diagnostics.items.len);
+
+    const maybe_config = try TargetsConfig.fromAST(allocator, ast);
+    try testing.expect(maybe_config != null);
+
+    const config = maybe_config.?;
+    defer config.deinit(allocator);
+
+    try testing.expectEqual(@as(usize, 1), config.targets.len);
+    const exports = config.targets[0].wasm.?.exports.?;
+    try testing.expectEqual(@as(usize, 2), exports.len);
+    try testing.expectEqualStrings("start", exports[0]);
+    try testing.expectEqualStrings("update", exports[1]);
+}
+
 test "fromAST captures punned wasm identifier config" {
     const allocator = testing.allocator;
 
@@ -962,7 +1058,7 @@ test "fromAST captures punned wasm identifier config" {
         \\        },
         \\    }
         \\
-        \\import_memory = True
+        \\import_memory = Zeroed
         \\minimum_memory = 65536
         \\maximum_memory = 65536
         \\initial_stack_size = 14752

@@ -2994,14 +2994,14 @@ fn exprCanBeHoistedRoot(self: *Self, expr: CIR.Expr.Idx) bool {
         .e_hosted_lambda,
         => false,
         .e_str => |str| self.stringHasInterpolation(str.span),
+        .e_method_call => |call| !self.methodNameIs(call.method_name, "iter"),
+        .e_dispatch_call => |call| !self.methodNameIs(call.method_name, "iter"),
         .e_list,
         .e_tuple,
         .e_block,
         .e_match,
         .e_if,
         .e_call,
-        .e_method_call,
-        .e_dispatch_call,
         .e_record,
         .e_tag,
         .e_nominal,
@@ -3069,14 +3069,14 @@ fn exprCanCoverHoistedChildren(self: *Self, expr: CIR.Expr.Idx) bool {
         .e_run_low_level,
         => false,
         .e_str => |str| self.stringHasInterpolation(str.span),
+        .e_method_call => |call| !self.methodNameIs(call.method_name, "iter"),
+        .e_dispatch_call => |call| !self.methodNameIs(call.method_name, "iter"),
         .e_list,
         .e_tuple,
         .e_block,
         .e_match,
         .e_if,
         .e_call,
-        .e_method_call,
-        .e_dispatch_call,
         .e_record,
         .e_tag,
         .e_nominal,
@@ -3102,11 +3102,11 @@ fn exprCanBeHoistedBindingRoot(self: *Self, expr: CIR.Expr.Idx) bool {
     return switch (self.cir.store.getExpr(expr)) {
         .e_lookup_local => true,
         .e_call,
-        .e_method_call,
         .e_type_method_call,
         .e_type_dispatch_call,
-        .e_dispatch_call,
         => true,
+        .e_method_call => |call| !self.methodNameIs(call.method_name, "iter"),
+        .e_dispatch_call => |call| !self.methodNameIs(call.method_name, "iter"),
         .e_for,
         .e_run_low_level,
         .e_lookup_required,
@@ -3160,6 +3160,10 @@ fn exprCanBeHoistedBindingRoot(self: *Self, expr: CIR.Expr.Idx) bool {
         .e_str,
         => !self.exprHasDedicatedLiteralConversionRoot(expr),
     };
+}
+
+fn methodNameIs(self: *const Self, method_name: Ident.Idx, comptime text: []const u8) bool {
+    return Ident.textEql(self.cir.getIdentText(method_name), text);
 }
 
 fn stringHasInterpolation(self: *Self, span: CIR.Expr.Span) bool {
@@ -14618,6 +14622,7 @@ fn checkBlockStatements(self: *Self, statements: CIR.Statement.Span, env: *Env, 
                 self.markCurrentHoistObservableEffect();
                 statement_blocks_later_hoists = true;
                 const for_region = self.cir.store.getStatementRegion(stmt_idx);
+                const for_expected = if (blocks_later_hoists) base_statement_expected else statement_expected;
                 does_fx = try self.checkIteratorForLoop(
                     ModuleEnv.nodeIdxFrom(stmt_idx),
                     for_stmt.patt,
@@ -14625,7 +14630,7 @@ fn checkBlockStatements(self: *Self, statements: CIR.Statement.Span, env: *Env, 
                     for_stmt.body,
                     env,
                     for_region,
-                    statement_expected,
+                    for_expected,
                 ) or does_fx;
                 const empty_rec = try self.freshFromContent(.{ .structure = .empty_record }, env, for_region);
                 _ = try self.unify(stmt_var, empty_rec, env);

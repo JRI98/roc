@@ -8979,9 +8979,19 @@ pub fn deinit(self: *Builder) void {
     self.* = undefined;
 }
 
-/// Finalizes the module-level inline assembly, ensuring it ends with a newline.
+/// Adds module-level inline assembly, ensuring the accumulated text ends with a newline.
 pub fn finishModuleAsm(self: *Builder, aw: *Writer.Allocating) Allocator.Error!void {
-    self.module_asm = aw.toArrayList();
+    if (self.module_asm.items.len == 0) {
+        self.module_asm = aw.toArrayList();
+    } else {
+        if (self.module_asm.getLastOrNull()) |last| if (last != '\n')
+            try self.module_asm.append(self.gpa, '\n');
+
+        var next = aw.toArrayList();
+        defer next.deinit(self.gpa);
+        try self.module_asm.appendSlice(self.gpa, next.items);
+    }
+
     if (self.module_asm.getLastOrNull()) |last| if (last != '\n')
         try self.module_asm.append(self.gpa, '\n');
 }

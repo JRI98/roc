@@ -12,6 +12,7 @@ const interpreter_style_tests = @import("eval_interpreter_style_tests.zig");
 const low_level_tests = @import("eval_low_level_tests.zig");
 const polymorphism_tests = @import("eval_polymorphism_tests.zig");
 const recursive_data_tests = @import("eval_recursive_data_tests.zig");
+const iter_alloc_tests = @import("eval_iter_alloc_tests.zig");
 
 /// All eval test cases, consumed by the parallel runner.
 ///
@@ -3649,6 +3650,108 @@ const core_tests = [_]TestCase{
         .expected = .{ .inspect_str = "Known(4)" },
     },
     .{
+        .name = "inspect: Iter.next steps appended iterator in order",
+        .source =
+        \\{
+        \\    first = Iter.next([1.I64, 2].iter().append(3))
+        \\    match first {
+        \\        One({ item, rest }) => [item].concat(Iter.fold(rest, [], |acc, n| acc.append(n)))
+        \\        _ => []
+        \\    }
+        \\}
+        ,
+        .expected = .{ .inspect_str = "[1, 2, 3]" },
+    },
+    .{
+        .name = "inspect: Iter.next reuses public iterator values",
+        .source =
+        \\{
+        \\    iter = [1.I64, 2].iter()
+        \\
+        \\    first = match Iter.next(iter) {
+        \\        One({ item, .. }) => item
+        \\        _ => 0
+        \\    }
+        \\
+        \\    second = match Iter.next(iter) {
+        \\        One({ item, .. }) => item
+        \\        _ => 0
+        \\    }
+        \\
+        \\    (first, second)
+        \\}
+        ,
+        .expected = .{ .inspect_str = "(1, 1)" },
+    },
+    .{
+        .name = "inspect: for loop does not mutate aliased public iterator",
+        .source =
+        \\{
+        \\    iter = [1.I64, 2].iter()
+        \\    saved = iter
+        \\
+        \\    var $sum = 0.I64
+        \\    for item in iter {
+        \\        $sum = $sum + item
+        \\    }
+        \\
+        \\    saved_first = match Iter.next(saved) {
+        \\        One({ item, .. }) => item
+        \\        _ => 0
+        \\    }
+        \\
+        \\    ($sum, saved_first)
+        \\}
+        ,
+        .expected = .{ .inspect_str = "(3, 1)" },
+    },
+    .{
+        .name = "inspect: escaped Iter.next rest keeps public meaning",
+        .source =
+        \\{
+        \\    iter = [1.I64, 2, 3].iter()
+        \\
+        \\    rest = match Iter.next(iter) {
+        \\        One({ rest, .. }) => rest
+        \\        _ => iter
+        \\    }
+        \\
+        \\    match Iter.next(rest) {
+        \\        One({ item, .. }) => item
+        \\        _ => 0
+        \\    }
+        \\}
+        ,
+        .expected = .{ .inspect_str = "2" },
+    },
+    .{
+        .name = "for loop over appended iterator",
+        .source =
+        \\{
+        \\    iter = [1.I64, 2].iter().append(3).append(4)
+        \\    var $sum = 0.I64
+        \\    for item in iter {
+        \\        $sum = $sum + item
+        \\    }
+        \\    $sum
+        \\}
+        ,
+        .expected = .{ .inspect_str = "10" },
+    },
+    .{
+        .name = "for loop over inline appended iterator",
+        .source =
+        \\{
+        \\    var $sum = 0.I64
+        \\    for item in [1.I64, 2].iter().append(3).append(4) {
+        \\        $sum = $sum + item
+        \\    }
+        \\    $sum
+        \\}
+        ,
+        .expected = .{ .inspect_str = "10" },
+    },
+    .{
         .name = "inspect: Iter.keep_if emits skip with rest iterator",
         .source =
         \\match Iter.next(Iter.keep_if([1.I64, 2].iter(), |item| item > 1)) {
@@ -5026,4 +5129,4 @@ const core_tests = [_]TestCase{
     },
 };
 
-pub const tests = core_tests ++ comptime_finalization_tests.tests ++ crypto_tests.tests ++ closure_recursion_tests.tests ++ recursive_data_tests.tests ++ low_level_tests.tests ++ highest_lowest_tests.tests ++ polymorphism_tests.tests ++ issue_tests.tests ++ interpreter_style_tests.tests ++ regression_repros.tests ++ trmc_tests.tests;
+pub const tests = core_tests ++ comptime_finalization_tests.tests ++ crypto_tests.tests ++ closure_recursion_tests.tests ++ recursive_data_tests.tests ++ low_level_tests.tests ++ highest_lowest_tests.tests ++ polymorphism_tests.tests ++ issue_tests.tests ++ interpreter_style_tests.tests ++ regression_repros.tests ++ trmc_tests.tests ++ iter_alloc_tests.tests;

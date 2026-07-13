@@ -2229,6 +2229,7 @@ pub const PackageEnv = struct {
         var seen = std.AutoHashMap(CheckedArtifact.CheckedModuleArtifactKey, void).init(self.gpa);
         defer seen.deinit();
 
+        try pending.append(self.gpa, CheckedArtifact.importedView(&self.builtin_modules.checked_artifact));
         for (imported_artifacts) |imported| {
             try pending.append(self.gpa, imported.view);
         }

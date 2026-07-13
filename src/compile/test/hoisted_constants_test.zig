@@ -12,28 +12,64 @@ const roc_target = @import("roc_target");
 
 const Coordinator = @import("../coordinator.zig").Coordinator;
 const CoreCtx = @import("ctx").CoreCtx;
+const static_data_exports = @import("../static_data_exports.zig");
 
 const HoistedConstantsTestError = std.mem.Allocator.Error ||
+    Coordinator.AppDiscoveryError ||
+    check.CheckedArtifact.CompileTimeFinalizer.Error ||
+    eval.BuiltinModules.InitError ||
     std.Io.Dir.CreateDirPathError ||
+    std.Io.Dir.RealPathFileAllocError ||
     std.Io.Dir.WriteFileError ||
     std.Io.File.Writer.Error ||
+    std.Thread.SpawnError ||
     error{
         AfterRootHadNoRequest,
         BeforeRootHadNoRequest,
+        BuiltinLowLevelAnnotationMustBeFunction,
+        CompileTimeProblem,
+        DownloadFailed,
         ExportedRuntimeEntrypointNotFound,
+        ExpectedPlatformString,
+        ExpectedString,
+        FileError,
+        HasUserErrors,
         HoistedConstWasNotI64,
         HoistedConstWasNotScalar,
         HoistedRootDidNotStoreConstNode,
         HoistedRootKindMismatch,
         HoistedTemplateWasNotStored,
+        Internal,
+        InvalidDependency,
+        InvalidNullByteInPath,
+        InvalidUrl,
+        Issue806MissingStackProbe,
+        Issue806UnsafeLargeStackCallArgument,
+        Issue806UnsafeLargeStackCallReturn,
+        Issue806UnsafeLargeStackClosureCapture,
+        Issue806UnsafeLargeStackJoinParam,
+        Issue806UnsafeLargeStackPatternPayload,
+        Issue806UnsafeLargeStackReturn,
+        Issue806UnsafeLargeStackSetLocalCopy,
+        Issue806UnsafeLargeStackStructAssign,
+        Issue806UnsafeLargeStackTagAssign,
+        LowLevelOperationsNotFound,
+        NoCacheDir,
+        NoPackageSource,
         OutOfMemory,
         PatternExtractionMissingCheckedRootPattern,
         PatternExtractionMissingSourcePattern,
         PatternExtractionRootValueWasNotSyntheticLookup,
         PatternExtractionRootWasNotSyntheticMatch,
+        PathOutsideWorkspace,
         RootDidNotStoreConstNode,
+        StaticDataLiteralNotFound,
+        StaticDataSymbolNotFound,
         TestExpectedEqual,
         TestUnexpectedResult,
+        UnsupportedBuiltinAnnotationOnly,
+        UnsupportedHeader,
+        WriteFailed,
     };
 
 test "hoisted local constants are finalized and restored during runtime lowering" {
@@ -385,6 +421,225 @@ test "imported checked bodies restore their module's hoisted constants" {
         .{ .target_usize = base.target.TargetUsize.native },
     );
     defer lowered.deinit();
+}
+
+test "hoisted list constants lower to internal static data" {
+    const gpa = std.testing.allocator;
+
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    try writeEchoPlatform(tmp_dir.dir);
+    try tmp_dir.dir.writeFile(std.testing.io, .{
+        .sub_path = "main.roc",
+        .data =
+        \\app [main!] { pf: platform "./.roc_echo_platform/main.roc" }
+        \\
+        \\import pf.Echo
+        \\
+        \\numbers = [11.I64, 22.I64, 33.I64, 44.I64]
+        \\
+        \\main! = |args| {
+        \\    var $sum = List.len(args).to_i64_wrap()
+        \\    for n in numbers {
+        \\        $sum = $sum + n
+        \\    }
+        \\    _ = $sum
+        \\    Echo.line!("done")
+        \\    Ok({})
+        \\}
+        ,
+    });
+    const app_path = try tmp_dir.dir.realPathFileAlloc(std.testing.io, "main.roc", gpa);
+    defer gpa.free(app_path);
+
+    var arena_impl = collections.SingleThreadArena.init(gpa);
+    defer arena_impl.deinit();
+    const arena = arena_impl.allocator();
+
+    var builtin_modules = try eval.BuiltinModules.init(gpa);
+    defer builtin_modules.deinit();
+
+    var coord = try Coordinator.init(
+        gpa,
+        .single_threaded,
+        1,
+        .x64linux,
+        &builtin_modules,
+        build_options.compiler_version,
+        null,
+        CoreCtx.default(gpa, arena, std.testing.io),
+    );
+    defer coord.deinit();
+    coord.enable_hosted_transform = true;
+
+    try coord.start();
+    try coord.discoverAppFromPath(arena, .{ .entry_path = app_path });
+    try coord.coordinatorLoop();
+    try std.testing.expect(!coord.hasUserErrors());
+
+    try coord.finalizeExecutableArtifacts();
+    try std.testing.expect(!coord.hasUserErrors());
+
+    const root = coord.executableRootCheckedArtifact();
+    const imports = try coord.collectImportedArtifactViews(arena, root);
+    const relations = try coord.collectRelationArtifactViews(arena, root);
+    const lir_roots = try lir.CheckedPipeline.selectPlatformEntrypointRoots(gpa, root.root_requests.runtime_requests);
+    defer gpa.free(lir_roots);
+
+    var lowered = try lir.CheckedPipeline.lowerCheckedModulesToLir(
+        gpa,
+        .{
+            .root = check.CheckedArtifact.loweringViewWithRelations(root, relations),
+            .imports = imports,
+        },
+        .{
+            .requests = lir_roots,
+            .include_static_data_exports = true,
+        },
+        .{ .target_usize = base.target.TargetUsize.u64 },
+    );
+    defer lowered.deinit();
+
+    try std.testing.expectEqual(@as(usize, 1), lowered.lir_result.static_data_values.items.len);
+    try expectStaticDataLiteralPresent(&lowered.lir_result);
+
+    const exports = try static_data_exports.buildProvidedDataExports(
+        gpa,
+        .{
+            .root = check.CheckedArtifact.loweringViewWithRelations(root, relations),
+            .imports = imports,
+        },
+        &lowered,
+        .x64linux,
+    );
+    defer static_data_exports.deinitProvidedDataExports(gpa, exports);
+
+    for (lowered.lir_result.static_data_values.items, 0..) |_, index| {
+        const static_data_id: lir.LIR.StaticDataId = @enumFromInt(@as(u32, @intCast(index)));
+        const expected_symbol = try lir.Program.staticDataSymbolName(gpa, static_data_id);
+        defer gpa.free(expected_symbol);
+
+        for (exports) |static_export| {
+            if (!std.mem.eql(u8, static_export.symbol_name, expected_symbol)) continue;
+
+            try std.testing.expect(static_export.bytes.len != 0);
+            try std.testing.expect(static_export.alignment != 0);
+            try std.testing.expect(static_export.is_global);
+            try std.testing.expect(!static_export.is_exported);
+            return;
+        }
+    }
+    return error.StaticDataSymbolNotFound;
+}
+
+test "inline list iter constants lower to internal static data" {
+    try expectInlineListStaticDataLiteral(
+        std.testing.allocator,
+        \\app [main!] { pf: platform "./.roc_echo_platform/main.roc" }
+        \\
+        \\import pf.Echo
+        \\
+        \\main! = |args| {
+        \\    var $sum = List.len(args).to_i64_wrap()
+        \\    for n in [11.I64, 22.I64, 33.I64, 44.I64].iter() {
+        \\        $sum = $sum + n
+        \\    }
+        \\    _ = $sum
+        \\    Echo.line!("done")
+        \\    Ok({})
+        \\}
+        ,
+    );
+}
+
+test "inline list for constants lower to internal static data" {
+    try expectInlineListStaticDataLiteral(
+        std.testing.allocator,
+        \\app [main!] { pf: platform "./.roc_echo_platform/main.roc" }
+        \\
+        \\import pf.Echo
+        \\
+        \\main! = |args| {
+        \\    var $sum = List.len(args).to_i64_wrap()
+        \\    for n in [11.I64, 22.I64, 33.I64, 44.I64] {
+        \\        $sum = $sum + n
+        \\    }
+        \\    _ = $sum
+        \\    Echo.line!("done")
+        \\    Ok({})
+        \\}
+        ,
+    );
+}
+
+fn expectInlineListStaticDataLiteral(gpa: std.mem.Allocator, source: []const u8) HoistedConstantsTestError!void {
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    try writeEchoPlatform(tmp_dir.dir);
+    try tmp_dir.dir.writeFile(std.testing.io, .{
+        .sub_path = "main.roc",
+        .data = source,
+    });
+    const app_path = try tmp_dir.dir.realPathFileAlloc(std.testing.io, "main.roc", gpa);
+    defer gpa.free(app_path);
+
+    var arena_impl = collections.SingleThreadArena.init(gpa);
+    defer arena_impl.deinit();
+    const arena = arena_impl.allocator();
+
+    var builtin_modules = try eval.BuiltinModules.init(gpa);
+    defer builtin_modules.deinit();
+
+    var coord = try Coordinator.init(
+        gpa,
+        .single_threaded,
+        1,
+        .x64linux,
+        &builtin_modules,
+        build_options.compiler_version,
+        null,
+        CoreCtx.default(gpa, arena, std.testing.io),
+    );
+    defer coord.deinit();
+    coord.enable_hosted_transform = true;
+
+    try coord.start();
+    try coord.discoverAppFromPath(arena, .{ .entry_path = app_path });
+    try coord.coordinatorLoop();
+    try std.testing.expect(!coord.hasUserErrors());
+
+    try coord.finalizeExecutableArtifacts();
+    try std.testing.expect(!coord.hasUserErrors());
+
+    const root = coord.executableRootCheckedArtifact();
+    const imports = try coord.collectImportedArtifactViews(arena, root);
+    const relations = try coord.collectRelationArtifactViews(arena, root);
+    const lir_roots = try lir.CheckedPipeline.selectPlatformEntrypointRoots(gpa, root.root_requests.runtime_requests);
+    defer gpa.free(lir_roots);
+
+    var lowered = try lir.CheckedPipeline.lowerCheckedModulesToLir(
+        gpa,
+        .{
+            .root = check.CheckedArtifact.loweringViewWithRelations(root, relations),
+            .imports = imports,
+        },
+        .{
+            .requests = lir_roots,
+            .include_static_data_exports = true,
+        },
+        .{
+            .target_usize = base.target.TargetUsize.u32,
+            .inline_mode = .wrappers,
+            .list_in_place_map = true,
+            .tag_reachability = true,
+        },
+    );
+    defer lowered.deinit();
+
+    try std.testing.expectEqual(@as(usize, 1), lowered.lir_result.static_data_values.items.len);
+    try expectStaticDataLiteralPresent(&lowered.lir_result);
 }
 
 test "callable binding with alias annotation is const-evaluated" {
@@ -1589,6 +1844,60 @@ fn countCompileTimeRootKind(
         if (root.kind == kind) count += 1;
     }
     return count;
+}
+
+fn expectStaticDataLiteralPresent(result: *const lir.Program.Result) HoistedConstantsTestError!void {
+    for (result.store.getCFStmts()) |stmt| {
+        switch (stmt) {
+            .assign_literal => |assign| switch (assign.value) {
+                .static_data => return,
+                .i64_literal,
+                .i128_literal,
+                .f64_literal,
+                .f32_literal,
+                .dec_literal,
+                .str_literal,
+                .bytes_literal,
+                .null_ptr,
+                .proc_ref,
+                => {},
+            },
+            .init_uninitialized,
+            .assign_ref,
+            .assign_call,
+            .assign_call_erased,
+            .assign_packed_erased_fn,
+            .assign_low_level,
+            .assign_list,
+            .assign_struct,
+            .assign_tag,
+            .store_struct,
+            .store_tag,
+            .set_local,
+            .debug,
+            .expect,
+            .expect_err,
+            .runtime_error,
+            .comptime_exhaustiveness_failed,
+            .comptime_branch_taken,
+            .switch_stmt,
+            .switch_initialized_payload,
+            .str_match,
+            .str_match_set,
+            .loop_continue,
+            .loop_break,
+            .join,
+            .jump,
+            .ret,
+            .crash,
+            .incref,
+            .decref,
+            .decref_if_initialized,
+            .free,
+            => {},
+        }
+    }
+    return error.StaticDataLiteralNotFound;
 }
 
 fn storedI64(

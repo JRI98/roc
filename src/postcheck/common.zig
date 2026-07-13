@@ -28,8 +28,13 @@ pub const RootRequests = struct {
 
 /// Checked const data that must produce a runtime layout and callable entries.
 pub const StaticDataRequest = struct {
-    data: checked.ProvidedDataExport,
+    const_locator: checked.ConstLocator,
+    node: ?checked.ConstNodeId = null,
+    checked_type: checked.CheckedTypeId,
 };
+
+/// Stage-local readonly static-data value id.
+pub const StaticDataId = enum(u32) { _ };
 
 /// Optional command-level test-plan metadata for a checked root request.
 pub const RootTestPlanMetadata = struct {

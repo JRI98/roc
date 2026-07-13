@@ -117,7 +117,6 @@ pub fn zig_fuzz_test_inner(buf: [*]u8, len: isize, debug: bool) void {
         .{ .requests = lir_roots },
         .{
             .target_usize = targetUsize(selected_target),
-            .inline_mode = .none,
             .list_in_place_map = false,
         },
     ) catch |err| switch (err) {

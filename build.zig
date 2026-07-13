@@ -2824,6 +2824,7 @@ pub fn build(b: *std.Build) void {
                 .imports = &.{
                     .{ .name = "test_harness", .module = createTestHarnessModule(b, roc_modules) },
                     .{ .name = "collections", .module = roc_modules.collections },
+                    .{ .name = "backend", .module = roc_modules.backend },
                     .{ .name = "bytebox", .module = bytebox.module("bytebox") },
                 },
             }),
@@ -3688,6 +3689,72 @@ pub fn build(b: *std.Build) void {
         build_wasm_str_concat_join_app.step.dependOn(build_test_hosts_step);
         build_test_wasm_static_lib_runner_step.dependOn(&build_wasm_str_concat_join_app.step);
 
+        // End-to-end cart gate for the minted-iterator `for`-loop drive. The
+        // size build covers the LLVM cart path, and the dev build covers wasm
+        // composite loop-state rebinding for recursive generated iterators.
+        const build_wasm_iter_for_app = b.addRunArtifact(roc_exe);
+        build_wasm_iter_for_app.addArgs(&.{
+            "build",
+            "test/wasm/iter_for_static_lib_app.roc",
+            "--opt=size",
+            "--target=wasm32",
+            "--output=test/wasm/iter_for_static_lib_app.wasm",
+        });
+        build_wasm_iter_for_app.step.dependOn(build_test_hosts_step);
+        build_test_wasm_static_lib_runner_step.dependOn(&build_wasm_iter_for_app.step);
+
+        const build_wasm_iter_for_dev_app = b.addRunArtifact(roc_exe);
+        build_wasm_iter_for_dev_app.addArgs(&.{
+            "build",
+            "test/wasm/iter_for_static_lib_app.roc",
+            "--opt=dev",
+            "--target=wasm32",
+            "--output=test/wasm/iter_for_static_lib_app_dev.wasm",
+        });
+        build_wasm_iter_for_dev_app.step.dependOn(build_test_hosts_step);
+        build_test_wasm_static_lib_runner_step.dependOn(&build_wasm_iter_for_dev_app.step);
+
+        // Dev-mode recursive iterator construction must converge at the
+        // explicit forced-dynamic representation tier.
+        const build_wasm_iter_recursive_concat_app = b.addRunArtifact(roc_exe);
+        build_wasm_iter_recursive_concat_app.addArgs(&.{
+            "build",
+            "test/wasm/iter_recursive_concat_static_lib_app.roc",
+            "--opt=dev",
+            "--target=wasm32",
+            "--output=test/wasm/iter_recursive_concat_static_lib_app.wasm",
+        });
+        build_wasm_iter_recursive_concat_app.step.dependOn(build_test_hosts_step);
+        build_test_wasm_static_lib_runner_step.dependOn(&build_wasm_iter_recursive_concat_app.step);
+
+        // Static-data hoisting gate: a constant list literal consumed via
+        // `.iter()` must materialize as static data and allocate nothing, so the
+        // whole minted chain (base list included) is zero-alloc on the cart path.
+        const build_wasm_iter_list_hoist_app = b.addRunArtifact(roc_exe);
+        build_wasm_iter_list_hoist_app.addArgs(&.{
+            "build",
+            "test/wasm/iter_list_hoist_static_lib_app.roc",
+            "--opt=size",
+            "--target=wasm32",
+            "--output=test/wasm/iter_list_hoist_static_lib_app.wasm",
+        });
+        build_wasm_iter_list_hoist_app.step.dependOn(build_test_hosts_step);
+        build_test_wasm_static_lib_runner_step.dependOn(&build_wasm_iter_list_hoist_app.step);
+
+        // Noiter twin: the same sums over plain list literals. The runner prints
+        // each cart's byte size, so the iter build minus this baseline is the
+        // minted-adapter premium tracked in CI (the fusion pass's target).
+        const build_wasm_iter_noiter_app = b.addRunArtifact(roc_exe);
+        build_wasm_iter_noiter_app.addArgs(&.{
+            "build",
+            "test/wasm/iter_for_noiter_static_lib_app.roc",
+            "--opt=size",
+            "--target=wasm32",
+            "--output=test/wasm/iter_for_noiter_static_lib_app.wasm",
+        });
+        build_wasm_iter_noiter_app.step.dependOn(build_test_hosts_step);
+        build_test_wasm_static_lib_runner_step.dependOn(&build_wasm_iter_noiter_app.step);
+
         const build_wasm_rc_cleanup_app = b.addRunArtifact(roc_exe);
         build_wasm_rc_cleanup_app.addArgs(&.{
             "build",
@@ -3709,6 +3776,17 @@ pub fn build(b: *std.Build) void {
         });
         build_wasm_rc_cleanup_model_list_app.step.dependOn(build_test_hosts_step);
         build_test_wasm_static_lib_runner_step.dependOn(&build_wasm_rc_cleanup_model_list_app.step);
+
+        const build_wasm_boxed_model_update_app = b.addRunArtifact(roc_exe);
+        build_wasm_boxed_model_update_app.addArgs(&.{
+            "build",
+            "test/wasm/boxed_model_update_static_lib_app.roc",
+            "--opt=dev",
+            "--target=wasm32",
+            "--output=test/wasm/boxed_model_update_static_lib_app.wasm",
+        });
+        build_wasm_boxed_model_update_app.step.dependOn(build_test_hosts_step);
+        build_test_wasm_static_lib_runner_step.dependOn(&build_wasm_boxed_model_update_app.step);
 
         const wasm_test_exe = b.addExecutable(.{
             .name = "wasm_static_lib_test",
@@ -3785,6 +3863,81 @@ pub fn build(b: *std.Build) void {
             run_wasm_str_concat_join_test.step.dependOn(build_test_wasm_static_lib_runner_step);
             run_test_wasm_static_lib_step.dependOn(&run_wasm_str_concat_join_test.step);
 
+            // Boot-and-play the minted-iterator `for`-loop cart; "ok" means every
+            // inlined `for` over append/map/concat/chained minted chains ran to
+            // completion with correct sums (i.e. the drive advanced its inner
+            // iterators and terminated). `--assert-alloc-balanced` also catches a
+            // per-step allocate/free leak in the drive.
+            const run_wasm_iter_for_test = b.addRunArtifact(wasm_test_exe);
+            run_wasm_iter_for_test.addArgs(&.{
+                "--wasm-path",
+                "test/wasm/iter_for_static_lib_app.wasm",
+                "--expected",
+                "ok",
+                "--assert-alloc-balanced",
+                // Absolute-size ceiling: the un-fused minted cart is ~48 KB
+                // (premium ~18 KB over the noiter twin). This catches a gross
+                // size blowup; the premium itself is read from the two printed
+                // sizes and is the fusion pass's target, not a hard gate pre-fusion.
+                "--max-bytes",
+                "65536",
+            });
+            run_wasm_iter_for_test.step.dependOn(build_test_wasm_static_lib_runner_step);
+            run_test_wasm_static_lib_step.dependOn(&run_wasm_iter_for_test.step);
+
+            const run_wasm_iter_recursive_concat_test = b.addRunArtifact(wasm_test_exe);
+            run_wasm_iter_recursive_concat_test.addArgs(&.{
+                "--wasm-path",
+                "test/wasm/iter_recursive_concat_static_lib_app.wasm",
+                "--expected",
+                "ok",
+                "--assert-alloc-balanced",
+                // The fixed cart is ~542 KB. The prior unbounded generated
+                // callable expansion exceeded 815 KB before failing to lower.
+                "--max-bytes",
+                "600000",
+            });
+            run_wasm_iter_recursive_concat_test.step.dependOn(build_test_wasm_static_lib_runner_step);
+            run_test_wasm_static_lib_step.dependOn(&run_wasm_iter_recursive_concat_test.step);
+
+            // Static-data hoisting: the constant list literal is materialized as
+            // static data, so the whole chain allocates nothing. `--max-allocs 0`
+            // is a strictly stronger assertion than `--assert-alloc-balanced`.
+            const run_wasm_iter_list_hoist_test = b.addRunArtifact(wasm_test_exe);
+            run_wasm_iter_list_hoist_test.addArgs(&.{
+                "--wasm-path",
+                "test/wasm/iter_list_hoist_static_lib_app.wasm",
+                "--expected",
+                "ok",
+                "--max-allocs",
+                "0",
+            });
+            run_wasm_iter_list_hoist_test.step.dependOn(build_test_wasm_static_lib_runner_step);
+            run_test_wasm_static_lib_step.dependOn(&run_wasm_iter_list_hoist_test.step);
+
+            const run_wasm_iter_for_dev_test = b.addRunArtifact(wasm_test_exe);
+            run_wasm_iter_for_dev_test.addArgs(&.{
+                "--wasm-path",
+                "test/wasm/iter_for_static_lib_app_dev.wasm",
+                "--expected",
+                "ok",
+                "--assert-alloc-balanced",
+            });
+            run_wasm_iter_for_dev_test.step.dependOn(build_test_wasm_static_lib_runner_step);
+            run_test_wasm_static_lib_step.dependOn(&run_wasm_iter_for_dev_test.step);
+
+            // Noiter twin — asserts correctness and prints its size so CI logs
+            // carry both numbers for premium tracking.
+            const run_wasm_iter_noiter_test = b.addRunArtifact(wasm_test_exe);
+            run_wasm_iter_noiter_test.addArgs(&.{
+                "--wasm-path",
+                "test/wasm/iter_for_noiter_static_lib_app.wasm",
+                "--expected",
+                "ok",
+            });
+            run_wasm_iter_noiter_test.step.dependOn(build_test_wasm_static_lib_runner_step);
+            run_test_wasm_static_lib_step.dependOn(&run_wasm_iter_noiter_test.step);
+
             const run_wasm_rc_cleanup_test = b.addRunArtifact(wasm_test_exe);
             run_wasm_rc_cleanup_test.addArgs(&.{
                 "--wasm-path",
@@ -3810,6 +3963,16 @@ pub fn build(b: *std.Build) void {
             });
             run_wasm_rc_cleanup_model_list_test.step.dependOn(build_test_wasm_static_lib_runner_step);
             run_test_wasm_static_lib_step.dependOn(&run_wasm_rc_cleanup_model_list_test.step);
+
+            const run_wasm_boxed_model_update_test = b.addRunArtifact(wasm_test_exe);
+            run_wasm_boxed_model_update_test.addArgs(&.{
+                "--wasm-path",
+                "test/wasm/boxed_model_update_static_lib_app.wasm",
+                "--expected",
+                "ok",
+            });
+            run_wasm_boxed_model_update_test.step.dependOn(build_test_wasm_static_lib_runner_step);
+            run_test_wasm_static_lib_step.dependOn(&run_wasm_boxed_model_update_test.step);
         }
         run_wasm_test.step.dependOn(build_test_wasm_static_lib_runner_step);
         run_test_wasm_static_lib_step.dependOn(&run_wasm_test.step);
@@ -5793,14 +5956,20 @@ fn addMainExe(
         }
     }
 
+    const use_bundled_deps = !use_system_llvm and user_llvm_path == null;
+
     const config = b.addOptions();
     config.addOption(bool, "llvm", true);
+    config.addOption(bool, "binaryen", use_bundled_deps);
     exe.root_module.addOptions("config", config);
     exe.root_module.addAnonymousImport("legal_details", .{ .root_source_file = b.path("legal_details") });
 
     const llvm_paths_exe = llvmPaths(b, target, use_system_llvm, user_llvm_path) orelse return null;
     exe.root_module.addLibraryPath(.{ .cwd_relative = llvm_paths_exe.lib });
     exe.root_module.addIncludePath(.{ .cwd_relative = llvm_paths_exe.include });
+    if (use_bundled_deps) {
+        addStaticBinaryenOptionsToModule(exe.root_module);
+    }
     try addStaticLlvmOptionsToModule(exe.root_module);
 
     add_tracy(b, roc_modules.build_options, exe, target, true, tracy);
@@ -6097,6 +6266,18 @@ fn addStaticLlvmOptionsToModule(mod: *std.Build.Module) !void {
         mod.linkSystemLibrary("uuid", .{});
         mod.linkSystemLibrary("ole32", .{});
     }
+}
+
+fn addStaticBinaryenOptionsToModule(mod: *std.Build.Module) void {
+    const link_static = std.Build.Module.LinkSystemLibraryOptions{
+        .preferred_link_mode = .static,
+        .search_strategy = .mode_first,
+    };
+    mod.addCSourceFile(.{
+        .file = .{ .cwd_relative = "src/build/zig_binaryen.cpp" },
+        .flags = &exe_cflags,
+    });
+    mod.linkSystemLibrary("binaryen", link_static);
 }
 
 const cpp_sources = [_][]const u8{

@@ -112,6 +112,11 @@ pub const NestedFn = struct {
     owner: names.ProcTemplate,
     site: names.ProcSiteId,
     context_fn_key: names.TypeDigest,
+    /// Digest of every local-procedure declaration context visible inside this
+    /// nested function. ConstStore restoration combines it with the restored
+    /// function identity and a direct call's checked binder to derive stable
+    /// local-procedure specialization identities.
+    local_proc_context_digest: ?names.TypeDigest = null,
 };
 
 /// Function template plus source and monomorphic type identities.
@@ -233,6 +238,12 @@ fn writeFnDef(hasher: *std.crypto.hash.sha2.Sha256, fn_def: FnDef) void {
             writeProcTemplate(hasher, nested.owner);
             writeU32(hasher, @intFromEnum(nested.site));
             writeBytes(hasher, &nested.context_fn_key.bytes);
+            if (nested.local_proc_context_digest) |digest| {
+                writeBytes(hasher, "local_proc_contexts");
+                writeBytes(hasher, &digest.bytes);
+            } else {
+                writeBytes(hasher, "no_local_proc_contexts");
+            }
         },
         .local_hosted => |hosted| {
             writeBytes(hasher, "local_hosted");
@@ -503,6 +514,13 @@ pub const Expr = struct {
     data: ExprData,
 };
 
+/// A restored compile-time value that may lower to static data once the final
+/// LIR const plan and target layout are known.
+pub const StaticDataCandidate = struct {
+    static_data: Common.StaticDataId,
+    runtime_expr: ExprId,
+};
+
 /// A checked early return plus the explicit target lambda return type.
 pub const Return = struct {
     value: ExprId,
@@ -519,6 +537,7 @@ pub const ExprData = union(enum(u8)) {
     dec_lit: builtins.dec.RocDec,
     str_lit: StringLiteralId,
     bytes_lit: StringLiteralId,
+    static_data_candidate: StaticDataCandidate,
     list: Span(ExprId),
     tuple: Span(ExprId),
     record: Span(FieldExpr),
@@ -795,6 +814,9 @@ pub const RuntimeSchemaRequest = struct {
     ty: Type.TypeId,
 };
 
+/// Request to make a Monotype value available as static data.
+pub const StaticDataValue = Common.StaticDataRequest;
+
 /// Errors reported by Monotype program-view call-target verification.
 pub const CallTargetVerifyError = enum {
     local_fn_out_of_bounds,
@@ -854,6 +876,7 @@ pub const ProgramView = struct {
     roots: []const Root,
     layout_requests: []const LayoutRequest,
     runtime_schema_requests: []const RuntimeSchemaRequest,
+    static_data_values: []const StaticDataValue,
     comptime_sites: []const ComptimeSite,
     source_files: []const []const u8,
     expr_locs: []const base.SourceLoc,
@@ -1016,6 +1039,7 @@ pub const ProgramBuilder = struct {
     roots: ProgramList(Root, "roots"),
     layout_requests: ProgramList(LayoutRequest, "layout_requests"),
     runtime_schema_requests: ProgramList(RuntimeSchemaRequest, "runtime_schema_requests"),
+    static_data_values: ProgramList(StaticDataValue, "static_data_values"),
     comptime_sites: ProgramList(ComptimeSite, "comptime_sites"),
     /// Source file table for `SourceLoc.file` indices (module display names,
     /// owned by this program).
@@ -1069,6 +1093,7 @@ pub const ProgramBuilder = struct {
             .roots = .empty,
             .layout_requests = .empty,
             .runtime_schema_requests = .empty,
+            .static_data_values = .empty,
             .comptime_sites = .empty,
             .source_files = .empty,
             .expr_locs = .empty,
@@ -1096,6 +1121,7 @@ pub const ProgramBuilder = struct {
             self.allocator.free(site.branch_regions);
         }
         self.comptime_sites.deinit(self.allocator);
+        self.static_data_values.deinit(self.allocator);
         self.runtime_schema_requests.deinit(self.allocator);
         self.layout_requests.deinit(self.allocator);
         self.roots.deinit(self.allocator);
@@ -1265,6 +1291,7 @@ pub const ProgramBuilder = struct {
             .roots = self.roots.unsafeRawItemsForView(),
             .layout_requests = self.layout_requests.unsafeRawItemsForView(),
             .runtime_schema_requests = self.runtime_schema_requests.unsafeRawItemsForView(),
+            .static_data_values = self.static_data_values.unsafeRawItemsForView(),
             .comptime_sites = self.comptime_sites.unsafeRawItemsForView(),
             .source_files = self.source_files.unsafeRawItemsForView(),
             .expr_locs = self.expr_locs.unsafeRawItemsForView(),
@@ -1540,6 +1567,12 @@ pub const ProgramBuilder = struct {
 
     pub fn addRuntimeSchemaRequest(self: *ProgramBuilder, request: RuntimeSchemaRequest) std.mem.Allocator.Error!void {
         try self.runtime_schema_requests.append(self.allocator, request);
+    }
+
+    pub fn addStaticDataValue(self: *ProgramBuilder, value: StaticDataValue) std.mem.Allocator.Error!Common.StaticDataId {
+        const id: Common.StaticDataId = @enumFromInt(@as(u32, @intCast(self.static_data_values.len())));
+        try self.static_data_values.append(self.allocator, value);
+        return id;
     }
 
     pub fn comptimeSiteCount(self: *const ProgramBuilder) usize {

@@ -143,4 +143,3 @@ for small literals (threshold keeps the fast path).
 - Debug-allocator balance test for frozen refcounted elements.
 - Keep PR #9924's overflow repro green and extend it one order of
   magnitude past the old `u16` ceiling.
-

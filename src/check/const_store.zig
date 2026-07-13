@@ -56,6 +56,18 @@ pub const TypeDef = struct {
     /// Declaring statement: within-module discriminator for same-named
     /// block-local declarations.
     source_decl: ?u32 = null,
+    /// Compiler-generated specialization identity for internal nominals minted
+    /// after checking while preserving the public declaration identity.
+    generated: ?names.TypeDigest = null,
+    iterator_representation: IteratorRepresentation = .none,
+    iterator_depth: u8 = 0,
+};
+
+/// Checked iterator representation tier preserved for post-check consumers.
+pub const IteratorRepresentation = enum(u8) {
+    none,
+    minted,
+    forced_dynamic,
 };
 
 /// How much of a stored named type's backing type later stages may inspect.
@@ -150,6 +162,7 @@ pub const FnDef = union(enum) {
         owner: names.ProcTemplate,
         site: names.ProcSiteId,
         context_fn_key: names.TypeDigest,
+        local_proc_context_digest: ?names.TypeDigest = null,
     },
     local_hosted: names.ProcTemplate,
     imported_hosted: names.ProcTemplate,
@@ -444,6 +457,9 @@ pub const ConstTypeStore = struct {
             .module = try translation.target.internModuleIdentity(translation.source.moduleIdentityBytes(def.module)),
             .type_name = try translation.target.internTypeName(translation.source.typeNameText(def.type_name)),
             .source_decl = def.source_decl,
+            .generated = def.generated,
+            .iterator_representation = def.iterator_representation,
+            .iterator_depth = def.iterator_depth,
         };
     }
 

@@ -17,6 +17,7 @@ const CanonicalNameStore = check.CanonicalNames.CanonicalNameStore;
 const Checked = check.CheckedArtifact;
 const CheckedModule = check.CheckedModule;
 const ConstFn = check.ConstStore.ConstFn;
+const ConstFnDef = check.ConstStore.FnDef;
 const ConstStrDataId = check.ConstStore.ConstStrDataId;
 const ConstValue = CheckedModule.ConstValue;
 const StaticDataExport = backend.StaticDataExport;
@@ -60,7 +61,7 @@ const ConstStrDataSite = struct {
     data: u32,
 };
 
-/// Build readonly data exports for provided constants.
+/// Build readonly data symbols for provided constants and internal LIR static values.
 pub fn buildProvidedDataExports(
     allocator: Allocator,
     modules: ModuleViews,
@@ -69,10 +70,15 @@ pub fn buildProvidedDataExports(
 ) MaterializationError![]StaticDataExport {
     const root = modules.root orelse {
         if (hasProvidedData(modules)) staticDataInvariant("provided data exports require a root checked module");
+        if (lowered) |lowered_program| {
+            if (lowered_program.lir_result.static_data_values.items.len != 0) {
+                staticDataInvariant("internal static data values require a root checked module");
+            }
+        }
         return try allocator.alloc(StaticDataExport, 0);
     };
     const lowered_program = lowered orelse {
-        if (moduleHasProvidedData(root.module)) staticDataInvariant("provided data exports require LIR layout output");
+        if (moduleHasProvidedData(root.module)) staticDataInvariant("static data exports require LIR layout output");
         return try allocator.alloc(StaticDataExport, 0);
     };
 
@@ -142,6 +148,13 @@ const StaticDataBuilder = struct {
     fn build(self: *StaticDataBuilder) MaterializationError![]StaticDataExport {
         errdefer self.deinitNodes();
 
+        try self.buildProvidedExports();
+        try self.buildInternalStaticValues();
+
+        return try self.nodes.toOwnedSlice(self.allocator);
+    }
+
+    fn buildProvidedExports(self: *StaticDataBuilder) MaterializationError!void {
         for (self.root.module.provided_exports.exports) |provided| {
             const data = switch (provided) {
                 .data => |data| data,
@@ -162,11 +175,31 @@ const StaticDataBuilder = struct {
                 .bytes = materialized.bytes,
                 .alignment = materialized.alignment,
                 .is_global = true,
+                .is_exported = true,
                 .relocations = materialized.relocations,
             });
         }
+    }
 
-        return try self.nodes.toOwnedSlice(self.allocator);
+    fn buildInternalStaticValues(self: *StaticDataBuilder) MaterializationError!void {
+        for (self.lowered.lir_result.static_data_values.items, 0..) |value, index| {
+            const static_data_id: lir.LIR.StaticDataId = @enumFromInt(@as(u32, @intCast(index)));
+            const symbol_name = try lir.Program.staticDataSymbolName(self.allocator, static_data_id);
+            errdefer self.allocator.free(symbol_name);
+
+            const const_node = self.staticDataConstNode(value);
+            const materialized = try self.materializeValue(const_node, value.plan, value.layout_idx);
+            errdefer self.deinitMaterialized(materialized);
+
+            try self.nodes.append(self.allocator, .{
+                .symbol_name = symbol_name,
+                .bytes = materialized.bytes,
+                .alignment = materialized.alignment,
+                .is_global = true,
+                .is_exported = false,
+                .relocations = materialized.relocations,
+            });
+        }
     }
 
     fn deinitNodes(self: *StaticDataBuilder) void {
@@ -196,6 +229,18 @@ const StaticDataBuilder = struct {
         };
     }
 
+    fn staticDataConstNode(self: *StaticDataBuilder, value: lir.Program.StaticDataValue) ConstNode {
+        const module = self.moduleForConst(value.const_locator);
+        if (value.node) |node| return .{ .module = module, .id = node };
+        const template = module.templates.get(value.const_locator);
+        return switch (template.state) {
+            .stored_const => |stored| .{ .module = module, .id = stored.node },
+            .reserved,
+            .eval_template,
+            => staticDataInvariant("internal static data const was not stored before static materialization"),
+        };
+    }
+
     fn moduleForConst(self: *StaticDataBuilder, ref: CheckedModule.ConstRef) ConstModule {
         if (moduleBytesEqual(self.root.module.key.bytes, ref.artifact.bytes)) return .{
             .key = self.root.module.key,
@@ -203,6 +248,14 @@ const StaticDataBuilder = struct {
             .templates = &self.root.module.const_templates,
             .store = &self.root.module.const_store,
         };
+        for (self.root.relation_modules) |relation| {
+            if (moduleBytesEqual(relation.key.bytes, ref.artifact.bytes)) return .{
+                .key = relation.key,
+                .names = relation.canonical_names,
+                .templates = relation.const_templates,
+                .store = relation.const_store,
+            };
+        }
         for (self.imports) |imported| {
             if (moduleBytesEqual(imported.key.bytes, ref.artifact.bytes)) return .{
                 .key = imported.key,
@@ -211,7 +264,7 @@ const StaticDataBuilder = struct {
                 .store = imported.const_store,
             };
         }
-        staticDataInvariant("provided data export referenced a const outside the lowering module set");
+        staticDataInvariant("static data export referenced a const outside the lowering module set");
     }
 
     fn requestedLayout(self: *StaticDataBuilder, checked_type: CheckedModule.CheckedTypeId) lir.Program.RequestedLayout {
@@ -288,7 +341,11 @@ const StaticDataBuilder = struct {
                 };
                 try self.writeValue(bytes, relocations, base_offset, source, source.store.get(backing), named.backing, layout_idx);
             },
-            .fn_value => staticDataInvariant("provided function-valued data export reached finite callable static materialization"),
+            .fn_value => |set| {
+                if (!try self.writeBoxedSemanticValue(bytes, relocations, base_offset, source, value, plan_id, layout_idx)) {
+                    try self.writeFnValue(bytes, relocations, base_offset, source, value, set, layout_idx);
+                }
+            },
             .erased_fn => |set| try self.writeErasedFn(bytes, relocations, base_offset, source, value, set, layout_idx),
         }
     }
@@ -661,6 +718,78 @@ const StaticDataBuilder = struct {
         tag_data.writeDiscriminant(bytes[base_offset..].ptr, variant.discriminant, self.layouts().targetUsize());
     }
 
+    fn writeFnValue(
+        self: *StaticDataBuilder,
+        bytes: []u8,
+        relocations: *std.ArrayList(StaticDataRelocation),
+        base_offset: u32,
+        source: ConstModule,
+        value: ConstValue,
+        set_id: lir.Program.FnSetId,
+        callable_layout_idx: layout.Idx,
+    ) MaterializationError!void {
+        const fn_id = switch (value) {
+            .fn_value => |fn_id| fn_id,
+            else => staticDataInvariant("finite callable const plan received non-function ConstStore node"),
+        };
+        const raw = @intFromEnum(fn_id);
+        if (raw >= source.store.fns.items.len) staticDataInvariant("ConstStore function id is out of range");
+        const fn_value = source.store.getFn(@enumFromInt(raw));
+        const set = self.lowered.lir_result.fn_sets.items[@intFromEnum(set_id)];
+        if (set.layout != callable_layout_idx) {
+            staticDataInvariant("finite callable const plan layout differed from requested static data layout");
+        }
+        const variant = fnVariantForConstFn(set, fn_value);
+
+        const callable_layout = self.layoutValue(callable_layout_idx);
+        if (callable_layout.tag == .zst) {
+            if (self.layouts().layoutSize(self.layoutValue(variant.payload_layout)) != 0) {
+                staticDataInvariant("ZST finite callable layout had non-ZST capture payload");
+            }
+            return;
+        }
+
+        if (callable_layout.tag == .tag_union) {
+            const tag_info = self.layouts().getTagUnionInfo(callable_layout);
+            const active_payload_layout_idx = tag_info.variants.get(@intCast(variant.discriminant)).payload_layout;
+            if (active_payload_layout_idx != variant.payload_layout) {
+                staticDataInvariant("finite callable variant payload layout differed from committed tag-union payload layout");
+            }
+            try self.writeCaptures(
+                bytes,
+                relocations,
+                base_offset,
+                source,
+                fn_value,
+                variant.captures,
+                active_payload_layout_idx,
+            );
+            const tag_data = self.layouts().getTagUnionData(callable_layout.getTagUnion().idx);
+            tag_data.writeDiscriminant(bytes[base_offset..].ptr, variant.discriminant, self.layouts().targetUsize());
+            return;
+        }
+
+        try self.writeCaptures(
+            bytes,
+            relocations,
+            base_offset,
+            source,
+            fn_value,
+            variant.captures,
+            callable_layout_idx,
+        );
+    }
+
+    fn fnVariantForConstFn(
+        set: lir.Program.FnSet,
+        fn_value: ConstFn,
+    ) lir.Program.FnVariant {
+        for (set.variants) |variant| {
+            if (sameFnTemplate(fn_value, variant.template)) return variant;
+        }
+        staticDataInvariant("finite callable ConstStore function was absent from LIR callable variants");
+    }
+
     fn writeErasedFn(
         self: *StaticDataBuilder,
         bytes: []u8,
@@ -877,6 +1006,7 @@ const StaticDataBuilder = struct {
             .bytes = bytes,
             .alignment = @max(payload_alignment, self.word_size),
             .is_global = false,
+            .is_exported = false,
             .relocations = relocations,
         });
 
@@ -1002,13 +1132,12 @@ fn payloadLayoutForTagArg(
     arg_index: u32,
 ) layout.Idx {
     if (arg_count == 0) return layout.Idx.zst;
+    // A single-argument tag variant stores that argument's layout directly as the
+    // committed payload layout (no wrapper struct), so the whole payload layout is
+    // the argument layout. Only multi-argument variants pack their arguments into a
+    // payload struct that must be indexed by argument position.
+    if (arg_count == 1) return variant_layout_idx;
     const variant_layout = layouts.getLayout(variant_layout_idx);
-    if (arg_count == 1) {
-        if (variant_layout.tag == .struct_ and layouts.getStructInfo(variant_layout).fields.len == 1) {
-            return layouts.getStructFieldLayoutByOriginalIndex(variant_layout.getStruct().idx, 0);
-        }
-        return variant_layout_idx;
-    }
     if (variant_layout.tag != .struct_) staticDataInvariant("multi-payload tag did not use struct payload layout");
     return layouts.getStructFieldLayoutByOriginalIndex(variant_layout.getStruct().idx, arg_index);
 }
@@ -1031,9 +1160,35 @@ fn staticDataPtrOffset(word_size: u32, element_alignment: u32, contains_refcount
 }
 
 fn sameFnTemplate(fn_value: ConstFn, template: lir.Program.FnTemplate) bool {
-    return std.meta.eql(fn_value.fn_def, template.fn_def) and
+    return sameFnDef(fn_value.fn_def, template.fn_def) and
         fn_value.source_fn_ty == template.source_fn_ty and
         std.mem.eql(u8, fn_value.source_fn_key.bytes[0..], template.source_fn_key.bytes[0..]);
+}
+
+fn sameFnDef(a: ConstFnDef, b: ConstFnDef) bool {
+    if (std.meta.activeTag(a) != std.meta.activeTag(b)) return false;
+    return switch (a) {
+        .local_template => |template| sameProcTemplate(template, b.local_template),
+        .imported_template => |template| sameProcTemplate(template, b.imported_template),
+        // Restored nested functions have fresh specialization contexts. Their
+        // checked owner/site is the durable source identity; sameFnTemplate
+        // separately compares the function's checked source type key.
+        .nested => |nested| sameProcTemplate(nested.owner, b.nested.owner) and
+            nested.site == b.nested.site,
+        .local_hosted => |template| sameProcTemplate(template, b.local_hosted),
+        .imported_hosted => |template| sameProcTemplate(template, b.imported_hosted),
+        .checked_generated => |template| sameProcTemplate(template, b.checked_generated),
+        .parser_runtime => |runtime| sameProcTemplate(runtime.owner, b.parser_runtime.owner) and
+            runtime.expr == b.parser_runtime.expr,
+        .encoder_for_runtime => |runtime| sameProcTemplate(runtime.owner, b.encoder_for_runtime.owner) and
+            runtime.expr == b.encoder_for_runtime.expr,
+    };
+}
+
+fn sameProcTemplate(a: check.CanonicalNames.ProcTemplate, b: check.CanonicalNames.ProcTemplate) bool {
+    return std.mem.eql(u8, a.artifact.bytes[0..], b.artifact.bytes[0..]) and
+        a.proc_base == b.proc_base and
+        a.template == b.template;
 }
 
 fn alignForwardU32(value: u32, alignment: u32) u32 {

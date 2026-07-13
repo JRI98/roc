@@ -87,6 +87,7 @@ const jobs = [_]Job{
     .{ .name = "run-test-zig-watch-cli" },
     .{ .name = "run-test-zig-minici" },
     .{ .name = "run-test-zig-fx-platform" },
+    .{ .name = "run-test-zig-lir-inline" },
     .{ .name = "run-test-eval", .kind = .harness, .args = &.{ "--timeout", "120000" } },
     .{ .name = "run-test-eval-host-effects", .kind = .harness },
     .{ .name = "run-test-playground", .kind = .harness },

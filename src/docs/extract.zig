@@ -969,7 +969,7 @@ fn extractWhereMethodSignature(
     const signature = try allocDocType(gpa, .{ .function = .{
         .args = args,
         .ret = ret,
-        .effectful = false,
+        .effectful = method.effectful,
     } });
     args_moved = true;
     ret_moved = true;

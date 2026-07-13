@@ -197,6 +197,13 @@ pub const Expr = struct {
     data: ExprData,
 };
 
+/// A restored compile-time value that may lower to static data once the final
+/// LIR const plan and target layout are known.
+pub const StaticDataCandidate = struct {
+    static_data: Common.StaticDataId,
+    runtime_expr: ExprId,
+};
+
 /// Lambda Mono expression forms.
 pub const ExprData = union(enum) {
     local: LocalId,
@@ -207,6 +214,7 @@ pub const ExprData = union(enum) {
     dec_lit: builtins.dec.RocDec,
     str_lit: StringLiteralId,
     bytes_lit: StringLiteralId,
+    static_data_candidate: StaticDataCandidate,
     list: Span(ExprId),
     tuple: Span(ExprId),
     record: Span(FieldExpr),
@@ -415,6 +423,9 @@ pub const RuntimeSchemaRequest = struct {
     ty: Type.TypeId,
 };
 
+/// Request to make a Lambda Mono value available as static data.
+pub const StaticDataValue = Common.StaticDataRequest;
+
 /// Complete Lambda Mono program plus side arrays.
 pub const Program = struct {
     allocator: std.mem.Allocator,
@@ -440,6 +451,7 @@ pub const Program = struct {
     roots: ProgramList(Root, "roots"),
     layout_requests: ProgramList(LayoutRequest, "layout_requests"),
     runtime_schema_requests: ProgramList(RuntimeSchemaRequest, "runtime_schema_requests"),
+    static_data_values: ProgramList(StaticDataValue, "static_data_values"),
     comptime_sites: ProgramList(ComptimeSite, "comptime_sites"),
     /// Source file table for `SourceLoc.file` indices (copied from the lifted
     /// program; owned by this program).
@@ -490,6 +502,7 @@ pub const Program = struct {
             .roots = .empty,
             .layout_requests = .empty,
             .runtime_schema_requests = .empty,
+            .static_data_values = .empty,
             .comptime_sites = .empty,
             .source_files = .empty,
             .expr_locs = .empty,
@@ -517,6 +530,7 @@ pub const Program = struct {
             self.allocator.free(site.branch_regions);
         }
         self.comptime_sites.deinit(self.allocator);
+        self.static_data_values.deinit(self.allocator);
         self.runtime_schema_requests.deinit(self.allocator);
         self.layout_requests.deinit(self.allocator);
         self.roots.deinit(self.allocator);

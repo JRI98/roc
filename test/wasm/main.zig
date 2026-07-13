@@ -43,6 +43,10 @@ const TestOptions = struct {
     assert_alloc_balanced: bool = false,
     min_allocs: usize = 0,
     max_allocs: ?usize = null,
+    /// When set, the `.wasm` file must be at most this many bytes. The size is
+    /// always printed, so pairing an iterator cart with its noiter twin makes
+    /// the minted-adapter premium (iter bytes minus noiter bytes) visible in CI.
+    max_bytes: ?usize = null,
 };
 
 /// Host import implementations for the WASM module.
@@ -230,6 +234,19 @@ fn callWasmMain(wasm: *const WasmInterface, allocator: std.mem.Allocator) anyerr
 
 /// Run a single test case.
 fn runTest(gpa: std.mem.Allocator, arena: std.mem.Allocator, io: std.Io, wasm_path: []const u8, expected_output: []const u8, options: TestOptions) TestResult {
+    if (std.Io.Dir.cwd().readFileAlloc(io, wasm_path, arena, .unlimited)) |bytes| {
+        std.debug.print("WASM size: {d} bytes\n", .{bytes.len});
+        if (options.max_bytes) |max_bytes| {
+            if (bytes.len > max_bytes) {
+                return .{
+                    .name = wasm_path,
+                    .passed = false,
+                    .message = std.fmt.allocPrint(arena, "WASM size {d} exceeded --max-bytes {d}", .{ bytes.len, max_bytes }) catch "WASM too large",
+                };
+            }
+        }
+    } else |_| {}
+
     var wasm = setupWasm(gpa, arena, io, wasm_path, options) catch |err| {
         return .{
             .name = wasm_path,
@@ -369,6 +386,15 @@ pub fn main(init: std.process.Init) anyerror!void {
             };
             options.max_allocs = std.fmt.parseInt(usize, max_allocs_arg, 10) catch |err| {
                 std.debug.print("Error: invalid --max-allocs value '{s}': {}\n", .{ max_allocs_arg, err });
+                return;
+            };
+        } else if (std.mem.eql(u8, arg, "--max-bytes")) {
+            const max_bytes_arg = arg_iter.next() orelse {
+                std.debug.print("Error: --max-bytes requires an argument\n", .{});
+                return;
+            };
+            options.max_bytes = std.fmt.parseInt(usize, max_bytes_arg, 10) catch |err| {
+                std.debug.print("Error: invalid --max-bytes value '{s}': {}\n", .{ max_bytes_arg, err });
                 return;
             };
         }

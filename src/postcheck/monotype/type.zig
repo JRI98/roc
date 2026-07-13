@@ -54,6 +54,21 @@ pub const TypeDef = struct {
     /// Declaring statement in the (content-identified) module: the
     /// within-module discriminator for same-named block-local declarations.
     source_decl: ?u32 = null,
+    /// Compiler-generated specialization identity for internal nominals minted
+    /// from a public source nominal. Null means this is the source nominal.
+    generated: ?names.TypeDigest = null,
+    /// Representation decision produced when an internal iterator nominal is
+    /// created. Later stages consume the recorded tier and mint depth directly.
+    iterator_representation: IteratorRepresentation = .none,
+    /// Producer-computed minted-chain depth. Meaningful only for `.minted`.
+    iterator_depth: u8 = 0,
+};
+
+/// Explicit representation tier assigned when an iterator nominal is created.
+pub const IteratorRepresentation = enum(u8) {
+    none,
+    minted,
+    forced_dynamic,
 };
 
 /// Named checked type instance.
@@ -883,6 +898,9 @@ pub const Store = struct {
                 if (named.def.source_decl == null) {
                     writeBytes(hasher, name_store.typeNameText(named.def.type_name));
                 }
+                writeOptionalDigest(hasher, named.def.generated);
+                writeBytes(hasher, @tagName(named.def.iterator_representation));
+                writeU32(hasher, named.def.iterator_depth);
                 writeBytes(hasher, @tagName(named.kind));
                 if (named.builtin_owner) |owner| {
                     writeBytes(hasher, "builtin");
@@ -1105,6 +1123,9 @@ fn namedTypeViewEql(
     {
         return false;
     }
+    if (!optionalDigestEql(lhs.def.generated, rhs.def.generated)) return false;
+    if (lhs.def.iterator_representation != rhs.def.iterator_representation) return false;
+    if (lhs.def.iterator_depth != rhs.def.iterator_depth) return false;
     if (lhs.builtin_owner != rhs.builtin_owner) return false;
     if (!try typeSpanViewEql(type_view, name_store, lhs.args, rhs.args, visited)) return false;
 
@@ -1421,6 +1442,9 @@ fn namedTypeEqlAcrossStores(
     {
         return false;
     }
+    if (!optionalDigestEql(lhs.def.generated, rhs.def.generated)) return false;
+    if (lhs.def.iterator_representation != rhs.def.iterator_representation) return false;
+    if (lhs.def.iterator_depth != rhs.def.iterator_depth) return false;
     if (lhs.builtin_owner != rhs.builtin_owner) return false;
     if (!try typeSpanEqlAcrossStores(name_store, lhs_view, lhs.args, rhs_view, rhs.args, visited)) return false;
 
@@ -1993,6 +2017,11 @@ pub fn generatedEvidenceOwnerUsesBacking(owner: static_dispatch.BuiltinOwner) bo
         .fields,
         .field,
         .parse_tag_union_spec,
+        // `Iter`/`Stream` instances of one item type share a nominal but
+        // carry different step captures per chain, so their layouts must be
+        // distinguished by backing rather than by nominal identity alone.
+        .iter,
+        .stream,
         => true,
         else => false,
     };
@@ -2007,6 +2036,18 @@ fn writeOptionalU32(hasher: *std.crypto.hash.sha2.Sha256, value: ?u32) void {
     const present: u8 = if (value == null) 0 else 1;
     hasher.update(std.mem.asBytes(&present));
     if (value) |v| writeU32(hasher, v);
+}
+
+fn writeOptionalDigest(hasher: *std.crypto.hash.sha2.Sha256, value: ?names.TypeDigest) void {
+    const present: u8 = if (value == null) 0 else 1;
+    hasher.update(std.mem.asBytes(&present));
+    if (value) |v| hasher.update(&v.bytes);
+}
+
+fn optionalDigestEql(lhs: ?names.TypeDigest, rhs: ?names.TypeDigest) bool {
+    if (lhs == null and rhs == null) return true;
+    if (lhs == null or rhs == null) return false;
+    return std.mem.eql(u8, lhs.?.bytes[0..], rhs.?.bytes[0..]);
 }
 
 /// The builtin method owner a primitive monotype belongs to, by definition.

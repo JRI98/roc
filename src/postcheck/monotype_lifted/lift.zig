@@ -50,6 +50,7 @@ pub fn run(
     var stmt_locs = owned.stmt_locs.takeArrayList();
     var stmt_regions = owned.stmt_regions.takeArrayList();
     var local_names = owned.local_names.takeArrayList();
+    var static_data_values = owned.static_data_values.takeArrayList();
 
     var program = Ast.Program.init(
         allocator,
@@ -78,6 +79,7 @@ pub fn run(
         stmt_locs,
         stmt_regions,
         local_names,
+        static_data_values,
         comptime_sites,
         owned.next_symbol,
     );
@@ -106,6 +108,7 @@ pub fn run(
     stmt_locs = undefined;
     stmt_regions = undefined;
     local_names = undefined;
+    static_data_values = undefined;
     comptime_sites = undefined;
     program.runtime_schema_requests = Ast.ProgramList(Ast.RuntimeSchemaRequest, "runtime_schema_requests").fromArrayList(runtime_schema_requests);
     runtime_schema_requests = undefined;
@@ -158,6 +161,7 @@ fn movedMonoView(source: *const Mono.Program, moved: *const Ast.Program) Mono.Pr
         .roots = source_view.roots,
         .layout_requests = source_view.layout_requests,
         .runtime_schema_requests = moved_view.runtime_schema_requests,
+        .static_data_values = moved_view.static_data_values,
         .comptime_sites = moved_view.comptime_sites,
         .source_files = moved_view.source_files,
         .expr_locs = moved_view.expr_locs,
@@ -412,34 +416,7 @@ const Lifter = struct {
     }
 
     fn completeFunctionReferenceCaptures(self: *Lifter) Allocator.Error!void {
-        for (self.expr_done, 0..) |done, index| {
-            if (!done) continue;
-            const expr_id: Ast.ExprId = @enumFromInt(@as(u32, @intCast(index)));
-            switch (self.output.getExpr(expr_id).data) {
-                .fn_ref => |fn_ref| {
-                    const slots = self.output.typedLocalSpan(self.output.getFn(fn_ref.fn_id).captures);
-                    if (slots.len == 0 and fn_ref.captures.len == 0) continue;
-                    const captures = try rebuildCaptureOperandSpan(self.output, fn_ref.captures, slots, expr_id);
-                    self.output.setExprData(expr_id, .{ .fn_ref = .{
-                        .fn_id = fn_ref.fn_id,
-                        .captures = captures,
-                    } });
-                },
-                .call_proc => |call| {
-                    const fn_id = Ast.localDirectCallee(call) orelse continue;
-                    const slots = self.output.typedLocalSpan(self.output.getFn(fn_id).captures);
-                    if (slots.len == 0 and call.captures.len == 0) continue;
-                    const captures = try rebuildCaptureOperandSpan(self.output, call.captures, slots, expr_id);
-                    self.output.setExprData(expr_id, .{ .call_proc = .{
-                        .callee = call.callee,
-                        .args = call.args,
-                        .captures = captures,
-                        .is_cold = call.is_cold,
-                    } });
-                },
-                else => {},
-            }
-        }
+        try finalizeProgramFunctionReferenceCaptures(self.output, self.fn_captures);
     }
 
     fn lowerTopLevelDef(self: *Lifter, fn_id: Ast.FnId, def: Mono.Def) Allocator.Error!void {
@@ -571,6 +548,7 @@ const Lifter = struct {
             => |items| try self.rewriteExprSpan(items),
             .record => |fields| try self.rewriteFieldExprSpan(fields),
             .tag => |tag| try self.rewriteExprSpan(tag.payloads),
+            .static_data_candidate => |candidate| try self.rewriteExpr(candidate.runtime_expr),
             .nominal,
             .dbg,
             .expect,
@@ -901,17 +879,27 @@ fn deinitCaptureTable(allocator: Allocator, captures: []std.ArrayList(Ast.TypedL
 
 /// Find the existing operand value that supplies capture `id`.
 ///
-/// For a plain local read whose value-local carries a CaptureId, that CaptureId
-/// is authoritative — not the operand's stored id: spec_constr substitution can
-/// replace an operand's value with a local of a different capture while leaving
-/// the stored id stale, so the value's current identity wins.
+/// An operand carries two identities: the value's own CaptureId (when its value
+/// is a plain local that carries one) and the operand's declared `id` (set when
+/// the operand was built to fill a specific target slot). They agree for a
+/// pass-through capture, but diverge in two ways this join must both handle:
 ///
-/// When the value-local carries no CaptureId (e.g. a spec_constr-minted arg or
-/// temp local produced by argument splitting/inlining), no value identity is
-/// available, so the operand's stored id — set when the operand was built for a
-/// specific slot — is the only identity and is honored when present. Genuinely
-/// explicit (non-local) values likewise fall back to their stored id. A
-/// value-id match always takes precedence over the stored id.
+///   - A value-local whose CaptureId equals `id` is the exact supply for the
+///     slot and wins outright. This also overrides a stale declared id: when
+///     spec_constr substitutes an operand's value with a local of a different
+///     capture but leaves the declared id unchanged, the value's current
+///     identity is authoritative.
+///
+///   - Otherwise the operand's declared id names the slot it fills, even when
+///     its value-local carries a different CaptureId. spec_constr routes a
+///     value-local into a slot its own binding does not name — e.g. a
+///     destructured successor `rest` passed as the next iterator's inner-state
+///     capture — and only the declared id records which slot that is. A
+///     value-local with no CaptureId, and a genuinely explicit (non-local)
+///     value, are likewise keyed solely by the declared id.
+///
+/// An exact value-CaptureId match always takes precedence over a declared-id
+/// match; a declared-id match is used only when no exact match exists.
 fn operandValueForSlotId(program: *const Ast.Program, existing: anytype, id: checked.CaptureId) ?Ast.ExprId {
     var fallback_by_id: ?Ast.ExprId = null;
     for (0..existing.len) |index| {
@@ -920,6 +908,7 @@ fn operandValueForSlotId(program: *const Ast.Program, existing: anytype, id: che
             .local => |local| {
                 if (program.getLocal(local).capture_id) |value_id| {
                     if (value_id == id) return operand.value;
+                    if (operand.id == id and fallback_by_id == null) fallback_by_id = operand.value;
                 } else if (operand.id == id and fallback_by_id == null) {
                     fallback_by_id = operand.value;
                 }
@@ -943,6 +932,7 @@ fn rebuildCaptureOperandSpan(
     existing_span: Ast.Span(Ast.CaptureOperand),
     slots: anytype,
     call_expr: Ast.ExprId,
+    bound: *const BoundSet,
 ) Allocator.Error!Ast.Span(Ast.CaptureOperand) {
     if (slots.len == 0) return .empty();
 
@@ -962,8 +952,20 @@ fn rebuildCaptureOperandSpan(
     for (0..slots.len) |index| {
         const slot = GuardedList.at(slots, index);
         const id = slotCaptureId(program, slot);
-        const value = operandValueForSlotId(program, existing, id) orelse
-            try program.addExpr(.{ .ty = slot.ty, .data = .{ .local = slot.local } });
+        const existing_value = operandValueForSlotId(program, existing, id);
+        const value = if (existing_value) |candidate| blk: {
+            const candidate_local = switch (program.getExpr(candidate).data) {
+                .local => |local| local,
+                else => break :blk candidate,
+            };
+            if (program.getLocal(candidate_local).capture_id != id) break :blk candidate;
+            const active = bound.bindingFor(program, candidate_local) orelse break :blk candidate;
+            if (active == candidate_local) break :blk candidate;
+            break :blk try program.addExpr(.{ .ty = slot.ty, .data = .{ .local = active } });
+        } else blk: {
+            const active = bound.bindingFor(program, slot.local) orelse slot.local;
+            break :blk try program.addExpr(.{ .ty = slot.ty, .data = .{ .local = active } });
+        };
         operands[index] = .{ .id = id, .value = value };
     }
     return try program.addCaptureOperandSpan(operands);
@@ -976,43 +978,21 @@ fn finalizeProgramFunctionReferenceCaptures(
     program: *Ast.Program,
     fn_captures: []std.ArrayList(Ast.TypedLocal),
 ) Allocator.Error!void {
-    const expr_count = program.exprCount();
-    for (0..expr_count) |index| {
-        const expr_id: Ast.ExprId = @enumFromInt(@as(u32, @intCast(index)));
-        switch (program.getExpr(expr_id).data) {
-            .fn_ref => |fn_ref| {
-                const fn_index = @intFromEnum(fn_ref.fn_id);
-                if (fn_index >= fn_captures.len) Common.invariant("function reference target missing recomputed captures");
+    var walker = CaptureSet.initForProgram(program.allocator, program, fn_captures);
+    defer walker.deinit();
+    walker.finalize_operands = true;
+    var bound = BoundSet.init(program.allocator);
+    defer bound.deinit();
 
-                // Always recompute: even when the target's capture set is
-                // unchanged, a caller-side operand value can have been rewritten
-                // by spec_constr, so the operand span must be re-derived from the
-                // current values, keyed to the target's recomputed slots.
-                const new_captures = fn_captures[fn_index].items;
-                const captures = try rebuildCaptureOperandSpan(program, fn_ref.captures, new_captures, expr_id);
-                program.setExprData(expr_id, .{ .fn_ref = .{
-                    .fn_id = fn_ref.fn_id,
-                    .captures = captures,
-                } });
-            },
-            .call_proc => |call| {
-                const fn_id = switch (call.callee) {
-                    .lifted => |fn_id| fn_id,
-                    .func => continue,
-                };
-                const fn_index = @intFromEnum(fn_id);
-                if (fn_index >= fn_captures.len) Common.invariant("direct call target missing recomputed captures");
-
-                const new_captures = fn_captures[fn_index].items;
-                const captures = try rebuildCaptureOperandSpan(program, call.captures, new_captures, expr_id);
-                program.setExprData(expr_id, .{ .call_proc = .{
-                    .callee = call.callee,
-                    .args = call.args,
-                    .captures = captures,
-                    .is_cold = call.is_cold,
-                } });
-            },
-            else => {},
+    for (0..program.fnCount()) |raw| {
+        walker.clear();
+        bound.clear();
+        const fn_: Ast.FnId = @enumFromInt(@as(u32, @intCast(raw)));
+        const body = program.getFn(fn_);
+        try bindTypedLocals(program, &bound, program.typedLocalSpan(body.args));
+        switch (body.body) {
+            .roc => |expr| try walker.collectExpr(expr, &bound),
+            .hosted => {},
         }
     }
 }
@@ -1104,61 +1084,81 @@ fn explicitProvidesCaptureId(program: *const Ast.Program, explicit: anytype, id:
     return explicitCaptureValueForId(program, explicit, id) != null;
 }
 
+const BoundBinder = struct {
+    local: Mono.LocalId,
+    previous: ?u32,
+};
+
 const BoundSet = struct {
     locals: std.AutoHashMap(Mono.LocalId, void),
-    binders: std.AutoHashMap(checked.PatternBinderId, u32),
+    binder_heads: std.AutoHashMap(checked.PatternBinderId, u32),
+    binder_entries: std.ArrayList(BoundBinder),
 
     fn init(allocator: Allocator) BoundSet {
         return .{
             .locals = std.AutoHashMap(Mono.LocalId, void).init(allocator),
-            .binders = std.AutoHashMap(checked.PatternBinderId, u32).init(allocator),
+            .binder_heads = std.AutoHashMap(checked.PatternBinderId, u32).init(allocator),
+            .binder_entries = .empty,
         };
     }
 
     fn deinit(self: *BoundSet) void {
-        self.binders.deinit();
+        self.binder_entries.deinit(self.locals.allocator);
+        self.binder_heads.deinit();
         self.locals.deinit();
     }
 
     fn contains(self: *const BoundSet, input: *const Ast.Program, local: Mono.LocalId) bool {
-        if (self.locals.contains(local)) return true;
-        const local_data = input.getLocal(local);
-        return if (local_data.binder) |binder| self.binders.contains(binder) else false;
+        return self.bindingFor(input, local) != null;
+    }
+
+    fn binderIdentity(input: *const Ast.Program, local: Mono.LocalId) ?checked.PatternBinderId {
+        return input.getLocal(local).binder;
+    }
+
+    fn bindingFor(self: *const BoundSet, input: *const Ast.Program, local: Mono.LocalId) ?Mono.LocalId {
+        if (self.locals.contains(local)) return local;
+        const identity = binderIdentity(input, local) orelse return null;
+        const entry = self.binder_heads.get(identity) orelse return null;
+        return self.binder_entries.items[entry].local;
     }
 
     fn put(self: *BoundSet, input: *const Ast.Program, local: Mono.LocalId) Allocator.Error!void {
         try self.locals.put(local, {});
-        if (input.getLocal(local).binder) |binder| try self.putBinder(binder);
+        if (binderIdentity(input, local)) |identity| {
+            const entry: u32 = @intCast(self.binder_entries.items.len);
+            try self.binder_entries.append(self.locals.allocator, .{
+                .local = local,
+                .previous = self.binder_heads.get(identity),
+            });
+            try self.binder_heads.put(identity, entry);
+        }
     }
 
     fn remove(self: *BoundSet, input: *const Ast.Program, local: Mono.LocalId) void {
         _ = self.locals.remove(local);
-        if (input.getLocal(local).binder) |binder| self.removeBinder(binder);
-    }
-
-    fn putBinder(self: *BoundSet, binder: checked.PatternBinderId) Allocator.Error!void {
-        const entry = try self.binders.getOrPut(binder);
-        if (entry.found_existing) {
-            entry.value_ptr.* += 1;
-        } else {
-            entry.value_ptr.* = 1;
-        }
-    }
-
-    fn removeBinder(self: *BoundSet, binder: checked.PatternBinderId) void {
-        const count = self.binders.getPtr(binder) orelse
-            Common.invariant("capture collection removed an unbound checked binder");
-        if (count.* > 1) {
-            count.* -= 1;
-        } else {
-            _ = self.binders.remove(binder);
+        if (binderIdentity(input, local)) |identity| {
+            const entry_index = self.binder_heads.get(identity) orelse
+                Common.invariant("capture collection removed an unbound checked binder");
+            const entry = self.binder_entries.items[entry_index];
+            if (entry.local != local) {
+                Common.invariant("capture collection removed a shadowed checked binder out of order");
+            }
+            if (entry.previous) |previous| {
+                self.binder_heads.put(identity, previous) catch |err| switch (err) {
+                    error.OutOfMemory => Common.invariant("restoring a bound checked binder cannot allocate"),
+                };
+            } else {
+                _ = self.binder_heads.remove(identity);
+            }
         }
     }
 
     /// Reset for reuse across fixpoint solves without freeing capacity.
     fn clear(self: *BoundSet) void {
         self.locals.clearRetainingCapacity();
-        self.binders.clearRetainingCapacity();
+        self.binder_heads.clearRetainingCapacity();
+        self.binder_entries.clearRetainingCapacity();
     }
 };
 
@@ -1169,6 +1169,7 @@ const CaptureSet = struct {
     fn_captures: []std.ArrayList(Ast.TypedLocal),
     items: std.ArrayList(Ast.TypedLocal),
     seen: std.AutoHashMap(Mono.LocalId, void),
+    finalize_operands: bool,
 
     fn init(lifter: *Lifter) CaptureSet {
         return .{
@@ -1178,6 +1179,7 @@ const CaptureSet = struct {
             .fn_captures = lifter.fn_captures,
             .items = .empty,
             .seen = std.AutoHashMap(Mono.LocalId, void).init(lifter.allocator),
+            .finalize_operands = false,
         };
     }
 
@@ -1193,6 +1195,7 @@ const CaptureSet = struct {
             .fn_captures = fn_captures,
             .items = .empty,
             .seen = std.AutoHashMap(Mono.LocalId, void).init(allocator),
+            .finalize_operands = false,
         };
     }
 
@@ -1241,10 +1244,38 @@ const CaptureSet = struct {
             .comptime_exhaustiveness_failed,
             => {},
             .fn_ref => |fn_ref| {
-                const operands = input.captureOperandSpan(fn_ref.captures);
-                for (0..operands.len) |operand_index| {
-                    const operand = GuardedList.at(operands, operand_index);
+                const operands = try GuardedList.dupe(self.allocator, Ast.CaptureOperand, input.captureOperandSpan(fn_ref.captures));
+                defer self.allocator.free(operands);
+                for (operands) |operand| {
                     try self.collectExpr(operand.value, bound);
+                }
+                if (self.finalize_operands) {
+                    const fn_index = @intFromEnum(fn_ref.fn_id);
+                    // Inline lambdas are reserved while lifting expressions,
+                    // after the initial def/nested-def fixed-point table was
+                    // sized. Their function records already contain the exact
+                    // capture span computed by `liftLambda`; later recompute
+                    // passes size the table to include every function.
+                    const captures = if (fn_index < self.fn_captures.len)
+                        try rebuildCaptureOperandSpan(
+                            self.program,
+                            fn_ref.captures,
+                            self.fn_captures[fn_index].items,
+                            expr_id,
+                            bound,
+                        )
+                    else
+                        try rebuildCaptureOperandSpan(
+                            self.program,
+                            fn_ref.captures,
+                            self.program.typedLocalSpan(self.program.getFn(fn_ref.fn_id).captures),
+                            expr_id,
+                            bound,
+                        );
+                    self.program.setExprData(expr_id, .{ .fn_ref = .{
+                        .fn_id = fn_ref.fn_id,
+                        .captures = captures,
+                    } });
                 }
             },
             .fn_def => |fn_def| {
@@ -1274,6 +1305,7 @@ const CaptureSet = struct {
                 const payloads = input.exprSpan(tag.payloads);
                 for (0..payloads.len) |payload_index| try self.collectExpr(GuardedList.at(payloads, payload_index), bound);
             },
+            .static_data_candidate => |candidate| try self.collectExpr(candidate.runtime_expr, bound),
             .nominal,
             .dbg,
             .expect,
@@ -1314,8 +1346,32 @@ const CaptureSet = struct {
                 }
                 const args = input.exprSpan(call.args);
                 for (0..args.len) |arg_index| try self.collectExpr(GuardedList.at(args, arg_index), bound);
-                const captures = input.captureOperandSpan(call.captures);
-                for (0..captures.len) |capture_index| try self.collectExpr(GuardedList.at(captures, capture_index).value, bound);
+                const captures = try GuardedList.dupe(self.allocator, Ast.CaptureOperand, input.captureOperandSpan(call.captures));
+                defer self.allocator.free(captures);
+                for (captures) |capture| try self.collectExpr(capture.value, bound);
+                if (self.finalize_operands) {
+                    const fn_id = switch (call.callee) {
+                        .lifted => |fn_id| fn_id,
+                        // Imported direct calls retain their imported function
+                        // slot through lifting and have no local capture set.
+                        .func => return,
+                    };
+                    const fn_index = @intFromEnum(fn_id);
+                    if (fn_index >= self.fn_captures.len) Common.invariant("direct call target missing recomputed captures");
+                    const finalized = try rebuildCaptureOperandSpan(
+                        self.program,
+                        call.captures,
+                        self.fn_captures[fn_index].items,
+                        expr_id,
+                        bound,
+                    );
+                    self.program.setExprData(expr_id, .{ .call_proc = .{
+                        .callee = call.callee,
+                        .args = call.args,
+                        .captures = finalized,
+                        .is_cold = call.is_cold,
+                    } });
+                }
             },
             .low_level => |call| {
                 const args = input.exprSpan(call.args);
@@ -1651,6 +1707,85 @@ test "checkCaptureInvariants accepts a well-formed capture and catches a corrupt
         "operand CaptureId did not match its slot",
         (try checkCaptureInvariants(&program)).?,
     );
+}
+
+test "capture finalization supplies the caller's active binder local" {
+    const allocator = std.testing.allocator;
+    var program = Ast.Program.init(
+        allocator,
+        @import("check").CheckedNames.NameStore.init(allocator),
+        MonoType.Store.init(allocator),
+        .empty, // imported_fns
+        .empty, // exprs
+        .empty, // pats
+        .empty, // stmts
+        .empty, // locals
+        .empty, // expr_ids
+        .empty, // pat_ids
+        .empty, // typed_locals
+        .empty, // stmt_ids
+        .empty, // field_exprs
+        .empty, // fn_def_captures
+        .empty, // record_destructs
+        .empty, // str_pattern_steps
+        .empty, // branches
+        .empty, // if_branches
+        .empty, // string_literals
+        Ast.ProcDebugNameMap.init(allocator),
+        .empty, // source_files
+        .empty, // expr_locs
+        .empty, // expr_regions
+        .empty, // stmt_locs
+        .empty, // stmt_regions
+        .empty, // local_names
+        .empty, // static_data_values
+        .empty, // comptime_sites
+        0, // next_symbol
+    );
+    defer program.deinit();
+
+    const ty = try program.types.add(.zst);
+    const binder: checked.PatternBinderId = @enumFromInt(1);
+    const captured_outer = try program.addLocalWithBinder(@enumFromInt(1), ty, binder);
+    const active_arg = try program.addLocalWithBinder(@enumFromInt(2), ty, binder);
+
+    const callee_body = try program.addExpr(.{ .ty = ty, .data = .{ .local = captured_outer } });
+    const callee = try program.addFn(.{
+        .symbol = @enumFromInt(1),
+        .args = .empty(),
+        .captures = .empty(),
+        .body = .{ .roc = callee_body },
+        .ret = ty,
+    });
+
+    const call = try program.addExpr(.{ .ty = ty, .data = .{ .call_proc = .{
+        .callee = .{ .lifted = callee },
+        .args = .empty(),
+        .captures = .empty(),
+    } } });
+    _ = try program.addFn(.{
+        .symbol = @enumFromInt(2),
+        .args = try program.addTypedLocalSpan(&.{.{ .local = active_arg, .ty = ty }}),
+        .captures = .empty(),
+        .body = .{ .roc = call },
+        .ret = ty,
+    });
+
+    try recomputeCaptures(allocator, &program);
+
+    const finalized = switch (program.getExpr(call).data) {
+        .call_proc => |value| value,
+        else => return error.TestUnexpectedResult,
+    };
+    const operands = program.captureOperandSpan(finalized.captures);
+    try std.testing.expectEqual(@as(usize, 1), operands.len);
+    const operand = GuardedList.at(operands, 0);
+    try std.testing.expectEqual(checked.CaptureId.fromBinder(binder), operand.id);
+    const supplied = switch (program.getExpr(operand.value).data) {
+        .local => |local| local,
+        else => return error.TestUnexpectedResult,
+    };
+    try std.testing.expectEqual(active_arg, supplied);
 }
 
 test "monotype lifted lower declarations are referenced" {

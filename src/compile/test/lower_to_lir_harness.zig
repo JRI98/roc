@@ -68,6 +68,7 @@ pub const LirInspectFn = *const fn (
 /// Options controlling how the harness lowers an app to LIR.
 pub const LirLoweringOptions = struct {
     target_usize: base.target.TargetUsize = base.target.TargetUsize.native,
+    inline_mode: lir.CheckedPipeline.InlineMode = .none,
     list_in_place_map: bool = false,
 };
 
@@ -82,6 +83,18 @@ pub fn expectLowersToLir(app_body: []const u8) LowerToLirHarnessError!void {
 /// the app checked cleanly and passed ARC certification.
 pub fn expectAppPathLowersToLir(app_path: []const u8) LowerToLirHarnessError!void {
     try lowerAppPathToLir(std.testing.allocator, app_path, null, .{}, null);
+}
+
+/// Lower an app at `app_path` to LIR, then run a focused invariant check
+/// against the actual lowered store and layout store.
+pub fn expectAppPathLirInspection(app_path: []const u8, inspect: LirInspectFn) LowerToLirHarnessError!void {
+    try lowerAppPathToLir(std.testing.allocator, app_path, null, .{}, inspect);
+}
+
+/// Lower an app at `app_path` to LIR with explicit lowering options, then run
+/// a focused invariant check against the actual lowered store and layout store.
+pub fn runAppPathLirInspection(app_path: []const u8, opts: LirLoweringOptions, inspect: LirInspectFn) LowerToLirHarnessError!void {
+    try lowerAppPathToLir(std.testing.allocator, app_path, null, opts, inspect);
 }
 
 /// Lower an app whose body is `app_body` to LIR, then run a focused invariant
@@ -240,7 +253,11 @@ fn lowerAppPathToLir(
             .imports = imports,
         },
         .{ .requests = lir_roots },
-        .{ .target_usize = opts.target_usize, .list_in_place_map = opts.list_in_place_map },
+        .{
+            .target_usize = opts.target_usize,
+            .inline_mode = opts.inline_mode,
+            .list_in_place_map = opts.list_in_place_map,
+        },
     );
     defer lowered.deinit();
 

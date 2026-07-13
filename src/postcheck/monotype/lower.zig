@@ -74,6 +74,10 @@ pub const Options = struct {
     /// Whether inline expects should be lowered at all. Optimized runtime builds
     /// omit them before their conditions can affect control-flow decisions.
     inline_expects: InlineExpectMode = .run,
+    /// Restore stored constants as readonly static-data candidates when their
+    /// ConstStore shape may require runtime storage.
+    static_data_literals: bool = false,
+    target_usize: base.target.TargetUsize = base.target.TargetUsize.native,
 };
 
 /// Deterministic counters used by specialization-shape tests.
@@ -425,6 +429,26 @@ const ParseIntrinsic = enum {
     field_name,
 };
 
+/// Internal iterator-family nominal kind.
+///
+/// These are not source-visible nominal declarations like `MapIter`. The
+/// distinct compiler-owned nominal identity is the `TypeDef.generated` digest
+/// minted from this kind plus the concrete component types. That digest is the
+/// identity; display names stay the public `Iter` provenance.
+const GeneratedIteratorKind = enum {
+    custom,
+    single,
+    range_exclusive,
+    range_inclusive,
+    map,
+    keep_if,
+    drop_if,
+    take_first,
+    drop_first,
+    concat,
+    append,
+};
+
 const FieldNameBound = enum {
     shortest,
     longest,
@@ -440,6 +464,12 @@ const ConstExprAddress = struct {
     type_module_bytes: [32]u8,
     node: u32,
     mono_ty: u32,
+};
+
+const StaticDataUse = struct {
+    module: checked.ModuleId,
+    node: checked.ConstNodeId,
+    checked_type: checked.CheckedTypeId,
 };
 
 /// Key for a memoized structural-derivation helper def. `value_ty` is the type
@@ -549,8 +579,12 @@ const Builder = struct {
     loaded_specialization_shards: []const LoadedSpecializationShard,
     counters: ?*SpecializationCounters,
     inline_expects: InlineExpectMode,
+    static_data_literals: bool,
+    target_usize: base.target.TargetUsize,
     symbols: Common.SymbolGen = .{},
     type_cache: std.AutoHashMap(CheckedTypeAddress, Type.TypeId),
+    generated_iter_types: std.AutoHashMap([32]u8, Type.TypeId),
+    forced_dynamic_iter_types: std.AutoHashMap([32]u8, Type.TypeId),
     spec_store: specialize.SpecBuilder,
     /// Monotypes owned by the builder-global type cache. They are lowered
     /// without body evidence, so empty tag unions inside them are unresolved
@@ -562,6 +596,7 @@ const Builder = struct {
     lowered_nested_by_fn: std.AutoHashMap(Ast.FnId, Ast.SpecId),
     nested_site_cache: std.AutoHashMap(NestedSiteAddress, names.ProcSiteId),
     const_expr_cache: std.AutoHashMap(ConstExprAddress, Ast.ExprId),
+    static_data_ids: std.AutoHashMap(StaticDataUse, Common.StaticDataId),
     inspect_defs: std.AutoHashMap(GeneratedHelperDefAddress, GeneratedHelperDefEntry),
     equality_defs: std.AutoHashMap(GeneratedHelperDefAddress, GeneratedHelperDefEntry),
     hash_defs: std.AutoHashMap(GeneratedHelperDefAddress, GeneratedHelperDefEntry),
@@ -599,13 +634,18 @@ const Builder = struct {
             .loaded_specialization_shards = options.loaded_specialization_shards,
             .counters = options.specialization_counters,
             .inline_expects = options.inline_expects,
+            .static_data_literals = options.static_data_literals,
+            .target_usize = options.target_usize,
             .type_cache = std.AutoHashMap(CheckedTypeAddress, Type.TypeId).init(allocator),
+            .generated_iter_types = std.AutoHashMap([32]u8, Type.TypeId).init(allocator),
+            .forced_dynamic_iter_types = std.AutoHashMap([32]u8, Type.TypeId).init(allocator),
             .spec_store = spec_store,
             .unsolved_monos = std.AutoHashMap(Type.TypeId, void).init(allocator),
             .lowered_templates = std.AutoHashMap(Ast.FnId, LoweredTemplate).init(allocator),
             .lowered_nested_by_fn = std.AutoHashMap(Ast.FnId, Ast.SpecId).init(allocator),
             .nested_site_cache = std.AutoHashMap(NestedSiteAddress, names.ProcSiteId).init(allocator),
             .const_expr_cache = std.AutoHashMap(ConstExprAddress, Ast.ExprId).init(allocator),
+            .static_data_ids = std.AutoHashMap(StaticDataUse, Common.StaticDataId).init(allocator),
             .inspect_defs = std.AutoHashMap(GeneratedHelperDefAddress, GeneratedHelperDefEntry).init(allocator),
             .equality_defs = std.AutoHashMap(GeneratedHelperDefAddress, GeneratedHelperDefEntry).init(allocator),
             .hash_defs = std.AutoHashMap(GeneratedHelperDefAddress, GeneratedHelperDefEntry).init(allocator),
@@ -641,12 +681,15 @@ const Builder = struct {
         self.hash_defs.deinit();
         self.equality_defs.deinit();
         self.inspect_defs.deinit();
+        self.static_data_ids.deinit();
         self.const_expr_cache.deinit();
         self.nested_site_cache.deinit();
         self.lowered_nested_by_fn.deinit();
         self.lowered_templates.deinit();
         self.spec_store.deinit();
         self.unsolved_monos.deinit();
+        self.generated_iter_types.deinit();
+        self.forced_dynamic_iter_types.deinit();
         self.type_cache.deinit();
         self.evidence_arena.deinit();
     }
@@ -876,6 +919,24 @@ const Builder = struct {
         };
     }
 
+    /// The builtin `Iter`/`Stream` nominals carry no `CheckedBuiltinNominal`
+    /// tag, so recognize them by their declaring module and name to stamp a
+    /// `BuiltinOwner`. Downstream layout/erasure stages read that owner to keep
+    /// the step closure inline instead of erasing it to a boxed callable.
+    fn builtinOwnerForNominal(
+        self: *Builder,
+        view: ModuleView,
+        nominal: checked.CheckedNominalType,
+    ) ?static_dispatch.BuiltinOwner {
+        if (builtinOwner(nominal.builtin)) |owner| return owner;
+        const source_view = self.moduleForDigest(moduleDigestFromId(nominal.owner_module));
+        if (source_view.module_env.module_role != .builtin) return null;
+        const name_text = view.names.typeNameText(nominal.name);
+        if (Ident.textEql(name_text, "Iter")) return .iter;
+        if (Ident.textEql(name_text, "Stream")) return .stream;
+        return null;
+    }
+
     fn declaredModuleForAlias(_: *Builder, _: ModuleView, alias: checked.CheckedAliasType) names.CheckedModuleDigest {
         return moduleDigestFromId(alias.owner_module);
     }
@@ -885,14 +946,16 @@ const Builder = struct {
     }
 
     fn lowerRoot(self: *Builder, request: checked.RootRequest) Allocator.Error!void {
-        const def = if (request.procedure_template) |template|
-            try self.lowerTemplate(template, moduleView(self.root_view), request.checked_type)
-        else if (request.procedure_binding) |binding|
-            try self.lowerProcedureBindingRoot(request, binding)
-        else if (request.procedure_use) |procedure|
-            try self.lowerProcedureUseRoot(request, procedure)
-        else
-            Common.invariant("root request reached Monotype without a checked procedure template or procedure source");
+        const def = if (request.procedure_template) |template| blk: {
+            const def = try self.lowerTemplate(template, moduleView(self.root_view), request.checked_type);
+            break :blk def;
+        } else if (request.procedure_binding) |binding| blk: {
+            const def = try self.lowerProcedureBindingRoot(request, binding);
+            break :blk def;
+        } else if (request.procedure_use) |procedure| blk: {
+            const def = try self.lowerProcedureUseRoot(request, procedure);
+            break :blk def;
+        } else Common.invariant("root request reached Monotype without a checked procedure template or procedure source");
         try self.appendRuntimeSchemaRequestsForDef(def);
         try self.program.addRoot(.{ .def = def, .request = request });
     }
@@ -908,9 +971,9 @@ const Builder = struct {
 
     fn lowerStaticDataRequest(self: *Builder, request: Common.StaticDataRequest) Allocator.Error!void {
         const type_view = moduleView(self.root_view);
-        const ret_ty = try self.lowerType(type_view, request.data.checked_type);
-        const const_node = self.providedConstNode(request.data);
-        const body = try self.restoreConstNodeAtType(const_node.module, type_view, const_node.id, ret_ty);
+        const ret_ty = try self.lowerType(type_view, request.checked_type);
+        const const_node = self.constNode(request.const_locator, request.node);
+        const body = try self.restoreConstNodeAtTypeWithStaticRoot(const_node.module, type_view, const_node.id, ret_ty, request.const_locator);
         const def = try self.program.addDef(.{
             .symbol = self.symbols.fresh(),
             .fn_def = null,
@@ -919,7 +982,7 @@ const Builder = struct {
             .ret = ret_ty,
         });
         try self.program.addLayoutRequest(.{
-            .checked_type = request.data.checked_type,
+            .checked_type = request.checked_type,
             .ty = ret_ty,
             .def = def,
         });
@@ -1146,7 +1209,7 @@ const Builder = struct {
         const template = view.callable_eval_templates.templates[raw];
         const root = view.compile_time_roots.root(template.root);
         return switch (root.payload) {
-            .fn_value => |fn_id| try self.restoreConstFnExpr(view, fn_id, mono_fn_ty),
+            .fn_value => |fn_id| try self.restoreConstFnExpr(view, fn_id, mono_fn_ty, null),
             .pending => try self.lowerPendingCallableEvalBindingValue(view, template, root, mono_fn_ty),
             else => Common.invariant("callable eval binding root did not output a callable value"),
         };
@@ -1251,7 +1314,9 @@ const Builder = struct {
             switch (record.status) {
                 .ready,
                 .lowering,
-                => return existing.def,
+                => {
+                    return existing.def;
+                },
                 .reserved => {
                     reserved_def = existing.def;
                     lower_fn_ty = record.request_fn_ty;
@@ -1274,7 +1339,9 @@ const Builder = struct {
                 switch (hit.status) {
                     .ready,
                     .lowering,
-                    => return existing.def,
+                    => {
+                        return existing.def;
+                    },
                     .reserved => {
                         reserved_def = existing.def;
                         // A reserved record can only have matched through its
@@ -1464,7 +1531,7 @@ const Builder = struct {
         // serve many specializations.
         const root_node = try body_ctx.instNode(template.checked_fn_root);
         const body_uses_generated_evidence =
-            !self.unsolved_monos.contains(lower_fn_ty) and body_ctx.functionHasGeneratedOpaqueEvidence(lower_fn_ty);
+            !self.unsolved_monos.contains(lower_fn_ty) and try body_ctx.functionHasGeneratedOpaqueEvidence(lower_fn_ty);
         if (!self.unsolved_monos.contains(lower_fn_ty) and !body_uses_generated_evidence) {
             try graph.addMonoView(root_node, lower_fn_ty);
         }
@@ -1855,7 +1922,7 @@ const Builder = struct {
                     .named_type = .{ .module = self.declaredModuleForNominal(view, nominal), .ty = checked_ty },
                     .def = try self.typeDef(view, nominal.origin_module, nominal.name, nominal.source_decl),
                     .kind = if (nominal.is_opaque) .@"opaque" else .nominal,
-                    .builtin_owner = builtinOwner(nominal.builtin),
+                    .builtin_owner = self.builtinOwnerForNominal(view, nominal),
                     .args = try self.program.types.addSpan(args),
                     .backing = switch (nominal.representation) {
                         .opaque_without_backing => null,
@@ -2037,6 +2104,11 @@ const Builder = struct {
             .zst,
             => false,
             .named => |named| blk: {
+                if (named.def.iterator_representation != .none) {
+                    if (named.builtin_owner) |owner| {
+                        if (owner == .iter or owner == .stream) break :blk true;
+                    }
+                }
                 if (self.generatedFieldNamesBackingInfo(ty) or
                     self.generatedParseTagUnionSpecBackingInfo(ty))
                 {
@@ -2498,15 +2570,73 @@ const Builder = struct {
         return try self.program.types.addDeclaredFields(entries);
     }
 
-    fn providedConstNode(self: *Builder, data: checked.ProvidedDataExport) ConstNode {
-        const view = self.moduleForId(checked.constModuleId(data.const_ref));
-        const template = view.const_templates.get(data.const_ref);
+    fn constNode(self: *Builder, const_locator: checked.ConstLocator, node: ?checked.ConstNodeId) ConstNode {
+        const view = self.moduleForId(checked.constModuleId(const_locator));
+        if (node) |id| return .{ .module = view, .id = id };
+        const template = view.const_templates.get(const_locator);
         return switch (template.state) {
             .stored_const => |stored| .{ .module = view, .id = stored.node },
             .reserved,
             .eval_template,
             => Common.invariant("static data request const was not stored before Monotype lowering"),
         };
+    }
+
+    fn staticDataValue(
+        self: *Builder,
+        const_locator: checked.ConstLocator,
+        node: ?checked.ConstNodeId,
+        checked_type: checked.CheckedTypeId,
+    ) Allocator.Error!Common.StaticDataId {
+        const const_node = self.constNode(const_locator, node);
+        const gop = try self.static_data_ids.getOrPut(.{
+            .module = const_node.module.key,
+            .node = const_node.id,
+            .checked_type = checked_type,
+        });
+        if (!gop.found_existing) {
+            gop.value_ptr.* = try self.program.addStaticDataValue(.{
+                .const_locator = const_locator,
+                .node = node,
+                .checked_type = checked_type,
+            });
+        }
+        return gop.value_ptr.*;
+    }
+
+    const BareFnCandidate = enum {
+        disallow,
+        allow,
+    };
+
+    fn constNodeMayUseStaticDataCandidate(self: *Builder, view: ModuleView, node: checked.ConstNodeId, bare_fn: BareFnCandidate) bool {
+        return self.constValueMayUseStaticDataCandidate(view, view.const_store.get(node), bare_fn);
+    }
+
+    fn constValueMayUseStaticDataCandidate(self: *Builder, view: ModuleView, value: checked.ConstValue, bare_fn: BareFnCandidate) bool {
+        return switch (value) {
+            .pending => Common.invariant("pending ConstStore node reached static data selection"),
+            .zst,
+            .scalar,
+            .crash,
+            => false,
+            .str => |str| self.constStrNeedsStaticData(view, str),
+            .fn_value => bare_fn == .allow,
+            .list => |items| items.len != 0,
+            .box => true,
+            .tuple,
+            .record,
+            .tag,
+            => true,
+            .nominal => |nominal| self.constValueMayUseStaticDataCandidate(view, view.const_store.get(nominal.backing), .allow),
+        };
+    }
+
+    fn constStrNeedsStaticData(self: *Builder, view: ModuleView, str: check.ConstStore.ConstStr) bool {
+        const str_bytes = view.const_store.strBytes(str);
+        const backing = view.const_store.strData(str.data);
+        const roc_str_size = self.target_usize.size() * 3;
+        return backing.len >= roc_str_size or str_bytes.len >= roc_str_size;
     }
 
     /// Exact `(dispatch head, method)` lookup into the checked method
@@ -2696,6 +2826,9 @@ const Builder = struct {
                 defer body_draft.deinit();
                 var fn_ctx = try BodyContext.init(self.allocator, self, fn_view, ownerTemplateForConstFnDef(fn_template.fn_def), graph, &body_draft);
                 defer fn_ctx.deinit();
+                fn_ctx.current_fn_key = fn_template.fn_def.nested.context_fn_key;
+                fn_ctx.restored_local_proc_context_digest = fn_template.fn_def.nested.local_proc_context_digest;
+                fn_ctx.restored_local_proc_base_key = fn_template.fn_def.nested.context_fn_key;
                 const draft = FinalBodyOutputGuard.begin(self);
                 const fn_id = try self.lowerNestedFnFromContext(&fn_ctx, checkedLambdaExprIdForConstFn(fn_view, fn_template.fn_def), fn_template, null);
                 const draft_end = draft.end(self);
@@ -2813,7 +2946,8 @@ const Builder = struct {
     ) Allocator.Error!Ast.FnId {
         const nested_ctx = try self.allocator.create(BodyContext);
         errdefer self.allocator.destroy(nested_ctx);
-        nested_ctx.* = try source_ctx.nestedInstantiationContext(Ast.fnTemplateDigest(fn_template, &self.program.types, &self.program.names));
+        const nested_key = Ast.fnTemplateDigest(fn_template, &self.program.types, &self.program.names);
+        nested_ctx.* = try source_ctx.nestedInstantiationContext(nested_key);
         if (nested_evidence) |vector| {
             // A generalized local function gets its own vector at depth 0; the
             // enclosing chain stays reachable at higher depths (compile-time
@@ -2867,7 +3001,7 @@ const Builder = struct {
 
         const root_node = try request.ctx.instNode(fn_template.source_fn_ty);
         const body_uses_generated_evidence =
-            !self.unsolved_monos.contains(fn_template.mono_fn_ty) and request.ctx.functionHasGeneratedOpaqueEvidence(fn_template.mono_fn_ty);
+            !self.unsolved_monos.contains(fn_template.mono_fn_ty) and try request.ctx.functionHasGeneratedOpaqueEvidence(fn_template.mono_fn_ty);
         if (!body_uses_generated_evidence) {
             if (request.ctx.graph.monoViewNode(fn_template.mono_fn_ty)) |request_node| {
                 try request.ctx.graph.unify(root_node, request_node);
@@ -3092,6 +3226,7 @@ const Builder = struct {
                     .owner = nested.owner,
                     .site = nested.site,
                     .context_fn_key = restoredConstFnContextKey(store_view.key, fn_id, fn_value.source_fn_key),
+                    .local_proc_context_digest = nested.local_proc_context_digest,
                 } };
             },
             else => Common.invariant("capturing stored function had no nested function identity"),
@@ -3103,7 +3238,12 @@ const Builder = struct {
         return switch (fn_def) {
             .local_template => |template| .{ .local_template = template },
             .imported_template => |template| .{ .imported_template = template },
-            .nested => |nested| .{ .nested = .{ .owner = nested.owner, .site = nested.site, .context_fn_key = nested.context_fn_key } },
+            .nested => |nested| .{ .nested = .{
+                .owner = nested.owner,
+                .site = nested.site,
+                .context_fn_key = nested.context_fn_key,
+                .local_proc_context_digest = nested.local_proc_context_digest,
+            } },
             .local_hosted => |template| .{ .local_hosted = self.hostedFn(template) },
             .imported_hosted => |template| .{ .imported_hosted = self.hostedFn(template) },
             .checked_generated => |template| .{ .checked_generated = template },
@@ -3133,6 +3273,7 @@ const Builder = struct {
         store_view: ModuleView,
         fn_view: ModuleView,
         fn_value: check.ConstStore.ConstFn,
+        static_data_const_locator: ?checked.ConstLocator,
     ) Allocator.Error!std.ArrayList(RestoredConstSourceCapture) {
         var capture_count: usize = 0;
         for (fn_value.captures) |capture| {
@@ -3165,7 +3306,10 @@ const Builder = struct {
         var out_index: usize = 0;
         for (fn_value.captures) |capture| {
             if (!capture.id.isCanonical()) continue;
-            out.items[out_index].value = try fn_ctx.restoreConstNodeAtType(store_view, fn_view, capture.value, out.items[out_index].ty);
+            out.items[out_index].value = if (static_data_const_locator) |const_locator|
+                try fn_ctx.restoredStaticDataCandidateNode(store_view, fn_view, capture.value, out.items[out_index].ty, const_locator, checkedBinderType(fn_view, capture.id.binder()), .allow)
+            else
+                try fn_ctx.restoreConstNodeAtType(store_view, fn_view, capture.value, out.items[out_index].ty);
             out_index += 1;
         }
 
@@ -3319,6 +3463,7 @@ const Builder = struct {
                 }
                 return false;
             },
+            .static_data_candidate => |candidate| return try self.exprDependsOnFreeLocalInner(candidate.runtime_expr, target, bound, active_fns),
             .nominal,
             .dbg,
             .expect,
@@ -3652,15 +3797,16 @@ const Builder = struct {
         store_view: ModuleView,
         fn_id: checked.ConstFnId,
         ty: Type.TypeId,
+        static_data_const_locator: ?checked.ConstLocator,
     ) Allocator.Error!Ast.ExprId {
         const raw = @intFromEnum(fn_id);
         if (raw >= store_view.const_store.fns.items.len) Common.invariant("ConstStore function id is out of range");
         const fn_value = store_view.const_store.getFn(@enumFromInt(raw));
         if (fn_value.fn_def == .parser_runtime) {
-            return try self.restoreConstParserRuntimeFnExpr(store_view, fn_value, ty);
+            return try self.restoreConstParserRuntimeFnExpr(store_view, fn_value, ty, static_data_const_locator);
         }
         if (fn_value.fn_def == .encoder_for_runtime) {
-            return try self.restoreConstEncoderForRuntimeFnExpr(store_view, fn_value, ty);
+            return try self.restoreConstEncoderForRuntimeFnExpr(store_view, fn_value, ty, static_data_const_locator);
         }
         if (fn_value.captures.len == 0) {
             const template = try self.restoredConstFnTemplateToMono(store_view, fn_id, fn_value, ty);
@@ -3682,6 +3828,8 @@ const Builder = struct {
         var fn_ctx = try BodyContext.init(self.allocator, self, fn_view, ownerTemplateForConstFnDef(fn_value.fn_def), graph, &body_draft);
         defer fn_ctx.deinit();
         fn_ctx.current_fn_key = restoredConstFnContextKey(store_view.key, fn_id, fn_value.source_fn_key);
+        fn_ctx.restored_local_proc_context_digest = fn_value.fn_def.nested.local_proc_context_digest;
+        fn_ctx.restored_local_proc_base_key = fn_ctx.current_fn_key;
         try fn_ctx.constrainTypeToMono(fn_value.source_fn_ty, ty);
         const draft = FinalBodyOutputGuard.begin(self);
 
@@ -3732,8 +3880,12 @@ const Builder = struct {
             };
             initialized += 1;
         }
+        fn_ctx.restored_local_proc_base_key = try fn_ctx.lexicalContextKey();
         for (fn_value.captures, 0..) |capture, index| {
-            captures[index].value = try fn_ctx.restoreConstNodeAtType(store_view, fn_view, capture.value, captures[index].ty);
+            captures[index].value = if (static_data_const_locator) |const_locator|
+                try fn_ctx.restoredStaticDataCandidateNode(store_view, fn_view, capture.value, captures[index].ty, const_locator, checkedBinderType(fn_view, constCaptureBinder(capture.id)), .allow)
+            else
+                try fn_ctx.restoreConstNodeAtType(store_view, fn_view, capture.value, captures[index].ty);
         }
         var template = try self.constFnTemplateToMono(fn_value, ty);
         switch (template.fn_def) {
@@ -3742,6 +3894,7 @@ const Builder = struct {
                     .owner = nested.owner,
                     .site = nested.site,
                     .context_fn_key = try fn_ctx.lexicalContextKey(),
+                    .local_proc_context_digest = nested.local_proc_context_digest,
                 } };
             },
             else => Common.invariant("capturing stored function had no nested function identity"),
@@ -3793,6 +3946,7 @@ const Builder = struct {
         store_view: ModuleView,
         fn_value: check.ConstStore.ConstFn,
         ty: Type.TypeId,
+        static_data_const_locator: ?checked.ConstLocator,
     ) Allocator.Error!Ast.ExprId {
         const runtime = switch (fn_value.fn_def) {
             .parser_runtime => |runtime| runtime,
@@ -3811,7 +3965,7 @@ const Builder = struct {
         defer fn_ctx.deinit();
         fn_ctx.current_fn_key = fn_value.source_fn_key;
 
-        var source_captures = try self.bindConstSourceCaptures(&fn_ctx, store_view, fn_view, fn_value);
+        var source_captures = try self.bindConstSourceCaptures(&fn_ctx, store_view, fn_view, fn_value, static_data_const_locator);
         defer self.releaseConstSourceCaptures(&fn_ctx, &source_captures);
 
         const expr = fn_view.bodies.expr(runtime.expr);
@@ -3844,7 +3998,10 @@ const Builder = struct {
             fn_ctx.setLocalCaptureId(local, parserEncodingCaptureId());
             encoding_let = .{
                 .local = local,
-                .value = try fn_ctx.restoreConstNodeAtType(store_view, fn_view, node, arg_tys[0]),
+                .value = if (static_data_const_locator) |const_locator|
+                    try fn_ctx.restoreConstNodeAtTypeWithStaticRoot(store_view, fn_view, node, arg_tys[0], const_locator)
+                else
+                    try fn_ctx.restoreConstNodeAtType(store_view, fn_view, node, arg_tys[0]),
             };
             break :blk try fn_ctx.localExpr(local, arg_tys[0]);
         } else try fn_ctx.lowerDispatchOperandAtType(plan_args[0], arg_tys[0]);
@@ -3901,6 +4058,7 @@ const Builder = struct {
         store_view: ModuleView,
         fn_value: check.ConstStore.ConstFn,
         ty: Type.TypeId,
+        static_data_const_locator: ?checked.ConstLocator,
     ) Allocator.Error!Ast.ExprId {
         const runtime = switch (fn_value.fn_def) {
             .encoder_for_runtime => |runtime| runtime,
@@ -3919,7 +4077,7 @@ const Builder = struct {
         defer fn_ctx.deinit();
         fn_ctx.current_fn_key = fn_value.source_fn_key;
 
-        var source_captures = try self.bindConstSourceCaptures(&fn_ctx, store_view, fn_view, fn_value);
+        var source_captures = try self.bindConstSourceCaptures(&fn_ctx, store_view, fn_view, fn_value, static_data_const_locator);
         defer self.releaseConstSourceCaptures(&fn_ctx, &source_captures);
 
         const expr = fn_view.bodies.expr(runtime.expr);
@@ -3954,7 +4112,10 @@ const Builder = struct {
             fn_ctx.setLocalCaptureId(local, encoderForEncodingCaptureId());
             encoding_let = .{
                 .local = local,
-                .value = try fn_ctx.restoreConstNodeAtType(store_view, fn_view, node, arg_tys[0]),
+                .value = if (static_data_const_locator) |const_locator|
+                    try fn_ctx.restoreConstNodeAtTypeWithStaticRoot(store_view, fn_view, node, arg_tys[0], const_locator)
+                else
+                    try fn_ctx.restoreConstNodeAtType(store_view, fn_view, node, arg_tys[0]),
             };
             break :blk try fn_ctx.localExpr(local, arg_tys[0]);
         } else try fn_ctx.lowerDispatchOperandAtType(plan_args[0], arg_tys[0]);
@@ -4038,38 +4199,51 @@ const Builder = struct {
         node: checked.ConstNodeId,
         ty: Type.TypeId,
     ) Allocator.Error!Ast.ExprId {
+        return try self.restoreConstNodeAtTypeWithStaticRoot(store_view, type_view, node, ty, null);
+    }
+
+    fn restoreConstNodeAtTypeWithStaticRoot(
+        self: *Builder,
+        store_view: ModuleView,
+        type_view: ModuleView,
+        node: checked.ConstNodeId,
+        ty: Type.TypeId,
+        static_data_const_locator: ?checked.ConstLocator,
+    ) Allocator.Error!Ast.ExprId {
         const address = ConstExprAddress{
             .store_module_bytes = store_view.key.bytes,
             .type_module_bytes = type_view.key.bytes,
             .node = @intFromEnum(node),
             .mono_ty = @intFromEnum(ty),
         };
-        if (self.const_expr_cache.get(address)) |existing| return existing;
+        if (static_data_const_locator == null) {
+            if (self.const_expr_cache.get(address)) |existing| return existing;
+        }
 
         const value = store_view.const_store.get(node);
         switch (value) {
             .fn_value => |fn_id| {
-                const expr = try self.restoreConstFnExpr(store_view, fn_id, ty);
-                try self.const_expr_cache.put(address, expr);
+                const expr = try self.restoreConstFnExpr(store_view, fn_id, ty, static_data_const_locator);
+                if (static_data_const_locator == null) try self.const_expr_cache.put(address, expr);
                 return expr;
             },
             .tag, .record, .tuple => if (self.nominalConstructionLayer(ty)) |layer| {
                 const backing_expr = try self.restoreConstNodeAtType(store_view, type_view, node, layer.backing);
                 const expr = try self.program.addExpr(.{ .ty = layer.named, .data = .{ .nominal = backing_expr } });
-                try self.const_expr_cache.put(address, expr);
+                if (static_data_const_locator == null) try self.const_expr_cache.put(address, expr);
                 return expr;
             },
             .nominal => |nominal| if (self.nominalConstructionLayer(ty)) |layer| {
                 const backing_expr = try self.restoreConstNodeAtType(store_view, type_view, nominal.backing, layer.backing);
                 const expr = try self.program.addExpr(.{ .ty = layer.named, .data = .{ .nominal = backing_expr } });
-                try self.const_expr_cache.put(address, expr);
+                if (static_data_const_locator == null) try self.const_expr_cache.put(address, expr);
                 return expr;
             },
             else => {},
         }
-        const data = try self.restoreConstData(store_view, type_view, value, ty);
+        const data = try self.restoreConstData(store_view, type_view, value, ty, static_data_const_locator);
         const expr = try self.program.addExpr(.{ .ty = ty, .data = data });
-        try self.const_expr_cache.put(address, expr);
+        if (static_data_const_locator == null) try self.const_expr_cache.put(address, expr);
         return expr;
     }
 
@@ -4079,6 +4253,7 @@ const Builder = struct {
         type_view: ModuleView,
         value: checked.ConstValue,
         ty: Type.TypeId,
+        static_data_const_locator: ?checked.ConstLocator,
     ) Allocator.Error!Ast.ExprData {
         return switch (value) {
             .pending => Common.invariant("pending ConstStore node reached Monotype restore"),
@@ -4094,21 +4269,21 @@ const Builder = struct {
                 str.offset,
                 str.len,
             ) },
-            .list => |items| .{ .list = try self.restoreConstList(store_view, type_view, ty, items) },
+            .list => |items| .{ .list = try self.restoreConstList(store_view, type_view, ty, items, static_data_const_locator) },
             .box => |payload| blk: {
-                const child = try self.restoreConstNodeAtType(store_view, type_view, payload, self.constBoxPayloadType(ty));
+                const child = try self.restoreConstNodeAtTypeWithStaticRoot(store_view, type_view, payload, self.constBoxPayloadType(ty), static_data_const_locator);
                 break :blk .{ .low_level = .{
                     .op = .box_box,
                     .args = try self.program.addExprSpan(&.{child}),
                 } };
             },
-            .tuple => |items| .{ .tuple = try self.restoreConstTuple(store_view, type_view, ty, items) },
-            .record => |items| .{ .record = try self.restoreConstRecord(store_view, type_view, ty, items) },
+            .tuple => |items| .{ .tuple = try self.restoreConstTuple(store_view, type_view, ty, items, static_data_const_locator) },
+            .record => |items| .{ .record = try self.restoreConstRecord(store_view, type_view, ty, items, static_data_const_locator) },
             .tag => |tag| .{ .tag = .{
                 .name = try self.program.names.internTagLabel(tag.tag_name),
-                .payloads = try self.restoreConstTagPayloads(store_view, type_view, ty, tag),
+                .payloads = try self.restoreConstTagPayloads(store_view, type_view, ty, tag, static_data_const_locator),
             } },
-            .nominal => |nominal| .{ .nominal = try self.restoreConstNodeAtType(store_view, type_view, nominal.backing, self.namedBackingType(ty) orelse ty) },
+            .nominal => |nominal| .{ .nominal = try self.restoreConstNodeAtTypeWithStaticRoot(store_view, type_view, nominal.backing, self.namedBackingType(ty) orelse ty, static_data_const_locator) },
             .fn_value => Common.invariant("ConstStore function value must be restored as an expression"),
         };
     }
@@ -4119,12 +4294,13 @@ const Builder = struct {
         type_view: ModuleView,
         ty: Type.TypeId,
         items: []const checked.ConstNodeId,
+        static_data_const_locator: ?checked.ConstLocator,
     ) Allocator.Error!Ast.Span(Ast.ExprId) {
         const elem_ty = self.constListElemType(ty);
         const lowered = try self.allocator.alloc(Ast.ExprId, items.len);
         defer self.allocator.free(lowered);
         for (items, 0..) |item, index| {
-            lowered[index] = try self.restoreConstNodeAtType(store_view, type_view, item, elem_ty);
+            lowered[index] = try self.restoreConstNodeAtTypeWithStaticRoot(store_view, type_view, item, elem_ty, static_data_const_locator);
         }
         return try self.program.addExprSpan(lowered);
     }
@@ -4135,6 +4311,7 @@ const Builder = struct {
         type_view: ModuleView,
         ty: Type.TypeId,
         items: []const checked.ConstNodeId,
+        static_data_const_locator: ?checked.ConstLocator,
     ) Allocator.Error!Ast.Span(Ast.ExprId) {
         const item_span = self.tupleItemSpan(ty);
         const item_count: usize = @intCast(item_span.len);
@@ -4144,7 +4321,7 @@ const Builder = struct {
         for (items, 0..) |item, index| {
             const item_tys = self.program.types.span(item_span);
             const item_ty = GuardedList.at(item_tys, index);
-            lowered[index] = try self.restoreConstNodeAtType(store_view, type_view, item, item_ty);
+            lowered[index] = try self.restoreConstNodeAtTypeWithStaticRoot(store_view, type_view, item, item_ty, static_data_const_locator);
         }
         return try self.program.addExprSpan(lowered);
     }
@@ -4155,6 +4332,7 @@ const Builder = struct {
         type_view: ModuleView,
         ty: Type.TypeId,
         items: []const checked.ConstNodeId,
+        static_data_const_locator: ?checked.ConstLocator,
     ) Allocator.Error!Ast.Span(Ast.FieldExpr) {
         const field_span = self.recordFieldsSpan(ty);
         const field_count: usize = @intCast(field_span.len);
@@ -4166,7 +4344,7 @@ const Builder = struct {
             const field = GuardedList.at(fields, index);
             lowered[index] = .{
                 .name = field.name,
-                .value = try self.restoreConstNodeAtType(store_view, type_view, item, field.ty),
+                .value = try self.restoreConstNodeAtTypeWithStaticRoot(store_view, type_view, item, field.ty, static_data_const_locator),
             };
         }
         return try self.program.addFieldExprSpan(lowered);
@@ -4178,6 +4356,7 @@ const Builder = struct {
         type_view: ModuleView,
         ty: Type.TypeId,
         tag: anytype,
+        static_data_const_locator: ?checked.ConstLocator,
     ) Allocator.Error!Ast.Span(Ast.ExprId) {
         const mono_tag_name = try self.program.names.internTagLabel(tag.tag_name);
         const payload_span = self.tagPayloadSpan(ty, mono_tag_name);
@@ -4188,7 +4367,7 @@ const Builder = struct {
         for (tag.payloads, 0..) |payload, index| {
             const payload_tys = self.program.types.span(payload_span);
             const payload_ty = GuardedList.at(payload_tys, index);
-            lowered[index] = try self.restoreConstNodeAtType(store_view, type_view, payload, payload_ty);
+            lowered[index] = try self.restoreConstNodeAtTypeWithStaticRoot(store_view, type_view, payload, payload_ty, static_data_const_locator);
         }
         return try self.program.addExprSpan(lowered);
     }
@@ -5137,6 +5316,11 @@ const DraftReturn = struct {
     target: DraftTypeCell,
 };
 
+const DraftStaticDataCandidate = struct {
+    static_data: Common.StaticDataId,
+    runtime_expr: DraftExprId,
+};
+
 const DraftExpr = struct {
     ty: DraftTypeCell,
     data: DraftExprData,
@@ -5158,6 +5342,7 @@ const DraftExprData = union(enum(u8)) {
     dec_lit: builtins.dec.RocDec,
     str_lit: DraftStringLiteralId,
     bytes_lit: DraftStringLiteralId,
+    static_data_candidate: DraftStaticDataCandidate,
     list: DraftSpan(DraftExprId),
     tuple: DraftSpan(DraftExprId),
     record: DraftSpan(DraftFieldExpr),
@@ -6040,6 +6225,10 @@ const BodyDraftStore = struct {
             .dec_lit => |value| .{ .dec_lit = value },
             .str_lit => |literal| .{ .str_lit = ids.stringLiteral(literal) },
             .bytes_lit => |literal| .{ .bytes_lit = ids.stringLiteral(literal) },
+            .static_data_candidate => |candidate| .{ .static_data_candidate = .{
+                .static_data = candidate.static_data,
+                .runtime_expr = ids.expr(candidate.runtime_expr),
+            } },
             .list => |span| .{ .list = ids.exprSpan(span) },
             .tuple => |span| .{ .tuple = ids.exprSpan(span) },
             .record => |span| .{ .record = ids.fieldExprSpan(span) },
@@ -6396,6 +6585,13 @@ const BodyContext = struct {
     binders: BinderMap,
     typed_binders: TypedBinders,
     local_proc_contexts: std.AutoHashMap(checked.PatternBinderId, LocalProcContext),
+    /// Durable digest of local-procedure declaration contexts captured by a
+    /// restored ConstStore closure. Null during ordinary source lowering.
+    restored_local_proc_context_digest: ?names.TypeDigest = null,
+    /// Stable identity of the outer restored closure. Nested local-procedure
+    /// bodies retain this base so a recursive call resolves to the same
+    /// specialization instead of deriving a new key at every nesting level.
+    restored_local_proc_base_key: ?names.TypeDigest = null,
     /// This specialization's type solver, shared by every instantiation
     /// context created while lowering the same specialization.
     graph: *InstGraph,
@@ -6919,7 +7115,7 @@ const BodyContext = struct {
 
     fn addExpr(self: *BodyContext, expr: BodyExpr) Allocator.Error!DraftExprId {
         return try self.draft.addExprWithSource(
-            .{ .ty = try self.draftTypeCell(expr.ty), .data = expr.data },
+            .{ .ty = try self.draftTypeCellPreservingGenerated(expr.ty), .data = expr.data },
             self.builder.program.current_loc,
             self.builder.program.current_region,
         );
@@ -6948,7 +7144,14 @@ const BodyContext = struct {
     }
 
     fn addPat(self: *BodyContext, pat: BodyPat) Allocator.Error!DraftPatId {
-        return try self.draft.addPat(.{ .ty = try self.draftTypeCell(pat.ty), .data = pat.data });
+        return try self.draft.addPat(.{ .ty = try self.draftTypeCellPreservingGenerated(pat.ty), .data = pat.data });
+    }
+
+    fn draftTypeCellPreservingGenerated(self: *BodyContext, ty: Type.TypeId) Allocator.Error!DraftTypeCell {
+        if (try self.builder.monoTypeHasGeneratedOpaqueEvidence(ty)) {
+            return DraftTypeCell.fromSealed(ty);
+        }
+        return try self.draftTypeCell(ty);
     }
 
     fn addPatWithTypeCell(self: *BodyContext, ty: DraftTypeCell, data: BodyPatData) Allocator.Error!DraftPatId {
@@ -6965,7 +7168,7 @@ const BodyContext = struct {
         ty: Type.TypeId,
         binder: ?checked.PatternBinderId,
     ) Allocator.Error!DraftLocalId {
-        return try self.addLocalWithBinderCell(symbol, try self.draftTypeCell(ty), binder);
+        return try self.addLocalWithBinderCell(symbol, try self.draftTypeCellPreservingGenerated(ty), binder);
     }
 
     fn addLocalWithBinderCell(
@@ -6983,7 +7186,7 @@ const BodyContext = struct {
                 .fn_def = source.fn_def,
                 .source_fn_ty = source.source_fn_ty,
                 .source_fn_key = source.source_fn_key,
-                .mono_fn_ty = try self.draftTypeCell(source.mono_fn_ty),
+                .mono_fn_ty = try self.draftTypeCellPreservingGenerated(source.mono_fn_ty),
             },
         });
     }
@@ -7002,7 +7205,7 @@ const BodyContext = struct {
         for (values, 0..) |value, index| {
             draft_values[index] = .{
                 .local = value.local,
-                .ty = try self.draftTypeCell(value.ty),
+                .ty = try self.draftTypeCellPreservingGenerated(value.ty),
             };
         }
         return try self.draft.addTypedLocalSpan(draft_values);
@@ -7086,7 +7289,7 @@ const BodyContext = struct {
     }
 
     fn setLocalType(self: *BodyContext, id: DraftLocalId, ty: Type.TypeId) Allocator.Error!void {
-        self.draft.setLocalType(id, try self.draftTypeCell(ty));
+        self.draft.setLocalType(id, try self.draftTypeCellPreservingGenerated(ty));
     }
 
     fn bindLocalName(self: *BodyContext, local: DraftLocalId, binder: checked.PatternBinderId) Allocator.Error!void {
@@ -7460,6 +7663,8 @@ const BodyContext = struct {
         child.source_region_override = self.source_region_override;
         child.current_entry_root = self.current_entry_root;
         child.restore_const_result_ty = self.restore_const_result_ty;
+        child.restored_local_proc_context_digest = self.restored_local_proc_context_digest;
+        child.restored_local_proc_base_key = self.restored_local_proc_base_key;
 
         var binder_iter = self.binders.iterator();
         while (binder_iter.next()) |entry| {
@@ -7493,7 +7698,12 @@ const BodyContext = struct {
         while (binder_iter.next()) |entry| {
             const local = entry.value_ptr.*;
             const local_ty = self.localTypeCell(local);
-            try self.constrainTypeToCell(checkedBinderType(self.view, entry.key_ptr.*), local_ty);
+            const active_local_ty = try self.activeTypeFromCell(local_ty);
+            if (try self.builder.monoTypeHasGeneratedOpaqueEvidence(active_local_ty)) {
+                try self.constrainTypeToMono(checkedBinderType(self.view, entry.key_ptr.*), active_local_ty);
+            } else {
+                try self.constrainTypeToCell(checkedBinderType(self.view, entry.key_ptr.*), local_ty);
+            }
         }
     }
 
@@ -7547,6 +7757,37 @@ const BodyContext = struct {
         }
 
         return lexicalContextKeyFromEntries(context.base_key, entries);
+    }
+
+    fn localProcContextsDigest(self: *BodyContext) Allocator.Error!?names.TypeDigest {
+        if (self.local_proc_contexts.count() == 0) return null;
+
+        const binders = try self.allocator.alloc(checked.PatternBinderId, self.local_proc_contexts.count());
+        defer self.allocator.free(binders);
+        var index: usize = 0;
+        var iter = self.local_proc_contexts.keyIterator();
+        while (iter.next()) |binder| : (index += 1) binders[index] = binder.*;
+        std.mem.sort(checked.PatternBinderId, binders, {}, struct {
+            fn lessThan(_: void, lhs: checked.PatternBinderId, rhs: checked.PatternBinderId) bool {
+                return @intFromEnum(lhs) < @intFromEnum(rhs);
+            }
+        }.lessThan);
+
+        var hasher = std.crypto.hash.sha2.Sha256.init(.{});
+        hasher.update("roc.monotype.local_proc_contexts");
+        for (binders) |binder| {
+            const context = self.local_proc_contexts.get(binder) orelse
+                Common.invariant("local procedure context key disappeared during digesting");
+            hashU32(&hasher, @intFromEnum(binder));
+            hasher.update(&context.base_key.bytes);
+            for (context.entries) |entry| {
+                hasher.update(&.{entry.kind});
+                hashU32(&hasher, entry.binder);
+                hasher.update(&entry.type_digest.bytes);
+                hashU32(&hasher, entry.local);
+            }
+        }
+        return .{ .bytes = hasher.finalResult() };
     }
 
     fn captureLexicalBinderEntries(self: *BodyContext) Allocator.Error![]LexicalBinderEntry {
@@ -7741,6 +7982,7 @@ const BodyContext = struct {
                 }
                 return false;
             },
+            .static_data_candidate => |candidate| return try self.exprDependsOnFreeLocalInner(candidate.runtime_expr, target, bound),
             .nominal,
             .dbg,
             .expect,
@@ -8017,7 +8259,7 @@ const BodyContext = struct {
     ) Allocator.Error!void {
         self.builder.constrain_depth += 1;
         defer self.builder.constrain_depth -= 1;
-        try self.graph.unify(try self.instNode(checked_ty), try self.graph.importMono(mono_ty));
+        try self.graph.unify(try self.instNode(checked_ty), try self.graph.importMono(try self.publicOpaqueUnificationType(mono_ty)));
         if (self.builder.constrain_depth == 1) try self.graph.drainDirty();
     }
 
@@ -8311,7 +8553,7 @@ const BodyContext = struct {
             .named_type = .{ .module = self.builder.declaredModuleForNominal(self.view, nominal), .ty = checked_ty },
             .def = try self.builder.typeDef(self.view, nominal.origin_module, nominal.name, nominal.source_decl),
             .kind = if (nominal.is_opaque) .@"opaque" else .nominal,
-            .builtin_owner = builtinOwner(nominal.builtin),
+            .builtin_owner = self.builder.builtinOwnerForNominal(self.view, nominal),
             .args = args,
             .backing = backing,
             .declared_order = try self.instDeclaredOrderForNominal(nominal),
@@ -8496,10 +8738,10 @@ const BodyContext = struct {
                         };
                     },
                     .hosted_lambda => Common.invariant("hosted lambda template must lower through hosted metadata, not source lambda body"),
-                    else => .{
+                    else => LoweredTemplateBody{
                         .args = .empty(),
                         .body = try self.lowerExprAtType(body.root_expr, ret_ty),
-                        .ret = try self.draftTypeCell(ret_ty),
+                        .ret = try self.draftTypeCellPreservingGenerated(ret_ty),
                     },
                 };
             },
@@ -8524,7 +8766,7 @@ const BodyContext = struct {
                     .numeral_conversion, .quote_conversion => return .{
                         .args = .empty(),
                         .body = try self.lowerNumeralRootBody(wrapper.body_expr, ret_ty),
-                        .ret = try self.draftTypeCell(ret_ty),
+                        .ret = try self.draftTypeCellPreservingGenerated(ret_ty),
                     },
                     .constant,
                     .hoisted_constant,
@@ -8532,10 +8774,10 @@ const BodyContext = struct {
                     .expect,
                     => {},
                 }
-                return .{
+                return LoweredTemplateBody{
                     .args = .empty(),
                     .body = try self.lowerComptimeRootExprAtType(wrapper.body_expr, ret_ty),
-                    .ret = try self.draftTypeCell(ret_ty),
+                    .ret = try self.draftTypeCellPreservingGenerated(ret_ty),
                 };
             },
             .intrinsic_wrapper => |wrapper_id| {
@@ -8561,7 +8803,7 @@ const BodyContext = struct {
         return .{
             .args = try self.addTypedLocalSpan(&.{typed_arg}),
             .body = body,
-            .ret = try self.draftTypeCell(ret_ty),
+            .ret = try self.draftTypeCellPreservingGenerated(ret_ty),
         };
     }
 
@@ -8659,8 +8901,11 @@ const BodyContext = struct {
         const body_ty = try self.exprType(body);
         try self.graph.unify(try self.graph.importMono(ret_ty), try self.graph.importMono(body_ty));
         try self.graph.drainDirty();
-        const solved_ret_ty = try self.activeTypeFromType(ret_ty);
-        self.draft.exprs.items[@intFromEnum(body)].ty = try self.draftTypeCell(solved_ret_ty);
+        const solved_ret_ty = if (try self.builder.monoTypeHasGeneratedOpaqueEvidence(ret_ty))
+            ret_ty
+        else
+            try self.activeTypeFromType(ret_ty);
+        self.draft.exprs.items[@intFromEnum(body)].ty = try self.draftTypeCellPreservingGenerated(solved_ret_ty);
 
         for (args) |*arg| {
             arg.ty = try self.localType(arg.local);
@@ -8669,7 +8914,7 @@ const BodyContext = struct {
         return .{
             .args = try self.addTypedLocalSpan(args),
             .body = body,
-            .ret = try self.draftTypeCell(solved_ret_ty),
+            .ret = try self.draftTypeCellPreservingGenerated(solved_ret_ty),
         };
     }
 
@@ -8836,10 +9081,7 @@ const BodyContext = struct {
         if (self.current_entry_root) |entry_root| {
             return moduleBytesEqual(entry_root.module.bytes, self.view.key.bytes) and entry.root == entry_root.root;
         }
-
-        const wrapper = self.view.entry_wrappers.lookupByRoot(entry.root) orelse
-            Common.invariant("hoisted const root had no checked entry wrapper");
-        return names.procedureTemplateRefEql(wrapper.template, self.owner_template);
+        return false;
     }
 
     fn restoredHoistedConstAtType(
@@ -8858,7 +9100,15 @@ const BodyContext = struct {
                 defer self.builder.program.current_region = saved_region;
                 self.builder.program.current_loc = try self.sourceLocFor(source_region);
                 self.builder.program.current_region = source_region;
-                break :blk try self.restoreConstNodeAtType(self.view, self.view, stored.node, ty);
+                break :blk try self.restoredStaticDataCandidateNode(
+                    self.view,
+                    self.view,
+                    stored.node,
+                    ty,
+                    entry.const_ref,
+                    entry.checked_type,
+                    .disallow,
+                );
             },
             .eval_template => |eval| try self.lowerConstEvalTemplateUse(self.view, eval, ty, source_region, .{ .module = self.view.key, .root = entry.root }),
             .reserved => Common.invariant("reserved hoisted const template reached Monotype"),
@@ -8886,12 +9136,12 @@ const BodyContext = struct {
         self: *BodyContext,
         selected: checked.SelectedHoistedConstUse,
     ) checked.HoistedConstEntry {
-        const const_ref = selected.const_use.const_ref;
-        const module_id = checked.constModuleId(const_ref);
+        const const_locator = selected.const_use.const_ref;
+        const module_id = checked.constModuleId(const_locator);
         if (!moduleBytesEqual(module_id.bytes, self.view.key.bytes)) {
             Common.invariant("selected hoisted local const ref referenced a different checked module");
         }
-        const hoisted = switch (const_ref.owner) {
+        const hoisted = switch (const_locator.owner) {
             .hoisted_expr => |owner| owner,
             .top_level_binding => Common.invariant("selected hoisted local const ref did not reference a hoisted const"),
         };
@@ -8977,10 +9227,17 @@ const BodyContext = struct {
             },
             .closure => |closure| try self.lowerClosure(expr_id, closure, ty),
             .lambda => blk: {
-                break :blk try self.lowerLambdaExpr(
+                var template = try self.builder.fnTemplateForNestedExprWithMono(
+                    self.view,
+                    self.owner_template,
                     expr_id,
-                    try self.builder.fnTemplateForNestedExprWithMono(self.view, self.owner_template, expr_id, expr.ty, self.view.types.rootKey(expr.ty), ty, try self.lexicalContextKey()),
+                    expr.ty,
+                    self.view.types.rootKey(expr.ty),
+                    ty,
+                    try self.lexicalContextKey(),
                 );
+                template.fn_def.nested.local_proc_context_digest = try self.localProcContextsDigest();
+                break :blk try self.lowerLambdaExpr(expr_id, template);
             },
             .call => Common.invariant("call expression reached ordinary expression lowering after call-site lowering"),
             .dispatch_call,
@@ -9339,7 +9596,7 @@ const BodyContext = struct {
         const template = view.callable_eval_templates.templates[raw];
         const root = view.compile_time_roots.root(template.root);
         return switch (root.payload) {
-            .fn_value => |fn_id| try self.restoreConstFn(view, fn_id, mono_fn_ty),
+            .fn_value => |fn_id| try self.restoreConstFn(view, fn_id, mono_fn_ty, null),
             .pending => try self.lowerPendingCallableEvalBindingValue(view, template, root, mono_fn_ty),
             else => Common.invariant("callable eval binding root did not output a callable value"),
         };
@@ -9403,6 +9660,83 @@ const BodyContext = struct {
         }
     }
 
+    fn builtinProcedureTextForResolvedTarget(self: *BodyContext, target: checked.ResolvedValueId) ?[]const u8 {
+        const raw = @intFromEnum(target);
+        if (raw >= self.view.resolved_refs.records.len) {
+            Common.invariant("checked builtin target is outside resolved value table");
+        }
+        const record = self.view.resolved_refs.records[raw];
+        return switch (record.ref) {
+            .top_level_proc,
+            .imported_proc,
+            .hosted_proc,
+            .promoted_top_level_proc,
+            => |proc| self.builtinProcedureTextForUse(proc),
+            .platform_required_proc => |proc| self.builtinProcedureTextForUse(proc.procedure),
+            else => null,
+        };
+    }
+
+    fn builtinProcedureTextForUse(self: *BodyContext, proc: checked.ProcedureUseTemplate) ?[]const u8 {
+        return switch (proc.binding) {
+            .top_level => |top_level| blk: {
+                const view = self.builder.moduleForId(checked.topLevelProcedureModuleId(top_level));
+                if (view.module_env.module_role != .builtin) break :blk null;
+                const binding = view.top_level_procedure_bindings.get(top_level.binding);
+                break :blk builtinProcedureTextForBindingBody(view, binding.body);
+            },
+            .imported => |imported| blk: {
+                const view = self.builder.moduleForId(checked.importedProcedureModuleId(imported));
+                if (view.module_env.module_role != .builtin) break :blk null;
+                for (view.exported_procedure_bindings.bindings) |binding| {
+                    if (binding.binding.def == imported.def and binding.binding.pattern == imported.pattern) {
+                        break :blk builtinProcedureTextForImportedBindingBody(view, binding.body);
+                    }
+                }
+                Common.invariant("imported builtin procedure binding was not exported by its checked module");
+            },
+            .hosted => |hosted| blk: {
+                const view = self.builder.moduleForId(moduleIdFromDigest(names.procTemplateModuleDigest(hosted.template)));
+                if (view.module_env.module_role != .builtin) break :blk null;
+                break :blk builtinProcedureTextForTemplate(view, hosted.template);
+            },
+            .platform_required => |required| blk: {
+                const view = self.builder.moduleForId(checked.requiredProcedureModuleId(required));
+                if (view.module_env.module_role != .builtin) break :blk null;
+                const binding = view.top_level_procedure_bindings.get(required.procedure_binding);
+                break :blk builtinProcedureTextForBindingBody(view, binding.body);
+            },
+        };
+    }
+
+    fn builtinProcedureTextForBindingBody(view: ModuleView, body: checked.ProcedureBindingBody) ?[]const u8 {
+        return switch (body) {
+            .direct_template => |direct| builtinProcedureTextForDirectTemplate(view, direct),
+            .callable_eval_template => null,
+        };
+    }
+
+    fn builtinProcedureTextForImportedBindingBody(view: ModuleView, body: checked.ImportedProcedureBindingBody) ?[]const u8 {
+        return switch (body) {
+            .direct_template => |direct| builtinProcedureTextForDirectTemplate(view, direct),
+            .callable_eval_template => null,
+        };
+    }
+
+    fn builtinProcedureTextForDirectTemplate(view: ModuleView, direct: checked.DirectProcedureBinding) ?[]const u8 {
+        const template = switch (direct.template) {
+            .checked => |template| template,
+            .lifted, .synthetic => return null,
+        };
+        return builtinProcedureTextForTemplate(view, template);
+    }
+
+    fn builtinProcedureTextForTemplate(view: ModuleView, template: names.ProcTemplate) ?[]const u8 {
+        const proc_base = view.names.procBase(template.proc_base);
+        const export_name = proc_base.export_name orelse return null;
+        return view.names.exportNameText(export_name);
+    }
+
     fn parseIntrinsicForBuiltinProcedureUse(self: *BodyContext, proc: checked.ProcedureUseTemplate) ?ParseIntrinsic {
         const top_level = switch (proc.binding) {
             .top_level => |top_level| top_level,
@@ -9444,6 +9778,79 @@ const BodyContext = struct {
         if (Ident.textEql(text, "Builtin.Encoding.FieldName.FieldNames.for_size")) return .fields_for_size;
         if (Ident.textEql(text, "Builtin.Encoding.FieldName.name")) return .field_name;
         return null;
+    }
+
+    fn isBuiltinIterNextText(text: []const u8) bool {
+        return Ident.textEql(text, "Builtin.Iter.next");
+    }
+
+    fn isBuiltinIterCustomText(text: []const u8) bool {
+        return Ident.textEql(text, "Builtin.Iter.custom");
+    }
+
+    fn isBuiltinIterSingleText(text: []const u8) bool {
+        return Ident.textEql(text, "Builtin.Iter.single");
+    }
+
+    fn isBuiltinIterMapText(text: []const u8) bool {
+        return Ident.textEql(text, "Builtin.Iter.map");
+    }
+
+    fn isBuiltinIterKeepIfText(text: []const u8) bool {
+        return Ident.textEql(text, "Builtin.Iter.keep_if");
+    }
+
+    fn isBuiltinIterDropIfText(text: []const u8) bool {
+        return Ident.textEql(text, "Builtin.Iter.drop_if");
+    }
+
+    fn isBuiltinIterTakeFirstText(text: []const u8) bool {
+        return Ident.textEql(text, "Builtin.Iter.take_first");
+    }
+
+    fn isBuiltinIterDropFirstText(text: []const u8) bool {
+        return Ident.textEql(text, "Builtin.Iter.drop_first");
+    }
+
+    fn isBuiltinIterConcatText(text: []const u8) bool {
+        return Ident.textEql(text, "Builtin.Iter.concat");
+    }
+
+    fn isBuiltinIterAppendText(text: []const u8) bool {
+        return Ident.textEql(text, "Builtin.Iter.append");
+    }
+
+    fn isBuiltinExclusiveRangeText(text: []const u8) bool {
+        return Ident.textEql(text, "Builtin.Iter.exclusive_range");
+    }
+
+    fn isBuiltinInclusiveRangeText(text: []const u8) bool {
+        return Ident.textEql(text, "Builtin.Iter.inclusive_range");
+    }
+
+    // Numeric `range_exclusive` / `range_inclusive` methods whose bodies build
+    // the flat self-recursive range shape (each forwards through
+    // `range_*_with_len` to `Iter.exclusive_range` / `Iter.inclusive_range`).
+    // A `..<` / `..=` binop dispatches to one of these, so the method call is
+    // the outermost producer of a flat range — the point it is reached with no
+    // expected type — and therefore where its per-chain type is minted. F32 and
+    // F64 are deliberately absent: their range methods build an `Iter.custom`
+    // chain (float stepping carries seed state), which is a different minted
+    // kind produced by the `Iter.custom` recognition instead.
+    fn isFlatRangeMethodText(text: []const u8, comptime method_suffix: []const u8) bool {
+        const flat_types = [_][]const u8{ "U8", "I8", "U16", "I16", "U32", "I32", "U64", "I64", "U128", "I128", "Dec" };
+        inline for (flat_types) |ty| {
+            if (Ident.textEql(text, "Builtin.Num." ++ ty ++ method_suffix)) return true;
+        }
+        return false;
+    }
+
+    fn isBuiltinIterFromStepText(text: []const u8) bool {
+        return Ident.textEql(text, "iter_from_step") or Ident.textEql(text, "Builtin.iter_from_step");
+    }
+
+    fn isBuiltinRangeDoneText(text: []const u8) bool {
+        return Ident.textEql(text, "range_done") or Ident.textEql(text, "Builtin.range_done");
     }
 
     fn lowerFieldNamesRenameFieldNames(
@@ -10207,12 +10614,36 @@ const BodyContext = struct {
         return self.generatedParseTagUnionSpecBackingInfo(spec_ty) != null;
     }
 
+    fn isGeneratedIteratorEvidenceType(self: *BodyContext, ty: Type.TypeId) bool {
+        return switch (self.builder.program.types.get(ty)) {
+            .named => |named| switch (named.def.iterator_representation) {
+                .minted, .forced_dynamic => switch (named.builtin_owner orelse return false) {
+                    .iter, .stream => true,
+                    else => false,
+                },
+                .none => false,
+            },
+            else => false,
+        };
+    }
+
+    fn isForcedDynamicIteratorType(self: *BodyContext, ty: Type.TypeId) bool {
+        return switch (self.builder.program.types.get(ty)) {
+            .named => |named| named.def.iterator_representation == .forced_dynamic,
+            else => false,
+        };
+    }
+
     fn isGeneratedOpaqueEvidenceType(self: *BodyContext, ty: Type.TypeId) bool {
-        return self.isGeneratedFieldNamesEvidenceType(ty) or self.isGeneratedParseTagUnionSpecEvidenceType(ty);
+        return self.isGeneratedFieldNamesEvidenceType(ty) or
+            self.isGeneratedParseTagUnionSpecEvidenceType(ty) or
+            self.isGeneratedIteratorEvidenceType(ty);
     }
 
     fn isGeneratedSpecializationEvidenceType(self: *BodyContext, ty: Type.TypeId) bool {
-        return self.isGeneratedFieldNamesEvidenceType(ty) or self.isGeneratedParseTagUnionSpecEvidenceType(ty);
+        return self.isGeneratedFieldNamesEvidenceType(ty) or
+            self.isGeneratedParseTagUnionSpecEvidenceType(ty) or
+            self.isGeneratedIteratorEvidenceType(ty);
     }
 
     fn sealedGeneratedOpaqueEvidenceType(self: *BodyContext, ty: Type.TypeId) Allocator.Error!Type.TypeId {
@@ -10220,38 +10651,253 @@ const BodyContext = struct {
         return try self.graph.sealType(ty);
     }
 
-    fn functionHasGeneratedOpaqueEvidence(self: *BodyContext, fn_ty: Type.TypeId) bool {
+    fn functionHasGeneratedOpaqueEvidence(self: *BodyContext, fn_ty: Type.TypeId) Allocator.Error!bool {
         const function = self.builder.functionShape(fn_ty, "generated opaque evidence check requested for a non-function type");
         const args = self.builder.program.types.span(function.args);
         for (0..GuardedList.borrowLen(args)) |index| {
             const arg = GuardedList.at(args, index);
-            if (self.isGeneratedOpaqueEvidenceType(arg)) return true;
+            if (try self.builder.monoTypeHasGeneratedOpaqueEvidence(arg)) return true;
         }
-        return self.isGeneratedOpaqueEvidenceType(function.ret);
+        return try self.builder.monoTypeHasGeneratedOpaqueEvidence(function.ret);
     }
 
     fn publicOpaqueUnificationType(self: *BodyContext, ty: Type.TypeId) Allocator.Error!Type.TypeId {
-        if (!self.isGeneratedOpaqueEvidenceType(ty)) return ty;
+        if (!try self.builder.monoTypeHasGeneratedOpaqueEvidence(ty)) return ty;
+        var cache = std.AutoHashMap(Type.TypeId, Type.TypeId).init(self.allocator);
+        defer cache.deinit();
+        return try self.publicOpaqueUnificationTypeInner(ty, &cache);
+    }
+
+    fn publicOpaqueUnificationTypeInner(
+        self: *BodyContext,
+        ty: Type.TypeId,
+        cache: *std.AutoHashMap(Type.TypeId, Type.TypeId),
+    ) Allocator.Error!Type.TypeId {
+        if (cache.get(ty)) |cached| return cached;
+        if (!try self.builder.monoTypeHasGeneratedOpaqueEvidence(ty)) return ty;
+
         return switch (self.builder.program.types.get(ty)) {
-            .named => |named| try self.builder.program.types.add(.{ .named = .{
+            .primitive,
+            .erased,
+            .zst,
+            => ty,
+            .named => |named| if (self.isGeneratedIteratorEvidenceType(ty))
+                try self.publicIteratorUnificationType(ty, named, cache)
+            else if (self.isGeneratedOpaqueEvidenceType(ty))
+                try self.publicOpaqueEvidenceNamedType(named)
+            else
+                try self.clonePublicOpaqueUnificationType(ty, cache),
+            else => try self.clonePublicOpaqueUnificationType(ty, cache),
+        };
+    }
+
+    fn clonePublicOpaqueUnificationType(
+        self: *BodyContext,
+        ty: Type.TypeId,
+        cache: *std.AutoHashMap(Type.TypeId, Type.TypeId),
+    ) Allocator.Error!Type.TypeId {
+        const Context = struct {
+            body: *BodyContext,
+            source: Type.TypeId,
+            cache: *std.AutoHashMap(Type.TypeId, Type.TypeId),
+
+            fn fill(ctx: @This(), public_ty: Type.TypeId) Allocator.Error!Type.Content {
+                try ctx.cache.put(ctx.source, public_ty);
+                return try ctx.body.clonePublicOpaqueUnificationContent(ctx.source, ctx.cache);
+            }
+        };
+        return try self.builder.program.types.addRecursive(Context{
+            .body = self,
+            .source = ty,
+            .cache = cache,
+        }, Context.fill);
+    }
+
+    fn clonePublicOpaqueUnificationContent(
+        self: *BodyContext,
+        ty: Type.TypeId,
+        cache: *std.AutoHashMap(Type.TypeId, Type.TypeId),
+    ) Allocator.Error!Type.Content {
+        return switch (self.builder.program.types.get(ty)) {
+            .primitive => |primitive| .{ .primitive = primitive },
+            .erased => |digest| .{ .erased = digest },
+            .zst => .zst,
+            .list => |elem| .{ .list = try self.publicOpaqueUnificationTypeInner(elem, cache) },
+            .box => |elem| .{ .box = try self.publicOpaqueUnificationTypeInner(elem, cache) },
+            .tuple => |items| .{ .tuple = try self.publicOpaqueUnificationTypeSpan(items, cache) },
+            .func => |function| .{ .func = .{
+                .args = try self.publicOpaqueUnificationTypeSpan(function.args, cache),
+                .ret = try self.publicOpaqueUnificationTypeInner(function.ret, cache),
+            } },
+            .record => |fields| .{ .record = try self.publicOpaqueUnificationFieldSpan(fields, cache) },
+            .tag_union => |tags| .{ .tag_union = try self.publicOpaqueUnificationTagSpan(tags, cache) },
+            .named => |named| .{ .named = .{
                 .named_type = named.named_type,
                 .def = named.def,
                 .kind = named.kind,
                 .builtin_owner = named.builtin_owner,
-                .args = named.args,
-                .backing = .{
-                    .ty = try self.builder.program.types.add(.{ .record = .empty() }),
-                    .use = if (named.backing) |backing| backing.use else .runtime_layout_only,
-                },
-                .declared_order = named.declared_order,
-            } }),
-            else => ty,
+                .args = try self.publicOpaqueUnificationTypeSpan(named.args, cache),
+                .backing = if (named.backing) |backing| .{
+                    .ty = try self.publicOpaqueUnificationTypeInner(backing.ty, cache),
+                    .use = backing.use,
+                } else null,
+                .declared_order = try self.publicOpaqueUnificationDeclaredFieldSpan(named.declared_order, cache),
+            } },
         };
+    }
+
+    fn publicOpaqueUnificationTypeSpan(
+        self: *BodyContext,
+        span: Type.Span,
+        cache: *std.AutoHashMap(Type.TypeId, Type.TypeId),
+    ) Allocator.Error!Type.Span {
+        const items = try GuardedList.dupe(self.allocator, Type.TypeId, self.builder.program.types.span(span));
+        defer self.allocator.free(items);
+        if (items.len == 0) return .empty();
+        const public_items = try self.allocator.alloc(Type.TypeId, items.len);
+        defer self.allocator.free(public_items);
+        for (items, 0..) |item, index| {
+            public_items[index] = try self.publicOpaqueUnificationTypeInner(item, cache);
+        }
+        return try self.builder.program.types.addSpan(public_items);
+    }
+
+    fn publicOpaqueUnificationFieldSpan(
+        self: *BodyContext,
+        span: Type.Span,
+        cache: *std.AutoHashMap(Type.TypeId, Type.TypeId),
+    ) Allocator.Error!Type.Span {
+        const fields = try GuardedList.dupe(self.allocator, Type.Field, self.builder.program.types.fieldSpan(span));
+        defer self.allocator.free(fields);
+        if (fields.len == 0) return .empty();
+        const public_fields = try self.allocator.alloc(Type.Field, fields.len);
+        defer self.allocator.free(public_fields);
+        for (fields, 0..) |field, index| {
+            public_fields[index] = .{
+                .name = field.name,
+                .ty = try self.publicOpaqueUnificationTypeInner(field.ty, cache),
+            };
+        }
+        return try self.builder.program.types.addRecordFields(&self.builder.program.names, public_fields);
+    }
+
+    fn publicOpaqueUnificationTagSpan(
+        self: *BodyContext,
+        span: Type.Span,
+        cache: *std.AutoHashMap(Type.TypeId, Type.TypeId),
+    ) Allocator.Error!Type.Span {
+        const tags = try GuardedList.dupe(self.allocator, Type.Tag, self.builder.program.types.tagSpan(span));
+        defer self.allocator.free(tags);
+        if (tags.len == 0) return .empty();
+        const public_tags = try self.allocator.alloc(Type.Tag, tags.len);
+        defer self.allocator.free(public_tags);
+        for (tags, 0..) |tag, index| {
+            public_tags[index] = .{
+                .name = tag.name,
+                .checked_name = tag.checked_name,
+                .payloads = try self.publicOpaqueUnificationTypeSpan(tag.payloads, cache),
+            };
+        }
+        return try self.builder.program.types.addTagVariants(&self.builder.program.names, public_tags);
+    }
+
+    fn publicOpaqueUnificationDeclaredFieldSpan(
+        self: *BodyContext,
+        span: Type.Span,
+        cache: *std.AutoHashMap(Type.TypeId, Type.TypeId),
+    ) Allocator.Error!Type.Span {
+        const fields = try GuardedList.dupe(self.allocator, Type.DeclaredField, self.builder.program.types.declaredFieldSpan(span));
+        defer self.allocator.free(fields);
+        if (fields.len == 0) return .empty();
+        const public_fields = try self.allocator.alloc(Type.DeclaredField, fields.len);
+        defer self.allocator.free(public_fields);
+        for (fields, 0..) |field, index| {
+            public_fields[index] = switch (field) {
+                .named => |name| .{ .named = name },
+                .padding => |padding| .{ .padding = try self.publicOpaqueUnificationTypeInner(padding, cache) },
+            };
+        }
+        return try self.builder.program.types.addDeclaredFields(public_fields);
+    }
+
+    fn publicIteratorUnificationType(
+        self: *BodyContext,
+        generated_ty: Type.TypeId,
+        named: Type.NamedContent,
+        cache: *std.AutoHashMap(Type.TypeId, Type.TypeId),
+    ) Allocator.Error!Type.TypeId {
+        if (cache.get(generated_ty)) |cached| return cached;
+
+        const Context = struct {
+            body: *BodyContext,
+            generated_ty: Type.TypeId,
+            named: Type.NamedContent,
+            cache: *std.AutoHashMap(Type.TypeId, Type.TypeId),
+
+            fn fill(ctx: @This(), self_ty: Type.TypeId) Allocator.Error!Type.Content {
+                try ctx.cache.put(ctx.generated_ty, self_ty);
+
+                var public_def = ctx.named.def;
+                public_def.generated = null;
+                public_def.iterator_representation = .none;
+                public_def.iterator_depth = 0;
+                const args = ctx.body.builder.program.types.span(ctx.named.args);
+                if (args.len == 0) Common.invariant("generated iterator evidence had no public item argument");
+                const public_item = try ctx.body.publicOpaqueUnificationTypeInner(GuardedList.at(args, 0), ctx.cache);
+                const public_args = [_]Type.TypeId{public_item};
+
+                const public_backing: ?Type.NamedBacking = if (ctx.named.backing) |backing| .{
+                    .ty = try ctx.body.publicOpaqueUnificationTypeInner(backing.ty, ctx.cache),
+                    .use = backing.use,
+                } else null;
+
+                return .{ .named = .{
+                    .named_type = ctx.named.named_type,
+                    .def = public_def,
+                    .kind = ctx.named.kind,
+                    .builtin_owner = ctx.named.builtin_owner,
+                    .args = try ctx.body.builder.program.types.addSpan(&public_args),
+                    .backing = public_backing,
+                    .declared_order = ctx.named.declared_order,
+                } };
+            }
+        };
+
+        return try self.builder.program.types.addRecursive(Context{
+            .body = self,
+            .generated_ty = generated_ty,
+            .named = named,
+            .cache = cache,
+        }, Context.fill);
+    }
+
+    fn publicOpaqueEvidenceNamedType(
+        self: *BodyContext,
+        named: Type.NamedContent,
+    ) Allocator.Error!Type.TypeId {
+        var public_def = named.def;
+        public_def.generated = null;
+        public_def.iterator_representation = .none;
+        public_def.iterator_depth = 0;
+        return try self.builder.program.types.add(.{ .named = .{
+            .named_type = named.named_type,
+            .def = public_def,
+            .kind = named.kind,
+            .builtin_owner = named.builtin_owner,
+            .args = named.args,
+            .backing = .{
+                .ty = try self.builder.program.types.add(.{ .record = .empty() }),
+                .use = if (named.backing) |backing| backing.use else .runtime_layout_only,
+            },
+            .declared_order = named.declared_order,
+        } });
     }
 
     fn publicOpaqueFunctionUnificationType(self: *BodyContext, fn_ty: Type.TypeId) Allocator.Error!Type.TypeId {
         const function = self.builder.functionShape(fn_ty, "public opaque unification requested for a non-function type");
-        const args = self.builder.program.types.span(function.args);
+        const args = try GuardedList.dupe(self.allocator, Type.TypeId, self.builder.program.types.span(function.args));
+        defer self.allocator.free(args);
+        const public_ret = try self.publicOpaqueUnificationType(function.ret);
         var changed = false;
         const public_args = try self.allocator.alloc(Type.TypeId, args.len);
         defer self.allocator.free(public_args);
@@ -10260,11 +10906,954 @@ const BodyContext = struct {
             public_args[index] = try self.publicOpaqueUnificationType(arg);
             if (public_args[index] != arg) changed = true;
         }
+        if (public_ret != function.ret) changed = true;
         if (!changed) return fn_ty;
         return try self.builder.program.types.add(.{ .func = .{
             .args = try self.builder.program.types.addSpan(public_args),
-            .ret = function.ret,
+            .ret = public_ret,
         } });
+    }
+
+    fn generatedIteratorDirectCallFunctionType(
+        self: *BodyContext,
+        target: checked.ResolvedValueId,
+        mono_fn_ty: Type.TypeId,
+        checked_args: []const checked.CheckedExprId,
+        expected_ret_ty: ?Type.TypeId,
+    ) Allocator.Error!?Type.TypeId {
+        const text = self.builtinProcedureTextForResolvedTarget(target) orelse return null;
+        return try self.generatedIteratorBuiltinFunctionType(text, mono_fn_ty, checked_args, expected_ret_ty);
+    }
+
+    fn generatedIteratorBuiltinFunctionType(
+        self: *BodyContext,
+        text: []const u8,
+        mono_fn_ty: Type.TypeId,
+        checked_args: []const checked.CheckedExprId,
+        expected_ret_ty: ?Type.TypeId,
+    ) Allocator.Error!?Type.TypeId {
+        const fn_data = self.builder.functionShape(mono_fn_ty, "iterator generated call target had a non-function type");
+        const arg_tys = try GuardedList.dupe(self.allocator, Type.TypeId, self.builder.program.types.span(fn_data.args));
+        defer self.allocator.free(arg_tys);
+
+        if (expected_ret_ty) |expected| {
+            if (self.isGeneratedIteratorEvidenceType(expected)) {
+                const stable_expected = try self.stableGeneratedIteratorEvidenceType(expected);
+                if (isBuiltinIterFromStepText(text)) {
+                    return try self.generatedIteratorConstructorFunctionType(stable_expected);
+                }
+                if (isBuiltinRangeDoneText(text) or
+                    isBuiltinExclusiveRangeText(text) or
+                    isBuiltinInclusiveRangeText(text))
+                {
+                    return try self.functionTypeWithReturn(arg_tys, stable_expected);
+                }
+            }
+        }
+
+        if (expected_ret_ty) |expected| {
+            if (!try self.builder.monoTypeHasGeneratedOpaqueEvidence(expected)) return null;
+        }
+
+        if (isBuiltinIterNextText(text)) {
+            if (checked_args.len != 1 or arg_tys.len != 1) Common.invariant("Iter.next reached Monotype with an unexpected arity");
+            if (self.isGeneratedIteratorEvidenceType(arg_tys[0])) {
+                return try self.functionTypeWithReturn(arg_tys, try self.generatedIteratorStepReturnType(arg_tys[0]));
+            }
+            return null;
+        }
+
+        if (isBuiltinIterCustomText(text)) {
+            if (checked_args.len != 3 or arg_tys.len != 3) Common.invariant("Iter.custom reached Monotype with an unexpected arity");
+            if (expected_ret_ty) |expected| {
+                if (self.isGeneratedIteratorEvidenceType(expected)) {
+                    const stable_expected = try self.stableGeneratedIteratorEvidenceType(expected);
+                    if (self.isForcedDynamicIteratorType(stable_expected)) {
+                        return try self.functionTypeWithReturn(arg_tys, stable_expected);
+                    }
+                    const expected_components = try self.generatedIteratorComponentArgs(stable_expected, 2);
+                    defer self.allocator.free(expected_components);
+                    const stable_args = [_]Type.TypeId{ expected_components[0], arg_tys[1], expected_components[1] };
+                    return try self.functionTypeWithReturn(&stable_args, stable_expected);
+                }
+            }
+            if (expected_ret_ty == null) {
+                const components = [_]Type.TypeId{ arg_tys[0], arg_tys[2] };
+                return try self.functionTypeWithReturn(arg_tys, try self.generatedIteratorType(.custom, fn_data.ret, &components, try self.callableArgumentEvidenceDigest(checked_args[2])));
+            }
+        }
+
+        if (isBuiltinIterSingleText(text)) {
+            if (checked_args.len != 1 or arg_tys.len != 1) Common.invariant("Iter.single reached Monotype with an unexpected arity");
+            if (expected_ret_ty) |expected| {
+                if (self.isGeneratedIteratorEvidenceType(expected)) {
+                    const stable_expected = try self.stableGeneratedIteratorEvidenceType(expected);
+                    if (self.isForcedDynamicIteratorType(stable_expected)) {
+                        return try self.functionTypeWithReturn(arg_tys, stable_expected);
+                    }
+                    const expected_args = try self.generatedIteratorComponentArgs(stable_expected, 1);
+                    defer self.allocator.free(expected_args);
+                    return try self.functionTypeWithReturn(expected_args, stable_expected);
+                }
+            }
+            if (expected_ret_ty == null) {
+                const components = [_]Type.TypeId{arg_tys[0]};
+                return try self.functionTypeWithReturn(arg_tys, try self.generatedIteratorType(.single, fn_data.ret, &components, null));
+            }
+        }
+
+        // Mint a fresh range iterator at any producer in a range's construction
+        // chain: the numeric `range_exclusive` / `range_inclusive` method a
+        // `..<` / `..=` dispatches to, the `range_*_with_len` helper, and the
+        // `Iter.exclusive_range` / `Iter.inclusive_range` step producer. The
+        // generated-evidence branch above already returned for a minted expected
+        // type, so reaching here means the expected type is absent or the public
+        // source `Iter` (which a numeric-method or helper body imposes on its
+        // forwarded producer call); minting in both cases keeps a range's state
+        // carried by value instead of leaving it as the recursive public nominal
+        // that boxes under an adapter and mismatches a materialized step
+        // callable. The step producer's self-recursive `rest` and `range_done()`
+        // resolve to the minted self type through the evidence branch, so the
+        // recursion does not re-mint.
+        // Mint a fresh range iterator where a range construction is reached with
+        // no expected type. A `..<` / `..=` binop dispatches to the numeric
+        // `range_exclusive` / `range_inclusive` method, so that method call is
+        // the outermost producer; a direct `Iter.exclusive_range` /
+        // `Iter.inclusive_range` call is the step producer itself. The minted
+        // type then flows down the construction chain (numeric method body ->
+        // `range_*_with_len` -> `Iter.*_range` -> `iter_from_step` /
+        // `range_done`) as generated evidence, so the self-recursive step
+        // closure joins the minted callable set. Without minting here a range
+        // stays the recursive public nominal, which boxes its state whenever an
+        // adapter embeds it.
+        if (expected_ret_ty == null and
+            (isBuiltinExclusiveRangeText(text) or isFlatRangeMethodText(text, ".range_exclusive")))
+        {
+            return try self.functionTypeWithReturn(arg_tys, try self.generatedIteratorType(.range_exclusive, fn_data.ret, &.{}, null));
+        }
+
+        if (expected_ret_ty == null and
+            (isBuiltinInclusiveRangeText(text) or isFlatRangeMethodText(text, ".range_inclusive")))
+        {
+            return try self.functionTypeWithReturn(arg_tys, try self.generatedIteratorType(.range_inclusive, fn_data.ret, &.{}, null));
+        }
+
+        if (isBuiltinIterMapText(text)) {
+            if (checked_args.len != 2 or arg_tys.len != 2) Common.invariant("Iter.map reached Monotype with an unexpected arity");
+            if (expected_ret_ty) |expected| {
+                if (self.isGeneratedIteratorEvidenceType(expected)) {
+                    const stable_expected = try self.stableGeneratedIteratorEvidenceType(expected);
+                    if (self.isForcedDynamicIteratorType(stable_expected)) {
+                        return try self.functionTypeWithReturn(arg_tys, stable_expected);
+                    }
+                    const expected_args = try self.generatedIteratorComponentArgs(stable_expected, 2);
+                    defer self.allocator.free(expected_args);
+                    return try self.functionTypeWithReturn(expected_args, stable_expected);
+                }
+            }
+            if (self.isGeneratedIteratorEvidenceType(arg_tys[0])) {
+                const stable_iterator = try self.stableGeneratedIteratorEvidenceType(arg_tys[0]);
+                const stable_args = [_]Type.TypeId{ stable_iterator, arg_tys[1] };
+                const components = [_]Type.TypeId{ stable_iterator, arg_tys[1] };
+                return try self.functionTypeWithReturn(&stable_args, try self.generatedIteratorType(.map, fn_data.ret, &components, try self.callableArgumentEvidenceDigest(checked_args[1])));
+            }
+        }
+
+        if (isBuiltinIterKeepIfText(text)) {
+            if (checked_args.len != 2 or arg_tys.len != 2) Common.invariant("Iter.keep_if reached Monotype with an unexpected arity");
+            if (expected_ret_ty) |expected| {
+                if (self.isGeneratedIteratorEvidenceType(expected)) {
+                    const stable_expected = try self.stableGeneratedIteratorEvidenceType(expected);
+                    if (self.isForcedDynamicIteratorType(stable_expected)) {
+                        return try self.functionTypeWithReturn(arg_tys, stable_expected);
+                    }
+                    const expected_args = try self.generatedIteratorComponentArgs(stable_expected, 2);
+                    defer self.allocator.free(expected_args);
+                    return try self.functionTypeWithReturn(expected_args, stable_expected);
+                }
+            }
+            if (self.isGeneratedIteratorEvidenceType(arg_tys[0])) {
+                const stable_iterator = try self.stableGeneratedIteratorEvidenceType(arg_tys[0]);
+                const stable_args = [_]Type.TypeId{ stable_iterator, arg_tys[1] };
+                const components = [_]Type.TypeId{ stable_iterator, arg_tys[1] };
+                return try self.functionTypeWithReturn(&stable_args, try self.generatedIteratorType(.keep_if, fn_data.ret, &components, try self.callableArgumentEvidenceDigest(checked_args[1])));
+            }
+        }
+
+        if (isBuiltinIterDropIfText(text)) {
+            if (checked_args.len != 2 or arg_tys.len != 2) Common.invariant("Iter.drop_if reached Monotype with an unexpected arity");
+            if (expected_ret_ty) |expected| {
+                if (self.isGeneratedIteratorEvidenceType(expected)) {
+                    const stable_expected = try self.stableGeneratedIteratorEvidenceType(expected);
+                    if (self.isForcedDynamicIteratorType(stable_expected)) {
+                        return try self.functionTypeWithReturn(arg_tys, stable_expected);
+                    }
+                    const expected_args = try self.generatedIteratorComponentArgs(stable_expected, 2);
+                    defer self.allocator.free(expected_args);
+                    return try self.functionTypeWithReturn(expected_args, stable_expected);
+                }
+            }
+            if (self.isGeneratedIteratorEvidenceType(arg_tys[0])) {
+                const stable_iterator = try self.stableGeneratedIteratorEvidenceType(arg_tys[0]);
+                const stable_args = [_]Type.TypeId{ stable_iterator, arg_tys[1] };
+                const components = [_]Type.TypeId{ stable_iterator, arg_tys[1] };
+                return try self.functionTypeWithReturn(&stable_args, try self.generatedIteratorType(.drop_if, fn_data.ret, &components, try self.callableArgumentEvidenceDigest(checked_args[1])));
+            }
+        }
+
+        if (isBuiltinIterTakeFirstText(text)) {
+            if (checked_args.len != 2 or arg_tys.len != 2) Common.invariant("Iter.take_first reached Monotype with an unexpected arity");
+            if (expected_ret_ty) |expected| {
+                if (self.isGeneratedIteratorEvidenceType(expected)) {
+                    const stable_expected = try self.stableGeneratedIteratorEvidenceType(expected);
+                    if (self.isForcedDynamicIteratorType(stable_expected)) {
+                        return try self.functionTypeWithReturn(arg_tys, stable_expected);
+                    }
+                    const expected_args = try self.generatedIteratorComponentArgs(stable_expected, 2);
+                    defer self.allocator.free(expected_args);
+                    return try self.functionTypeWithReturn(expected_args, stable_expected);
+                }
+            }
+            if (self.isGeneratedIteratorEvidenceType(arg_tys[0])) {
+                const stable_iterator = try self.stableGeneratedIteratorEvidenceType(arg_tys[0]);
+                const stable_args = [_]Type.TypeId{ stable_iterator, arg_tys[1] };
+                const components = [_]Type.TypeId{ stable_iterator, arg_tys[1] };
+                return try self.functionTypeWithReturn(&stable_args, try self.generatedIteratorType(.take_first, fn_data.ret, &components, null));
+            }
+        }
+
+        if (isBuiltinIterDropFirstText(text)) {
+            if (checked_args.len != 2 or arg_tys.len != 2) Common.invariant("Iter.drop_first reached Monotype with an unexpected arity");
+            if (expected_ret_ty) |expected| {
+                if (self.isGeneratedIteratorEvidenceType(expected)) {
+                    const stable_expected = try self.stableGeneratedIteratorEvidenceType(expected);
+                    if (self.isForcedDynamicIteratorType(stable_expected)) {
+                        return try self.functionTypeWithReturn(arg_tys, stable_expected);
+                    }
+                    const expected_args = try self.generatedIteratorComponentArgs(stable_expected, 2);
+                    defer self.allocator.free(expected_args);
+                    return try self.functionTypeWithReturn(expected_args, stable_expected);
+                }
+            }
+            if (self.isGeneratedIteratorEvidenceType(arg_tys[0])) {
+                const stable_iterator = try self.stableGeneratedIteratorEvidenceType(arg_tys[0]);
+                const stable_args = [_]Type.TypeId{ stable_iterator, arg_tys[1] };
+                const components = [_]Type.TypeId{ stable_iterator, arg_tys[1] };
+                return try self.functionTypeWithReturn(&stable_args, try self.generatedIteratorType(.drop_first, fn_data.ret, &components, null));
+            }
+        }
+
+        if (isBuiltinIterConcatText(text)) {
+            if (checked_args.len != 2 or arg_tys.len != 2) Common.invariant("Iter.concat reached Monotype with an unexpected arity");
+            if (expected_ret_ty) |expected| {
+                if (self.isGeneratedIteratorEvidenceType(expected)) {
+                    const stable_expected = try self.stableGeneratedIteratorEvidenceType(expected);
+                    if (self.isForcedDynamicIteratorType(stable_expected)) {
+                        return try self.functionTypeWithReturn(arg_tys, stable_expected);
+                    }
+                    const expected_args = try self.generatedIteratorComponentArgs(stable_expected, 2);
+                    defer self.allocator.free(expected_args);
+                    return try self.functionTypeWithReturn(expected_args, stable_expected);
+                }
+            }
+            if (self.isGeneratedIteratorEvidenceType(arg_tys[0]) or self.isGeneratedIteratorEvidenceType(arg_tys[1])) {
+                const stable_first = try self.stableGeneratedIteratorEvidenceType(arg_tys[0]);
+                const stable_second = try self.stableGeneratedIteratorEvidenceType(arg_tys[1]);
+                const stable_args = [_]Type.TypeId{ stable_first, stable_second };
+                const components = [_]Type.TypeId{ stable_first, stable_second };
+                return try self.functionTypeWithReturn(&stable_args, try self.generatedIteratorType(.concat, fn_data.ret, &components, null));
+            }
+        }
+
+        if (isBuiltinIterAppendText(text)) {
+            if (checked_args.len != 2 or arg_tys.len != 2) Common.invariant("Iter.append reached Monotype with an unexpected arity");
+            if (expected_ret_ty) |expected| {
+                if (self.isGeneratedIteratorEvidenceType(expected)) {
+                    const stable_expected = try self.stableGeneratedIteratorEvidenceType(expected);
+                    if (self.isForcedDynamicIteratorType(stable_expected)) {
+                        return try self.functionTypeWithReturn(arg_tys, stable_expected);
+                    }
+                    const expected_args = try self.generatedIteratorComponentArgs(stable_expected, 2);
+                    defer self.allocator.free(expected_args);
+                    return try self.functionTypeWithReturn(expected_args, stable_expected);
+                }
+            }
+            if (self.isGeneratedIteratorEvidenceType(arg_tys[0])) {
+                const stable_iterator = try self.stableGeneratedIteratorEvidenceType(arg_tys[0]);
+                const stable_args = [_]Type.TypeId{ stable_iterator, arg_tys[1] };
+                const components = [_]Type.TypeId{ stable_iterator, arg_tys[1] };
+                return try self.functionTypeWithReturn(&stable_args, try self.generatedIteratorType(.append, fn_data.ret, &components, null));
+            }
+        }
+
+        return null;
+    }
+
+    fn functionTypeWithReturn(
+        self: *BodyContext,
+        arg_tys: []const Type.TypeId,
+        ret_ty: Type.TypeId,
+    ) Allocator.Error!Type.TypeId {
+        const copied_args = try self.allocator.dupe(Type.TypeId, arg_tys);
+        defer self.allocator.free(copied_args);
+        return try self.builder.program.types.add(.{ .func = .{
+            .args = try self.builder.program.types.addSpan(copied_args),
+            .ret = ret_ty,
+        } });
+    }
+
+    fn stableGeneratedIteratorEvidenceType(
+        self: *BodyContext,
+        ty: Type.TypeId,
+    ) Allocator.Error!Type.TypeId {
+        if (!self.isGeneratedIteratorEvidenceType(ty)) return ty;
+        if (self.isForcedDynamicIteratorType(ty)) return ty;
+        const original_digest = self.generatedIteratorEvidenceDigest(ty) orelse
+            Common.invariant("generated iterator evidence had no generated digest");
+        const Context = struct {
+            body: *BodyContext,
+            original: Type.TypeId,
+            original_digest: names.TypeDigest,
+
+            fn fill(ctx: @This(), self_ty: Type.TypeId) Allocator.Error!Type.Content {
+                var cache = std.AutoHashMap(Type.TypeId, Type.TypeId).init(ctx.body.allocator);
+                defer cache.deinit();
+                try cache.put(ctx.original, self_ty);
+                return try ctx.body.cloneTypeReplacingGeneratedSelfContent(ctx.original, ctx.original_digest, self_ty, &cache);
+            }
+        };
+        return try self.builder.program.types.addRecursive(Context{
+            .body = self,
+            .original = ty,
+            .original_digest = original_digest,
+        }, Context.fill);
+    }
+
+    fn generatedIteratorEvidenceDigest(self: *BodyContext, ty: Type.TypeId) ?names.TypeDigest {
+        return switch (self.builder.program.types.get(ty)) {
+            .named => |named| if (named.def.iterator_representation == .minted) named.def.generated else null,
+            else => null,
+        };
+    }
+
+    fn cloneTypeReplacingGeneratedSelf(
+        self: *BodyContext,
+        ty: Type.TypeId,
+        original_digest: names.TypeDigest,
+        replacement_ty: Type.TypeId,
+        cache: *std.AutoHashMap(Type.TypeId, Type.TypeId),
+    ) Allocator.Error!Type.TypeId {
+        if (cache.get(ty)) |cached| return cached;
+        if (self.generatedIteratorEvidenceDigest(ty)) |digest| {
+            if (optionalDigestEql(digest, original_digest)) {
+                try cache.put(ty, replacement_ty);
+                return replacement_ty;
+            }
+        }
+        if (self.graph.monoViewNode(ty)) |node| {
+            const sealed = try self.graph.sealNode(node);
+            return try self.cloneTypeReplacingGeneratedSelf(sealed, original_digest, replacement_ty, cache);
+        }
+        return switch (self.builder.program.types.get(ty)) {
+            .primitive,
+            .erased,
+            .zst,
+            => ty,
+            else => blk: {
+                const CloneContext = struct {
+                    body: *BodyContext,
+                    original: Type.TypeId,
+                    original_digest: names.TypeDigest,
+                    replacement_ty: Type.TypeId,
+                    cache: *std.AutoHashMap(Type.TypeId, Type.TypeId),
+
+                    fn fill(ctx: @This(), self_ty: Type.TypeId) Allocator.Error!Type.Content {
+                        try ctx.cache.put(ctx.original, self_ty);
+                        return try ctx.body.cloneTypeReplacingGeneratedSelfContent(ctx.original, ctx.original_digest, ctx.replacement_ty, ctx.cache);
+                    }
+                };
+                const cloned = try self.builder.program.types.addRecursive(CloneContext{
+                    .body = self,
+                    .original = ty,
+                    .original_digest = original_digest,
+                    .replacement_ty = replacement_ty,
+                    .cache = cache,
+                }, CloneContext.fill);
+                break :blk cloned;
+            },
+        };
+    }
+
+    fn cloneTypeReplacingGeneratedSelfContent(
+        self: *BodyContext,
+        ty: Type.TypeId,
+        original_digest: names.TypeDigest,
+        replacement_ty: Type.TypeId,
+        cache: *std.AutoHashMap(Type.TypeId, Type.TypeId),
+    ) Allocator.Error!Type.Content {
+        return switch (self.builder.program.types.get(ty)) {
+            .primitive => |primitive| .{ .primitive = primitive },
+            .erased => |digest| .{ .erased = digest },
+            .zst => .zst,
+            .list => |elem| .{ .list = try self.cloneTypeReplacingGeneratedSelf(elem, original_digest, replacement_ty, cache) },
+            .box => |elem| .{ .box = try self.cloneTypeReplacingGeneratedSelf(elem, original_digest, replacement_ty, cache) },
+            .tuple => |items| .{ .tuple = try self.cloneTypeSpanReplacingGeneratedSelf(items, original_digest, replacement_ty, cache) },
+            .func => |function| .{ .func = .{
+                .args = try self.cloneTypeSpanReplacingGeneratedSelf(function.args, original_digest, replacement_ty, cache),
+                .ret = try self.cloneTypeReplacingGeneratedSelf(function.ret, original_digest, replacement_ty, cache),
+            } },
+            .record => |fields| .{ .record = try self.cloneFieldSpanReplacingGeneratedSelf(fields, original_digest, replacement_ty, cache) },
+            .tag_union => |tags| .{ .tag_union = try self.cloneTagSpanReplacingGeneratedSelf(tags, original_digest, replacement_ty, cache) },
+            .named => |named| .{ .named = .{
+                .named_type = named.named_type,
+                .def = named.def,
+                .kind = named.kind,
+                .builtin_owner = named.builtin_owner,
+                .args = try self.cloneTypeSpanReplacingGeneratedSelf(named.args, original_digest, replacement_ty, cache),
+                .backing = if (named.backing) |backing| .{
+                    .ty = try self.cloneTypeReplacingGeneratedSelf(backing.ty, original_digest, replacement_ty, cache),
+                    .use = backing.use,
+                } else null,
+                .declared_order = try self.cloneDeclaredFieldSpanReplacingGeneratedSelf(named.declared_order, original_digest, replacement_ty, cache),
+            } },
+        };
+    }
+
+    fn cloneTypeSpanReplacingGeneratedSelf(
+        self: *BodyContext,
+        span: Type.Span,
+        original_digest: names.TypeDigest,
+        replacement_ty: Type.TypeId,
+        cache: *std.AutoHashMap(Type.TypeId, Type.TypeId),
+    ) Allocator.Error!Type.Span {
+        const items = try GuardedList.dupe(self.allocator, Type.TypeId, self.builder.program.types.span(span));
+        defer self.allocator.free(items);
+        if (items.len == 0) return .empty();
+        const cloned = try self.allocator.alloc(Type.TypeId, items.len);
+        defer self.allocator.free(cloned);
+        for (items, 0..) |item, index| {
+            cloned[index] = try self.cloneTypeReplacingGeneratedSelf(item, original_digest, replacement_ty, cache);
+        }
+        return try self.builder.program.types.addSpan(cloned);
+    }
+
+    fn cloneFieldSpanReplacingGeneratedSelf(
+        self: *BodyContext,
+        span: Type.Span,
+        original_digest: names.TypeDigest,
+        replacement_ty: Type.TypeId,
+        cache: *std.AutoHashMap(Type.TypeId, Type.TypeId),
+    ) Allocator.Error!Type.Span {
+        const fields = try GuardedList.dupe(self.allocator, Type.Field, self.builder.program.types.fieldSpan(span));
+        defer self.allocator.free(fields);
+        if (fields.len == 0) return .empty();
+        const cloned = try self.allocator.alloc(Type.Field, fields.len);
+        defer self.allocator.free(cloned);
+        for (fields, 0..) |field, index| {
+            cloned[index] = .{
+                .name = field.name,
+                .ty = try self.cloneTypeReplacingGeneratedSelf(field.ty, original_digest, replacement_ty, cache),
+            };
+        }
+        return try self.builder.program.types.addRecordFields(&self.builder.program.names, cloned);
+    }
+
+    fn cloneTagSpanReplacingGeneratedSelf(
+        self: *BodyContext,
+        span: Type.Span,
+        original_digest: names.TypeDigest,
+        replacement_ty: Type.TypeId,
+        cache: *std.AutoHashMap(Type.TypeId, Type.TypeId),
+    ) Allocator.Error!Type.Span {
+        const tags = try GuardedList.dupe(self.allocator, Type.Tag, self.builder.program.types.tagSpan(span));
+        defer self.allocator.free(tags);
+        if (tags.len == 0) return .empty();
+        const cloned = try self.allocator.alloc(Type.Tag, tags.len);
+        defer self.allocator.free(cloned);
+        for (tags, 0..) |tag, index| {
+            cloned[index] = .{
+                .name = tag.name,
+                .checked_name = tag.checked_name,
+                .payloads = try self.cloneTypeSpanReplacingGeneratedSelf(tag.payloads, original_digest, replacement_ty, cache),
+            };
+        }
+        return try self.builder.program.types.addTagVariants(&self.builder.program.names, cloned);
+    }
+
+    fn cloneDeclaredFieldSpanReplacingGeneratedSelf(
+        self: *BodyContext,
+        span: Type.Span,
+        original_digest: names.TypeDigest,
+        replacement_ty: Type.TypeId,
+        cache: *std.AutoHashMap(Type.TypeId, Type.TypeId),
+    ) Allocator.Error!Type.Span {
+        const fields = try GuardedList.dupe(self.allocator, Type.DeclaredField, self.builder.program.types.declaredFieldSpan(span));
+        defer self.allocator.free(fields);
+        if (fields.len == 0) return .empty();
+        const cloned = try self.allocator.alloc(Type.DeclaredField, fields.len);
+        defer self.allocator.free(cloned);
+        for (fields, 0..) |field, index| {
+            cloned[index] = switch (field) {
+                .named => |name| .{ .named = name },
+                .padding => |padding| .{ .padding = try self.cloneTypeReplacingGeneratedSelf(padding, original_digest, replacement_ty, cache) },
+            };
+        }
+        return try self.builder.program.types.addDeclaredFields(cloned);
+    }
+
+    fn generatedIteratorComponentArgs(
+        self: *BodyContext,
+        generated_iter_ty: Type.TypeId,
+        expected_components: usize,
+    ) Allocator.Error![]Type.TypeId {
+        const named = switch (self.builder.program.types.get(generated_iter_ty)) {
+            .named => |named| named,
+            else => Common.invariant("generated iterator component args requested for a non-named type"),
+        };
+        const args = self.builder.program.types.span(named.args);
+        if (args.len != expected_components + 1) {
+            Common.invariant("generated iterator did not contain the expected component count");
+        }
+        const out = try self.allocator.alloc(Type.TypeId, expected_components);
+        for (0..expected_components) |index| {
+            out[index] = GuardedList.at(args, index + 1);
+        }
+        return out;
+    }
+
+    fn generatedIteratorConstructorFunctionType(
+        self: *BodyContext,
+        generated_iter_ty: Type.TypeId,
+    ) Allocator.Error!Type.TypeId {
+        const backing_ty = self.builder.namedBackingType(generated_iter_ty) orelse
+            Common.invariant("generated iterator constructor requested a type without backing");
+        const len_field = self.recordFieldByText(backing_ty, "len_if_known");
+        const step_field = self.recordFieldByText(backing_ty, "step");
+        const args = [_]Type.TypeId{ len_field.ty, step_field.ty };
+        return try self.functionTypeWithReturn(&args, generated_iter_ty);
+    }
+
+    fn generatedIteratorStepReturnType(
+        self: *BodyContext,
+        iter_ty: Type.TypeId,
+    ) Allocator.Error!Type.TypeId {
+        const backing_ty = self.builder.namedBackingType(iter_ty) orelse
+            Common.invariant("generated iterator next requested a type without backing");
+        const step_field = self.recordFieldByText(backing_ty, "step");
+        return self.builder.functionShape(step_field.ty, "generated iterator step field had a non-function type").ret;
+    }
+
+    fn generatedIteratorType(
+        self: *BodyContext,
+        kind: GeneratedIteratorKind,
+        public_iter_ty: Type.TypeId,
+        components: []const Type.TypeId,
+        callable_evidence: ?names.TypeDigest,
+    ) Allocator.Error!Type.TypeId {
+        // Mint a per-chain internal `Iter` nominal. Reusing the public `Iter`
+        // definition here is only provenance for public unification and error
+        // boundaries. The explicit representation tier and generated digest
+        // separate this chain's nominal identity from public `Iter`, the
+        // forced-dynamic tier, and sibling chains. This is representation-level
+        // minting, not SpecConstr.
+        const public_named = self.publicIteratorNamed(public_iter_ty);
+        const item_ty = self.iterItemType(public_iter_ty);
+        const digest = self.generatedIteratorDigest(kind, item_ty, components, callable_evidence);
+        if (self.builder.generated_iter_types.get(digest.bytes)) |cached| return cached;
+
+        // Depth backstop: a chain nested past the cap becomes the explicit
+        // forced-dynamic representation instead of minting deeper. Adapters
+        // over that representation remain forced-dynamic, so a recursively
+        // constructed chain reaches a type fixed point and specialization
+        // terminates. A statically bounded chain deeper than the cap takes the
+        // same representation degradation, never an unbounded type expansion.
+        var chain_depth: u32 = 1;
+        for (components) |component| {
+            chain_depth = @max(chain_depth, self.mintedIteratorChainDepth(component, depth_walk_fuel) + 1);
+        }
+        if (chain_depth > max_minted_iterator_chain_depth) return try self.forcedDynamicIteratorType(public_iter_ty);
+
+        const args = try self.allocator.alloc(Type.TypeId, components.len + 1);
+        defer self.allocator.free(args);
+        args[0] = item_ty;
+        @memcpy(args[1..], components);
+
+        const Context = struct {
+            body: *BodyContext,
+            public_named: Type.NamedContent,
+            item_ty: Type.TypeId,
+            args: []const Type.TypeId,
+            digest: names.TypeDigest,
+            chain_depth: u32,
+
+            fn fill(ctx: @This(), self_ty: Type.TypeId) Allocator.Error!Type.Content {
+                return try ctx.body.generatedIteratorContent(ctx.public_named, ctx.item_ty, ctx.args, ctx.digest, ctx.chain_depth, self_ty);
+            }
+        };
+
+        const context = Context{
+            .body = self,
+            .public_named = public_named,
+            .item_ty = item_ty,
+            .args = args,
+            .digest = digest,
+            .chain_depth = chain_depth,
+        };
+        const generated = try self.builder.program.types.addRecursive(context, Context.fill);
+        try self.builder.generated_iter_types.put(digest.bytes, generated);
+        return generated;
+    }
+
+    /// Maximum minted-chain depth (source = 1, each adapter +1). Bounding the
+    /// minted type universe is what guarantees specialization terminates for
+    /// recursively-constructed chains regardless of call structure: finitely
+    /// many minted types means finitely many templates, and template dedup
+    /// closes every recursion. This is deliberately a bound on the TYPES
+    /// rather than on any call or request path — a recursive construction has
+    /// many routes into specialization, and capping the type universe covers
+    /// all of them at the single point where minted types are born. See
+    /// design.md "Core Principles" on bounded post-check walks: exhaustion
+    /// errs toward the explicit forced-dynamic representation (a tier
+    /// degradation on an implausibly deep static chain), never toward
+    /// divergence.
+    const max_minted_iterator_chain_depth: u32 = 16;
+
+    /// Recursion budget for the structural depth walk; exhausting it reports
+    /// the cap (never zero) so an unexpectedly deep or cyclic shape can only
+    /// over-trigger the backstop, never under-count into divergence. The safe
+    /// direction here is the opposite of a substitution check's: reporting
+    /// too SHALLOW a depth would let minting continue past the cap and
+    /// diverge, so the walk must fail deep, not shallow.
+    const depth_walk_fuel: u32 = 64;
+
+    /// Chain depth of any minted iterator reachable inside `ty` by value:
+    /// a minted iterator reads its recorded depth; containers (named args,
+    /// records, tuples, tag payloads, list/box elements) take the max over
+    /// their children. Function types contribute nothing (their returns are
+    /// control flow, not stored data), and named backings are not walked (the
+    /// public recursive nominal self-references only through its backing).
+    fn mintedIteratorChainDepth(self: *BodyContext, ty: Type.TypeId, fuel: u32) u32 {
+        if (fuel == 0) return max_minted_iterator_chain_depth;
+        return switch (self.builder.program.types.get(ty)) {
+            .primitive, .erased, .zst, .func => 0,
+            .named => |named| blk: {
+                switch (named.def.iterator_representation) {
+                    .minted => break :blk named.def.iterator_depth,
+                    .forced_dynamic => break :blk max_minted_iterator_chain_depth,
+                    .none => {},
+                }
+                var depth: u32 = 0;
+                const named_args = self.builder.program.types.span(named.args);
+                for (0..GuardedList.borrowLen(named_args)) |index| {
+                    depth = @max(depth, self.mintedIteratorChainDepth(GuardedList.at(named_args, index), fuel - 1));
+                }
+                break :blk depth;
+            },
+            .record => |fields| blk: {
+                var depth: u32 = 0;
+                const field_span = self.builder.program.types.fieldSpan(fields);
+                for (0..GuardedList.borrowLen(field_span)) |index| {
+                    depth = @max(depth, self.mintedIteratorChainDepth(GuardedList.at(field_span, index).ty, fuel - 1));
+                }
+                break :blk depth;
+            },
+            .tuple => |items| blk: {
+                var depth: u32 = 0;
+                const item_span = self.builder.program.types.span(items);
+                for (0..GuardedList.borrowLen(item_span)) |index| {
+                    depth = @max(depth, self.mintedIteratorChainDepth(GuardedList.at(item_span, index), fuel - 1));
+                }
+                break :blk depth;
+            },
+            .tag_union => |tags| blk: {
+                var depth: u32 = 0;
+                const tag_span = self.builder.program.types.tagSpan(tags);
+                for (0..GuardedList.borrowLen(tag_span)) |tag_index| {
+                    const payload_span = self.builder.program.types.span(GuardedList.at(tag_span, tag_index).payloads);
+                    for (0..GuardedList.borrowLen(payload_span)) |payload_index| {
+                        depth = @max(depth, self.mintedIteratorChainDepth(GuardedList.at(payload_span, payload_index), fuel - 1));
+                    }
+                }
+                break :blk depth;
+            },
+            .list, .box => |element| self.mintedIteratorChainDepth(element, fuel - 1),
+        };
+    }
+
+    fn generatedIteratorDigest(
+        self: *BodyContext,
+        kind: GeneratedIteratorKind,
+        item_ty: Type.TypeId,
+        components: []const Type.TypeId,
+        callable_evidence: ?names.TypeDigest,
+    ) names.TypeDigest {
+        var hasher = std.crypto.hash.sha2.Sha256.init(.{});
+        hasher.update("roc.generated_iterator");
+        hasher.update(@tagName(kind));
+        self.updateTypeDigest(&hasher, item_ty);
+        hashU32(&hasher, @intCast(components.len));
+        for (components) |component| {
+            self.updateTypeDigest(&hasher, component);
+        }
+        if (callable_evidence) |evidence| {
+            hasher.update("callable_evidence");
+            hasher.update(&evidence.bytes);
+        }
+        return .{ .bytes = hasher.finalResult() };
+    }
+
+    fn callableArgumentEvidenceDigest(
+        self: *BodyContext,
+        expr_id: checked.CheckedExprId,
+    ) Allocator.Error!?names.TypeDigest {
+        const expr = self.view.bodies.expr(expr_id);
+        return switch (expr.data) {
+            .closure => |closure| try self.closureArgumentEvidenceDigest(expr_id, closure),
+            .lambda => |lambda| self.lambdaArgumentEvidenceDigest(expr_id, lambda.args.len),
+            else => null,
+        };
+    }
+
+    fn lambdaArgumentEvidenceDigest(
+        self: *BodyContext,
+        expr_id: checked.CheckedExprId,
+        arg_count: usize,
+    ) names.TypeDigest {
+        var hasher = std.crypto.hash.sha2.Sha256.init(.{});
+        hasher.update("roc.generated_iterator.callable.lambda");
+        hasher.update(self.view.key.bytes[0..]);
+        hashU32(&hasher, @intFromEnum(expr_id));
+        hashU32(&hasher, @intCast(arg_count));
+        hashU32(&hasher, 0);
+        return .{ .bytes = hasher.finalResult() };
+    }
+
+    fn closureArgumentEvidenceDigest(
+        self: *BodyContext,
+        expr_id: checked.CheckedExprId,
+        closure: anytype,
+    ) Allocator.Error!names.TypeDigest {
+        var hasher = std.crypto.hash.sha2.Sha256.init(.{});
+        hasher.update("roc.generated_iterator.callable.closure");
+        hasher.update(self.view.key.bytes[0..]);
+        hashU32(&hasher, @intFromEnum(expr_id));
+        hashU32(&hasher, @intFromEnum(closure.lambda));
+        hashU32(&hasher, @intCast(closure.captures.len));
+        for (closure.captures) |capture| {
+            hashU32(&hasher, @intFromEnum(capture.capture_id));
+            hashU32(&hasher, capture.scope_depth);
+            const binder = checkedCaptureBinder(self.view, capture.pattern);
+            const capture_ty = try self.lowerTypeView(checkedBinderType(self.view, binder));
+            self.updateTypeDigest(&hasher, capture_ty);
+        }
+        return .{ .bytes = hasher.finalResult() };
+    }
+
+    fn updateTypeDigest(
+        self: *BodyContext,
+        hasher: *std.crypto.hash.sha2.Sha256,
+        ty: Type.TypeId,
+    ) void {
+        const digest = self.builder.program.types.typeDigest(&self.builder.program.names, ty);
+        hasher.update(&digest.bytes);
+    }
+
+    fn publicIteratorNamed(self: *BodyContext, ty: Type.TypeId) Type.NamedContent {
+        return switch (self.builder.program.types.get(ty)) {
+            .named => |named| blk: {
+                if (named.builtin_owner) |owner| {
+                    if (owner != .iter) Common.invariant("generated iterator requested a non-Iter public type");
+                    break :blk named;
+                }
+                const type_name = self.builder.program.names.typeNameText(named.def.type_name);
+                if (!Ident.textEql(type_name, "Builtin.Iter") and !Ident.textEql(type_name, "Iter")) {
+                    Common.invariant("generated iterator requested a non-Iter public type");
+                }
+                var stamped = named;
+                stamped.builtin_owner = .iter;
+                break :blk stamped;
+            },
+            else => Common.invariant("generated iterator requested a non-named public type"),
+        };
+    }
+
+    fn generatedIteratorContent(
+        self: *BodyContext,
+        public_named: Type.NamedContent,
+        item_ty: Type.TypeId,
+        args: []const Type.TypeId,
+        digest: names.TypeDigest,
+        chain_depth: u32,
+        self_ty: Type.TypeId,
+    ) Allocator.Error!Type.Content {
+        const public_backing = public_named.backing orelse
+            Common.invariant("generated iterator requested a public Iter without backing");
+        var def = public_named.def;
+        def.generated = digest;
+        def.iterator_representation = .minted;
+        def.iterator_depth = @intCast(chain_depth);
+        return .{ .named = .{
+            .named_type = public_named.named_type,
+            .def = def,
+            .kind = public_named.kind,
+            .builtin_owner = public_named.builtin_owner,
+            .args = try self.builder.program.types.addSpan(args),
+            .backing = .{
+                .ty = try self.generatedIteratorBackingType(public_backing.ty, self_ty, item_ty),
+                .use = public_backing.use,
+            },
+            .declared_order = public_named.declared_order,
+        } };
+    }
+
+    fn forcedDynamicIteratorType(
+        self: *BodyContext,
+        public_iter_ty: Type.TypeId,
+    ) Allocator.Error!Type.TypeId {
+        const public_named = self.publicIteratorNamed(public_iter_ty);
+        const item_ty = self.iterItemType(public_iter_ty);
+        var hasher = std.crypto.hash.sha2.Sha256.init(.{});
+        hasher.update("roc.forced_dynamic_iterator");
+        self.updateTypeDigest(&hasher, item_ty);
+        const key = hasher.finalResult();
+        if (self.builder.forced_dynamic_iter_types.get(key)) |cached| return cached;
+
+        const Context = struct {
+            body: *BodyContext,
+            public_named: Type.NamedContent,
+            item_ty: Type.TypeId,
+
+            fn fill(ctx: @This(), self_ty: Type.TypeId) Allocator.Error!Type.Content {
+                const public_backing = ctx.public_named.backing orelse
+                    Common.invariant("forced dynamic iterator requested a public Iter without backing");
+                var def = ctx.public_named.def;
+                def.generated = null;
+                def.iterator_representation = .forced_dynamic;
+                def.iterator_depth = max_minted_iterator_chain_depth;
+                const args = [_]Type.TypeId{ctx.item_ty};
+                return .{ .named = .{
+                    .named_type = ctx.public_named.named_type,
+                    .def = def,
+                    .kind = ctx.public_named.kind,
+                    .builtin_owner = ctx.public_named.builtin_owner,
+                    .args = try ctx.body.builder.program.types.addSpan(&args),
+                    .backing = .{
+                        .ty = try ctx.body.generatedIteratorBackingType(public_backing.ty, self_ty, ctx.item_ty),
+                        .use = public_backing.use,
+                    },
+                    .declared_order = ctx.public_named.declared_order,
+                } };
+            }
+        };
+
+        const dynamic = try self.builder.program.types.addRecursive(Context{
+            .body = self,
+            .public_named = public_named,
+            .item_ty = item_ty,
+        }, Context.fill);
+        try self.builder.forced_dynamic_iter_types.put(key, dynamic);
+        return dynamic;
+    }
+
+    fn generatedIteratorBackingType(
+        self: *BodyContext,
+        public_backing_ty: Type.TypeId,
+        self_ty: Type.TypeId,
+        item_ty: Type.TypeId,
+    ) Allocator.Error!Type.TypeId {
+        const public_fields = switch (self.builder.shapeContent(public_backing_ty)) {
+            .record => |fields| self.builder.program.types.fieldSpan(fields),
+            else => Common.invariant("public Iter backing was not a record"),
+        };
+        const fields = try self.allocator.alloc(Type.Field, public_fields.len);
+        defer self.allocator.free(fields);
+        for (0..public_fields.len) |index| {
+            const field = GuardedList.at(public_fields, index);
+            const field_text = self.builder.program.names.recordFieldLabelText(field.name);
+            fields[index] = .{
+                .name = field.name,
+                .ty = if (Ident.textEql(field_text, "step"))
+                    try self.generatedIteratorStepFunctionType(field.ty, self_ty, item_ty)
+                else
+                    field.ty,
+            };
+        }
+        return try self.builder.program.types.add(.{ .record = try self.builder.program.types.addRecordFields(&self.builder.program.names, fields) });
+    }
+
+    fn generatedIteratorStepFunctionType(
+        self: *BodyContext,
+        public_step_ty: Type.TypeId,
+        self_ty: Type.TypeId,
+        item_ty: Type.TypeId,
+    ) Allocator.Error!Type.TypeId {
+        const step = self.builder.functionShape(public_step_ty, "public Iter step field was not a function");
+        return try self.builder.program.types.add(.{ .func = .{
+            .args = step.args,
+            .ret = try self.generatedIteratorStepResultType(step.ret, self_ty, item_ty),
+        } });
+    }
+
+    fn generatedIteratorStepResultType(
+        self: *BodyContext,
+        public_step_ret_ty: Type.TypeId,
+        self_ty: Type.TypeId,
+        item_ty: Type.TypeId,
+    ) Allocator.Error!Type.TypeId {
+        const public_tags = switch (self.builder.shapeContent(public_step_ret_ty)) {
+            .tag_union => |tags| self.builder.program.types.tagSpan(tags),
+            else => Common.invariant("public Iter step result was not a tag union"),
+        };
+        const tags = try self.allocator.alloc(Type.Tag, public_tags.len);
+        defer self.allocator.free(tags);
+        for (0..public_tags.len) |index| {
+            const tag = GuardedList.at(public_tags, index);
+            const payloads = self.builder.program.types.span(tag.payloads);
+            const generated_payloads = try self.allocator.alloc(Type.TypeId, payloads.len);
+            defer self.allocator.free(generated_payloads);
+            for (0..payloads.len) |payload_index| {
+                const payload = GuardedList.at(payloads, payload_index);
+                generated_payloads[payload_index] = try self.generatedIteratorStepPayloadType(tag.name, payload, self_ty, item_ty);
+            }
+            tags[index] = .{
+                .name = tag.name,
+                .checked_name = tag.checked_name,
+                .payloads = try self.builder.program.types.addSpan(generated_payloads),
+            };
+        }
+        return try self.builder.program.types.add(.{ .tag_union = try self.builder.program.types.addTagVariants(&self.builder.program.names, tags) });
+    }
+
+    fn generatedIteratorStepPayloadType(
+        self: *BodyContext,
+        tag_name: names.TagNameId,
+        payload_ty: Type.TypeId,
+        self_ty: Type.TypeId,
+        item_ty: Type.TypeId,
+    ) Allocator.Error!Type.TypeId {
+        const tag_text = self.builder.program.names.tagLabelText(tag_name);
+        if (!Ident.textEql(tag_text, "One") and !Ident.textEql(tag_text, "Skip")) return payload_ty;
+
+        const public_fields = switch (self.builder.shapeContent(payload_ty)) {
+            .record => |fields| self.builder.program.types.fieldSpan(fields),
+            else => Common.invariant("public Iter step payload was not a record"),
+        };
+        const fields = try self.allocator.alloc(Type.Field, public_fields.len);
+        defer self.allocator.free(fields);
+        for (0..public_fields.len) |index| {
+            const field = GuardedList.at(public_fields, index);
+            const field_text = self.builder.program.names.recordFieldLabelText(field.name);
+            fields[index] = .{
+                .name = field.name,
+                .ty = if (Ident.textEql(field_text, "rest"))
+                    self_ty
+                else if (Ident.textEql(field_text, "item"))
+                    item_ty
+                else
+                    field.ty,
+            };
+        }
+        return try self.builder.program.types.add(.{ .record = try self.builder.program.types.addRecordFields(&self.builder.program.names, fields) });
     }
 
     fn lowerFieldNamesValueIter(
@@ -14481,18 +16070,22 @@ const BodyContext = struct {
             call_ctx.current_entry_root = self.current_entry_root;
 
             const source_fn_ty = self.directCallInstantiationSourceFnType(target, call.source_fn_ty_payload);
-            const mono_fn_ty = try call_ctx.instantiateCallTypeFromCallerAtType(source_fn_ty, self, checked_ret_ty, call.args, expected_ret_ty);
-            const source_fn_key = call_ctx.view.types.rootKey(source_fn_ty);
-            const callee = try self.fnTemplateForDirectCallWithMono(target, source_fn_ty, source_fn_key, mono_fn_ty);
+            var mono_fn_ty = try call_ctx.instantiateCallTypeFromCallerAtType(source_fn_ty, self, checked_ret_ty, call.args, expected_ret_ty);
+            if (try self.generatedIteratorDirectCallFunctionType(target, mono_fn_ty, call.args, expected_ret_ty)) |generated_fn_ty| {
+                mono_fn_ty = generated_fn_ty;
+            }
             const fn_data = self.builder.functionShape(mono_fn_ty, "checked direct call target had a non-function type");
             try self.constrainTypeToMono(checked_ret_ty, fn_data.ret);
             if (expected_ret_ty) |expected| {
-                if (!self.sameType(expected, fn_data.ret)) {
+                if (!try self.sameTypeOrPublicOpaque(expected, fn_data.ret)) {
                     Common.invariant("checked direct call result type differed from its expected Monotype type");
                 }
             }
+            if (try self.lowerGeneratedIteratorNextCall(target, call.args, fn_data, checked_ret_ty)) |lowered| return lowered;
+            const source_fn_key = call_ctx.view.types.rootKey(source_fn_ty);
+            const callee = try self.fnTemplateForDirectCallWithMono(target, source_fn_ty, source_fn_key, mono_fn_ty);
             return .{
-                .ret_ty = try self.lowerTypeCell(checked_ret_ty),
+                .ret_ty = try self.callReturnTypeCell(checked_ret_ty, fn_data.ret),
                 .data = .{ .call_proc = .{
                     .callee = draftProcCalleeFromAst(Ast.procCalleeForSlot(callee)),
                     .args = try self.lowerExprSpanAtTypes(call.args, self.builder.program.types.span(fn_data.args)),
@@ -14514,17 +16107,79 @@ const BodyContext = struct {
         const fn_data = self.builder.functionShape(fn_ty, "checked call function type was not a function");
         try self.constrainTypeToMono(checked_ret_ty, fn_data.ret);
         if (expected_ret_ty) |expected| {
-            if (!self.sameType(expected, fn_data.ret)) {
+            if (!try self.sameTypeOrPublicOpaque(expected, fn_data.ret)) {
                 Common.invariant("checked indirect call result type differed from its expected Monotype type");
             }
         }
         return .{
-            .ret_ty = try self.lowerTypeCell(checked_ret_ty),
+            .ret_ty = try self.callReturnTypeCell(checked_ret_ty, fn_data.ret),
             .data = .{ .call_value = .{
                 .callee = try self.lowerExprAtType(call.func, fn_ty),
                 .args = try self.lowerExprSpanAtTypes(call.args, self.builder.program.types.span(fn_data.args)),
             } },
         };
+    }
+
+    fn lowerGeneratedIteratorNextCall(
+        self: *BodyContext,
+        target: checked.ResolvedValueId,
+        checked_args: []const checked.CheckedExprId,
+        fn_data: FunctionShape,
+        checked_ret_ty: checked.CheckedTypeId,
+    ) Allocator.Error!?LoweredCall {
+        const text = self.builtinProcedureTextForResolvedTarget(target) orelse return null;
+        if (!isBuiltinIterNextText(text)) return null;
+        const arg_tys = self.builder.program.types.span(fn_data.args);
+        if (checked_args.len != 1 or arg_tys.len != 1) Common.invariant("Iter.next reached Monotype with an unexpected arity");
+        const iter_ty = GuardedList.at(arg_tys, 0);
+        if (!self.isGeneratedIteratorEvidenceType(iter_ty)) return null;
+
+        const iterator = try self.lowerExprAtType(checked_args[0], iter_ty);
+        return .{
+            .ret_ty = try self.callReturnTypeCell(checked_ret_ty, fn_data.ret),
+            .data = try self.lowerGeneratedIteratorNextData(iterator, iter_ty),
+        };
+    }
+
+    fn lowerGeneratedIteratorNextExpr(
+        self: *BodyContext,
+        iterator: DraftExprId,
+        iter_ty: Type.TypeId,
+    ) Allocator.Error!DraftExprId {
+        return try self.addExpr(.{
+            .ty = try self.generatedIteratorStepReturnType(iter_ty),
+            .data = try self.lowerGeneratedIteratorNextData(iterator, iter_ty),
+        });
+    }
+
+    fn lowerGeneratedIteratorNextData(
+        self: *BodyContext,
+        iterator: DraftExprId,
+        iter_ty: Type.TypeId,
+    ) Allocator.Error!BodyExprData {
+        const backing_ty = self.builder.namedBackingType(iter_ty) orelse
+            Common.invariant("generated iterator next requested a type without backing");
+        const step_name = try self.builder.program.names.internRecordFieldLabel("step");
+        const step_ty = self.builder.recordFieldType(backing_ty, step_name);
+        const step = try self.addExpr(.{ .ty = step_ty, .data = .{ .field_access = .{
+            .receiver = iterator,
+            .field = step_name,
+        } } });
+        return .{ .call_value = .{
+            .callee = step,
+            .args = .empty(),
+        } };
+    }
+
+    fn callReturnTypeCell(
+        self: *BodyContext,
+        checked_ret_ty: checked.CheckedTypeId,
+        ret_ty: Type.TypeId,
+    ) Allocator.Error!DraftTypeCell {
+        if (try self.builder.monoTypeHasGeneratedOpaqueEvidence(ret_ty)) {
+            return DraftTypeCell.fromSealed(ret_ty);
+        }
+        return try self.lowerTypeCell(checked_ret_ty);
     }
 
     fn indirectCalleeMonoType(
@@ -14547,7 +16202,7 @@ const BodyContext = struct {
                 const field_ty = try self.lowerExprType(checked_func);
                 if (expected_ret_ty) |expected| {
                     const fn_data = self.builder.functionShape(field_ty, "checked field callee type was not a function");
-                    if (!self.sameType(expected, fn_data.ret)) break :blk null;
+                    if (!try self.sameTypeOrPublicOpaque(expected, fn_data.ret)) break :blk null;
                 }
                 break :blk field_ty;
             },
@@ -14575,7 +16230,7 @@ const BodyContext = struct {
         const arg_tys = self.builder.program.types.span(fn_data.args);
         if (arg_tys.len != checked_args.len) Common.invariant("checked local callee arity differed from call arity");
         if (expected_ret_ty) |expected| {
-            if (!self.sameType(expected, fn_data.ret)) return null;
+            if (!try self.sameTypeOrPublicOpaque(expected, fn_data.ret)) return null;
         }
         for (checked_args) |checked_arg| {
             if (try self.callArgumentMonoType(checked_arg, null)) |evidence_ty| {
@@ -14649,6 +16304,7 @@ const BodyContext = struct {
         defer self.allocator.free(generated_arg_overrides);
         @memset(generated_arg_overrides, null);
         var saw_generated_opaque_evidence = false;
+        var generated_ret_override: ?Type.TypeId = null;
         for (function.args, checked_args, 0..) |formal_ty, checked_arg, index| {
             const arg_ty = caller.view.bodies.expr(checked_arg).ty;
             const formal_node = try self.instNode(formal_ty);
@@ -14668,9 +16324,18 @@ const BodyContext = struct {
                 try self.graph.unify(formal_node, try caller.instNode(arg_ty));
             }
         }
-        try self.graph.unify(try self.instNode(function.ret), try caller.instNode(checked_ret_ty));
         if (expected_ret_ty) |expected| {
-            try self.graph.unify(try self.instNode(function.ret), try self.graph.importMono(expected));
+            if (self.isGeneratedSpecializationEvidenceType(expected)) {
+                saw_generated_opaque_evidence = true;
+                generated_ret_override = try self.graph.sealType(expected);
+                try self.graph.unify(try self.instNode(function.ret), try self.graph.importMono(try self.publicOpaqueUnificationType(generated_ret_override.?)));
+                try self.graph.unify(try caller.instNode(checked_ret_ty), try self.graph.importMono(try self.publicOpaqueUnificationType(generated_ret_override.?)));
+            } else {
+                try self.graph.unify(try self.instNode(function.ret), try caller.instNode(checked_ret_ty));
+                try self.graph.unify(try self.instNode(function.ret), try self.graph.importMono(expected));
+            }
+        } else {
+            try self.graph.unify(try self.instNode(function.ret), try caller.instNode(checked_ret_ty));
         }
         try self.graph.drainDirty();
         if (saw_generated_opaque_evidence) {
@@ -14680,11 +16345,15 @@ const BodyContext = struct {
                 args[index] = if (override) |ty|
                     ty
                 else
-                    try self.graph.sealNode(try self.instNode(formal_ty));
+                    try self.activeTypeFromNode(try self.instNode(formal_ty));
             }
+            // As in `instantiateDispatchPlanCallTypeFromCaller`: seal only the
+            // generated-evidence positions; the other parameters and the return
+            // stay active so a callee that constructs its (iterator-shaped)
+            // result can still extend the result type's callable slots.
             const generated_fn_ty = try self.builder.program.types.add(.{ .func = .{
                 .args = try self.builder.program.types.addSpan(args),
-                .ret = try self.graph.sealNode(try self.instNode(function.ret)),
+                .ret = generated_ret_override orelse try self.activeTypeFromNode(try self.instNode(function.ret)),
             } });
             return generated_fn_ty;
         }
@@ -14699,7 +16368,78 @@ const BodyContext = struct {
         operands: []const static_dispatch.StaticDispatchOperand,
         expected_ret_ty: ?Type.TypeId,
     ) Allocator.Error!Type.TypeId {
-        const fn_node = try self.instantiateDispatchPlanCallNodeFromCaller(source_fn_ty, caller, checked_ret_ty, operands, expected_ret_ty);
+        const function = self.checkedFunctionType(source_fn_ty);
+        if (function.args.len != operands.len) {
+            Common.invariant("checked dispatch plan arity differs from its function type");
+        }
+        const fn_node = try self.instNode(source_fn_ty);
+        const generated_arg_overrides = try self.allocator.alloc(?Type.TypeId, function.args.len);
+        defer self.allocator.free(generated_arg_overrides);
+        @memset(generated_arg_overrides, null);
+        var saw_generated_opaque_evidence = false;
+        var generated_ret_override: ?Type.TypeId = null;
+        for (function.args, operands, 0..) |formal_ty, operand, index| {
+            const formal_node = try self.instNode(formal_ty);
+            switch (operand) {
+                .checked_expr => |checked_arg| {
+                    const arg_ty = caller.view.bodies.expr(checked_arg).ty;
+                    if (try caller.callArgumentMonoType(checked_arg, null)) |evidence_ty| {
+                        if (self.isGeneratedSpecializationEvidenceType(evidence_ty)) {
+                            const evidence_snapshot = try self.graph.sealType(evidence_ty);
+                            saw_generated_opaque_evidence = true;
+                            generated_arg_overrides[index] = evidence_snapshot;
+                            try self.graph.unify(try self.graph.importMono(try self.publicOpaqueUnificationType(evidence_snapshot)), formal_node);
+                        } else if (self.isGeneratedOpaqueEvidenceType(evidence_ty)) {
+                            try self.graph.unify(try self.graph.importMono(try self.publicOpaqueUnificationType(evidence_ty)), formal_node);
+                        } else {
+                            try self.graph.unify(formal_node, try caller.instNode(arg_ty));
+                            try self.graph.unify(formal_node, try self.graph.importMono(evidence_ty));
+                        }
+                    } else {
+                        try self.graph.unify(formal_node, try caller.instNode(arg_ty));
+                    }
+                },
+                .generated_interpolation_iter,
+                .generated_numeral,
+                .generated_quote,
+                => {},
+            }
+        }
+        if (expected_ret_ty) |expected| {
+            if (self.isGeneratedSpecializationEvidenceType(expected)) {
+                saw_generated_opaque_evidence = true;
+                generated_ret_override = try self.graph.sealType(expected);
+                try self.graph.unify(try self.instNode(function.ret), try self.graph.importMono(try self.publicOpaqueUnificationType(generated_ret_override.?)));
+                try self.graph.unify(try caller.instNode(checked_ret_ty), try self.graph.importMono(try self.publicOpaqueUnificationType(generated_ret_override.?)));
+            } else {
+                try self.graph.unify(try self.instNode(function.ret), try caller.instNode(checked_ret_ty));
+                try self.graph.unify(try self.instNode(function.ret), try self.graph.importMono(expected));
+            }
+        } else {
+            try self.graph.unify(try self.instNode(function.ret), try caller.instNode(checked_ret_ty));
+        }
+        try self.graph.drainDirty();
+        if (saw_generated_opaque_evidence) {
+            const args = try self.allocator.alloc(Type.TypeId, function.args.len);
+            defer self.allocator.free(args);
+            for (function.args, generated_arg_overrides, 0..) |formal_ty, override, index| {
+                args[index] = if (override) |ty|
+                    ty
+                else
+                    try self.activeTypeFromNode(try self.instNode(formal_ty));
+            }
+            // Only the generated-evidence positions are sealed snapshots (they
+            // key the specialization). The remaining parameters and the return
+            // stay active: sealing the return would freeze an iterator-shaped
+            // result's callable slots as an empty snapshot, so a callee body
+            // that constructs its result (a step closure flowing into a
+            // returned iterator's backing) could never extend them, leaving a
+            // zero-sized callable layout for a value that carries members.
+            return try self.builder.program.types.add(.{ .func = .{
+                .args = try self.builder.program.types.addSpan(args),
+                .ret = generated_ret_override orelse try self.activeTypeFromNode(try self.instNode(function.ret)),
+            } });
+        }
         return try self.activeTypeFromNode(fn_node);
     }
 
@@ -14987,7 +16727,7 @@ const BodyContext = struct {
             if (try self.indirectCalleeMonoType(call.func, call.args, expected_ret_ty)) |fn_ty| {
                 const ret_ty = self.functionReturnType(fn_ty);
                 if (expected_ret_ty) |expected| {
-                    if (!self.sameType(expected, ret_ty)) {
+                    if (!try self.sameTypeOrPublicOpaque(expected, ret_ty)) {
                         Common.invariant("checked indirect call result type differed from its expected Monotype type");
                     }
                     try self.constrainTypeToMono(checked_ret_ty, expected);
@@ -15018,7 +16758,10 @@ const BodyContext = struct {
         call_ctx.current_entry_root = self.current_entry_root;
 
         const source_fn_ty = self.directCallInstantiationSourceFnType(call.direct_target.?, call.source_fn_ty_payload);
-        const mono_fn_ty = try call_ctx.instantiateCallTypeFromCallerAtType(source_fn_ty, self, checked_ret_ty, call.args, expected_ret_ty);
+        var mono_fn_ty = try call_ctx.instantiateCallTypeFromCallerAtType(source_fn_ty, self, checked_ret_ty, call.args, expected_ret_ty);
+        if (try self.generatedIteratorDirectCallFunctionType(call.direct_target.?, mono_fn_ty, call.args, expected_ret_ty)) |generated_fn_ty| {
+            mono_fn_ty = generated_fn_ty;
+        }
         return call_ctx.functionReturnType(mono_fn_ty);
     }
 
@@ -15065,10 +16808,18 @@ const BodyContext = struct {
         mono_fn_ty: Type.TypeId,
         evidence: []const SpecEvidence,
     ) Allocator.Error!Ast.FnId {
-        const context = self.local_proc_contexts.get(local.binder) orelse
+        const context_fn_key = if (self.local_proc_contexts.get(local.binder)) |context|
+            try self.localProcUseContextKey(context)
+        else if (self.restored_local_proc_context_digest) |digest|
+            restoredLocalProcUseContextKey(
+                self.restored_local_proc_base_key orelse
+                    Common.invariant("restored local procedure contexts had no stable base identity"),
+                digest,
+                local.binder,
+            )
+        else
             Common.invariant("local procedure use reached Monotype before its declaration context");
-        const context_fn_key = try self.localProcUseContextKey(context);
-        const fn_template = try self.builder.fnTemplateForNestedExprWithMono(
+        var fn_template = try self.builder.fnTemplateForNestedExprWithMono(
             self.view,
             self.owner_template,
             local.expr,
@@ -15077,6 +16828,7 @@ const BodyContext = struct {
             mono_fn_ty,
             context_fn_key,
         );
+        fn_template.fn_def.nested.local_proc_context_digest = try self.localProcContextsDigest();
         return try self.builder.lowerNestedFnFromContext(self, local.expr, fn_template, if (evidence.len > 0) evidence else null);
     }
 
@@ -15166,7 +16918,7 @@ const BodyContext = struct {
         self: *BodyContext,
         ref_id: checked.ResolvedValueId,
         ty: Type.TypeId,
-    ) ?CurrentLocal {
+    ) Allocator.Error!?CurrentLocal {
         const raw = @intFromEnum(ref_id);
         if (raw >= self.view.resolved_refs.records.len) {
             Common.invariant("checked lookup resolved value id was outside resolved value table");
@@ -15191,6 +16943,18 @@ const BodyContext = struct {
             .promoted_top_level_proc,
             => return null,
         };
+
+        // A nested function context inherits type-specific outer bindings so
+        // genuinely polymorphic captures remain available. Its own arguments
+        // and mutable versions then replace the active lexical binding. When
+        // that active binding has the requested type, it must win over the
+        // inherited type-specific entry; otherwise reads incorrectly refer to
+        // the outer capture instead of the function argument/current version.
+        if (self.binders.get(binder)) |local| {
+            if (self.sameType(try self.localType(local), ty)) {
+                return .{ .binder = binder, .local = local };
+            }
+        }
         return if (self.typed_binders.get(self.typedBinder(binder, ty))) |local|
             .{ .binder = binder, .local = local }
         else
@@ -15226,7 +16990,7 @@ const BodyContext = struct {
             .promoted_top_level_proc,
             => {},
         }
-        const typed_binding = self.currentTypedLocalBindingForResolvedValue(ref_id, ty);
+        const typed_binding = try self.currentTypedLocalBindingForResolvedValue(ref_id, ty);
         const fallback_binding = if (typed_binding == null) self.currentLocalBindingForResolvedValue(ref_id) else null;
         if (typed_binding orelse fallback_binding) |binding| {
             const local_id = binding.local;
@@ -15241,6 +17005,8 @@ const BodyContext = struct {
             const live_ty = try self.lowerTypeView(binder_ty);
             const use_ty = if (self.sameType(ty, local_ty))
                 local_ty
+            else if (try self.generatedLocalUseType(local_ty, ty)) |generated_use_ty|
+                generated_use_ty
             else if (self.sameType(ty, live_ty))
                 live_ty
             else
@@ -15365,7 +17131,15 @@ const BodyContext = struct {
         const store_view = self.builder.moduleForId(checked.constModuleId(const_use.const_ref));
         const template = store_view.const_templates.get(const_use.const_ref);
         return switch (template.state) {
-            .stored_const => |stored| try self.restoreConstNodeAtType(store_view, self.view, stored.node, ty),
+            .stored_const => |stored| try self.restoredStaticDataCandidateNode(
+                store_view,
+                self.view,
+                stored.node,
+                ty,
+                const_use.const_ref,
+                requested_ty,
+                .disallow,
+            ),
             .reserved => Common.invariant("reserved checked const template reached Monotype"),
             .eval_template => |eval| try self.lowerConstEvalTemplateUse(store_view, eval, ty, null, null),
         };
@@ -15472,6 +17246,17 @@ const BodyContext = struct {
         node: checked.ConstNodeId,
         ty: Type.TypeId,
     ) Allocator.Error!DraftExprId {
+        return try self.restoreConstNodeAtTypeWithStaticRoot(store_view, type_view, node, ty, null);
+    }
+
+    fn restoreConstNodeAtTypeWithStaticRoot(
+        self: *BodyContext,
+        store_view: ModuleView,
+        type_view: ModuleView,
+        node: checked.ConstNodeId,
+        ty: Type.TypeId,
+        static_data_const_locator: ?checked.ConstLocator,
+    ) Allocator.Error!DraftExprId {
         const previous_restore_const_result_ty = self.restore_const_result_ty;
         if (previous_restore_const_result_ty == null) self.restore_const_result_ty = ty;
         defer self.restore_const_result_ty = previous_restore_const_result_ty;
@@ -15479,7 +17264,7 @@ const BodyContext = struct {
         const value = store_view.const_store.get(node);
         switch (value) {
             .fn_value => |fn_id| {
-                return try self.restoreConstFn(store_view, fn_id, ty);
+                return try self.restoreConstFn(store_view, fn_id, ty, static_data_const_locator);
             },
             .tag, .record, .tuple => if (self.builder.nominalConstructionLayer(ty)) |layer| {
                 const backing_expr = try self.restoreConstNodeAtType(store_view, type_view, node, layer.backing);
@@ -15491,8 +17276,32 @@ const BodyContext = struct {
             },
             else => {},
         }
-        const data = try self.restoreConstData(store_view, type_view, value, ty);
+        const data = try self.restoreConstData(store_view, type_view, value, ty, static_data_const_locator);
         return try self.addExpr(.{ .ty = ty, .data = data });
+    }
+
+    fn restoredStaticDataCandidateNode(
+        self: *BodyContext,
+        store_view: ModuleView,
+        type_view: ModuleView,
+        node: checked.ConstNodeId,
+        ty: Type.TypeId,
+        const_locator: checked.ConstLocator,
+        checked_type: checked.CheckedTypeId,
+        bare_fn: Builder.BareFnCandidate,
+    ) Allocator.Error!DraftExprId {
+        if (!moduleBytesEqual(checked.constModuleId(const_locator).bytes, store_view.key.bytes)) {
+            Common.invariant("static-data const context referenced a different ConstStore module");
+        }
+        const runtime_expr = try self.restoreConstNodeAtTypeWithStaticRoot(store_view, type_view, node, ty, const_locator);
+        if (self.builder.static_data_literals and self.builder.constNodeMayUseStaticDataCandidate(store_view, node, bare_fn)) {
+            const id = try self.builder.staticDataValue(const_locator, node, checked_type);
+            return try self.addExpr(.{ .ty = ty, .data = .{ .static_data_candidate = .{
+                .static_data = id,
+                .runtime_expr = runtime_expr,
+            } } });
+        }
+        return runtime_expr;
     }
 
     fn restoreConstData(
@@ -15501,6 +17310,7 @@ const BodyContext = struct {
         type_view: ModuleView,
         value: checked.ConstValue,
         ty: Type.TypeId,
+        static_data_const_locator: ?checked.ConstLocator,
     ) Allocator.Error!BodyExprData {
         return switch (value) {
             .pending => Common.invariant("pending ConstStore node reached Monotype restore"),
@@ -15516,21 +17326,21 @@ const BodyContext = struct {
                 str.offset,
                 str.len,
             ) },
-            .list => |items| .{ .list = try self.restoreConstList(store_view, type_view, ty, items) },
+            .list => |items| .{ .list = try self.restoreConstList(store_view, type_view, ty, items, static_data_const_locator) },
             .box => |payload| blk: {
-                const child = try self.restoreConstNodeAtType(store_view, type_view, payload, self.constBoxPayloadType(ty));
+                const child = try self.restoreConstNodeAtTypeWithStaticRoot(store_view, type_view, payload, self.constBoxPayloadType(ty), static_data_const_locator);
                 break :blk .{ .low_level = .{
                     .op = .box_box,
                     .args = try self.addExprSpan(&.{child}),
                 } };
             },
-            .tuple => |items| .{ .tuple = try self.restoreConstTuple(store_view, type_view, ty, items) },
-            .record => |items| .{ .record = try self.restoreConstRecord(store_view, type_view, ty, items) },
+            .tuple => |items| .{ .tuple = try self.restoreConstTuple(store_view, type_view, ty, items, static_data_const_locator) },
+            .record => |items| .{ .record = try self.restoreConstRecord(store_view, type_view, ty, items, static_data_const_locator) },
             .tag => |tag| .{ .tag = .{
                 .name = try self.builder.program.names.internTagLabel(tag.tag_name),
-                .payloads = try self.restoreConstTagPayloads(store_view, type_view, ty, tag),
+                .payloads = try self.restoreConstTagPayloads(store_view, type_view, ty, tag, static_data_const_locator),
             } },
-            .nominal => |nominal| .{ .nominal = try self.restoreConstNodeAtType(store_view, type_view, nominal.backing, self.builder.namedBackingType(ty) orelse ty) },
+            .nominal => |nominal| .{ .nominal = try self.restoreConstNodeAtTypeWithStaticRoot(store_view, type_view, nominal.backing, self.builder.namedBackingType(ty) orelse ty, static_data_const_locator) },
             .fn_value => Common.invariant("ConstStore function value must be restored as an expression"),
         };
     }
@@ -15541,12 +17351,13 @@ const BodyContext = struct {
         type_view: ModuleView,
         ty: Type.TypeId,
         items: []const checked.ConstNodeId,
+        static_data_const_locator: ?checked.ConstLocator,
     ) Allocator.Error!DraftSpan(DraftExprId) {
         const elem_ty = self.constListElemType(ty);
         const lowered = try self.allocator.alloc(DraftExprId, items.len);
         defer self.allocator.free(lowered);
         for (items, 0..) |item, index| {
-            lowered[index] = try self.restoreConstNodeAtType(store_view, type_view, item, elem_ty);
+            lowered[index] = try self.restoreConstNodeAtTypeWithStaticRoot(store_view, type_view, item, elem_ty, static_data_const_locator);
         }
         return try self.addExprSpan(lowered);
     }
@@ -15557,6 +17368,7 @@ const BodyContext = struct {
         type_view: ModuleView,
         ty: Type.TypeId,
         items: []const checked.ConstNodeId,
+        static_data_const_locator: ?checked.ConstLocator,
     ) Allocator.Error!DraftSpan(DraftExprId) {
         const item_span = self.builder.tupleItemSpan(ty);
         const item_count: usize = @intCast(item_span.len);
@@ -15566,7 +17378,7 @@ const BodyContext = struct {
         for (items, 0..) |item, index| {
             const item_tys = self.builder.program.types.span(item_span);
             const item_ty = GuardedList.at(item_tys, index);
-            lowered[index] = try self.restoreConstNodeAtType(store_view, type_view, item, item_ty);
+            lowered[index] = try self.restoreConstNodeAtTypeWithStaticRoot(store_view, type_view, item, item_ty, static_data_const_locator);
         }
         return try self.addExprSpan(lowered);
     }
@@ -15577,6 +17389,7 @@ const BodyContext = struct {
         type_view: ModuleView,
         ty: Type.TypeId,
         items: []const checked.ConstNodeId,
+        static_data_const_locator: ?checked.ConstLocator,
     ) Allocator.Error!DraftSpan(DraftFieldExpr) {
         const field_span = self.builder.recordFieldsSpan(ty);
         const field_count: usize = @intCast(field_span.len);
@@ -15588,7 +17401,7 @@ const BodyContext = struct {
             const field = GuardedList.at(fields, index);
             lowered[index] = .{
                 .name = field.name,
-                .value = try self.restoreConstNodeAtType(store_view, type_view, item, field.ty),
+                .value = try self.restoreConstNodeAtTypeWithStaticRoot(store_view, type_view, item, field.ty, static_data_const_locator),
             };
         }
         return try self.addFieldExprSpan(lowered);
@@ -15600,6 +17413,7 @@ const BodyContext = struct {
         type_view: ModuleView,
         ty: Type.TypeId,
         tag: anytype,
+        static_data_const_locator: ?checked.ConstLocator,
     ) Allocator.Error!DraftSpan(DraftExprId) {
         const mono_tag_name = try self.builder.program.names.internTagLabel(tag.tag_name);
         const payload_span = self.builder.tagPayloadSpan(ty, mono_tag_name);
@@ -15610,7 +17424,7 @@ const BodyContext = struct {
         for (tag.payloads, 0..) |payload, index| {
             const payload_tys = self.builder.program.types.span(payload_span);
             const payload_ty = GuardedList.at(payload_tys, index);
-            lowered[index] = try self.restoreConstNodeAtType(store_view, type_view, payload, payload_ty);
+            lowered[index] = try self.restoreConstNodeAtTypeWithStaticRoot(store_view, type_view, payload, payload_ty, static_data_const_locator);
         }
         return try self.addExprSpan(lowered);
     }
@@ -15797,6 +17611,9 @@ const BodyContext = struct {
             .module = try self.builder.program.names.internModuleIdentity(store_view.names.moduleIdentityBytes(def.module)),
             .type_name = try self.builder.program.names.internTypeName(store_view.names.typeNameText(def.type_name)),
             .source_decl = def.source_decl,
+            .generated = def.generated,
+            .iterator_representation = @enumFromInt(@intFromEnum(def.iterator_representation)),
+            .iterator_depth = def.iterator_depth,
         };
     }
 
@@ -15809,19 +17626,20 @@ const BodyContext = struct {
         store_view: ModuleView,
         fn_id: checked.ConstFnId,
         ty: Type.TypeId,
+        static_data_const_locator: ?checked.ConstLocator,
     ) Allocator.Error!DraftExprId {
         const raw = @intFromEnum(fn_id);
         if (raw >= store_view.const_store.fns.items.len) Common.invariant("ConstStore function id is out of range");
         const fn_value = store_view.const_store.getFn(@enumFromInt(raw));
         if (fn_value.fn_def == .parser_runtime) {
-            return try self.restoreConstParserRuntimeFn(store_view, fn_value, ty);
+            return try self.restoreConstParserRuntimeFn(store_view, fn_value, ty, static_data_const_locator);
         }
         if (fn_value.fn_def == .encoder_for_runtime) {
-            return try self.restoreConstEncoderForRuntimeFn(store_view, fn_value, ty);
+            return try self.restoreConstEncoderForRuntimeFn(store_view, fn_value, ty, static_data_const_locator);
         }
         const template = try self.builder.restoredConstFnTemplateToMono(store_view, fn_id, fn_value, ty);
         if (fn_value.captures.len != 0) {
-            return try self.restoreCapturingConstFn(store_view, fn_id, fn_value, template, ty);
+            return try self.restoreCapturingConstFn(store_view, fn_id, fn_value, template, ty, static_data_const_locator);
         }
         const mono_fn_id = try self.restoreConstFnTemplate(fn_value, template);
         return try self.addExpr(.{
@@ -15880,6 +17698,7 @@ const BodyContext = struct {
         fn_value: check.ConstStore.ConstFn,
         template: Ast.FnTemplate,
         ty: Type.TypeId,
+        static_data_const_locator: ?checked.ConstLocator,
     ) Allocator.Error!DraftExprId {
         const fn_view = self.builder.moduleForConstFnDef(fn_value.fn_def);
         var fn_ctx = try BodyContext.init(self.allocator, self.builder, fn_view, ownerTemplateForConstFnDef(fn_value.fn_def), self.graph, self.draft);
@@ -15887,6 +17706,8 @@ const BodyContext = struct {
         fn_ctx.restore_evidence = self.restore_evidence;
         defer fn_ctx.deinit();
         fn_ctx.current_fn_key = restoredConstFnContextKey(store_view.key, fn_id, fn_value.source_fn_key);
+        fn_ctx.restored_local_proc_context_digest = fn_value.fn_def.nested.local_proc_context_digest;
+        fn_ctx.restored_local_proc_base_key = fn_ctx.current_fn_key;
         try fn_ctx.constrainTypeToMono(fn_value.source_fn_ty, ty);
 
         const lambda_expr_id = checkedLambdaExprIdForConstFn(fn_view, fn_value.fn_def);
@@ -15937,10 +17758,13 @@ const BodyContext = struct {
             };
             initialized += 1;
         }
+        fn_ctx.restored_local_proc_base_key = try fn_ctx.lexicalContextKey();
         for (fn_value.captures, 0..) |capture, index| {
-            captures[index].value = try fn_ctx.restoreConstNodeAtType(store_view, fn_view, capture.value, captures[index].ty);
+            captures[index].value = if (static_data_const_locator) |const_locator|
+                try fn_ctx.restoredStaticDataCandidateNode(store_view, fn_view, capture.value, captures[index].ty, const_locator, checkedBinderType(fn_view, constCaptureBinder(capture.id)), .allow)
+            else
+                try fn_ctx.restoreConstNodeAtType(store_view, fn_view, capture.value, captures[index].ty);
         }
-
         var capture_template = template;
         switch (capture_template.fn_def) {
             .nested => |nested| {
@@ -15948,6 +17772,7 @@ const BodyContext = struct {
                     .owner = nested.owner,
                     .site = nested.site,
                     .context_fn_key = try fn_ctx.lexicalContextKey(),
+                    .local_proc_context_digest = nested.local_proc_context_digest,
                 } };
                 // A compile-time-evaluated closure keeps its dispatch evidence
                 // params even when the outer scheme is concrete. Capture types
@@ -16007,6 +17832,7 @@ const BodyContext = struct {
         store_view: ModuleView,
         fn_value: check.ConstStore.ConstFn,
         ty: Type.TypeId,
+        static_data_const_locator: ?checked.ConstLocator,
     ) Allocator.Error!DraftExprId {
         const runtime = switch (fn_value.fn_def) {
             .parser_runtime => |runtime| runtime,
@@ -16048,7 +17874,10 @@ const BodyContext = struct {
             fn_ctx.setLocalCaptureId(local, parserEncodingCaptureId());
             encoding_let = .{
                 .local = local,
-                .value = try fn_ctx.restoreConstNodeAtType(store_view, fn_view, node, arg_tys[0]),
+                .value = if (static_data_const_locator) |const_locator|
+                    try fn_ctx.restoreConstNodeAtTypeWithStaticRoot(store_view, fn_view, node, arg_tys[0], const_locator)
+                else
+                    try fn_ctx.restoreConstNodeAtType(store_view, fn_view, node, arg_tys[0]),
             };
             break :blk try fn_ctx.localExpr(local, arg_tys[0]);
         } else try fn_ctx.lowerDispatchOperandAtType(plan_args[0], arg_tys[0]);
@@ -16100,6 +17929,7 @@ const BodyContext = struct {
         store_view: ModuleView,
         fn_value: check.ConstStore.ConstFn,
         ty: Type.TypeId,
+        static_data_const_locator: ?checked.ConstLocator,
     ) Allocator.Error!DraftExprId {
         const runtime = switch (fn_value.fn_def) {
             .encoder_for_runtime => |runtime| runtime,
@@ -16143,7 +17973,10 @@ const BodyContext = struct {
             fn_ctx.setLocalCaptureId(local, encoderForEncodingCaptureId());
             encoding_let = .{
                 .local = local,
-                .value = try fn_ctx.restoreConstNodeAtType(store_view, fn_view, node, arg_tys[0]),
+                .value = if (static_data_const_locator) |const_locator|
+                    try fn_ctx.restoreConstNodeAtTypeWithStaticRoot(store_view, fn_view, node, arg_tys[0], const_locator)
+                else
+                    try fn_ctx.restoreConstNodeAtType(store_view, fn_view, node, arg_tys[0]),
             };
             break :blk try fn_ctx.localExpr(local, arg_tys[0]);
         } else try fn_ctx.lowerDispatchOperandAtType(plan_args[0], arg_tys[0]);
@@ -16541,7 +18374,7 @@ const BodyContext = struct {
         return switch (self.builder.program.types.get(ty)) {
             .named => |named| blk: {
                 const args = self.builder.program.types.span(named.args);
-                if (args.len != 1) Common.invariant("Iter nominal did not have one type argument");
+                if (GuardedList.borrowLen(args) == 0) Common.invariant("Iter nominal did not have an item type argument");
                 break :blk GuardedList.at(args, 0);
             },
             else => Common.invariant("generated interpolation iterator expected named Iter type"),
@@ -16567,7 +18400,8 @@ const BodyContext = struct {
                 if (try self.lowerParseIntrinsicCallExpr(checked_expr, expr.ty, call, ty)) |lowered| return lowered;
                 try self.constrainKnownType(expr.ty, ty);
                 const lowered = try self.lowerCallAtType(expr.ty, call, ty);
-                if (!self.sameType(ty, try self.activeTypeFromCell(lowered.ret_ty))) {
+                const actual_ty = try self.activeTypeFromCell(lowered.ret_ty);
+                if (!try self.sameTypeOrPublicOpaque(ty, actual_ty)) {
                     Common.invariant("checked call expression lowered at a type different from its context type");
                 }
                 return try self.addExpr(.{
@@ -16620,10 +18454,199 @@ const BodyContext = struct {
         }
         try self.constrainKnownType(expr.ty, ty);
         const lowered = try self.lowerExprWithType(checked_expr, ty);
-        if (!self.sameType(ty, try self.exprType(lowered))) {
+        if (!try self.sameTypeOrPublicOpaque(ty, try self.exprType(lowered))) {
             Common.invariant("checked expression lowered at a type different from its call operand type");
         }
         return lowered;
+    }
+
+    fn sameTypeOrPublicOpaque(self: *BodyContext, expected: Type.TypeId, actual: Type.TypeId) Allocator.Error!bool {
+        const stable_expected = if (self.isGeneratedIteratorEvidenceType(expected))
+            try self.stableGeneratedIteratorEvidenceType(expected)
+        else
+            expected;
+        const stable_actual = if (self.isGeneratedIteratorEvidenceType(actual))
+            try self.stableGeneratedIteratorEvidenceType(actual)
+        else
+            actual;
+        if (self.sameType(stable_expected, stable_actual)) return true;
+        const public_expected = try self.publicOpaqueUnificationType(stable_expected);
+        const public_actual = try self.publicOpaqueUnificationType(stable_actual);
+        return self.samePublicOpaqueType(public_expected, public_actual);
+    }
+
+    fn generatedLocalUseType(
+        self: *BodyContext,
+        local_ty: Type.TypeId,
+        expected_ty: Type.TypeId,
+    ) Allocator.Error!?Type.TypeId {
+        if (!self.isGeneratedSpecializationEvidenceType(local_ty)) return null;
+        if (self.isGeneratedSpecializationEvidenceType(expected_ty)) {
+            if (self.isGeneratedIteratorEvidenceType(local_ty) and self.isGeneratedIteratorEvidenceType(expected_ty)) {
+                const stable_local = try self.stableGeneratedIteratorEvidenceType(local_ty);
+                const stable_expected = try self.stableGeneratedIteratorEvidenceType(expected_ty);
+                if (self.sameType(stable_expected, stable_local)) return local_ty;
+            }
+            return null;
+        }
+
+        const public_local = try self.publicOpaqueUnificationType(local_ty);
+        const public_expected = try self.publicOpaqueUnificationType(expected_ty);
+        if (self.samePublicOpaqueType(public_expected, public_local)) return local_ty;
+        return null;
+    }
+
+    fn samePublicOpaqueType(self: *BodyContext, expected: Type.TypeId, actual: Type.TypeId) bool {
+        var visiting = std.AutoHashMap(TypePair, void).init(self.allocator);
+        defer visiting.deinit();
+        return self.samePublicOpaqueTypeInner(expected, actual, &visiting);
+    }
+
+    fn samePublicOpaqueTypeInner(
+        self: *BodyContext,
+        expected: Type.TypeId,
+        actual: Type.TypeId,
+        visiting: *std.AutoHashMap(TypePair, void),
+    ) bool {
+        if (expected == actual) return true;
+        if (monoAliasBacking(&self.builder.program.types, expected)) |backing| {
+            if (self.samePublicOpaqueTypeInner(backing, actual, visiting)) return true;
+        }
+        if (monoAliasBacking(&self.builder.program.types, actual)) |backing| {
+            if (self.samePublicOpaqueTypeInner(expected, backing, visiting)) return true;
+        }
+
+        const pair = TypePair{ .expected = expected, .actual = actual };
+        if (visiting.contains(pair)) return true;
+        visiting.put(pair, {}) catch Common.invariant("public opaque type equality could not record a recursive type pair");
+        defer _ = visiting.remove(pair);
+
+        const expected_content = self.builder.program.types.get(expected);
+        const actual_content = self.builder.program.types.get(actual);
+        return switch (expected_content) {
+            .primitive => |primitive| switch (actual_content) {
+                .primitive => |actual_primitive| primitive == actual_primitive,
+                else => false,
+            },
+            .named => |named| switch (actual_content) {
+                .named => |actual_named| self.samePublicOpaqueNamedType(named, actual_named, visiting),
+                else => false,
+            },
+            .record => |fields| switch (actual_content) {
+                .record => |actual_fields| self.samePublicOpaqueRecordFieldNames(fields, actual_fields, visiting),
+                else => false,
+            },
+            .tuple => |items| switch (actual_content) {
+                .tuple => |actual_items| self.samePublicOpaqueTypeSpans(items, actual_items, visiting),
+                else => false,
+            },
+            .tag_union => |tags| switch (actual_content) {
+                .tag_union => |actual_tags| self.samePublicOpaqueTags(tags, actual_tags, visiting),
+                else => false,
+            },
+            .list => |elem| switch (actual_content) {
+                .list => |actual_elem| self.samePublicOpaqueTypeInner(elem, actual_elem, visiting),
+                else => false,
+            },
+            .box => |elem| switch (actual_content) {
+                .box => |actual_elem| self.samePublicOpaqueTypeInner(elem, actual_elem, visiting),
+                else => false,
+            },
+            .func => |function| switch (actual_content) {
+                .func => |actual_function| self.samePublicOpaqueTypeSpans(function.args, actual_function.args, visiting) and
+                    self.samePublicOpaqueTypeInner(function.ret, actual_function.ret, visiting),
+                else => false,
+            },
+            .erased => |erased| switch (actual_content) {
+                .erased => |actual_erased| std.mem.eql(u8, erased.bytes[0..], actual_erased.bytes[0..]),
+                else => false,
+            },
+            .zst => switch (actual_content) {
+                .zst => true,
+                else => false,
+            },
+        };
+    }
+
+    fn samePublicOpaqueNamedType(
+        self: *BodyContext,
+        expected: anytype,
+        actual: anytype,
+        visiting: *std.AutoHashMap(TypePair, void),
+    ) bool {
+        if (expected.def.module != actual.def.module) return false;
+        if (expected.def.source_decl != actual.def.source_decl) return false;
+        if (expected.def.source_decl == null and expected.def.type_name != actual.def.type_name) return false;
+        if (expected.kind != actual.kind) return false;
+        if (!publicOpaqueBuiltinOwnersCompatible(expected.builtin_owner, actual.builtin_owner)) return false;
+        if (!self.samePublicOpaqueTypeSpans(expected.args, actual.args, visiting)) return false;
+        if (expected.kind == .@"opaque") return true;
+        if (!self.sameNamedBacking(expected.backing, actual.backing, visiting)) return false;
+        return self.sameDeclaredOrder(expected.declared_order, actual.declared_order, visiting);
+    }
+
+    fn samePublicOpaqueTypeSpans(
+        self: *BodyContext,
+        expected: Type.Span,
+        actual: Type.Span,
+        visiting: *std.AutoHashMap(TypePair, void),
+    ) bool {
+        const expected_items = self.builder.program.types.span(expected);
+        const actual_items = self.builder.program.types.span(actual);
+        if (expected_items.len != actual_items.len) return false;
+        for (0..expected_items.len) |index| {
+            const expected_item = GuardedList.at(expected_items, index);
+            const actual_item = GuardedList.at(actual_items, index);
+            if (!self.samePublicOpaqueTypeInner(expected_item, actual_item, visiting)) return false;
+        }
+        return true;
+    }
+
+    fn samePublicOpaqueRecordFieldNames(
+        self: *BodyContext,
+        expected: Type.Span,
+        actual: Type.Span,
+        visiting: *std.AutoHashMap(TypePair, void),
+    ) bool {
+        const expected_fields = self.builder.program.types.fieldSpan(expected);
+        const actual_fields = self.builder.program.types.fieldSpan(actual);
+        if (expected_fields.len != actual_fields.len) return false;
+        for (0..expected_fields.len) |index| {
+            const expected_field = GuardedList.at(expected_fields, index);
+            const actual_field = GuardedList.at(actual_fields, index);
+            if (expected_field.name != actual_field.name) return false;
+            if (!self.samePublicOpaqueTypeInner(expected_field.ty, actual_field.ty, visiting)) return false;
+        }
+        return true;
+    }
+
+    fn samePublicOpaqueTags(
+        self: *BodyContext,
+        expected: Type.Span,
+        actual: Type.Span,
+        visiting: *std.AutoHashMap(TypePair, void),
+    ) bool {
+        const expected_tags = self.builder.program.types.tagSpan(expected);
+        const actual_tags = self.builder.program.types.tagSpan(actual);
+        if (expected_tags.len != actual_tags.len) return false;
+        for (0..expected_tags.len) |index| {
+            const expected_tag = GuardedList.at(expected_tags, index);
+            const actual_tag = GuardedList.at(actual_tags, index);
+            if (expected_tag.name != actual_tag.name or expected_tag.checked_name != actual_tag.checked_name) return false;
+            if (!self.samePublicOpaqueTypeSpans(expected_tag.payloads, actual_tag.payloads, visiting)) return false;
+        }
+        return true;
+    }
+
+    fn publicOpaqueBuiltinOwnersCompatible(left: ?static_dispatch.BuiltinOwner, right: ?static_dispatch.BuiltinOwner) bool {
+        if (left == right) return true;
+        if (left) |left_owner| {
+            if (right == null and static_dispatch.isIteratorOwner(left_owner)) return true;
+        }
+        if (right) |right_owner| {
+            if (left == null and static_dispatch.isIteratorOwner(right_owner)) return true;
+        }
+        return false;
     }
 
     fn sameType(self: *BodyContext, expected: Type.TypeId, actual: Type.TypeId) bool {
@@ -16725,6 +18748,9 @@ const BodyContext = struct {
         if (expected.def.module != actual.def.module) return false;
         if (expected.def.source_decl != actual.def.source_decl) return false;
         if (expected.def.source_decl == null and expected.def.type_name != actual.def.type_name) return false;
+        if (!optionalDigestEql(expected.def.generated, actual.def.generated)) return false;
+        if (expected.def.iterator_representation != actual.def.iterator_representation) return false;
+        if (expected.def.iterator_depth != actual.def.iterator_depth) return false;
         if (expected.kind != actual.kind) return false;
         if (expected.builtin_owner != actual.builtin_owner) return false;
         if (!self.sameTypeSpans(expected.args, actual.args, visiting)) return false;
@@ -16887,7 +18913,8 @@ const BodyContext = struct {
         const lambda = self.view.bodies.expr(closure.lambda);
         return switch (lambda.data) {
             .lambda => blk: {
-                const nested = try self.builder.fnTemplateForNestedExprWithMono(self.view, self.owner_template, expr_id, lambda.ty, self.view.types.rootKey(lambda.ty), closure_ty, try self.lexicalContextKey());
+                var nested = try self.builder.fnTemplateForNestedExprWithMono(self.view, self.owner_template, expr_id, lambda.ty, self.view.types.rootKey(lambda.ty), closure_ty, try self.lexicalContextKey());
+                nested.fn_def.nested.local_proc_context_digest = try self.localProcContextsDigest();
                 switch (nested.fn_def) {
                     .nested => {},
                     else => Common.invariant("closure expression was not assigned a nested function identity"),
@@ -17079,10 +19106,11 @@ const BodyContext = struct {
                 .encoder => try self.lowerStructuralEncoderFor(plan, callable_mono_ty, plan_ret_ty, self, pre_lowered),
             };
         }
-        const target_mono_ty = try self.methodTargetMonoTypeFromPlan(resolved, callable_mono_ty);
+        const target_mono_ty = (try self.generatedIteratorMethodTargetFunctionType(resolved, callable_mono_ty, plan_args, expected_ret_ty)) orelse
+            try self.methodTargetMonoTypeFromPlan(resolved, callable_mono_ty);
         try call_ctx.constrainTypeToMono(plan.callable_ty, target_mono_ty);
         const refreshed_target_mono_ty = try self.activeTypeFromType(target_mono_ty);
-        if (!self.sameType(callable_mono_ty, refreshed_target_mono_ty)) {
+        if (!try self.sameTypeOrPublicOpaque(callable_mono_ty, refreshed_target_mono_ty)) {
             Common.invariant("checked dispatch target callable type differed from dispatch plan callable type");
         }
         const fn_data = self.builder.functionShape(refreshed_target_mono_ty, "checked dispatch target had a non-function type");
@@ -17091,7 +19119,7 @@ const BodyContext = struct {
         const ret_ty = try self.activeTypeFromType(fn_data.ret);
         if (expected_ret_ty) |expected| {
             const expected_ty = try self.activeTypeFromType(expected);
-            if (!self.sameType(expected_ty, ret_ty)) Common.invariant("checked dispatch expression lowered at a type different from its call operand type");
+            if (!try self.sameTypeOrPublicOpaque(expected_ty, ret_ty)) Common.invariant("checked dispatch expression lowered at a type different from its call operand type");
         }
         const call_expr = try self.addExpr(.{
             .ty = ret_ty,
@@ -17755,9 +19783,10 @@ const BodyContext = struct {
             try self.constrainTypeToMono(checked_ret_ty, plan_ret_ty);
             return plan_ret_ty;
         }
-        const target_mono_ty = try self.methodTargetMonoTypeFromPlan(resolved, callable_mono_ty);
+        const target_mono_ty = (try self.generatedIteratorMethodTargetFunctionType(resolved, callable_mono_ty, plan_args, expected_ret_ty)) orelse
+            try self.methodTargetMonoTypeFromPlan(resolved, callable_mono_ty);
         try call_ctx.constrainTypeToMono(plan.callable_ty, target_mono_ty);
-        if (!self.sameType(callable_mono_ty, target_mono_ty)) {
+        if (!try self.sameTypeOrPublicOpaque(callable_mono_ty, target_mono_ty)) {
             Common.invariant("checked dispatch target callable type differed from dispatch plan callable type");
         }
         const ret_ty = self.functionReturnType(target_mono_ty);
@@ -17980,6 +20009,50 @@ const BodyContext = struct {
         var target_ctx = try self.methodTargetContext(lookup);
         defer target_ctx.deinit();
         return try target_ctx.instantiateTargetCallTypeFromMonoArgs(lookup.target.callable_ty, plan_args, plan_fn.ret);
+    }
+
+    fn generatedIteratorMethodTargetFunctionType(
+        self: *BodyContext,
+        lookup: MethodLookup,
+        mono_fn_ty: Type.TypeId,
+        operands: []const static_dispatch.StaticDispatchOperand,
+        expected_ret_ty: ?Type.TypeId,
+    ) Allocator.Error!?Type.TypeId {
+        const text = self.builtinProcedureTextForMethodLookup(lookup) orelse return null;
+        const checked_args = (try self.checkedExprDispatchOperands(operands)) orelse return null;
+        defer self.allocator.free(checked_args);
+        return try self.generatedIteratorBuiltinFunctionType(text, mono_fn_ty, checked_args, expected_ret_ty);
+    }
+
+    fn checkedExprDispatchOperands(
+        self: *BodyContext,
+        operands: []const static_dispatch.StaticDispatchOperand,
+    ) Allocator.Error!?[]checked.CheckedExprId {
+        const checked_args = try self.allocator.alloc(checked.CheckedExprId, operands.len);
+        errdefer self.allocator.free(checked_args);
+        for (operands, 0..) |operand, index| {
+            checked_args[index] = switch (operand) {
+                .checked_expr => |expr| expr,
+                .generated_interpolation_iter,
+                .generated_numeral,
+                .generated_quote,
+                => {
+                    self.allocator.free(checked_args);
+                    return null;
+                },
+            };
+        }
+        return checked_args;
+    }
+
+    fn builtinProcedureTextForMethodLookup(_: *BodyContext, lookup: MethodLookup) ?[]const u8 {
+        return switch (lookup.target.kind) {
+            .procedure => |procedure| builtinProcedureTextForTemplate(lookup.view, procedure.template),
+            .local_proc,
+            .generated_structural_parser,
+            .generated_structural_encoder,
+            => null,
+        };
     }
 
     fn methodTargetMonoTypePreservingSourceArgsAndRet(
@@ -23447,7 +25520,10 @@ const BodyContext = struct {
         try self.constrainTypeToMono(plan.iterator_ty, step.skip_rest.ty);
         const item_ty = step.one_item.ty;
         try self.constrainTypeToMono(plan.item_ty, item_ty);
-        const step_expected_ty = try self.lowerTypeView(plan.step_ty);
+        const step_expected_ty = if (self.isGeneratedIteratorEvidenceType(iterator_ty))
+            try self.generatedIteratorStepReturnType(iterator_ty)
+        else
+            try self.lowerTypeView(plan.step_ty);
         const iterator_local = try self.addLocal(self.builder.symbols.fresh(), iterator_ty);
         const iterator_param = BodyTypedLocal{ .local = iterator_local, .ty = iterator_ty };
 
@@ -23556,6 +25632,10 @@ const BodyContext = struct {
         const plan_args = plan.argsSlice(self.view.static_dispatch_plans);
         if (plan.dispatcher_arg_index >= plan_args.len) Common.invariant("iterator dispatch plan dispatcher argument index was outside the argument span");
 
+        if (try self.lowerGeneratedIteratorDispatch(plan, plan_args, loop_iterator, expected_ret_ty)) |generated| {
+            return generated;
+        }
+
         var call_ctx = try BodyContext.init(self.allocator, self.builder, self.view, self.owner_template, self.graph, self.draft);
         call_ctx.evidence = self.evidence;
         defer call_ctx.deinit();
@@ -23619,6 +25699,39 @@ const BodyContext = struct {
                 .args = try self.addExprSpan(args),
             } },
         });
+    }
+
+    fn lowerGeneratedIteratorDispatch(
+        self: *BodyContext,
+        plan: static_dispatch.IteratorDispatchCall,
+        plan_args: []const static_dispatch.IteratorDispatchOperand,
+        loop_iterator: ?BodyTypedLocal,
+        expected_ret_ty: ?Type.TypeId,
+    ) Allocator.Error!?DraftExprId {
+        const method_text = self.view.names.methodNameText(plan.method);
+        if (!Ident.textEql(method_text, "iter") and !Ident.textEql(method_text, "next")) return null;
+
+        const dispatcher_ty = (try self.iteratorOperandMonoType(plan_args[plan.dispatcher_arg_index], loop_iterator, null)) orelse
+            Common.invariant("iterator dispatch plan dispatcher operand did not have a Monotype");
+        if (!self.isGeneratedIteratorEvidenceType(dispatcher_ty)) return null;
+
+        if (Ident.textEql(method_text, "iter")) {
+            if (expected_ret_ty) |expected| {
+                if (!try self.sameTypeOrPublicOpaque(expected, dispatcher_ty)) {
+                    Common.invariant("generated iterator .iter dispatch result differed from expected type");
+                }
+            }
+            return try self.lowerIteratorOperandAtType(plan_args[plan.dispatcher_arg_index], loop_iterator, dispatcher_ty);
+        }
+
+        const step_ret_ty = try self.generatedIteratorStepReturnType(dispatcher_ty);
+        if (expected_ret_ty) |expected| {
+            if (!try self.sameTypeOrPublicOpaque(expected, step_ret_ty)) {
+                Common.invariant("generated iterator .next dispatch result differed from expected type");
+            }
+        }
+        const iterator = try self.lowerIteratorOperandAtType(plan_args[plan.dispatcher_arg_index], loop_iterator, dispatcher_ty);
+        return try self.lowerGeneratedIteratorNextExpr(iterator, dispatcher_ty);
     }
 
     fn instantiateIteratorPlanCallTypeFromCaller(
@@ -24479,7 +26592,7 @@ const BodyContext = struct {
     }
 
     fn lowerPatternAtType(self: *BodyContext, pattern_id: checked.CheckedPatternId, ty: Type.TypeId) Allocator.Error!DraftPatId {
-        return try self.lowerPatternAtTypeCell(pattern_id, try self.draftTypeCell(ty), ty);
+        return try self.lowerPatternAtTypeCell(pattern_id, try self.draftTypeCellPreservingGenerated(ty), ty);
     }
 
     fn lowerPatternAtTypeCell(
@@ -24491,7 +26604,13 @@ const BodyContext = struct {
         const pattern = self.view.bodies.pattern(pattern_id);
         switch (pattern.data) {
             .assign => {},
-            else => try self.constrainTypeToCell(pattern.ty, ty_cell),
+            else => {
+                if (try self.builder.monoTypeHasGeneratedOpaqueEvidence(ty)) {
+                    try self.constrainTypeToMono(pattern.ty, try self.publicOpaqueUnificationType(ty));
+                } else {
+                    try self.constrainTypeToCell(pattern.ty, ty_cell);
+                }
+            },
         }
         const data: BodyPatData = switch (pattern.data) {
             .pending,
@@ -24525,7 +26644,7 @@ const BodyContext = struct {
                     self.builder.namedBackingType(ty) orelse ty;
                 break :blk .{ .nominal = try self.lowerPatternAtTypeCell(
                     nominal.backing_pattern,
-                    try self.draftTypeCell(backing_ty),
+                    try self.draftTypeCellPreservingGenerated(backing_ty),
                     backing_ty,
                 ) };
             },
@@ -25422,6 +27541,19 @@ fn restoredConstFnContextKey(
     return .{ .bytes = hasher.finalResult() };
 }
 
+fn restoredLocalProcUseContextKey(
+    restored_fn_key: names.TypeDigest,
+    source_contexts: names.TypeDigest,
+    binder: checked.PatternBinderId,
+) names.TypeDigest {
+    var hasher = std.crypto.hash.sha2.Sha256.init(.{});
+    hasher.update("roc.monotype.restored_local_proc_context");
+    hasher.update(&restored_fn_key.bytes);
+    hasher.update(&source_contexts.bytes);
+    hashU32(&hasher, @intFromEnum(binder));
+    return .{ .bytes = hasher.finalResult() };
+}
+
 fn parserEncodingCaptureId() u32 {
     return 0;
 }
@@ -25763,7 +27895,16 @@ fn verifyMonotypeCallTargets(program: *const Ast.Program) void {
 fn sameTypeDef(left: Type.TypeDef, right: Type.TypeDef) bool {
     return left.module == right.module and
         left.type_name == right.type_name and
-        left.source_decl == right.source_decl;
+        left.source_decl == right.source_decl and
+        optionalDigestEql(left.generated, right.generated) and
+        left.iterator_representation == right.iterator_representation and
+        left.iterator_depth == right.iterator_depth;
+}
+
+fn optionalDigestEql(left: ?names.TypeDigest, right: ?names.TypeDigest) bool {
+    if (left == null and right == null) return true;
+    if (left == null or right == null) return false;
+    return std.mem.eql(u8, left.?.bytes[0..], right.?.bytes[0..]);
 }
 
 const CheckedTypeAddress = struct {

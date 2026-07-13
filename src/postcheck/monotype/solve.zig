@@ -724,11 +724,44 @@ pub const InstGraph = struct {
                         try self.unifyThroughBacking(right, right_content, left, pending);
                         return;
                     }
+                    if (isPublicMintedIteratorPair(left_named, right_named)) {
+                        if (left_named.args.len == 0 or right_named.args.len == 0) {
+                            Common.invariant("minted/public iterator pair reached Monotype instantiation without a public item argument");
+                        }
+                        try pending.append(self.allocator, .{
+                            .left = left_named.args[0],
+                            .right = right_named.args[0],
+                        });
+                        if (left_named.def.iterator_representation == .minted) {
+                            try self.union_(left, right);
+                        } else {
+                            try self.union_(right, left);
+                        }
+                        return;
+                    }
+                    if (isForcedDynamicIteratorPair(left_named, right_named)) {
+                        if (left_named.args.len == 0 or right_named.args.len == 0) {
+                            Common.invariant("forced-dynamic iterator reached Monotype instantiation without a public item argument");
+                        }
+                        try pending.append(self.allocator, .{
+                            .left = left_named.args[0],
+                            .right = right_named.args[0],
+                        });
+                        if (left_named.def.iterator_representation == .forced_dynamic) {
+                            try self.union_(left, right);
+                        } else {
+                            try self.union_(right, left);
+                        }
+                        return;
+                    }
                     if (std.meta.eql(left_named.def, right_named.def) and left_named.args.len == right_named.args.len) {
                         for (left_named.args, right_named.args) |left_arg, right_arg| {
                             try pending.append(self.allocator, .{ .left = left_arg, .right = right_arg });
                         }
-                        if (!sameBuiltinOwner(left_named.builtin_owner, right_named.builtin_owner, .fields)) {
+                        if (!sameBuiltinOwner(left_named.builtin_owner, right_named.builtin_owner, .fields) and
+                            !eitherBuiltinOwner(left_named.builtin_owner, right_named.builtin_owner, .iter) and
+                            !eitherBuiltinOwner(left_named.builtin_owner, right_named.builtin_owner, .stream))
+                        {
                             if (left_named.backing) |left_backing| {
                                 if (right_named.backing) |right_backing| {
                                     try pending.append(self.allocator, .{ .left = left_backing.node, .right = right_backing.node });
@@ -892,7 +925,17 @@ pub const InstGraph = struct {
 
     fn sameTypeDef(left: Type.TypeDef, right: Type.TypeDef) bool {
         return left.module == right.module and
-            left.type_name == right.type_name;
+            left.type_name == right.type_name and
+            left.source_decl == right.source_decl and
+            optionalDigestEql(left.generated, right.generated) and
+            left.iterator_representation == right.iterator_representation and
+            left.iterator_depth == right.iterator_depth;
+    }
+
+    fn optionalDigestEql(left: ?names.TypeDigest, right: ?names.TypeDigest) bool {
+        if (left == null and right == null) return true;
+        if (left == null or right == null) return false;
+        return std.mem.eql(u8, left.?.bytes[0..], right.?.bytes[0..]);
     }
 
     const RowKind = enum {
@@ -1634,10 +1677,10 @@ pub const InstGraph = struct {
     ) Allocator.Error!Type.TypeId {
         const ty = existing orelse return try self.monoFor(node);
         const root = self.find(node);
-        const previous_root = if (self.mono_nodes.get(ty)) |mapped| self.find(mapped) else null;
+        const previous_root = self.monoViewNode(ty) orelse return try self.monoFor(root);
         try self.mono_nodes.put(ty, root);
         try self.registerMonoView(root, ty);
-        if (previous_root == null or previous_root.? != root) {
+        if (previous_root != root) {
             try self.queueDirty(root);
         }
         return ty;
@@ -1648,15 +1691,17 @@ pub const InstGraph = struct {
         nodes_slice: []const NodeId,
         existing: ?Type.Span,
     ) Allocator.Error![]Type.TypeId {
+        const existing_copy = if (existing) |old_span| blk: {
+            const old = self.types.span(old_span);
+            break :blk if (old.len == nodes_slice.len) try GuardedList.dupe(self.allocator, Type.TypeId, old) else null;
+        } else null;
+        defer if (existing_copy) |old| self.allocator.free(old);
+
         const out = try self.arena().alloc(Type.TypeId, nodes_slice.len);
         for (nodes_slice, 0..) |node, index| {
-            const existing_ty: ?Type.TypeId = if (existing) |span| existing_ty: {
-                const old = self.types.span(span);
-                break :existing_ty if (old.len == nodes_slice.len) GuardedList.at(old, index) else null;
-            } else null;
             out[index] = try self.monoForWithReuse(
                 node,
-                existing_ty,
+                if (existing_copy) |old| old[index] else null,
             );
         }
         return out;
@@ -1811,6 +1856,11 @@ pub const GraphTypeFinals = struct {
     }
 
     pub fn sealType(self: *GraphTypeFinals, ty: Type.TypeId) Allocator.Error!Type.TypeId {
+        if (self.isGeneratedIteratorEvidenceType(ty)) {
+            if (self.graph.monoViewNode(ty) != null) return try self.sealStoreType(ty);
+            if (try self.typeHasGraphViews(ty)) return try self.sealStoreType(ty);
+            return ty;
+        }
         if (self.graph.mono_nodes.get(ty)) |raw_node| {
             const node = self.graph.find(raw_node);
             if (self.graph.node_monos.get(node)) |views| {
@@ -1821,6 +1871,19 @@ pub const GraphTypeFinals = struct {
         }
         if (try self.typeHasGraphViews(ty)) return try self.sealStoreType(ty);
         return ty;
+    }
+
+    fn isGeneratedIteratorEvidenceType(self: *GraphTypeFinals, ty: Type.TypeId) bool {
+        return switch (self.graph.types.get(ty)) {
+            .named => |named| switch (named.def.iterator_representation) {
+                .minted, .forced_dynamic => switch (named.builtin_owner orelse return false) {
+                    .iter, .stream => true,
+                    else => false,
+                },
+                .none => false,
+            },
+            else => false,
+        };
     }
 
     pub fn sealNode(self: *GraphTypeFinals, raw_node: NodeId) Allocator.Error!Type.TypeId {
@@ -2261,6 +2324,54 @@ fn sameBuiltinOwner(left: ?static_dispatch.BuiltinOwner, right: ?static_dispatch
     return left_owner == owner and right_owner == owner;
 }
 
+fn eitherBuiltinOwner(left: ?static_dispatch.BuiltinOwner, right: ?static_dispatch.BuiltinOwner, owner: static_dispatch.BuiltinOwner) bool {
+    if (left) |left_owner| {
+        if (left_owner == owner) return true;
+    }
+    if (right) |right_owner| {
+        if (right_owner == owner) return true;
+    }
+    return false;
+}
+
+fn isForcedDynamicIteratorPair(left: InstNamed, right: InstNamed) bool {
+    if (left.kind != right.kind) return false;
+    if (left.def.module != right.def.module or
+        left.def.type_name != right.def.type_name or
+        left.def.source_decl != right.def.source_decl)
+    {
+        return false;
+    }
+    if (!isIteratorLikeOwnerPair(left.builtin_owner, right.builtin_owner)) return false;
+    return (left.def.iterator_representation == .forced_dynamic) !=
+        (right.def.iterator_representation == .forced_dynamic);
+}
+
+fn isPublicMintedIteratorPair(left: InstNamed, right: InstNamed) bool {
+    if (left.kind != right.kind) return false;
+    if (left.def.module != right.def.module or
+        left.def.type_name != right.def.type_name or
+        left.def.source_decl != right.def.source_decl)
+    {
+        return false;
+    }
+    if (!isIteratorLikeOwnerPair(left.builtin_owner, right.builtin_owner)) return false;
+    return (left.def.iterator_representation == .minted and right.def.iterator_representation == .none) or
+        (left.def.iterator_representation == .none and right.def.iterator_representation == .minted);
+}
+
+fn isIteratorLikeOwnerPair(left: ?static_dispatch.BuiltinOwner, right: ?static_dispatch.BuiltinOwner) bool {
+    const owner = left orelse right orelse return false;
+    if (owner != .iter and owner != .stream) return false;
+    if (left) |left_owner| {
+        if (left_owner != owner) return false;
+    }
+    if (right) |right_owner| {
+        if (right_owner != owner) return false;
+    }
+    return true;
+}
+
 fn testCheckedTypeId(comptime value: u32) checked.CheckedTypeId {
     comptime std.debug.assert(value != 0);
     return @enumFromInt(value);
@@ -2605,6 +2716,71 @@ test "unconstrained checked graph node seals to empty tag union" {
     const sealed = try graph.sealNode(node);
     const content = type_store.get(sealed);
     try std.testing.expectEqual(Type.Span.empty(), content.tag_union);
+}
+
+test "minted iterator unification with its public type preserves the minted backing" {
+    const gpa = std.testing.allocator;
+
+    var type_store = Type.Store.init(gpa);
+    defer type_store.deinit();
+
+    var name_store = names.NameStore.init(gpa);
+    defer name_store.deinit();
+
+    var unsolved_monos = std.AutoHashMap(Type.TypeId, void).init(gpa);
+    defer unsolved_monos.deinit();
+
+    const graph = try InstGraph.create(gpa, &type_store, &name_store, &unsolved_monos);
+    defer graph.destroy();
+
+    const module_identity = try name_store.internModuleIdentity(&([_]u8{0xA7} ** 32));
+    const type_name = try name_store.internTypeName("Builtin.Iter");
+    const named_type: Type.NamedType = .{ .module = .{}, .ty = testCheckedTypeId(5) };
+    const public_def: Type.TypeDef = .{
+        .module = module_identity,
+        .type_name = type_name,
+        .source_decl = 62,
+    };
+    var minted_def = public_def;
+    minted_def.generated = .{ .bytes = [_]u8{0x5A} ** 32 };
+    minted_def.iterator_representation = .minted;
+    minted_def.iterator_depth = 1;
+
+    const item = try graph.newNode(.{ .primitive = .u64 });
+    const public_backing = try graph.newNode(.empty_record);
+    const minted_backing = try graph.newNode(.empty_record);
+    const public_args = try graph.arena().alloc(NodeId, 1);
+    public_args[0] = item;
+    const minted_args = try graph.arena().alloc(NodeId, 1);
+    minted_args[0] = item;
+
+    const public_iter = try graph.newNode(.{ .named = .{
+        .named_type = named_type,
+        .def = public_def,
+        .kind = .@"opaque",
+        .builtin_owner = .iter,
+        .args = public_args,
+        .backing = .{ .node = public_backing, .use = .inspectable },
+    } });
+    const minted_iter = try graph.newNode(.{ .named = .{
+        .named_type = named_type,
+        .def = minted_def,
+        .kind = .@"opaque",
+        .builtin_owner = .iter,
+        .args = minted_args,
+        .backing = .{ .node = minted_backing, .use = .inspectable },
+    } });
+
+    try graph.unify(public_iter, minted_iter);
+
+    try std.testing.expectEqual(graph.find(public_iter), graph.find(minted_iter));
+    const unified = switch (graph.content(minted_iter)) {
+        .named => |named| named,
+        else => return error.TestUnexpectedResult,
+    };
+    try std.testing.expectEqual(Type.IteratorRepresentation.minted, unified.def.iterator_representation);
+    try std.testing.expectEqual(minted_backing, unified.backing.?.node);
+    try std.testing.expect(graph.find(public_backing) != graph.find(minted_backing));
 }
 
 test "issue 9647: unresolved tag row extension absorbs rest without allocating a rest node" {

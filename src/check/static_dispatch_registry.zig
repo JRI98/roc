@@ -100,7 +100,19 @@ pub const BuiltinOwner = enum(u8) {
     crypto_sha256_hasher,
     crypto_blake3_digest,
     crypto_blake3_hasher,
+    iter,
+    stream,
 };
+
+/// The builtin `Iter`/`Stream` nominals hold their step closure by value inside
+/// a finite backing record. Later stages consult this to keep that closure a
+/// lambda set (inline captures) instead of erasing it to a boxed callable.
+pub fn isIteratorOwner(owner: BuiltinOwner) bool {
+    return switch (owner) {
+        .iter, .stream => true,
+        else => false,
+    };
+}
 
 /// Public `MethodKey` declaration.
 pub const MethodKey = struct {

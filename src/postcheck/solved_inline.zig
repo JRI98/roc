@@ -227,6 +227,7 @@ const WrapperAnalyzer = struct {
                 return true;
             },
             .tag => |tag| self.exprSpanReadsOnlyArgs(tag.payloads, args),
+            .static_data_candidate => |candidate| self.exprReadsOnlyArgs(candidate.runtime_expr, args),
             .nominal,
             .dbg,
             .expect,
@@ -328,6 +329,7 @@ const WrapperAnalyzer = struct {
                 }
             },
             .tag => |tag| try self.visitSpanCallees(tag.payloads),
+            .static_data_candidate => |candidate| try self.visitBodyCallees(candidate.runtime_expr),
             .nominal,
             .dbg,
             .expect,
