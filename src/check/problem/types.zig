@@ -37,6 +37,7 @@ pub const Problem = union(enum) {
     nominal_type_resolution_failed: NominalTypeResolutionFailed,
     recursive_alias: RecursiveAlias,
     unsupported_alias_where_clause: UnsupportedAliasWhereClause,
+    where_clause_receiver_not_introduced: WhereClauseReceiverNotIntroduced,
     invalid_nominal_decl_recursion: InvalidNominalDeclRecursion,
     infinite_recursion: VarWithSnapshot,
     anonymous_recursion: VarWithSnapshot,
@@ -496,5 +497,13 @@ pub const RecursiveAlias = struct {
 /// This syntax was used for abilities which have been removed from the language
 pub const UnsupportedAliasWhereClause = struct {
     alias_name: base.Ident.Idx,
+    region: base.Region,
+};
+
+/// Error when a where clause attempts to add a constraint to a rigid type
+/// variable introduced by a different annotation.
+pub const WhereClauseReceiverNotIntroduced = struct {
+    type_var_name: base.Ident.Idx,
+    method_name: base.Ident.Idx,
     region: base.Region,
 };

@@ -3677,7 +3677,7 @@ fn canonicalizeAssociatedItems(
                         try self.env.store.addScratchWhereClause(canonicalized_where);
                     }
 
-                    break :blk try self.env.store.whereClauseSpanFrom(where_start);
+                    break :blk try self.env.store.whereClauseSpanFrom(where_start, type_anno_idx);
                 } else null;
 
                 // Now, check the next stmt to see if it matches this anno
@@ -4238,7 +4238,7 @@ pub fn canonicalizeFile(
                         try self.env.store.addScratchWhereClause(canonicalized_where);
                     }
 
-                    break :blk try self.env.store.whereClauseSpanFrom(where_start);
+                    break :blk try self.env.store.whereClauseSpanFrom(where_start, type_anno_idx);
                 } else null;
 
                 // Now, check the next non-malformed stmt to see if it matches this anno
@@ -9202,7 +9202,7 @@ fn canonicalizeStandaloneTypeAnnoStatement(
             const canonicalized_where = try self.canonicalizeWhereClause(where_idx, .local_anno);
             try self.env.store.addScratchWhereClause(canonicalized_where);
         }
-        break :inner_blk try self.env.store.whereClauseSpanFrom(where_start);
+        break :inner_blk try self.env.store.whereClauseSpanFrom(where_start, type_anno_idx);
     } else null;
 
     if (type_anno.is_var) {
@@ -11037,7 +11037,7 @@ fn runExprKernel(
                             const canonicalized_where = try self.canonicalizeWhereClause(where_idx, .local_anno);
                             try self.env.store.addScratchWhereClause(canonicalized_where);
                         }
-                        break :inner_blk try self.env.store.whereClauseSpanFrom(where_start);
+                        break :inner_blk try self.env.store.whereClauseSpanFrom(where_start, type_anno_idx);
                     } else null;
 
                     const next_i = state.next + 1;
