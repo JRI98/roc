@@ -2075,6 +2075,7 @@ pub const ExposedItem = union(enum) {
     },
     upper_ident_star: struct {
         ident: Token.Idx,
+        qualifiers: Token.Span,
         region: TokenizedRegion,
     },
     malformed: struct {
@@ -2149,8 +2150,8 @@ pub const ExposedItem = union(enum) {
                 try ast.appendRegionInfoToSexprTree(env, tree, i.region);
 
                 // text attribute
-                const token = ast.tokens.tokens.get(i.ident);
-                const text = env.getIdent(token.extra.interned);
+                const strip_tokens = [_]Token.Tag{ .NoSpaceDotLowerIdent, .NoSpaceDotUpperIdent };
+                const text = ast.resolveQualifiedName(i.qualifiers, i.ident, &strip_tokens);
                 try tree.pushStringPair("text", text);
                 const attrs = tree.beginNode();
                 try tree.endNode(begin, attrs);

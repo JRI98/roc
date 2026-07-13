@@ -214,6 +214,7 @@ pub const Resolver = struct {
 
         return switch (checkedTypePayload(artifact, checked_type)) {
             .pending => unreachable,
+            .err => unreachable,
             .flex, .rigid => if (parent_context == .heap_indirect)
                 .{ .canonical = .opaque_ptr }
             else

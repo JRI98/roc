@@ -2185,6 +2185,18 @@ fn registerTypeDecl(
             type_header.name,
             type_decl_stmt_idx,
         );
+        if (ast_stmt_idx) |idx| {
+            if (self.parserTypePathForAstStatement(idx)) |path| {
+                const source_path_name = try self.typePathIdent(path, false);
+                if (!source_path_name.eql(type_header.name)) {
+                    try self.introduceAssociatedTypeAliasInScope(
+                        self.scopes.items.len - 1,
+                        source_path_name,
+                        type_decl_stmt_idx,
+                    );
+                }
+            }
+        }
     }
 
     // Process type parameters and annotation in a separate scope
@@ -3665,7 +3677,7 @@ fn canonicalizeAssociatedItems(
                         try self.env.store.addScratchWhereClause(canonicalized_where);
                     }
 
-                    break :blk try self.env.store.whereClauseSpanFrom(where_start);
+                    break :blk try self.env.store.whereClauseSpanFrom(where_start, type_anno_idx);
                 } else null;
 
                 // Now, check the next stmt to see if it matches this anno
@@ -4226,7 +4238,7 @@ pub fn canonicalizeFile(
                         try self.env.store.addScratchWhereClause(canonicalized_where);
                     }
 
-                    break :blk try self.env.store.whereClauseSpanFrom(where_start);
+                    break :blk try self.env.store.whereClauseSpanFrom(where_start, type_anno_idx);
                 } else null;
 
                 // Now, check the next non-malformed stmt to see if it matches this anno
@@ -9190,7 +9202,7 @@ fn canonicalizeStandaloneTypeAnnoStatement(
             const canonicalized_where = try self.canonicalizeWhereClause(where_idx, .local_anno);
             try self.env.store.addScratchWhereClause(canonicalized_where);
         }
-        break :inner_blk try self.env.store.whereClauseSpanFrom(where_start);
+        break :inner_blk try self.env.store.whereClauseSpanFrom(where_start, type_anno_idx);
     } else null;
 
     if (type_anno.is_var) {
@@ -11025,7 +11037,7 @@ fn runExprKernel(
                             const canonicalized_where = try self.canonicalizeWhereClause(where_idx, .local_anno);
                             try self.env.store.addScratchWhereClause(canonicalized_where);
                         }
-                        break :inner_blk try self.env.store.whereClauseSpanFrom(where_start);
+                        break :inner_blk try self.env.store.whereClauseSpanFrom(where_start, type_anno_idx);
                     } else null;
 
                     const next_i = state.next + 1;
@@ -14999,12 +15011,14 @@ const PatternKernelRecordNextWork = struct {
     fields: AST.PatternRecordField.Span,
     region: Region,
     scratch_top: u32,
+    scratch_seen_record_fields_top: u32,
     next: usize,
 };
 const PatternKernelRecordAfterFieldWork = struct {
     fields: AST.PatternRecordField.Span,
     region: Region,
     scratch_top: u32,
+    scratch_seen_record_fields_top: u32,
     next: usize,
     field_idx: AST.PatternRecordField.Idx,
     field_name_ident: Ident.Idx,
@@ -16737,6 +16751,7 @@ pub fn canonicalizePattern(
                         .fields = e.fields,
                         .region = self.parse_ir.tokenizedRegionToRegion(e.region),
                         .scratch_top = self.env.store.scratchRecordDestructTop(),
+                        .scratch_seen_record_fields_top = self.scratch_seen_record_fields.top(),
                         .next = 0,
                     });
                 },
@@ -16862,6 +16877,7 @@ pub fn canonicalizePattern(
             if (state.next >= fields.len) {
                 // Create span of the new scratch record destructs
                 const destructs_span = try self.env.store.recordDestructSpanFrom(state.scratch_top);
+                self.scratch_seen_record_fields.clearFrom(state.scratch_seen_record_fields_top);
 
                 // Create the record destructure pattern
                 last_pattern = try self.env.addPattern(Pattern{
@@ -16889,6 +16905,7 @@ pub fn canonicalizePattern(
                     .fields = state.fields,
                     .region = state.region,
                     .scratch_top = state.scratch_top,
+                    .scratch_seen_record_fields_top = state.scratch_seen_record_fields_top,
                     .next = state.next + 1,
                 });
                 continue :patternkernel_loop .dispatch;
@@ -16909,12 +16926,41 @@ pub fn canonicalizePattern(
                 continue :patternkernel_loop .dispatch;
             };
 
+            const field_name_region = self.parse_ir.tokens.resolve(field.name.?);
+            var found_duplicate = false;
+            for (self.scratch_seen_record_fields.sliceFromStart(state.scratch_seen_record_fields_top)) |seen_field| {
+                if (field_name_ident.eql(seen_field.ident)) {
+                    try self.env.pushDiagnostic(Diagnostic{ .duplicate_record_field = .{
+                        .field_name = field_name_ident,
+                        .duplicate_region = field_name_region,
+                        .original_region = seen_field.region,
+                    } });
+                    found_duplicate = true;
+                    break;
+                }
+            }
+            if (found_duplicate) {
+                try stacks.pushRecordNext(frame_allocator, .{
+                    .fields = state.fields,
+                    .region = state.region,
+                    .scratch_top = state.scratch_top,
+                    .scratch_seen_record_fields_top = state.scratch_seen_record_fields_top,
+                    .next = state.next + 1,
+                });
+                continue :patternkernel_loop .dispatch;
+            }
+            try self.scratch_seen_record_fields.append(.{
+                .ident = field_name_ident,
+                .region = field_name_region,
+            });
+
             if (field.value) |sub_pattern_idx| {
                 // Handle patterns like `{ name: x }` or `{ address: { city } }` where there's a sub-pattern
                 try stacks.pushRecordAfterField(frame_allocator, .{
                     .fields = state.fields,
                     .region = state.region,
                     .scratch_top = state.scratch_top,
+                    .scratch_seen_record_fields_top = state.scratch_seen_record_fields_top,
                     .next = state.next + 1,
                     .field_idx = field_idx,
                     .field_name_ident = field_name_ident,
@@ -16972,6 +17018,7 @@ pub fn canonicalizePattern(
                     .fields = state.fields,
                     .region = state.region,
                     .scratch_top = state.scratch_top,
+                    .scratch_seen_record_fields_top = state.scratch_seen_record_fields_top,
                     .next = state.next + 1,
                 });
             }
@@ -17002,6 +17049,7 @@ pub fn canonicalizePattern(
                 .fields = state.fields,
                 .region = state.region,
                 .scratch_top = state.scratch_top,
+                .scratch_seen_record_fields_top = state.scratch_seen_record_fields_top,
                 .next = state.next,
             });
 

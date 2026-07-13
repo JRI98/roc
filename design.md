@@ -3103,17 +3103,19 @@ the k-th evidence entry a call edge supplies. The definition's module and any
 importing module enumerate identical lists from their structural copies of the
 scheme.
 
-**Edges supply evidence.** Checking persists, for every instantiation of a
-constrained scheme, the (pristine var, fresh var) pairs of its constrained
-vars. Checking resolves each instantiation edge's requirements — against the
-enclosing callable's own evidence params (producing `constraint(k)` again),
-against concrete types (producing `direct` targets through exact registry
-lookups), through the monomorphic default rule, or structurally — and stores
-the result as site evidence keyed by the use expression. Monotype lowering
-materializes a specialization's evidence vector at each call edge and passes
-it to the callee specialization; a plan resolved `constraint(k)` reads entry
-`k` of the innermost vector (walking lexical parents for nested local
-functions by `depth`).
+**Edges supply evidence.** Checking persists every constrained-scheme edge.
+An ordinary instantiation records the (pristine var, fresh var) pairs of its
+constrained vars. A monomorphic edge to an in-flight recursive value or method
+target records the exact shared scheme root and no copy pairs. Checking
+resolves each edge's requirements — against the enclosing callable's own
+evidence params (producing `constraint(k)` again), against concrete types
+(producing `direct` targets through exact registry lookups), through the
+monomorphic default rule, or structurally — and stores the result as site
+evidence keyed by the use expression. Monotype lowering materializes a
+specialization's evidence vector at each call edge and passes it to the callee
+specialization; a plan resolved `constraint(k)` reads entry `k` of the
+innermost vector (walking lexical parents for nested local functions by
+`depth`).
 
 **The default rule.** A constrained var no edge can pin follows exactly the
 rule Monotype uses to materialize unresolved variables: numeral literals and

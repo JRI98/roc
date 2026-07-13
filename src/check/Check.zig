@@ -424,11 +424,11 @@ instantiation_source_expr: ?CIR.Expr.Idx = null,
 /// While discharging a static-dispatch constraint, the site that constraint
 /// originated at. Scheme instantiations that copy constrained vars are then
 /// recorded against that node's `dispatch_target` evidence slot (see
-/// `recordSchemeInstantiationEvidence`).
+/// `recordSchemeUse`).
 evidence_target_site: ?EvidenceTargetSite = null,
 /// Scratch buffer for the (scheme var → fresh var) pairs of one constrained
-/// scheme instantiation, flushed into `cir.scheme_instantiations`.
-scratch_evidence_pairs: std.ArrayListUnmanaged(ModuleEnv.SchemeInstantiationPair) = .empty,
+/// scheme instantiation, flushed into `cir.scheme_uses`.
+scratch_evidence_pairs: std.ArrayListUnmanaged(ModuleEnv.SchemeUsePair) = .empty,
 /// Worklist of flex vars created by literal conversions (`from_numeral`,
 /// `from_quote`, or `from_interpolation`) — open literals that may still need
 /// defaulting. Checker bookkeeping, not type data:
@@ -1205,8 +1205,10 @@ const ValueLookupEntry = struct {
 
 /// A struct scratch info about a static dispatch constraint
 const ScratchStaticDispatchConstraint = struct {
+    where_clause: CIR.WhereClause.Idx,
     var_: Var,
     constraint: types_mod.StaticDispatchConstraint,
+    state: enum { declared, completed },
 };
 
 const ReturnConstraint = struct {
@@ -3236,7 +3238,8 @@ const ImportCache = std.HashMapUnmanaged(ImportCacheKey, Var, struct {
 
 const OpenNumeralLiteral = struct {
     var_: Var,
-    info: types_mod.NumeralInfo,
+    constraint: StaticDispatchConstraint,
+    source_node: ?CIR.Node.Idx,
 };
 
 const PendingTupleAccess = struct {
@@ -3925,7 +3928,7 @@ fn instantiateVarHelp(
                         }
                     }
                     if (has_literal_constraint) {
-                        try self.recordOpenLiteralVar(fresh_var, constraints);
+                        try self.recordOpenLiteralVar(fresh_var, constraints, null);
                     }
                     if (has_other_constraint) {
                         try self.instantiation_dispatchers.append(self.gpa, .{
@@ -3970,7 +3973,7 @@ fn instantiateVarHelp(
     // decide how each of the scheme's dispatch constraints was satisfied here.
     if (self.scratch_evidence_pairs.items.len > 0) {
         if (self.evidence_target_site) |target| {
-            try self.cir.recordSchemeInstantiation(
+            try self.cir.recordSchemeUse(
                 target.node_idx,
                 .dispatch_target,
                 @intFromEnum(target.constraint_fn_var),
@@ -3987,7 +3990,7 @@ fn instantiateVarHelp(
                 .expr_external_lookup,
                 .expr_required_lookup,
                 .expr_field_access,
-                => try self.cir.recordSchemeInstantiation(
+                => try self.cir.recordSchemeUse(
                     @intFromEnum(source_expr),
                     .value_use,
                     0,
@@ -4008,6 +4011,16 @@ fn instantiateVarHelp(
 
     // Return the instantiated var
     return instantiated_var;
+}
+
+fn recordSharedSchemeUse(
+    self: *Self,
+    node_idx: u32,
+    slot: ModuleEnv.SchemeUseRecord.Slot,
+    slot_data: u32,
+    scheme_root: Var,
+) std.mem.Allocator.Error!void {
+    try self.cir.recordSchemeUse(node_idx, slot, slot_data, scheme_root, &.{});
 }
 
 // regions //
@@ -4679,6 +4692,7 @@ fn recordOpenLiteralVar(
     self: *Self,
     literal_var: Var,
     constraints: []const StaticDispatchConstraint,
+    source_node: ?CIR.Node.Idx,
 ) Allocator.Error!void {
     var has_literal = false;
     for (constraints) |constraint| {
@@ -4686,9 +4700,10 @@ fn recordOpenLiteralVar(
             .from_literal => |lit| {
                 has_literal = true;
                 switch (lit) {
-                    .numeral => |info| try self.open_numeral_literals.append(self.gpa, .{
+                    .numeral => try self.open_numeral_literals.append(self.gpa, .{
                         .var_ = literal_var,
-                        .info = info,
+                        .constraint = constraint,
+                        .source_node = source_node,
                     }),
                     .quote, .interpolation => {},
                 }
@@ -4761,9 +4776,6 @@ fn mkFlexWithFromNumeralConstraint(
         },
     };
     const fn_var = try self.freshFromContent(func_content, env, num_literal_info.region);
-    if (source_node) |node_idx| {
-        try self.cir.recordNumeralDispatchPlan(node_idx, flex_var, fn_var);
-    }
 
     // Create the constraint with numeric literal info
     const constraint = types_mod.StaticDispatchConstraint{
@@ -4783,7 +4795,11 @@ fn mkFlexWithFromNumeralConstraint(
         },
     };
     try self.unifyWith(flex_var, flex_content, env);
-    try self.recordOpenLiteralVar(flex_var, &.{constraint});
+
+    if (source_node) |node_idx| {
+        try self.cir.recordNumeralDispatchPlan(node_idx, flex_var, fn_var);
+    }
+    try self.recordOpenLiteralVar(flex_var, &.{constraint}, source_node);
 
     return flex_var;
 }
@@ -4860,7 +4876,7 @@ fn mkFlexWithFromQuoteConstraint(
         },
     };
     try self.unifyWith(flex_var, flex_content, env);
-    try self.recordOpenLiteralVar(flex_var, &.{constraint});
+    try self.recordOpenLiteralVar(flex_var, &.{constraint}, source_node);
 
     return flex_var;
 }
@@ -8316,7 +8332,7 @@ fn processRequiresTypes(self: *Self, env: *Env) std.mem.Allocator.Error!void {
         // Then, generate the type for the actual required type
         //   { [Model : model] for main : { init : model, ... } }
         //                                ^^^^^^^^^^^^^^^^^^^^^^
-        try self.generateAnnoTypeInPlace(required_type.type_anno, env, .annotation);
+        try self.generateAnnoTypeInPlace(required_type.type_anno, env, .{ .annotation = null });
     }
 }
 
@@ -9573,17 +9589,16 @@ fn generateStandaloneTypeAnno(
     const scratch_static_dispatch_constraints_top = self.scratch_static_dispatch_constraints.top();
     defer self.scratch_static_dispatch_constraints.clearFrom(scratch_static_dispatch_constraints_top);
 
-    // Iterate over where clauses (if they exist), adding them to scratch_static_dispatch_constraints
-    if (type_anno.where) |where_span| {
-        const where_slice = self.cir.store.sliceWhereClauses(where_span);
-        for (where_slice) |where_idx| {
-            try self.generateStaticDispatchConstraintFromWhere(where_idx, env);
-        }
-    }
-
     // Generate the type from the annotation
     const anno_var: Var = ModuleEnv.varFrom(type_anno.anno);
-    try self.generateAnnoTypeInPlace(type_anno.anno, env, .annotation);
+    const ctx = GenTypeAnnoCtx{ .annotation = type_anno.where };
+    try self.generateAnnoTypeInPlace(type_anno.anno, env, ctx);
+    if (type_anno.where) |where_span| {
+        if (try self.generateRemainingWhereConstraintOwners(where_span, env, ctx)) {
+            try self.unifyWith(anno_var, .err, env);
+        }
+        try self.reportUnsupportedWhereAliases(where_span);
+    }
 
     // Unify the statement variable with the generated annotation type
     _ = try self.unify(stmt_var, anno_var, env);
@@ -9640,7 +9655,7 @@ const OutVar = enum {
 
 /// The context use for free var generation
 const GenTypeAnnoCtx = union(enum) {
-    annotation,
+    annotation: ?CIR.WhereClause.Span,
     type_decl: struct {
         idx: CIR.Statement.Idx,
         name: Ident.Idx,
@@ -9667,74 +9682,126 @@ fn generateAnnotationType(self: *Self, annotation_idx: CIR.Annotation.Idx, env: 
     const scratch_static_dispatch_constraints_top = self.scratch_static_dispatch_constraints.top();
     defer self.scratch_static_dispatch_constraints.clearFrom(scratch_static_dispatch_constraints_top);
 
-    // Iterate over where clauses (if they exist), adding them to scratch_static_dispatch_constraints
-    if (annotation.where) |where_span| {
-        const where_slice = self.cir.store.sliceWhereClauses(where_span);
-        for (where_slice) |where_idx| {
-            try self.generateStaticDispatchConstraintFromWhere(where_idx, env);
-        }
-    }
-
     // Then, generate the type for the annotation
-    try self.generateAnnoTypeInPlace(annotation.anno, env, .annotation);
+    const ctx = GenTypeAnnoCtx{ .annotation = annotation.where };
+    try self.generateAnnoTypeInPlace(annotation.anno, env, ctx);
+    if (annotation.where) |where_span| {
+        if (try self.generateRemainingWhereConstraintOwners(where_span, env, ctx)) {
+            try self.unifyWith(ModuleEnv.varFrom(annotation.anno), .err, env);
+        }
+        try self.reportUnsupportedWhereAliases(where_span);
+    }
 
     // Redirect the root annotation to inner annotation
     _ = try self.unify(annotation_var, ModuleEnv.varFrom(annotation.anno), env);
 }
 
-/// Given a where clause, generate static dispatch constraints and add to scratch_static_dispatch_constraints
-fn generateStaticDispatchConstraintFromWhere(self: *Self, where_idx: CIR.WhereClause.Idx, env: *Env) std.mem.Allocator.Error!void {
-    const trace = tracy.trace(@src());
-    defer trace.end();
-
-    const where = self.cir.store.getWhereClause(where_idx);
+fn declareOwnedStaticDispatchConstraint(
+    self: *Self,
+    where_idx: CIR.WhereClause.Idx,
+    owner_var: Var,
+    env: *Env,
+) std.mem.Allocator.Error!void {
     const where_region = self.cir.store.getNodeRegion(ModuleEnv.nodeIdxFrom(where_idx));
-
-    switch (where) {
+    switch (self.cir.store.getWhereClause(where_idx)) {
         .w_method => |method| {
-            // Generate type of the thing dispatch receiver
-            try self.generateAnnoTypeInPlace(method.var_, env, .annotation);
-            const method_var = ModuleEnv.varFrom(method.var_);
+            const func_var = try self.fresh(env, where_region);
 
-            // Generate the arguments
-            const args_anno_slice = self.cir.store.sliceTypeAnnos(method.args);
-            for (args_anno_slice) |arg_anno_idx| {
-                try self.generateAnnoTypeInPlace(arg_anno_idx, env, .annotation);
-            }
-            const anno_arg_vars: []Var = @ptrCast(args_anno_slice);
-
-            // Generate return type
-            try self.generateAnnoTypeInPlace(method.ret, env, .annotation);
-            const ret_var = ModuleEnv.varFrom(method.ret);
-
-            // Create the function var
-            const func_content = if (method.effectful)
-                try self.types.mkFuncEffectful(anno_arg_vars, ret_var)
-            else
-                try self.types.mkFuncPure(anno_arg_vars, ret_var);
-            const func_var = try self.freshFromContent(func_content, env, where_region);
-
-            // Add to scratch list
             try self.scratch_static_dispatch_constraints.append(ScratchStaticDispatchConstraint{
-                .var_ = method_var,
+                .where_clause = where_idx,
+                .var_ = owner_var,
                 .constraint = StaticDispatchConstraint{
                     .fn_name = method.method_name,
                     .fn_var = func_var,
                     .origin = .{ .where_clause = .{} },
                 },
+                .state = .declared,
             });
         },
-        .w_alias => |alias| {
-            // Alias syntax in where clauses (e.g., `where [a.Decode]`) was used for abilities,
-            // which have been removed from Roc. Emit an error.
-            _ = try self.problems.appendProblem(self.gpa, .{ .unsupported_alias_where_clause = .{
-                .alias_name = alias.alias_name,
-                .region = where_region,
-            } });
-        },
-        .w_malformed => {
-            // If it's malformed, just ignore
-        },
+        .w_alias, .w_malformed => {},
+    }
+}
+
+fn completeOwnedStaticDispatchConstraint(
+    self: *Self,
+    where_idx: CIR.WhereClause.Idx,
+    method: std.meta.fieldInfo(CIR.WhereClause, .w_method).type,
+    owner_var: Var,
+    constraint_index: usize,
+    env: *Env,
+    ctx: GenTypeAnnoCtx,
+) std.mem.Allocator.Error!void {
+    const entry = self.scratch_static_dispatch_constraints.items.items[constraint_index];
+    if (entry.state != .declared or entry.where_clause != where_idx or entry.var_ != owner_var) {
+        try self.unifyWith(entry.var_, .err, env);
+        try self.unifyWith(entry.constraint.fn_var, .err, env);
+        self.scratch_static_dispatch_constraints.items.items[constraint_index].state = .completed;
+        return;
+    }
+
+    try self.generateAnnoTypeInPlace(method.var_, env, ctx);
+
+    const args_anno_slice = self.cir.store.sliceTypeAnnos(method.args);
+    for (args_anno_slice) |arg_anno_idx| {
+        try self.generateAnnoTypeInPlace(arg_anno_idx, env, ctx);
+    }
+    const anno_arg_vars: []Var = @ptrCast(args_anno_slice);
+
+    try self.generateAnnoTypeInPlace(method.ret, env, ctx);
+    const ret_var = ModuleEnv.varFrom(method.ret);
+
+    const func_content = if (method.effectful)
+        try self.types.mkFuncEffectful(anno_arg_vars, ret_var)
+    else
+        try self.types.mkFuncPure(anno_arg_vars, ret_var);
+    try self.unifyWith(entry.constraint.fn_var, func_content, env);
+    self.scratch_static_dispatch_constraints.items.items[constraint_index].state = .completed;
+}
+
+fn generateRemainingWhereConstraintOwners(
+    self: *Self,
+    where_span: CIR.WhereClause.Span,
+    env: *Env,
+    ctx: GenTypeAnnoCtx,
+) std.mem.Allocator.Error!bool {
+    var invalid_receiver = false;
+    for (self.cir.store.sliceWhereClauseOwners(where_span)) |owner| {
+        if (owner.introduced_in_scope) {
+            try self.generateAnnoTypeInPlace(@enumFromInt(owner.rigid_var), env, ctx);
+            continue;
+        }
+
+        invalid_receiver = true;
+        const rigid_anno = self.cir.store.getTypeAnno(@enumFromInt(owner.rigid_var));
+        std.debug.assert(rigid_anno == .rigid_var);
+        const type_var_name = rigid_anno.rigid_var.name;
+        for (self.cir.store.sliceWhereClausesForOwner(owner)) |where_idx| {
+            switch (self.cir.store.getWhereClause(where_idx)) {
+                .w_method => |method| {
+                    _ = try self.problems.appendProblem(self.gpa, .{ .where_clause_receiver_not_introduced = .{
+                        .type_var_name = type_var_name,
+                        .method_name = method.method_name,
+                        .region = self.cir.store.getNodeRegion(ModuleEnv.nodeIdxFrom(where_idx)),
+                    } });
+                },
+                .w_alias, .w_malformed => {},
+            }
+        }
+    }
+    return invalid_receiver;
+}
+
+fn reportUnsupportedWhereAliases(self: *Self, where_span: CIR.WhereClause.Span) std.mem.Allocator.Error!void {
+    for (self.cir.store.sliceWhereClauses(where_span)) |where_idx| {
+        switch (self.cir.store.getWhereClause(where_idx)) {
+            .w_alias => |alias| {
+                _ = try self.problems.appendProblem(self.gpa, .{ .unsupported_alias_where_clause = .{
+                    .alias_name = alias.alias_name,
+                    .region = self.cir.store.getNodeRegion(ModuleEnv.nodeIdxFrom(where_idx)),
+                } });
+            },
+            .w_method, .w_malformed => {},
+        }
     }
 }
 
@@ -9778,19 +9845,28 @@ fn generateAnnoTypeInPlace(self: *Self, anno_idx: CIR.TypeAnno.Idx, env: *Env, c
                     return;
                 }
             }
-            const static_dispatch_constraints_start = self.types.static_dispatch_constraints.len();
-            switch (ctx) {
-                .annotation => {
-                    // If this an annotation, then check all where constraints
-                    // and see if any reference this rigid var
-                    for (self.scratch_static_dispatch_constraints.items.items) |scratch_constraint| {
-                        const resolved_scratch_var = self.types.resolveVar(scratch_constraint.var_).var_;
-                        if (resolved_scratch_var == anno_var) {
-                            _ = try self.types.static_dispatch_constraints.append(self.types.gpa, scratch_constraint.constraint);
+            const owned_where_clauses: []const CIR.WhereClause.Idx = switch (ctx) {
+                .annotation => |mb_where| blk: {
+                    const where_span = mb_where orelse break :blk &.{};
+                    for (self.cir.store.sliceWhereClauseOwners(where_span)) |owner| {
+                        if (owner.rigid_var == @intFromEnum(anno_idx) and owner.introduced_in_scope) {
+                            break :blk self.cir.store.sliceWhereClausesForOwner(owner);
                         }
                     }
+                    break :blk &.{};
                 },
-                .type_decl => {},
+                .type_decl => &.{},
+            };
+
+            const scratch_constraints_start = self.scratch_static_dispatch_constraints.top();
+            for (owned_where_clauses) |where_idx| {
+                try self.declareOwnedStaticDispatchConstraint(where_idx, anno_var, env);
+            }
+
+            const static_dispatch_constraints_start = self.types.static_dispatch_constraints.len();
+            for (0..owned_where_clauses.len) |offset| {
+                const scratch_constraint = self.scratch_static_dispatch_constraints.items.items[scratch_constraints_start + offset];
+                _ = try self.types.static_dispatch_constraints.append(self.types.gpa, scratch_constraint.constraint);
             }
             const static_dispatch_constraints_end = self.types.static_dispatch_constraints.len();
             const static_dispatch_constraints_range = StaticDispatchConstraint.SafeList.Range{ .start = @enumFromInt(static_dispatch_constraints_start), .count = @intCast(static_dispatch_constraints_end - static_dispatch_constraints_start) };
@@ -9799,6 +9875,22 @@ fn generateAnnoTypeInPlace(self: *Self, anno_idx: CIR.TypeAnno.Idx, env: *Env, c
                 .name = rigid.name,
                 .constraints = static_dispatch_constraints_range,
             } }, env);
+
+            for (owned_where_clauses, 0..) |where_idx, offset| {
+                switch (self.cir.store.getWhereClause(where_idx)) {
+                    .w_method => |method| try self.completeOwnedStaticDispatchConstraint(
+                        where_idx,
+                        method,
+                        anno_var,
+                        scratch_constraints_start + offset,
+                        env,
+                        ctx,
+                    ),
+                    .w_alias, .w_malformed => {
+                        try self.unifyWith(anno_var, .err, env);
+                    },
+                }
+            }
         },
         .rigid_var_lookup => |rigid_lookup| {
             _ = try self.unify(anno_var, ModuleEnv.varFrom(rigid_lookup.ref), env);
@@ -12143,6 +12235,12 @@ fn checkExpr(self: *Self, expr_idx: CIR.Expr.Idx, env: *Env, expected: Expected)
                                 // type, so facts discovered at the call site
                                 // flow into the inferred scheme.
                                 _ = try self.unifyInContext(expr_var, pat_var, env, .{ .recursive_def = .{ .def_name = processing_def.def_name } });
+                                try self.recordSharedSchemeUse(
+                                    @intFromEnum(expr_idx),
+                                    .shared_value_use,
+                                    0,
+                                    ModuleEnv.varFrom(processing_def.def_idx),
+                                );
                             }
                             break :blk;
                         }
@@ -12180,6 +12278,12 @@ fn checkExpr(self: *Self, expr_idx: CIR.Expr.Idx, env: *Env, expected: Expected)
                         // whole merged group out of generalization instead of
                         // generalizing with the suspended group's boundary.
                         _ = try self.unifyInContext(expr_var, ModuleEnv.varFrom(referenced_def.expr), env, .{ .recursive_def = .{ .def_name = processing_def.def_name } });
+                        try self.recordSharedSchemeUse(
+                            @intFromEnum(expr_idx),
+                            .shared_value_use,
+                            0,
+                            ModuleEnv.varFrom(processing_def.def_idx),
+                        );
                         break :blk;
                     },
                     .processed => {},
@@ -12213,6 +12317,12 @@ fn checkExpr(self: *Self, expr_idx: CIR.Expr.Idx, env: *Env, expected: Expected)
                 std.debug.assert(self.types.resolveVar(pat_var).desc.rank != .generalized);
 
                 _ = try self.unifyInContext(expr_var, pat_var, env, .{ .recursive_def = .{ .def_name = local_def.def_name } });
+                try self.recordSharedSchemeUse(
+                    @intFromEnum(expr_idx),
+                    .shared_value_use,
+                    0,
+                    pat_var,
+                );
                 break :blk;
             }
 
@@ -12249,6 +12359,14 @@ fn checkExpr(self: *Self, expr_idx: CIR.Expr.Idx, env: *Env, expected: Expected)
                 _ = try self.unify(expr_var, instantiated, env);
             } else {
                 _ = try self.unify(expr_var, pat_var, env);
+                if (mb_processing_def) |processing_def| {
+                    try self.recordSharedSchemeUse(
+                        @intFromEnum(expr_idx),
+                        .shared_value_use,
+                        0,
+                        ModuleEnv.varFrom(processing_def.def_idx),
+                    );
+                }
             }
         },
         .e_lookup_external => |ext| {
@@ -16179,7 +16297,7 @@ fn mkInterpolationConstraint(
 
     _ = try self.unify(constrained_var, dispatcher_var, env);
 
-    try self.recordOpenLiteralVar(constrained_var, &.{constraint});
+    try self.recordOpenLiteralVar(constrained_var, &.{constraint}, ModuleEnv.nodeIdxFrom(expr_idx));
 
     return constraint_fn_var;
 }
@@ -16404,7 +16522,7 @@ fn postProcessCopiedVars(self: *Self, region: Region) std.mem.Allocator.Error!vo
                 const constraints = self.types.sliceStaticDispatchConstraints(fresh_content.flex.constraints);
                 for (constraints) |c| {
                     if (c.origin == .from_literal) {
-                        try self.recordOpenLiteralVar(fresh_var, constraints);
+                        try self.recordOpenLiteralVar(fresh_var, constraints, null);
                         break;
                     }
                 }
@@ -16678,8 +16796,8 @@ const Probe = struct {
     open_literal_vars_len: usize,
     open_numeral_literals_len: usize,
     pending_tuple_accesses_len: usize,
-    scheme_instantiations_len: usize,
-    scheme_instantiation_pairs_len: usize,
+    scheme_uses_len: usize,
+    scheme_use_pairs_len: usize,
 
     fn rollback(self: *Probe) void {
         self.check.types.rollbackToSavepoint(&self.savepoint);
@@ -16692,10 +16810,10 @@ const Probe = struct {
         self.check.open_literal_vars.shrinkRetainingCapacity(self.open_literal_vars_len);
         self.check.open_numeral_literals.shrinkRetainingCapacity(self.open_numeral_literals_len);
         self.check.pending_tuple_accesses.shrinkRetainingCapacity(self.pending_tuple_accesses_len);
-        // Scheme-instantiation evidence recorded during the probe references
-        // fresh vars the savepoint rollback just discarded.
-        self.check.cir.scheme_instantiations.items.shrinkRetainingCapacity(self.scheme_instantiations_len);
-        self.check.cir.scheme_instantiation_pairs.items.shrinkRetainingCapacity(self.scheme_instantiation_pairs_len);
+        // Scheme-use evidence recorded during the probe can reference fresh
+        // vars the savepoint rollback just discarded.
+        self.check.cir.scheme_uses.items.shrinkRetainingCapacity(self.scheme_uses_len);
+        self.check.cir.scheme_use_pairs.items.shrinkRetainingCapacity(self.scheme_use_pairs_len);
     }
 
     /// Close the probe scope KEEPING everything it did: the type-store
@@ -16713,8 +16831,8 @@ fn beginProbe(self: *Self) std.mem.Allocator.Error!Probe {
     const open_literal_vars_len = self.open_literal_vars.items.len;
     const open_numeral_literals_len = self.open_numeral_literals.items.len;
     const pending_tuple_accesses_len = self.pending_tuple_accesses.items.len;
-    const scheme_instantiations_len = self.cir.scheme_instantiations.items.items.len;
-    const scheme_instantiation_pairs_len = self.cir.scheme_instantiation_pairs.items.items.len;
+    const scheme_uses_len = self.cir.scheme_uses.items.items.len;
+    const scheme_use_pairs_len = self.cir.scheme_use_pairs.items.items.len;
     return .{
         .check = self,
         .regions_len = regions_len,
@@ -16722,8 +16840,8 @@ fn beginProbe(self: *Self) std.mem.Allocator.Error!Probe {
         .open_literal_vars_len = open_literal_vars_len,
         .open_numeral_literals_len = open_numeral_literals_len,
         .pending_tuple_accesses_len = pending_tuple_accesses_len,
-        .scheme_instantiations_len = scheme_instantiations_len,
-        .scheme_instantiation_pairs_len = scheme_instantiation_pairs_len,
+        .scheme_uses_len = scheme_uses_len,
+        .scheme_use_pairs_len = scheme_use_pairs_len,
         .savepoint = try self.types.createSavepoint(),
     };
 }
@@ -18781,12 +18899,24 @@ fn checkStaticDispatchConstraints(self: *Self, env: *Env, is_numeric_default_pas
                     const method_var = if (cycle_method_expr_var) |expr_var_for_method| blk: {
                         // Cycle participant or recursive self-dispatch: use the
                         // fresh flex var instead of def_var to avoid rank lowering.
+                        try self.recordSharedSchemeUse(
+                            self.evidence_target_site.?.node_idx,
+                            .dispatch_target,
+                            @intFromEnum(self.evidence_target_site.?.constraint_fn_var),
+                            expr_var_for_method,
+                        );
                         break :blk expr_var_for_method;
                     } else if (method_is_this_module) blk: {
                         const local_method_type_var = predeclared_scheme_for_method orelse method_type_var;
                         if (self.types.resolveVar(local_method_type_var).desc.rank == .generalized) {
                             break :blk try self.instantiateVar(local_method_type_var, env, .use_last_var);
                         }
+                        try self.recordSharedSchemeUse(
+                            self.evidence_target_site.?.node_idx,
+                            .dispatch_target,
+                            @intFromEnum(self.evidence_target_site.?.constraint_fn_var),
+                            local_method_type_var,
+                        );
                         break :blk local_method_type_var;
                     } else blk: {
                         // Copy the method from the other module's type store
@@ -19057,12 +19187,24 @@ fn checkStaticDispatchConstraints(self: *Self, env: *Env, is_numeric_default_pas
                         .constraint_fn_var = constraint.fn_var,
                     };
                     const method_var = if (cycle_method_expr_var) |expr_var_for_method| blk: {
+                        try self.recordSharedSchemeUse(
+                            self.evidence_target_site.?.node_idx,
+                            .dispatch_target,
+                            @intFromEnum(self.evidence_target_site.?.constraint_fn_var),
+                            expr_var_for_method,
+                        );
                         break :blk expr_var_for_method;
                     } else if (method_is_this_module) blk: {
                         const local_method_type_var = predeclared_scheme_for_method orelse method_type_var;
                         if (self.types.resolveVar(local_method_type_var).desc.rank == .generalized) {
                             break :blk try self.instantiateVar(local_method_type_var, env, .use_last_var);
                         }
+                        try self.recordSharedSchemeUse(
+                            self.evidence_target_site.?.node_idx,
+                            .dispatch_target,
+                            @intFromEnum(self.evidence_target_site.?.constraint_fn_var),
+                            local_method_type_var,
+                        );
                         break :blk local_method_type_var;
                     } else blk: {
                         const copied_var = try self.copyVar(method_type_var, method_env, region);
@@ -20598,6 +20740,16 @@ fn validateResolvedOpenNumeralLiterals(
     while (i < literal_count) : (i += 1) {
         const entry = self.open_numeral_literals.items[i];
         const resolved = self.types.resolveVar(entry.var_);
+        if (resolved.desc.content == .err) continue;
+        if (try self.reportUnmaterializableNumeralLiteral(resolved.var_, entry.constraint, env)) {
+            if (entry.source_node) |node_idx| {
+                if (isExprNodeTag(self.cir.store.nodes.get(node_idx).tag)) {
+                    try self.erroneous_value_exprs.put(self.gpa, @enumFromInt(@intFromEnum(node_idx)), {});
+                }
+            }
+            continue;
+        }
+
         const nominal_type = switch (resolved.desc.content) {
             .structure => |flat_type| switch (flat_type) {
                 .nominal_type => |nominal| nominal,
@@ -20607,7 +20759,7 @@ fn validateResolvedOpenNumeralLiterals(
             else => continue,
         };
         const num_kind = self.builtinNumKindFromNominalType(nominal_type) orelse continue;
-        _ = try self.reportInvalidBuiltinFromNumeralInfo(resolved.var_, num_kind, entry.info, env);
+        _ = try self.reportInvalidBuiltinFromNumeralInfo(resolved.var_, num_kind, entry.constraint.origin.numeralInfo().?, env);
     }
 }
 

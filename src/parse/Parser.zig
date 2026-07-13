@@ -792,6 +792,7 @@ fn parseExposedItemTokens(self: *Parser) std.mem.Allocator.Error!AST.ExposedItem
                 return try self.store.addExposedItem(.{ .upper_ident_star = .{
                     .region = .{ .start = start, .end = self.pos },
                     .ident = ident,
+                    .qualifiers = qual_result.qualifiers,
                 } });
             }
             return try self.store.addExposedItem(.{ .upper_ident = .{
@@ -2273,12 +2274,14 @@ const ExprStringState = struct {
 
 const ExprRecordExtState = struct {
     start: Token.Idx,
+    record_start: Token.Idx,
     min_bp: u8,
     nominal_mapper: ?AST.Expr.Idx,
 };
 
 const ExprRecordState = struct {
     start: Token.Idx,
+    record_start: Token.Idx,
     min_bp: u8,
     scratch_top: u32,
     ext: ?AST.Expr.Idx,
@@ -2287,6 +2290,7 @@ const ExprRecordState = struct {
 
 const ExprRecordFieldState = struct {
     start: Token.Idx,
+    record_start: Token.Idx,
     min_bp: u8,
     scratch_top: u32,
     ext: ?AST.Expr.Idx,
@@ -3140,6 +3144,7 @@ fn runExprStatementKernel(
                     if (self.peek() == .CloseCurly) {
                         expr_record_state = .{
                             .start = start,
+                            .record_start = start,
                             .min_bp = expr_state.min_bp,
                             .scratch_top = self.store.scratchRecordFieldTop(),
                             .ext = null,
@@ -3150,6 +3155,7 @@ fn runExprStatementKernel(
                         self.advance();
                         try open_syntax.pushExpr(open_allocator, .expr_record_ext, ExprRecordExtState, .{
                             .start = start,
+                            .record_start = start,
                             .min_bp = expr_state.min_bp,
                             .nominal_mapper = null,
                         });
@@ -3193,6 +3199,7 @@ fn runExprStatementKernel(
                         }
                         expr_record_state = .{
                             .start = start,
+                            .record_start = start,
                             .min_bp = expr_state.min_bp,
                             .scratch_top = self.store.scratchRecordFieldTop(),
                             .ext = null,
@@ -3380,10 +3387,12 @@ fn runExprStatementKernel(
             const tok_int = @intFromEnum(tok);
 
             if (tok == .Dot and self.peekN(1) == .OpenCurly) {
+                const record_start = self.pos + 1;
                 self.advance();
                 self.advance();
                 expr_record_state = .{
                     .start = expr_finish_state.start,
+                    .record_start = record_start,
                     .min_bp = expr_finish_state.min_bp,
                     .scratch_top = self.store.scratchRecordFieldTop(),
                     .ext = null,
@@ -3397,6 +3406,7 @@ fn runExprStatementKernel(
                     self.advance();
                     try open_syntax.pushExpr(open_allocator, .expr_record_ext, ExprRecordExtState, .{
                         .start = expr_finish_state.start,
+                        .record_start = record_start,
                         .min_bp = expr_finish_state.min_bp,
                         .nominal_mapper = expr_finish_state.expr,
                     });
@@ -3671,6 +3681,7 @@ fn runExprStatementKernel(
                         self.advance();
                         expr_record_state = .{
                             .start = state.start,
+                            .record_start = state.record_start,
                             .min_bp = state.min_bp,
                             .scratch_top = self.store.scratchRecordFieldTop(),
                             .ext = completed,
@@ -3689,6 +3700,7 @@ fn runExprStatementKernel(
                         try self.store.addScratchRecordField(field);
                         expr_record_state = .{
                             .start = state.start,
+                            .record_start = state.record_start,
                             .min_bp = state.min_bp,
                             .scratch_top = state.scratch_top,
                             .ext = state.ext,
@@ -4248,6 +4260,7 @@ fn runExprStatementKernel(
                     self.advance();
                     try open_syntax.pushExpr(open_allocator, .expr_record_field, ExprRecordFieldState, .{
                         .start = expr_record_state.start,
+                        .record_start = expr_record_state.record_start,
                         .min_bp = expr_record_state.min_bp,
                         .scratch_top = expr_record_state.scratch_top,
                         .ext = expr_record_state.ext,
@@ -4295,7 +4308,7 @@ fn runExprStatementKernel(
                 const layout = self.directCollectionLayout();
                 self.advance();
                 const fields = try self.store.recordFieldSpanFrom(expr_record_state.scratch_top);
-                const expr = try self.finishRecordExpr(expr_record_state.start, fields, expr_record_state.ext, expr_record_state.nominal_mapper, layout);
+                const expr = try self.finishRecordExpr(expr_record_state.start, expr_record_state.record_start, fields, expr_record_state.ext, expr_record_state.nominal_mapper, layout);
                 expr_finish_state = .{ .start = expr_record_state.start, .min_bp = expr_record_state.min_bp, .expr = expr };
                 continue :expr_kernel .suffix;
             },
@@ -5422,6 +5435,7 @@ fn runExprStatementKernel(
                     try open_syntax.pushExpr(open_allocator, .statement_expr_body, Token.Idx, start);
                     expr_record_state = .{
                         .start = start,
+                        .record_start = start,
                         .min_bp = 0,
                         .scratch_top = self.store.scratchRecordFieldTop(),
                         .ext = null,
@@ -6454,6 +6468,7 @@ pub fn runStatementOnlyBlock(self: *Parser, start: u32, owner_type_path: ?DeclIn
 fn finishRecordExpr(
     self: *Parser,
     start: Token.Idx,
+    record_start: Token.Idx,
     fields: AST.RecordField.Span,
     ext: ?AST.Expr.Idx,
     nominal_mapper: ?AST.Expr.Idx,
@@ -6463,7 +6478,7 @@ fn finishRecordExpr(
         const record_expr = try self.store.addExpr(.{ .record = .{
             .fields = fields,
             .ext = ext,
-            .region = .{ .start = start, .end = self.pos },
+            .region = .{ .start = record_start, .end = self.pos },
         } });
         self.store.setCollectionLayout(record_expr, layout);
 

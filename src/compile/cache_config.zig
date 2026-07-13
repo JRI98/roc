@@ -46,7 +46,9 @@ pub const Constants = struct {
     /// 20: Nominal declaration table serialized with the type store.
     /// 21: Checked function serialization no longer carries instantiation stamps.
     /// 22: CommonIdents carries the range_exclusive/range_inclusive method idents.
-    pub const CACHE_VERSION = 22;
+    /// 23: Canonical node storage records where-clause rigid ownership.
+    /// 24: ModuleEnv scheme instantiation evidence was renamed to scheme-use evidence.
+    pub const CACHE_VERSION = 24;
 };
 
 /// Configuration for the Roc cache system.

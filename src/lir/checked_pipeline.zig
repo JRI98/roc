@@ -436,6 +436,7 @@ fn checkedTypeContainsFunctionInner(
     if (index >= types.payloadCount()) checkedPipelineInvariant("checked type function scan referenced a missing type");
     return switch (types.payload(root)) {
         .pending => checkedPipelineInvariant("checked type function scan reached a pending type"),
+        .err => false,
         .function => true,
         .alias => |alias| (try checkedTypeContainsFunctionInner(types, alias.backing, active)) or
             try checkedTypeSliceContainsFunction(types, alias.args, active),

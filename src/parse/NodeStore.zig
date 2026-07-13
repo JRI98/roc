@@ -535,6 +535,8 @@ pub fn addExposedItem(store: *NodeStore, item: AST.ExposedItem) std.mem.Allocato
         .upper_ident_star => |i| {
             node.tag = .exposed_item_upper_star;
             node.main_token = i.ident;
+            node.data.lhs = i.qualifiers.span.start;
+            node.data.rhs = i.qualifiers.span.len;
             node.region = i.region;
         },
         .malformed => |m| {
@@ -1564,6 +1566,7 @@ pub fn getExposedItem(store: *const NodeStore, exposed_item_idx: AST.ExposedItem
             return .{ .upper_ident_star = .{
                 .region = node.region,
                 .ident = node.main_token,
+                .qualifiers = .{ .span = .{ .start = node.data.lhs, .len = node.data.rhs } },
             } };
         },
         .malformed => {

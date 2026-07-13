@@ -195,7 +195,7 @@ const Builder = struct {
 
     fn writeContent(self: *Builder, content: types.Content) Allocator.Error!void {
         switch (content) {
-            .err => invariantViolation("canonical type key requested for erroneous checked type"),
+            .err => self.writeTag("err"),
             .flex => |flex| {
                 if (self.require_concrete) {
                     if (self.flexLiteralDefaultKind(flex)) |kind| {
@@ -655,6 +655,21 @@ fn invariantViolation(comptime message: []const u8) noreturn {
 
 test "canonical type key declarations are referenced" {
     std.testing.refAllDecls(@This());
+}
+
+test "erroneous checked types have a canonical key" {
+    const allocator = std.testing.allocator;
+
+    var env = try ModuleEnv.init(allocator, "");
+    defer env.deinit();
+
+    var store = try TypeStore.initCapacity(allocator, 1, 0);
+    defer store.deinit();
+    const err_var = try store.freshFromContent(.err);
+
+    const first = try fromVar(allocator, &store, &env, err_var);
+    const second = try fromVar(allocator, &store, &env, err_var);
+    try std.testing.expectEqual(first, second);
 }
 
 test "concrete keys default open literal flex vars per kind (numeral -> Dec, quote -> Str)" {

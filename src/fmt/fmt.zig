@@ -1079,15 +1079,24 @@ const Formatter = struct {
         try fmt.push('}');
     }
 
-    fn formatRecordField(fmt: *Formatter, idx: AST.RecordField.Idx) FormatAstError!AST.TokenizedRegion {
+    fn formatRecordFieldWithInfo(fmt: *Formatter, idx: AST.RecordField.Idx) FormatAstError!FormattedExpr {
         const field = fmt.ast.store.getRecordField(idx);
+        var ends_with_multiline_string_line = false;
         try fmt.pushTokenText(field.name);
         if (field.value) |v| {
             try fmt.pushAll(": ");
-            try fmt.formatExprDiscard(v);
+            const formatted_value = try fmt.formatExprWithInfo(v);
+            ends_with_multiline_string_line = formatted_value.ends_with_multiline_string_line;
         }
 
-        return field.region;
+        return .{
+            .region = field.region,
+            .ends_with_multiline_string_line = ends_with_multiline_string_line,
+        };
+    }
+
+    fn formatRecordField(fmt: *Formatter, idx: AST.RecordField.Idx) FormatAstError!AST.TokenizedRegion {
+        return (try fmt.formatRecordFieldWithInfo(idx)).region;
     }
 
     const ExprFormatBehavior = enum {
@@ -1335,9 +1344,22 @@ const Formatter = struct {
             },
             .field_access => |fa| {
                 const left_expr = fmt.ast.store.getExpr(fa.left);
-                const parenthesize_receiver = left_expr == .arrow_call;
+                const parenthesize_receiver = left_expr == .arrow_call or fmt.exprIsNumericAccessReceiver(fa.left);
+                const expand_parenthesized_receiver = left_expr == .arrow_call and
+                    fmt.nodeWillBeMultiline(AST.Expr.Idx, fa.left);
                 if (parenthesize_receiver) try fmt.push('(');
+                if (expand_parenthesized_receiver) {
+                    fmt.curr_indent += 1;
+                    try fmt.ensureNewline();
+                    try fmt.pushIndent();
+                }
                 const left = try fmt.formatExprWithInfo(fa.left);
+                if (expand_parenthesized_receiver) {
+                    try fmt.push(',');
+                    fmt.curr_indent -= 1;
+                    try fmt.ensureNewline();
+                    try fmt.pushIndent();
+                }
                 if (parenthesize_receiver) try fmt.push(')');
                 const right_region = fmt.nodeRegion(@intFromEnum(fa.right));
                 if (!parenthesize_receiver) {
@@ -1352,9 +1374,22 @@ const Formatter = struct {
             },
             .method_call => |mc| {
                 const left_expr = fmt.ast.store.getExpr(mc.receiver);
-                const parenthesize_receiver = left_expr == .arrow_call;
+                const parenthesize_receiver = left_expr == .arrow_call or fmt.exprIsNumericAccessReceiver(mc.receiver);
+                const expand_parenthesized_receiver = left_expr == .arrow_call and
+                    fmt.nodeWillBeMultiline(AST.Expr.Idx, mc.receiver);
                 if (parenthesize_receiver) try fmt.push('(');
+                if (expand_parenthesized_receiver) {
+                    fmt.curr_indent += 1;
+                    try fmt.ensureNewline();
+                    try fmt.pushIndent();
+                }
                 const receiver = try fmt.formatExprWithInfo(mc.receiver);
+                if (expand_parenthesized_receiver) {
+                    try fmt.push(',');
+                    fmt.curr_indent -= 1;
+                    try fmt.ensureNewline();
+                    try fmt.pushIndent();
+                }
                 if (parenthesize_receiver) try fmt.push(')');
                 if (!parenthesize_receiver) {
                     const continued = try fmt.continueAfterMultilineStringLine(receiver);
@@ -1453,8 +1488,11 @@ const Formatter = struct {
             },
             .tuple_access => |ta| {
                 // Format: expr.N (e.g., tuple.0, tuple.1)
+                const parenthesize_receiver = fmt.exprIsNumericAccessReceiver(ta.expr);
+                if (parenthesize_receiver) try fmt.push('(');
                 const target = try fmt.formatExprWithInfo(ta.expr);
                 _ = try fmt.continueAfterMultilineStringLine(target);
+                if (parenthesize_receiver) try fmt.push(')');
                 // Get the element index from the token
                 const token_text = fmt.ast.resolve(ta.elem_token);
                 // Token includes leading dot (e.g., ".0")
@@ -1503,14 +1541,14 @@ const Formatter = struct {
                     if (!record_multiline) {
                         try fmt.push(' ');
                     }
-                    const field_region = try fmt.formatRecordField(field_idx);
+                    const formatted_field = try fmt.formatRecordFieldWithInfo(field_idx);
                     if (record_multiline) {
-                        if (fmt.has_multiline_string) {
+                        if (formatted_field.ends_with_multiline_string_line or fmt.has_multiline_string) {
                             try fmt.ensureNewline();
                             try fmt.pushIndent();
                         }
                         try fmt.push(',');
-                        try fmt.flushCommentsAfterDiscard(field_region.end);
+                        try fmt.flushCommentsAfterDiscard(formatted_field.region.end);
                         if (i == fields.len - 1) {
                             fmt.curr_indent -= 1;
                         }
@@ -1818,18 +1856,27 @@ const Formatter = struct {
                     if (!record_multiline) {
                         try fmt.push(' ');
                     }
-                    const field_region = try fmt.formatRecordField(field_idx);
+                    const formatted_field = try fmt.formatRecordFieldWithInfo(field_idx);
+                    const ends_with_multiline_string_line = formatted_field.ends_with_multiline_string_line or fmt.has_multiline_string;
 
                     if (i < fields.len - 1) {
+                        if (ends_with_multiline_string_line) {
+                            try fmt.ensureNewline();
+                            try fmt.pushIndent();
+                        }
                         try fmt.push(',');
                         if (record_multiline) {
-                            try fmt.flushCommentsAfterDiscard(field_region.end);
+                            try fmt.flushCommentsAfterDiscard(formatted_field.region.end);
                             try fmt.ensureNewline();
                             try fmt.pushIndent();
                         }
                     } else if (record_multiline) {
+                        if (ends_with_multiline_string_line) {
+                            try fmt.ensureNewline();
+                            try fmt.pushIndent();
+                        }
                         try fmt.push(',');
-                        try fmt.flushCommentsAfterDiscard(field_region.end);
+                        try fmt.flushCommentsAfterDiscard(formatted_field.region.end);
                         fmt.curr_indent -= 1;
                         try fmt.ensureNewline();
                         try fmt.pushIndent();
@@ -2106,6 +2153,10 @@ const Formatter = struct {
             },
             .upper_ident_star => |i| {
                 region = i.region;
+                for (fmt.ast.store.tokenSlice(i.qualifiers)) |qualifier| {
+                    try fmt.pushTokenText(qualifier);
+                    try fmt.push('.');
+                }
                 try fmt.pushTokenText(i.ident);
                 try fmt.pushAll(".*");
             },
@@ -2424,9 +2475,13 @@ const Formatter = struct {
                         try fmt.ensureNewline();
                         try fmt.pushIndent();
                     }
-                    const field_region = try fmt.formatRecordField(field_idx);
-                    Formatter.discardRegion(field_region);
+                    const formatted_field = try fmt.formatRecordFieldWithInfo(field_idx);
+                    Formatter.discardRegion(formatted_field.region);
                     if (packages_multiline) {
+                        if (formatted_field.ends_with_multiline_string_line or fmt.has_multiline_string) {
+                            try fmt.ensureNewline();
+                            try fmt.pushIndent();
+                        }
                         try fmt.push(',');
                     } else if (i < package_fields.len - 1) {
                         try fmt.pushAll(", ");
@@ -3242,6 +3297,14 @@ const Formatter = struct {
         try fmt.pushAll(text);
     }
 
+    fn exprIsNumericAccessReceiver(fmt: *Formatter, expr_idx: AST.Expr.Idx) bool {
+        return switch (fmt.ast.store.getExpr(expr_idx)) {
+            .int, .frac, .typed_int, .typed_frac => true,
+            .unary_op => |unary| fmt.exprIsNumericAccessReceiver(unary.expr),
+            else => false,
+        };
+    }
+
     fn nodeWillBeMultiline(fmt: *Formatter, comptime T: type, item: T) bool {
         switch (T) {
             AST.Expr.Idx => {
@@ -3447,6 +3510,11 @@ const Formatter = struct {
                         fmt.nodesWillBeMultiline(AST.AnnoRecordField.Idx, fmt.ast.store.annoRecordFieldSlice(r.fields)),
                     .tag_union => |t| type_has_comment or fmt.ast.store.getCollectionLayout(item) == .expanded or
                         fmt.nodesWillBeMultiline(AST.TypeAnno.Idx, fmt.ast.store.typeAnnoSlice(t.tags)),
+                    .@"fn" => |f| type_has_comment or fmt.ast.regionIsMultiline(typeAnno.to_tokenized_region()) or
+                        fmt.nodesWillBeMultiline(AST.TypeAnno.Idx, fmt.ast.store.typeAnnoSlice(f.args)) or
+                        fmt.nodeWillBeMultiline(AST.TypeAnno.Idx, f.ret),
+                    .parens => |p| type_has_comment or fmt.ast.regionIsMultiline(typeAnno.to_tokenized_region()) or
+                        fmt.nodeWillBeMultiline(AST.TypeAnno.Idx, p.anno),
                     else => fmt.ast.regionIsMultiline(typeAnno.to_tokenized_region()),
                 };
             },
@@ -3528,6 +3596,10 @@ const Formatter = struct {
                 const exposed_item_slice = fmt.ast.store.exposedItemSlice(.{ .span = collection.span });
                 return fmt.nodesWillBeMultiline(AST.ExposedItem.Idx, exposed_item_slice);
             },
+            AST.WhereClause.Idx => {
+                const where_clause_slice = fmt.ast.store.whereClauseSlice(.{ .span = collection.span });
+                return fmt.nodesWillBeMultiline(AST.WhereClause.Idx, where_clause_slice);
+            },
             else => return false,
         }
     }
@@ -3596,6 +3668,21 @@ fn parseAndFmt(gpa: std.mem.Allocator, input: []const u8, debug: bool) FormatPar
 // These test cases verify that formatting is stable (idempotent) - formatting twice
 // produces the same output as formatting once.
 
+test "function type expands when its return type is multiline" {
+    const result = try moduleFmtsStable(
+        std.testing.allocator,
+        "r:(),(->c),(->d)->(c,)",
+        false,
+    );
+    defer std.testing.allocator.free(result);
+
+    try std.testing.expectEqualStrings("r : (),\n" ++
+        "(() -> c),\n" ++
+        "(() -> d) -> (\n" ++
+        "\tc,\n" ++
+        ")\n", result);
+}
+
 test "issue 8851: arrow call with space before field access is idempotent" {
     // a=0->b .c() should format stably with parentheses to disambiguate
     const result = try moduleFmtsStable(std.testing.allocator, "a=0->b .c()", false);
@@ -3618,6 +3705,29 @@ test "issue 8851: multiline arrow call with field access is idempotent" {
     , false);
     defer std.testing.allocator.free(result);
     try std.testing.expectEqualStrings("a = (0->b()).c()\n", result);
+}
+
+test "multiline arrow receiver in tuple is idempotent" {
+    const result = try moduleFmtsStable(std.testing.allocator,
+        \\a=(0(0->X)
+        \\->X .a)
+    , false);
+    defer std.testing.allocator.free(result);
+    try std.testing.expectEqualStrings(
+        "a = (\n" ++
+            "\t(\n" ++
+            "\t\t0(0->X)\n" ++
+            "\t\t\t->X,\n" ++
+            "\t).a,\n" ++
+            ")\n",
+        result,
+    );
+}
+
+test "integer field receiver separated by carriage return is idempotent" {
+    const result = try moduleFmtsStable(std.testing.allocator, "a=(0\r.e)\n", false);
+    defer std.testing.allocator.free(result);
+    try std.testing.expectEqualStrings("a = (\n\t(0).e,\n)\n", result);
 }
 
 test "issue 8851: tuple dispatch with chained zero-arg applies is idempotent" {

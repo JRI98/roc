@@ -577,4 +577,28 @@ pub const tests = [_]TestCase{
         .source = "Dec.rem_by(-7.5, 2.0)",
         .expected = .{ .inspect_str = "-1.5" },
     },
+    .{
+        // https://github.com/roc-lang/roc/issues/10084
+        // `item` is bound only through `outer.get`'s return type. The call edge
+        // must carry both static-dispatch evidence entries into specialization.
+        .name = "issue 10084: constraint-only receiver evidence reaches nested dispatch",
+        .source_kind = .module,
+        .source =
+        \\Inner := [Inner(U64)].{
+        \\    get : Inner -> U64
+        \\    get = |Inner.Inner(value)| value
+        \\}
+        \\
+        \\Outer := [Outer(Inner)].{
+        \\    get : Outer -> Inner
+        \\    get = |Outer.Outer(value)| value
+        \\}
+        \\
+        \\nested_get : outer -> result where [outer.get : outer -> item, item.get : item -> result]
+        \\nested_get = |outer| outer.get().get()
+        \\
+        \\main = nested_get(Outer.Outer(Inner.Inner(42)))
+        ,
+        .expected = .{ .inspect_str = "42" },
+    },
 };

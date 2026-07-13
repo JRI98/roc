@@ -1786,6 +1786,7 @@ const Builder = struct {
     fn lowerTypePayload(self: *Builder, view: ModuleView, checked_ty: checked.CheckedTypeId, payload: checked.CheckedTypePayload) Allocator.Error!Type.Content {
         return switch (payload) {
             .pending => Common.invariant("pending checked type reached Monotype lowering"),
+            .err => Common.invariant("erroneous checked type reached Monotype lowering"),
             .flex => |variable| lowerCheckedTypeVariable(variable),
             .rigid => |variable| lowerCheckedTypeVariable(variable),
             .empty_record => .{ .record = .empty() },
@@ -8199,6 +8200,7 @@ const BodyContext = struct {
     fn instNodeContent(self: *BodyContext, checked_ty: checked.CheckedTypeId) Allocator.Error!NodeId {
         return switch (checkedPayload(self.view, checked_ty)) {
             .pending => Common.invariant("pending checked type reached Monotype instantiation"),
+            .err => Common.invariant("erroneous checked type reached Monotype instantiation"),
             .flex, .rigid => |variable| try self.graph.newNode(.{ .unresolved = InstVariable.checkedVariable(
                 variable.numeric_default_phase,
                 variable.row_default,

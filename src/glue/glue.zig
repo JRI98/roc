@@ -1644,6 +1644,7 @@ const TypeTable = struct {
 
         switch (checkedTypePayload(src.artifact, src.checked_type)) {
             .pending => glueInvariant("pending checked type reached glue bound type string", .{}),
+            .err => glueInvariant("erroneous checked type reached glue bound type string", .{}),
             .flex => try buf.appendSlice(self.gpa, "flex"),
             .rigid => try buf.appendSlice(self.gpa, "rigid"),
             .alias => |alias| try self.writeTypeStringBound(src.artifact, alias.backing, buf, active),
@@ -2481,6 +2482,7 @@ const TypeTable = struct {
         const payload = checkedTypePayload(artifact, checked_type);
         return switch (payload) {
             .pending => glueInvariant("pending checked type reached glue type table", .{}),
+            .err => glueInvariant("erroneous checked type reached glue type table", .{}),
             .flex => .{ .unknown = .{ .name = try self.gpa.dupe(u8, "flex"), .layout = self.layoutFactsForIdx(.opaque_ptr) } },
             .rigid => .{ .unknown = .{ .name = try self.gpa.dupe(u8, "rigid"), .layout = self.layoutFactsForIdx(.opaque_ptr) } },
             .alias => |alias| try self.getAliasBackingRepr(artifact, alias.backing),
@@ -3935,6 +3937,7 @@ fn writeTypeString(
 
     switch (checkedTypePayload(artifact, checked_type)) {
         .pending => glueInvariant("pending checked type reached glue type string", .{}),
+        .err => glueInvariant("erroneous checked type reached glue type string", .{}),
         .flex => try buf.appendSlice(gpa, "flex"),
         .rigid => try buf.appendSlice(gpa, "rigid"),
         .alias => |alias| try writeTypeString(gpa, artifact, alias.backing, buf, active),
