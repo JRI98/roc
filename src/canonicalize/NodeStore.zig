@@ -38,6 +38,7 @@ type_apply_data: collections.SafeList(TypeApplyData), // Typed storage for type 
 pattern_list_data: collections.SafeList(PatternListData), // Typed storage for pattern lists
 pattern_str_interpolation_data: collections.SafeList(PatternStrInterpolationData), // Typed storage for string interpolation patterns
 pattern_str_interpolation_steps: collections.SafeList(PatternStrInterpolationStepData), // Typed storage for string interpolation pattern steps
+where_clause_owners: collections.SafeList(WhereClauseOwnerData), // Canonical receiver ownership for each where-clause scope
 index_data: collections.SafeList(u32), // Storage for variable-length index arrays (tuple elems, tag args, scratch spans)
 scratch: ?*Scratch, // Nullable because when we deserialize a NodeStore, we don't bother to reinitialize scratch.
 
@@ -169,6 +170,16 @@ pub const PatternStrInterpolationData = extern struct {
 pub const PatternStrInterpolationStepData = extern struct {
     capture_plus_one: u32,
     delimiter: u32,
+};
+
+/// Canonical ownership of a group of method where clauses by one rigid-var
+/// declaration. The clause indices are stored in `index_data`.
+pub const WhereClauseOwnerData = extern struct {
+    rigid_var: u32,
+    clauses_start: u32,
+    clauses_len: u32,
+    introduced_in_scope: bool,
+    _padding: [3]u8 = .{ 0, 0, 0 },
 };
 
 const Scratch = struct {
@@ -307,6 +318,8 @@ pub fn initCapacity(gpa: Allocator, capacity: usize) Allocator.Error!NodeStore {
     errdefer pattern_str_interpolation_data.deinit(gpa);
     var pattern_str_interpolation_steps = try collections.SafeList(PatternStrInterpolationStepData).initCapacity(gpa, capacity / 16);
     errdefer pattern_str_interpolation_steps.deinit(gpa);
+    var where_clause_owners = try collections.SafeList(WhereClauseOwnerData).initCapacity(gpa, capacity / 16);
+    errdefer where_clause_owners.deinit(gpa);
     var index_data = try collections.SafeList(u32).initCapacity(gpa, capacity / 4);
     errdefer index_data.deinit(gpa);
     const scratch = try Scratch.init(gpa);
@@ -331,6 +344,7 @@ pub fn initCapacity(gpa: Allocator, capacity: usize) Allocator.Error!NodeStore {
         .pattern_list_data = pattern_list_data,
         .pattern_str_interpolation_data = pattern_str_interpolation_data,
         .pattern_str_interpolation_steps = pattern_str_interpolation_steps,
+        .where_clause_owners = where_clause_owners,
         .index_data = index_data,
         .scratch = scratch,
     };
@@ -357,6 +371,7 @@ pub fn clone(self: *const NodeStore, gpa: Allocator) Allocator.Error!NodeStore {
         .pattern_list_data = try self.pattern_list_data.clone(gpa),
         .pattern_str_interpolation_data = try self.pattern_str_interpolation_data.clone(gpa),
         .pattern_str_interpolation_steps = try self.pattern_str_interpolation_steps.clone(gpa),
+        .where_clause_owners = try self.where_clause_owners.clone(gpa),
         .index_data = try self.index_data.clone(gpa),
         .scratch = null,
     };
@@ -383,6 +398,7 @@ pub fn deinit(store: *NodeStore) void {
     store.pattern_list_data.deinit(store.gpa);
     store.pattern_str_interpolation_data.deinit(store.gpa);
     store.pattern_str_interpolation_steps.deinit(store.gpa);
+    store.where_clause_owners.deinit(store.gpa);
     store.index_data.deinit(store.gpa);
     if (store.scratch) |scratch| {
         scratch.deinit(store.gpa);
@@ -409,6 +425,7 @@ pub fn relocate(store: *NodeStore, offset: isize) void {
     store.pattern_list_data.relocate(offset);
     store.pattern_str_interpolation_data.relocate(offset);
     store.pattern_str_interpolation_steps.relocate(offset);
+    store.where_clause_owners.relocate(offset);
     store.index_data.relocate(offset);
     // scratch is null for deserialized NodeStores, no need to relocate
 }
@@ -721,10 +738,10 @@ pub fn getStatement(store: *const NodeStore, statement: CIR.Statement.Idx) CIR.S
         .statement_type_anno => {
             const p = payload.statement_type_anno;
 
-            const where_clause = if (p.where_span2_idx_plus_one != 0) blk: {
-                const where_data = store.span2_data.items.items[p.where_span2_idx_plus_one - 1];
-                break :blk CIR.WhereClause.Span{ .span = DataSpan.init(where_data.start, where_data.len) };
-            } else null;
+            const where_clause = if (p.where_span2_idx_plus_one != 0)
+                store.loadWhereClauseSpan(p.where_span2_idx_plus_one - 1)
+            else
+                null;
 
             return CIR.Statement{
                 .s_type_anno = .{
@@ -2045,10 +2062,10 @@ pub fn getAnnotation(store: *const NodeStore, annotation: CIR.Annotation.Idx) CI
     const p = payload.annotation;
     const anno: CIR.TypeAnno.Idx = @enumFromInt(p.anno);
 
-    const where_clause = if (p.has_where) blk: {
-        const where_data = store.span2_data.items.items[p.where_span2_idx];
-        break :blk CIR.WhereClause.Span{ .span = DataSpan.init(where_data.start, where_data.len) };
-    } else null;
+    const where_clause = if (p.has_where)
+        store.loadWhereClauseSpan(p.where_span2_idx)
+    else
+        null;
 
     return CIR.Annotation{
         .anno = anno,
@@ -2273,14 +2290,10 @@ fn makeStatementNode(store: *NodeStore, statement: CIR.Statement) Allocator.Erro
         .s_type_anno => |s| {
             node.tag = .statement_type_anno;
 
-            const where_span2_idx_plus_one: u32 = if (s.where) |where_clause| blk: {
-                const idx: u32 = @intCast(store.span2_data.len());
-                _ = try store.span2_data.append(store.gpa, .{
-                    .start = where_clause.span.start,
-                    .len = where_clause.span.len,
-                });
-                break :blk idx + 1;
-            } else 0;
+            const where_span2_idx_plus_one: u32 = if (s.where) |where_clause|
+                (try store.storeWhereClauseSpan(where_clause)) + 1
+            else
+                0;
 
             node.setPayload(.{ .statement_type_anno = .{
                 .anno = @intFromEnum(s.anno),
@@ -3317,11 +3330,7 @@ pub fn addAnnotation(store: *NodeStore, annotation: CIR.Annotation, region: base
     const contains_underscore = store.annotationContainsUnderscore(annotation.anno, annotation.where);
 
     if (annotation.where) |where_clause| {
-        const where_span2_idx: u32 = @intCast(store.span2_data.len());
-        _ = try store.span2_data.append(store.gpa, .{
-            .start = where_clause.span.start,
-            .len = where_clause.span.len,
-        });
+        const where_span2_idx = try store.storeWhereClauseSpan(where_clause);
         node.setPayload(.{ .annotation = .{
             .anno = @intFromEnum(annotation.anno),
             .where_span2_idx = where_span2_idx,
@@ -3344,6 +3353,31 @@ pub fn addAnnotation(store: *NodeStore, annotation: CIR.Annotation, region: base
     const nid = try store.nodes.append(store.gpa, node);
     _ = try store.regions.append(store.gpa, region);
     return @enumFromInt(@intFromEnum(nid));
+}
+
+fn storeWhereClauseSpan(store: *NodeStore, where: CIR.WhereClause.Span) Allocator.Error!u32 {
+    const owners_span2_idx: u32 = @intCast(store.span2_data.len());
+    _ = try store.span2_data.append(store.gpa, .{
+        .start = where.owners.span.start,
+        .len = where.owners.span.len,
+    });
+
+    const where_span_idx: u32 = @intCast(store.span_with_node_data.len());
+    _ = try store.span_with_node_data.append(store.gpa, .{
+        .start = where.span.start,
+        .len = where.span.len,
+        .node = owners_span2_idx,
+    });
+    return where_span_idx;
+}
+
+fn loadWhereClauseSpan(store: *const NodeStore, idx: u32) CIR.WhereClause.Span {
+    const where = store.span_with_node_data.items.items[idx];
+    const owners = store.span2_data.items.items[where.node];
+    return .{
+        .span = DataSpan.init(where.start, where.len),
+        .owners = .{ .span = DataSpan.init(owners.start, owners.len) },
+    };
 }
 
 /// Which type-variable occurrences to count when scanning an annotation.
@@ -3733,9 +3767,110 @@ pub fn recordFieldSpanFrom(store: *NodeStore, start: u32) Allocator.Error!CIR.Re
     return try store.spanFrom("record_fields", CIR.RecordField.Span, start);
 }
 
-/// Returns a span from the scratch where clauses starting at the given index.
-pub fn whereClauseSpanFrom(store: *NodeStore, start: u32) Allocator.Error!CIR.WhereClause.Span {
-    return try store.spanFrom("where_clauses", CIR.WhereClause.Span, start);
+/// Returns a span from the scratch where clauses starting at the given index,
+/// together with the canonical rigid declaration that owns each method group.
+pub fn whereClauseSpanFrom(store: *NodeStore, start: u32, root_anno: CIR.TypeAnno.Idx) Allocator.Error!CIR.WhereClause.Span {
+    const clauses = try store.spanFrom("where_clauses", CIR.WhereClause.IdxSpan, start);
+
+    var introduced = std.AutoHashMapUnmanaged(CIR.TypeAnno.Idx, void){};
+    defer introduced.deinit(store.gpa);
+    try store.collectIntroducedRigidVars(root_anno, &introduced);
+    for (store.sliceWhereClauseIndices(clauses)) |where_idx| {
+        switch (store.getWhereClause(where_idx)) {
+            .w_method => |method| {
+                try store.collectIntroducedRigidVars(method.var_, &introduced);
+                for (store.sliceTypeAnnos(method.args)) |arg| {
+                    try store.collectIntroducedRigidVars(arg, &introduced);
+                }
+                try store.collectIntroducedRigidVars(method.ret, &introduced);
+            },
+            .w_alias => |alias| try store.collectIntroducedRigidVars(alias.var_, &introduced),
+            .w_malformed => {},
+        }
+    }
+
+    const ClauseList = std.ArrayListUnmanaged(CIR.WhereClause.Idx);
+    var grouped = std.AutoArrayHashMapUnmanaged(CIR.TypeAnno.Idx, ClauseList){};
+    defer {
+        for (grouped.values()) |*list| list.deinit(store.gpa);
+        grouped.deinit(store.gpa);
+    }
+
+    for (store.sliceWhereClauseIndices(clauses)) |where_idx| {
+        const method = switch (store.getWhereClause(where_idx)) {
+            .w_method => |method| method,
+            .w_alias, .w_malformed => continue,
+        };
+        const owner = switch (store.getTypeAnno(method.var_)) {
+            .rigid_var => method.var_,
+            .rigid_var_lookup => |lookup| lookup.ref,
+            else => continue,
+        };
+        const gop = try grouped.getOrPut(store.gpa, owner);
+        if (!gop.found_existing) gop.value_ptr.* = .empty;
+        try gop.value_ptr.append(store.gpa, where_idx);
+    }
+
+    const owners_start: u32 = @intCast(store.where_clause_owners.len());
+    for (grouped.keys(), grouped.values()) |owner, owned_clauses| {
+        const clauses_start: u32 = @intCast(store.index_data.len());
+        for (owned_clauses.items) |where_idx| {
+            _ = try store.index_data.append(store.gpa, @intFromEnum(where_idx));
+        }
+        _ = try store.where_clause_owners.append(store.gpa, .{
+            .rigid_var = @intFromEnum(owner),
+            .clauses_start = clauses_start,
+            .clauses_len = @intCast(owned_clauses.items.len),
+            .introduced_in_scope = introduced.contains(owner),
+        });
+    }
+
+    return .{
+        .span = clauses.span,
+        .owners = .{ .span = .{
+            .start = owners_start,
+            .len = @intCast(grouped.count()),
+        } },
+    };
+}
+
+fn collectIntroducedRigidVars(
+    store: *const NodeStore,
+    anno_idx: CIR.TypeAnno.Idx,
+    introduced: *std.AutoHashMapUnmanaged(CIR.TypeAnno.Idx, void),
+) Allocator.Error!void {
+    switch (store.getTypeAnno(anno_idx)) {
+        .rigid_var => try introduced.put(store.gpa, anno_idx, {}),
+        .rigid_var_lookup, .underscore, .lookup, .malformed => {},
+        .apply => |apply| for (store.sliceTypeAnnos(apply.args)) |arg| {
+            try store.collectIntroducedRigidVars(arg, introduced);
+        },
+        .tag_union => |tag_union| {
+            for (store.sliceTypeAnnos(tag_union.tags)) |tag| {
+                try store.collectIntroducedRigidVars(tag, introduced);
+            }
+            if (tag_union.ext) |ext| try store.collectIntroducedRigidVars(ext, introduced);
+        },
+        .tag => |tag| for (store.sliceTypeAnnos(tag.args)) |arg| {
+            try store.collectIntroducedRigidVars(arg, introduced);
+        },
+        .tuple => |tuple| for (store.sliceTypeAnnos(tuple.elems)) |elem| {
+            try store.collectIntroducedRigidVars(elem, introduced);
+        },
+        .record => |record| {
+            for (store.sliceAnnoRecordFields(record.fields)) |field_idx| {
+                try store.collectIntroducedRigidVars(store.getAnnoRecordField(field_idx).ty, introduced);
+            }
+            if (record.ext) |ext| try store.collectIntroducedRigidVars(ext, introduced);
+        },
+        .@"fn" => |func| {
+            for (store.sliceTypeAnnos(func.args)) |arg| {
+                try store.collectIntroducedRigidVars(arg, introduced);
+            }
+            try store.collectIntroducedRigidVars(func.ret, introduced);
+        },
+        .parens => |parens| try store.collectIntroducedRigidVars(parens.anno, introduced),
+    }
 }
 
 /// Returns the current top of the scratch exposed items buffer.
@@ -3980,6 +4115,25 @@ pub fn sliceExposedItems(store: *const NodeStore, span: CIR.ExposedItem.Span) []
 /// Returns a slice of where clauses from the store.
 pub fn sliceWhereClauses(store: *const NodeStore, span: CIR.WhereClause.Span) []CIR.WhereClause.Idx {
     return store.sliceFromSpan(CIR.WhereClause.Idx, span.span);
+}
+
+fn sliceWhereClauseIndices(store: *const NodeStore, span: CIR.WhereClause.IdxSpan) []CIR.WhereClause.Idx {
+    return store.sliceFromSpan(CIR.WhereClause.Idx, span.span);
+}
+
+/// Returns the canonical rigid-owner groups for one where-clause scope.
+pub fn sliceWhereClauseOwners(store: *const NodeStore, span: CIR.WhereClause.Span) []const WhereClauseOwnerData {
+    const start: usize = span.owners.span.start;
+    const end = start + span.owners.span.len;
+    return store.where_clause_owners.items.items[start..end];
+}
+
+/// Returns the method clauses canonically assigned to one rigid owner.
+pub fn sliceWhereClausesForOwner(store: *const NodeStore, owner: WhereClauseOwnerData) []CIR.WhereClause.Idx {
+    return store.sliceFromSpan(CIR.WhereClause.Idx, .{
+        .start = owner.clauses_start,
+        .len = owner.clauses_len,
+    });
 }
 
 /// Returns a slice of annotation record fields from the store.
@@ -5039,6 +5193,7 @@ pub const Serialized = extern struct {
     pattern_list_data: collections.SafeList(PatternListData).Serialized,
     pattern_str_interpolation_data: collections.SafeList(PatternStrInterpolationData).Serialized,
     pattern_str_interpolation_steps: collections.SafeList(PatternStrInterpolationStepData).Serialized,
+    where_clause_owners: collections.SafeList(WhereClauseOwnerData).Serialized,
     index_data: collections.SafeList(u32).Serialized,
     scratch: u64, // Reserve enough space for a 64-bit pointer
 
@@ -5083,6 +5238,8 @@ pub const Serialized = extern struct {
         try self.pattern_str_interpolation_data.serialize(&store.pattern_str_interpolation_data, allocator, writer);
         // Serialize pattern_str_interpolation_steps
         try self.pattern_str_interpolation_steps.serialize(&store.pattern_str_interpolation_steps, allocator, writer);
+        // Serialize canonical where-clause ownership
+        try self.where_clause_owners.serialize(&store.where_clause_owners, allocator, writer);
         // Serialize index_data
         try self.index_data.serialize(&store.index_data, allocator, writer);
     }
@@ -5111,6 +5268,7 @@ pub const Serialized = extern struct {
             .pattern_list_data = self.pattern_list_data.deserializeInto(base_addr),
             .pattern_str_interpolation_data = self.pattern_str_interpolation_data.deserializeInto(base_addr),
             .pattern_str_interpolation_steps = self.pattern_str_interpolation_steps.deserializeInto(base_addr),
+            .where_clause_owners = self.where_clause_owners.deserializeInto(base_addr),
             .index_data = self.index_data.deserializeInto(base_addr),
             .scratch = null, // A deserialized NodeStore is read-only, so it has no need for scratch memory!
         };
@@ -5139,6 +5297,7 @@ pub const Serialized = extern struct {
             .pattern_list_data = self.pattern_list_data.deserializeInto(base_addr),
             .pattern_str_interpolation_data = self.pattern_str_interpolation_data.deserializeInto(base_addr),
             .pattern_str_interpolation_steps = self.pattern_str_interpolation_steps.deserializeInto(base_addr),
+            .where_clause_owners = self.where_clause_owners.deserializeInto(base_addr),
             .index_data = self.index_data.deserializeInto(base_addr),
             .scratch = null,
         };

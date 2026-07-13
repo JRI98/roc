@@ -112,7 +112,8 @@ pub fn defaultDec(idents: *const Ident.Store) canonical.CanonicalTypeKey {
 /// store, so the app's checked-module output needs the platform root's checked
 /// module as the type's owner — the platform root must then produce its checked
 /// module at check time rather than deferring to finalization. Erroneous type
-/// content conservatively counts as a reference (the caller then skips deferral).
+/// content conservatively counts as a reference for this probe, while ordinary
+/// key construction records it explicitly.
 pub fn varReferencesModuleLocalNamedType(
     allocator: Allocator,
     store: *const TypeStore,
@@ -249,7 +250,7 @@ const Builder = struct {
                     self.references_module_local_named_type = true;
                     return;
                 }
-                invariantViolation("canonical type key requested for erroneous checked type");
+                self.writeTag("err");
             },
             .flex => |flex| {
                 if (self.require_concrete) {
@@ -713,6 +714,21 @@ fn invariantViolation(comptime message: []const u8) noreturn {
 
 test "canonical type key declarations are referenced" {
     std.testing.refAllDecls(@This());
+}
+
+test "erroneous checked types have a canonical key" {
+    const allocator = std.testing.allocator;
+
+    var env = try ModuleEnv.init(allocator, "");
+    defer env.deinit();
+
+    var store = try TypeStore.initCapacity(allocator, 1, 0);
+    defer store.deinit();
+    const err_var = try store.freshFromContent(.err);
+
+    const first = try fromVar(allocator, &store, &env, err_var);
+    const second = try fromVar(allocator, &store, &env, err_var);
+    try std.testing.expectEqual(first, second);
 }
 
 test "concrete keys default open literal flex vars per kind (numeral -> Dec, quote -> Str)" {

@@ -1,15 +1,15 @@
 # META
 ~~~ini
-description=Issue #10097: Unstable formatting in parser/formatter roundtrip
+description=parser formatter stability: newline + malformed number token
 type=file
 ~~~
 # SOURCE
 ~~~roc
 e={0#
-.{}}
+.0.{} }
 ~~~
 # EXPECTED
-UNRECOGNIZED SYNTAX - fuzz_crash_089.md:1:4:2:4
+UNRECOGNIZED SYNTAX - fuzz_crash_104.md:1:4:2:6
 # PROBLEMS
 
 ┌─────────────────────┐
@@ -17,16 +17,16 @@ UNRECOGNIZED SYNTAX - fuzz_crash_089.md:1:4:2:4
 └┬────────────────────┘                                                       │
  │                                                                            │
  │  e={0#                                                                     │
- │  .{}}                                                                      │
+ │  .0.{} }                                                                   │
  │                                                                            │
- └───────────────────────────────────────────────────── fuzz_crash_089.md:1:4 ┘
+ └───────────────────────────────────────────────────── fuzz_crash_104.md:1:4 ┘
 
     This might be a syntax error, an unsupported language feature, or a typo.
 
 # TOKENS
 ~~~zig
 LowerIdent,OpAssign,OpenCurly,Int,
-Dot,OpenCurly,CloseCurly,CloseCurly,
+DotInt,Dot,OpenCurly,CloseCurly,CloseCurly,
 EndOfFile,
 ~~~
 # PARSE
@@ -39,14 +39,15 @@ EndOfFile,
 			(e-block
 				(statements
 					(e-nominal-record
-						(mapper (e-int (raw "0")))
+						(mapper (e-tuple-access
+								(e-int (raw "0"))
+								".0"))
 						(backing (e-record))))))))
 ~~~
 # FORMATTED
 ~~~roc
 e = {
-	0 #
-	.{}
+	(0).0.{}
 }
 ~~~
 # CANONICALIZE

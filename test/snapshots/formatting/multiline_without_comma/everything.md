@@ -620,10 +620,16 @@ import I2 exposing [I21 as Ias1, I22 as Ias2]
 
 # Where constraint
 A(a) : a
-	where [a.a1 : (a, a) -> Str, a.a2 : (a, a) -> Str]
+	where [
+		a.a1 : (a, a) -> Str,
+		a.a2 : (a, a) -> Str,
+	]
 
 B(b) : b
-	where [b.b1 : (b, b) -> Str, b.b2 : (b, b) -> Str]
+	where [
+		b.b1 : (b, b) -> Str,
+		b.b2 : (b, b) -> Str,
+	]
 
 C(a, b) : (a, b)
 

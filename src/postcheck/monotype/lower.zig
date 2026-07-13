@@ -1768,6 +1768,7 @@ const Builder = struct {
     fn lowerTypePayload(self: *Builder, view: ModuleView, checked_ty: checked.CheckedTypeId, payload: checked.CheckedTypePayload) Allocator.Error!Type.Content {
         return switch (payload) {
             .pending => Common.invariant("pending checked type reached Monotype lowering"),
+            .err => Common.invariant("erroneous checked type reached Monotype lowering"),
             .flex => |variable| lowerCheckedTypeVariable(variable),
             .rigid => |variable| lowerCheckedTypeVariable(variable),
             .empty_record => .{ .record = .empty() },
@@ -2500,8 +2501,8 @@ const Builder = struct {
     /// user dispatch never resolves here — its targets are consumed from
     /// checked evidence.
     fn componentMethodTargetByName(self: *Builder, ty: Type.TypeId, method_name: []const u8) ?MethodLookup {
+        const owner = componentDispatchOwner(&self.program.types, ty) orelse return null;
         const method = self.program.names.lookupMethodName(method_name) orelse return null;
-        const owner = self.componentDispatchOwner(ty) orelse return null;
         return self.component_method_targets.get(.{ .owner = owner, .method = method });
     }
 
@@ -2514,29 +2515,6 @@ const Builder = struct {
         method: names.MethodNameId,
     ) ?MethodLookup {
         return self.componentMethodTargetByName(ty, method_view.names.methodNameText(method));
-    }
-
-    /// The registry key naming `ty`'s dispatch head, read from the checked
-    /// type identity the monotype carries; null for shapes with no head
-    /// (structural rows, functions, unsolved placeholders).
-    fn componentDispatchOwner(self: *Builder, ty: Type.TypeId) ?static_dispatch.MethodOwner {
-        return switch (self.program.types.dispatchHeadContent(ty)) {
-            .primitive => |primitive| .{ .builtin = Type.builtinOwnerForPrimitive(primitive) },
-            .list => .{ .builtin = .list },
-            .box => .{ .builtin = .box },
-            .named => |named| if (named.builtin_owner) |owner|
-                .{ .builtin = owner }
-            else if (named.kind == .alias)
-                // An alias with no backing has no head.
-                null
-            else
-                .{ .nominal = .{
-                    .module = named.def.module,
-                    .type_name = named.def.type_name,
-                    .source_decl = named.def.source_decl,
-                } },
-            else => null,
-        };
     }
 
     fn importModuleAlreadyScanned(self: *Builder, module_id: checked.ModuleId, import_index: usize) bool {
@@ -8000,6 +7978,7 @@ const BodyContext = struct {
     fn instNodeContent(self: *BodyContext, checked_ty: checked.CheckedTypeId) Allocator.Error!NodeId {
         return switch (checkedPayload(self.view, checked_ty)) {
             .pending => Common.invariant("pending checked type reached Monotype instantiation"),
+            .err => Common.invariant("erroneous checked type reached Monotype instantiation"),
             .flex, .rigid => |variable| try self.graph.newNode(.{ .unresolved = InstVariable.checkedVariable(
                 variable.numeric_default_phase,
                 variable.row_default,
@@ -17520,41 +17499,19 @@ const BodyContext = struct {
         return self.materializeEvidence(refs);
     }
 
-    /// Evidence vector for a dispatch plan's chosen target (the target's own
-    /// requirements): a direct plan carries it as the evidence node's nested
-    /// refs; a constraint plan's edge-supplied target carries it materialized.
-    fn evidenceForDispatchTarget(self: *BodyContext, plan: static_dispatch.StaticDispatchCallPlan) Allocator.Error!SpecEvidenceVector {
-        switch (plan.resolution) {
+    /// Evidence vector for a dispatch plan's or iterator call's chosen target
+    /// (the target's own requirements): a direct resolution carries it as the
+    /// evidence node's nested refs; a constraint resolution's edge-supplied
+    /// target carries it materialized.
+    fn evidenceForResolvedTarget(self: *BodyContext, resolution: static_dispatch.StaticDispatchResolution) Allocator.Error!SpecEvidenceVector {
+        switch (resolution) {
             .direct => |node_id| {
                 const node = self.view.static_dispatch_plans.evidenceNode(node_id);
                 return .{ .resolved = try self.materializeEvidence(self.view.static_dispatch_plans.nestedEvidence(node)) };
             },
             .constraint => |constraint_ref| {
                 const entry = self.evidence.at(constraint_ref) orelse
-                    Common.invariant("dispatch plan's constraint ref was outside the edge's evidence chain");
-                return switch (entry) {
-                    .target => |target| switch (target.nested) {
-                        .resolved => |nested| .{ .resolved = nested },
-                        .synthesize => .synthesize,
-                    },
-                    .structural, .unreachable_value, .checked_error => .{ .resolved = &.{} },
-                };
-            },
-            .structural, .checked_error, .unreachable_dispatch => return .{ .resolved = &.{} },
-        }
-    }
-
-    /// Evidence vector for an iterator dispatch call's chosen target,
-    /// mirroring `evidenceForDispatchTarget` for `IteratorDispatchCall`s.
-    fn evidenceForIteratorCall(self: *BodyContext, call: static_dispatch.IteratorDispatchCall) Allocator.Error!SpecEvidenceVector {
-        switch (call.resolution) {
-            .direct => |node_id| {
-                const node = self.view.static_dispatch_plans.evidenceNode(node_id);
-                return .{ .resolved = try self.materializeEvidence(self.view.static_dispatch_plans.nestedEvidence(node)) };
-            },
-            .constraint => |constraint_ref| {
-                const entry = self.evidence.at(constraint_ref) orelse
-                    Common.invariant("iterator dispatch plan's constraint ref was outside the edge's evidence chain");
+                    Common.invariant("dispatch resolution's constraint ref was outside the edge's evidence chain");
                 return switch (entry) {
                     .target => |target| switch (target.nested) {
                         .resolved => |nested| .{ .resolved = nested },
@@ -17774,7 +17731,7 @@ const BodyContext = struct {
         method_name: []const u8,
     ) MethodLookup {
         return self.builder.componentMethodTargetByName(owner_ty, method_name) orelse
-            Common.invariant("checked method registry is missing a compiler-generated helper method");
+            Common.invariantFmt("checked method registry is missing compiler-generated helper method {s}", .{method_name});
     }
 
     /// Resolve a target's requirements from its checked dispatcher paths
@@ -18046,7 +18003,7 @@ const BodyContext = struct {
         const fn_data = self.builder.functionShape(callable_mono_ty, "checked dispatch target had a non-function type");
         const args = try arg_ctx.lowerDispatchOperandsAtTypes(plan.argsSlice(self.view.static_dispatch_plans), self.builder.program.types.span(fn_data.args), pre_lowered);
         return .{ .call_proc = .{
-            .callee = draftProcCalleeFromAst(Ast.procCalleeForSlot(try self.methodTargetCalleeWithMono(lookup, callable_mono_ty, try self.evidenceForDispatchTarget(plan)))),
+            .callee = draftProcCalleeFromAst(Ast.procCalleeForSlot(try self.methodTargetCalleeWithMono(lookup, callable_mono_ty, try self.evidenceForResolvedTarget(plan.resolution)))),
             .args = args,
         } };
     }
@@ -23213,7 +23170,7 @@ const BodyContext = struct {
         return try self.addExpr(.{
             .ty = fn_data.ret,
             .data = .{ .call_proc = .{
-                .callee = draftProcCalleeFromAst(Ast.procCalleeForSlot(try self.methodTargetCalleeWithMono(lookup, target_mono_ty, try self.evidenceForIteratorCall(plan)))),
+                .callee = draftProcCalleeFromAst(Ast.procCalleeForSlot(try self.methodTargetCalleeWithMono(lookup, target_mono_ty, try self.evidenceForResolvedTarget(plan.resolution)))),
                 .args = try self.addExprSpan(args),
             } },
         });
@@ -25193,28 +25150,46 @@ fn hostedTemplate(hosted: anytype) names.ProcTemplate {
     @compileError("unsupported hosted function payload");
 }
 
+/// The registry key naming `ty`'s dispatch head, read from the checked type
+/// identity the monotype carries (`named.def` / `builtin_owner`,
+/// alias-transparently); null for shapes with no head (structural rows,
+/// functions, unsolved placeholders). The one head reader: the component
+/// lookup and the shape predicates below all derive from it.
+fn componentDispatchOwner(types: *const Type.Store, ty: Type.TypeId) ?static_dispatch.MethodOwner {
+    return switch (types.dispatchHeadContent(ty)) {
+        .primitive => |primitive| .{ .builtin = Type.builtinOwnerForPrimitive(primitive) },
+        .list => .{ .builtin = .list },
+        .box => .{ .builtin = .box },
+        .named => |named| if (named.builtin_owner) |owner|
+            .{ .builtin = owner }
+        else if (named.kind == .alias)
+            // An alias with no backing has no head.
+            null
+        else
+            .{ .nominal = .{
+                .module = named.def.module,
+                .type_name = named.def.type_name,
+                .source_decl = named.def.source_decl,
+            } },
+        else => null,
+    };
+}
+
 /// Whether a dispatcher's monotype has grounded to a shape that names a
 /// dispatch head (a builtin or nominal type, alias-transparently). This only
 /// orders lowering — operand pre-lowering and argument-evidence passes wait
 /// for ungrounded dispatchers to solve; dispatch targets themselves are
 /// always consumed from checked evidence, never resolved from this shape.
 fn dispatcherIsGrounded(types: *const Type.Store, ty: Type.TypeId) bool {
-    return switch (types.dispatchHeadContent(ty)) {
-        .primitive, .list, .box => true,
-        .named => |named| named.builtin_owner != null or named.kind != .alias,
-        else => false,
-    };
+    return componentDispatchOwner(types, ty) != null;
 }
 
 /// Whether `ty`'s dispatch head is the given builtin (alias-transparently).
 /// Shape predicate only — never resolves a dispatch target.
 fn typeHasBuiltinHead(types: *const Type.Store, ty: Type.TypeId, owner: static_dispatch.BuiltinOwner) bool {
-    return switch (types.dispatchHeadContent(ty)) {
-        .primitive => |primitive| Type.builtinOwnerForPrimitive(primitive) == owner,
-        .list => owner == .list,
-        .box => owner == .box,
-        .named => |named| if (named.builtin_owner) |builtin| builtin == owner else false,
-        else => false,
+    return switch (componentDispatchOwner(types, ty) orelse return false) {
+        .builtin => |builtin| builtin == owner,
+        .nominal => false,
     };
 }
 
@@ -25247,34 +25222,7 @@ fn nominalHasDeclarationBacking(nominal: checked.CheckedNominalType) bool {
 }
 
 fn builtinOwner(builtin: ?checked.CheckedBuiltinNominal) ?static_dispatch.BuiltinOwner {
-    return switch (builtin orelse return null) {
-        .bool => .bool,
-        .str => .str,
-        .u8 => .u8,
-        .i8 => .i8,
-        .u16 => .u16,
-        .i16 => .i16,
-        .u32 => .u32,
-        .i32 => .i32,
-        .u64 => .u64,
-        .i64 => .i64,
-        .u128 => .u128,
-        .i128 => .i128,
-        .f32 => .f32,
-        .f64 => .f64,
-        .dec => .dec,
-        .list => .list,
-        .box => .box,
-        .dict => .dict,
-        .set => .set,
-        .parse_tag_union_spec => .parse_tag_union_spec,
-        .fields => .fields,
-        .field => .field,
-        .crypto_sha256_digest => .crypto_sha256_digest,
-        .crypto_sha256_hasher => .crypto_sha256_hasher,
-        .crypto_blake3_digest => .crypto_blake3_digest,
-        .crypto_blake3_hasher => .crypto_blake3_hasher,
-    };
+    return static_dispatch.builtinOwnerForCheckedBuiltin(builtin orelse return null);
 }
 
 fn primitiveInspectLowLevelOp(primitive: Type.Primitive) can.CIR.Expr.LowLevel {

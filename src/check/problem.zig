@@ -56,6 +56,7 @@ pub const ComptimeCondition = types.ComptimeCondition;
 pub const TypeApplyArityMismatch = types.TypeApplyArityMismatch;
 pub const RecursiveAlias = types.RecursiveAlias;
 pub const UnsupportedAliasWhereClause = types.UnsupportedAliasWhereClause;
+pub const WhereClauseReceiverNotIntroduced = types.WhereClauseReceiverNotIntroduced;
 
 // Nominal type errors
 pub const CannotAccessOpaqueNominal = types.CannotAccessOpaqueNominal;

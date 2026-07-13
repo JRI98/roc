@@ -197,6 +197,7 @@ pub fn checkedTypePayloadContainsIdentityVariables(
             .forbid => true,
             .tolerate => context.pendingContainsIdentityVariables(root),
         },
+        .err => false,
         .flex,
         .rigid,
         => true,

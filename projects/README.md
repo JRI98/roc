@@ -117,10 +117,6 @@ Small:
   lists, ending the one-local-per-element explosion behind issue 9898.
 
 Big:
-- [big/arc-inserter-join-summaries.md](big/arc-inserter-join-summaries.md)
-  — applies the certifier's finite-summary/dataflow discipline to
-  production ARC insertion, replacing the join and liveness re-walks that
-  make generated structural encoders compile in minutes.
 - [big/single-source-builtin-registration.md](big/single-source-builtin-registration.md)
   — collapses the seven hand-typed `roc_builtins_*` symbol/ABI tables onto
   one comptime-generated registry.
@@ -143,6 +139,5 @@ front-loads leverage and keeps prerequisites satisfied:
 9. `big/platform-relation-from-checking.md`
 10. `small/frame-partitioned-checker-state.md`
 11. `small/compact-constant-aggregates.md`
-12. `big/arc-inserter-join-summaries.md`
-13. `big/single-source-builtin-registration.md`
-14. `big/decision-tree-match-compiler.md`
+12. `big/single-source-builtin-registration.md`
+13. `big/decision-tree-match-compiler.md`

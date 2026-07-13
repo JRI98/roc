@@ -2837,7 +2837,8 @@ test "compiler-generated dispatch classes lower via checked evidence" {
     // `Str.inspect` through a custom `to_inspect`, and parser-format
     // synthesis with builtin Set helpers (JSON parse of a Set field).
     // Debug-mode lowering asserts dispatch-evidence totality by invariant
-    // throughout, so completing the lowering is the assertion.
+    // throughout, and the evaluated output asserts every class resolved to
+    // the RIGHT target, not merely some lowerable one.
     const source =
         \\module [main]
         \\
@@ -2848,7 +2849,7 @@ test "compiler-generated dispatch classes lower via checked evidence" {
         \\    to_inspect = |Speed.Mph(mph)| Str.inspect(mph)
         \\}
         \\
-        \\main : Str
+        \\main : Bool
         \\main = {
         \\    var $sum = 0.U64
         \\    for item in [1.U64, 2.U64, 3.U64] {
@@ -2856,21 +2857,26 @@ test "compiler-generated dispatch classes lower via checked evidence" {
         \\    }
         \\    lhs = { speed: Speed.Mph($sum), label: "total" }
         \\    rhs = { speed: Speed.Mph(6), label: "total" }
+        \\    other = { speed: Speed.Mph(7), label: "total" }
         \\    parsed : Try({ names : Set(Str) }, Json.ParseErr)
         \\    parsed = Json.parse("{ \"names\": [\"a\", \"b\"] }")
         \\    parsed_count = match parsed {
         \\        Ok(rec) => rec.names.len()
         \\        Err(_) => 0
         \\    }
-        \\    if lhs == rhs and parsed_count > 0 Str.inspect(lhs.speed) else "no"
+        \\    lhs == rhs and lhs != other and parsed_count == 2 and Str.inspect(lhs.speed) == "6"
         \\}
     ;
 
-    var mono = try lowerMonotypeModule(allocator, source);
-    defer mono.deinit(allocator);
+    var compiled = try helpers.compileInspectedProgramWithBuiltin(allocator, std.testing.io, .module, source, &.{}, try sharedPrePublishedBuiltin(), null);
+    defer compiled.deinit(allocator);
 
     // The program must check cleanly: a reported problem would resolve the
     // dispatch plans as checked errors and crash-lower the very classes this
     // test exists to exercise.
-    try std.testing.expectEqual(@as(usize, 0), mono.resources.checker.problems.problems.items.len);
+    try std.testing.expectEqual(@as(usize, 0), compiled.resources.checker.problems.problems.items.len);
+
+    const output = try helpers.lirInterpreterInspectedStr(allocator, &compiled.lowered);
+    defer allocator.free(output);
+    try std.testing.expectEqualStrings("True", output);
 }

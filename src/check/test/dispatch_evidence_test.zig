@@ -94,7 +94,7 @@ test "evidence params reach vars bound only inside constraint fn types" {
     ;
     var test_env = try TestEnv.init("Test", source);
     defer test_env.deinit();
-    try test_env.assertDefType("helper", "a -> Str where [a.step : a -> b]");
+    try test_env.assertDefType("helper", "a -> Str where [a.step : a -> b, b.to_str : b -> Str]");
 
     const gpa = std.testing.allocator;
     const env = test_env.module_env;
@@ -102,15 +102,12 @@ test "evidence params reach vars bound only inside constraint fn types" {
     defer params.deinit(gpa);
     try enumerate(gpa, env, try defVar(env, "helper"), &params);
 
-    // `a` occurs in the signature and emits `step`. The checker currently does
-    // not attach `b.to_str` to the `b` bound inside `a.step`'s fn type (the
-    // type writer prints the scheme without it), so the enumeration — which
-    // does walk constraint fn types, exactly for vars like `b` — finds one
-    // param today. If the checker starts attaching clause-only-var
-    // constraints, this expectation grows to [step, to_str].
-    try std.testing.expectEqual(@as(usize, 1), params.items.len);
+    // `a` occurs in the signature and emits `step`; walking that constraint's
+    // function type reaches the constraint-only `b` and emits `to_str`.
+    try std.testing.expectEqual(@as(usize, 2), params.items.len);
     const idents = env.getIdentStoreConst();
     try std.testing.expectEqualStrings("step", idents.getText(params.items[0].constraint.fn_name));
+    try std.testing.expectEqualStrings("to_str", idents.getText(params.items[1].constraint.fn_name));
 }
 
 test "imported scheme copy enumerates the same param list as the defining module" {
@@ -157,11 +154,11 @@ test "imported scheme copy enumerates the same param list as the defining module
     );
 
     // Caller module's enumeration over the pristine scheme copy captured by
-    // the dispatch_target instantiation record.
+    // the dispatch_target scheme-use record.
     const env_b = test_env_b.module_env;
     var found_matching_record = false;
-    for (env_b.scheme_instantiations.items.items) |record| {
-        if (record.slot_kind != @intFromEnum(ModuleEnv.SchemeInstantiationRecord.Slot.dispatch_target)) continue;
+    for (env_b.scheme_uses.items.items) |record| {
+        if (record.slot_kind != @intFromEnum(ModuleEnv.SchemeUseRecord.Slot.dispatch_target)) continue;
 
         var params_b = std.ArrayListUnmanaged(dispatch_evidence.EvidenceParam).empty;
         defer params_b.deinit(gpa);

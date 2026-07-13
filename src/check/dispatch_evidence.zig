@@ -6,7 +6,7 @@
 //! resolution and a call edge's k-th evidence entry both refer to. The order
 //! is defined purely by the scheme's type structure, so the definition's own
 //! module and a caller holding a structural copy of the scheme (an import
-//! copy, or the pristine root recorded by a `SchemeInstantiationRecord`)
+//! copy, or the pristine root recorded by a `SchemeUseRecord`)
 //! enumerate identical lists without sharing var identities.
 //!
 //! Order contract: depth-first over the resolved type structure — function

@@ -63,6 +63,7 @@ const ComptimeCondition = problem_mod.ComptimeCondition;
 const TypeApplyArityMismatch = problem_mod.TypeApplyArityMismatch;
 const RecursiveAlias = problem_mod.RecursiveAlias;
 const UnsupportedAliasWhereClause = problem_mod.UnsupportedAliasWhereClause;
+const WhereClauseReceiverNotIntroduced = problem_mod.WhereClauseReceiverNotIntroduced;
 const InvalidNominalDeclRecursion = problem_mod.InvalidNominalDeclRecursion;
 
 // Nominal type errors
@@ -881,6 +882,9 @@ pub const ReportBuilder = struct {
             },
             .unsupported_alias_where_clause => |data| {
                 return self.buildUnsupportedAliasWhereClauseReport(data);
+            },
+            .where_clause_receiver_not_introduced => |data| {
+                return self.buildWhereClauseReceiverNotIntroducedReport(data);
             },
             .invalid_nominal_decl_recursion => |data| {
                 return self.buildInvalidNominalDeclRecursionReport(data);
@@ -2015,6 +2019,41 @@ pub const ReportBuilder = struct {
             D.bytes("This syntax was used for abilities, which have been removed from Roc. Use method constraints like"),
             D.bytes("where [a.methodName(args) -> ret]").withAnnotation(.inline_code),
             D.bytes("instead."),
+        }, self, &report);
+
+        return report;
+    }
+
+    /// Build a report for a where constraint on a rigid introduced by a different annotation.
+    fn buildWhereClauseReceiverNotIntroducedReport(
+        self: *Self,
+        data: WhereClauseReceiverNotIntroduced,
+    ) Allocator.Error!Report {
+        var report = try Report.init(self.gpa, "Constraint in Wrong Annotation", "", .runtime_error);
+        errdefer report.deinit();
+        try D.renderSliceInto(&.{
+            D.bytes("The type variable"),
+            D.ident(data.type_var_name).withAnnotation(.inline_code),
+            D.bytes("was introduced by a different annotation, so this where clause cannot add the"),
+            D.ident(data.method_name).withAnnotation(.symbol),
+            D.bytes("method to it."),
+        }, self, &report, &report.headline);
+
+        const region_info = self.module_env.calcRegionInfo(data.region);
+        try report.document.addSourceRegion(
+            region_info,
+            .error_highlight,
+            self.filename,
+            self.source,
+            self.module_env.getLineStarts(),
+        );
+        try report.document.addLineBreak();
+
+        try D.renderSlice(&.{
+            D.bytes("A where clause can only add methods to type variables introduced by the same annotation. Add this method to the annotation that introduced"),
+            D.ident(data.type_var_name).withAnnotation(.inline_code),
+            D.bytes(",").withNoPrecedingSpace(),
+            D.bytes("or use a new type variable here."),
         }, self, &report);
 
         return report;

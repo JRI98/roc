@@ -77,7 +77,7 @@ test "check tests" {
     std.testing.refAllDecls(@import("test/unify_test.zig"));
     std.testing.refAllDecls(@import("test/instantiate_tag_union_test.zig"));
     std.testing.refAllDecls(@import("test/where_clause_test.zig"));
-    std.testing.refAllDecls(@import("test/scheme_instantiation_evidence_test.zig"));
+    std.testing.refAllDecls(@import("test/scheme_use_evidence_test.zig"));
     std.testing.refAllDecls(@import("test/dispatch_evidence_test.zig"));
     std.testing.refAllDecls(@import("dispatch_evidence.zig"));
     std.testing.refAllDecls(@import("test/range_test.zig"));

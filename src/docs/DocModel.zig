@@ -999,6 +999,11 @@ pub const DocType = union(enum) {
     /// Error/unknown type
     @"error",
 
+    pub const Layout = enum {
+        compact,
+        multiline,
+    };
+
     pub const TypeRef = struct {
         /// Module path where this type is defined, as provided by the compiler.
         /// Currently basenames like "Builtin", "Counter", "Num".
@@ -1023,6 +1028,7 @@ pub const DocType = union(enum) {
         ext: ?*const DocType,
         /// True when the record is open (`..` or `..name`).
         is_open: bool,
+        layout: Layout = .compact,
     };
 
     pub const Field = struct {
@@ -1037,25 +1043,30 @@ pub const DocType = union(enum) {
         ext: ?*const DocType,
         /// True when the union is open (`..` or `..name`).
         is_open: bool,
+        layout: Layout = .compact,
     };
 
     pub const Tag = struct {
         name: []const u8,
         args: []const *const DocType,
+        layout: Layout = .compact,
     };
 
     pub const Tuple = struct {
         elems: []const *const DocType,
+        layout: Layout = .compact,
     };
 
     pub const Apply = struct {
         constructor: *const DocType, // the type being applied (e.g., List)
         args: []const *const DocType,
+        layout: Layout = .compact,
     };
 
     pub const WhereClause = struct {
         type: *const DocType,
         constraints: []const Constraint,
+        layout: Layout = .compact,
     };
 
     pub const Constraint = struct {

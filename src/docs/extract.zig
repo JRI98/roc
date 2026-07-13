@@ -675,8 +675,7 @@ fn extractDefEntry(
             // is already available in CIR.
             const type_sig: ?*const DocType = blk: {
                 if (def.annotation) |anno_idx| {
-                    const annotation = module_env.store.getAnnotation(anno_idx);
-                    break :blk try extractAnnotationAsDocType(gpa, module_env, local_module_path, annotation);
+                    break :blk try extractAnnotationAsDocType(gpa, module_env, local_module_path, anno_idx);
                 }
 
                 const def_var = ModuleEnv.varFrom(def_idx);
@@ -845,8 +844,9 @@ fn extractAnnotationAsDocType(
     gpa: Allocator,
     module_env: *const ModuleEnv,
     local_module_path: []const u8,
-    annotation: CIR.Annotation,
+    annotation_idx: CIR.Annotation.Idx,
 ) Allocator.Error!?*const DocType {
+    const annotation = module_env.store.getAnnotation(annotation_idx);
     const base_type = try extractTypeAnnoAsDocType(gpa, module_env, local_module_path, annotation.anno) orelse return null;
     var base_type_moved = false;
     errdefer if (!base_type_moved) {
@@ -902,6 +902,7 @@ fn extractAnnotationAsDocType(
     const wrapped = try allocDocType(gpa, .{ .where_clause = .{
         .type = base_type,
         .constraints = owned_constraints,
+        .layout = sourceWhereClauseLayout(module_env, where_span),
     } });
     base_type_moved = true;
     constraints_moved = true;
@@ -1030,6 +1031,81 @@ fn isAnonymousOpenExt(module_env: *const ModuleEnv, ext_idx: CIR.TypeAnno.Idx) b
     return name.len > 0 and name[0] == '#';
 }
 
+/// Recover the parser's explicit collection-layout choice from a CIR source
+/// region. A trailing comma requests expanded formatting; line breaks alone do
+/// not. Comments after the comma are ignored, matching the parser's token-based
+/// decision.
+fn sourceCollectionLayout(module_env: *const ModuleEnv, region: base.Region) DocType.Layout {
+    return collectionLayoutFromSource(module_env.getSourceAll(), region);
+}
+
+fn collectionLayoutFromSource(source: []const u8, region: base.Region) DocType.Layout {
+    const start: usize = @min(region.start.offset, source.len);
+    const end: usize = @min(region.end.offset, source.len);
+    if (start >= end) return .compact;
+
+    var last_significant: ?u8 = null;
+    var in_comment = false;
+    for (source[start..end]) |byte| {
+        if (in_comment) {
+            if (byte == '\n' or byte == '\r') in_comment = false;
+            continue;
+        }
+        if (byte == '#') {
+            in_comment = true;
+            continue;
+        }
+        if (!std.ascii.isWhitespace(byte) and byte != ')' and byte != ']' and byte != '}') {
+            last_significant = byte;
+        }
+    }
+
+    return if (last_significant == ',') .multiline else .compact;
+}
+
+fn sourceWhereClauseLayout(module_env: *const ModuleEnv, where_span: CIR.WhereClause.Span) DocType.Layout {
+    const clauses = module_env.store.sliceWhereClauses(where_span);
+    if (clauses.len == 0) return .compact;
+
+    const last_node: CIR.Node.Idx = @enumFromInt(@intFromEnum(clauses[clauses.len - 1]));
+    const last_region = module_env.store.getNodeRegion(last_node);
+    const source = module_env.getSourceAll();
+    const start: usize = @min(last_region.end.offset, source.len);
+
+    var in_comment = false;
+    for (source[start..]) |byte| {
+        if (in_comment) {
+            if (byte == '\n' or byte == '\r') in_comment = false;
+            continue;
+        }
+        if (byte == '#') {
+            in_comment = true;
+            continue;
+        }
+        if (std.ascii.isWhitespace(byte)) continue;
+        return if (byte == ',') .multiline else .compact;
+    }
+    return .compact;
+}
+
+test "collection layout follows trailing commas rather than source newlines" {
+    const compact_source = "List(\n    U8\n)";
+    try std.testing.expectEqual(
+        DocType.Layout.compact,
+        collectionLayoutFromSource(compact_source, base.Region.from_raw_offsets(0, compact_source.len)),
+    );
+
+    const multiline_source = "List(U8, # preserve expanded layout\n)";
+    try std.testing.expectEqual(
+        DocType.Layout.multiline,
+        collectionLayoutFromSource(multiline_source, base.Region.from_raw_offsets(0, multiline_source.len)),
+    );
+}
+
+fn sourceTypeLayout(module_env: *const ModuleEnv, anno_idx: CIR.TypeAnno.Idx) DocType.Layout {
+    return sourceCollectionLayout(module_env, module_env.store.getTypeAnnoRegion(anno_idx));
+}
+
 /// Extract a CIR TypeAnno as a structured DocType.
 fn extractTypeAnnoAsDocType(
     gpa: Allocator,
@@ -1044,21 +1120,28 @@ fn extractTypeAnnoAsDocType(
             name: []const u8,
             module_path: []const u8,
             arg_count: usize,
+            layout: DocType.Layout,
         },
         finish_tag: struct {
             name: []const u8,
             arg_count: usize,
+            layout: DocType.Layout,
         },
         finish_tag_union: struct {
             tag_count: usize,
             has_ext: bool,
             is_open: bool,
+            layout: DocType.Layout,
         },
-        finish_tuple: usize,
+        finish_tuple: struct {
+            elem_count: usize,
+            layout: DocType.Layout,
+        },
         finish_record: struct {
             fields: []CIR.TypeAnno.RecordField.Idx,
             has_ext: bool,
             is_open: bool,
+            layout: DocType.Layout,
         },
         finish_fn: struct {
             arg_count: usize,
@@ -1136,6 +1219,7 @@ fn extractTypeAnnoAsDocType(
                                 .name = name,
                                 .module_path = module_path,
                                 .arg_count = args_slice.len,
+                                .layout = sourceTypeLayout(module_env, idx),
                             } });
                             try Builder.pushVisitsReversed(&frames, gpa, args_slice);
                         }
@@ -1166,6 +1250,7 @@ fn extractTypeAnnoAsDocType(
                             .tag_count = tags_slice.len,
                             .has_ext = has_ext,
                             .is_open = tu.ext != null,
+                            .layout = sourceTypeLayout(module_env, idx),
                         } });
                         if (has_ext) {
                             try frames.append(gpa, .{ .visit = tu.ext.? });
@@ -1180,6 +1265,7 @@ fn extractTypeAnnoAsDocType(
                                     try frames.append(gpa, .{ .finish_tag = .{
                                         .name = module_env.getIdentText(t.name),
                                         .arg_count = tag_args_slice.len,
+                                        .layout = sourceTypeLayout(module_env, tags_slice[i]),
                                     } });
                                     try Builder.pushVisitsReversed(&frames, gpa, tag_args_slice);
                                 },
@@ -1194,12 +1280,16 @@ fn extractTypeAnnoAsDocType(
                         try frames.append(gpa, .{ .finish_tag = .{
                             .name = module_env.getIdentText(t.name),
                             .arg_count = tag_args_slice.len,
+                            .layout = sourceTypeLayout(module_env, idx),
                         } });
                         try Builder.pushVisitsReversed(&frames, gpa, tag_args_slice);
                     },
                     .tuple => |t| {
                         const elems_slice = module_env.store.sliceTypeAnnos(t.elems);
-                        try frames.append(gpa, .{ .finish_tuple = elems_slice.len });
+                        try frames.append(gpa, .{ .finish_tuple = .{
+                            .elem_count = elems_slice.len,
+                            .layout = sourceTypeLayout(module_env, idx),
+                        } });
                         try Builder.pushVisitsReversed(&frames, gpa, elems_slice);
                     },
                     .record => |r| {
@@ -1209,6 +1299,7 @@ fn extractTypeAnnoAsDocType(
                             .fields = fields_slice,
                             .has_ext = has_ext,
                             .is_open = r.ext != null,
+                            .layout = sourceTypeLayout(module_env, idx),
                         } });
                         if (has_ext) {
                             try frames.append(gpa, .{ .visit = r.ext.? });
@@ -1255,6 +1346,7 @@ fn extractTypeAnnoAsDocType(
                 tags[0] = .{
                     .name = try gpa.dupe(u8, "?"),
                     .args = tag_args,
+                    .layout = .compact,
                 };
                 tags_len = 1;
                 tag_args_moved = true;
@@ -1292,6 +1384,7 @@ fn extractTypeAnnoAsDocType(
                 const app = try allocDocType(gpa, .{ .apply = .{
                     .constructor = constructor,
                     .args = args,
+                    .layout = finish.layout,
                 } });
                 args_moved = true;
                 constructor_moved = true;
@@ -1321,6 +1414,7 @@ fn extractTypeAnnoAsDocType(
                 tags[0] = .{
                     .name = try gpa.dupe(u8, finish.name),
                     .args = tag_args,
+                    .layout = finish.layout,
                 };
                 tags_len = 1;
                 tag_args_moved = true;
@@ -1377,15 +1471,16 @@ fn extractTypeAnnoAsDocType(
                     .tags = tags,
                     .ext = ext,
                     .is_open = finish.is_open,
+                    .layout = finish.layout,
                 } });
                 tags_moved = true;
                 ext_moved = true;
                 try Builder.pushResult(&results, gpa, tag_union);
             },
-            .finish_tuple => |elem_count| {
-                std.debug.assert(results.items.len >= elem_count);
-                const start = results.items.len - elem_count;
-                const elems = try gpa.alloc(*const DocType, elem_count);
+            .finish_tuple => |finish| {
+                std.debug.assert(results.items.len >= finish.elem_count);
+                const start = results.items.len - finish.elem_count;
+                const elems = try gpa.alloc(*const DocType, finish.elem_count);
                 var elems_moved = false;
                 errdefer if (!elems_moved) {
                     Builder.cleanupDocTypes(gpa, elems);
@@ -1394,7 +1489,10 @@ fn extractTypeAnnoAsDocType(
                 @memcpy(elems, results.items[start..]);
                 results.shrinkRetainingCapacity(start);
 
-                const tuple = try allocDocType(gpa, .{ .tuple = .{ .elems = elems } });
+                const tuple = try allocDocType(gpa, .{ .tuple = .{
+                    .elems = elems,
+                    .layout = finish.layout,
+                } });
                 elems_moved = true;
                 try Builder.pushResult(&results, gpa, tuple);
             },
@@ -1450,6 +1548,7 @@ fn extractTypeAnnoAsDocType(
                     .fields = fields,
                     .ext = ext,
                     .is_open = finish.is_open,
+                    .layout = finish.layout,
                 } });
                 fields_moved = true;
                 ext_moved = true;
@@ -1641,6 +1740,7 @@ fn extractDocType(
         return try allocDocType(gpa, .{ .where_clause = .{
             .type = base_type.?,
             .constraints = owned_constraints,
+            .layout = .multiline,
         } });
     }
 
@@ -1779,6 +1879,7 @@ fn extractDocTypeInner(
                 return try allocDocType(gpa, .{ .apply = .{
                     .constructor = constructor,
                     .args = args_slice,
+                    .layout = .multiline,
                 } });
             } else {
                 // Simple type reference
@@ -1832,6 +1933,7 @@ fn extractFlatType(
                 .fields = try gpa.alloc(DocType.Field, 0),
                 .ext = null,
                 .is_open = false,
+                .layout = .multiline,
             } });
         },
         .empty_tag_union => {
@@ -1839,6 +1941,7 @@ fn extractFlatType(
                 .tags = try gpa.alloc(DocType.Tag, 0),
                 .ext = null,
                 .is_open = false,
+                .layout = .multiline,
             } });
         },
     }
@@ -1905,6 +2008,7 @@ fn extractNominalType(
         return try allocDocType(gpa, .{ .apply = .{
             .constructor = constructor,
             .args = args_slice,
+            .layout = .multiline,
         } });
     } else {
         return try allocDocType(gpa, .{ .type_ref = .{
@@ -2035,6 +2139,7 @@ fn extractRecord(
         .fields = doc_fields,
         .ext = ext_doc_type,
         .is_open = is_open,
+        .layout = .multiline,
     } });
 }
 
@@ -2049,6 +2154,7 @@ fn extractRecordUnbound(
             .fields = try gpa.alloc(DocType.Field, 0),
             .ext = null,
             .is_open = false,
+            .layout = .multiline,
         } });
     }
 
@@ -2075,6 +2181,7 @@ fn extractRecordUnbound(
         .fields = fields,
         .ext = null,
         .is_open = false,
+        .layout = .multiline,
     } });
 }
 
@@ -2089,7 +2196,10 @@ fn extractTuple(
         elems[i] = try extractDocTypeInner(ctx, elem_var) orelse
             try allocDocType(gpa, .@"error");
     }
-    return try allocDocType(gpa, .{ .tuple = .{ .elems = elems } });
+    return try allocDocType(gpa, .{ .tuple = .{
+        .elems = elems,
+        .layout = .multiline,
+    } });
 }
 
 fn extractTagUnion(
@@ -2122,7 +2232,11 @@ fn extractTagUnion(
                 try allocDocType(gpa, .@"error");
         }
 
-        try tags.append(gpa, .{ .name = tag_name, .args = tag_args });
+        try tags.append(gpa, .{
+            .name = tag_name,
+            .args = tag_args,
+            .layout = .multiline,
+        });
     }
 
     // Handle extension variable
@@ -2185,6 +2299,7 @@ fn extractTagUnion(
         .tags = tags_slice,
         .ext = ext_type,
         .is_open = is_open,
+        .layout = .multiline,
     } });
 }
 

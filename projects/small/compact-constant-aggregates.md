@@ -144,8 +144,3 @@ for small literals (threshold keeps the fast path).
 - Keep PR #9924's overflow repro green and extend it one order of
   magnitude past the old `u16` ceiling.
 
-## Related projects
-
-- [../big/arc-inserter-join-summaries.md](../big/arc-inserter-join-summaries.md)
-  — the other "generated code shape makes a compiler phase O(too much)"
-  project; both target compile-time scaling on generated-heavy programs.

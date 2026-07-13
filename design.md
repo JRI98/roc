@@ -3121,8 +3121,9 @@ constraints to guess a target.
 Totality is enforced at the boundary: `validateDispatchEvidence`, run by the
 checked module's `verifyComplete`, asserts that every dispatch-bearing
 checked expression names a plan and that every plan and evidence reference
-lands inside the checked module data's evidence tables. A missing or corrupt
-record is a compiler bug reported at the boundary, not a lowering panic.
+lands inside the checked module data's evidence tables. In debug builds —
+where the boundary verifiers run — a missing or corrupt record is a compiler
+bug reported at the boundary, not a lowering panic.
 
 **Evidence params.** Every type scheme with dispatch requirements has one
 deterministic ordered list of (dispatcher var, constraint) pairs —
@@ -3135,17 +3136,19 @@ the k-th evidence entry a call edge supplies. The definition's module and any
 importing module enumerate identical lists from their structural copies of the
 scheme.
 
-**Edges supply evidence.** Checking persists, for every instantiation of a
-constrained scheme, the (pristine var, fresh var) pairs of its constrained
-vars. Checking resolves each instantiation edge's requirements — against the
-enclosing callable's own evidence params (producing `constraint(k)` again),
-against concrete types (producing `direct` targets through exact registry
-lookups), through the monomorphic default rule, or structurally — and stores
-the result as site evidence keyed by the use expression. Monotype lowering
-materializes a specialization's evidence vector at each call edge and passes
-it to the callee specialization; a plan resolved `constraint(k)` reads entry
-`k` of the innermost vector (walking lexical parents for nested local
-functions by `depth`).
+**Edges supply evidence.** Checking persists every constrained-scheme edge.
+An ordinary instantiation records the (pristine var, fresh var) pairs of its
+constrained vars. A monomorphic edge to an in-flight recursive value or method
+target records the exact shared scheme root and no copy pairs. Checking
+resolves each edge's requirements — against the enclosing callable's own
+evidence params (producing `constraint(k)` again), against concrete types
+(producing `direct` targets through exact registry lookups), through the
+monomorphic default rule, or structurally — and stores the result as site
+evidence keyed by the use expression. Monotype lowering materializes a
+specialization's evidence vector at each call edge and passes it to the callee
+specialization; a plan resolved `constraint(k)` reads entry `k` of the
+innermost vector (walking lexical parents for nested local functions by
+`depth`).
 
 **The default rule.** A constrained var no edge can pin follows exactly the
 rule Monotype uses to materialize unresolved variables: numeral literals and

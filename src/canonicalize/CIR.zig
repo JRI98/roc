@@ -401,7 +401,19 @@ pub const TypeHeader = struct {
 /// Represents a where clause constraint in type definitions
 pub const WhereClause = union(enum) {
     pub const Idx = enum(u32) { _ };
-    pub const Span = extern struct { span: base.DataSpan };
+    pub const IdxSpan = extern struct { span: base.DataSpan };
+    pub const Owner = extern struct {
+        rigid_var: TypeAnno.Idx,
+        clauses: IdxSpan,
+        introduced_in_scope: bool,
+        _padding: [3]u8 = .{ 0, 0, 0 },
+
+        pub const Span = extern struct { span: base.DataSpan };
+    };
+    pub const Span = extern struct {
+        span: base.DataSpan,
+        owners: Owner.Span,
+    };
 
     w_method: struct {
         var_: TypeAnno.Idx,

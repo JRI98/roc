@@ -109,6 +109,14 @@ pub fn invariant(comptime message: []const u8) noreturn {
     unreachable;
 }
 
+/// `invariant` with runtime context formatted into the panic message.
+pub fn invariantFmt(comptime fmt: []const u8, args: anytype) noreturn {
+    if (@import("builtin").mode == .Debug) {
+        std.debug.panic("postcheck invariant violated: " ++ fmt, args);
+    }
+    unreachable;
+}
+
 /// Monotonic symbol id generator for post-check stages.
 pub const SymbolGen = struct {
     next: u32 = 0,
