@@ -4836,7 +4836,7 @@ test "iterdiff: infinite custom iterator bounded prefix agrees across inline mod
     );
 }
 
-// Tier-one LIR identity (iter_fusion_design.md Acceptance item 2). A bounded
+// Tier-one LIR identity. A bounded
 // `list.iter().map(f).collect()` whose construction is statically known at its
 // consuming loop fuses to the same generated-code loop as a hand-written `for`
 // loop: no adapter dispatch, no per-element indirect call, one scalar loop that
@@ -4845,7 +4845,7 @@ test "iterdiff: infinite custom iterator bounded prefix agrees across inline mod
 // The comparison is asserted per the principled relation rather than raw
 // per-field equality across every field, because two field families cannot
 // reach equality for reasons that are inherent to the compared programs, not
-// missed fusion (flagged in the Slice D report):
+// missed fusion:
 //
 //   * Consumer allocation strategy. `.collect()` on a bounded iterator knows
 //     the length up front, so it pre-sizes with `list_with_capacity` and writes
@@ -4857,7 +4857,7 @@ test "iterdiff: infinite custom iterator bounded prefix agrees across inline mod
 //     asserted instead.
 //   * Adapter carried box. `map` over a list carries a nested recursive-nominal
 //     iterator (map wraps the list iterator), whose loop-exit re-materialization
-//     is Slice E's box (amplified to a nested pair here). The plain list-iterator
+//     needs a box (amplified to a nested pair here). The plain list-iterator
 //     `for` loop carries no such box, so its exit re-materializes nothing.
 test "iterdiff: tier-one map collect matches hand-written loop shape" {
     const allocator = std.testing.allocator;
