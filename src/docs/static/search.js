@@ -122,50 +122,76 @@ const setupSearch = () => {
 
     addLangRefSearchEntries();
 
+    // Precompute a lowercase search haystack for every entry once. The old code
+    // re-read the DOM (querySelector + textContent) for all ~1500 entries on
+    // every keystroke, which was needless work per input. The entry <li>s are
+    // static (server-rendered, plus the langref entries appended above) and
+    // persist across soft navigations, so this only has to happen once.
+    const searchEntries = Array.from(
+      searchTypeAhead.querySelectorAll("li"),
+    ).map((li) => {
+      const entryModule =
+        li.querySelector(".type-ahead-module-name")?.textContent?.toLowerCase() ??
+        "";
+      const entryName =
+        li.querySelector(".type-ahead-def-name")?.textContent?.toLowerCase() ?? "";
+      const signature =
+        li
+          .querySelector(".type-ahead-signature")
+          ?.textContent?.toLowerCase()
+          ?.replace(/\s+/g, "") ?? "";
+      const qualifiedName = entryModule ? `${entryModule}.${entryName}` : entryName;
+      return { li, qualifiedName, signature };
+    });
+
+    // Cap how many results we reveal at once. Broad queries (e.g. a single "m")
+    // match well over a thousand entries, and laying out and painting that many
+    // list items is what made the first keystroke freeze. The dropdown scrolls
+    // and typing more characters narrows things down fast, so a modest cap keeps
+    // the type-ahead responsive without meaningfully hurting usability.
+    const MAX_RESULTS = 50;
+
+    // The entries currently revealed, so each search only re-hides the handful it
+    // previously showed instead of touching every entry in the list.
+    let shownItems = [];
+
     function search() {
       topSearchResultListItem = undefined;
-      let text = searchBox.value.toLowerCase(); // Search is case-insensitive.
+      const text = searchBox.value.toLowerCase(); // Search is case-insensitive.
+
+      // Hide whatever the previous search revealed before revealing new matches.
+      for (const li of shownItems) {
+        li.classList.add("hidden");
+      }
+      shownItems = [];
 
       if (text === "") {
         searchTypeAhead.classList.add("hidden");
-      } else {
-        let totalResults = 0;
-        // Show/hide all the sub-entries within each module (top-level functions etc.)
-        searchTypeAhead.querySelectorAll("li").forEach((entry) => {
-          const entryModule = entry
-            .querySelector(".type-ahead-module-name")
-            ?.textContent?.toLowerCase() ?? "";
-          const entryName = entry
-            .querySelector(".type-ahead-def-name")
-            .textContent.toLowerCase();
-          const entrySignature = entry
-            .querySelector(".type-ahead-signature")
-            ?.textContent?.toLowerCase()
-            ?.replace(/\s+/g, "");
+        return;
+      }
 
-          const qualifiedEntryName = entryModule
-            ? `${entryModule}.${entryName}`
-            : entryName;
-
-          if (
-            qualifiedEntryName.includes(text) ||
-            entrySignature?.includes(text.replace(/\s+/g, ""))
-          ) {
-            totalResults++;
-            entry.classList.remove("hidden");
-            if (topSearchResultListItem === undefined) {
-              topSearchResultListItem = entry;
-            }
-          } else {
-            entry.classList.add("hidden");
-            searchTypeAhead.scrollTop = 0;
+      const signatureText = text.replace(/\s+/g, "");
+      for (const entry of searchEntries) {
+        if (
+          entry.qualifiedName.includes(text) ||
+          (signatureText !== "" && entry.signature.includes(signatureText))
+        ) {
+          entry.li.classList.remove("hidden");
+          shownItems.push(entry.li);
+          if (topSearchResultListItem === undefined) {
+            topSearchResultListItem = entry.li;
           }
-        });
-        if (totalResults < 1) {
-          searchTypeAhead.classList.add("hidden");
-        } else {
-          searchTypeAhead.classList.remove("hidden");
+          if (shownItems.length >= MAX_RESULTS) {
+            break;
+          }
         }
+      }
+
+      if (shownItems.length === 0) {
+        searchTypeAhead.classList.add("hidden");
+      } else {
+        searchTypeAhead.scrollTop = 0;
+        searchTypeAhead.classList.remove("hidden");
       }
     }
 
@@ -276,11 +302,14 @@ const setupCopyButtonActions = () => {
 const setupSidebarToggle = () => {
   let body = document.body;
   const sidebarOpen = "sidebar-open";
-  const removeOpenClass = () => {
+  const removeOpenClass = (event) => {
+    // Toggling a module's disclosure triangle only expands/collapses that
+    // entry's sub-list; it must not also close the whole mobile sidebar, so
+    // ignore clicks that landed on a toggle rather than outside the sidebar.
+    if (closestElement(event.target, ".sidebar-module-summary")) return;
+
     body.classList.remove(sidebarOpen);
-    document.body
-      .querySelector("main")
-      .removeEventListener("click", removeOpenClass);
+    document.body.removeEventListener("click", removeOpenClass);
   };
   Array.from(document.body.querySelectorAll(".menu-toggle")).forEach(
     (menuToggle) => {
@@ -366,6 +395,16 @@ const setupDocsSoftNavigation = () => {
     pathname
       .replace(/\/index\.html$/, "")
       .replace(/\/$/, "");
+
+  // The docs landing page (this site's root, e.g. "/docs/main/" with nothing
+  // after it) shows the guide links (Tutorial, FAQ, Language Reference) above
+  // the search bar, in addition to the sidebar; every other docs page (a
+  // module, or a langref article) hides those guide links. The server already
+  // renders the right state into the initial HTML (see the "docs-index" body
+  // class in render_html.zig); this mirrors that check so soft navigation
+  // keeps it in sync without a full page load.
+  const isDocsIndexPath = (pathname) =>
+    canonicalDocsPath(pathname) === canonicalDocsPath(docsRootPath);
 
   const fragmentKey = (url) =>
     `${url.origin}${canonicalDocsPath(url.pathname)}${url.search}`;
@@ -846,10 +885,18 @@ const setupDocsSoftNavigation = () => {
   const createMainShell = (oldMain, oldContent, includePersistentUi) => {
     const nextMain = oldMain.cloneNode(false);
     const nextContent = oldContent.cloneNode(false);
+    const currentGuideLinks = document.getElementById("index-guide-links");
     const currentSearch = document.getElementById("module-search-form");
 
     nextContent.textContent = "";
     nextContent.removeAttribute("data-roc-highlight-id");
+
+    // Carried forward like the search form below: both are positioned via
+    // explicit CSS grid-row (not DOM order), so visibility is what determines
+    // whether the guide links show, not append order.
+    if (includePersistentUi && currentGuideLinks) {
+      nextMain.appendChild(currentGuideLinks);
+    }
 
     if (includePersistentUi && currentSearch) {
       nextMain.appendChild(currentSearch);
@@ -869,6 +916,7 @@ const setupDocsSoftNavigation = () => {
     oldMain.replaceWith(nextMain);
     bindMainScrollBox();
     activeDocumentKey = fragmentKey(url);
+    document.body.classList.toggle("docs-index", isDocsIndexPath(url.pathname));
     syncSidebarForUrl(url);
     hideSearchResults();
     closeSidebar();
@@ -942,6 +990,15 @@ const setupDocsSoftNavigation = () => {
 
       if (stageUntilReady) {
         phaseStart = performance.now();
+        // Mirrors createMainShell's persistent-UI handling above: staged
+        // navigations skip that step (includePersistentUi is false while
+        // content streams into a still-hidden shell) and instead move these
+        // elements over here, once, right before the shell swap.
+        const currentGuideLinksAfterStream =
+          document.getElementById("index-guide-links");
+        if (currentGuideLinksAfterStream) {
+          nextMain.insertBefore(currentGuideLinksAfterStream, nextContent);
+        }
         const currentSearchAfterStream =
           document.getElementById("module-search-form");
         if (currentSearchAfterStream) {

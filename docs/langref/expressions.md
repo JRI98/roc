@@ -10,12 +10,12 @@ can't be wrapped in parentheses without causing an error. Some examples:
 - `1` is a valid expression. It's already a value `(1)` is valid.
 - `import Foo` is a [statement](statements.md) not an expression. `(import Foo)` is invalid.
 - `# Something` is a [comment](comments.md), not an expression. `(# Something)` is invalid.
-- `package […]` is a [module header](modules.md#headers), not an expression. `(package […])` is invalid.
+- `package […]` is a [module header](modules.md#module-headers), not an expression. `(package […])` is invalid.
 
 Another way to think of an expression is that you can always assign it to a name—so, you
 can always put it after an `=` sign.
 
-## [Types of Expressions](#literal-expressions) {#literal-expression}
+## [Types of Expressions](#literal-expression) {#literal-expression}
 
 Here are all the different types of expressions in Roc:
 
@@ -69,7 +69,7 @@ Roc's compiler does _opportunistic mutation_ using the [Perceus](https://www.mic
 - Builtin operations on reference-counted values will update them in place when their reference counts are 1
 - When their reference counts are greater than 1, they will be shallowly cloned first, and then the clone will be updated and returned.
 
-For example, when [`List.set`](../builtins/List#set) is passed a unique list (reference count is 1), then that list will have the given element replaced. When it's given a shared list (reference count is not 1), it will first shallowly clone the list, and then replace the given element in the clone. Either way, the modified list will be returned—regardless of whether the clone or the original was the one modified.
+For example, when [`List.set`](../List#set) is passed a unique list (reference count is 1), then that list will have the given element replaced. When it's given a shared list (reference count is not 1), it will first shallowly clone the list, and then replace the given element in the clone. Either way, the modified list will be returned—regardless of whether the clone or the original was the one modified.
 
 ## [Block Expressions](#block-expressions) {#block-expressions}
 

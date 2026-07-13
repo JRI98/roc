@@ -62,7 +62,7 @@ You can use these type parameters in type aliases:
 Letters(others) : [A, B, ..others]
 ```
 
-If you match on a [catch-all underscore pattern](pattern-matching#underscore), 
+If you match on a [catch-all underscore pattern](pattern-matching#catch-all-patterns-_), 
 you can accept a tag union containing _at least_ some tags, but also arbitrary others:
 
 ```roc
@@ -164,3 +164,7 @@ Unlike structural tag unions, nominal tag unions can be recursive, and can alway
 across the host boundary.
 
 However, nominal tag unions are not extensible.
+
+## "Void" (Empty Tag Union) {#void}
+
+TODO

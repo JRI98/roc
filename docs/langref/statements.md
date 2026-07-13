@@ -1,11 +1,11 @@
 # Statements
 
 Statements are run as soon as they are encountered at runtime.
-They do not [evaluate](expressions.md#evaluation) to a [value](expressions.md#value).
+They do not [evaluate](expressions.md#evaluation) to a [value](expressions.md#values).
 
 ## [`=` (assignment)](#assignment) {#assignment}
 
-An _assignment statement_ gives a name to a [value](expressions.md#value) inside the current scope.
+An _assignment statement_ gives a name to a [value](expressions.md#values) inside the current scope.
 
 ### [Pattern matching in assignments](#import-exposing) {#import-exposing}
 
@@ -67,7 +67,7 @@ y = |arg| if arg <= 9 { x(arg + 1) } else { 0 }
 ### [Reassignment](#reassignment) {#reassignment}
 
 Reassigning to an existing name is only allowed when the name was declared with
-[`var`](pattern-matching#var). This is allowed:
+[`var`](naming#var-keyword). This is allowed:
 
 ```roc
 var $foo = 0

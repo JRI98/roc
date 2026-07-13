@@ -41,6 +41,14 @@ that can reasonably be considered side effects:
 2. Memory allocation and deallocation. Although memory allocation and deallocation absolutely does depend on mutating state for bookkeeping, Roc does automatic memory management, and so program correctness should never depend on the state of this bookkeeping. Allocation can fail, which in Roc results in a crash—and as previously noted, a crash at compile time is considered preferable to the end user encountering a program crash at runtime.
 3. `dbg` and `expect` output. Pure functions are allowed to use `dbg` and `expect`, as these are outputs are intended to be for the programmer only. By design, program behavior should never depend on them, so it's considered fine to display these outputs at compile time only (or not at all, if their code paths end up getting optimized away entirely), as this only means the programmer will see them even earlier in the process.
 
+## Effectful Functions
+
+TODO
+
+### Side Effects
+
+TODO
+
 ## Function Type Annotations
 
 Here's a type annotation for a pure function, and then right below it,
@@ -137,6 +145,10 @@ In the previous example, `find(rest, query)` is a tail call. It's calling a func
 immediately returning without doing any other work. In this case, it's calling itself (making
 this a _self-tail-call,_ which is also known as _self-tail-recursion),_ although tail calls
 can be to other functions too.
+
+### Self-Tail Calls
+
+TODO
 
 ### Tail-Call Optimization
 
