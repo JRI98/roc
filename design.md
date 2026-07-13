@@ -3924,6 +3924,11 @@ against the borrow typing rules:
   refinement is bounded by the name count; balance divergence across
   mode-identical entries is itself a finding — per-iteration accumulation),
   so certification of every procedure runs to completion
+- explicit initialized-payload control flow refines conditional ownership:
+  the initialized edge promotes the payload to ordinary owned state and the
+  uninitialized edge removes its possible unit and binding. Presence
+  conditions never survive an edge that has proved them true, so independent
+  tests do not accumulate stale mode dimensions at later joins
 - every call site satisfies the callee variant's signature, and every pinned
   signature holds
 

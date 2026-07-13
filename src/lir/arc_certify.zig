@@ -22,6 +22,12 @@
 //! consumption tolerates a transiently negative balance and relies on the
 //! per-path terminal balance check to flag a missing restore.
 //!
+//! Conditional ownership is refined by explicit initialized-payload control
+//! flow. The initialized edge promotes the payload to ordinary owned state;
+//! the uninitialized edge removes its possible unit and binding. Keeping the
+//! old condition on the initialized edge is both imprecise and non-convergent:
+//! independent presence tests accumulate stale mode dimensions at later joins.
+//!
 //! ## Join points: dataflow fixpoint over a finite-height lattice
 //!
 //! Every jump into a join is summarized over the locals the join body reads
@@ -811,6 +817,12 @@ const State = struct {
         try self.growToValue(value);
         self.conditional_condition.items[value] = @intFromEnum(condition.local);
         self.conditional_condition_mask.items[value] = condition.mask;
+    }
+
+    fn markDefinitelyInitialized(self: *State, value: ValueId) void {
+        if (value >= self.conditional_condition.items.len) return;
+        self.conditional_condition.items[value] = no_dense;
+        self.conditional_condition_mask.items[value] = 0;
     }
 };
 
@@ -2589,6 +2601,7 @@ const Certifier = struct {
 
                                 var initialized_state = try state.clone();
                                 errdefer initialized_state.deinit();
+                                initialized_state.markDefinitelyInitialized(payload_value);
                                 try work.append(self.allocator, .{ .segment = .{ .cursor = switch_stmt.initialized_branch, .state = initialized_state, .origin_join = segment.origin_join } });
 
                                 var uninitialized_state = try state.clone();
@@ -3547,6 +3560,110 @@ test "certify compresses maybe-initialized join payload states" {
     _ = try f.addProc(&.{}, body, .i64);
 
     try f.certify();
+}
+
+test "certify promotes conditional payload on initialized switch edge" {
+    var f = try CertifyTest.init(testing.allocator);
+    defer f.deinit();
+    const payload = try f.local(.str);
+    const presence = try f.local(.i64);
+    const result = try f.local(.i64);
+
+    const ret = try f.ret(result);
+    const release = try f.decrefStmt(payload, .str, ret);
+    const second_initialized = try f.assignI64(result, release);
+    const second_uninitialized = try f.assignI64(result, release);
+    const second_switch = try f.store.addCFStmt(.{ .switch_initialized_payload = .{
+        .cond = presence,
+        .payload = payload,
+        .initialized_branch = second_initialized,
+        .uninitialized_branch = second_uninitialized,
+    } });
+    const first_uninitialized = try f.assignI64(result, ret);
+    const first_switch = try f.store.addCFStmt(.{ .switch_initialized_payload = .{
+        .cond = presence,
+        .payload = payload,
+        .initialized_branch = second_switch,
+        .uninitialized_branch = first_uninitialized,
+    } });
+
+    const join_id = f.freshJoinPointId();
+    const jump_with_payload = try f.store.addCFStmt(.{ .jump = .{ .target = join_id } });
+    const jump_without_payload = try f.store.addCFStmt(.{ .jump = .{ .target = join_id } });
+    const release_before_jump = try f.decrefStmt(payload, .str, jump_without_payload);
+    const choose_presence = try f.store.addCFStmt(.{ .switch_stmt = .{
+        .cond = presence,
+        .branches = try f.store.addCFSwitchBranches(&[_]LIR.CFSwitchBranch{
+            .{ .value = 1, .body = jump_with_payload },
+        }),
+        .default_branch = release_before_jump,
+    } });
+    const join_stmt = try f.store.addCFStmt(.{ .join = .{
+        .id = join_id,
+        .params = try f.store.addLocalSpan(&.{payload}),
+        .maybe_uninitialized_params = try f.store.addLocalSpan(&.{payload}),
+        .maybe_uninitialized_conditions = try f.store.addLocalSpan(&.{presence}),
+        .maybe_uninitialized_condition_masks = try f.store.addU64Span(&.{1}),
+        .body = first_switch,
+        .remainder = choose_presence,
+    } });
+    const presence_assign = try f.assignI64(presence, join_stmt);
+    const body = try f.assignStr(payload, presence_assign);
+    _ = try f.addProc(&.{}, body, .i64);
+
+    // The first switch's initialized edge proves the payload exists. Re-testing
+    // that condition therefore follows only the initialized edge; retaining
+    // the stale conditional state also explores the unreachable uninitialized
+    // edge, where the deliberately invalid release exposes the false path.
+    try f.certify();
+}
+
+test "certify rejects a mismatched conditional payload guard before refinement" {
+    var f = try CertifyTest.init(testing.allocator);
+    defer f.deinit();
+    const payload = try f.local(.str);
+    const presence = try f.local(.i64);
+    const unrelated = try f.local(.i64);
+    const result = try f.local(.i64);
+
+    const ret = try f.ret(result);
+    const release = try f.decrefStmt(payload, .str, ret);
+    const initialized = try f.assignI64(result, release);
+    const uninitialized = try f.assignI64(result, ret);
+    const mismatched_switch = try f.store.addCFStmt(.{ .switch_initialized_payload = .{
+        .cond = unrelated,
+        .payload = payload,
+        .initialized_branch = initialized,
+        .uninitialized_branch = uninitialized,
+    } });
+
+    const join_id = f.freshJoinPointId();
+    const jump_with_payload = try f.store.addCFStmt(.{ .jump = .{ .target = join_id } });
+    const jump_without_payload = try f.store.addCFStmt(.{ .jump = .{ .target = join_id } });
+    const release_before_jump = try f.decrefStmt(payload, .str, jump_without_payload);
+    const choose_presence = try f.store.addCFStmt(.{ .switch_stmt = .{
+        .cond = presence,
+        .branches = try f.store.addCFSwitchBranches(&[_]LIR.CFSwitchBranch{
+            .{ .value = 1, .body = jump_with_payload },
+        }),
+        .default_branch = release_before_jump,
+    } });
+    const join_stmt = try f.store.addCFStmt(.{ .join = .{
+        .id = join_id,
+        .params = try f.store.addLocalSpan(&.{payload}),
+        .maybe_uninitialized_params = try f.store.addLocalSpan(&.{payload}),
+        .maybe_uninitialized_conditions = try f.store.addLocalSpan(&.{presence}),
+        .maybe_uninitialized_condition_masks = try f.store.addU64Span(&.{1}),
+        .body = mismatched_switch,
+        .remainder = choose_presence,
+    } });
+    const unrelated_assign = try f.assignI64(unrelated, join_stmt);
+    const presence_assign = try f.assignI64(presence, unrelated_assign);
+    const body = try f.assignStr(payload, presence_assign);
+    _ = try f.addProc(&.{}, body, .i64);
+
+    try testing.expectError(error.Certification, f.certify());
+    try testing.expect(std.mem.find(u8, f.diag.message(), "did not match") != null);
 }
 
 test "certify flags branches that disagree at a join" {
