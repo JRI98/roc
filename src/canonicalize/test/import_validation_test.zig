@@ -6,6 +6,7 @@
 //! the canonicalization process.
 
 const std = @import("std");
+const build_options = @import("build_options");
 const Allocator = std.mem.Allocator;
 const base = @import("base");
 const parse = @import("parse");
@@ -79,8 +80,8 @@ fn parseAndCanonicalizeSource(
 }
 
 test "file imports reject absolute paths before recording dependencies" {
-    var gpa_state = std.heap.DebugAllocator(.{ .safety = true }){};
-    defer std.debug.assert(gpa_state.deinit() == .ok);
+    var gpa_state = std.heap.DebugAllocator(.{ .safety = true, .stack_trace_frames = build_options.debug_gpa_stack_trace_frames }){};
+    defer std.debug.assert(build_options.debugGpaOk(gpa_state.deinit()));
     const allocator = gpa_state.allocator();
 
     const source =
@@ -121,8 +122,8 @@ test "file imports reject absolute paths before recording dependencies" {
 }
 
 test "import validation - mix of MODULE NOT FOUND, TYPE NOT EXPOSED, VALUE NOT EXPOSED, and working imports" {
-    var gpa_state = std.heap.DebugAllocator(.{ .safety = true }){};
-    defer std.debug.assert(gpa_state.deinit() == .ok);
+    var gpa_state = std.heap.DebugAllocator(.{ .safety = true, .stack_trace_frames = build_options.debug_gpa_stack_trace_frames }){};
+    defer std.debug.assert(build_options.debugGpaOk(gpa_state.deinit()));
     const allocator = gpa_state.allocator();
 
     // First, create some module environments with exposed items
@@ -258,8 +259,8 @@ test "import validation - mix of MODULE NOT FOUND, TYPE NOT EXPOSED, VALUE NOT E
 }
 
 test "import validation - type module associated values are importable via exposing" {
-    var gpa_state = std.heap.DebugAllocator(.{ .safety = true }){};
-    defer std.debug.assert(gpa_state.deinit() == .ok);
+    var gpa_state = std.heap.DebugAllocator(.{ .safety = true, .stack_trace_frames = build_options.debug_gpa_stack_trace_frames }){};
+    defer std.debug.assert(build_options.debugGpaOk(gpa_state.deinit()));
     const allocator = gpa_state.allocator();
     const Ident = base.Ident;
 
@@ -362,8 +363,8 @@ test "import validation - exposed nested type associated function resolves via s
     // `Square` resolves fine as a *type*; the bug is that `Square.create` (a
     // static-dispatch lookup of the nested type's associated value) is reported
     // as "does not exist".
-    var gpa_state = std.heap.DebugAllocator(.{ .safety = true }){};
-    defer std.debug.assert(gpa_state.deinit() == .ok);
+    var gpa_state = std.heap.DebugAllocator(.{ .safety = true, .stack_trace_frames = build_options.debug_gpa_stack_trace_frames }){};
+    defer std.debug.assert(build_options.debugGpaOk(gpa_state.deinit()));
     const allocator = gpa_state.allocator();
     const Ident = base.Ident;
 
@@ -470,8 +471,8 @@ test "import validation - exposing a type module's main type by name is not a re
     // `exposing` (as platform code does with `import NodeB exposing [NodeB]`)
     // binds the same external type to the same name twice. That is idempotent,
     // not a DUPLICATE DEFINITION.
-    var gpa_state = std.heap.DebugAllocator(.{ .safety = true }){};
-    defer std.debug.assert(gpa_state.deinit() == .ok);
+    var gpa_state = std.heap.DebugAllocator(.{ .safety = true, .stack_trace_frames = build_options.debug_gpa_stack_trace_frames }){};
+    defer std.debug.assert(build_options.debugGpaOk(gpa_state.deinit()));
     const allocator = gpa_state.allocator();
     const Ident = base.Ident;
 
@@ -552,8 +553,8 @@ test "import validation - exposing a type module's main type by name is not a re
 }
 
 test "unresolved exposed value is not imported as external lookup target zero" {
-    var gpa_state = std.heap.DebugAllocator(.{ .safety = true }){};
-    defer std.debug.assert(gpa_state.deinit() == .ok);
+    var gpa_state = std.heap.DebugAllocator(.{ .safety = true, .stack_trace_frames = build_options.debug_gpa_stack_trace_frames }){};
+    defer std.debug.assert(build_options.debugGpaOk(gpa_state.deinit()));
     const allocator = gpa_state.allocator();
     const Ident = base.Ident;
 
@@ -639,8 +640,8 @@ test "unresolved exposed value is not imported as external lookup target zero" {
 }
 
 test "import validation - no module_envs provided" {
-    var gpa_state = std.heap.DebugAllocator(.{ .safety = true }){};
-    defer std.debug.assert(gpa_state.deinit() == .ok);
+    var gpa_state = std.heap.DebugAllocator(.{ .safety = true, .stack_trace_frames = build_options.debug_gpa_stack_trace_frames }){};
+    defer std.debug.assert(build_options.debugGpaOk(gpa_state.deinit()));
     const allocator = gpa_state.allocator();
 
     // Parse source code with import statements
@@ -685,8 +686,8 @@ test "import validation - no module_envs provided" {
 }
 
 test "import interner - Import.Idx functionality" {
-    var gpa_state = std.heap.DebugAllocator(.{ .safety = true }){};
-    defer std.debug.assert(gpa_state.deinit() == .ok);
+    var gpa_state = std.heap.DebugAllocator(.{ .safety = true, .stack_trace_frames = build_options.debug_gpa_stack_trace_frames }){};
+    defer std.debug.assert(build_options.debugGpaOk(gpa_state.deinit()));
     const allocator = gpa_state.allocator();
     // Parse source code with multiple imports, including duplicates
     const source =
@@ -742,8 +743,8 @@ test "import interner - Import.Idx functionality" {
 }
 
 test "import interner - many imports keep stable module identity keys" {
-    var gpa_state = std.heap.DebugAllocator(.{ .safety = true }){};
-    defer std.debug.assert(gpa_state.deinit() == .ok);
+    var gpa_state = std.heap.DebugAllocator(.{ .safety = true, .stack_trace_frames = build_options.debug_gpa_stack_trace_frames }){};
+    defer std.debug.assert(build_options.debugGpaOk(gpa_state.deinit()));
     const allocator = gpa_state.allocator();
 
     const import_count = 320;
@@ -783,8 +784,8 @@ test "import interner - many imports keep stable module identity keys" {
 }
 
 test "import interner - comprehensive usage example" {
-    var gpa_state = std.heap.DebugAllocator(.{ .safety = true }){};
-    defer std.debug.assert(gpa_state.deinit() == .ok);
+    var gpa_state = std.heap.DebugAllocator(.{ .safety = true, .stack_trace_frames = build_options.debug_gpa_stack_trace_frames }){};
+    defer std.debug.assert(build_options.debugGpaOk(gpa_state.deinit()));
     const allocator = gpa_state.allocator();
     // Parse source with imports used in different contexts
     const source =
@@ -842,8 +843,8 @@ test "import interner - comprehensive usage example" {
 }
 
 test "module scopes - imports work in module scope" {
-    var gpa_state = std.heap.DebugAllocator(.{ .safety = true }){};
-    defer std.debug.assert(gpa_state.deinit() == .ok);
+    var gpa_state = std.heap.DebugAllocator(.{ .safety = true, .stack_trace_frames = build_options.debug_gpa_stack_trace_frames }){};
+    defer std.debug.assert(build_options.debugGpaOk(gpa_state.deinit()));
     const allocator = gpa_state.allocator();
     // Parse source with imports used in module scope
     const source =
@@ -882,8 +883,8 @@ test "module scopes - imports work in module scope" {
 }
 
 test "module-qualified lookups with e_lookup_external" {
-    var gpa_state = std.heap.DebugAllocator(.{ .safety = true }){};
-    defer std.debug.assert(gpa_state.deinit() == .ok);
+    var gpa_state = std.heap.DebugAllocator(.{ .safety = true, .stack_trace_frames = build_options.debug_gpa_stack_trace_frames }){};
+    defer std.debug.assert(build_options.debugGpaOk(gpa_state.deinit()));
     const allocator = gpa_state.allocator();
     // Parse source with module-qualified lookups
     const source =
@@ -921,8 +922,8 @@ test "module-qualified lookups with e_lookup_external" {
 }
 
 test "exposed_items - tracking CIR node indices for exposed items" {
-    var gpa_state = std.heap.DebugAllocator(.{ .safety = true }){};
-    defer std.debug.assert(gpa_state.deinit() == .ok);
+    var gpa_state = std.heap.DebugAllocator(.{ .safety = true, .stack_trace_frames = build_options.debug_gpa_stack_trace_frames }){};
+    defer std.debug.assert(build_options.debugGpaOk(gpa_state.deinit()));
     const allocator = gpa_state.allocator();
 
     // Create module environments with exposed items
@@ -987,8 +988,8 @@ test "exposed_items - tracking CIR node indices for exposed items" {
 }
 
 test "imported type-module tag rejects alias target" {
-    var gpa_state = std.heap.DebugAllocator(.{ .safety = true }){};
-    defer std.debug.assert(gpa_state.deinit() == .ok);
+    var gpa_state = std.heap.DebugAllocator(.{ .safety = true, .stack_trace_frames = build_options.debug_gpa_stack_trace_frames }){};
+    defer std.debug.assert(build_options.debugGpaOk(gpa_state.deinit()));
     const allocator = gpa_state.allocator();
 
     var builtin_ctx = try BuiltinTestContext.init(allocator);
@@ -1063,8 +1064,8 @@ test "imported type-module tag rejects alias target" {
 }
 
 test "imported nested associated types resolve by qualified export key" {
-    var gpa_state = std.heap.DebugAllocator(.{ .safety = true }){};
-    defer std.debug.assert(gpa_state.deinit() == .ok);
+    var gpa_state = std.heap.DebugAllocator(.{ .safety = true, .stack_trace_frames = build_options.debug_gpa_stack_trace_frames }){};
+    defer std.debug.assert(build_options.debugGpaOk(gpa_state.deinit()));
     const allocator = gpa_state.allocator();
 
     var builtin_ctx = try BuiltinTestContext.init(allocator);
@@ -1147,8 +1148,8 @@ test "imported nested associated types resolve by qualified export key" {
 }
 
 test "export count safety - ensures safe u16 casting" {
-    var gpa_state = std.heap.DebugAllocator(.{ .safety = true }){};
-    defer std.debug.assert(gpa_state.deinit() == .ok);
+    var gpa_state = std.heap.DebugAllocator(.{ .safety = true, .stack_trace_frames = build_options.debug_gpa_stack_trace_frames }){};
+    defer std.debug.assert(build_options.debugGpaOk(gpa_state.deinit()));
     const allocator = gpa_state.allocator();
 
     // This test verifies that we check export counts to ensure safe casting to u16

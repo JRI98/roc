@@ -4,6 +4,7 @@
 //! filtering, process-level parallelism, timeout reporting, and MiniCI stats.
 
 const std = @import("std");
+const build_options = @import("build_options");
 const posix = std.posix;
 const Allocator = std.mem.Allocator;
 
@@ -108,7 +109,7 @@ fn buildMessage(
 fn runSingleTest(io: std.Io, allocator: Allocator, spec: integration.Spec, _: u64) TestResult {
     var timer = harness.Timer.start() catch @panic("no clock");
 
-    var spec_allocator_impl: std.heap.DebugAllocator(.{}) = .init;
+    var spec_allocator_impl: std.heap.DebugAllocator(.{ .stack_trace_frames = build_options.debug_gpa_stack_trace_frames }) = .init;
     const spec_allocator = spec_allocator_impl.allocator();
     test_env.init(spec_allocator, io);
     log_err_count = 0;
@@ -128,7 +129,7 @@ fn runSingleTest(io: std.Io, allocator: Allocator, spec: integration.Spec, _: u6
         },
     }
 
-    const leaks: usize = if (spec_allocator_impl.deinit() == .leak) 1 else 0;
+    const leaks: usize = if (build_options.debugGpaOk(spec_allocator_impl.deinit())) 0 else 1;
 
     if (log_err_count != 0 or leaks != 0) {
         if (status == .pass or status == .skip) status = .fail;
@@ -396,8 +397,8 @@ fn printUsage() void {
 
 /// Runs the parallel LSP integration harness or one worker process.
 pub fn main(init: std.process.Init) RunnerMainError!void {
-    var gpa_impl: std.heap.DebugAllocator(.{}) = .init;
-    defer _ = gpa_impl.deinit();
+    var gpa_impl: std.heap.DebugAllocator(.{ .stack_trace_frames = build_options.debug_gpa_stack_trace_frames }) = .init;
+    defer _ = build_options.debugGpaOk(gpa_impl.deinit());
     const gpa = gpa_impl.allocator();
 
     var arena_impl = std.heap.ArenaAllocator.init(gpa);

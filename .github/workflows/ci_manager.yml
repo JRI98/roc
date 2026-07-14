@@ -165,8 +165,13 @@ jobs:
           error_string_contains: "HttpConnectionClosing|build.zig.zon|TemporaryNameServerFailure|error: cannot download|EndOfStream|WriteFailed|503|bad HTTP response code"
           retry_count: 3
 
+      # On a leak failure this re-runs `zig build minici -Ddebug-gpa-traces`,
+      # which MiniCI forwards to every child `zig build` step, so the re-run's
+      # leak reports include allocation-site stack traces.
       - name: Run MiniCI
-        run: zig build minici
+        uses: ./.github/actions/debug-gpa-retrace
+        with:
+          command: zig build minici
 
       - name: Upload MiniCI report and logs
         if: failure()

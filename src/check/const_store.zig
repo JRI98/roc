@@ -63,13 +63,32 @@ pub const TypeDef = struct {
     /// after checking while preserving the public declaration identity.
     generated: ?names.TypeDigest = null,
     iterator_representation: IteratorRepresentation = .none,
+    iterator_kind: IteratorKind = .none,
     iterator_depth: u8 = 0,
 };
 
-/// Checked iterator representation tier preserved for post-check consumers.
+/// Target-independent Monotype iterator tier preserved across constant storage.
 pub const IteratorRepresentation = enum(u8) {
     none,
     minted,
+    forced_dynamic,
+};
+
+/// Producer or adapter that minted a stored iterator representation.
+pub const IteratorKind = enum(u8) {
+    none,
+    custom,
+    list,
+    single,
+    range_exclusive,
+    range_inclusive,
+    map,
+    keep_if,
+    drop_if,
+    take_first,
+    drop_first,
+    concat,
+    append,
     forced_dynamic,
 };
 
@@ -111,7 +130,7 @@ pub const TypeDeclaredField = union(enum) {
     padding: ConstTypeId,
 };
 
-/// Monomorphic type evidence stored with compile-time function captures.
+/// Monomorphic type evidence stored for compile-time roots and function captures.
 pub const ConstType = union(enum) {
     primitive: Primitive,
     named: struct {
@@ -485,6 +504,7 @@ pub const ConstTypeStore = struct {
             .source_decl = def.source_decl,
             .generated = def.generated,
             .iterator_representation = def.iterator_representation,
+            .iterator_kind = def.iterator_kind,
             .iterator_depth = def.iterator_depth,
         };
     }
@@ -529,7 +549,7 @@ pub const ConstStore = struct {
     node_pool: std.ArrayList(ConstNodeId),
     /// Flat pool of tag-name bytes.
     tag_name_pool: std.ArrayList(u8),
-    /// Monomorphic type evidence for function captures.
+    /// Monomorphic type evidence for roots and function captures.
     type_store: ConstTypeStore,
     /// Flat pool of function captures.
     capture_pool: std.ArrayList(ConstCapture),

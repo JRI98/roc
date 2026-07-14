@@ -2434,6 +2434,7 @@ pub fn build(b: *std.Build) void {
     const cli_test_llvm = b.option(bool, "cli-test-llvm", "Include LLVM size/speed backend jobs in CLI platform tests") orelse false;
     const trace_build = b.option(bool, "trace-build", "Enable detailed build pipeline tracing") orelse false;
     const debug_gpa = b.option(bool, "debug-gpa", "Use the leak-checking DebugAllocator for the roc binary even when libc is linked (default: off, so libc's malloc and its ASan/Valgrind/LD_PRELOAD tooling are used)") orelse false;
+    const debug_gpa_traces = b.option(bool, "debug-gpa-traces", "Capture an allocation-site stack trace on every DebugAllocator allocation so leak reports show where the leaked memory was allocated (default: off, because capturing traces dominates Debug-build runtime; leaks are detected either way)") orelse false;
     const shared_memory_size = b.option(u64, "shared-memory-size", "Explicitly set shared-memory arena sizes in bytes");
     const print_trmc = b.option(bool, "print-trmc", "Print one line for each transformed TRMC/TCE proc") orelse false;
     const print_ir_after_trmc = b.option(bool, "print-ir-after-trmc", "Print full LIR for each proc transformed by TRMC/TCE") orelse false;
@@ -2493,6 +2494,7 @@ pub fn build(b: *std.Build) void {
     build_options.addOption(bool, "trace_modules", trace_modules);
     build_options.addOption(bool, "trace_build", trace_build);
     build_options.addOption(bool, "debug_gpa", debug_gpa);
+    build_options.addOption(bool, "debug_gpa_traces", debug_gpa_traces);
     build_options.addOption(bool, "has_shared_memory_size", shared_memory_size != null);
     build_options.addOption(u64, "shared_memory_size", shared_memory_size orelse 0);
     build_options.addOption(bool, "print_trmc", print_trmc);
@@ -2523,6 +2525,34 @@ pub fn build(b: *std.Build) void {
         \\    },
         \\    compiler_version_git,
         \\});
+        \\
+    ) catch @panic("OOM");
+    // Shared config for every first-party leak-checking DebugAllocator. Capturing a
+    // stack trace per allocation dominates Debug-build runtime (~80% of `roc test`
+    // wall time on macOS arm64), so traces are off unless -Ddebug-gpa-traces is
+    // passed; leaks are still detected without them. Lives in the generated
+    // build_options module because it is imported by everything that instantiates
+    // a DebugAllocator, including minimal test platform hosts.
+    build_options.contents.appendSlice(b.allocator,
+        \\
+        \\pub const debug_gpa_stack_trace_frames: usize =
+        \\    if (debug_gpa_traces and @import("std").debug.sys_can_stack_trace) 6 else 0;
+        \\
+        \\/// Appended to leak reports in traceless builds; empty when traces are on.
+        \\pub const debug_gpa_leak_hint: []const u8 = if (debug_gpa_stack_trace_frames == 0)
+        \\    "note: leak reports above have no allocation-site stack traces; rebuild with `-Ddebug-gpa-traces` to capture them\n"
+        \\else
+        \\    "";
+        \\
+        \\/// Deinit-check for leak-checking DebugAllocators: prints the
+        \\/// -Ddebug-gpa-traces hint when `check` reports a leak in a traceless
+        \\/// build, then returns whether the check passed.
+        \\pub fn debugGpaOk(check: @import("std").heap.Check) bool {
+        \\    if (check == .leak) {
+        \\        @import("std").debug.print("{s}", .{debug_gpa_leak_hint});
+        \\    }
+        \\    return check == .ok;
+        \\}
         \\
     ) catch @panic("OOM");
     build_options.addOption(bool, "enable_tracy_callstack", flag_tracy_callstack);
@@ -2708,6 +2738,12 @@ pub fn build(b: *std.Build) void {
         run_minici.addArg("--search-prefix");
         run_minici.addArg(search_prefix);
     }
+    // MiniCI forwards these args to every child `zig build` it runs, so
+    // `zig build minici -Ddebug-gpa-traces` gives all child steps traced
+    // leak reports (CI re-runs failed leaky jobs this way).
+    if (debug_gpa_traces) {
+        run_minici.addArg("-Ddebug-gpa-traces");
+    }
     run_minici.step.dependOn(&install_minici.step);
     run_minici_step.dependOn(&run_minici.step);
 
@@ -2872,7 +2908,9 @@ pub fn build(b: *std.Build) void {
             .root_source_file = b.path("src/cli/test/test_runner.zig"),
             .target = target,
             .optimize = optimize,
-            .imports = &.{},
+            .imports = &.{
+                .{ .name = "build_options", .module = roc_modules.build_options },
+            },
             // runner_core.zig uses std.c.{timespec,clock_gettime,environ}; Zig 0.16 requires
             // explicit libc linkage for any module that touches std.c.
             .link_libc = true,
@@ -2900,6 +2938,7 @@ pub fn build(b: *std.Build) void {
                     .{ .name = "collections", .module = roc_modules.collections },
                     .{ .name = "backend", .module = roc_modules.backend },
                     .{ .name = "bytebox", .module = bytebox.module("bytebox") },
+                    .{ .name = "build_options", .module = roc_modules.build_options },
                 },
             }),
         });
@@ -3493,6 +3532,7 @@ pub fn build(b: *std.Build) void {
         });
         configureBackend(echo_wasm_archive_exe, target);
         echo_wasm_archive_exe.root_module.addImport("bundle", roc_modules.bundle);
+        echo_wasm_archive_exe.root_module.addImport("build_options", roc_modules.build_options);
         echo_wasm_archive_exe.root_module.linkLibrary(zstd.artifact("zstd"));
 
         const echo_wasm_archive_cmd = b.addRunArtifact(echo_wasm_archive_exe);
@@ -3524,6 +3564,7 @@ pub fn build(b: *std.Build) void {
             }),
         });
         configureBackend(echo_native_exe, target);
+        echo_native_exe.root_module.addImport("build_options", roc_modules.build_options);
         echo_native_exe.root_module.addImport("compile", roc_modules.compile);
         echo_native_exe.root_module.addImport("check", roc_modules.check);
         echo_native_exe.root_module.addImport("eval", roc_modules.eval);
@@ -3576,6 +3617,7 @@ pub fn build(b: *std.Build) void {
             }),
         });
         configureBackend(glue_release_exe, target);
+        glue_release_exe.root_module.addImport("build_options", roc_modules.build_options);
 
         const glue_package_cmd = b.addRunArtifact(roc_exe);
         glue_package_cmd.setCwd(b.path("src/glue/platform"));
@@ -3868,6 +3910,7 @@ pub fn build(b: *std.Build) void {
         });
         configureBackend(wasm_test_exe, target);
         wasm_test_exe.root_module.addImport("bytebox", bytebox.module("bytebox"));
+        wasm_test_exe.root_module.addImport("build_options", roc_modules.build_options);
 
         const install = b.addInstallArtifact(wasm_test_exe, .{});
         build_test_wasm_static_lib_runner_step.dependOn(&install.step);
@@ -5474,6 +5517,7 @@ fn add_fuzz_target(
     });
     configureBackend(repro_exe, target);
     repro_exe.root_module.addImport("fuzz_test", fuzz_obj.root_module);
+    repro_exe.root_module.addImport("build_options", roc_modules.build_options);
 
     _ = install_and_run(b, no_bin, repro_exe, build_repro_step, run_repro_step, run_args);
 

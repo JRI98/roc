@@ -102,6 +102,20 @@ pub const Writer = struct {
         };
     }
 
+    /// Preserve the exact producer-owned representation of a compile-time
+    /// root in the checked module's durable ConstStore type table.
+    pub fn storeRootType(
+        self: *Writer,
+        root: LirProgram.ConstRootPlan,
+    ) Allocator.Error!const_store.ConstTypeId {
+        return self.module.const_store.type_store.cloneTypeFromTranslated(
+            &self.program.const_types,
+            &self.program.const_type_names,
+            &self.module.canonical_names,
+            root.ret_type,
+        );
+    }
+
     fn storeValue(
         self: *Writer,
         plan_id: LirProgram.ConstPlanId,
@@ -933,6 +947,7 @@ test "const store writer pointer memoization is scoped to one root" {
         },
         .proc = undefined, // storeRoot does not inspect the root procedure for stored values.
         .ret_layout = .str,
+        .ret_type = undefined, // storeRoot does not inspect root type evidence in this focused test.
         .plan = str_plan,
     };
 
