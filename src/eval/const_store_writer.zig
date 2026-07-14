@@ -102,6 +102,20 @@ pub const Writer = struct {
         };
     }
 
+    /// Preserve the exact producer-owned representation of a compile-time
+    /// root in the checked module's durable ConstStore type table.
+    pub fn storeRootType(
+        self: *Writer,
+        root: LirProgram.ConstRootPlan,
+    ) Allocator.Error!const_store.ConstTypeId {
+        return self.module.const_store.type_store.cloneTypeFromTranslated(
+            &self.program.const_types,
+            &self.program.const_type_names,
+            &self.module.canonical_names,
+            root.ret_type,
+        );
+    }
+
     fn storeValue(
         self: *Writer,
         plan_id: LirProgram.ConstPlanId,
@@ -394,11 +408,14 @@ pub const Writer = struct {
         const variant = self.selectFnVariant(set, tag_base.layout_idx, tag_base.value);
         const captures = try self.storeCaptures(variant.captures, variant.payload_layout, tag_base.value);
         defer self.module.const_store.allocator.free(captures);
+        const evidence_chain = try self.storeEvidenceChain(variant.template.const_evidence_chain);
+        defer self.module.const_store.allocator.free(evidence_chain);
         return try self.module.const_store.appendFn(.{
             .fn_def = variant.template.fn_def,
             .source_fn_ty = variant.template.source_fn_ty,
             .source_fn_key = variant.template.source_fn_key,
             .captures = captures,
+            .evidence_chain = evidence_chain,
         });
     }
 
@@ -414,14 +431,50 @@ pub const Writer = struct {
             if (entry.entry != resolved.proc) continue;
             const captures = try self.storeCaptures(entry.captures, entry.capture_layout, .{ .ptr = resolved.capture_ptr });
             defer self.module.const_store.allocator.free(captures);
+            const evidence_chain = try self.storeEvidenceChain(entry.template.const_evidence_chain);
+            defer self.module.const_store.allocator.free(evidence_chain);
             return try self.module.const_store.appendFn(.{
                 .fn_def = entry.template.fn_def,
                 .source_fn_ty = entry.template.source_fn_ty,
                 .source_fn_key = entry.template.source_fn_key,
                 .captures = captures,
+                .evidence_chain = evidence_chain,
             });
         }
         writerInvariant("erased callable result did not match an explicit erased function entry");
+    }
+
+    fn storeEvidenceChain(self: *Writer, range: const_store.ConstRange) Allocator.Error![]const const_store.ConstRange {
+        const source = self.program.const_evidence_chain_pool.items[range.start .. range.start + range.len];
+        const stored = try self.module.const_store.allocator.alloc(const_store.ConstRange, source.len);
+        errdefer self.module.const_store.allocator.free(stored);
+        for (source, 0..) |vector, index| {
+            stored[index] = try self.storeEvidenceVector(vector);
+        }
+        return stored;
+    }
+
+    fn storeEvidenceVector(self: *Writer, range: const_store.ConstRange) Allocator.Error!const_store.ConstRange {
+        const source = self.program.const_evidence_pool.items[range.start .. range.start + range.len];
+        const relocated = try self.module.const_store.allocator.alloc(const_store.ConstEvidence, source.len);
+        defer self.module.const_store.allocator.free(relocated);
+
+        for (source, 0..) |evidence, index| {
+            relocated[index] = switch (evidence) {
+                .target => |target| .{ .target = .{
+                    .module = target.module,
+                    .method = target.method,
+                    .nested = switch (target.nested) {
+                        .resolved => |nested| .{ .resolved = try self.storeEvidenceVector(nested) },
+                        .synthesize => .synthesize,
+                    },
+                } },
+                .structural => |kind| .{ .structural = kind },
+                .unreachable_value => .unreachable_value,
+                .checked_error => .checked_error,
+            };
+        }
+        return try self.module.const_store.appendEvidence(relocated);
     }
 
     fn storeCaptures(
@@ -894,6 +947,7 @@ test "const store writer pointer memoization is scoped to one root" {
         },
         .proc = undefined, // storeRoot does not inspect the root procedure for stored values.
         .ret_layout = .str,
+        .ret_type = undefined, // storeRoot does not inspect root type evidence in this focused test.
         .plan = str_plan,
     };
 

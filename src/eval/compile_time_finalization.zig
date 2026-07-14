@@ -591,7 +591,15 @@ fn lowerEvalAndFinishRoots(
         }
 
         module.compile_time_roots.fillPayload(root_id, payload);
-        finishConstRoot(module, compile_time_root, payload);
+        const stored_root_type = switch (compile_time_root.kind) {
+            .constant, .hoisted_constant => try writer.storeRootType(root),
+            .callable_binding,
+            .expect,
+            .numeral_conversion,
+            .quote_conversion,
+            => null,
+        };
+        finishConstRoot(module, compile_time_root, payload, stored_root_type);
         state.markDone(root_id);
     }
 
@@ -1082,7 +1090,15 @@ fn lowerDevEvalAndFinishRoots(
         }
 
         module.compile_time_roots.fillPayload(job.root_id, payload);
-        finishConstRoot(module, job.compile_time_root, payload);
+        const stored_root_type = switch (job.compile_time_root.kind) {
+            .constant, .hoisted_constant => try writer.storeRootType(job.root),
+            .callable_binding,
+            .expect,
+            .numeral_conversion,
+            .quote_conversion,
+            => null,
+        };
+        finishConstRoot(module, job.compile_time_root, payload, stored_root_type);
         state.markDone(job.root_id);
     }
 
@@ -1678,6 +1694,7 @@ fn finishConstRoot(
     module: *checked.CheckedModuleArtifact,
     root: checked.CompileTimeRoot,
     payload: checked.CompileTimeRootPayload,
+    root_type: ?check.ConstStore.ConstTypeId,
 ) void {
     if (root.kind != .constant and root.kind != .hoisted_constant) return;
     const node = switch (payload) {
@@ -1708,7 +1725,10 @@ fn finishConstRoot(
         .quote_conversion,
         => unreachable,
     };
-    const stored = checked.StoredConstTemplate{ .node = node };
+    const stored = checked.StoredConstTemplate{
+        .node = node,
+        .root_type = root_type orelse finalizationInvariant("constant root finalized without exact Monotype representation evidence"),
+    };
     module.const_templates.fillStoredConst(const_ref, stored);
     if (root.kind == .constant) {
         module.exported_const_templates.fillStoredConst(const_ref, stored);

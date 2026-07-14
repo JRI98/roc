@@ -79,6 +79,8 @@ fn movedSolvedView(source: *const Solved.Program, moved: *const Ast.Program) Sol
             .stmt_ids = lifted.stmt_ids,
             .field_exprs = lifted.field_exprs,
             .fn_def_captures = lifted.fn_def_captures,
+            .const_evidence_pool = lifted.const_evidence_pool,
+            .const_evidence_chain_pool = lifted.const_evidence_chain_pool,
             .capture_operands = lifted.capture_operands,
             .record_destructs = lifted.record_destructs,
             .str_pattern_steps = lifted.str_pattern_steps,

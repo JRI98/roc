@@ -60,6 +60,10 @@ pub const TypeDef = struct {
     /// Representation decision produced when an internal iterator nominal is
     /// created. Later stages consume the recorded tier and mint depth directly.
     iterator_representation: IteratorRepresentation = .none,
+    /// Exact producer or adapter that minted this iterator representation.
+    /// Consumers use this evidence instead of reconstructing an operation from
+    /// the generated function body's shape.
+    iterator_kind: IteratorKind = .none,
     /// Producer-computed minted-chain depth. Meaningful only for `.minted`.
     iterator_depth: u8 = 0,
 };
@@ -68,6 +72,24 @@ pub const TypeDef = struct {
 pub const IteratorRepresentation = enum(u8) {
     none,
     minted,
+    forced_dynamic,
+};
+
+/// Producer-owned identity of an internal iterator representation.
+pub const IteratorKind = enum(u8) {
+    none,
+    custom,
+    list,
+    single,
+    range_exclusive,
+    range_inclusive,
+    map,
+    keep_if,
+    drop_if,
+    take_first,
+    drop_first,
+    concat,
+    append,
     forced_dynamic,
 };
 
@@ -170,6 +192,11 @@ pub const Store = struct {
     specialization_digests: StoreList(?names.TypeDigest, "specialization_digests"),
     type_digest_generations: StoreList(u64, "type_digest_generations"),
     specialization_digest_generations: StoreList(u64, "specialization_digest_generations"),
+    /// Unique allocation epoch for each live TypeId. Store restoration can
+    /// recycle an id after discarding an interner candidate, so caches keyed
+    /// by TypeId validate this epoch as well as mutable-view generations.
+    type_epochs: StoreList(u64, "type_epochs"),
+    next_type_epoch: u64,
     digest_cache_generation: u64,
     spans: StoreList(TypeId, "spans"),
     fields: StoreList(Field, "fields"),
@@ -185,6 +212,8 @@ pub const Store = struct {
             .specialization_digests = .empty,
             .type_digest_generations = .empty,
             .specialization_digest_generations = .empty,
+            .type_epochs = .empty,
+            .next_type_epoch = 1,
             .digest_cache_generation = 1,
             .spans = .empty,
             .fields = .empty,
@@ -201,6 +230,7 @@ pub const Store = struct {
         self.spans.deinit(self.allocator);
         self.specialization_digest_generations.deinit(self.allocator);
         self.type_digest_generations.deinit(self.allocator);
+        self.type_epochs.deinit(self.allocator);
         self.specialization_digests.deinit(self.allocator);
         self.type_digests.deinit(self.allocator);
         self.types.deinit(self.allocator);
@@ -270,6 +300,10 @@ pub const Store = struct {
         try self.type_digest_generations.append(self.allocator, 0);
         errdefer _ = self.type_digest_generations.pop();
         try self.specialization_digest_generations.append(self.allocator, 0);
+        errdefer _ = self.specialization_digest_generations.pop();
+        if (self.next_type_epoch == std.math.maxInt(u64)) Common.invariant("Monotype type epoch exhausted");
+        try self.type_epochs.append(self.allocator, self.next_type_epoch);
+        self.next_type_epoch += 1;
         return @enumFromInt(@as(u32, @intCast(index)));
     }
 
@@ -311,6 +345,10 @@ pub const Store = struct {
         return self.types.unsafeRawItemsForView()[@intFromEnum(ty)];
     }
 
+    pub fn typeEpoch(self: *const Store, ty: TypeId) u64 {
+        return self.type_epochs.unsafeRawItemsForView()[@intFromEnum(ty)];
+    }
+
     pub fn span(self: *const Store, span_: Span) StoreSpanBorrow(TypeId, "spans") {
         return self.spans.borrowSpan(span_.start, span_.len);
     }
@@ -341,6 +379,7 @@ pub const Store = struct {
         specialization_digests_len: usize,
         type_digest_generations_len: usize,
         specialization_digest_generations_len: usize,
+        type_epochs_len: usize,
         spans_len: usize,
         fields_len: usize,
         tags_len: usize,
@@ -354,6 +393,7 @@ pub const Store = struct {
             .specialization_digests_len = self.specialization_digests.len(),
             .type_digest_generations_len = self.type_digest_generations.len(),
             .specialization_digest_generations_len = self.specialization_digest_generations.len(),
+            .type_epochs_len = self.type_epochs.len(),
             .spans_len = self.spans.len(),
             .fields_len = self.fields.len(),
             .tags_len = self.tags.len(),
@@ -368,6 +408,7 @@ pub const Store = struct {
         self.specialization_digests.restoreLen(mark_.specialization_digests_len);
         self.type_digest_generations.restoreLen(mark_.type_digest_generations_len);
         self.specialization_digest_generations.restoreLen(mark_.specialization_digest_generations_len);
+        self.type_epochs.restoreLen(mark_.type_epochs_len);
         self.spans.restoreLen(mark_.spans_len);
         self.fields.restoreLen(mark_.fields_len);
         self.tags.restoreLen(mark_.tags_len);
@@ -900,6 +941,7 @@ pub const Store = struct {
                 }
                 writeOptionalDigest(hasher, named.def.generated);
                 writeBytes(hasher, @tagName(named.def.iterator_representation));
+                writeBytes(hasher, @tagName(named.def.iterator_kind));
                 writeU32(hasher, named.def.iterator_depth);
                 writeBytes(hasher, @tagName(named.kind));
                 if (named.builtin_owner) |owner| {
@@ -1125,6 +1167,7 @@ fn namedTypeViewEql(
     }
     if (!optionalDigestEql(lhs.def.generated, rhs.def.generated)) return false;
     if (lhs.def.iterator_representation != rhs.def.iterator_representation) return false;
+    if (lhs.def.iterator_kind != rhs.def.iterator_kind) return false;
     if (lhs.def.iterator_depth != rhs.def.iterator_depth) return false;
     if (lhs.builtin_owner != rhs.builtin_owner) return false;
     if (!try typeSpanViewEql(type_view, name_store, lhs.args, rhs.args, visited)) return false;
@@ -1444,6 +1487,7 @@ fn namedTypeEqlAcrossStores(
     }
     if (!optionalDigestEql(lhs.def.generated, rhs.def.generated)) return false;
     if (lhs.def.iterator_representation != rhs.def.iterator_representation) return false;
+    if (lhs.def.iterator_kind != rhs.def.iterator_kind) return false;
     if (lhs.def.iterator_depth != rhs.def.iterator_depth) return false;
     if (lhs.builtin_owner != rhs.builtin_owner) return false;
     if (!try typeSpanEqlAcrossStores(name_store, lhs_view, lhs.args, rhs_view, rhs.args, visited)) return false;
@@ -2073,6 +2117,22 @@ pub fn builtinOwnerForPrimitive(primitive: Primitive) static_dispatch.BuiltinOwn
 
 test "monotype type declarations are referenced" {
     std.testing.refAllDecls(@This());
+}
+
+test "monotype type epochs distinguish recycled ids" {
+    var store = Store.init(std.testing.allocator);
+    defer store.deinit();
+
+    _ = try store.add(.{ .primitive = .u64 });
+    const mark_ = store.mark();
+    const discarded = try store.add(.{ .primitive = .i64 });
+    const discarded_epoch = store.typeEpoch(discarded);
+
+    store.restore(mark_);
+    const replacement = try store.add(.{ .primitive = .str });
+
+    try std.testing.expectEqual(discarded, replacement);
+    try std.testing.expect(discarded_epoch != store.typeEpoch(replacement));
 }
 
 test "monotype type interner reuses child-first function nodes" {

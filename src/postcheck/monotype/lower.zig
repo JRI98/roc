@@ -83,6 +83,14 @@ pub const Options = struct {
 /// Deterministic counters used by specialization-shape tests.
 pub const SpecializationCounters = specialize.Counters;
 
+/// One memoized generated-evidence answer, valid only while the type store's
+/// digest generation and the TypeId's allocation epoch are unchanged.
+const EvidenceCacheEntry = struct {
+    generation: u64,
+    type_epoch: u64,
+    has_evidence: bool,
+};
+
 /// Lower checked modules and explicit roots into Monotype IR.
 pub fn run(
     allocator: Allocator,
@@ -467,22 +475,6 @@ const ParseIntrinsic = enum {
 ///
 /// These are not source-visible nominal declarations like `MapIter`. The
 /// distinct compiler-owned nominal identity is the `TypeDef.generated` digest
-/// minted from this kind plus the concrete component types. That digest is the
-/// identity; display names stay the public `Iter` provenance.
-const GeneratedIteratorKind = enum {
-    custom,
-    single,
-    range_exclusive,
-    range_inclusive,
-    map,
-    keep_if,
-    drop_if,
-    take_first,
-    drop_first,
-    concat,
-    append,
-};
-
 const FieldNameBound = enum {
     shortest,
     longest,
@@ -638,6 +630,14 @@ const Builder = struct {
     inspect_defs: std.AutoHashMap(GeneratedHelperDefAddress, GeneratedHelperDefEntry),
     equality_defs: std.AutoHashMap(GeneratedHelperDefAddress, GeneratedHelperDefEntry),
     hash_defs: std.AutoHashMap(GeneratedHelperDefAddress, GeneratedHelperDefEntry),
+    /// Memoized `monoTypeHasGeneratedOpaqueEvidence` answers. An entry is
+    /// valid only at the type store's current digest generation, which bumps
+    /// whenever a graph view refills in place, so a mutable view can never
+    /// return a stale answer. The TypeId allocation epoch separately rejects
+    /// ids recycled after the interner restores a discarded candidate.
+    evidence_cache: std.AutoHashMap(Type.TypeId, EvidenceCacheEntry),
+    /// Reused visited set for the evidence walk itself.
+    evidence_walk_visited: std.AutoHashMap(Type.TypeId, void),
     hosted_catalog: []HostedCatalogEntry = &.{},
     /// Demand-filled method lookup results keyed by the checked module whose
     /// registry scope applies. Checked modules output the ordered registry
@@ -686,6 +686,8 @@ const Builder = struct {
             .inspect_defs = std.AutoHashMap(GeneratedHelperDefAddress, GeneratedHelperDefEntry).init(allocator),
             .equality_defs = std.AutoHashMap(GeneratedHelperDefAddress, GeneratedHelperDefEntry).init(allocator),
             .hash_defs = std.AutoHashMap(GeneratedHelperDefAddress, GeneratedHelperDefEntry).init(allocator),
+            .evidence_cache = std.AutoHashMap(Type.TypeId, EvidenceCacheEntry).init(allocator),
+            .evidence_walk_visited = std.AutoHashMap(Type.TypeId, void).init(allocator),
             .batched_requester_drain_graph = null,
             .batched_requester_drain_needed = false,
             .evidence_arena = std.heap.ArenaAllocator.init(allocator),
@@ -715,6 +717,8 @@ const Builder = struct {
     fn deinit(self: *Builder) void {
         self.scoped_method_targets.deinit(self.allocator);
         self.allocator.free(self.hosted_catalog);
+        self.evidence_walk_visited.deinit();
+        self.evidence_cache.deinit();
         self.hash_defs.deinit();
         self.equality_defs.deinit();
         self.inspect_defs.deinit();
@@ -741,6 +745,45 @@ const Builder = struct {
         if (self.counters) |counters| {
             @field(counters, field) += @intCast(amount);
         }
+    }
+
+    /// Freeze one fully materialized evidence vector into target-independent
+    /// Monotype side data. Concrete targets retain checked module identity and
+    /// nested evidence for direct consumption by every later stage.
+    fn persistEvidenceVector(self: *Builder, vector: []const SpecEvidence) Allocator.Error!check.ConstStore.ConstRange {
+        const stored = try self.allocator.alloc(check.ConstStore.ConstEvidence, vector.len);
+        defer self.allocator.free(stored);
+
+        for (vector, 0..) |evidence, index| {
+            stored[index] = switch (evidence) {
+                .target => |target| .{ .target = .{
+                    .module = moduleDigestFromId(target.view.key),
+                    .method = target.target,
+                    .nested = switch (target.nested) {
+                        .resolved => |nested| .{ .resolved = try self.persistEvidenceVector(nested) },
+                        .synthesize => .synthesize,
+                    },
+                } },
+                .structural => |kind| .{ .structural = kind },
+                .unreachable_value => .unreachable_value,
+                .checked_error => .checked_error,
+            };
+        }
+        return try self.program.addConstEvidenceSpan(stored);
+    }
+
+    /// Persist every vector in a function body's lexical evidence chain,
+    /// ordered from the innermost scope to its parents.
+    fn persistEvidenceChain(self: *Builder, chain: EvidenceChain) Allocator.Error!check.ConstStore.ConstRange {
+        if (chain.vector.len == 0 and chain.parent == null) return .{};
+
+        var vectors = std.ArrayList(check.ConstStore.ConstRange).empty;
+        defer vectors.deinit(self.allocator);
+        var current: ?*const EvidenceChain = &chain;
+        while (current) |entry| : (current = entry.parent) {
+            try vectors.append(self.allocator, try self.persistEvidenceVector(entry.vector));
+        }
+        return try self.program.addConstEvidenceChain(vectors.items);
     }
 
     fn specializationTypeDigest(self: *Builder, ty: Type.TypeId) names.TypeDigest {
@@ -1361,7 +1404,7 @@ const Builder = struct {
 
         const view = self.moduleForDigest(names.procTemplateModuleDigest(template_ref));
         const template = view.templates.get(template_ref.template);
-        const fn_template = self.fnDefForTemplate(view, template_ref, source_fn_ty, source_fn_key, lower_fn_ty);
+        var fn_template = self.fnDefForTemplate(view, template_ref, source_fn_ty, source_fn_key, lower_fn_ty);
 
         const Reservation = struct {
             def: Ast.DefId,
@@ -1517,6 +1560,7 @@ const Builder = struct {
                 Common.invariant("intrinsic wrapper specialization request supplied fewer evidence entries than its scheme's params");
             }
         }
+        fn_template.const_evidence_chain = try self.persistEvidenceChain(body_ctx.evidence);
         body_ctx.source_region_override = source_region_override;
         body_ctx.current_entry_root = current_entry_root;
         const root_fn_key = Ast.fnTemplateDigest(fn_template, &self.program.types, &self.program.names);
@@ -2090,10 +2134,30 @@ const Builder = struct {
         };
     }
 
+    /// Whether a Monotype's structure reaches generated opaque evidence.
+    /// Answers memoize per type id at the store's current digest generation
+    /// and the id's allocation epoch. The generation bumps whenever any graph
+    /// view refills in place, and the epoch changes when a restored id is
+    /// reused, so no mutable or recycled type serves a stale answer. Repeated
+    /// walks between either change collapse into lookups.
     fn monoTypeHasGeneratedOpaqueEvidence(self: *Builder, ty: Type.TypeId) Allocator.Error!bool {
-        var visited = std.AutoHashMap(Type.TypeId, void).init(self.allocator);
-        defer visited.deinit();
-        return try self.monoTypeHasGeneratedOpaqueEvidenceInner(ty, &visited);
+        self.count("evidence_walks");
+        const generation = self.program.types.digest_cache_generation;
+        const type_epoch = self.program.types.typeEpoch(ty);
+        if (self.evidence_cache.get(ty)) |entry| {
+            if (entry.generation == generation and entry.type_epoch == type_epoch) {
+                self.count("evidence_walk_memo_hits");
+                return entry.has_evidence;
+            }
+        }
+        self.evidence_walk_visited.clearRetainingCapacity();
+        const has_evidence = try self.monoTypeHasGeneratedOpaqueEvidenceInner(ty, &self.evidence_walk_visited);
+        try self.evidence_cache.put(ty, .{
+            .generation = generation,
+            .type_epoch = type_epoch,
+            .has_evidence = has_evidence,
+        });
+        return has_evidence;
     }
 
     fn monoTypeHasGeneratedOpaqueEvidenceInner(
@@ -2433,9 +2497,10 @@ const Builder = struct {
         for (tags) |tag| {
             const payloads = try self.lowerTypeSlice(view, tag.argsSlice(view.types));
             defer self.allocator.free(payloads);
+            const tag_name = try self.tagName(view, tag.name);
             try out.append(self.allocator, .{
-                .name = try self.tagName(view, tag.name),
-                .checked_name = tag.name,
+                .name = tag_name,
+                .checked_name = tag_name,
                 .payloads = try self.program.types.addSpan(payloads),
             });
         }
@@ -3037,13 +3102,15 @@ const Builder = struct {
             parent.* = source_ctx.evidence;
             nested_ctx.evidence = .{ .vector = vector, .parent = parent };
         }
+        var stored_template = fn_template;
+        stored_template.const_evidence_chain = try self.persistEvidenceChain(nested_ctx.evidence);
         // Nested functions share the requester's graph, and an inferred local
         // procedure's body pins signature variables (its own evidence) that
         // the requester's remaining body relies on, so the body lowers now.
         return try self.lowerNestedFnRequest(.{
             .ctx = nested_ctx,
             .expr_id = expr_id,
-            .fn_template = fn_template,
+            .fn_template = stored_template,
         });
     }
 
@@ -3103,6 +3170,7 @@ const Builder = struct {
                 .source_fn_ty = def_template.source_fn_ty,
                 .source_fn_key = def_template.source_fn_key,
                 .mono_fn_ty = try DraftTypeCell.fromActiveType(request.ctx.graph, def_template.mono_fn_ty),
+                .const_evidence_chain = def_template.const_evidence_chain,
             },
             .fn_id = draftFinalFn(fn_id),
             .args = lowered.args,
@@ -3368,7 +3436,7 @@ const Builder = struct {
         for (fn_value.captures) |capture| {
             if (!capture.id.isCanonical()) continue;
             const binder = capture.id.binder();
-            const lowered_ty = try fn_ctx.lowerConstCaptureType(store_view, capture.ty);
+            const lowered_ty = try fn_ctx.lowerConstType(store_view, capture.ty);
             const local = try fn_ctx.addLocalWithBinder(self.symbols.fresh(), lowered_ty, binder);
             try fn_ctx.bindLocalName(local, binder);
             const previous = fn_ctx.binders.get(binder);
@@ -3944,7 +4012,7 @@ const Builder = struct {
 
         for (fn_value.captures, 0..) |capture, index| {
             const binder = constCaptureBinder(capture.id);
-            const lowered_ty = try fn_ctx.lowerConstCaptureType(store_view, capture.ty);
+            const lowered_ty = try fn_ctx.lowerConstType(store_view, capture.ty);
             const capture_cell = try fn_ctx.draftTypeCell(lowered_ty);
             const local = try fn_ctx.addLocalWithBinderCell(self.symbols.fresh(), capture_cell, binder);
             try fn_ctx.bindLocalName(local, binder);
@@ -5230,6 +5298,7 @@ const DraftFnTemplate = struct {
     source_fn_ty: checked.CheckedTypeId,
     source_fn_key: names.TypeDigest,
     mono_fn_ty: DraftTypeCell,
+    const_evidence_chain: check.ConstStore.ConstRange = .{},
 };
 
 const DraftFn = struct {
@@ -6247,6 +6316,7 @@ const BodyDraftStore = struct {
             .source_fn_ty = template.source_fn_ty,
             .source_fn_key = template.source_fn_key,
             .mono_fn_ty = try template.mono_fn_ty.seal(graph, sealer),
+            .const_evidence_chain = template.const_evidence_chain,
         };
     }
 
@@ -6731,11 +6801,6 @@ const BodyContext = struct {
     /// restored from the constant lower their bodies against this chain
     /// (their plans' `constraint(k)` refs index the constant's scheme).
     restore_evidence: EvidenceChain = .{},
-    /// While recursively restoring a stored constant, the concrete type of the
-    /// whole restored value. Nested stored closures use this to instantiate the
-    /// owner callable's return when synthesizing the constant scheme's evidence.
-    restore_const_result_ty: ?Type.TypeId = null,
-
     const PatternLiteralGuard = struct {
         local: DraftLocalId,
         ty: Type.TypeId,
@@ -7288,6 +7353,7 @@ const BodyContext = struct {
                 .source_fn_ty = source.source_fn_ty,
                 .source_fn_key = source.source_fn_key,
                 .mono_fn_ty = try self.draftTypeCellPreservingGenerated(source.mono_fn_ty),
+                .const_evidence_chain = source.const_evidence_chain,
             },
         });
     }
@@ -7763,7 +7829,6 @@ const BodyContext = struct {
         child.generated_encoder_lambda_index = self.generated_encoder_lambda_index;
         child.source_region_override = self.source_region_override;
         child.current_entry_root = self.current_entry_root;
-        child.restore_const_result_ty = self.restore_const_result_ty;
         child.restored_local_proc_context_digest = self.restored_local_proc_context_digest;
         child.restored_local_proc_base_key = self.restored_local_proc_base_key;
 
@@ -8714,8 +8779,10 @@ const BodyContext = struct {
     ) Allocator.Error!NodeId {
         const declaration_id: u32 = @intFromEnum(source.declaration.id);
         if (self.graph.nominalBackingNode(source.view.key.bytes, declaration_id, args)) |cached| {
+            self.builder.count("nominal_backing_reuses");
             return cached;
         }
+        self.builder.count("nominal_backing_instantiations");
 
         const placeholder = try self.graph.newNode(.{ .unresolved = InstVariable.placeholder() });
         try self.graph.putNominalBackingNode(source.view.key.bytes, declaration_id, args, placeholder);
@@ -9190,11 +9257,14 @@ const BodyContext = struct {
         entry: checked.HoistedConstEntry,
         ty: Type.TypeId,
     ) Allocator.Error!DraftExprId {
-        try self.constrainTypeToMono(entry.checked_type, ty);
         const template = self.view.const_templates.get(entry.const_ref);
         const source_region = self.hoistedConstSourceRegion(entry);
         return switch (template.state) {
             .stored_const => |stored| blk: {
+                const stored_ty = try self.storedConstRootMonoType(self.view, stored, entry.checked_type);
+                if (!try self.sameTypeOrPublicOpaque(ty, stored_ty)) {
+                    Common.invariant("stored hoisted const representation differed from its expected Monotype type");
+                }
                 const saved_loc = self.builder.program.current_loc;
                 defer self.builder.program.current_loc = saved_loc;
                 const saved_region = self.builder.program.current_region;
@@ -9205,13 +9275,16 @@ const BodyContext = struct {
                     self.view,
                     self.view,
                     stored.node,
-                    ty,
+                    stored_ty,
                     entry.const_ref,
                     entry.checked_type,
                     .disallow,
                 );
             },
-            .eval_template => |eval| try self.lowerConstEvalTemplateUse(self.view, eval, ty, source_region, .{ .module = self.view.key, .root = entry.root }),
+            .eval_template => |eval| blk: {
+                try self.constrainTypeToMono(entry.checked_type, ty);
+                break :blk try self.lowerConstEvalTemplateUse(self.view, eval, ty, source_region, .{ .module = self.view.key, .root = entry.root });
+            },
             .reserved => Common.invariant("reserved hoisted const template reached Monotype"),
         };
     }
@@ -9260,7 +9333,12 @@ const BodyContext = struct {
     ) Allocator.Error!?Type.TypeId {
         const entry = self.selectedHoistedConstEntry(selected);
         if (self.loweringOwnHoistedConstRoot(entry)) return null;
-        const hoisted_ty = try self.lowerTypeView(entry.checked_type);
+        const template = self.view.const_templates.get(entry.const_ref);
+        const hoisted_ty = switch (template.state) {
+            .stored_const => |stored| try self.storedConstRootMonoType(self.view, stored, entry.checked_type),
+            .eval_template => try self.lowerTypeView(entry.checked_type),
+            .reserved => Common.invariant("reserved hoisted const template reached Monotype type selection"),
+        };
         try self.constrainTypeToMono(checked_ty, hoisted_ty);
         return hoisted_ty;
     }
@@ -9891,6 +9969,10 @@ const BodyContext = struct {
 
     fn isBuiltinIterSingleText(text: []const u8) bool {
         return Ident.textEql(text, "Builtin.Iter.single");
+    }
+
+    fn isBuiltinListIterText(text: []const u8) bool {
+        return Ident.textEql(text, "Builtin.List.iter");
     }
 
     fn isBuiltinIterMapText(text: []const u8) bool {
@@ -10941,6 +11023,7 @@ const BodyContext = struct {
                 var public_def = ctx.named.def;
                 public_def.generated = null;
                 public_def.iterator_representation = .none;
+                public_def.iterator_kind = .none;
                 public_def.iterator_depth = 0;
                 const args = ctx.body.builder.program.types.span(ctx.named.args);
                 if (args.len == 0) Common.invariant("generated iterator evidence had no public item argument");
@@ -10979,6 +11062,7 @@ const BodyContext = struct {
         var public_def = named.def;
         public_def.generated = null;
         public_def.iterator_representation = .none;
+        public_def.iterator_kind = .none;
         public_def.iterator_depth = 0;
         return try self.builder.program.types.add(.{ .named = .{
             .named_type = named.named_type,
@@ -11052,10 +11136,6 @@ const BodyContext = struct {
             }
         }
 
-        if (expected_ret_ty) |expected| {
-            if (!try self.builder.monoTypeHasGeneratedOpaqueEvidence(expected)) return null;
-        }
-
         if (isBuiltinIterNextText(text)) {
             if (checked_args.len != 1 or arg_tys.len != 1) Common.invariant("Iter.next reached Monotype with an unexpected arity");
             if (self.isGeneratedIteratorEvidenceType(arg_tys[0])) {
@@ -11082,6 +11162,23 @@ const BodyContext = struct {
                 const components = [_]Type.TypeId{ arg_tys[0], arg_tys[2] };
                 return try self.functionTypeWithReturn(arg_tys, try self.generatedIteratorType(.custom, fn_data.ret, &components, try self.callableArgumentEvidenceDigest(checked_args[2])));
             }
+        }
+
+        if (isBuiltinListIterText(text)) {
+            if (checked_args.len != 1 or arg_tys.len != 1) Common.invariant("List.iter reached Monotype with an unexpected arity");
+            if (expected_ret_ty) |expected| {
+                if (self.isGeneratedIteratorEvidenceType(expected)) {
+                    const stable_expected = try self.stableGeneratedIteratorEvidenceType(expected);
+                    if (self.isForcedDynamicIteratorType(stable_expected)) {
+                        return try self.functionTypeWithReturn(arg_tys, stable_expected);
+                    }
+                    const expected_args = try self.generatedIteratorComponentArgs(stable_expected, 1);
+                    defer self.allocator.free(expected_args);
+                    return try self.functionTypeWithReturn(expected_args, stable_expected);
+                }
+            }
+            const components = [_]Type.TypeId{arg_tys[0]};
+            return try self.functionTypeWithReturn(arg_tys, try self.generatedIteratorType(.list, fn_data.ret, &components, null));
         }
 
         if (isBuiltinIterSingleText(text)) {
@@ -11546,7 +11643,7 @@ const BodyContext = struct {
 
     fn generatedIteratorType(
         self: *BodyContext,
-        kind: GeneratedIteratorKind,
+        kind: Type.IteratorKind,
         public_iter_ty: Type.TypeId,
         components: []const Type.TypeId,
         callable_evidence: ?names.TypeDigest,
@@ -11585,10 +11682,11 @@ const BodyContext = struct {
             item_ty: Type.TypeId,
             args: []const Type.TypeId,
             digest: names.TypeDigest,
+            kind: Type.IteratorKind,
             chain_depth: u32,
 
             fn fill(ctx: @This(), self_ty: Type.TypeId) Allocator.Error!Type.Content {
-                return try ctx.body.generatedIteratorContent(ctx.public_named, ctx.item_ty, ctx.args, ctx.digest, ctx.chain_depth, self_ty);
+                return try ctx.body.generatedIteratorContent(ctx.public_named, ctx.item_ty, ctx.args, ctx.digest, ctx.kind, ctx.chain_depth, self_ty);
             }
         };
 
@@ -11598,6 +11696,7 @@ const BodyContext = struct {
             .item_ty = item_ty,
             .args = args,
             .digest = digest,
+            .kind = kind,
             .chain_depth = chain_depth,
         };
         const generated = try self.builder.program.types.addRecursive(context, Context.fill);
@@ -11683,7 +11782,7 @@ const BodyContext = struct {
 
     fn generatedIteratorDigest(
         self: *BodyContext,
-        kind: GeneratedIteratorKind,
+        kind: Type.IteratorKind,
         item_ty: Type.TypeId,
         components: []const Type.TypeId,
         callable_evidence: ?names.TypeDigest,
@@ -11784,6 +11883,7 @@ const BodyContext = struct {
         item_ty: Type.TypeId,
         args: []const Type.TypeId,
         digest: names.TypeDigest,
+        kind: Type.IteratorKind,
         chain_depth: u32,
         self_ty: Type.TypeId,
     ) Allocator.Error!Type.Content {
@@ -11792,6 +11892,7 @@ const BodyContext = struct {
         var def = public_named.def;
         def.generated = digest;
         def.iterator_representation = .minted;
+        def.iterator_kind = kind;
         def.iterator_depth = @intCast(chain_depth);
         return .{ .named = .{
             .named_type = public_named.named_type,
@@ -11830,6 +11931,7 @@ const BodyContext = struct {
                 var def = ctx.public_named.def;
                 def.generated = null;
                 def.iterator_representation = .forced_dynamic;
+                def.iterator_kind = .forced_dynamic;
                 def.iterator_depth = max_minted_iterator_chain_depth;
                 const args = [_]Type.TypeId{ctx.item_ty};
                 return .{ .named = .{
@@ -17212,7 +17314,24 @@ const BodyContext = struct {
     fn constUseMonoType(self: *BodyContext, const_use: checked.ConstUseTemplate) Allocator.Error!Type.TypeId {
         const requested_ty = const_use.requested_source_ty_payload orelse
             Common.invariant("checked const use reached Monotype without a requested checked type");
-        return try self.lowerTypeView(requested_ty);
+        const store_view = self.builder.moduleForId(checked.constModuleId(const_use.const_ref));
+        const template = store_view.const_templates.get(const_use.const_ref);
+        return switch (template.state) {
+            .stored_const => |stored| try self.storedConstRootMonoType(store_view, stored, requested_ty),
+            .eval_template => try self.lowerTypeView(requested_ty),
+            .reserved => Common.invariant("reserved checked const template reached Monotype type selection"),
+        };
+    }
+
+    fn storedConstRootMonoType(
+        self: *BodyContext,
+        store_view: ModuleView,
+        stored: checked.StoredConstTemplate,
+        requested_ty: checked.CheckedTypeId,
+    ) Allocator.Error!Type.TypeId {
+        const stored_ty = try self.lowerConstType(store_view, stored.root_type);
+        try self.constrainTypeToMono(requested_ty, try self.publicOpaqueUnificationType(stored_ty));
+        return stored_ty;
     }
 
     fn restoreConstUseAtType(
@@ -17223,8 +17342,6 @@ const BodyContext = struct {
     ) Allocator.Error!DraftExprId {
         const requested_ty = const_use.requested_source_ty_payload orelse
             Common.invariant("checked const use reached Monotype without a requested checked type");
-        try self.constrainTypeToMono(requested_ty, ty);
-
         const previous_restore_evidence = self.restore_evidence;
         self.restore_evidence = .{ .vector = use_evidence };
         defer self.restore_evidence = previous_restore_evidence;
@@ -17232,17 +17349,26 @@ const BodyContext = struct {
         const store_view = self.builder.moduleForId(checked.constModuleId(const_use.const_ref));
         const template = store_view.const_templates.get(const_use.const_ref);
         return switch (template.state) {
-            .stored_const => |stored| try self.restoredStaticDataCandidateNode(
-                store_view,
-                self.view,
-                stored.node,
-                ty,
-                const_use.const_ref,
-                requested_ty,
-                .disallow,
-            ),
+            .stored_const => |stored| blk: {
+                const stored_ty = try self.storedConstRootMonoType(store_view, stored, requested_ty);
+                if (!try self.sameTypeOrPublicOpaque(ty, stored_ty)) {
+                    Common.invariant("stored const representation differed from its expected Monotype type");
+                }
+                break :blk try self.restoredStaticDataCandidateNode(
+                    store_view,
+                    self.view,
+                    stored.node,
+                    stored_ty,
+                    const_use.const_ref,
+                    requested_ty,
+                    .disallow,
+                );
+            },
             .reserved => Common.invariant("reserved checked const template reached Monotype"),
-            .eval_template => |eval| try self.lowerConstEvalTemplateUse(store_view, eval, ty, null, null),
+            .eval_template => |eval| blk: {
+                try self.constrainTypeToMono(requested_ty, ty);
+                break :blk try self.lowerConstEvalTemplateUse(store_view, eval, ty, null, null);
+            },
         };
     }
 
@@ -17358,10 +17484,6 @@ const BodyContext = struct {
         ty: Type.TypeId,
         static_data_const_locator: ?checked.ConstLocator,
     ) Allocator.Error!DraftExprId {
-        const previous_restore_const_result_ty = self.restore_const_result_ty;
-        if (previous_restore_const_result_ty == null) self.restore_const_result_ty = ty;
-        defer self.restore_const_result_ty = previous_restore_const_result_ty;
-
         const value = store_view.const_store.get(node);
         switch (value) {
             .fn_value => |fn_id| {
@@ -17544,17 +17666,17 @@ const BodyContext = struct {
         };
     }
 
-    fn lowerConstCaptureType(
+    fn lowerConstType(
         self: *BodyContext,
         store_view: ModuleView,
         ty: check.ConstStore.ConstTypeId,
     ) Allocator.Error!Type.TypeId {
         var map = std.AutoHashMap(check.ConstStore.ConstTypeId, Type.TypeId).init(self.allocator);
         defer map.deinit();
-        return try self.lowerConstCaptureTypeInner(store_view, ty, &map);
+        return try self.lowerConstTypeInner(store_view, ty, &map);
     }
 
-    fn lowerConstCaptureTypeInner(
+    fn lowerConstTypeInner(
         self: *BodyContext,
         store_view: ModuleView,
         ty: check.ConstStore.ConstTypeId,
@@ -17581,11 +17703,11 @@ const BodyContext = struct {
 
         fn fill(self: ConstTypeLowerContext, reserved: Type.TypeId) Allocator.Error!Type.Content {
             try self.map.put(self.ty, reserved);
-            return try self.body.lowerConstCaptureTypeContent(self.store_view, self.ty, self.map);
+            return try self.body.lowerConstTypeContent(self.store_view, self.ty, self.map);
         }
     };
 
-    fn lowerConstCaptureTypeContent(
+    fn lowerConstTypeContent(
         self: *BodyContext,
         store_view: ModuleView,
         ty: check.ConstStore.ConstTypeId,
@@ -17596,14 +17718,14 @@ const BodyContext = struct {
             .primitive => |primitive| .{ .primitive = monotypePrimitive(primitive) },
             .zst => .zst,
             .erased => |erased| .{ .erased = erased },
-            .list => |elem| .{ .list = try self.lowerConstCaptureTypeInner(store_view, elem, map) },
-            .box => |elem| .{ .box = try self.lowerConstCaptureTypeInner(store_view, elem, map) },
+            .list => |elem| .{ .list = try self.lowerConstTypeInner(store_view, elem, map) },
+            .box => |elem| .{ .box = try self.lowerConstTypeInner(store_view, elem, map) },
             .tuple => |items| blk: {
                 const source = type_store.typeSpan(items);
                 const out = try self.allocator.alloc(Type.TypeId, source.len);
                 defer self.allocator.free(out);
                 for (source, 0..) |item, index| {
-                    out[index] = try self.lowerConstCaptureTypeInner(store_view, item, map);
+                    out[index] = try self.lowerConstTypeInner(store_view, item, map);
                 }
                 break :blk .{ .tuple = try self.builder.program.types.addSpan(out) };
             },
@@ -17612,11 +17734,11 @@ const BodyContext = struct {
                 const out = try self.allocator.alloc(Type.TypeId, source.len);
                 defer self.allocator.free(out);
                 for (source, 0..) |arg, index| {
-                    out[index] = try self.lowerConstCaptureTypeInner(store_view, arg, map);
+                    out[index] = try self.lowerConstTypeInner(store_view, arg, map);
                 }
                 break :blk .{ .func = .{
                     .args = try self.builder.program.types.addSpan(out),
-                    .ret = try self.lowerConstCaptureTypeInner(store_view, func.ret, map),
+                    .ret = try self.lowerConstTypeInner(store_view, func.ret, map),
                 } };
             },
             .record => |fields| blk: {
@@ -17626,7 +17748,7 @@ const BodyContext = struct {
                 for (source, 0..) |field, index| {
                     out[index] = .{
                         .name = try self.constRecordFieldName(store_view, field.name),
-                        .ty = try self.lowerConstCaptureTypeInner(store_view, field.ty, map),
+                        .ty = try self.lowerConstTypeInner(store_view, field.ty, map),
                     };
                 }
                 break :blk .{ .record = try self.builder.program.types.addRecordFields(&self.builder.program.names, out) };
@@ -17640,7 +17762,7 @@ const BodyContext = struct {
                     const out_payloads = try self.allocator.alloc(Type.TypeId, payloads.len);
                     defer self.allocator.free(out_payloads);
                     for (payloads, 0..) |payload, payload_index| {
-                        out_payloads[payload_index] = try self.lowerConstCaptureTypeInner(store_view, payload, map);
+                        out_payloads[payload_index] = try self.lowerConstTypeInner(store_view, payload, map);
                     }
                     out[index] = .{
                         .name = try self.constTagName(store_view, tag.name),
@@ -17655,7 +17777,7 @@ const BodyContext = struct {
                 const out_args = try self.allocator.alloc(Type.TypeId, args.len);
                 defer self.allocator.free(out_args);
                 for (args, 0..) |arg, index| {
-                    out_args[index] = try self.lowerConstCaptureTypeInner(store_view, arg, map);
+                    out_args[index] = try self.lowerConstTypeInner(store_view, arg, map);
                 }
 
                 const declared = type_store.declaredFieldSpan(named.declared_order);
@@ -17664,7 +17786,7 @@ const BodyContext = struct {
                 for (declared, 0..) |entry, index| {
                     out_declared[index] = switch (entry) {
                         .named => |name| .{ .named = try self.constRecordFieldName(store_view, name) },
-                        .padding => |padding| .{ .padding = try self.lowerConstCaptureTypeInner(store_view, padding, map) },
+                        .padding => |padding| .{ .padding = try self.lowerConstTypeInner(store_view, padding, map) },
                     };
                 }
 
@@ -17678,7 +17800,7 @@ const BodyContext = struct {
                     .builtin_owner = named.builtin_owner,
                     .args = try self.builder.program.types.addSpan(out_args),
                     .backing = if (named.backing) |backing| .{
-                        .ty = try self.lowerConstCaptureTypeInner(store_view, backing.ty, map),
+                        .ty = try self.lowerConstTypeInner(store_view, backing.ty, map),
                         .use = monotypeBackingUse(backing.use),
                     } else null,
                     .declared_order = try self.builder.program.types.addDeclaredFields(out_declared),
@@ -17714,12 +17836,65 @@ const BodyContext = struct {
             .source_decl = def.source_decl,
             .generated = def.generated,
             .iterator_representation = @enumFromInt(@intFromEnum(def.iterator_representation)),
+            .iterator_kind = @enumFromInt(@intFromEnum(def.iterator_kind)),
             .iterator_depth = def.iterator_depth,
         };
     }
 
     fn constRecordFields(self: *BodyContext, ty: Type.TypeId) Type.StoreSpanBorrow(Type.Field, "fields") {
         return self.builder.program.types.fieldSpan(self.builder.recordFieldsSpan(ty));
+    }
+
+    fn restoreStoredEvidenceChain(
+        self: *BodyContext,
+        store_view: ModuleView,
+        stored_chain: []const check.ConstStore.ConstRange,
+    ) Allocator.Error!EvidenceChain {
+        if (stored_chain.len == 0) return .{};
+
+        const arena = self.builder.evidence_arena.allocator();
+        var parent: ?*const EvidenceChain = null;
+        var index = stored_chain.len;
+        while (index > 0) {
+            index -= 1;
+            const node = try arena.create(EvidenceChain);
+            node.* = .{
+                .vector = try self.restoreStoredEvidenceVector(store_view, stored_chain[index]),
+                .parent = parent,
+            };
+            parent = node;
+        }
+        return parent.?.*;
+    }
+
+    fn restoreStoredEvidenceVector(
+        self: *BodyContext,
+        store_view: ModuleView,
+        range: check.ConstStore.ConstRange,
+    ) Allocator.Error![]const SpecEvidence {
+        const stored = store_view.const_store.evidenceSlice(range);
+        const arena = self.builder.evidence_arena.allocator();
+        const restored = try arena.alloc(SpecEvidence, stored.len);
+        for (stored, 0..) |evidence, index| {
+            restored[index] = switch (evidence) {
+                .target => |target| blk: {
+                    const restored_target = try arena.create(SpecEvidenceTarget);
+                    restored_target.* = .{
+                        .view = self.builder.moduleForDigest(target.module),
+                        .target = target.method,
+                        .nested = switch (target.nested) {
+                            .resolved => |nested| .{ .resolved = try self.restoreStoredEvidenceVector(store_view, nested) },
+                            .synthesize => .synthesize,
+                        },
+                    };
+                    break :blk .{ .target = restored_target };
+                },
+                .structural => |kind| .{ .structural = kind },
+                .unreachable_value => .unreachable_value,
+                .checked_error => .checked_error,
+            };
+        }
+        return restored;
     }
 
     fn restoreConstFn(
@@ -17742,7 +17917,7 @@ const BodyContext = struct {
         if (fn_value.captures.len != 0) {
             return try self.restoreCapturingConstFn(store_view, fn_id, fn_value, template, ty, static_data_const_locator);
         }
-        const mono_fn_id = try self.restoreConstFnTemplate(fn_value, template);
+        const mono_fn_id = try self.restoreConstFnTemplate(store_view, fn_value, template);
         return try self.addExpr(.{
             .ty = self.builder.program.fnSource(mono_fn_id).mono_fn_ty,
             .data = .{ .fn_def = .{ .fn_id = draftFinalFn(mono_fn_id) } },
@@ -17751,44 +17926,39 @@ const BodyContext = struct {
 
     fn restoreConstFnTemplate(
         self: *BodyContext,
+        store_view: ModuleView,
         fn_value: check.ConstStore.ConstFn,
         template: Ast.FnTemplate,
     ) Allocator.Error!Ast.FnId {
+        const stored_evidence = if (fn_value.evidence_chain.len > 0)
+            try self.restoreStoredEvidenceChain(store_view, fn_value.evidence_chain)
+        else
+            self.restore_evidence;
         return switch (template.fn_def) {
             .nested => {
                 const fn_view = self.builder.moduleForConstFnDef(fn_value.fn_def);
                 var fn_ctx = try BodyContext.initWithMethodScope(self.allocator, self.builder, fn_view, self.method_scope, ownerTemplateForConstFnDef(fn_value.fn_def), self.graph, self.draft);
                 defer fn_ctx.deinit();
-                try self.prepareRestoredFnEvidence(&fn_ctx, fn_view, fn_value, template);
+                try self.prepareRestoredFnEvidence(&fn_ctx, stored_evidence, fn_value, template);
                 return try self.builder.lowerNestedFnFromContext(&fn_ctx, checkedLambdaExprIdForConstFn(fn_view, fn_value.fn_def), template, null);
             },
-            else => try self.builder.lowerFnTemplateDefFromContext(self, template, self.restore_evidence.vector),
+            else => try self.builder.lowerFnTemplateDefFromContext(self, template, stored_evidence.vector),
         };
     }
 
     fn prepareRestoredFnEvidence(
-        self: *BodyContext,
+        _: *BodyContext,
         fn_ctx: *BodyContext,
-        fn_view: ModuleView,
+        stored_evidence: EvidenceChain,
         fn_value: check.ConstStore.ConstFn,
         template: Ast.FnTemplate,
     ) Allocator.Error!void {
-        fn_ctx.evidence = self.restore_evidence;
+        fn_ctx.evidence = stored_evidence;
         try fn_ctx.constrainTypeToMono(fn_value.source_fn_ty, template.mono_fn_ty);
 
-        if (self.restore_evidence.vector.len == 0) {
-            const nested = switch (template.fn_def) {
-                .nested => |nested| nested,
-                else => Common.invariant("stored function evidence preparation requires a nested function identity"),
-            };
-            if (try fn_ctx.synthesizeRestoredClosureEvidence(fn_view, nested.owner, template.mono_fn_ty, null)) |synthesized| {
-                fn_ctx.evidence = .{ .vector = synthesized };
-            }
-        }
-
         // Captured ConstStore values belong to the same restored constant.
-        // Propagate the explicit use-edge or synthesized owner evidence before
-        // recursively restoring them.
+        // Propagate the stored producer evidence before recursively restoring
+        // them.
         fn_ctx.restore_evidence = fn_ctx.evidence;
     }
 
@@ -17803,8 +17973,11 @@ const BodyContext = struct {
     ) Allocator.Error!DraftExprId {
         const fn_view = self.builder.moduleForConstFnDef(fn_value.fn_def);
         var fn_ctx = try BodyContext.initWithMethodScope(self.allocator, self.builder, fn_view, self.method_scope, ownerTemplateForConstFnDef(fn_value.fn_def), self.graph, self.draft);
-        fn_ctx.evidence = self.restore_evidence;
-        fn_ctx.restore_evidence = self.restore_evidence;
+        fn_ctx.evidence = if (fn_value.evidence_chain.len > 0)
+            try self.restoreStoredEvidenceChain(store_view, fn_value.evidence_chain)
+        else
+            self.restore_evidence;
+        fn_ctx.restore_evidence = fn_ctx.evidence;
         defer fn_ctx.deinit();
         fn_ctx.current_fn_key = restoredConstFnContextKey(store_view.key, fn_id, fn_value.source_fn_key);
         fn_ctx.restored_local_proc_context_digest = fn_value.fn_def.nested.local_proc_context_digest;
@@ -17842,7 +18015,7 @@ const BodyContext = struct {
 
         for (fn_value.captures, 0..) |capture, index| {
             const binder = constCaptureBinder(capture.id);
-            const lowered_ty = try fn_ctx.lowerConstCaptureType(store_view, capture.ty);
+            const lowered_ty = try fn_ctx.lowerConstType(store_view, capture.ty);
             const capture_cell = try fn_ctx.draftTypeCell(lowered_ty);
             const local = try fn_ctx.addLocalWithBinderCell(self.builder.symbols.fresh(), capture_cell, binder);
             try fn_ctx.bindLocalName(local, binder);
@@ -17875,16 +18048,7 @@ const BodyContext = struct {
                     .context_fn_key = try fn_ctx.lexicalContextKey(),
                     .local_proc_context_digest = nested.local_proc_context_digest,
                 } };
-                // A compile-time-evaluated closure keeps its dispatch evidence
-                // params even when the outer scheme is concrete. Capture types
-                // and the enclosing constant result together instantiate the
-                // owner callable before its checked evidence paths are read.
-                if (self.restore_evidence.vector.len == 0) {
-                    const result_ty = self.restore_const_result_ty orelse ty;
-                    if (try fn_ctx.synthesizeRestoredClosureEvidence(fn_view, nested.owner, ty, result_ty)) |synthesized| {
-                        fn_ctx.evidence = .{ .vector = synthesized };
-                    }
-                }
+                capture_template.const_evidence_chain = try self.builder.persistEvidenceChain(fn_ctx.evidence);
                 fn_ctx.restore_evidence = fn_ctx.evidence;
             },
             else => Common.invariant("capturing stored function had no nested function identity"),
@@ -18851,6 +19015,7 @@ const BodyContext = struct {
         if (expected.def.source_decl == null and expected.def.type_name != actual.def.type_name) return false;
         if (!optionalDigestEql(expected.def.generated, actual.def.generated)) return false;
         if (expected.def.iterator_representation != actual.def.iterator_representation) return false;
+        if (expected.def.iterator_kind != actual.def.iterator_kind) return false;
         if (expected.def.iterator_depth != actual.def.iterator_depth) return false;
         if (expected.kind != actual.kind) return false;
         if (expected.builtin_owner != actual.builtin_owner) return false;
@@ -19173,30 +19338,30 @@ const BodyContext = struct {
         // dispatches (`unreachable_dispatch`, or a `checked_error` for
         // reported missing methods); both lower to an explicit crash. A
         // genuinely reachable ownerless dispatch was rejected at check time.
-        if (self.planUnexecutable(plan)) |reason| {
-            const crash_ty = expected_ret_ty orelse plan_ret_ty;
-            try self.constrainTypeToMono(checked_ret_ty, crash_ty);
-            return try self.runtimeCrashExpr(crash_ty, switch (reason) {
-                // The dispatcher is a value no specialization edge can supply,
-                // so the dispatch can never execute.
-                .unreachable_value => "dispatch on a value that can never exist",
+        const resolved = switch (self.consumeDispatchResolution(plan.resolution)) {
+            .target => |target| target,
+            .structural => |kind| return switch (kind) {
+                // Equality and hash share the binary structural lowering,
+                // which distinguishes their result modes internally.
+                .equality, .hash => try self.lowerStructuralEquality(plan, callable_mono_ty, plan_ret_ty, self, pre_lowered),
+                .parser => try self.lowerStructuralParser(plan, callable_mono_ty, plan_ret_ty, self, pre_lowered),
+                .encoder => try self.lowerStructuralEncoderFor(plan, callable_mono_ty, plan_ret_ty, self, pre_lowered),
+            },
+            .unreachable_value => {
+                const crash_ty = expected_ret_ty orelse plan_ret_ty;
+                try self.constrainTypeToMono(checked_ret_ty, crash_ty);
+                // The dispatcher is a value no specialization edge can
+                // supply, so the dispatch can never execute.
+                return try self.runtimeCrashExpr(crash_ty, "dispatch on a value that can never exist");
+            },
+            .checked_error => {
+                const crash_ty = expected_ret_ty orelse plan_ret_ty;
+                try self.constrainTypeToMono(checked_ret_ty, crash_ty);
                 // Checking reported the missing method; executing the site
                 // anyway (roc run with errors) crashes here.
-                .checked_error => "method dispatch failed to check",
-            });
-        }
-        const lookup = self.dispatchTarget(plan);
-        if (lookup == null) {
-            return switch (plan.result_mode) {
-                // `.equality` and `.hash` are both handled by lowerStructuralEquality,
-                // which switches on result_mode internally.
-                .equality, .hash => try self.lowerStructuralEquality(plan, callable_mono_ty, plan_ret_ty, self, pre_lowered),
-                .parser_for => try self.lowerStructuralParser(plan, callable_mono_ty, plan_ret_ty, self, pre_lowered),
-                .encoder_for => try self.lowerStructuralEncoderFor(plan, callable_mono_ty, plan_ret_ty, self, pre_lowered),
-                .value => Common.invariant("value dispatch plan had no resolved dispatch target"),
-            };
-        }
-        const resolved = lookup.?;
+                return try self.runtimeCrashExpr(crash_ty, "method dispatch failed to check");
+            },
+        };
         if (self.generatedStructuralDispatchKind(resolved)) |generated| {
             try self.constrainTypeToMono(checked_ret_ty, plan_ret_ty);
             if (expected_ret_ty) |expected| {
@@ -19286,8 +19451,22 @@ const BodyContext = struct {
         const plan_fn_data = self.builder.functionShape(callable_mono_ty, "checked from_numeral plan had a non-function type");
         const try_ty = plan_fn_data.ret;
 
-        const resolved = self.dispatchTarget(plan) orelse
-            Common.invariant("checked from_numeral dispatch unexpectedly resolved to structural equality");
+        const resolved = switch (self.consumeDispatchResolution(plan.resolution)) {
+            .target => |target| target,
+            .structural => Common.invariant("checked from_numeral dispatch unexpectedly resolved structurally"),
+            .unreachable_value => {
+                return .{
+                    .call = try self.runtimeCrashExpr(try_ty, "dispatch on a value that can never exist"),
+                    .try_ty = try_ty,
+                };
+            },
+            .checked_error => {
+                return .{
+                    .call = try self.runtimeCrashExpr(try_ty, "method dispatch failed to check"),
+                    .try_ty = try_ty,
+                };
+            },
+        };
 
         const target_mono_ty = try self.methodTargetMonoTypePreservingSourceArgsAndRet(resolved, try_ty);
         const target_fn_data = self.builder.functionShape(target_mono_ty, "checked from_numeral target had a non-function type");
@@ -19870,15 +20049,16 @@ const BodyContext = struct {
         // The dispatcher may not be solved yet when this runs for argument
         // evidence; the target then resolves when the expression itself
         // lowers, and the plan's return carries the evidence for now.
-        if (!dispatcherIsGrounded(&self.builder.program.types, dispatcher_ty) or
-            self.planUnexecutable(plan) != null)
-        {
+        if (!dispatcherIsGrounded(&self.builder.program.types, dispatcher_ty)) {
             try self.constrainTypeToMono(checked_ret_ty, plan_ret_ty);
             return plan_ret_ty;
         }
-        const resolved = self.dispatchTarget(plan) orelse {
-            try self.constrainTypeToMono(checked_ret_ty, plan_ret_ty);
-            return plan_ret_ty;
+        const resolved = switch (self.consumeDispatchResolution(plan.resolution)) {
+            .target => |target| target,
+            .structural, .unreachable_value, .checked_error => {
+                try self.constrainTypeToMono(checked_ret_ty, plan_ret_ty);
+                return plan_ret_ty;
+            },
         };
         if (self.generatedStructuralDispatchKind(resolved) != null) {
             try self.constrainTypeToMono(checked_ret_ty, plan_ret_ty);
@@ -19982,66 +20162,38 @@ const BodyContext = struct {
         }
     }
 
-    /// A consumed evidence resolution: a concrete target or the checker's
-    /// structural decision.
-    const EvidenceResolved = union(enum) {
+    /// The checker's dispatch resolution after substituting any evidence
+    /// supplied by the current specialization edge. This is the single
+    /// classification consumed by every Monotype dispatch lowering path.
+    const ConsumedDispatchResolution = union(enum) {
         target: MethodLookup,
-        structural,
+        structural: static_dispatch.StructuralKind,
+        unreachable_value,
+        checked_error,
     };
 
-    /// The plan's checked (or edge-supplied) resolution. Null only for
-    /// dispatches that never resolve a target: unreachable and checked-error
-    /// dispatches, which `planUnexecutable` lowers to explicit crashes first.
-    fn evidenceResolution(self: *BodyContext, plan: static_dispatch.StaticDispatchCallPlan) ?EvidenceResolved {
-        switch (plan.resolution) {
+    fn consumeDispatchResolution(
+        self: *BodyContext,
+        resolution: static_dispatch.StaticDispatchResolution,
+    ) ConsumedDispatchResolution {
+        switch (resolution) {
             .direct => |node_id| return .{ .target = self.methodLookupForResolvedTarget(self.view.static_dispatch_plans.evidenceNode(node_id).target) },
             .constraint => |constraint_ref| {
                 const entry = self.evidence.at(constraint_ref) orelse
-                    Common.invariant("dispatch plan's constraint ref was outside the edge's evidence chain");
+                    Common.invariant("dispatch resolution's constraint ref was outside the edge's evidence chain");
                 return switch (entry) {
                     .target => |target| .{ .target = .{ .view = target.view, .target = target.target } },
-                    .structural => .structural,
-                    // Unreachable and checked-error dispatches crash before
-                    // target resolution.
-                    .unreachable_value, .checked_error => null,
+                    .structural => |kind| .{ .structural = kind },
+                    .unreachable_value => .unreachable_value,
+                    .checked_error => .checked_error,
                 };
             },
-            .structural => return .structural,
-            .checked_error, .unreachable_dispatch => return null,
+            .structural => |kind| return .{ .structural = kind },
+            .checked_error => return .checked_error,
+            .unreachable_dispatch => return .unreachable_value,
         }
     }
 
-    const UnexecutableDispatch = enum { unreachable_value, checked_error };
-
-    /// Whether checking decided this dispatch can never execute: its
-    /// dispatcher is a value no edge can supply (unreachable), or checking
-    /// rejected the requirement (a reported missing method). Both lower to an
-    /// explicit crash.
-    fn planUnexecutable(self: *BodyContext, plan: static_dispatch.StaticDispatchCallPlan) ?UnexecutableDispatch {
-        return switch (plan.resolution) {
-            .unreachable_dispatch => .unreachable_value,
-            .checked_error => .checked_error,
-            .constraint => |constraint_ref| switch (self.evidence.at(constraint_ref) orelse
-                Common.invariant("dispatch plan's constraint ref was outside the edge's evidence chain")) {
-                .unreachable_value => .unreachable_value,
-                .checked_error => .checked_error,
-                .target, .structural => null,
-            },
-            .direct, .structural => null,
-        };
-    }
-
-    fn dispatchTarget(
-        self: *BodyContext,
-        plan: static_dispatch.StaticDispatchCallPlan,
-    ) ?MethodLookup {
-        const resolution = self.evidenceResolution(plan) orelse
-            Common.invariant("dispatch plan reached monotype lowering without a resolution");
-        return switch (resolution) {
-            .target => |lookup| lookup,
-            .structural => null,
-        };
-    }
     /// Text-keyed view of `static_dispatch.structural_method_kinds`, for
     /// classifying a checked module view's method names during component
     /// synthesis.
@@ -20247,45 +20399,6 @@ const BodyContext = struct {
     ) Allocator.Error![]const SpecEvidence {
         const template = lookup.view.templates.get(template_ref.template);
         return try self.synthesizeParamsEvidence(lookup.view, template, callable_mono_ty);
-    }
-
-    /// Evidence vector for a compile-time-evaluated closure restored without a
-    /// use-site vector: resolve the owner scheme's evidence params from its
-    /// checked dispatcher paths over the closure's concrete restored callable.
-    ///
-    /// The owner scheme's evidence-param paths run over the owner's whole
-    /// callable (a `constraint(0, k)` in the closure body forwards to the
-    /// owner's `k`th param). Instantiate the owner root, pin its return to the
-    /// result value that created this stored closure, and synthesize each param's
-    /// target over the resulting concrete owner callable. When the owner returns
-    /// the closure directly, that result is the restored closure type itself; an
-    /// ambient restored constant result only applies when the owner returns an
-    /// aggregate that contains this closure.
-    fn synthesizeRestoredClosureEvidence(
-        self: *BodyContext,
-        owner_view: ModuleView,
-        owner_ref: names.ProcTemplate,
-        ty: Type.TypeId,
-        owner_result_ty: ?Type.TypeId,
-    ) Allocator.Error!?[]const SpecEvidence {
-        const owner_template = owner_view.templates.get(owner_ref.template);
-        if (owner_template.evidence_params.len == 0) return null;
-
-        const owner_node = try self.instNode(owner_template.checked_fn_root);
-        const owner_mono_ty = try self.activeTypeFromNode(owner_node);
-        const owner_ret = self.functionReturnType(owner_mono_ty);
-        switch (self.builder.shapeContent(ty)) {
-            .func => {},
-            else => Common.invariant("stored capturing function had a non-function restored type"),
-        }
-        const restored_owner_result_ty = switch (self.builder.shapeContent(owner_ret)) {
-            .func => ty,
-            else => owner_result_ty orelse owner_ret,
-        };
-        try self.graph.unify(try self.graph.importMono(owner_ret), try self.graph.importMono(restored_owner_result_ty));
-        try self.graph.drainDirty();
-        const owner_callable_ty = try self.activeTypeFromNode(owner_node);
-        return try self.synthesizeParamsEvidence(owner_view, owner_template, owner_callable_ty);
     }
 
     /// Resolve a template's requirements from its checked dispatcher paths
@@ -23283,10 +23396,11 @@ const BodyContext = struct {
     //
     // is_eq and to_hash share one recursive ladder: walk a type one layer at a
     // time, decomposing aggregates (records/tuples/tag unions) and transparent
-    // nominals, dispatching owned types (List) to their real method, and
-    // emitting a leaf node (`structural_eq` / `structural_hash`) for scalars,
-    // opaque nominals, and other inline-handled leaves. Recursion is broken by
-    // an expansion stack plus a memoized generated helper def.
+    // nominals that have no exact component method. A List or named component
+    // with an exact method dispatches to that method before its representation
+    // can be inspected. Scalars, opaque nominals, and other inline-handled
+    // leaves emit a leaf node (`structural_eq` / `structural_hash`). Recursion is
+    // broken by an expansion stack plus a memoized generated helper def.
     //
     // The per-derivation specifics are supplied by a comptime `Deriver` type
     // (`EqDeriver` / `HashDeriver`). A Deriver provides:
@@ -23301,8 +23415,8 @@ const BodyContext = struct {
     //   - `combineSeed` / `combine` plus `forward`: fold the per-component
     //     results (equality conjoins component bools with AND; hashing threads
     //     the accumulator left to right).
-    //   - `ownedCall` / `named` / `tagUnion`: the shapes whose decomposition
-    //     differs structurally between the two derivations.
+    //   - `methodArgTypes` / `named` / `tagUnion`: method call types and the
+    //     shapes whose decomposition differs between the two derivations.
     //
     // A `DerivationCtx` carries the runtime parameters shared by every step:
     // the derivation's result type (Bool / Hasher) and the method name.
@@ -23320,6 +23434,21 @@ const BodyContext = struct {
         ctx: DerivationCtx,
     ) Allocator.Error!DraftExprId {
         const shape = self.builder.program.types.get(ty);
+
+        switch (shape) {
+            .list => {
+                const lookup = (try self.builder.componentMethodTargetByName(self.method_scope, ty, ctx.method_name)) orelse
+                    Common.invariant(D.missing_component_method_msg);
+                return try self.derivationMethodCall(D, lookup, ty, operand, ctx);
+            },
+            .named => {
+                if (try self.builder.componentMethodTargetByName(self.method_scope, ty, ctx.method_name)) |lookup| {
+                    return try self.derivationMethodCall(D, lookup, ty, operand, ctx);
+                }
+            },
+            else => {},
+        }
+
         const expands_structurally = structurallyExpands(shape);
         var remove_active_expansion = false;
         const stack = D.expansionStack(self);
@@ -23335,7 +23464,7 @@ const BodyContext = struct {
         }
 
         return switch (shape) {
-            .list => try D.ownedCall(self, ty, operand, ctx),
+            .list => unreachable,
             .record => |fields| try self.derivationRecord(D, self.builder.program.types.fieldSpan(fields), operand, ctx),
             .tuple => |items| try self.derivationTuple(D, self.builder.program.types.span(items), operand, ctx),
             .tag_union => |tags| try D.tagUnion(self, ty, tags, operand, ctx),
@@ -23376,21 +23505,18 @@ const BodyContext = struct {
         });
     }
 
-    /// Dispatch an owned (non-structural) type to its real derived method,
-    /// shared by every derivation. The argument types and the per-derivation
-    /// invariant wording come from the comptime `Deriver`; the operand-to-args
-    /// mapping reuses `D.callArgs`.
-    fn derivationOwnedCall(
+    /// Dispatch a component to its exact checked method target, shared by every
+    /// derivation. The argument types come from the comptime `Deriver`; the
+    /// operand-to-args mapping reuses `D.callArgs`.
+    fn derivationMethodCall(
         self: *BodyContext,
         comptime D: type,
+        lookup: MethodLookup,
         ty: Type.TypeId,
         operand: D.Operand,
         ctx: DerivationCtx,
     ) Allocator.Error!DraftExprId {
-        const lookup = (try self.builder.componentMethodTargetByName(self.method_scope, ty, ctx.method_name)) orelse
-            Common.invariant(D.owned_missing_target_msg);
-
-        const arg_tys = D.ownedArgTypes(ty, ctx.result_ty);
+        const arg_tys = D.methodArgTypes(ty, ctx.result_ty);
         const callable_mono_ty = try self.methodTargetMonoTypeFromArgs(lookup, &arg_tys, ctx.result_ty);
         const args = D.callArgs(operand);
         return try self.addExpr(.{ .ty = ctx.result_ty, .data = .{ .call_proc = .{
@@ -25799,16 +25925,18 @@ const BodyContext = struct {
         if (!self.sameType(dispatcher_ty, actual_dispatcher_ty)) {
             Common.invariant("iterator dispatch plan dispatcher operand differed from the checked dispatcher type");
         }
-        // Consume the checked (or edge-supplied) resolution; iterator
-        // dispatches always resolve to a callable target.
-        const lookup: MethodLookup = switch (plan.resolution) {
-            .direct => |node_id| self.methodLookupForResolvedTarget(self.view.static_dispatch_plans.evidenceNode(node_id).target),
-            .constraint => |constraint_ref| switch (self.evidence.at(constraint_ref) orelse
-                Common.invariant("iterator dispatch plan's constraint ref was outside the edge's evidence chain")) {
-                .target => |target| .{ .view = target.view, .target = target.target },
-                .structural, .unreachable_value, .checked_error => Common.invariant("iterator dispatch evidence was not a callable target"),
-            },
-            .structural, .checked_error, .unreachable_dispatch => Common.invariant("iterator dispatch plan resolution was not a callable target"),
+        const lookup = switch (self.consumeDispatchResolution(plan.resolution)) {
+            .target => |target| target,
+            // Iterator value dispatch has no compiler-derived structural
+            // implementation. A structural result here violates the checked
+            // iterator plan contract.
+            .structural => Common.invariant("iterator dispatch resolved structurally"),
+            // The checker proved that no specialization edge can supply the
+            // iterator value, so this call site is explicitly unreachable.
+            .unreachable_value => return try self.runtimeCrashExpr(plan_fn_data.ret, "dispatch on a value that can never exist"),
+            // Checking already reported the missing method; running a module
+            // with errors reaches an explicit runtime crash.
+            .checked_error => return try self.runtimeCrashExpr(plan_fn_data.ret, "method dispatch failed to check"),
         };
 
         const target_mono_ty = try self.methodTargetMonoTypeFromPlan(lookup, callable_mono_ty);
@@ -27201,14 +27329,10 @@ const EqDeriver = struct {
         return .{ .lhs = lhs_item, .rhs = rhs_item };
     }
 
-    const owned_missing_target_msg = "checked method registry is missing owned equality target";
+    const missing_component_method_msg = "checked method registry is missing List equality target";
 
-    fn ownedArgTypes(ty: Type.TypeId, _: Type.TypeId) [2]Type.TypeId {
+    fn methodArgTypes(ty: Type.TypeId, _: Type.TypeId) [2]Type.TypeId {
         return .{ ty, ty };
-    }
-
-    fn ownedCall(self: *BodyContext, ty: Type.TypeId, operand: Operand, ctx: BodyContext.DerivationCtx) Allocator.Error!DraftExprId {
-        return try self.derivationOwnedCall(EqDeriver, ty, operand, ctx);
     }
 
     /// Decomposes structural equality on a nominal type. Record and tuple backings are
@@ -27423,14 +27547,10 @@ const HashDeriver = struct {
         return .{ .value = item_value, .hasher = state };
     }
 
-    const owned_missing_target_msg = "checked method registry is missing owned to_hash target";
+    const missing_component_method_msg = "checked method registry is missing List to_hash target";
 
-    fn ownedArgTypes(ty: Type.TypeId, result_ty: Type.TypeId) [2]Type.TypeId {
+    fn methodArgTypes(ty: Type.TypeId, result_ty: Type.TypeId) [2]Type.TypeId {
         return .{ ty, result_ty };
-    }
-
-    fn ownedCall(self: *BodyContext, ty: Type.TypeId, operand: Operand, ctx: BodyContext.DerivationCtx) Allocator.Error!DraftExprId {
-        return try self.derivationOwnedCall(HashDeriver, ty, operand, ctx);
     }
 
     fn named(self: *BodyContext, named_ty: Type.TypeId, backing_ty: Type.TypeId, operand: Operand, ctx: BodyContext.DerivationCtx) Allocator.Error!DraftExprId {
@@ -28037,6 +28157,7 @@ fn sameTypeDef(left: Type.TypeDef, right: Type.TypeDef) bool {
         left.source_decl == right.source_decl and
         optionalDigestEql(left.generated, right.generated) and
         left.iterator_representation == right.iterator_representation and
+        left.iterator_kind == right.iterator_kind and
         left.iterator_depth == right.iterator_depth;
 }
 

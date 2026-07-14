@@ -47,6 +47,16 @@ pub const Counters = struct {
     specialization_type_digest_cache_misses: u64 = 0,
     specialization_type_digest_nodes_visited: u64 = 0,
     exact_type_checks: u64 = 0,
+    /// Declaration-backed nominal backings served from the per-graph
+    /// instantiation cache. Reuse compares argument cells by union-find root,
+    /// so instantiation counts must stay flat as unification merges argument
+    /// cells (issue #10128).
+    nominal_backing_reuses: u64 = 0,
+    nominal_backing_instantiations: u64 = 0,
+    /// Generated-evidence discovery walks, and how many were answered by the
+    /// generation-validated memo instead of re-walking the type.
+    evidence_walks: u64 = 0,
+    evidence_walk_memo_hits: u64 = 0,
 };
 
 /// Result of reserving or reusing a specialization record.

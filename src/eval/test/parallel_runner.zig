@@ -2167,8 +2167,8 @@ pub fn main(init: std.process.Init) RunnerError!void {
     var trace_worker = WorkerTrace.init(io);
     trace_worker.stamp("main entry");
 
-    var gpa_impl: std.heap.DebugAllocator(.{}) = .init;
-    defer _ = gpa_impl.deinit();
+    var gpa_impl: std.heap.DebugAllocator(.{ .stack_trace_frames = build_options.debug_gpa_stack_trace_frames }) = .init;
+    defer _ = build_options.debugGpaOk(gpa_impl.deinit());
     const gpa = gpa_impl.allocator();
     trace_worker.stamp("gpa init");
 

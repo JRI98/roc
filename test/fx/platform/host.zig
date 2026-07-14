@@ -373,7 +373,7 @@ const RocAllocation = struct {
 
 /// Host environment - contains DebugAllocator for leak detection
 const HostEnv = struct {
-    gpa: std.heap.DebugAllocator(.{ .safety = true, .thread_safe = false }),
+    gpa: std.heap.DebugAllocator(.{ .safety = true, .thread_safe = false, .stack_trace_frames = build_options.debug_gpa_stack_trace_frames }),
     test_state: TestState,
     std_io: std.Io,
     /// Track Roc allocations for cleanup on test failure
@@ -1424,7 +1424,7 @@ fn platform_main(test_spec: ?[]const u8, test_verbose: bool) (Allocator.Error ||
     }
 
     var host_env = HostEnv{
-        .gpa = std.heap.DebugAllocator(.{ .safety = true, .thread_safe = false }){},
+        .gpa = std.heap.DebugAllocator(.{ .safety = true, .thread_safe = false, .stack_trace_frames = build_options.debug_gpa_stack_trace_frames }){},
         .test_state = TestState.init(),
         .std_io = shim_io.io(),
     };
@@ -1494,6 +1494,7 @@ fn platform_main(test_spec: ?[]const u8, test_verbose: bool) (Allocator.Error ||
                 \\  This is internal to Roc's compiler/runtime, not application code.
                 \\
             });
+            std.debug.print("{s}", .{build_options.debug_gpa_leak_hint});
         }
     }
 

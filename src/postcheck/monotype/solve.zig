@@ -180,32 +180,34 @@ const RelationStamp = struct {
     right_version: u32,
 };
 
-const NominalBackingInstanceId = struct {
+const NominalBackingDeclaration = struct {
     module_bytes: [32]u8,
     declaration_id: u32,
-    args: []const NodeId,
 };
 
-const NominalBackingCacheContext = struct {
-    pub fn hash(_: NominalBackingCacheContext, key: NominalBackingInstanceId) u64 {
+const NominalBackingDeclarationContext = struct {
+    pub fn hash(_: NominalBackingDeclarationContext, key: NominalBackingDeclaration) u64 {
         var hasher = std.hash.Wyhash.init(0);
         hasher.update(&key.module_bytes);
         var declaration_id = std.mem.nativeToLittle(u32, key.declaration_id);
         hasher.update(std.mem.asBytes(&declaration_id));
-        var arg_len = std.mem.nativeToLittle(u32, @intCast(key.args.len));
-        hasher.update(std.mem.asBytes(&arg_len));
-        for (key.args) |arg| {
-            var raw_arg = std.mem.nativeToLittle(u32, @intFromEnum(arg));
-            hasher.update(std.mem.asBytes(&raw_arg));
-        }
         return hasher.final();
     }
 
-    pub fn eql(_: NominalBackingCacheContext, left: NominalBackingInstanceId, right: NominalBackingInstanceId) bool {
+    pub fn eql(_: NominalBackingDeclarationContext, left: NominalBackingDeclaration, right: NominalBackingDeclaration) bool {
         return std.mem.eql(u8, left.module_bytes[0..], right.module_bytes[0..]) and
-            left.declaration_id == right.declaration_id and
-            nodeSliceEql(left.args, right.args);
+            left.declaration_id == right.declaration_id;
     }
+};
+
+/// One instantiated backing of a declaration, keyed by the argument cells
+/// that seeded the declaration formal scope. Arguments are compared by their
+/// current union-find roots: raw node ids drift as unification merges cells,
+/// and comparing raw ids would treat the same instantiation as new each time
+/// its arguments gain evidence.
+const NominalBackingInstance = struct {
+    args: []NodeId,
+    node: NodeId,
 };
 
 /// Per-specialization type solver. Checked types instantiate into union-find
@@ -247,13 +249,37 @@ pub const InstGraph = struct {
     /// dirty marks propagate through these back references.
     row_parents: std.AutoHashMap(NodeId, std.ArrayList(NodeId)),
     /// Declaration-backed nominal backings already instantiated in this graph,
-    /// keyed by the source declaration and the exact argument cells that seeded
-    /// the declaration formal scope. This preserves per-argument correctness
-    /// without rebuilding the same backing template repeatedly.
-    nominal_backings: std.HashMap(NominalBackingInstanceId, NodeId, NominalBackingCacheContext, 80),
+    /// bucketed by source declaration. Instances inside a bucket compare their
+    /// argument cells by union-find root, so an instantiation stays shared
+    /// after unification merges or redirects its argument nodes. This
+    /// preserves per-argument correctness without rebuilding the same backing
+    /// template repeatedly.
+    nominal_backings: std.HashMap(NominalBackingDeclaration, std.ArrayList(NominalBackingInstance), NominalBackingDeclarationContext, 80),
     /// Template body requests made while lowering this specialization,
     /// processed once its body is complete and its types are final.
     deferred_templates: std.ArrayList(DeferredTemplate) = .empty,
+    /// Worklist and per-walk relation dedup for `unify`. One walk is active at
+    /// a time; a `unify` call issued while a walk is draining (a row-empty
+    /// collapse inside `unifyConcrete`) queues its pair onto the active walk,
+    /// which resolves the same constraints because unification is
+    /// order-independent.
+    unify_pending: std.ArrayList(NodePair) = .empty,
+    unify_related: std.AutoHashMap(NodePair, void),
+    unify_active: bool = false,
+    /// Reused traversal state for `markDirty` (never re-entered: dirty marking
+    /// only walks row back references).
+    dirty_mark_pending: std.ArrayList(NodeId) = .empty,
+    dirty_mark_visited: std.AutoHashMap(NodeId, void),
+    /// Reused row-collection state for `flattenTagRow`/`flattenRecordRow`.
+    /// Flattening reads node contents and allocates only fresh nodes and arena
+    /// copies, so no call inside the collection window can start another
+    /// flatten.
+    flat_tags_scratch: std.ArrayList(InstTag) = .empty,
+    flat_fields_scratch: std.ArrayList(InstField) = .empty,
+    row_seen_scratch: std.AutoHashMap(NodeId, void),
+    /// Reused chain-walk state for `findStructuralBackingNode`. Backing chains
+    /// are short, so membership is a linear scan.
+    backing_chain_scratch: std.ArrayList(NodeId) = .empty,
 
     pub fn create(
         allocator: Allocator,
@@ -277,13 +303,24 @@ pub const InstGraph = struct {
             .dirty_set = std.AutoHashMap(NodeId, void).init(allocator),
             .row_exts = std.AutoHashMap(NodeId, NodeId).init(allocator),
             .row_parents = std.AutoHashMap(NodeId, std.ArrayList(NodeId)).init(allocator),
-            .nominal_backings = std.HashMap(NominalBackingInstanceId, NodeId, NominalBackingCacheContext, 80).init(allocator),
+            .nominal_backings = std.HashMap(NominalBackingDeclaration, std.ArrayList(NominalBackingInstance), NominalBackingDeclarationContext, 80).init(allocator),
+            .unify_related = std.AutoHashMap(NodePair, void).init(allocator),
+            .dirty_mark_visited = std.AutoHashMap(NodeId, void).init(allocator),
+            .row_seen_scratch = std.AutoHashMap(NodeId, void).init(allocator),
         };
         return graph;
     }
 
     pub fn destroy(self: *InstGraph) void {
         const allocator = self.allocator;
+        self.backing_chain_scratch.deinit(allocator);
+        self.row_seen_scratch.deinit();
+        self.flat_fields_scratch.deinit(allocator);
+        self.flat_tags_scratch.deinit(allocator);
+        self.dirty_mark_visited.deinit();
+        self.dirty_mark_pending.deinit(allocator);
+        self.unify_related.deinit();
+        self.unify_pending.deinit(allocator);
         self.deferred_templates.deinit(allocator);
         var views = self.node_monos.valueIterator();
         while (views.next()) |list| {
@@ -293,6 +330,10 @@ pub const InstGraph = struct {
         var parents = self.row_parents.valueIterator();
         while (parents.next()) |list| {
             list.deinit(allocator);
+        }
+        var backing_buckets = self.nominal_backings.valueIterator();
+        while (backing_buckets.next()) |bucket| {
+            bucket.deinit(allocator);
         }
         self.nominal_backings.deinit();
         self.row_parents.deinit();
@@ -325,11 +366,21 @@ pub const InstGraph = struct {
         declaration_id: u32,
         args: []const NodeId,
     ) ?NodeId {
-        return self.nominal_backings.get(.{
+        const bucket = self.nominal_backings.getPtr(.{
             .module_bytes = module_bytes,
             .declaration_id = declaration_id,
-            .args = args,
-        });
+        }) orelse return null;
+        instances: for (bucket.items) |*instance| {
+            if (instance.args.len != args.len) continue;
+            for (instance.args, args) |*stored, wanted| {
+                // Repoint the stored cell at its current root so repeated
+                // lookups after heavy unification stay cheap.
+                stored.* = self.find(stored.*);
+                if (stored.* != self.find(wanted)) continue :instances;
+            }
+            return instance.node;
+        }
+        return null;
     }
 
     pub fn putNominalBackingNode(
@@ -340,12 +391,18 @@ pub const InstGraph = struct {
         node: NodeId,
     ) Allocator.Error!void {
         const stored_args = try self.arena().alloc(NodeId, args.len);
-        @memcpy(stored_args, args);
-        try self.nominal_backings.put(.{
+        for (stored_args, args) |*stored, arg| {
+            stored.* = self.find(arg);
+        }
+        const bucket = try self.nominal_backings.getOrPut(.{
             .module_bytes = module_bytes,
             .declaration_id = declaration_id,
+        });
+        if (!bucket.found_existing) bucket.value_ptr.* = .empty;
+        try bucket.value_ptr.append(self.allocator, .{
             .args = stored_args,
-        }, node);
+            .node = node,
+        });
     }
 
     fn registerRowParent(self: *InstGraph, row: NodeId, node_content: InstNode) Allocator.Error!void {
@@ -468,23 +525,21 @@ pub const InstGraph = struct {
     /// Queue the views of a changed root and of every row whose flattened view
     /// chains through it for a content refill.
     fn markDirty(self: *InstGraph, changed: NodeId) Allocator.Error!void {
-        var pending = std.ArrayList(NodeId).empty;
-        defer pending.deinit(self.allocator);
-        var visited = std.AutoHashMap(NodeId, void).init(self.allocator);
-        defer visited.deinit();
-        try pending.append(self.allocator, changed);
-        while (pending.pop()) |raw| {
+        self.dirty_mark_pending.clearRetainingCapacity();
+        self.dirty_mark_visited.clearRetainingCapacity();
+        try self.dirty_mark_pending.append(self.allocator, changed);
+        while (self.dirty_mark_pending.pop()) |raw| {
             const root = self.find(raw);
-            if (visited.contains(root)) continue;
-            try visited.put(root, {});
+            if (self.dirty_mark_visited.contains(root)) continue;
+            try self.dirty_mark_visited.put(root, {});
             if (self.node_monos.contains(root)) {
                 try self.queueDirty(root);
             }
             if (self.row_parents.get(root)) |parents| {
-                try pending.appendSlice(self.allocator, parents.items);
+                try self.dirty_mark_pending.appendSlice(self.allocator, parents.items);
             }
             if (self.row_parents.get(raw)) |parents| {
-                if (raw != root) try pending.appendSlice(self.allocator, parents.items);
+                if (raw != root) try self.dirty_mark_pending.appendSlice(self.allocator, parents.items);
             }
         }
     }
@@ -546,13 +601,20 @@ pub const InstGraph = struct {
     }
 
     pub fn unify(self: *InstGraph, a: NodeId, b: NodeId) Allocator.Error!void {
-        var pending = std.ArrayList(NodePair).empty;
-        defer pending.deinit(self.allocator);
-        var related = std.AutoHashMap(NodePair, void).init(self.allocator);
-        defer related.deinit();
-        try pending.append(self.allocator, .{ .left = a, .right = b });
-        while (pending.pop()) |pair| {
-            try self.unifyRoots(pair.left, pair.right, &pending, &related);
+        try self.unify_pending.append(self.allocator, .{ .left = a, .right = b });
+        // A unify issued while a walk is draining (a row-empty collapse inside
+        // `unifyConcrete`) joins the active walk: constraints resolve
+        // order-independently, so draining the pair later in the same walk is
+        // equivalent to a nested walk, without nested traversal state.
+        if (self.unify_active) return;
+        self.unify_active = true;
+        defer {
+            self.unify_active = false;
+            self.unify_pending.clearRetainingCapacity();
+            self.unify_related.clearRetainingCapacity();
+        }
+        while (self.unify_pending.pop()) |pair| {
+            try self.unifyRoots(pair.left, pair.right, &self.unify_pending, &self.unify_related);
         }
     }
 
@@ -863,13 +925,14 @@ pub const InstGraph = struct {
     }
 
     fn findStructuralBackingNode(self: *InstGraph, raw: NodeId, owner: InstNamed) Allocator.Error!StructuralBacking {
-        var seen = try std.DynamicBitSetUnmanaged.initEmpty(self.allocator, self.nodes.items.len);
-        defer seen.deinit(self.allocator);
+        const seen = &self.backing_chain_scratch;
+        seen.clearRetainingCapacity();
         var current = self.find(raw);
         while (true) {
-            const index = @intFromEnum(current);
-            if (seen.isSet(index)) return .{ .node = current, .recursive = true };
-            seen.set(index);
+            for (seen.items) |visited| {
+                if (visited == current) return .{ .node = current, .recursive = true };
+            }
+            try seen.append(self.allocator, current);
             const next = self.structuralBackingNext(current, owner) orelse return .{ .node = current, .recursive = false };
             current = next;
         }
@@ -931,6 +994,7 @@ pub const InstGraph = struct {
             left.source_decl == right.source_decl and
             optionalDigestEql(left.generated, right.generated) and
             left.iterator_representation == right.iterator_representation and
+            left.iterator_kind == right.iterator_kind and
             left.iterator_depth == right.iterator_depth;
     }
 
@@ -985,13 +1049,6 @@ pub const InstGraph = struct {
             .tag_union => |row| row,
             else => Common.invariant("instantiation flattened a non-tag-union row"),
         };
-        var tags = std.ArrayList(InstTag).empty;
-        defer tags.deinit(self.allocator);
-        try tags.appendSlice(self.allocator, row.tags);
-
-        var seen = std.AutoHashMap(NodeId, void).init(self.allocator);
-        defer seen.deinit();
-        try seen.put(root, {});
 
         var ext = self.find(row.ext);
         switch (self.nodes.items[@intFromEnum(ext)]) {
@@ -1004,6 +1061,18 @@ pub const InstGraph = struct {
             },
             else => {},
         }
+
+        // The collection scratch never survives a call that could start
+        // another flatten: the loop below only reads nodes and appends fresh
+        // nodes, and the collected tags are copied into the arena before the
+        // root is rewritten.
+        const tags = &self.flat_tags_scratch;
+        tags.clearRetainingCapacity();
+        try tags.appendSlice(self.allocator, row.tags);
+
+        const seen = &self.row_seen_scratch;
+        seen.clearRetainingCapacity();
+        try seen.put(root, {});
 
         while (true) {
             if (seen.contains(ext)) {
@@ -1036,13 +1105,6 @@ pub const InstGraph = struct {
             .record => |row| row,
             else => Common.invariant("instantiation flattened a non-record row"),
         };
-        var fields = std.ArrayList(InstField).empty;
-        defer fields.deinit(self.allocator);
-        try fields.appendSlice(self.allocator, row.fields);
-
-        var seen = std.AutoHashMap(NodeId, void).init(self.allocator);
-        defer seen.deinit();
-        try seen.put(root, {});
 
         var ext = self.find(row.ext);
         switch (self.nodes.items[@intFromEnum(ext)]) {
@@ -1055,6 +1117,16 @@ pub const InstGraph = struct {
             },
             else => {},
         }
+
+        // Same scratch discipline as `flattenTagRow`: the collection window
+        // contains no call that could start another flatten.
+        const fields = &self.flat_fields_scratch;
+        fields.clearRetainingCapacity();
+        try fields.appendSlice(self.allocator, row.fields);
+
+        const seen = &self.row_seen_scratch;
+        seen.clearRetainingCapacity();
+        try seen.put(root, {});
 
         while (true) {
             if (seen.contains(ext)) {
@@ -2718,6 +2790,35 @@ test "unconstrained checked graph node seals to empty tag union" {
     const sealed = try graph.sealNode(node);
     const content = type_store.get(sealed);
     try std.testing.expectEqual(Type.Span.empty(), content.tag_union);
+}
+
+test "issue 10128: nominal backing cache follows argument roots" {
+    const gpa = std.testing.allocator;
+
+    var type_store = Type.Store.init(gpa);
+    defer type_store.deinit();
+
+    var name_store = names.NameStore.init(gpa);
+    defer name_store.deinit();
+
+    var unsolved_monos = std.AutoHashMap(Type.TypeId, void).init(gpa);
+    defer unsolved_monos.deinit();
+
+    const graph = try InstGraph.create(gpa, &type_store, &name_store, &unsolved_monos);
+    defer graph.destroy();
+
+    const original_arg = try graph.newNode(.{ .unresolved = InstVariable.placeholder() });
+    const resolved_arg = try graph.newNode(.{ .primitive = .u64 });
+    const backing = try graph.newNode(.empty_record);
+    const module_bytes = [_]u8{0xA1} ** 32;
+
+    try graph.putNominalBackingNode(module_bytes, 17, &.{original_arg}, backing);
+    try graph.unify(original_arg, resolved_arg);
+
+    try std.testing.expectEqual(
+        backing,
+        graph.nominalBackingNode(module_bytes, 17, &.{resolved_arg}),
+    );
 }
 
 test "minted iterator unification with its public type preserves the minted backing" {

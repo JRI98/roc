@@ -154,6 +154,8 @@ pub const ProgramView = struct {
     stmt_ids: []const StmtId,
     field_exprs: []const FieldExpr,
     fn_def_captures: []const FnDefCapture,
+    const_evidence_pool: []const check.ConstStore.ConstEvidence,
+    const_evidence_chain_pool: []const check.ConstStore.ConstRange,
     capture_operands: []const CaptureOperand,
     record_destructs: []const RecordDestruct,
     str_pattern_steps: []const Mono.StrPatternStep,
@@ -379,6 +381,8 @@ pub const Program = struct {
     stmt_ids: ProgramList(StmtId, "stmt_ids"),
     field_exprs: ProgramList(FieldExpr, "field_exprs"),
     fn_def_captures: ProgramList(FnDefCapture, "fn_def_captures"),
+    const_evidence_pool: ProgramList(check.ConstStore.ConstEvidence, "const_evidence_pool"),
+    const_evidence_chain_pool: ProgramList(check.ConstStore.ConstRange, "const_evidence_chain_pool"),
     /// Backing pool for `Span(CaptureOperand)` capture operand spans on lifted
     /// `fn_ref`/`call_proc` nodes.
     capture_operands: ProgramList(CaptureOperand, "capture_operands"),
@@ -462,6 +466,8 @@ pub const Program = struct {
             .stmt_ids = ProgramList(StmtId, "stmt_ids").fromArrayList(stmt_ids),
             .field_exprs = ProgramList(FieldExpr, "field_exprs").fromArrayList(field_exprs),
             .fn_def_captures = ProgramList(FnDefCapture, "fn_def_captures").fromArrayList(fn_def_captures),
+            .const_evidence_pool = .empty,
+            .const_evidence_chain_pool = .empty,
             .capture_operands = .empty,
             .record_destructs = ProgramList(RecordDestruct, "record_destructs").fromArrayList(record_destructs),
             .str_pattern_steps = ProgramList(Mono.StrPatternStep, "str_pattern_steps").fromArrayList(str_pattern_steps),
@@ -513,6 +519,8 @@ pub const Program = struct {
         self.str_pattern_steps.deinit(self.allocator);
         self.record_destructs.deinit(self.allocator);
         self.fn_def_captures.deinit(self.allocator);
+        self.const_evidence_chain_pool.deinit(self.allocator);
+        self.const_evidence_pool.deinit(self.allocator);
         self.capture_operands.deinit(self.allocator);
         self.field_exprs.deinit(self.allocator);
         self.stmt_ids.deinit(self.allocator);
@@ -546,6 +554,8 @@ pub const Program = struct {
             .stmt_ids = self.stmt_ids.unsafeRawItemsForView(),
             .field_exprs = self.field_exprs.unsafeRawItemsForView(),
             .fn_def_captures = self.fn_def_captures.unsafeRawItemsForView(),
+            .const_evidence_pool = self.const_evidence_pool.unsafeRawItemsForView(),
+            .const_evidence_chain_pool = self.const_evidence_chain_pool.unsafeRawItemsForView(),
             .capture_operands = self.capture_operands.unsafeRawItemsForView(),
             .record_destructs = self.record_destructs.unsafeRawItemsForView(),
             .str_pattern_steps = self.str_pattern_steps.unsafeRawItemsForView(),

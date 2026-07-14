@@ -41,6 +41,7 @@ pub const FnTemplate = struct {
     fn_def: const_store.FnDef,
     source_fn_ty: checked.CheckedTypeId,
     source_fn_key: names.TypeDigest,
+    const_evidence_chain: const_store.ConstRange = .{},
 };
 
 /// Capture field copied from a checked binder into a callable payload.
@@ -120,6 +121,10 @@ pub const ConstRootPlan = struct {
     request: check.CheckedModule.RootRequest,
     proc: LIR.LirProcSpecId,
     ret_layout: layout.Idx,
+    /// Exact producer-owned Monotype representation of the evaluated root.
+    /// ConstStore restoration consumes this instead of reconstructing
+    /// representation evidence from the public checked type.
+    ret_type: const_store.ConstTypeId,
     plan: ConstPlanId,
 };
 
@@ -146,6 +151,10 @@ pub const Result = struct {
     requested_layouts: std.ArrayList(RequestedLayout),
     const_types: const_store.ConstTypeStore,
     const_type_names: names.NameStore,
+    /// Target-independent evidence copied from Monotype. FnTemplate ranges and
+    /// nested target ranges index these pools until ConstStore materialization.
+    const_evidence_pool: std.ArrayList(const_store.ConstEvidence),
+    const_evidence_chain_pool: std.ArrayList(const_store.ConstRange),
     fn_sets: std.ArrayList(FnSet),
     erased_fns: std.ArrayList(ErasedFns),
     const_plans: std.ArrayList(ConstPlan),
@@ -162,6 +171,8 @@ pub const Result = struct {
             .requested_layouts = .empty,
             .const_types = const_store.ConstTypeStore.init(allocator),
             .const_type_names = names.NameStore.init(allocator),
+            .const_evidence_pool = .empty,
+            .const_evidence_chain_pool = .empty,
             .fn_sets = .empty,
             .erased_fns = .empty,
             .const_plans = .empty,
@@ -185,6 +196,8 @@ pub const Result = struct {
         deinitErasedFns(allocator, self.erased_fns.items);
         self.erased_fns.deinit(allocator);
         self.fn_sets.deinit(allocator);
+        self.const_evidence_chain_pool.deinit(allocator);
+        self.const_evidence_pool.deinit(allocator);
         self.const_type_names.deinit();
         self.const_types.deinit();
         self.requested_layouts.deinit(allocator);

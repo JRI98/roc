@@ -1,0 +1,71 @@
+name: 'Debug GPA retrace'
+description: >
+  Run a zig build command; if it fails and its output contains DebugAllocator
+  leak reports (which carry no allocation-site stack traces in default builds),
+  re-run the command with -Ddebug-gpa-traces so the log gains the traces.
+  The step still fails with the original exit code; the re-run is diagnostics only.
+inputs:
+  command:
+    description: 'The zig build command to run'
+    required: true
+runs:
+  using: 'composite'
+  steps:
+    - name: Run command with leak retrace
+      shell: bash
+      run: |
+        heartbeat() {
+          while true; do
+            sleep 300
+            echo "[debug-gpa-retrace] command still running after ${SECONDS}s..."
+          done
+        }
+
+        # Avoid piping through tee: some Zig build children can inherit the
+        # pipe and keep it open after Zig has already exited successfully
+        # (same workaround as flaky-retry). `set +e` must come before the
+        # background launch: a backgrounded subshell inherits -e, and bash 3.2
+        # (macOS) then collapses the command's exit status to 1.
+        run_captured() {
+          set +e
+          heartbeat &
+          local heartbeat_pid=$!
+          eval "$1" > "$output_file" 2>&1 &
+          local command_pid=$!
+          wait "$command_pid"
+          captured_exit_code=$?
+          set -e
+          kill "$heartbeat_pid" 2>/dev/null || true
+          wait "$heartbeat_pid" 2>/dev/null || true
+          cat "$output_file"
+        }
+
+        output_file=$(mktemp)
+        trap 'rm -f "$output_file"' EXIT
+
+        echo "Running command: ${{ inputs.command }}"
+        run_captured "${{ inputs.command }}"
+        exit_code=$captured_exit_code
+
+        if [ "$exit_code" -eq 0 ]; then
+          exit 0
+        fi
+
+        if ! grep -qiE "leaked:|memory leak" "$output_file"; then
+          exit "$exit_code"
+        fi
+
+        # Insert -Ddebug-gpa-traces before any `--` run-args separator.
+        command="${{ inputs.command }}"
+        if [[ "$command" == *" -- "* ]]; then
+          traced_command="${command/ -- / -Ddebug-gpa-traces -- }"
+        else
+          traced_command="$command -Ddebug-gpa-traces"
+        fi
+
+        echo ""
+        echo "[debug-gpa-retrace] leak report detected; re-running with allocation-site stack traces:"
+        echo "[debug-gpa-retrace]   $traced_command"
+        run_captured "$traced_command"
+
+        exit "$exit_code"
