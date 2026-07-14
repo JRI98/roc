@@ -17,6 +17,7 @@
 //!   --verbose            Print PASS results and timing details
 
 const std = @import("std");
+const build_options = @import("build_options");
 const builtin = @import("builtin");
 const posix = std.posix;
 const Allocator = std.mem.Allocator;
@@ -8279,8 +8280,8 @@ test "effectiveTimeoutMs extends default for glue suite only" {
 
 /// Entry point for the parallel CLI test runner.
 pub fn main(init: std.process.Init) CliRunnerError!void {
-    var gpa_impl: std.heap.DebugAllocator(.{}) = .init;
-    defer _ = gpa_impl.deinit();
+    var gpa_impl: std.heap.DebugAllocator(.{ .stack_trace_frames = build_options.debug_gpa_stack_trace_frames }) = .init;
+    defer _ = build_options.debugGpaOk(gpa_impl.deinit());
     const gpa = gpa_impl.allocator();
 
     var spec_arena = collections.SingleThreadArena.init(gpa);

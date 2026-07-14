@@ -1303,17 +1303,21 @@ builder-owned sink for checked results, but that sink is not an alternate
 post-check state and is never visible to importers.
 
 The checked module may store checked-stage constant values in `ConstStore` and
-checked procedure templates for promoted callables. It must not store post-check
-representation data. In particular, the checked module does not contain runtime
-type payloads, value conversion plans, callable-set descriptors, erased callable
-ABI decisions, layout ids, runtime tag discriminants, or backend encodings.
+checked procedure templates for promoted callables. `ConstStore` also preserves
+the exact target-independent Monotype of an evaluated root or captured function
+value, because compile-time evaluation crosses a post-check boundary and later
+restoration must reproduce the producer's representation without guessing. The
+checked module does not contain target-specific runtime type payloads, value
+conversion plans, callable-set descriptors, erased callable ABI decisions,
+layout ids, runtime tag discriminants, or backend encodings.
 
 This is a checked-boundary rule, not merely a pipeline rule. Any checked
-module field whose only purpose is to feed post-check runtime representation is
-not part of the checked boundary. If later lowering needs data, checking must
-output it as target-independent checked data such as templates, dispatch
-plans, method registry entries, platform relation data, hosted declarations, or
-`ConstStore` entries. Runtime representation data is produced after checking.
+module field outside `ConstStore` whose only purpose is to feed post-check
+runtime representation is not part of the checked boundary. If later lowering
+needs data, checking must output it as target-independent checked data such as
+templates, dispatch plans, method registry entries, platform relation data,
+hosted declarations, or `ConstStore` entries. Target-specific runtime
+representation data is produced after checking.
 
 The checked module may output checked data that later stages need, such
 as:
@@ -1325,7 +1329,9 @@ as:
 - platform, hosted, and exposed function declarations
 - opaque, nominal, alias, row, and builtin ownership data
 
-Those data must remain target-independent and representation-free.
+Those data must remain target-independent. Outside the explicit Monotype
+evidence attached to evaluated `ConstStore` values, they are also
+representation-free.
 
 Named checked types carry explicit owner identity. The source-origin module
 identity remains the source identity used for `TypeDef`, diagnostics, source
@@ -1751,6 +1757,14 @@ solved inline analyzer consume it directly. They do not infer optimization mode
 from the target, backend, symbol names, builtin names, or emitted code. The mode
 changes optimization work, not source meaning or the stage route.
 
+Optional tag reachability uses a recursive abstract value tree. A struct field
+or tag payload carries the complete nested `ValueInfo` output for the value
+stored there, and every `set_local` join merges that complete tree. The
+pass may remove a switch edge only from this producer-complete fixed point; it
+must not flatten nested values to their top-level tag set, because an iterator
+successor can change a tag nested below both a step payload and the loop-carried
+state record.
+
 `SolvedLirLower` computes the logical Lambda Mono callable, capture, procedure,
 and function-free type decisions while directly consuming Lambda Solved syntax.
 Release builds do not materialize a second Lambda Mono expression, pattern,
@@ -1792,10 +1806,28 @@ const IteratorRepresentation = enum(u8) {
     forced_dynamic,
 };
 
+const IteratorKind = enum(u8) {
+    none,
+    custom,
+    list,
+    single,
+    range_exclusive,
+    range_inclusive,
+    map,
+    keep_if,
+    drop_if,
+    take_first,
+    drop_first,
+    concat,
+    append,
+    forced_dynamic,
+};
+
 const TypeDef = struct {
     // declaration identity fields
     generated: ?TypeDigest = null,
     iterator_representation: IteratorRepresentation = .none,
+    iterator_kind: IteratorKind = .none,
     iterator_depth: u8 = 0,
 };
 ```
@@ -1805,14 +1837,15 @@ The fields have these meanings:
 - `none` is the ordinary public nominal. It carries no internal chain identity.
 - `minted` is a statically bounded internal chain representation.
   `generated` is its chain/callable-evidence digest and `iterator_depth` is
-  the producer-computed chain depth.
+  the producer-computed chain depth. `iterator_kind` records the exact source
+  or adapter that produced it.
 - `forced_dynamic` is the explicit fixed-point representation selected at the
   mint-depth boundary. It retains the public declaration identity while the
   representation field keeps it distinct from the ordinary public nominal.
 
 These fields participate in named-type equality, cross-store equality, and type
 digests. Every type-store translation copies them. A later stage never derives a
-tier or mint depth from lowered type shape.
+tier, producer kind, or mint depth from lowered type shape.
 
 For a minted iterator, Monotype rewrites the public recursive `rest` type in the
 step result to the minted self type and records concrete adapter components as
@@ -1823,11 +1856,19 @@ identities rather than one public nominal with a recursive self edge.
 The representation producer is `generatedIteratorType` in
 `src/postcheck/monotype/lower.zig`. It computes:
 
+- `List.iter` as a first-class source representation rather than a public
+  recursive `Iter` boundary;
 - source depth 1;
 - adapter depth as one plus the maximum minted depth reachable by value through
   its components;
 - a hard minted depth limit of 16;
 - a structural-walk budget of 64.
+
+A public `Iter` expected type constrains the checked result type; it does not
+veto producer-owned representation evidence. A source or adapter whose inputs
+prove a bounded chain mints its concrete result and relates that result to the
+public type during checking. This keeps constant and non-constant chains on the
+same representation path.
 
 A `minted` child contributes its recorded depth. A `forced_dynamic` child
 contributes the cap, so every adapter above it remains dynamic. Ordinary named
@@ -1897,6 +1938,9 @@ a known iterator constructor, SpecConstr can:
 Iterator classification in this pass consumes the explicit iterator
 representation field (or the checked public `Builtin.Iter` identity). It does
 not identify generated iterator types solely from a nullable generated digest.
+Adapter-specific rewrites consume `iterator_kind`; for example, branch-append
+peeling recognizes `.append` from the result nominal instead of inspecting a
+generated step function and guessing its source operation from syntax.
 
 SpecConstr is not responsible for making bounded iterator representation
 allocation-free. Per-chain minting removes the recursive layout edge in every
@@ -1912,6 +1956,14 @@ the data segment. This is why a constant list consumed through `.iter()` can
 have zero runtime list allocation in a size cart even though the eval allocation
 harness, which does not perform final constant hoisting, observes one base-list
 allocation.
+
+The direct LIR const plan also records the root's exact Monotype return type.
+Finalization clones that type into the durable `ConstStore` type store and saves
+its id beside the stored root node. Restoration lowers the saved root type first
+and restores the node at that exact type; the checked public type is used only
+to assert that the saved representation has the checked root type.
+Representation evidence therefore survives CTFE without a consumer
+reconstructing it from constant node shape.
 
 #### Correctness Boundaries
 
@@ -4488,6 +4540,12 @@ a compiler bug, not a supported stored-constant representation.
 const ConstStore = struct {
     nodes: []const ConstValue,
     roots: []const ConstNodeId,
+    type_store: ConstTypeStore,
+};
+
+const StoredConstTemplate = struct {
+    node: ConstNodeId,
+    root_type: ConstTypeId,
 };
 
 const ConstValue = union(enum) {

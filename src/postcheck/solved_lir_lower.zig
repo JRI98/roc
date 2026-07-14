@@ -1263,6 +1263,7 @@ const Lowerer = struct {
                     .request = root.request,
                     .proc = proc,
                     .ret_layout = try self.layoutOfType(entry.ret),
+                    .ret_type = try self.constTypeOfType(entry.ret),
                     .plan = try self.constPlanOfType(entry.ret),
                 });
             }
@@ -1437,24 +1438,26 @@ const Lowerer = struct {
             .list => |elem| .{ .list = try self.constPlanOfType(elem) },
             .box => |elem| .{ .box = try self.constPlanOfType(elem) },
             .tuple => |items| blk: {
-                const source = self.types.span(items);
+                const source = try GuardedList.dupe(self.allocator, Type.TypeId, self.types.span(items));
+                defer self.allocator.free(source);
                 const plans = try self.allocator.alloc(LirProgram.ConstPlanId, source.len);
                 errdefer self.allocator.free(plans);
-                for (0..source.len) |i| plans[i] = try self.constPlanOfType(GuardedList.at(source, i));
+                for (source, 0..) |item, i| plans[i] = try self.constPlanOfType(item);
                 break :blk .{ .tuple = plans };
             },
             .record => |fields| blk: {
-                const source = self.types.fieldSpan(fields);
+                const source = try GuardedList.dupe(self.allocator, Type.Field, self.types.fieldSpan(fields));
+                defer self.allocator.free(source);
                 const plans = try self.allocator.alloc(LirProgram.ConstPlanId, source.len);
                 errdefer self.allocator.free(plans);
-                for (0..source.len) |i| {
-                    const field = GuardedList.at(source, i);
+                for (source, 0..) |field, i| {
                     plans[i] = try self.constPlanOfType(field.ty);
                 }
                 break :blk .{ .record = plans };
             },
             .tag_union => |tags| blk: {
-                const source = self.types.tagSpan(tags);
+                const source = try GuardedList.dupe(self.allocator, Type.Tag, self.types.tagSpan(tags));
+                defer self.allocator.free(source);
                 const variants = try self.allocator.alloc(LirProgram.ConstTagVariant, source.len);
                 var initialized: usize = 0;
                 errdefer {
@@ -1464,15 +1467,15 @@ const Lowerer = struct {
                     }
                     self.allocator.free(variants);
                 }
-                for (0..source.len) |i| {
-                    const tag = GuardedList.at(source, i);
+                for (source, 0..) |tag, i| {
                     const name = try self.allocator.dupe(u8, self.solved.lifted.names.tagLabelText(tag.name));
                     errdefer self.allocator.free(name);
-                    const payload_tys = self.types.span(tag.payloads);
+                    const payload_tys = try GuardedList.dupe(self.allocator, Type.TypeId, self.types.span(tag.payloads));
+                    defer self.allocator.free(payload_tys);
                     const payloads = try self.allocator.alloc(LirProgram.ConstPlanId, payload_tys.len);
                     var payloads_owned = true;
                     errdefer if (payloads_owned) self.allocator.free(payloads);
-                    for (0..payload_tys.len) |j| payloads[j] = try self.constPlanOfType(GuardedList.at(payload_tys, j));
+                    for (payload_tys, 0..) |payload_ty, j| payloads[j] = try self.constPlanOfType(payload_ty);
                     variants[i] = .{
                         .name = name,
                         .checked_name = tag.checked_name,
@@ -1531,6 +1534,7 @@ const Lowerer = struct {
             .source_decl = def.source_decl,
             .generated = def.generated,
             .iterator_representation = @enumFromInt(@intFromEnum(def.iterator_representation)),
+            .iterator_kind = @enumFromInt(@intFromEnum(def.iterator_kind)),
             .iterator_depth = def.iterator_depth,
         };
     }
@@ -1542,18 +1546,19 @@ const Lowerer = struct {
             .list => |elem| .{ .list = try self.constTypeOfType(elem) },
             .box => |elem| .{ .box = try self.constTypeOfType(elem) },
             .tuple => |items| blk: {
-                const source = self.types.span(items);
+                const source = try GuardedList.dupe(self.allocator, Type.TypeId, self.types.span(items));
+                defer self.allocator.free(source);
                 const out = try self.allocator.alloc(const_store.ConstTypeId, source.len);
                 defer self.allocator.free(out);
-                for (0..source.len) |i| out[i] = try self.constTypeOfType(GuardedList.at(source, i));
+                for (source, 0..) |item, i| out[i] = try self.constTypeOfType(item);
                 break :blk .{ .tuple = try self.result.const_types.appendTypeSpan(out) };
             },
             .record => |fields| blk: {
-                const source = self.types.fieldSpan(fields);
+                const source = try GuardedList.dupe(self.allocator, Type.Field, self.types.fieldSpan(fields));
+                defer self.allocator.free(source);
                 const out = try self.allocator.alloc(const_store.TypeField, source.len);
                 defer self.allocator.free(out);
-                for (0..source.len) |i| {
-                    const field = GuardedList.at(source, i);
+                for (source, 0..) |field, i| {
                     out[i] = .{
                         .name = try self.constRecordFieldName(field.name),
                         .ty = try self.constTypeOfType(field.ty),
@@ -1562,15 +1567,16 @@ const Lowerer = struct {
                 break :blk .{ .record = try self.result.const_types.appendFieldSpan(out) };
             },
             .tag_union => |tags| blk: {
-                const source = self.types.tagSpan(tags);
+                const source = try GuardedList.dupe(self.allocator, Type.Tag, self.types.tagSpan(tags));
+                defer self.allocator.free(source);
                 const out = try self.allocator.alloc(const_store.TypeTag, source.len);
                 defer self.allocator.free(out);
-                for (0..source.len) |i| {
-                    const tag = GuardedList.at(source, i);
-                    const payloads = self.types.span(tag.payloads);
+                for (source, 0..) |tag, i| {
+                    const payloads = try GuardedList.dupe(self.allocator, Type.TypeId, self.types.span(tag.payloads));
+                    defer self.allocator.free(payloads);
                     const stored_payloads = try self.allocator.alloc(const_store.ConstTypeId, payloads.len);
                     defer self.allocator.free(stored_payloads);
-                    for (0..payloads.len) |j| stored_payloads[j] = try self.constTypeOfType(GuardedList.at(payloads, j));
+                    for (payloads, 0..) |payload, j| stored_payloads[j] = try self.constTypeOfType(payload);
                     out[i] = .{
                         .name = try self.constTagName(tag.name),
                         .checked_name = try self.constTagName(tag.checked_name),
@@ -1580,16 +1586,17 @@ const Lowerer = struct {
                 break :blk .{ .tag_union = try self.result.const_types.appendTagSpan(out) };
             },
             .named => |named| blk: {
-                const args = self.types.span(named.args);
+                const args = try GuardedList.dupe(self.allocator, Type.TypeId, self.types.span(named.args));
+                defer self.allocator.free(args);
                 const stored_args = try self.allocator.alloc(const_store.ConstTypeId, args.len);
                 defer self.allocator.free(stored_args);
-                for (0..args.len) |i| stored_args[i] = try self.constTypeOfType(GuardedList.at(args, i));
+                for (args, 0..) |arg, i| stored_args[i] = try self.constTypeOfType(arg);
 
-                const declared = self.types.declaredFieldSpan(named.declared_order);
+                const declared = try GuardedList.dupe(self.allocator, Type.DeclaredField, self.types.declaredFieldSpan(named.declared_order));
+                defer self.allocator.free(declared);
                 const stored_declared = try self.allocator.alloc(const_store.TypeDeclaredField, declared.len);
                 defer self.allocator.free(stored_declared);
-                for (0..declared.len) |i| {
-                    const entry = GuardedList.at(declared, i);
+                for (declared, 0..) |entry, i| {
                     stored_declared[i] = switch (entry) {
                         .named => |name| .{ .named = try self.constRecordFieldName(name) },
                         .padding => |padding| .{ .padding = try self.constTypeOfType(padding) },
@@ -1653,7 +1660,8 @@ const Lowerer = struct {
     }
 
     fn fnSetForType(self: *Lowerer, ty: Type.TypeId, variants_span: Type.Span) Common.LowerError!LirProgram.FnSetId {
-        const type_variants = self.types.fnVariantSpan(variants_span);
+        const type_variants = try GuardedList.dupe(self.allocator, Type.FnVariant, self.types.fnVariantSpan(variants_span));
+        defer self.allocator.free(type_variants);
         const value_layout = try self.layoutOfType(ty);
         const variants = try self.allocator.alloc(LirProgram.FnVariant, type_variants.len);
         var initialized: usize = 0;
@@ -1664,8 +1672,7 @@ const Lowerer = struct {
             self.allocator.free(variants);
         }
 
-        for (0..type_variants.len) |index| {
-            const variant = GuardedList.at(type_variants, index);
+        for (type_variants, 0..) |variant, index| {
             const captures = if (variant.capture_ty) |capture_ty|
                 try self.captureSlotsForType(capture_ty)
             else
@@ -1697,7 +1704,8 @@ const Lowerer = struct {
     }
 
     fn erasedFnsForType(self: *Lowerer, ty: Type.TypeId, erased: anytype) Common.LowerError!LirProgram.ErasedFnsId {
-        const members = self.types.fnVariantSpan(erased.members);
+        const members = try GuardedList.dupe(self.allocator, Type.FnVariant, self.types.fnVariantSpan(erased.members));
+        defer self.allocator.free(members);
 
         // A const plan covers every tag payload, including payload types for
         // tags no value flow reached. Keep an explicit empty entry set for an
@@ -1713,8 +1721,7 @@ const Lowerer = struct {
             self.allocator.free(entries);
         }
 
-        for (0..members.len) |index| {
-            const member = GuardedList.at(members, index);
+        for (members, 0..) |member, index| {
             const captures = if (member.capture_ty) |capture_ty|
                 try self.captureSlotsForType(capture_ty)
             else
@@ -1765,14 +1772,14 @@ const Lowerer = struct {
     }
 
     fn captureSlotsForType(self: *Lowerer, ty: Type.TypeId) Common.LowerError![]const LirProgram.CaptureSlot {
-        const fields = switch (self.types.get(ty)) {
+        const fields = try GuardedList.dupe(self.allocator, Type.CaptureField, switch (self.types.get(ty)) {
             .capture_record => |fields| self.types.captureFieldSpan(fields),
             else => Common.invariant("function result capture slot output expected capture record type"),
-        };
+        });
+        defer self.allocator.free(fields);
         const slots = try self.allocator.alloc(LirProgram.CaptureSlot, fields.len);
         errdefer self.allocator.free(slots);
-        for (0..fields.len) |index| {
-            const field = GuardedList.at(fields, index);
+        for (fields, 0..) |field, index| {
             slots[index] = .{
                 .id = field.capture_id orelse Common.invariant("capture record field had no CaptureId"),
                 .slot = @intCast(index),

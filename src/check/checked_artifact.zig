@@ -22237,6 +22237,9 @@ pub const ConstEvalTemplate = struct {
 /// Public `StoredConstTemplate` declaration.
 pub const StoredConstTemplate = struct {
     node: ConstNodeId,
+    /// Exact producer-owned Monotype representation used to evaluate `node`.
+    /// This is explicit post-check evidence, stored in `ConstStore.type_store`.
+    root_type: const_store.ConstTypeId,
 };
 
 /// Public `ConstTemplateState` declaration.
@@ -23029,7 +23032,7 @@ pub const CheckedModuleArtifact = struct {
     /// Manual discriminant for `SERIALIZED_VERSION_HASH`: bump to force a cache /
     /// baked-blob invalidation for a layout change the structural fingerprint below
     /// cannot observe (e.g. a semantic change to how a field is interpreted).
-    const serialized_layout_version: u32 = 21;
+    const serialized_layout_version: u32 = 22;
 
     /// Comptime fingerprint of `Serialized`'s layout, mirroring
     /// `cache_module.MODULE_ENV_VERSION_HASH`. It is appended to the baked builtin
@@ -23601,6 +23604,7 @@ pub const CheckedModuleArtifact = struct {
                 },
                 .stored_const => |stored| {
                     std.debug.assert(@intFromEnum(stored.node) < self.const_store.values.items.len);
+                    std.debug.assert(@intFromEnum(stored.root_type) < self.const_store.type_store.types.items.len);
                 },
                 .reserved => std.debug.panic(
                     "checked artifact invariant violated: exported const template was not sealed",
@@ -23782,6 +23786,15 @@ pub const CheckedModuleArtifact = struct {
             }
         }
 
+        for (self.const_templates.templates.items) |template| {
+            switch (template.state) {
+                .stored_const => |stored| {
+                    std.debug.assert(@intFromEnum(stored.node) < self.const_store.values.items.len);
+                    std.debug.assert(@intFromEnum(stored.root_type) < self.const_store.type_store.types.items.len);
+                },
+                .eval_template, .reserved => {},
+            }
+        }
         self.const_templates.verifySealed();
         try self.const_store.verifyComplete();
         self.interface_capabilities.verifyComplete();
@@ -27633,8 +27646,8 @@ test "SERIALIZED_VERSION_HASH golden value" {
     // change, bump `serialized_layout_version` and replace the golden bytes below with
     // the ones this assertion prints.
     const golden: [32]u8 = .{
-        0x05, 0xE6, 0x4C, 0x8D, 0x66, 0x02, 0xA7, 0x77, 0xB6, 0xE7, 0xFC, 0x6D, 0x50, 0x86, 0xA9, 0x13,
-        0x71, 0xEA, 0xA9, 0x2E, 0xE9, 0x10, 0xF6, 0x89, 0x9E, 0x33, 0x62, 0xA9, 0x72, 0x2F, 0xD8, 0x1E,
+        0x5D, 0xF6, 0xAB, 0x64, 0xC5, 0x46, 0xD5, 0xE6, 0x71, 0xAD, 0x77, 0xC1, 0x91, 0xAA, 0x46, 0xD9,
+        0x2C, 0xD9, 0x8D, 0x55, 0x1E, 0xD5, 0x56, 0xD8, 0x30, 0x61, 0xF3, 0x15, 0x60, 0x76, 0x2C, 0x86,
     };
     try std.testing.expectEqualSlices(u8, &golden, &CheckedModuleArtifact.SERIALIZED_VERSION_HASH);
 }

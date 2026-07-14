@@ -7,6 +7,7 @@
 //! the given Roc code snippet.
 
 const std = @import("std");
+const build_options = @import("build_options");
 
 /// Application IO instance, initialized from `std.process.Init` in `main`.
 /// Use this instead of `app_io` for all application IO.
@@ -439,7 +440,7 @@ fn renderReportsToExpectedContent(allocator: std.mem.Allocator, reports: *const 
     return try generateExpectedContent(allocator, entries.items);
 }
 
-var debug_allocator: std.heap.DebugAllocator(.{}) = .{
+var debug_allocator: std.heap.DebugAllocator(.{ .stack_trace_frames = build_options.debug_gpa_stack_trace_frames }) = .{
     .backing_allocator = std.heap.page_allocator,
 };
 
@@ -458,8 +459,7 @@ pub fn main(init: std.process.Init) SnapshotError!void {
     var gpa_tracy: tracy.TracyAllocator(null) = undefined;
     var gpa = debug_allocator.allocator();
     defer {
-        const mem_state = debug_allocator.deinit();
-        std.debug.assert(mem_state == .ok);
+        std.debug.assert(build_options.debugGpaOk(debug_allocator.deinit()));
     }
 
     // Wrap with Tracy for allocation profiling when enabled

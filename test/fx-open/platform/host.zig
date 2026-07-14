@@ -15,7 +15,7 @@ pub const std_options = shim_io.std_options_no_stack_tracing;
 
 /// Host environment - contains DebugAllocator for leak detection
 const HostEnv = struct {
-    gpa: std.heap.DebugAllocator(.{ .thread_safe = false }),
+    gpa: std.heap.DebugAllocator(.{ .thread_safe = false, .stack_trace_frames = build_options.debug_gpa_stack_trace_frames }),
     std_io: std.Io,
 };
 
@@ -342,13 +342,14 @@ fn buildArgsList(ops: *builtins.host_abi.RocOps, argc: c_int, argv: [*][*:0]u8) 
 /// Platform host entrypoint
 fn platform_main(argc: c_int, argv: [*][*:0]u8) Allocator.Error!c_int {
     var host_env = HostEnv{
-        .gpa = std.heap.DebugAllocator(.{ .thread_safe = false }){},
+        .gpa = std.heap.DebugAllocator(.{ .thread_safe = false, .stack_trace_frames = build_options.debug_gpa_stack_trace_frames }){},
         .std_io = shim_io.io(),
     };
     defer {
         const leaked = host_env.gpa.deinit();
         if (leaked == .leak) {
             std.log.err("\x1b[33mMemory leak detected!\x1b[0m", .{});
+            std.debug.print("{s}", .{build_options.debug_gpa_leak_hint});
         }
     }
 

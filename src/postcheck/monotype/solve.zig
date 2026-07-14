@@ -994,6 +994,7 @@ pub const InstGraph = struct {
             left.source_decl == right.source_decl and
             optionalDigestEql(left.generated, right.generated) and
             left.iterator_representation == right.iterator_representation and
+            left.iterator_kind == right.iterator_kind and
             left.iterator_depth == right.iterator_depth;
     }
 

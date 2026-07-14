@@ -108,7 +108,9 @@ jobs:
         run: zig build run-check-cli-global-stdio
 
       - name: zig snapshot tests
-        run: zig build run-check-snapshots -- --debug
+        uses: ./.github/actions/debug-gpa-retrace
+        with:
+          command: zig build run-check-snapshots -- --debug
 
       - name: Run Playground Tests
         run: zig build run-test-playground -Doptimize=ReleaseSmall -- --verbose
@@ -257,13 +259,9 @@ jobs:
           retry_count: 3
 
       - name: Run CLI platform tests (LLVM size/speed backends)
-        if: runner.os != 'Windows'
-        run: zig build run-test-cli -- --include-llvm --filter "[size]" --filter "[speed]"
-
-      - name: Run CLI platform tests (LLVM size/speed backends, Windows)
-        if: runner.os == 'Windows'
-        run: |
-          zig build run-test-cli -- --include-llvm --filter "[size]" --filter "[speed]"
+        uses: ./.github/actions/debug-gpa-retrace
+        with:
+          command: zig build run-test-cli -- --include-llvm --filter "[size]" --filter "[speed]"
 
       - name: Shared-library build-and-run test (roc build --opt=size)
         run: zig build run-test-dylib
@@ -348,7 +346,9 @@ jobs:
 
       - name: Run Test Platforms (Unix)
         if: runner.os != 'Windows'
-        run: zig build run-test-cli ${{ matrix.target_flag }}
+        uses: ./.github/actions/debug-gpa-retrace
+        with:
+          command: zig build run-test-cli ${{ matrix.target_flag }}
 
       - name: Setup MSVC (Windows)
         if: runner.os == 'Windows'
@@ -358,8 +358,9 @@ jobs:
 
       - name: Run Test Platforms (Windows)
         if: runner.os == 'Windows'
-        run: |
-          zig build run-test-cli
+        uses: ./.github/actions/debug-gpa-retrace
+        with:
+          command: zig build run-test-cli
 
       - name: roc executable minimal check (Unix)
         if: runner.os != 'Windows'
@@ -372,7 +373,9 @@ jobs:
           zig-out\bin\roc.exe check ./CONTRIBUTING/profiling/bench_repeated_check.roc
 
       - name: zig snapshot tests
-        run: zig build run-check-snapshots ${{ matrix.target_flag }} -- --debug
+        uses: ./.github/actions/debug-gpa-retrace
+        with:
+          command: zig build run-check-snapshots ${{ matrix.target_flag }} -- --debug
 
       # 1) in debug mode
       - name: build and execute tests, build repro executables

@@ -148,7 +148,7 @@ const RocAllocation = struct {
 
 /// Host environment - contains DebugAllocator for leak detection
 const HostEnv = struct {
-    gpa: std.heap.DebugAllocator(.{ .safety = true }),
+    gpa: std.heap.DebugAllocator(.{ .safety = true, .stack_trace_frames = build_options.debug_gpa_stack_trace_frames }),
     std_io: std.Io,
     /// Track Roc allocations for cleanup on test failure
     roc_allocations: std.ArrayListUnmanaged(RocAllocation) = .{ .items = &.{}, .capacity = 0 },
@@ -704,7 +704,7 @@ fn platform_main(args: [][*:0]u8, std_io: std.Io) (Allocator.Error || error{ Mis
     }
 
     var host_env = HostEnv{
-        .gpa = std.heap.DebugAllocator(.{ .safety = true }){},
+        .gpa = std.heap.DebugAllocator(.{ .safety = true, .stack_trace_frames = build_options.debug_gpa_stack_trace_frames }){},
         .std_io = std_io,
     };
 
@@ -740,6 +740,7 @@ fn platform_main(args: [][*:0]u8, std_io: std.Io) (Allocator.Error || error{ Mis
                 \\[Roc Memory Info] Additional memory leak detected by GPA.
                 \\
             ) catch {};
+            stderr_file.writeStreamingAll(host_env.std_io, build_options.debug_gpa_leak_hint) catch {};
         }
     }
 
