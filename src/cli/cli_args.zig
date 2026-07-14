@@ -130,7 +130,7 @@ pub const RunArgs = struct {
     app_args: []const []const u8 = &[_][]const u8{}, // any arguments to be passed to roc application being run
     no_cache: bool = false, // bypass the executable cache
     allow_errors: bool = false, // allow execution even if there are type errors
-    watch: bool = false, // hot reload when source inputs change
+    watch: bool = false, // hot reload when source inputs change; implied for dev runs
     timings: bool = false, // always show the per-phase timing breakdown
     max_threads: ?usize = null, // max worker threads (null = auto, 1 = single-threaded)
     resolve_limits: ResolveLimitArgs = .{}, // package download size limits
@@ -1301,7 +1301,7 @@ fn parseRun(alloc: mem.Allocator, args: []const []const u8) std.mem.Allocator.Er
             }
         }
     }
-    return CliArgs{ .run = RunArgs{ .path = path orelse "main.roc", .opt = opt, .target = target, .app_args = try app_args.toOwnedSlice(), .no_cache = no_cache, .allow_errors = allow_errors, .watch = watch, .timings = timings, .max_threads = max_threads, .resolve_limits = resolve_limits } };
+    return CliArgs{ .run = RunArgs{ .path = path orelse "main.roc", .opt = opt, .target = target, .app_args = try app_args.toOwnedSlice(), .no_cache = no_cache, .allow_errors = allow_errors, .watch = watch or (opt == .dev), .timings = timings, .max_threads = max_threads, .resolve_limits = resolve_limits } };
 }
 
 fn isHelpFlag(arg: []const u8) bool {
@@ -1322,6 +1322,7 @@ test "default roc command" {
         defer result.deinit(gpa);
         try testing.expectEqualStrings("main.roc", result.run.path);
         try testing.expectEqual(.dev, result.run.opt);
+        try testing.expect(result.run.watch);
         try testing.expectEqualSlices([]const u8, &[_][]const u8{}, result.run.app_args);
     }
     {
@@ -1348,7 +1349,7 @@ test "default roc command" {
         const result = try parse(gpa, testing.io, &[_][]const u8{"foo.roc"});
         defer result.deinit(gpa);
         try testing.expectEqualStrings("foo.roc", result.run.path);
-        try testing.expect(!result.run.watch);
+        try testing.expect(result.run.watch);
     }
     {
         const result = try parse(gpa, testing.io, &[_][]const u8{ "--opt=speed", "foo.roc" });
