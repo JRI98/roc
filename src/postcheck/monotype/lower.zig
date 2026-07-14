@@ -19292,30 +19292,30 @@ const BodyContext = struct {
         // dispatches (`unreachable_dispatch`, or a `checked_error` for
         // reported missing methods); both lower to an explicit crash. A
         // genuinely reachable ownerless dispatch was rejected at check time.
-        if (self.planUnexecutable(plan)) |reason| {
-            const crash_ty = expected_ret_ty orelse plan_ret_ty;
-            try self.constrainTypeToMono(checked_ret_ty, crash_ty);
-            return try self.runtimeCrashExpr(crash_ty, switch (reason) {
-                // The dispatcher is a value no specialization edge can supply,
-                // so the dispatch can never execute.
-                .unreachable_value => "dispatch on a value that can never exist",
+        const resolved = switch (self.consumeDispatchResolution(plan.resolution)) {
+            .target => |target| target,
+            .structural => |kind| return switch (kind) {
+                // Equality and hash share the binary structural lowering,
+                // which distinguishes their result modes internally.
+                .equality, .hash => try self.lowerStructuralEquality(plan, callable_mono_ty, plan_ret_ty, self, pre_lowered),
+                .parser => try self.lowerStructuralParser(plan, callable_mono_ty, plan_ret_ty, self, pre_lowered),
+                .encoder => try self.lowerStructuralEncoderFor(plan, callable_mono_ty, plan_ret_ty, self, pre_lowered),
+            },
+            .unreachable_value => {
+                const crash_ty = expected_ret_ty orelse plan_ret_ty;
+                try self.constrainTypeToMono(checked_ret_ty, crash_ty);
+                // The dispatcher is a value no specialization edge can
+                // supply, so the dispatch can never execute.
+                return try self.runtimeCrashExpr(crash_ty, "dispatch on a value that can never exist");
+            },
+            .checked_error => {
+                const crash_ty = expected_ret_ty orelse plan_ret_ty;
+                try self.constrainTypeToMono(checked_ret_ty, crash_ty);
                 // Checking reported the missing method; executing the site
                 // anyway (roc run with errors) crashes here.
-                .checked_error => "method dispatch failed to check",
-            });
-        }
-        const lookup = self.dispatchTarget(plan);
-        if (lookup == null) {
-            return switch (plan.result_mode) {
-                // `.equality` and `.hash` are both handled by lowerStructuralEquality,
-                // which switches on result_mode internally.
-                .equality, .hash => try self.lowerStructuralEquality(plan, callable_mono_ty, plan_ret_ty, self, pre_lowered),
-                .parser_for => try self.lowerStructuralParser(plan, callable_mono_ty, plan_ret_ty, self, pre_lowered),
-                .encoder_for => try self.lowerStructuralEncoderFor(plan, callable_mono_ty, plan_ret_ty, self, pre_lowered),
-                .value => Common.invariant("value dispatch plan had no resolved dispatch target"),
-            };
-        }
-        const resolved = lookup.?;
+                return try self.runtimeCrashExpr(crash_ty, "method dispatch failed to check");
+            },
+        };
         if (self.generatedStructuralDispatchKind(resolved)) |generated| {
             try self.constrainTypeToMono(checked_ret_ty, plan_ret_ty);
             if (expected_ret_ty) |expected| {
@@ -19405,8 +19405,22 @@ const BodyContext = struct {
         const plan_fn_data = self.builder.functionShape(callable_mono_ty, "checked from_numeral plan had a non-function type");
         const try_ty = plan_fn_data.ret;
 
-        const resolved = self.dispatchTarget(plan) orelse
-            Common.invariant("checked from_numeral dispatch unexpectedly resolved to structural equality");
+        const resolved = switch (self.consumeDispatchResolution(plan.resolution)) {
+            .target => |target| target,
+            .structural => Common.invariant("checked from_numeral dispatch unexpectedly resolved structurally"),
+            .unreachable_value => {
+                return .{
+                    .call = try self.runtimeCrashExpr(try_ty, "dispatch on a value that can never exist"),
+                    .try_ty = try_ty,
+                };
+            },
+            .checked_error => {
+                return .{
+                    .call = try self.runtimeCrashExpr(try_ty, "method dispatch failed to check"),
+                    .try_ty = try_ty,
+                };
+            },
+        };
 
         const target_mono_ty = try self.methodTargetMonoTypePreservingSourceArgsAndRet(resolved, try_ty);
         const target_fn_data = self.builder.functionShape(target_mono_ty, "checked from_numeral target had a non-function type");
@@ -19989,15 +20003,16 @@ const BodyContext = struct {
         // The dispatcher may not be solved yet when this runs for argument
         // evidence; the target then resolves when the expression itself
         // lowers, and the plan's return carries the evidence for now.
-        if (!dispatcherIsGrounded(&self.builder.program.types, dispatcher_ty) or
-            self.planUnexecutable(plan) != null)
-        {
+        if (!dispatcherIsGrounded(&self.builder.program.types, dispatcher_ty)) {
             try self.constrainTypeToMono(checked_ret_ty, plan_ret_ty);
             return plan_ret_ty;
         }
-        const resolved = self.dispatchTarget(plan) orelse {
-            try self.constrainTypeToMono(checked_ret_ty, plan_ret_ty);
-            return plan_ret_ty;
+        const resolved = switch (self.consumeDispatchResolution(plan.resolution)) {
+            .target => |target| target,
+            .structural, .unreachable_value, .checked_error => {
+                try self.constrainTypeToMono(checked_ret_ty, plan_ret_ty);
+                return plan_ret_ty;
+            },
         };
         if (self.generatedStructuralDispatchKind(resolved) != null) {
             try self.constrainTypeToMono(checked_ret_ty, plan_ret_ty);
@@ -20101,66 +20116,38 @@ const BodyContext = struct {
         }
     }
 
-    /// A consumed evidence resolution: a concrete target or the checker's
-    /// structural decision.
-    const EvidenceResolved = union(enum) {
+    /// The checker's dispatch resolution after substituting any evidence
+    /// supplied by the current specialization edge. This is the single
+    /// classification consumed by every Monotype dispatch lowering path.
+    const ConsumedDispatchResolution = union(enum) {
         target: MethodLookup,
-        structural,
+        structural: static_dispatch.StructuralKind,
+        unreachable_value,
+        checked_error,
     };
 
-    /// The plan's checked (or edge-supplied) resolution. Null only for
-    /// dispatches that never resolve a target: unreachable and checked-error
-    /// dispatches, which `planUnexecutable` lowers to explicit crashes first.
-    fn evidenceResolution(self: *BodyContext, plan: static_dispatch.StaticDispatchCallPlan) ?EvidenceResolved {
-        switch (plan.resolution) {
+    fn consumeDispatchResolution(
+        self: *BodyContext,
+        resolution: static_dispatch.StaticDispatchResolution,
+    ) ConsumedDispatchResolution {
+        switch (resolution) {
             .direct => |node_id| return .{ .target = self.methodLookupForResolvedTarget(self.view.static_dispatch_plans.evidenceNode(node_id).target) },
             .constraint => |constraint_ref| {
                 const entry = self.evidence.at(constraint_ref) orelse
-                    Common.invariant("dispatch plan's constraint ref was outside the edge's evidence chain");
+                    Common.invariant("dispatch resolution's constraint ref was outside the edge's evidence chain");
                 return switch (entry) {
                     .target => |target| .{ .target = .{ .view = target.view, .target = target.target } },
-                    .structural => .structural,
-                    // Unreachable and checked-error dispatches crash before
-                    // target resolution.
-                    .unreachable_value, .checked_error => null,
+                    .structural => |kind| .{ .structural = kind },
+                    .unreachable_value => .unreachable_value,
+                    .checked_error => .checked_error,
                 };
             },
-            .structural => return .structural,
-            .checked_error, .unreachable_dispatch => return null,
+            .structural => |kind| return .{ .structural = kind },
+            .checked_error => return .checked_error,
+            .unreachable_dispatch => return .unreachable_value,
         }
     }
 
-    const UnexecutableDispatch = enum { unreachable_value, checked_error };
-
-    /// Whether checking decided this dispatch can never execute: its
-    /// dispatcher is a value no edge can supply (unreachable), or checking
-    /// rejected the requirement (a reported missing method). Both lower to an
-    /// explicit crash.
-    fn planUnexecutable(self: *BodyContext, plan: static_dispatch.StaticDispatchCallPlan) ?UnexecutableDispatch {
-        return switch (plan.resolution) {
-            .unreachable_dispatch => .unreachable_value,
-            .checked_error => .checked_error,
-            .constraint => |constraint_ref| switch (self.evidence.at(constraint_ref) orelse
-                Common.invariant("dispatch plan's constraint ref was outside the edge's evidence chain")) {
-                .unreachable_value => .unreachable_value,
-                .checked_error => .checked_error,
-                .target, .structural => null,
-            },
-            .direct, .structural => null,
-        };
-    }
-
-    fn dispatchTarget(
-        self: *BodyContext,
-        plan: static_dispatch.StaticDispatchCallPlan,
-    ) ?MethodLookup {
-        const resolution = self.evidenceResolution(plan) orelse
-            Common.invariant("dispatch plan reached monotype lowering without a resolution");
-        return switch (resolution) {
-            .target => |lookup| lookup,
-            .structural => null,
-        };
-    }
     /// Text-keyed view of `static_dispatch.structural_method_kinds`, for
     /// classifying a checked module view's method names during component
     /// synthesis.
@@ -25879,16 +25866,18 @@ const BodyContext = struct {
         if (!self.sameType(dispatcher_ty, actual_dispatcher_ty)) {
             Common.invariant("iterator dispatch plan dispatcher operand differed from the checked dispatcher type");
         }
-        // Consume the checked (or edge-supplied) resolution; iterator
-        // dispatches always resolve to a callable target.
-        const lookup: MethodLookup = switch (plan.resolution) {
-            .direct => |node_id| self.methodLookupForResolvedTarget(self.view.static_dispatch_plans.evidenceNode(node_id).target),
-            .constraint => |constraint_ref| switch (self.evidence.at(constraint_ref) orelse
-                Common.invariant("iterator dispatch plan's constraint ref was outside the edge's evidence chain")) {
-                .target => |target| .{ .view = target.view, .target = target.target },
-                .structural, .unreachable_value, .checked_error => Common.invariant("iterator dispatch evidence was not a callable target"),
-            },
-            .structural, .checked_error, .unreachable_dispatch => Common.invariant("iterator dispatch plan resolution was not a callable target"),
+        const lookup = switch (self.consumeDispatchResolution(plan.resolution)) {
+            .target => |target| target,
+            // Iterator value dispatch has no compiler-derived structural
+            // implementation. A structural result here violates the checked
+            // iterator plan contract.
+            .structural => Common.invariant("iterator dispatch resolved structurally"),
+            // The checker proved that no specialization edge can supply the
+            // iterator value, so this call site is explicitly unreachable.
+            .unreachable_value => return try self.runtimeCrashExpr(plan_fn_data.ret, "dispatch on a value that can never exist"),
+            // Checking already reported the missing method; running a module
+            // with errors reaches an explicit runtime crash.
+            .checked_error => return try self.runtimeCrashExpr(plan_fn_data.ret, "method dispatch failed to check"),
         };
 
         const target_mono_ty = try self.methodTargetMonoTypeFromPlan(lookup, callable_mono_ty);
