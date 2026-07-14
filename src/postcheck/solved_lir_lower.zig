@@ -2852,13 +2852,7 @@ const Lowerer = struct {
 
         const disc = try self.addLocalForLayout(.u16);
         const impossible = try self.result.store.addCFStmt(.{ .runtime_error = {} });
-        const switch_stmt = try self.result.store.addCFStmt(.{ .switch_stmt = .{
-            .cond = disc,
-            .branches = try self.result.store.addCFSwitchBranches(branches),
-            .default_branch = impossible,
-            .default_is_cold = true,
-            .continuation = null,
-        } });
+        const switch_stmt = try self.branchResultSwitch(disc, branches, impossible, true, next);
         return try self.result.store.addCFStmt(.{ .assign_ref = .{
             .target = disc,
             .op = .{ .discriminant = .{ .source = source } },
@@ -3437,7 +3431,7 @@ const Lowerer = struct {
             const variant_index: u16 = @intCast(i);
             const branch_done = try self.joinJump(done);
             const branch_body = try self.lowerCallableVariantCallInto(target, result_ty, callee, variant, variant_index, arg_exprs, branch_done);
-            current = try self.discriminantSwitch(callee, variant_index, branch_body, current, false);
+            current = try self.discriminantSwitchNoContinuation(callee, variant_index, branch_body, current, false);
         }
         const remainder = try self.lowerExprIntoAtType(callee, callee_expr, callee_ty, current);
         return try self.result.store.addCFStmt(.{ .join = .{
@@ -3918,7 +3912,14 @@ const Lowerer = struct {
                 .next = err_tag,
             } });
 
-        const switch_stmt = try self.discriminantSwitch(input_try_local, ok_variant, ok_start, err_start, sequence.err_is_cold);
+        const switch_stmt = try self.discriminantBranchResultSwitch(
+            input_try_local,
+            ok_variant,
+            ok_start,
+            err_start,
+            sequence.err_is_cold,
+            next,
+        );
         return try self.lowerExprInto(input_try_local, sequence.try_expr, switch_stmt);
     }
 
@@ -3985,7 +3986,14 @@ const Lowerer = struct {
                 .next = err_tag,
             } });
 
-        const switch_stmt = try self.discriminantSwitch(input_try_local, ok_variant, ok_start, err_start, sequence.err_is_cold);
+        const switch_stmt = try self.discriminantBranchResultSwitch(
+            input_try_local,
+            ok_variant,
+            ok_start,
+            err_start,
+            sequence.err_is_cold,
+            next,
+        );
         return try self.lowerExprInto(input_try_local, sequence.try_expr, switch_stmt);
     }
 
@@ -4687,7 +4695,7 @@ const Lowerer = struct {
         const source_ty = self.storageTypeOfLocalOr(source, ty);
         const variant_index = self.tagIndex(source_ty, name);
         const bind_payloads = try self.matchTagPayloadPatterns(source_ty, variant_index, payloads, source, on_match, miss, continuation);
-        return try self.discriminantSwitch(source, variant_index, bind_payloads, try self.patternMissJump(miss), false);
+        return try self.discriminantSwitchNoContinuation(source, variant_index, bind_payloads, try self.patternMissJump(miss), false);
     }
 
     fn lowerRecordPatternThen(
@@ -5339,7 +5347,15 @@ const Lowerer = struct {
         while (i > 0) {
             i -= 1;
             const field = GuardedList.at(fields, i);
-            current = try self.lowerFieldEqStep(lhs, rhs, field.ty, @intCast(i), current, failed);
+            current = try self.lowerFieldEqStep(
+                lhs,
+                rhs,
+                field.ty,
+                @intCast(i),
+                current,
+                failed,
+                next,
+            );
         }
         return current;
     }
@@ -5359,7 +5375,15 @@ const Lowerer = struct {
         while (i > 0) {
             i -= 1;
             const field = GuardedList.at(fields, i);
-            current = try self.lowerFieldEqStep(lhs, rhs, field.ty, @intCast(i), current, failed);
+            current = try self.lowerFieldEqStep(
+                lhs,
+                rhs,
+                field.ty,
+                @intCast(i),
+                current,
+                failed,
+                next,
+            );
         }
         return current;
     }
@@ -5378,7 +5402,15 @@ const Lowerer = struct {
         var i = items.len;
         while (i > 0) {
             i -= 1;
-            current = try self.lowerFieldEqStep(lhs, rhs, GuardedList.at(items, i), @intCast(i), current, failed);
+            current = try self.lowerFieldEqStep(
+                lhs,
+                rhs,
+                GuardedList.at(items, i),
+                @intCast(i),
+                current,
+                failed,
+                next,
+            );
         }
         return current;
     }
@@ -5391,11 +5423,12 @@ const Lowerer = struct {
         field_index: u16,
         on_equal: LIR.CFStmtId,
         on_not_equal: LIR.CFStmtId,
+        continuation: LIR.CFStmtId,
     ) Common.LowerError!LIR.CFStmtId {
         const lhs_field = try self.addTemp(field_ty);
         const rhs_field = try self.addTemp(field_ty);
         const eq = try self.addLocalForLayout(.bool);
-        var current = try self.boolSwitchNoContinuation(eq, on_equal, on_not_equal);
+        var current = try self.boolBranchResultSwitch(eq, on_equal, on_not_equal, continuation);
         current = try self.lowerEqLocalsInto(eq, lhs_field, rhs_field, field_ty, false, current);
         if (!self.isZstLocal(rhs_field)) {
             current = try self.assignRefRead(
@@ -5442,17 +5475,20 @@ const Lowerer = struct {
             const tag = GuardedList.at(tags, index);
             branches[index] = .{
                 .value = @intCast(index),
-                .body = try self.lowerTagPayloadEqVariant(lhs, rhs, tag, @intCast(index), success, failed),
+                .body = try self.lowerTagPayloadEqVariant(
+                    lhs,
+                    rhs,
+                    tag,
+                    @intCast(index),
+                    success,
+                    failed,
+                    next,
+                ),
             };
         }
 
-        const payload_switch = try self.result.store.addCFStmt(.{ .switch_stmt = .{
-            .cond = lhs_disc,
-            .branches = try self.result.store.addCFSwitchBranches(branches),
-            .default_branch = failed,
-            .continuation = null,
-        } });
-        const disc_switch = try self.boolSwitchNoContinuation(same_disc, payload_switch, failed);
+        const payload_switch = try self.branchResultSwitch(lhs_disc, branches, failed, false, next);
+        const disc_switch = try self.boolBranchResultSwitch(same_disc, payload_switch, failed, next);
         const eq_op: LIR.LowLevel = .num_is_eq;
         const compare_disc = try self.result.store.addCFStmt(.{ .assign_low_level = .{
             .target = same_disc,
@@ -5481,6 +5517,7 @@ const Lowerer = struct {
         variant_index: u16,
         on_equal: LIR.CFStmtId,
         on_not_equal: LIR.CFStmtId,
+        continuation: LIR.CFStmtId,
     ) Common.LowerError!LIR.CFStmtId {
         var current = on_equal;
         const payloads = self.types.span(tag.payloads);
@@ -5491,7 +5528,7 @@ const Lowerer = struct {
             const lhs_payload = try self.addTemp(payload_ty);
             const rhs_payload = try self.addTemp(payload_ty);
             const eq = try self.addLocalForLayout(.bool);
-            current = try self.boolSwitchNoContinuation(eq, current, on_not_equal);
+            current = try self.boolBranchResultSwitch(eq, current, on_not_equal, continuation);
             current = try self.lowerEqLocalsInto(eq, lhs_payload, rhs_payload, payload_ty, false, current);
             const payload_idx: ?u16 = if (payloads.len == 1) null else @as(u16, @intCast(i));
             if (!self.isZstLocal(rhs_payload)) {
@@ -5546,38 +5583,112 @@ const Lowerer = struct {
         } });
     }
 
-    fn boolSwitchNoContinuation(self: *Lowerer, cond: LIR.LocalId, true_body: LIR.CFStmtId, false_body: LIR.CFStmtId) Common.LowerError!LIR.CFStmtId {
-        const branches = [_]LIR.CFSwitchBranch{.{ .value = 1, .body = true_body }};
+    /// Build a structured switch whose result paths flow to one exact shared
+    /// suffix. Requiring the suffix here prevents lowering from silently
+    /// discarding the control-flow provenance ARC needs.
+    fn branchResultSwitch(
+        self: *Lowerer,
+        cond: LIR.LocalId,
+        branches: []const LIR.CFSwitchBranch,
+        default_branch: LIR.CFStmtId,
+        default_is_cold: bool,
+        continuation: LIR.CFStmtId,
+    ) Common.LowerError!LIR.CFStmtId {
         return try self.result.store.addCFStmt(.{ .switch_stmt = .{
             .cond = cond,
-            .branches = try self.result.store.addCFSwitchBranches(&branches),
-            .default_branch = false_body,
+            .branches = try self.result.store.addCFSwitchBranches(branches),
+            .default_branch = default_branch,
+            .default_is_cold = default_is_cold,
+            .continuation = continuation,
+        } });
+    }
+
+    /// Build a switch whose branches dispatch to distinct control-flow exits
+    /// rather than producing a result for one shared suffix.
+    fn nonRejoiningSwitch(
+        self: *Lowerer,
+        cond: LIR.LocalId,
+        branches: []const LIR.CFSwitchBranch,
+        default_branch: LIR.CFStmtId,
+        default_is_cold: bool,
+    ) Common.LowerError!LIR.CFStmtId {
+        return try self.result.store.addCFStmt(.{ .switch_stmt = .{
+            .cond = cond,
+            .branches = try self.result.store.addCFSwitchBranches(branches),
+            .default_branch = default_branch,
+            .default_is_cold = default_is_cold,
             .continuation = null,
         } });
     }
 
-    fn discriminantSwitch(
+    fn boolBranchResultSwitch(
+        self: *Lowerer,
+        cond: LIR.LocalId,
+        true_body: LIR.CFStmtId,
+        false_body: LIR.CFStmtId,
+        continuation: LIR.CFStmtId,
+    ) Common.LowerError!LIR.CFStmtId {
+        const branches = [_]LIR.CFSwitchBranch{.{ .value = 1, .body = true_body }};
+        return try self.branchResultSwitch(cond, &branches, false_body, false, continuation);
+    }
+
+    fn boolSwitchNoContinuation(self: *Lowerer, cond: LIR.LocalId, true_body: LIR.CFStmtId, false_body: LIR.CFStmtId) Common.LowerError!LIR.CFStmtId {
+        const branches = [_]LIR.CFSwitchBranch{.{ .value = 1, .body = true_body }};
+        return try self.nonRejoiningSwitch(cond, &branches, false_body, false);
+    }
+
+    fn discriminantBranchResultSwitch(
         self: *Lowerer,
         source: LIR.LocalId,
         discriminant: u16,
         body: LIR.CFStmtId,
-        default: LIR.CFStmtId,
+        default_branch: LIR.CFStmtId,
+        default_is_cold: bool,
+        continuation: LIR.CFStmtId,
+    ) Common.LowerError!LIR.CFStmtId {
+        if (self.isZstLocal(source)) return body;
+        const disc_local = try self.addLocalForLayout(.u16);
+        const branches = [_]LIR.CFSwitchBranch{.{ .value = discriminant, .body = body }};
+        const switch_stmt = try self.branchResultSwitch(
+            disc_local,
+            &branches,
+            default_branch,
+            default_is_cold,
+            continuation,
+        );
+        return try self.discriminantRead(source, disc_local, switch_stmt);
+    }
+
+    fn discriminantSwitchNoContinuation(
+        self: *Lowerer,
+        source: LIR.LocalId,
+        discriminant: u16,
+        body: LIR.CFStmtId,
+        default_branch: LIR.CFStmtId,
         default_is_cold: bool,
     ) Common.LowerError!LIR.CFStmtId {
         if (self.isZstLocal(source)) return body;
         const disc_local = try self.addLocalForLayout(.u16);
         const branches = [_]LIR.CFSwitchBranch{.{ .value = discriminant, .body = body }};
-        const switch_stmt = try self.result.store.addCFStmt(.{ .switch_stmt = .{
-            .cond = disc_local,
-            .branches = try self.result.store.addCFSwitchBranches(&branches),
-            .default_branch = default,
-            .default_is_cold = default_is_cold,
-            .continuation = null,
-        } });
+        const switch_stmt = try self.nonRejoiningSwitch(
+            disc_local,
+            &branches,
+            default_branch,
+            default_is_cold,
+        );
+        return try self.discriminantRead(source, disc_local, switch_stmt);
+    }
+
+    fn discriminantRead(
+        self: *Lowerer,
+        source: LIR.LocalId,
+        target: LIR.LocalId,
+        next: LIR.CFStmtId,
+    ) Common.LowerError!LIR.CFStmtId {
         return try self.result.store.addCFStmt(.{ .assign_ref = .{
-            .target = disc_local,
+            .target = target,
             .op = .{ .discriminant = .{ .source = source } },
-            .next = switch_stmt,
+            .next = next,
         } });
     }
 
@@ -5994,13 +6105,7 @@ const Lowerer = struct {
 
         const disc = try self.addLocalForLayout(.u16);
         const impossible = try self.result.store.addCFStmt(.{ .runtime_error = {} });
-        const switch_stmt = try self.result.store.addCFStmt(.{ .switch_stmt = .{
-            .cond = disc,
-            .branches = try self.result.store.addCFSwitchBranches(branches),
-            .default_branch = impossible,
-            .default_is_cold = true,
-            .continuation = null,
-        } });
+        const switch_stmt = try self.branchResultSwitch(disc, branches, impossible, true, next);
         return try self.result.store.addCFStmt(.{ .assign_ref = .{
             .target = disc,
             .op = .{ .discriminant = .{ .source = source } },
@@ -6224,13 +6329,7 @@ const Lowerer = struct {
 
         const disc = try self.addLocalForLayout(.u16);
         const impossible = try self.result.store.addCFStmt(.{ .runtime_error = {} });
-        const switch_stmt = try self.result.store.addCFStmt(.{ .switch_stmt = .{
-            .cond = disc,
-            .branches = try self.result.store.addCFSwitchBranches(branches),
-            .default_branch = impossible,
-            .default_is_cold = true,
-            .continuation = null,
-        } });
+        const switch_stmt = try self.branchResultSwitch(disc, branches, impossible, true, next);
         return try self.result.store.addCFStmt(.{ .assign_ref = .{
             .target = disc,
             .op = .{ .discriminant = .{ .source = source } },
