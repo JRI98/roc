@@ -22,8 +22,8 @@ A loop body only includes statements; it does not have a final expression. The l
 
 `for` can also be used on types that have an
 [`iter`](static-dispatch.md#iteration) method, as long as that method returns an
-[`Iter`](../builtins/Iter). The loop then calls `next` on the returned iterator.
-For example, [`List`](../builtins/List) has `List.iter`, so you can do a `for`
+[`Iter`](../Iter). The loop then calls `next` on the returned iterator.
+For example, [`List`](../List) has `List.iter`, so you can do a `for`
 loop over a list:
 
 ```roc
@@ -56,7 +56,7 @@ for _ in items {
 }
 ```
 
-Just like with [assignments](statements#assignments), the pattern you use here must be [exhaustive](pattern-matching#exhaustiveness). For example, the following would give an exhaustiveness error because the loop body couldn't know what value to use for `amount_to_add` if the item was ever `Err` at runtime:
+Just like with [assignments](statements#assignment), the pattern you use here must be [exhaustive](pattern-matching#exhaustiveness). For example, the following would give an exhaustiveness error because the loop body couldn't know what value to use for `amount_to_add` if the item was ever `Err` at runtime:
 
 ```roc
 var $count = 0
@@ -112,3 +112,7 @@ for i in [1, 2, 3] {
 ```
 
 Loops typically use [variable reassignment](./statements.md#reassignment) or for calling [effectful functions](./functions.md#effectful-functions).
+
+## Infinite Loops
+
+TODO

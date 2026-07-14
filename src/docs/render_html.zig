@@ -17,6 +17,13 @@ pub const RenderError = Allocator.Error || std.Io.Dir.CreateDirPathError || std.
 /// chosen so it cannot collide with a real module name.
 const langref_sidebar_id = "__lang_ref__";
 
+/// Links to the prose guides that live outside the generated docs. These are
+/// surfaced both in the sidebar and on the package index's main content (for the
+/// langref-enabled roc-lang.org site only), so they live here to stay in sync.
+/// Site-absolute so they also resolve in local previews of the whole site.
+const tutorial_url = "https://github.com/roc-lang/roc/blob/main/docs/mini-tutorial-new-compiler.md";
+const faq_url = "/faq";
+
 // Static assets embedded at compile time
 const embedded_css = @embedFile("static/styles.css");
 const embedded_js = @embedFile("static/search.js");
@@ -575,7 +582,7 @@ fn writeLangRefArticlePage(
     const base = if (article.is_index) "../" else "../../";
     const langref_base = if (article.is_index) "" else "../";
     try writeHtmlHead(w, title, base);
-    try writeBodyOpen(w);
+    try writeBodyOpen(w, false);
     try renderSidebar(w, ctx, gpa, base);
 
     try writeMainOpen(w, ctx, gpa, base);
@@ -607,27 +614,21 @@ fn writePackageIndex(ctx: *const RenderContext, gpa: Allocator, io: std.Io, dir:
     var index_title_buf: [256]u8 = undefined;
     const index_title = std.fmt.bufPrint(&index_title_buf, "{s} Docs", .{display_name}) catch display_name;
     try writeHtmlHead(w, index_title, "");
-    try writeBodyOpen(w);
+    try writeBodyOpen(w, true);
     try renderSidebar(w, ctx, gpa, "");
 
     // Main content
+    //
+    // The index page's center content used to repeat the module list (and a
+    // "Builtin Docs"/package-name heading) that's already in the sidebar. It's
+    // now just the guide links (see writeMainOpen) plus the search bar, so
+    // there's nothing package-specific to render here — just a decorative logo
+    // filling the otherwise-empty space.
     try writeMainOpen(w, ctx, gpa, "");
-    try w.writeAll("        <h1 class=\"module-name\">");
-    try writeHtmlEscaped(w, display_name);
-    try w.writeAll("</h1>\n");
-    try writeDocsStreamChunk(w);
 
-    // Module list
-    try w.writeAll("        <ul class=\"index-module-links\">\n");
-    for (ctx.package_docs.modules) |mod| {
-        try w.writeAll("            <li><a href=\"");
-        try writeHtmlEscaped(w, mod.name);
-        try w.writeAll("/\">");
-        try writeHtmlEscaped(w, mod.name);
-        try w.writeAll("</a></li>\n");
-    }
-    try w.writeAll("        </ul>\n");
-    try writeDocsStreamChunk(w);
+    try w.writeAll("        <div class=\"index-decoration\">\n            ");
+    try w.writeAll(index_decoration_svg);
+    try w.writeAll("\n        </div>\n");
 
     try writeFooter(w);
     try w.writeAll("    </main>\n");
@@ -660,7 +661,7 @@ fn writeModulePageToDir(ctx: *const RenderContext, gpa: Allocator, io: std.Io, d
     var title_buf: [256]u8 = undefined;
     const title = std.fmt.bufPrint(&title_buf, "{s} Docs", .{mod.name}) catch mod.name;
     try writeHtmlHead(w, title, base);
-    try writeBodyOpen(w);
+    try writeBodyOpen(w, false);
     try renderSidebar(w, ctx, gpa, base);
 
     // Main content
@@ -749,8 +750,16 @@ const link_svg_use =
     \\<svg class="link-icon"><use href="#link-icon"/></svg>
 ;
 
-fn writeBodyOpen(w: Writer) error{WriteFailed}!void {
-    try w.writeAll("<body>\n");
+fn writeBodyOpen(w: Writer, is_index: bool) error{WriteFailed}!void {
+    // The "docs-index" class shows the guide links in the main content on the
+    // docs landing page, in addition to the sidebar; search.js toggles the
+    // same class during soft navigation to keep it in sync on every other
+    // docs page.
+    if (is_index) {
+        try w.writeAll("<body class=\"docs-index\">\n");
+    } else {
+        try w.writeAll("<body>\n");
+    }
     try w.writeAll(link_svg_defs);
     try w.writeAll("\n");
 }
@@ -767,6 +776,7 @@ const menu_toggle_svg =
 
 fn writeMainOpen(w: Writer, ctx: *const RenderContext, gpa: Allocator, base: []const u8) (Allocator.Error || error{WriteFailed})!void {
     try w.writeAll("    <main>\n");
+
     try w.writeAll("        <form id=\"module-search-form\">\n");
     try w.writeAll("            <input type=\"search\" id=\"module-search\" placeholder=\"Search Documentation\" autocomplete=\"off\" />\n");
     // The no-JS input must be a sibling (not nested inside <noscript>) so it
@@ -783,6 +793,33 @@ fn writeMainOpen(w: Writer, ctx: *const RenderContext, gpa: Allocator, base: []c
     try renderSearchEntries(w, ctx, gpa, base);
     try w.writeAll("            </ul>\n");
     try w.writeAll("        </form>\n");
+
+    // Prose-guide links (Tutorial, FAQ, Language Reference) — the same links
+    // shown in the sidebar. Written into every docs page (gated only on
+    // langref, not on page type) because this element is part of the
+    // persistent chrome search.js carries across soft navigations, alongside
+    // the search form above (see createMainShell): it needs to already exist
+    // wherever the user first loads a full page, so it's there, correctly
+    // positioned, whenever a later soft navigation lands back on the index
+    // page and CSS (the "docs-index" body class) makes it visible. The
+    // langref link is base-relative like the sidebar's; both get normalized to
+    // an absolute pathname once at setup (see search.js's normalizeDocsLinks),
+    // so it keeps resolving correctly even after this element moves across
+    // page contexts as part of that persistent chrome.
+    if (ctx.langref != null) {
+        try w.writeAll("        <ul id=\"index-guide-links\" class=\"index-guide-links\">\n");
+        try w.writeAll("            <li><a href=\"");
+        try w.writeAll(base);
+        try w.writeAll("langref/\">Language Reference</a></li>\n");
+        try w.writeAll("            <li><a href=\"");
+        try w.writeAll(tutorial_url);
+        try w.writeAll("\">Tutorial</a></li>\n");
+        try w.writeAll("            <li><a href=\"");
+        try w.writeAll(faq_url);
+        try w.writeAll("\">FAQ</a></li>\n");
+        try w.writeAll("        </ul>\n");
+    }
+
     try w.writeAll("        <div class=\"main-content\">\n");
     try writeDocsStreamStart(w);
 }
@@ -1175,6 +1212,14 @@ const roc_logo_svg =
     \\</svg>
 ;
 
+/// Large outline-only rendering of the Roc logo shown as background decoration
+/// in the otherwise-empty center of the docs landing page.
+const index_decoration_svg =
+    \\<svg class="index-decoration-logo" viewBox="-0.5 -0.5 51.5 54" xmlns="http://www.w3.org/2000/svg" aria-hidden="true" focusable="false">
+    \\    <polygon points="0,0 23.8834,3.21052 37.2438,19.0101 45.9665,16.6324 50.5,22 45,22 44.0315,26.3689 26.4673,39.3424 27.4527,45.2132 17.655,53 23.6751,22.7086" />
+    \\</svg>
+;
+
 fn renderSidebarTree(
     w: Writer,
     module_name: []const u8,
@@ -1365,6 +1410,25 @@ fn renderSidebar(w: Writer, ctx: *const RenderContext, gpa: Allocator, base: []c
 
     try w.writeAll("        <div class=\"module-links-container\">\n");
     try w.writeAll("            <ul class=\"module-links\">\n");
+
+    // The langref-enabled docs are only built for the roc-lang.org site (see
+    // the title comment above), which serves them as the site's central docs
+    // page, so link the prose guides that live outside the generated docs:
+    // the tutorial on GitHub and the FAQ on the website (site-absolute so they
+    // also work in local previews of the site). Platforms are covered by the
+    // langref's own "Platforms" article, so they need no separate link here.
+    if (ctx.langref != null) {
+        try w.writeAll("                <li class=\"sidebar-entry\">\n");
+        try w.writeAll("                    <a class=\"sidebar-module-link active prose-label\" href=\"");
+        try w.writeAll(tutorial_url);
+        try w.writeAll("\"><span>Tutorial</span></a>\n");
+        try w.writeAll("                </li>\n");
+        try w.writeAll("                <li class=\"sidebar-entry\">\n");
+        try w.writeAll("                    <a class=\"sidebar-module-link active prose-label\" href=\"");
+        try w.writeAll(faq_url);
+        try w.writeAll("\"><span>FAQ</span></a>\n");
+        try w.writeAll("                </li>\n");
+    }
 
     // The promoted builtin types are grouped under one collapsible "Builtin
     // Types" entry so the (long) list can be hidden in one click and doesn't

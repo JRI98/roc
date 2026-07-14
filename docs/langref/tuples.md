@@ -82,3 +82,7 @@ describePoint = |point|
         (_, 0) -> "on x-axis"
         (x, y) -> "at (${x.toStr()}, ${y.toStr()})"
 ```
+
+## [Tuples vs Records](#tuples-vs-records) {#tuples-vs-records}
+
+TODO

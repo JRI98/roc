@@ -9,7 +9,7 @@ Roc has several different categories of modules, and they each hide different th
 
 - [Type modules](#type-modules) expose a single [type](types.md), including all its associated items (methods, nested types, etc.) and hide implementation details such as private helper functions called by that type's methods.
 - [Package modules](#package-modules) expose one or more [type modules](#type-modules) and hide private modules that are only used behind the scenes.
-- [Application modules](#app-modules) expose the entrypoints (e.g. `main`) required by the platform, and hide the implementation details which go into building those entrypoints.
+- [Application modules](#application-modules) expose the entrypoints (e.g. `main`) required by the platform, and hide the implementation details which go into building those entrypoints.
 - [Platform modules](#platform-modules) expose the [type modules](#type-modules) that application authors can import from the platform, and hide the configuration it uses to communicate with its lower-level [host](platforms.md#host) implementation.
 
 ## Type Modules
@@ -17,7 +17,7 @@ Roc has several different categories of modules, and they each hide different th
 Type modules are specified by a .roc file with a capitalized name, such as `Url.roc`.
 
 The file must contain a top-level [nominal type](types.md#nominal-types)
-(defined with `:=`, or optionally with `::` to make it [opaque](types.md#opaque-types)) whose name is
+(defined with `:=`, or optionally with `::` to make it [opaque](types.md#opaque-nominal-types)) whose name is
 the same as the filename without the `.roc` extension. Note that [type aliases](types.md#type-aliases)
 (defined with `:`) don't satisfy this requirement.
 
@@ -48,7 +48,7 @@ Url :: { self : Str }.{
 
 In this example, since `Url.ParseErr` is itself a type, you can nest other types inside it
 to get something like `Url.ParseErr.Foo.blah`. The nesting can go as deep as you like, and
-other modules can flatten out the nesting using `import` with the [`as` keyword](#import-as).
+other modules can flatten out the nesting using `import` with the [`as` keyword](#renaming-imported-modules-with-as).
 
 ### Alias modules
 
@@ -68,7 +68,7 @@ Now you could import `ParseErr` directly. This isn't commonly done for things li
 though, because having it qualified as `Url.ParseErr` is useful; it tells you that it's
 specifically a URL parsing error, which is more informative than a generic name like `ParseErr`.
 
-Alias modules are more useful when exporting [mutually recursive types](#mutually-recursive-type-modules).
+Alias modules are more useful when exporting [mutually recursive types](#importing-mutually-recursive-types).
 
 ### "Void" modules
 
@@ -93,7 +93,7 @@ private_helper_fn : …
 This is known as a _void module_ because it exposes an opaque _void type_ (namely, `[]`, which is
 the [empty tag union type](tag-unions.md#void); the empty tag union type is known as "void" for short).
 
-`Util` is [opaque](types.md#opaque-types), which prevents other modules from instantiating it,
+`Util` is [opaque](types.md#opaque-nominal-types), which prevents other modules from instantiating it,
 and its backing type is `[]`, which means it can't even be instantiated inside `Util.roc`
 itself. Choosing `[]` over `{}` for the backing type makes it clear that the `Util` type's
 purpose is just to be a namespace, not to be a value that ever gets passed anywhere.
@@ -121,7 +121,7 @@ annotations, where `Url` is the module name and `ParseError` is the type.
 
 Similarly, if you have a module like `Util.elm`, you still capitalize it, and still use `Util.foo`
 to call a `foo` function it exposes, but you don't have to define a `Util` type like you do in Roc.
-Mutually recursive types (discussed [below](#mutually-recursive-types)) work similarly in Elm to how
+Mutually recursive types (discussed [below](#importing-mutually-recursive-types)) work similarly in Elm to how
 they work in Roc; you'd define `FooBar.elm` which exposes the mutually recursive types `Foo` and `Bar`,
 and then import them using something like `import FooBar exposing (Foo, Bar)`.
 
@@ -264,7 +264,7 @@ These [mutually recursive types](types.md#mutually-recursive) do not come up oft
 they do, there's a helpful technique you can use to make them easier to import.
 
 Since type modules expose a single type, you can't expose both `Foo` and `Bar` from the
-same `.roc` file. However, you can wrap them both in a [void module](#void-module) named something like `FooBar.roc`:
+same `.roc` file. However, you can wrap them both in a [void module](#void-modules) named something like `FooBar.roc`:
 
 ```roc
 FooBar :: {}.{
