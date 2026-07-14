@@ -4608,7 +4608,7 @@ Builtin :: [].{
 
 				for (key, value) in data.entries {
 					entry_hash = hasher_finish(Value.to_hash(value, Key.to_hash(key, hasher)))
-					$entry_hashes = dict_combine_entry_hashes($entry_hashes, entry_hash)
+					$entry_hashes = combine_unordered_hashes($entry_hashes, entry_hash)
 				}
 
 				Hasher.write_u64(Hasher.write_u64(hasher, List.len(data.entries)), $entry_hashes)
@@ -5079,6 +5079,22 @@ Builtin :: [].{
 						},
 				)
 				state.all_found
+			}
+		}
+
+		## Feed a [Set] into a [Hasher]. The hash is independent of insertion order.
+		to_hash : Set(a), Hasher -> Hasher
+			where [a.to_hash : a, Hasher -> Hasher]
+		to_hash = |set, hasher| match set {
+			Items(items) => {
+				var $item_hashes = 0
+
+				for item in items {
+					item_hash = hasher_finish(item.to_hash(hasher))
+					$item_hashes = combine_unordered_hashes($item_hashes, item_hash)
+				}
+
+				Hasher.write_u64(Hasher.write_u64(hasher, List.len(items)), $item_hashes)
 			}
 		}
 
@@ -15764,8 +15780,8 @@ crypto_blake3_hasher_finish : List(U8) -> List(U8)
 dict_seed : () -> U64
 dict_seed = || dict_pseudo_seed()
 
-dict_combine_entry_hashes : U64, U64 -> U64
-dict_combine_entry_hashes = |a, b| U64.bitwise_xor(a, b)
+combine_unordered_hashes : U64, U64 -> U64
+combine_unordered_hashes = |a, b| U64.bitwise_xor(a, b)
 
 dict_empty_bucket : Dict.DictBucket
 dict_empty_bucket = { dist_and_fingerprint: 0, entry_index: 0 }

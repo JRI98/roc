@@ -502,6 +502,31 @@ pub const tests = [_]TestCase{
         .expected = .{ .inspect_str = "Ok(22.0)" },
     },
     .{
+        // https://github.com/roc-lang/roc/issues/10049
+        // Structural derivation must call a named component's exact equality
+        // and hash methods instead of inspecting its backing representation.
+        .name = "issue 10049: structural containers honor component equality and hash methods",
+        .source_kind = .module,
+        .source =
+        \\main = {
+        \\    d1 = Dict.from_list([("Bob", 3.1), ("John", 4.2)])
+        \\    d2 = Dict.from_list([("John", 4.2), ("Bob", 3.1)])
+        \\    records_equal = { owes: d1 } == { owes: d2 }
+        \\    tuples_equal = (d1, 0) == (d2, 0)
+        \\    tags_equal = Owes(d1) == Owes(d2)
+        \\    lists_equal = [d1] == [d2]
+        \\    sets_equal = { items: Set.from_list([1, 2]) } == { items: Set.from_list([2, 1]) }
+        \\    hash_round_trip = Dict.empty().insert({ owes: d1 }, "found").get({ owes: d2 }) == Ok("found")
+        \\    tuple_hash_round_trip = Dict.empty().insert((d1, 0), "found").get((d2, 0)) == Ok("found")
+        \\    tag_hash_round_trip = Dict.empty().insert(Owes(d1), "found").get(Owes(d2)) == Ok("found")
+        \\    set_hash_round_trip = Dict.empty().insert(Set.from_list([1, 2]), "found").get(Set.from_list([2, 1])) == Ok("found")
+        \\
+        \\    records_equal and tuples_equal and tags_equal and lists_equal and sets_equal and hash_round_trip and tuple_hash_round_trip and tag_hash_round_trip and set_hash_round_trip
+        \\}
+        ,
+        .expected = .{ .inspect_str = "True" },
+    },
+    .{
         // https://github.com/roc-lang/roc/issues/9783
         // The exact mathematical result is 16129, which does not fit in I8.
         .name = "issue 9783: signed times crashes on overflow",

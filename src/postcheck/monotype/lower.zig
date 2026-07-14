@@ -23409,10 +23409,11 @@ const BodyContext = struct {
     //
     // is_eq and to_hash share one recursive ladder: walk a type one layer at a
     // time, decomposing aggregates (records/tuples/tag unions) and transparent
-    // nominals, dispatching owned types (List) to their real method, and
-    // emitting a leaf node (`structural_eq` / `structural_hash`) for scalars,
-    // opaque nominals, and other inline-handled leaves. Recursion is broken by
-    // an expansion stack plus a memoized generated helper def.
+    // nominals that have no exact component method. A List or named component
+    // with an exact method dispatches to that method before its representation
+    // can be inspected. Scalars, opaque nominals, and other inline-handled
+    // leaves emit a leaf node (`structural_eq` / `structural_hash`). Recursion is
+    // broken by an expansion stack plus a memoized generated helper def.
     //
     // The per-derivation specifics are supplied by a comptime `Deriver` type
     // (`EqDeriver` / `HashDeriver`). A Deriver provides:
@@ -23427,8 +23428,8 @@ const BodyContext = struct {
     //   - `combineSeed` / `combine` plus `forward`: fold the per-component
     //     results (equality conjoins component bools with AND; hashing threads
     //     the accumulator left to right).
-    //   - `ownedCall` / `named` / `tagUnion`: the shapes whose decomposition
-    //     differs structurally between the two derivations.
+    //   - `methodArgTypes` / `named` / `tagUnion`: method call types and the
+    //     shapes whose decomposition differs between the two derivations.
     //
     // A `DerivationCtx` carries the runtime parameters shared by every step:
     // the derivation's result type (Bool / Hasher) and the method name.
@@ -23446,6 +23447,21 @@ const BodyContext = struct {
         ctx: DerivationCtx,
     ) Allocator.Error!DraftExprId {
         const shape = self.builder.program.types.get(ty);
+
+        switch (shape) {
+            .list => {
+                const lookup = (try self.builder.componentMethodTargetByName(self.method_scope, ty, ctx.method_name)) orelse
+                    Common.invariant(D.missing_component_method_msg);
+                return try self.derivationMethodCall(D, lookup, ty, operand, ctx);
+            },
+            .named => {
+                if (try self.builder.componentMethodTargetByName(self.method_scope, ty, ctx.method_name)) |lookup| {
+                    return try self.derivationMethodCall(D, lookup, ty, operand, ctx);
+                }
+            },
+            else => {},
+        }
+
         const expands_structurally = structurallyExpands(shape);
         var remove_active_expansion = false;
         const stack = D.expansionStack(self);
@@ -23461,7 +23477,7 @@ const BodyContext = struct {
         }
 
         return switch (shape) {
-            .list => try D.ownedCall(self, ty, operand, ctx),
+            .list => unreachable,
             .record => |fields| try self.derivationRecord(D, self.builder.program.types.fieldSpan(fields), operand, ctx),
             .tuple => |items| try self.derivationTuple(D, self.builder.program.types.span(items), operand, ctx),
             .tag_union => |tags| try D.tagUnion(self, ty, tags, operand, ctx),
@@ -23502,21 +23518,18 @@ const BodyContext = struct {
         });
     }
 
-    /// Dispatch an owned (non-structural) type to its real derived method,
-    /// shared by every derivation. The argument types and the per-derivation
-    /// invariant wording come from the comptime `Deriver`; the operand-to-args
-    /// mapping reuses `D.callArgs`.
-    fn derivationOwnedCall(
+    /// Dispatch a component to its exact checked method target, shared by every
+    /// derivation. The argument types come from the comptime `Deriver`; the
+    /// operand-to-args mapping reuses `D.callArgs`.
+    fn derivationMethodCall(
         self: *BodyContext,
         comptime D: type,
+        lookup: MethodLookup,
         ty: Type.TypeId,
         operand: D.Operand,
         ctx: DerivationCtx,
     ) Allocator.Error!DraftExprId {
-        const lookup = (try self.builder.componentMethodTargetByName(self.method_scope, ty, ctx.method_name)) orelse
-            Common.invariant(D.owned_missing_target_msg);
-
-        const arg_tys = D.ownedArgTypes(ty, ctx.result_ty);
+        const arg_tys = D.methodArgTypes(ty, ctx.result_ty);
         const callable_mono_ty = try self.methodTargetMonoTypeFromArgs(lookup, &arg_tys, ctx.result_ty);
         const args = D.callArgs(operand);
         return try self.addExpr(.{ .ty = ctx.result_ty, .data = .{ .call_proc = .{
@@ -27327,14 +27340,10 @@ const EqDeriver = struct {
         return .{ .lhs = lhs_item, .rhs = rhs_item };
     }
 
-    const owned_missing_target_msg = "checked method registry is missing owned equality target";
+    const missing_component_method_msg = "checked method registry is missing List equality target";
 
-    fn ownedArgTypes(ty: Type.TypeId, _: Type.TypeId) [2]Type.TypeId {
+    fn methodArgTypes(ty: Type.TypeId, _: Type.TypeId) [2]Type.TypeId {
         return .{ ty, ty };
-    }
-
-    fn ownedCall(self: *BodyContext, ty: Type.TypeId, operand: Operand, ctx: BodyContext.DerivationCtx) Allocator.Error!DraftExprId {
-        return try self.derivationOwnedCall(EqDeriver, ty, operand, ctx);
     }
 
     /// Decomposes structural equality on a nominal type. Record and tuple backings are
@@ -27549,14 +27558,10 @@ const HashDeriver = struct {
         return .{ .value = item_value, .hasher = state };
     }
 
-    const owned_missing_target_msg = "checked method registry is missing owned to_hash target";
+    const missing_component_method_msg = "checked method registry is missing List to_hash target";
 
-    fn ownedArgTypes(ty: Type.TypeId, result_ty: Type.TypeId) [2]Type.TypeId {
+    fn methodArgTypes(ty: Type.TypeId, result_ty: Type.TypeId) [2]Type.TypeId {
         return .{ ty, result_ty };
-    }
-
-    fn ownedCall(self: *BodyContext, ty: Type.TypeId, operand: Operand, ctx: BodyContext.DerivationCtx) Allocator.Error!DraftExprId {
-        return try self.derivationOwnedCall(HashDeriver, ty, operand, ctx);
     }
 
     fn named(self: *BodyContext, named_ty: Type.TypeId, backing_ty: Type.TypeId, operand: Operand, ctx: BodyContext.DerivationCtx) Allocator.Error!DraftExprId {
