@@ -1494,9 +1494,12 @@ fn renderLangRefSidebar(
         try writeHtmlEscaped(w, base);
         try w.writeAll("langref/");
         // Slugs contain only filename-safe characters, but escape defensively.
-        // No `.html`: each article is served at the extensionless `/langref/<slug>`.
+        // No `.html`: each article is served from `<slug>/index.html`. The
+        // trailing slash matches the module links above (`<Module>/`) and keeps
+        // the article's own relative links resolving correctly even when the
+        // server doesn't redirect the extensionless URL to its slashed form.
         try writeHtmlEscaped(w, article.slug);
-        try w.writeAll("\">");
+        try w.writeAll("/\">");
         // Render the title inline so backtick spans (e.g. the "`if` / `else`"
         // heading) become inline `<code>` rather than literal backticks.
         try render_markdown.renderTitleInline(w, gpa, langref.articles, article);
@@ -2541,21 +2544,30 @@ fn writeTypeLink(
         try w.writeAll("/#");
     }
 
-    // The promoted builtin modules use bare anchors (the `<module>.` prefix is
-    // stripped from their ids), so drop it from the fragment too.
-    if (ctx.isBuiltinDerived(target_module)) {
-        const bare_head = if (already_qualified) effective_head[target_module.len + 1 ..] else effective_head;
-        try writeHtmlEscaped(w, bare_head);
-        try writeHtmlEscaped(w, tail);
-        return;
+    // Compute the reference path relative to its module (i.e. without a leading
+    // `<module>.`). The module name may already be present in one of two shapes:
+    // folded into a multi-segment `effective_head` ("Num.U8"), or as a bare head
+    // whose tail holds the rest ("Encoding" + ".JsonState"). Detect and drop it
+    // in both, so the fragment we emit matches the id actually on the page.
+    var rel_head = effective_head;
+    var rel_tail = tail;
+    if (already_qualified) {
+        rel_head = effective_head[target_module.len + 1 ..];
+    } else if (std.mem.eql(u8, effective_head, target_module) and tail.len > 1 and tail[0] == '.') {
+        rel_head = tail[1..];
+        rel_tail = "";
     }
 
-    if (!already_qualified) {
+    // Promoted builtin modules use bare ids (the `<module>.` prefix is stripped
+    // from them), so emit the relative path as-is. Every other module keeps the
+    // prefix on its ids, so re-add it. Doing the stripping first means a
+    // reference that already carried the module name isn't prefixed twice.
+    if (!ctx.isBuiltinDerived(target_module)) {
         try writeHtmlEscaped(w, target_module);
         try w.writeAll(".");
     }
-    try writeHtmlEscaped(w, effective_head);
-    try writeHtmlEscaped(w, tail);
+    try writeHtmlEscaped(w, rel_head);
+    try writeHtmlEscaped(w, rel_tail);
 }
 
 fn writeHtmlEscaped(w: Writer, text: []const u8) (Allocator.Error || error{WriteFailed})!void {
@@ -2614,6 +2626,87 @@ test "renderDocTypeHtml handles deeply nested types without call stack recursion
 
     try renderDocTypeHtml(&output.writer, &ctx, gpa, root, false);
     try testing.expect(std.mem.startsWith(u8, output.written(), "<span class=\"type\">Wrap</span>("));
+}
+
+test "writeTypeLink strips the module prefix for same-module builtin refs" {
+    const testing = std.testing;
+    const gpa = testing.allocator;
+
+    // A promoted builtin module ("Encoding") uses bare ids (`JsonState`,
+    // `Json.ParseErr`), but the compiler can report a same-module reference
+    // module-qualified (`Encoding.JsonState`). The link must drop the redundant
+    // `Encoding.` so the fragment matches the id on the page — otherwise it
+    // points at `#Encoding.JsonState`, which doesn't exist. A regular module
+    // ("Parser") keeps the prefix on its ids, and must not have it doubled.
+    const encoding_entries = try gpa.alloc(DocModel.DocEntry, 1);
+    encoding_entries[0] = .{
+        .name = try gpa.dupe(u8, "Encoding.JsonState"),
+        .kind = .alias,
+        .type_signature = null,
+        .doc_comment = null,
+        .children = try gpa.alloc(DocModel.DocEntry, 0),
+    };
+    const parser_entries = try gpa.alloc(DocModel.DocEntry, 1);
+    parser_entries[0] = .{
+        .name = try gpa.dupe(u8, "State"),
+        .kind = .alias,
+        .type_signature = null,
+        .doc_comment = null,
+        .children = try gpa.alloc(DocModel.DocEntry, 0),
+    };
+
+    const modules = try gpa.alloc(DocModel.ModuleDocs, 2);
+    modules[0] = .{
+        .name = try gpa.dupe(u8, "Encoding"),
+        .package_name = try gpa.dupe(u8, "test"),
+        .kind = .type_module,
+        .module_doc = null,
+        .entries = encoding_entries,
+        .builtin_derived = true,
+    };
+    modules[1] = .{
+        .name = try gpa.dupe(u8, "Parser"),
+        .package_name = try gpa.dupe(u8, "test"),
+        .kind = .type_module,
+        .module_doc = null,
+        .entries = parser_entries,
+    };
+    defer {
+        for (modules) |*m| m.deinit(gpa);
+        gpa.free(modules);
+    }
+
+    var package_docs = DocModel.PackageDocs{
+        .name = try gpa.dupe(u8, "test"),
+        .modules = modules,
+    };
+    defer gpa.free(package_docs.name);
+
+    var ctx = try RenderContext.init(&package_docs, gpa);
+    defer ctx.deinit(gpa);
+
+    const expect = struct {
+        fn link(a: Allocator, c: *RenderContext, module_path: []const u8, type_name: []const u8, want: []const u8) (Allocator.Error || error{ WriteFailed, TestExpectedEqual })!void {
+            var out: std.Io.Writer.Allocating = .init(a);
+            defer out.deinit();
+            try writeTypeLink(&out.writer, c, module_path, type_name);
+            try std.testing.expectEqualStrings(want, out.written());
+        }
+    }.link;
+
+    // Same-module builtin refs: the `Encoding.` prefix is dropped, whether the
+    // type is top-level or nested under a sub-namespace.
+    try ctx.enterModule(gpa, &modules[0]);
+    try expect(gpa, &ctx, "Encoding", "Encoding.JsonState", "#JsonState");
+    try expect(gpa, &ctx, "Encoding", "Encoding.Json.ParseErr", "#Json.ParseErr");
+    try expect(gpa, &ctx, "Encoding", "JsonState", "#JsonState");
+    ctx.leaveModule();
+
+    // A regular module keeps the prefix on its ids and must not double it.
+    try ctx.enterModule(gpa, &modules[1]);
+    try expect(gpa, &ctx, "Parser", "Parser.State", "#Parser.State");
+    try expect(gpa, &ctx, "Parser", "State", "#Parser.State");
+    ctx.leaveModule();
 }
 
 test "writeDocRefHref reports broken shorthand refs" {
