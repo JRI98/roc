@@ -78,7 +78,9 @@ expect skipped_scalar_accepts("null")
 expect skipped_scalar_rejects("Null")
 
 # truncated literals are rejected, including at end of input
+# spellchecker:ignore-next-line
 expect bool_rejects("tru")
+# spellchecker:ignore-next-line
 expect bool_rejects("fals")
 expect skipped_scalar_rejects("nul")
 
