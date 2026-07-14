@@ -680,16 +680,16 @@ fn writeModulePageToDir(ctx: *const RenderContext, gpa: Allocator, io: std.Io, d
     if (entry_tree.collapsed_entry) |entry| {
         if (entry.kind == .nominal) {
             if (entry.type_signature) |sig| {
-                try w.writeAll("        <code class=\"entry-type-def\">");
+                try w.writeAll("        <pre class=\"entry-type-def\"><code class=\"entry-type-def-code\">");
                 try w.writeAll(":= ");
                 try renderDocTypeHtml(w, ctx, gpa, sig, false);
-                try w.writeAll("</code>\n");
+                try w.writeAll("</code></pre>\n");
                 try writeDocsStreamChunk(w);
             }
         } else if (entry.kind == .@"opaque") {
-            try w.writeAll("        <code class=\"entry-type-def\">");
+            try w.writeAll("        <pre class=\"entry-type-def\"><code class=\"entry-type-def-code\">");
             try writeHtmlEscaped(w, entry.type_header orelse entry.name);
-            try w.writeAll(" :: # (opaque)</code>\n");
+            try w.writeAll(" :: # (opaque)</code></pre>\n");
             try writeDocsStreamChunk(w);
         }
     }
@@ -1126,16 +1126,16 @@ fn renderEntryTree(
                 if (entry.kind == .nominal) {
                     if (entry.type_signature) |sig| {
                         try writeIndent(w, base + 1);
-                        try w.writeAll("<code class=\"entry-type-def\">");
+                        try w.writeAll("<pre class=\"entry-type-def\"><code class=\"entry-type-def-code\">");
                         try w.writeAll(":= ");
                         try renderDocTypeHtml(w, ctx, gpa, sig, false);
-                        try w.writeAll("</code>\n");
+                        try w.writeAll("</code></pre>\n");
                     }
                 } else if (entry.kind == .@"opaque") {
                     try writeIndent(w, base + 1);
-                    try w.writeAll("<code class=\"entry-type-def\">");
+                    try w.writeAll("<pre class=\"entry-type-def\"><code class=\"entry-type-def-code\">");
                     try writeHtmlEscaped(w, entry.type_header orelse entry.name);
-                    try w.writeAll(" :: # (opaque)</code>\n");
+                    try w.writeAll(" :: # (opaque)</code></pre>\n");
                 }
             } else {
                 // Signature block - styled as code, not a heading
@@ -1150,9 +1150,11 @@ fn renderEntryTree(
                 try w.writeAll(link_svg_use);
                 try w.writeAll("</a>\n");
                 try writeIndent(w, base + 2);
-                try w.writeAll("<code class=\"entry-signature-code\">");
+                // Use a preformatted element so production HTML minification
+                // preserves the relative indentation in multiline signatures.
+                try w.writeAll("<pre class=\"entry-signature-pre\"><code class=\"entry-signature-code\">");
                 try renderEntrySignature(w, ctx, gpa, entry, anchor_id);
-                try w.writeAll("</code>\n");
+                try w.writeAll("</code></pre>\n");
                 try writeIndent(w, base + 1);
                 try w.writeAll("</div>\n");
             }
@@ -2173,6 +2175,7 @@ fn renderDocTypeHtml(
                             } });
                             if (i > 0) try frames.append(gpa, .{ .html = ", " });
                         }
+                        if (func.args.len == 0) try frames.append(gpa, .{ .html = "()" });
                         if (item.needs_parens) try frames.append(gpa, .{ .html = "(" });
                     },
                     .record => |rec| {
@@ -2724,10 +2727,15 @@ test "doc shorthand refs in package docs resolve builtins and nested type-module
         .children = try gpa.alloc(DocModel.DocEntry, 0),
     };
 
+    const any_thing_type = try gpa.create(DocType);
+    any_thing_type.* = .{ .type_ref = .{
+        .module_path = try gpa.dupe(u8, ""),
+        .type_name = try gpa.dupe(u8, "Bool"),
+    } };
     const any_thing_entry = DocModel.DocEntry{
         .name = try gpa.dupe(u8, "any_thing"),
         .kind = .value,
-        .type_signature = null,
+        .type_signature = any_thing_type,
         .doc_comment = try gpa.dupe(u8, "Matches any [Utf8] and consumes all the input without fail."),
         .children = try gpa.alloc(DocModel.DocEntry, 0),
         .doc_comment_start_line = 8,
@@ -2803,7 +2811,54 @@ test "doc shorthand refs in package docs resolve builtins and nested type-module
     // Shorthand `[Name]` refs wrap their label in <code>.
     try testing.expect(std.mem.find(u8, html, "href=\"https://roc-lang.org/builtins/main/Str\"><code>Str</code></a>") != null);
     try testing.expect(std.mem.find(u8, html, "href=\"#String.Utf8\"><code>Utf8</code></a>") != null);
-    try testing.expect(std.mem.find(u8, html, "String(item) :: # (opaque)") != null);
+    try testing.expect(std.mem.find(
+        u8,
+        html,
+        "<pre class=\"entry-type-def\"><code class=\"entry-type-def-code\">String(item) :: # (opaque)</code></pre>",
+    ) != null);
+    try testing.expect(std.mem.find(
+        u8,
+        html,
+        "<pre class=\"entry-signature-pre\"><code class=\"entry-signature-code\">",
+    ) != null);
+}
+
+test "renderDocTypeHtml includes the unit argument for zero-argument functions" {
+    const testing = std.testing;
+    const gpa = testing.allocator;
+
+    const ret = try gpa.create(DocType);
+    ret.* = .{ .type_ref = .{
+        .module_path = try gpa.dupe(u8, ""),
+        .type_name = try gpa.dupe(u8, "Result"),
+    } };
+    const root = try gpa.create(DocType);
+    root.* = .{ .function = .{
+        .args = try gpa.alloc(*const DocType, 0),
+        .ret = ret,
+        .effectful = false,
+    } };
+    defer {
+        root.deinit(gpa);
+        gpa.destroy(root);
+    }
+
+    const package_docs = DocModel.PackageDocs{
+        .name = "Test",
+        .modules = &[_]DocModel.ModuleDocs{},
+    };
+    var ctx = try RenderContext.init(&package_docs, gpa);
+    defer ctx.deinit(gpa);
+    ctx.suppress_type_links = true;
+
+    var output: std.Io.Writer.Allocating = .init(gpa);
+    defer output.deinit();
+
+    try renderDocTypeHtml(&output.writer, &ctx, gpa, root, false);
+    try testing.expectEqualStrings(
+        "()<span class=\"sig-arrow\"> -&gt; </span><span class=\"type\">Result</span>",
+        output.written(),
+    );
 }
 
 test "renderDocTypeHtml renders where clause multi-line with square brackets" {
