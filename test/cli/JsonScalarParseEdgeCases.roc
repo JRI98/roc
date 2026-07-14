@@ -166,3 +166,131 @@ expect {
 	result = Json.parse("[,1]")
 	result == Err(Json.invalid_json)
 }
+
+# --- inter-token whitespace is exactly RFC 8259's ws ---
+
+# all four RFC whitespace bytes are skippable around tokens
+expect {
+	result : Try({ a : U64 }, Json.ParseErr)
+	result = Json.parse(" \t\n\r{ \"a\" :\t42 }\r\n")
+	result == Ok({ a: 42 })
+}
+
+# a form feed (0x0C) between tokens is not JSON whitespace
+expect {
+	document = Str.from_utf8([91, 49, 44, 12, 50, 93])
+
+	result : Try(List(U64), Json.ParseErr)
+	result = match document {
+		Ok(value) => Json.parse(value)
+		Err(_) => Err(Json.invalid_json)
+	}
+
+	result == Err(Json.invalid_json)
+}
+
+# a no-break space (U+00A0) before a value is not JSON whitespace
+expect {
+	document = Str.from_utf8([194, 160, 116, 114, 117, 101])
+
+	result : Try(Bool, Json.ParseErr)
+	result = match document {
+		Ok(value) => Json.parse(value)
+		Err(_) => Err(Json.invalid_json)
+	}
+
+	result == Err(Json.invalid_json)
+}
+
+# a vertical tab (0x0B) after the document is not JSON whitespace
+expect {
+	document = Str.from_utf8([52, 50, 11])
+
+	result : Try(U64, Json.ParseErr)
+	result = match document {
+		Ok(value) => Json.parse(value)
+		Err(_) => Err(Json.invalid_json)
+	}
+
+	result == Err(Json.invalid_json)
+}
+
+# a no-break space at each remaining grammar position rejects the document
+
+# after a key, before the colon
+expect {
+	document = Str.from_utf8([123, 34, 97, 34, 194, 160, 58, 49, 125])
+
+	result : Try({ a : U64 }, Json.ParseErr)
+	result = match document {
+		Ok(value) => Json.parse(value)
+		Err(_) => Err(Json.invalid_json)
+	}
+
+	result == Err(Json.invalid_json)
+}
+
+# after the colon, before the value
+expect {
+	document = Str.from_utf8([123, 34, 97, 34, 58, 194, 160, 49, 125])
+
+	result : Try({ a : U64 }, Json.ParseErr)
+	result = match document {
+		Ok(value) => Json.parse(value)
+		Err(_) => Err(Json.invalid_json)
+	}
+
+	result == Err(Json.invalid_json)
+}
+
+# between object fields, after the comma
+expect {
+	document = Str.from_utf8([123, 34, 97, 34, 58, 49, 44, 194, 160, 34, 98, 34, 58, 50, 125])
+
+	result : Try({ a : U64, b : U64 }, Json.ParseErr)
+	result = match document {
+		Ok(value) => Json.parse(value)
+		Err(_) => Err(Json.invalid_json)
+	}
+
+	result == Err(Json.invalid_json)
+}
+
+# before the object closer
+expect {
+	document = Str.from_utf8([123, 34, 97, 34, 58, 49, 194, 160, 125])
+
+	result : Try({ a : U64 }, Json.ParseErr)
+	result = match document {
+		Ok(value) => Json.parse(value)
+		Err(_) => Err(Json.invalid_json)
+	}
+
+	result == Err(Json.invalid_json)
+}
+
+# after the array opener
+expect {
+	document = Str.from_utf8([91, 194, 160, 49, 93])
+
+	result : Try(List(U64), Json.ParseErr)
+	result = match document {
+		Ok(value) => Json.parse(value)
+		Err(_) => Err(Json.invalid_json)
+	}
+
+	result == Err(Json.invalid_json)
+}
+
+# inside a skipped object, before a key
+expect {
+	document = Str.from_utf8([123, 34, 115, 107, 105, 112, 34, 58, 123, 194, 160, 34, 120, 34, 58, 49, 125, 44, 34, 97, 34, 58, 55, 125])
+
+	result : Try({ a : U64 }, Json.ParseErr)
+	result = match document {
+		Ok(value) => Json.parse(value)
+		Err(_) => Err(Json.invalid_json)
+	}
+
+	result == Err(Json.invalid_json)
+}
