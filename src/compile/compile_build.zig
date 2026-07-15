@@ -630,12 +630,24 @@ pub const BuildEnv = struct {
     /// Build `root_file`, using package aliases from an owning app/package/platform
     /// `main.roc` when the checked file is a child module.
     ///
+    /// A root file that carries its own packages (app/default_app/package/platform)
+    /// always uses its own header, regardless of `preferred_main`: `preferred_main`
+    /// exists to supply package aliases for files that declare none of their own
+    /// (module/type_module/hosted), not to override a root's own dependency graph.
+    ///
     /// `preferred_main` (e.g. LSP workspace `{root}/main.roc` or CLI `--main`) wins
     /// when set and different from `root_file`. Otherwise module/type_module/hosted
     /// roots walk ancestor directories for `main.roc` (same convention as #6538).
     pub fn buildResolvingMain(self: *BuildEnv, root_file: []const u8, preferred_main: ?[]const u8) BuildWithMainError!void {
         const root_abs = try self.makeAbsolute(root_file);
         defer self.gpa.free(root_abs);
+
+        const kind = self.peekPackageKind(root_abs) catch null;
+        const carries_packages = kind == .app or kind == .default_app or kind == .package or kind == .platform;
+        if (carries_packages) {
+            try self.build(root_file);
+            return;
+        }
 
         if (preferred_main) |main_path| {
             const main_abs = try self.makeAbsolute(main_path);
@@ -645,13 +657,6 @@ pub const BuildEnv = struct {
             } else {
                 try self.buildWithMain(root_file, main_path);
             }
-            return;
-        }
-
-        const kind = self.peekPackageKind(root_abs) catch null;
-        const carries_packages = kind == .app or kind == .default_app or kind == .package or kind == .platform;
-        if (carries_packages) {
-            try self.build(root_file);
             return;
         }
 

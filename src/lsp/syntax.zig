@@ -179,6 +179,11 @@ pub const SyntaxChecker = struct {
     }
 
     /// Test helper: record a URI as having published non-empty diagnostics.
+    ///
+    /// Not gated on `builtin.is_test` (unlike `getDocumentForTesting` in server.zig):
+    /// the LSP integration harness runs as a plain executable (`addExecutable`, not
+    /// `addTest`), so `builtin.is_test` is false there and such a guard would make
+    /// this helper silently inert for the integration specs that rely on it.
     pub fn seedPublishedDiagnosticUriForTesting(self: *SyntaxChecker, uri: []const u8) Allocator.Error!void {
         const owned = try self.allocator.dupe(u8, uri);
         const gop = try self.published_diagnostic_uris.getOrPut(self.allocator, owned);
@@ -186,6 +191,7 @@ pub const SyntaxChecker = struct {
     }
 
     /// Test helper: whether a URI is tracked as having published non-empty diagnostics.
+    /// See `seedPublishedDiagnosticUriForTesting` for why this isn't gated on `builtin.is_test`.
     pub fn hasPublishedDiagnosticUriForTesting(self: *SyntaxChecker, uri: []const u8) bool {
         return self.published_diagnostic_uris.contains(uri);
     }
