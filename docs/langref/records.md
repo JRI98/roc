@@ -7,3 +7,7 @@ TODO
 ## Nominal Records
 
 TODO
+
+## Empty Record
+
+TODO

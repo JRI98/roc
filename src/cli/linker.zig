@@ -19,11 +19,10 @@ const cli_ctx = @import("CliCtx.zig");
 const CliCtx = cli_ctx.CliCtx;
 const Io = cli_ctx.Io;
 
-/// Suppress linker warnings in release builds only. Debug builds of the
-/// compiler surface them: lld reports flags it parsed but ignored (e.g. a
-/// MachO `-r`) only as warnings, and suppressing those hides real bugs from
-/// compiler developers.
-const suppress_linker_warnings = builtin.mode != .Debug;
+/// Suppress embedded LLD warnings by default. Build the compiler with
+/// `-Dlinker-warnings=true` to surface all LLD diagnostics (including ignored
+/// flags that lld only reports as warnings).
+const suppress_linker_warnings = !build_options.linker_warnings;
 
 /// The embedded LLD entrypoints are only linked into LLVM-enabled CLI builds.
 const llvm_available = if (@import("builtin").is_test) false else @import("config").llvm;
@@ -557,7 +556,6 @@ fn buildLinkArgs(ctx: *CliCtx, config: LinkConfig) LinkError!std.array_list.Mana
             // Stamp a build id so stripped copies of the binary can be
             // matched back to their debug info.
             try args.append("--build-id");
-            // TODO make the confirugable instead of using comments
             // Suppress linker warnings
             if (suppress_linker_warnings) {
                 try args.append("-w");

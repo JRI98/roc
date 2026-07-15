@@ -12,6 +12,7 @@
 //!   - glue/env
 
 const std = @import("std");
+const build_options = @import("build_options");
 
 const glue_specs = [_]Spec{
     .{ .source = "src/glue/src/RustGlue.roc", .dest = "RustGlue.roc" },
@@ -30,8 +31,8 @@ const Spec = struct {
 pub fn main(init: std.process.Init) !void {
     const io = init.io;
 
-    var gpa_impl: std.heap.DebugAllocator(.{}) = .init;
-    defer _ = gpa_impl.deinit();
+    var gpa_impl: std.heap.DebugAllocator(.{ .stack_trace_frames = build_options.debug_gpa_stack_trace_frames }) = .init;
+    defer _ = build_options.debugGpaOk(gpa_impl.deinit());
     const gpa = gpa_impl.allocator();
 
     var arena_impl = std.heap.ArenaAllocator.init(gpa);

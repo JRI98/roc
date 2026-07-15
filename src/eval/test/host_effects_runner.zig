@@ -12,6 +12,7 @@
 //! order, and whether execution returned or terminated via crash.
 
 const std = @import("std");
+const build_options = @import("build_options");
 const Allocator = std.mem.Allocator;
 const posix = std.posix;
 const eval = @import("eval");
@@ -1016,8 +1017,8 @@ fn writeStatsJson(
 
 /// Public function `main`.
 pub fn main(init: std.process.Init) RunnerMainError!void {
-    var gpa_impl: std.heap.DebugAllocator(.{}) = .init;
-    defer _ = gpa_impl.deinit();
+    var gpa_impl: std.heap.DebugAllocator(.{ .stack_trace_frames = build_options.debug_gpa_stack_trace_frames }) = .init;
+    defer _ = build_options.debugGpaOk(gpa_impl.deinit());
     const gpa = gpa_impl.allocator();
 
     const io = init.io;

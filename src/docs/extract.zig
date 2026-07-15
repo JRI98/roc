@@ -32,11 +32,41 @@ pub const DocCommentExtract = struct {
     start_line: u32,
 };
 
+/// Precomputed index of newline byte positions for O(log n) byte-to-line lookup.
+pub const LineIndex = struct {
+    /// Sorted array of byte offsets where each `\n` occurs.
+    newline_offsets: []const u32,
+
+    pub fn build(allocator: Allocator, source: []const u8) Allocator.Error!LineIndex {
+        var list = std.ArrayList(u32).empty;
+        errdefer list.deinit(allocator);
+        for (source, 0..) |byte, i| {
+            if (byte == '\n') {
+                try list.append(allocator, @intCast(i));
+            }
+        }
+        return .{ .newline_offsets = try list.toOwnedSlice(allocator) };
+    }
+
+    pub fn deinit(self: LineIndex, allocator: Allocator) void {
+        allocator.free(self.newline_offsets);
+    }
+
+    /// Convert a byte offset to a 1-based line number using binary search.
+    pub fn lineOf(self: LineIndex, offset: u32) u32 {
+        return @intCast(std.sort.lowerBound(u32, self.newline_offsets, offset, struct {
+            fn compare(context: u32, item: u32) std.math.Order {
+                return std.math.order(context, item);
+            }
+        }.compare) + 1);
+    }
+};
+
 /// Extract the module-level doc comment from the top of a source file.
 ///
 /// Module doc comments are consecutive `##` lines at the very beginning of the
 /// file, before any non-comment content. Returns null if none found.
-pub fn extractModuleDocComment(gpa: Allocator, source: []const u8) Allocator.Error!?DocCommentExtract {
+pub fn extractModuleDocComment(gpa: Allocator, source: []const u8, line_index: LineIndex) Allocator.Error!?DocCommentExtract {
     var lines = std.ArrayList([]const u8).empty;
     defer lines.deinit(gpa);
 
@@ -92,7 +122,7 @@ pub fn extractModuleDocComment(gpa: Allocator, source: []const u8) Allocator.Err
 
     return .{
         .text = try joinLines(gpa, lines.items),
-        .start_line = byteOffsetToLine(source, first_line_byte),
+        .start_line = line_index.lineOf(first_line_byte),
     };
 }
 
@@ -100,7 +130,7 @@ pub fn extractModuleDocComment(gpa: Allocator, source: []const u8) Allocator.Err
 ///
 /// Scans backwards from `def_start_offset` to find consecutive `##` lines.
 /// Returns null if no doc comment is found.
-pub fn extractDocComment(gpa: Allocator, source: []const u8, def_start_offset: u32) Allocator.Error!?DocCommentExtract {
+pub fn extractDocComment(gpa: Allocator, source: []const u8, def_start_offset: u32, line_index: LineIndex) Allocator.Error!?DocCommentExtract {
     if (def_start_offset == 0 or def_start_offset > source.len) return null;
 
     var lines = std.ArrayList([]const u8).empty;
@@ -164,19 +194,8 @@ pub fn extractDocComment(gpa: Allocator, source: []const u8, def_start_offset: u
 
     return .{
         .text = try joinLines(gpa, lines.items),
-        .start_line = byteOffsetToLine(source, first_line_byte),
+        .start_line = line_index.lineOf(first_line_byte),
     };
-}
-
-/// Convert a byte offset within `source` into a 1-based source line number.
-fn byteOffsetToLine(source: []const u8, offset: u32) u32 {
-    var line: u32 = 1;
-    const end = @min(@as(usize, offset), source.len);
-    var i: usize = 0;
-    while (i < end) : (i += 1) {
-        if (source[i] == '\n') line += 1;
-    }
-    return line;
 }
 
 /// Extract documentation for all exported definitions in a module.
@@ -198,9 +217,11 @@ pub fn extractModuleDocs(
     source_path: ?[]const u8,
 ) Allocator.Error!DocModel.ModuleDocs {
     const source = module_env.getSourceAll();
+    const line_index = try LineIndex.build(gpa, source);
+    defer line_index.deinit(gpa);
 
     // Extract module-level doc comment
-    const module_doc_extract = try extractModuleDocComment(gpa, source);
+    const module_doc_extract = try extractModuleDocComment(gpa, source, line_index);
     errdefer if (module_doc_extract) |d| gpa.free(d.text);
     const module_doc: ?[]const u8 = if (module_doc_extract) |d| d.text else null;
     const module_doc_start_line: u32 = if (module_doc_extract) |d| d.start_line else 0;
@@ -244,7 +265,7 @@ pub fn extractModuleDocs(
     };
 
     for (defs_slice) |def_idx| {
-        if (try extractDefEntry(gpa, module_env, local_module_path, def_idx, source)) |entry| {
+        if (try extractDefEntry(gpa, module_env, local_module_path, def_idx, source, line_index)) |entry| {
             // Skip internal Builtin functions
             if (std.mem.eql(u8, package_name, "Builtin") and isInternalBuiltin(entry.name)) {
                 var mutable_entry = entry;
@@ -270,7 +291,7 @@ pub fn extractModuleDocs(
                 if (std.mem.eql(u8, package_name, "Builtin") and isInternalBuiltin(entry_name)) continue;
 
                 const region = module_env.store.getStatementRegion(stmt_idx);
-                const doc_extract = try extractDocComment(gpa, source, region.start.offset);
+                const doc_extract = try extractDocComment(gpa, source, region.start.offset, line_index);
                 errdefer if (doc_extract) |d| gpa.free(d.text);
 
                 const type_sig = try extractDeclTypeSig(gpa, module_env, local_module_path, decl.anno);
@@ -302,7 +323,7 @@ pub fn extractModuleDocs(
                 if (std.mem.eql(u8, package_name, "Builtin") and isInternalBuiltin(entry_name)) continue;
 
                 const region = module_env.store.getStatementRegion(stmt_idx);
-                const doc_extract = try extractDocComment(gpa, source, region.start.offset);
+                const doc_extract = try extractDocComment(gpa, source, region.start.offset, line_index);
                 errdefer if (doc_extract) |d| gpa.free(d.text);
 
                 const type_sig = try extractDeclTypeSig(gpa, module_env, local_module_path, decl.anno);
@@ -654,6 +675,7 @@ fn extractDefEntry(
     local_module_path: []const u8,
     def_idx: CIR.Def.Idx,
     source: []const u8,
+    line_index: LineIndex,
 ) Allocator.Error!?DocModel.DocEntry {
     const def = module_env.store.getDef(def_idx);
     const pattern = module_env.store.getPattern(def.pattern);
@@ -666,7 +688,7 @@ fn extractDefEntry(
 
             // Get the byte offset for doc comment scanning
             const offset = getDefSourceOffset(module_env, def);
-            const doc_extract = try extractDocComment(gpa, source, offset);
+            const doc_extract = try extractDocComment(gpa, source, offset, line_index);
             errdefer if (doc_extract) |d| gpa.free(d.text);
 
             // For annotated definitions, render the checked source annotation.
@@ -718,7 +740,7 @@ fn extractDefEntry(
 
                     // Use the statement region for doc comment scanning
                     const region = module_env.store.getStatementRegion(n.nominal_type_decl);
-                    const doc_extract = try extractDocComment(gpa, source, region.start.offset);
+                    const doc_extract = try extractDocComment(gpa, source, region.start.offset, line_index);
                     errdefer if (doc_extract) |d| gpa.free(d.text);
 
                     const type_sig = try extractDeclTypeSig(gpa, module_env, local_module_path, decl.anno);
@@ -2445,4 +2467,85 @@ fn trimLeft(s: []const u8) []const u8 {
         i += 1;
     }
     return s[i..];
+}
+
+/// Reference implementation of the old byteOffsetToLine for test comparison.
+fn oldByteOffsetToLine(source: []const u8, offset: u32) u32 {
+    var line: u32 = 1;
+    const end = @min(@as(usize, offset), source.len);
+    var i: usize = 0;
+    while (i < end) : (i += 1) {
+        if (source[i] == '\n') line += 1;
+    }
+    return line;
+}
+
+fn expectLineIndexMatches(source: []const u8) Allocator.Error!void {
+    const gpa = std.testing.allocator;
+    const index = try LineIndex.build(gpa, source);
+    defer index.deinit(gpa);
+
+    const end: u32 = @intCast(source.len);
+    var offset: u32 = 0;
+    while (offset <= end) : (offset += 1) {
+        const expected = oldByteOffsetToLine(source, offset);
+        const actual = index.lineOf(offset);
+        if (expected != actual) {
+            std.debug.panic("lineOf({d}): expected {d}, got {d}", .{ offset, expected, actual });
+        }
+    }
+}
+
+test "LineIndex: empty source" {
+    try expectLineIndexMatches("");
+}
+
+test "LineIndex: single line, no newline" {
+    try expectLineIndexMatches("hello world");
+}
+
+test "LineIndex: single trailing newline" {
+    try expectLineIndexMatches("hello\n");
+}
+
+test "LineIndex: two lines" {
+    try expectLineIndexMatches("hello\nworld");
+}
+
+test "LineIndex: two lines with trailing newline" {
+    try expectLineIndexMatches("hello\nworld\n");
+}
+
+test "LineIndex: multiple lines" {
+    try expectLineIndexMatches("line1\nline2\nline3\nline4");
+}
+
+test "LineIndex: consecutive newlines" {
+    try expectLineIndexMatches("a\n\n\nb\n");
+}
+
+test "LineIndex: offset at newline byte" {
+    try expectLineIndexMatches("abc\ndef\nghi");
+}
+
+test "LineIndex: offset beyond source length clamps to line count" {
+    const gpa = std.testing.allocator;
+    const source = "one\ntwo\nthree";
+    const index = try LineIndex.build(gpa, source);
+    defer index.deinit(gpa);
+
+    // Offset past end of source should still return the last line
+    const beyond: u32 = @intCast(source.len + 100);
+    const expected = oldByteOffsetToLine(source, beyond);
+    const actual = index.lineOf(beyond);
+    try std.testing.expectEqual(expected, actual);
+}
+
+test "LineIndex: offset zero" {
+    const gpa = std.testing.allocator;
+    const source = "first\nsecond\nthird";
+    const index = try LineIndex.build(gpa, source);
+    defer index.deinit(gpa);
+
+    try std.testing.expectEqual(@as(u32, 1), index.lineOf(0));
 }

@@ -7,6 +7,7 @@
 //! "Hello from the Greeting module!" as raw echo output.
 
 const std = @import("std");
+const build_options = @import("build_options");
 const Allocator = std.mem.Allocator;
 const bytebox = @import("bytebox");
 
@@ -95,8 +96,8 @@ fn requireNotContains(haystack: []const u8, needle: []const u8, label: []const u
 pub fn main(init: std.process.Init) anyerror!void {
     const io = init.io;
 
-    var gpa_impl: std.heap.DebugAllocator(.{}) = .init;
-    defer _ = gpa_impl.deinit();
+    var gpa_impl: std.heap.DebugAllocator(.{ .stack_trace_frames = build_options.debug_gpa_stack_trace_frames }) = .init;
+    defer _ = build_options.debugGpaOk(gpa_impl.deinit());
     const gpa = gpa_impl.allocator();
 
     var arena_impl = std.heap.ArenaAllocator.init(gpa);

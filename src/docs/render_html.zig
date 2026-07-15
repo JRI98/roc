@@ -17,6 +17,13 @@ pub const RenderError = Allocator.Error || std.Io.Dir.CreateDirPathError || std.
 /// chosen so it cannot collide with a real module name.
 const langref_sidebar_id = "__lang_ref__";
 
+/// Links to the prose guides that live outside the generated docs. These are
+/// surfaced both in the sidebar and on the package index's main content (for the
+/// langref-enabled roc-lang.org site only), so they live here to stay in sync.
+/// Site-absolute so they also resolve in local previews of the whole site.
+const tutorial_url = "https://github.com/roc-lang/roc/blob/main/docs/mini-tutorial-new-compiler.md";
+const faq_url = "/faq";
+
 // Static assets embedded at compile time
 const embedded_css = @embedFile("static/styles.css");
 const embedded_js = @embedFile("static/search.js");
@@ -575,7 +582,7 @@ fn writeLangRefArticlePage(
     const base = if (article.is_index) "../" else "../../";
     const langref_base = if (article.is_index) "" else "../";
     try writeHtmlHead(w, title, base);
-    try writeBodyOpen(w);
+    try writeBodyOpen(w, false);
     try renderSidebar(w, ctx, gpa, base);
 
     try writeMainOpen(w, ctx, gpa, base);
@@ -607,27 +614,21 @@ fn writePackageIndex(ctx: *const RenderContext, gpa: Allocator, io: std.Io, dir:
     var index_title_buf: [256]u8 = undefined;
     const index_title = std.fmt.bufPrint(&index_title_buf, "{s} Docs", .{display_name}) catch display_name;
     try writeHtmlHead(w, index_title, "");
-    try writeBodyOpen(w);
+    try writeBodyOpen(w, true);
     try renderSidebar(w, ctx, gpa, "");
 
     // Main content
+    //
+    // The index page's center content used to repeat the module list (and a
+    // "Builtin Docs"/package-name heading) that's already in the sidebar. It's
+    // now just the guide links (see writeMainOpen) plus the search bar, so
+    // there's nothing package-specific to render here — just a decorative logo
+    // filling the otherwise-empty space.
     try writeMainOpen(w, ctx, gpa, "");
-    try w.writeAll("        <h1 class=\"module-name\">");
-    try writeHtmlEscaped(w, display_name);
-    try w.writeAll("</h1>\n");
-    try writeDocsStreamChunk(w);
 
-    // Module list
-    try w.writeAll("        <ul class=\"index-module-links\">\n");
-    for (ctx.package_docs.modules) |mod| {
-        try w.writeAll("            <li><a href=\"");
-        try writeHtmlEscaped(w, mod.name);
-        try w.writeAll("/\">");
-        try writeHtmlEscaped(w, mod.name);
-        try w.writeAll("</a></li>\n");
-    }
-    try w.writeAll("        </ul>\n");
-    try writeDocsStreamChunk(w);
+    try w.writeAll("        <div class=\"index-decoration\">\n            ");
+    try w.writeAll(index_decoration_svg);
+    try w.writeAll("\n        </div>\n");
 
     try writeFooter(w);
     try w.writeAll("    </main>\n");
@@ -660,7 +661,7 @@ fn writeModulePageToDir(ctx: *const RenderContext, gpa: Allocator, io: std.Io, d
     var title_buf: [256]u8 = undefined;
     const title = std.fmt.bufPrint(&title_buf, "{s} Docs", .{mod.name}) catch mod.name;
     try writeHtmlHead(w, title, base);
-    try writeBodyOpen(w);
+    try writeBodyOpen(w, false);
     try renderSidebar(w, ctx, gpa, base);
 
     // Main content
@@ -679,16 +680,16 @@ fn writeModulePageToDir(ctx: *const RenderContext, gpa: Allocator, io: std.Io, d
     if (entry_tree.collapsed_entry) |entry| {
         if (entry.kind == .nominal) {
             if (entry.type_signature) |sig| {
-                try w.writeAll("        <code class=\"entry-type-def\">");
+                try w.writeAll("        <pre class=\"entry-type-def\"><code class=\"entry-type-def-code\">");
                 try w.writeAll(":= ");
                 try renderDocTypeHtml(w, ctx, gpa, sig, false);
-                try w.writeAll("</code>\n");
+                try w.writeAll("</code></pre>\n");
                 try writeDocsStreamChunk(w);
             }
         } else if (entry.kind == .@"opaque") {
-            try w.writeAll("        <code class=\"entry-type-def\">");
+            try w.writeAll("        <pre class=\"entry-type-def\"><code class=\"entry-type-def-code\">");
             try writeHtmlEscaped(w, entry.type_header orelse entry.name);
-            try w.writeAll(" :: # (opaque)</code>\n");
+            try w.writeAll(" :: # (opaque)</code></pre>\n");
             try writeDocsStreamChunk(w);
         }
     }
@@ -749,8 +750,16 @@ const link_svg_use =
     \\<svg class="link-icon"><use href="#link-icon"/></svg>
 ;
 
-fn writeBodyOpen(w: Writer) error{WriteFailed}!void {
-    try w.writeAll("<body>\n");
+fn writeBodyOpen(w: Writer, is_index: bool) error{WriteFailed}!void {
+    // The "docs-index" class shows the guide links in the main content on the
+    // docs landing page, in addition to the sidebar; search.js toggles the
+    // same class during soft navigation to keep it in sync on every other
+    // docs page.
+    if (is_index) {
+        try w.writeAll("<body class=\"docs-index\">\n");
+    } else {
+        try w.writeAll("<body>\n");
+    }
     try w.writeAll(link_svg_defs);
     try w.writeAll("\n");
 }
@@ -767,6 +776,7 @@ const menu_toggle_svg =
 
 fn writeMainOpen(w: Writer, ctx: *const RenderContext, gpa: Allocator, base: []const u8) (Allocator.Error || error{WriteFailed})!void {
     try w.writeAll("    <main>\n");
+
     try w.writeAll("        <form id=\"module-search-form\">\n");
     try w.writeAll("            <input type=\"search\" id=\"module-search\" placeholder=\"Search Documentation\" autocomplete=\"off\" />\n");
     // The no-JS input must be a sibling (not nested inside <noscript>) so it
@@ -783,6 +793,33 @@ fn writeMainOpen(w: Writer, ctx: *const RenderContext, gpa: Allocator, base: []c
     try renderSearchEntries(w, ctx, gpa, base);
     try w.writeAll("            </ul>\n");
     try w.writeAll("        </form>\n");
+
+    // Prose-guide links (Tutorial, FAQ, Language Reference) — the same links
+    // shown in the sidebar. Written into every docs page (gated only on
+    // langref, not on page type) because this element is part of the
+    // persistent chrome search.js carries across soft navigations, alongside
+    // the search form above (see createMainShell): it needs to already exist
+    // wherever the user first loads a full page, so it's there, correctly
+    // positioned, whenever a later soft navigation lands back on the index
+    // page and CSS (the "docs-index" body class) makes it visible. The
+    // langref link is base-relative like the sidebar's; both get normalized to
+    // an absolute pathname once at setup (see search.js's normalizeDocsLinks),
+    // so it keeps resolving correctly even after this element moves across
+    // page contexts as part of that persistent chrome.
+    if (ctx.langref != null) {
+        try w.writeAll("        <ul id=\"index-guide-links\" class=\"index-guide-links\">\n");
+        try w.writeAll("            <li><a href=\"");
+        try w.writeAll(base);
+        try w.writeAll("langref/\">Language Reference</a></li>\n");
+        try w.writeAll("            <li><a href=\"");
+        try w.writeAll(tutorial_url);
+        try w.writeAll("\">Tutorial</a></li>\n");
+        try w.writeAll("            <li><a href=\"");
+        try w.writeAll(faq_url);
+        try w.writeAll("\">FAQ</a></li>\n");
+        try w.writeAll("        </ul>\n");
+    }
+
     try w.writeAll("        <div class=\"main-content\">\n");
     try writeDocsStreamStart(w);
 }
@@ -1089,16 +1126,16 @@ fn renderEntryTree(
                 if (entry.kind == .nominal) {
                     if (entry.type_signature) |sig| {
                         try writeIndent(w, base + 1);
-                        try w.writeAll("<code class=\"entry-type-def\">");
+                        try w.writeAll("<pre class=\"entry-type-def\"><code class=\"entry-type-def-code\">");
                         try w.writeAll(":= ");
                         try renderDocTypeHtml(w, ctx, gpa, sig, false);
-                        try w.writeAll("</code>\n");
+                        try w.writeAll("</code></pre>\n");
                     }
                 } else if (entry.kind == .@"opaque") {
                     try writeIndent(w, base + 1);
-                    try w.writeAll("<code class=\"entry-type-def\">");
+                    try w.writeAll("<pre class=\"entry-type-def\"><code class=\"entry-type-def-code\">");
                     try writeHtmlEscaped(w, entry.type_header orelse entry.name);
-                    try w.writeAll(" :: # (opaque)</code>\n");
+                    try w.writeAll(" :: # (opaque)</code></pre>\n");
                 }
             } else {
                 // Signature block - styled as code, not a heading
@@ -1113,9 +1150,11 @@ fn renderEntryTree(
                 try w.writeAll(link_svg_use);
                 try w.writeAll("</a>\n");
                 try writeIndent(w, base + 2);
-                try w.writeAll("<code class=\"entry-signature-code\">");
+                // Use a preformatted element so production HTML minification
+                // preserves the relative indentation in multiline signatures.
+                try w.writeAll("<pre class=\"entry-signature-pre\"><code class=\"entry-signature-code\">");
                 try renderEntrySignature(w, ctx, gpa, entry, anchor_id);
-                try w.writeAll("</code>\n");
+                try w.writeAll("</code></pre>\n");
                 try writeIndent(w, base + 1);
                 try w.writeAll("</div>\n");
             }
@@ -1172,6 +1211,14 @@ const roc_logo_svg =
     \\<svg viewBox="0 -6 51 58" fill="none" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="logo-link">
     \\    <title id="logo-link">Home</title>
     \\    <polygon role="presentation" points="0,0 23.8834,3.21052 37.2438,19.0101 45.9665,16.6324 50.5,22 45,22 44.0315,26.3689 26.4673,39.3424 27.4527,45.2132 17.655,53 23.6751,22.7086" />
+    \\</svg>
+;
+
+/// Large outline-only rendering of the Roc logo shown as background decoration
+/// in the otherwise-empty center of the docs landing page.
+const index_decoration_svg =
+    \\<svg class="index-decoration-logo" viewBox="-0.5 -0.5 51.5 54" xmlns="http://www.w3.org/2000/svg" aria-hidden="true" focusable="false">
+    \\    <polygon points="0,0 23.8834,3.21052 37.2438,19.0101 45.9665,16.6324 50.5,22 45,22 44.0315,26.3689 26.4673,39.3424 27.4527,45.2132 17.655,53 23.6751,22.7086" />
     \\</svg>
 ;
 
@@ -1366,6 +1413,25 @@ fn renderSidebar(w: Writer, ctx: *const RenderContext, gpa: Allocator, base: []c
     try w.writeAll("        <div class=\"module-links-container\">\n");
     try w.writeAll("            <ul class=\"module-links\">\n");
 
+    // The langref-enabled docs are only built for the roc-lang.org site (see
+    // the title comment above), which serves them as the site's central docs
+    // page, so link the prose guides that live outside the generated docs:
+    // the tutorial on GitHub and the FAQ on the website (site-absolute so they
+    // also work in local previews of the site). Platforms are covered by the
+    // langref's own "Platforms" article, so they need no separate link here.
+    if (ctx.langref != null) {
+        try w.writeAll("                <li class=\"sidebar-entry\">\n");
+        try w.writeAll("                    <a class=\"sidebar-module-link active prose-label\" href=\"");
+        try w.writeAll(tutorial_url);
+        try w.writeAll("\"><span>Tutorial</span></a>\n");
+        try w.writeAll("                </li>\n");
+        try w.writeAll("                <li class=\"sidebar-entry\">\n");
+        try w.writeAll("                    <a class=\"sidebar-module-link active prose-label\" href=\"");
+        try w.writeAll(faq_url);
+        try w.writeAll("\"><span>FAQ</span></a>\n");
+        try w.writeAll("                </li>\n");
+    }
+
     // The promoted builtin types are grouped under one collapsible "Builtin
     // Types" entry so the (long) list can be hidden in one click and doesn't
     // push the Language Reference section down. Everything else renders as a
@@ -1430,9 +1496,12 @@ fn renderLangRefSidebar(
         try writeHtmlEscaped(w, base);
         try w.writeAll("langref/");
         // Slugs contain only filename-safe characters, but escape defensively.
-        // No `.html`: each article is served at the extensionless `/langref/<slug>`.
+        // No `.html`: each article is served from `<slug>/index.html`. The
+        // trailing slash matches the module links above (`<Module>/`) and keeps
+        // the article's own relative links resolving correctly even when the
+        // server doesn't redirect the extensionless URL to its slashed form.
         try writeHtmlEscaped(w, article.slug);
-        try w.writeAll("\">");
+        try w.writeAll("/\">");
         // Render the title inline so backtick spans (e.g. the "`if` / `else`"
         // heading) become inline `<code>` rather than literal backticks.
         try render_markdown.renderTitleInline(w, gpa, langref.articles, article);
@@ -2109,6 +2178,7 @@ fn renderDocTypeHtml(
                             } });
                             if (i > 0) try frames.append(gpa, .{ .html = ", " });
                         }
+                        if (func.args.len == 0) try frames.append(gpa, .{ .html = "()" });
                         if (item.needs_parens) try frames.append(gpa, .{ .html = "(" });
                     },
                     .record => |rec| {
@@ -2477,21 +2547,30 @@ fn writeTypeLink(
         try w.writeAll("/#");
     }
 
-    // The promoted builtin modules use bare anchors (the `<module>.` prefix is
-    // stripped from their ids), so drop it from the fragment too.
-    if (ctx.isBuiltinDerived(target_module)) {
-        const bare_head = if (already_qualified) effective_head[target_module.len + 1 ..] else effective_head;
-        try writeHtmlEscaped(w, bare_head);
-        try writeHtmlEscaped(w, tail);
-        return;
+    // Compute the reference path relative to its module (i.e. without a leading
+    // `<module>.`). The module name may already be present in one of two shapes:
+    // folded into a multi-segment `effective_head` ("Num.U8"), or as a bare head
+    // whose tail holds the rest ("Encoding" + ".JsonState"). Detect and drop it
+    // in both, so the fragment we emit matches the id actually on the page.
+    var rel_head = effective_head;
+    var rel_tail = tail;
+    if (already_qualified) {
+        rel_head = effective_head[target_module.len + 1 ..];
+    } else if (std.mem.eql(u8, effective_head, target_module) and tail.len > 1 and tail[0] == '.') {
+        rel_head = tail[1..];
+        rel_tail = "";
     }
 
-    if (!already_qualified) {
+    // Promoted builtin modules use bare ids (the `<module>.` prefix is stripped
+    // from them), so emit the relative path as-is. Every other module keeps the
+    // prefix on its ids, so re-add it. Doing the stripping first means a
+    // reference that already carried the module name isn't prefixed twice.
+    if (!ctx.isBuiltinDerived(target_module)) {
         try writeHtmlEscaped(w, target_module);
         try w.writeAll(".");
     }
-    try writeHtmlEscaped(w, effective_head);
-    try writeHtmlEscaped(w, tail);
+    try writeHtmlEscaped(w, rel_head);
+    try writeHtmlEscaped(w, rel_tail);
 }
 
 fn writeHtmlEscaped(w: Writer, text: []const u8) (Allocator.Error || error{WriteFailed})!void {
@@ -2550,6 +2629,87 @@ test "renderDocTypeHtml handles deeply nested types without call stack recursion
 
     try renderDocTypeHtml(&output.writer, &ctx, gpa, root, false);
     try testing.expect(std.mem.startsWith(u8, output.written(), "<span class=\"type\">Wrap</span>("));
+}
+
+test "writeTypeLink strips the module prefix for same-module builtin refs" {
+    const testing = std.testing;
+    const gpa = testing.allocator;
+
+    // A promoted builtin module ("Encoding") uses bare ids (`JsonState`,
+    // `Json.ParseErr`), but the compiler can report a same-module reference
+    // module-qualified (`Encoding.JsonState`). The link must drop the redundant
+    // `Encoding.` so the fragment matches the id on the page — otherwise it
+    // points at `#Encoding.JsonState`, which doesn't exist. A regular module
+    // ("Parser") keeps the prefix on its ids, and must not have it doubled.
+    const encoding_entries = try gpa.alloc(DocModel.DocEntry, 1);
+    encoding_entries[0] = .{
+        .name = try gpa.dupe(u8, "Encoding.JsonState"),
+        .kind = .alias,
+        .type_signature = null,
+        .doc_comment = null,
+        .children = try gpa.alloc(DocModel.DocEntry, 0),
+    };
+    const parser_entries = try gpa.alloc(DocModel.DocEntry, 1);
+    parser_entries[0] = .{
+        .name = try gpa.dupe(u8, "State"),
+        .kind = .alias,
+        .type_signature = null,
+        .doc_comment = null,
+        .children = try gpa.alloc(DocModel.DocEntry, 0),
+    };
+
+    const modules = try gpa.alloc(DocModel.ModuleDocs, 2);
+    modules[0] = .{
+        .name = try gpa.dupe(u8, "Encoding"),
+        .package_name = try gpa.dupe(u8, "test"),
+        .kind = .type_module,
+        .module_doc = null,
+        .entries = encoding_entries,
+        .builtin_derived = true,
+    };
+    modules[1] = .{
+        .name = try gpa.dupe(u8, "Parser"),
+        .package_name = try gpa.dupe(u8, "test"),
+        .kind = .type_module,
+        .module_doc = null,
+        .entries = parser_entries,
+    };
+    defer {
+        for (modules) |*m| m.deinit(gpa);
+        gpa.free(modules);
+    }
+
+    var package_docs = DocModel.PackageDocs{
+        .name = try gpa.dupe(u8, "test"),
+        .modules = modules,
+    };
+    defer gpa.free(package_docs.name);
+
+    var ctx = try RenderContext.init(&package_docs, gpa);
+    defer ctx.deinit(gpa);
+
+    const expect = struct {
+        fn link(a: Allocator, c: *RenderContext, module_path: []const u8, type_name: []const u8, want: []const u8) (Allocator.Error || error{ WriteFailed, TestExpectedEqual })!void {
+            var out: std.Io.Writer.Allocating = .init(a);
+            defer out.deinit();
+            try writeTypeLink(&out.writer, c, module_path, type_name);
+            try std.testing.expectEqualStrings(want, out.written());
+        }
+    }.link;
+
+    // Same-module builtin refs: the `Encoding.` prefix is dropped, whether the
+    // type is top-level or nested under a sub-namespace.
+    try ctx.enterModule(gpa, &modules[0]);
+    try expect(gpa, &ctx, "Encoding", "Encoding.JsonState", "#JsonState");
+    try expect(gpa, &ctx, "Encoding", "Encoding.Json.ParseErr", "#Json.ParseErr");
+    try expect(gpa, &ctx, "Encoding", "JsonState", "#JsonState");
+    ctx.leaveModule();
+
+    // A regular module keeps the prefix on its ids and must not double it.
+    try ctx.enterModule(gpa, &modules[1]);
+    try expect(gpa, &ctx, "Parser", "Parser.State", "#Parser.State");
+    try expect(gpa, &ctx, "Parser", "State", "#Parser.State");
+    ctx.leaveModule();
 }
 
 test "writeDocRefHref reports broken shorthand refs" {
@@ -2660,10 +2820,15 @@ test "doc shorthand refs in package docs resolve builtins and nested type-module
         .children = try gpa.alloc(DocModel.DocEntry, 0),
     };
 
+    const any_thing_type = try gpa.create(DocType);
+    any_thing_type.* = .{ .type_ref = .{
+        .module_path = try gpa.dupe(u8, ""),
+        .type_name = try gpa.dupe(u8, "Bool"),
+    } };
     const any_thing_entry = DocModel.DocEntry{
         .name = try gpa.dupe(u8, "any_thing"),
         .kind = .value,
-        .type_signature = null,
+        .type_signature = any_thing_type,
         .doc_comment = try gpa.dupe(u8, "Matches any [Utf8] and consumes all the input without fail."),
         .children = try gpa.alloc(DocModel.DocEntry, 0),
         .doc_comment_start_line = 8,
@@ -2739,7 +2904,54 @@ test "doc shorthand refs in package docs resolve builtins and nested type-module
     // Shorthand `[Name]` refs wrap their label in <code>.
     try testing.expect(std.mem.find(u8, html, "href=\"https://roc-lang.org/builtins/main/Str\"><code>Str</code></a>") != null);
     try testing.expect(std.mem.find(u8, html, "href=\"#String.Utf8\"><code>Utf8</code></a>") != null);
-    try testing.expect(std.mem.find(u8, html, "String(item) :: # (opaque)") != null);
+    try testing.expect(std.mem.find(
+        u8,
+        html,
+        "<pre class=\"entry-type-def\"><code class=\"entry-type-def-code\">String(item) :: # (opaque)</code></pre>",
+    ) != null);
+    try testing.expect(std.mem.find(
+        u8,
+        html,
+        "<pre class=\"entry-signature-pre\"><code class=\"entry-signature-code\">",
+    ) != null);
+}
+
+test "renderDocTypeHtml includes the unit argument for zero-argument functions" {
+    const testing = std.testing;
+    const gpa = testing.allocator;
+
+    const ret = try gpa.create(DocType);
+    ret.* = .{ .type_ref = .{
+        .module_path = try gpa.dupe(u8, ""),
+        .type_name = try gpa.dupe(u8, "Result"),
+    } };
+    const root = try gpa.create(DocType);
+    root.* = .{ .function = .{
+        .args = try gpa.alloc(*const DocType, 0),
+        .ret = ret,
+        .effectful = false,
+    } };
+    defer {
+        root.deinit(gpa);
+        gpa.destroy(root);
+    }
+
+    const package_docs = DocModel.PackageDocs{
+        .name = "Test",
+        .modules = &[_]DocModel.ModuleDocs{},
+    };
+    var ctx = try RenderContext.init(&package_docs, gpa);
+    defer ctx.deinit(gpa);
+    ctx.suppress_type_links = true;
+
+    var output: std.Io.Writer.Allocating = .init(gpa);
+    defer output.deinit();
+
+    try renderDocTypeHtml(&output.writer, &ctx, gpa, root, false);
+    try testing.expectEqualStrings(
+        "()<span class=\"sig-arrow\"> -&gt; </span><span class=\"type\">Result</span>",
+        output.written(),
+    );
 }
 
 test "renderDocTypeHtml renders where clause multi-line with square brackets" {

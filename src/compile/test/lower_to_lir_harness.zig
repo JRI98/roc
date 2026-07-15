@@ -79,6 +79,13 @@ pub fn expectLowersToLir(app_body: []const u8) LowerToLirHarnessError!void {
     try runToLir(app_body, null, .{}, null);
 }
 
+/// Lower an app whose body is `app_body` to LIR with explicit lowering
+/// options. Reaching the end without a panic means the program checked cleanly
+/// and passed ARC certification.
+pub fn expectLowersToLirWithOptions(app_body: []const u8, opts: LirLoweringOptions) LowerToLirHarnessError!void {
+    try runToLir(app_body, null, opts, null);
+}
+
 /// Lower an app at `app_path` to LIR. Reaching the end without a panic means
 /// the app checked cleanly and passed ARC certification.
 pub fn expectAppPathLowersToLir(app_path: []const u8) LowerToLirHarnessError!void {

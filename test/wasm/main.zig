@@ -6,6 +6,7 @@
 //! Run with: zig build run-test-wasm-static-lib
 
 const std = @import("std");
+const build_options = @import("build_options");
 const Allocator = std.mem.Allocator;
 const bytebox = @import("bytebox");
 
@@ -332,8 +333,8 @@ fn runTest(gpa: std.mem.Allocator, arena: std.mem.Allocator, io: std.Io, wasm_pa
 }
 
 pub fn main(init: std.process.Init) anyerror!void {
-    var gpa_impl = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa_impl.deinit();
+    var gpa_impl = std.heap.DebugAllocator(.{ .stack_trace_frames = build_options.debug_gpa_stack_trace_frames }){};
+    defer _ = build_options.debugGpaOk(gpa_impl.deinit());
     const gpa = gpa_impl.allocator();
 
     var arena_impl = std.heap.ArenaAllocator.init(gpa);

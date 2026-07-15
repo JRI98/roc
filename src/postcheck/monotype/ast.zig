@@ -125,6 +125,10 @@ pub const FnTemplate = struct {
     source_fn_ty: checked.CheckedTypeId,
     source_fn_key: names.TypeDigest,
     mono_fn_ty: Type.TypeId,
+    /// Range into the owning program's `const_evidence_chain_pool`. The chain
+    /// is explicit producer data used only if this function value is frozen
+    /// into ConstStore.
+    const_evidence_chain: check.ConstStore.ConstRange = .{},
 };
 
 /// Monotype function-specialization metadata.
@@ -868,6 +872,8 @@ pub const ProgramView = struct {
     stmt_ids: []const StmtId,
     field_exprs: []const FieldExpr,
     fn_def_captures: []const FnDefCapture,
+    const_evidence_pool: []const check.ConstStore.ConstEvidence,
+    const_evidence_chain_pool: []const check.ConstStore.ConstRange,
     capture_operands: []const CaptureOperand,
     record_destructs: []const RecordDestruct,
     str_pattern_steps: []const StrPatternStep,
@@ -1029,6 +1035,11 @@ pub const ProgramBuilder = struct {
     stmt_ids: ProgramList(StmtId, "stmt_ids"),
     field_exprs: ProgramList(FieldExpr, "field_exprs"),
     fn_def_captures: ProgramList(FnDefCapture, "fn_def_captures"),
+    /// Target-independent evidence trees attached to function templates that
+    /// may cross the compile-time constant boundary.
+    const_evidence_pool: ProgramList(check.ConstStore.ConstEvidence, "const_evidence_pool"),
+    /// Evidence-vector ranges, flattened innermost-to-outermost per function.
+    const_evidence_chain_pool: ProgramList(check.ConstStore.ConstRange, "const_evidence_chain_pool"),
     /// Backing pool for lifted `Span(CaptureOperand)` capture operand spans.
     /// Empty in the pre-lift Monotype program (populated by closure lifting).
     capture_operands: ProgramList(CaptureOperand, "capture_operands"),
@@ -1085,6 +1096,8 @@ pub const ProgramBuilder = struct {
             .stmt_ids = .empty,
             .field_exprs = .empty,
             .fn_def_captures = .empty,
+            .const_evidence_pool = .empty,
+            .const_evidence_chain_pool = .empty,
             .capture_operands = .empty,
             .record_destructs = .empty,
             .str_pattern_steps = .empty,
@@ -1135,6 +1148,8 @@ pub const ProgramBuilder = struct {
         self.str_pattern_steps.deinit(self.allocator);
         self.record_destructs.deinit(self.allocator);
         self.fn_def_captures.deinit(self.allocator);
+        self.const_evidence_chain_pool.deinit(self.allocator);
+        self.const_evidence_pool.deinit(self.allocator);
         self.capture_operands.deinit(self.allocator);
         self.field_exprs.deinit(self.allocator);
         self.stmt_ids.deinit(self.allocator);
@@ -1283,6 +1298,8 @@ pub const ProgramBuilder = struct {
             .stmt_ids = self.stmt_ids.unsafeRawItemsForView(),
             .field_exprs = self.field_exprs.unsafeRawItemsForView(),
             .fn_def_captures = self.fn_def_captures.unsafeRawItemsForView(),
+            .const_evidence_pool = self.const_evidence_pool.unsafeRawItemsForView(),
+            .const_evidence_chain_pool = self.const_evidence_chain_pool.unsafeRawItemsForView(),
             .capture_operands = self.capture_operands.unsafeRawItemsForView(),
             .record_destructs = self.record_destructs.unsafeRawItemsForView(),
             .str_pattern_steps = self.str_pattern_steps.unsafeRawItemsForView(),
@@ -1677,6 +1694,26 @@ pub const ProgramBuilder = struct {
         const start: u32 = @intCast(self.fn_def_captures.len());
         try self.fn_def_captures.appendSlice(self.allocator, values);
         return .{ .start = start, .len = @intCast(values.len) };
+    }
+
+    pub fn addConstEvidenceSpan(self: *ProgramBuilder, values: []const check.ConstStore.ConstEvidence) std.mem.Allocator.Error!check.ConstStore.ConstRange {
+        const start: u32 = @intCast(self.const_evidence_pool.len());
+        try self.const_evidence_pool.appendSlice(self.allocator, values);
+        return .{ .start = start, .len = @intCast(values.len) };
+    }
+
+    pub fn addConstEvidenceChain(self: *ProgramBuilder, vectors: []const check.ConstStore.ConstRange) std.mem.Allocator.Error!check.ConstStore.ConstRange {
+        const start: u32 = @intCast(self.const_evidence_chain_pool.len());
+        try self.const_evidence_chain_pool.appendSlice(self.allocator, vectors);
+        return .{ .start = start, .len = @intCast(vectors.len) };
+    }
+
+    pub fn constEvidenceSpan(self: *const ProgramBuilder, range: check.ConstStore.ConstRange) []const check.ConstStore.ConstEvidence {
+        return self.const_evidence_pool.unsafeRawItemsForView()[range.start..][0..range.len];
+    }
+
+    pub fn constEvidenceChain(self: *const ProgramBuilder, range: check.ConstStore.ConstRange) []const check.ConstStore.ConstRange {
+        return self.const_evidence_chain_pool.unsafeRawItemsForView()[range.start..][0..range.len];
     }
 
     pub fn addRecordDestructSpan(self: *ProgramBuilder, values: []const RecordDestruct) std.mem.Allocator.Error!Span(RecordDestruct) {

@@ -760,7 +760,9 @@ fn linkSharedLibrary(
             try args.append(allocator, "-dylib");
             try args.append(allocator, "-o");
             try args.append(allocator, std.mem.sliceTo(shared_lib_path, 0));
-            try args.append(allocator, "-w");
+            if (!build_options.linker_warnings) {
+                try args.append(allocator, "-w");
+            }
             try args.append(allocator, "-arch");
             try args.append(allocator, roc_target.machoArchName(builtin.cpu.arch) catch return Error.LinkFailed);
             try args.append(allocator, "-platform_version");

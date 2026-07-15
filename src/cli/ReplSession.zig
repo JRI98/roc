@@ -1661,6 +1661,33 @@ test "Repl - invalid syntax preserves definitions" {
     try testing.expectEqualStrings("42.0", result);
 }
 
+// Repro for https://github.com/roc-lang/roc/issues/10063: the annotated
+// function value should render without evaluating its constrained body.
+test "Repl - issue 10063 nested iterator where constraints" {
+    const steps = &[_][2][]const u8{
+        .{
+            "join : b -> List(a) where [b.iter : b -> Iter(item), item.iter : item -> Iter(a)]",
+            "",
+        },
+        .{
+            \\join = |list| {
+            \\    var $state = []
+            \\    for sublist in list {
+            \\        for i in sublist {
+            \\            $state = $state.append(i)
+            \\        }
+            \\    }
+            \\    $state
+            \\}
+            ,
+            "assigned `join`",
+        },
+        .{ "join", "<function>" },
+    };
+
+    try expectStateful(.interpreter, steps);
+}
+
 test "Repl - for loop over list" {
     const steps = &[_][2][]const u8{
         .{ "[\"hello\", \"world\", \"test\"]", "[\"hello\", \"world\", \"test\"]" },

@@ -257,13 +257,7 @@ jobs:
           retry_count: 3
 
       - name: Run CLI platform tests (LLVM size/speed backends)
-        if: runner.os != 'Windows'
         run: zig build run-test-cli -- --include-llvm --filter "[size]" --filter "[speed]"
-
-      - name: Run CLI platform tests (LLVM size/speed backends, Windows)
-        if: runner.os == 'Windows'
-        run: |
-          zig build run-test-cli -- --include-llvm --filter "[size]" --filter "[speed]"
 
       - name: Shared-library build-and-run test (roc build --opt=size)
         run: zig build run-test-dylib

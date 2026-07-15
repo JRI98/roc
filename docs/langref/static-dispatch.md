@@ -347,3 +347,11 @@ type that fits.
 If committing a default narrows a function's inferred type, the compiler
 emits a `LITERAL DEFAULTED` warning. To pick a different type, add a type
 annotation or a suffix (`5.U64`).
+
+## Where Clauses
+
+TODO
+
+## Aliases
+
+TODO

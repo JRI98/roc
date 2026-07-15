@@ -736,6 +736,22 @@ const opaque_function_field =
     \\main = W.run(W.mk("x")) == V("x")
 ;
 
+// Repro for https://github.com/roc-lang/roc/issues/10118
+const stored_where_constrained_closure =
+    \\Item := [It(Str)].{
+    \\    to_str : Item -> Str
+    \\    to_str = |Item.It(s)| s
+    \\}
+    \\
+    \\mk : a -> ({} -> Str) where [a.to_str : a -> Str]
+    \\mk = |x| |{}| x.to_str()
+    \\
+    \\p : {} -> Str
+    \\p = mk(Item.It("whereconstrained"))
+    \\
+    \\main = p({})
+;
+
 const top_level_expect_type_error =
     \\foo : U64 -> U64
     \\foo = |x| x
@@ -983,6 +999,7 @@ pub const tests = [_]TestCase{
         .expected = .{ .inspect_str = "42" },
     },
     .{ .name = "issue 9262: dev evaluator handles opaque function field lookup", .source_kind = .module, .source = opaque_function_field, .expected = .{ .inspect_str = "True" } },
+    .{ .name = "issue 10118: stored where-constrained closure keeps dispatch evidence", .source_kind = .module, .source = stored_where_constrained_closure, .expected = .{ .inspect_str = "\"whereconstrained\"" } },
     .{
         .name = "issue 9281: dev evaluator stack overflow with nested recursive opaque types across modules",
         .source_kind = .module,

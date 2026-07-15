@@ -587,9 +587,12 @@ pub const CFStmt = union(enum) {
         /// expected to be cold. Backends may use this for branch weights or
         /// block placement, but must not infer it from source names or shapes.
         default_is_cold: bool = false,
-        /// Common continuation used by structured branch-result switches, when
-        /// the branch bodies flow back to a shared suffix. ARC insertion uses
-        /// this to release branch-local owned values before the shared suffix.
+        /// Common continuation used by structured branch-result switches. Direct
+        /// lowering must provide this when branch bodies reach one exact shared
+        /// suffix within the same control-flow region. `null` means there is no
+        /// such same-region suffix; branches may still converge across a join.
+        /// ARC insertion uses the continuation to release branch-local owned
+        /// values before the shared suffix.
         continuation: ?CFStmtId = null,
     },
     /// Branch on a condition that is compiler-proven to describe whether

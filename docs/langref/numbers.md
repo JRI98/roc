@@ -11,7 +11,7 @@ Roc number literals can consist of any combination of the following:
 * **Scientific Notation Suffix** (if the number is base-10 and ends in `e___`, everything before the `e` will be multiplied by 10 to the power of the number in the `___`. This suffix can't be used if any base prefix is specified.)
 * **A decimal point** (can optionally be combined with scientific notation, but cannot be used if a base prefix is specified because uppercase hexadecimal letters after the decimal point would be ambiguous with a [type suffix](type-suffix) such as `.F64`.)
 * **Underscores** (the compiler skips over these; they're just for making long numbers easier to read. They can appear in between any digits, including letter digits, and digits after the decimal point, but each underscore must always have a digit on either side of it.)
-* **Minus sign in front** (for negative numbers, not to be confused with [the unary negate operator](operators#negate) which is an operator that applies to expressions. For example, `-x` applies the unary negate operator to `x`, but `-1` is just an ordinary number literal and no negate operation will be executed. This distinction can matter for [custom number types](custom).)
+* **Minus sign in front** (for negative numbers, not to be confused with [the unary negate operator](operators#--negate) which is an operator that applies to expressions. For example, `-x` applies the unary negate operator to `x`, but `-1` is just an ordinary number literal and no negate operation will be executed. This distinction can matter for [custom number types](custom).)
 
 Here are some examples of valid number literals:
 
@@ -32,15 +32,15 @@ Roc's compiler will infer the type of your number literal based on how it's used
 List.get(my_list, 3)
 ```
 
-Here, the type of `3` will be `U64` based on how it's used here, because [`List.get`](../builtins/List#get) takes a [`List`](../builtins/List) as its first argument and a [`U64`](../builtins/U64) as its second argument. 
+Here, the type of `3` will be `U64` based on how it's used here, because [`List.get`](../List#get) takes a [`List`](../List) as its first argument and a [`U64`](../Num#U64) as its second argument. 
 
-If you want to specify an explicit type for the number (perhaps for documentation, or maybe because you want an error report if it gets used as any other type), you can add the type you want after a dot at the end. For example, here's how you would specify that the number `-12.34` should be interpreted as a [`Dec`](../builtins/Dec):
+If you want to specify an explicit type for the number (perhaps for documentation, or maybe because you want an error report if it gets used as any other type), you can add the type you want after a dot at the end. For example, here's how you would specify that the number `-12.34` should be interpreted as a [`Dec`](../Num#Dec):
 
 ```roc
 -12.34.Dec
 ```
 
-This not only works with builtin number types, but also with any [custom number type](custom) you might make—the only requirement is that the type name must be in scope (which you can accomplish using [`import`](modules#import) as long as it's accessible to your module).
+This not only works with builtin number types, but also with any [custom number type](custom) you might make—the only requirement is that the type name must be in scope (which you can accomplish using [`import`](modules#import-statements) as long as it's accessible to your module).
 
 ## Defaulting to `Dec`
 
@@ -52,7 +52,7 @@ if 2 > 1 {
 }
 ```
 
-Here, `2 > 1` must be evaluated in order to tell whether the `if` should be taken, yet it's never used in a way that would associate it with any particular number type. In these cases, Roc will use the builtin [`Dec`](builtins/Dec) number type for the literal. So this code will do exactly the same thing as:
+Here, `2 > 1` must be evaluated in order to tell whether the `if` should be taken, yet it's never used in a way that would associate it with any particular number type. In these cases, Roc will use the builtin [`Dec`](../Num#Dec) number type for the literal. So this code will do exactly the same thing as:
 
 ```roc
 if 2.Dec > 1.Dec {
@@ -64,7 +64,7 @@ This almost never comes up in practice, unless you're playing around putting num
 
 ## Builtin Number Types
 
-All of Roc's builtin number types have a fixed size (and that size never varies by what target you're building for), and they only ever perform heap allocations when converting to heap-allocated types like [Str](builtins/Str).
+All of Roc's builtin number types have a fixed size (and that size never varies by what target you're building for), and they only ever perform heap allocations when converting to heap-allocated types like [Str](../Str).
 
 ### Integers
 
@@ -146,6 +146,10 @@ Like the other operators, ranges use [static dispatch](static-dispatch#operators
 `start..=end` calls `range_inclusive`, so custom number types can support range
 syntax by defining those methods.
 
+### Fractions
+
+TODO
+
 ## Custom Number Types
 
 We already saw how you can use optional [number type suffixes](#type-suffixes) to specify the type of a number literal instead of letting it be inferred. For example:
@@ -154,7 +158,7 @@ We already saw how you can use optional [number type suffixes](#type-suffixes) t
 -12.34.F64
 ```
 
-[`F64`](../builtins/F64) is a builtin type, but you can use your own custom number type in the same way. Let's say you made a custom number type called `Ratio` which stores both a numerator and denominator, so it can represent fractions like two-thirds which can't be precisely represented using either decimals or floating-point numbers. You could create a `Ratio` value like this:
+[`F64`](../Num#F64) is a builtin type, but you can use your own custom number type in the same way. Let's say you made a custom number type called `Ratio` which stores both a numerator and denominator, so it can represent fractions like two-thirds which can't be precisely represented using either decimals or floating-point numbers. You could create a `Ratio` value like this:
 
 ```
 -12.34.Ratio
@@ -165,7 +169,7 @@ Here's what will happen if you write this:
 * Just based on the syntax here, at compile time, Roc will call `Ratio.from_numeral(...)` 
 * It will pass an argument to specify that this is a negative number with the digits `12` before the decimal point and `34` after it.
 * `Ratio.from_numeral` will return a `Try` representing whether the specified digits are a valid `Ratio`. (Some custom number types may have limits on the size of the numbers they store, may or may not support negative numbers, may or may not support digits after the decimal point, etc.)
-  * If `Ratio.from_numeral` returned a [`Try.Ok`](../builtins/Try) tag, then that tag's [payload](tag-unions#payloads) will contain the actual number value that these digits resolved to.
+  * If `Ratio.from_numeral` returned a [`Try.Ok`](../Try) tag, then that tag's [payload](tag-unions#tags) will contain the actual number value that these digits resolved to.
   * If it returned an `Err`, then (since this is all being evaluated at compile time), the compiler will report an error for this number literal before the program even runs.
 
 `from_numeral` is one of Roc's
@@ -211,9 +215,9 @@ Similarly, the number 0x1 (that is, the integer 1 in hexadecimal notation)
 technically has the type `Num (Integer *)`, so when you pass two of them to
 [Num.add], the answer you get is `2 : Num (Integer *)`.
 
-The type [`Frac a`](#Frac) is defined to be an alias for `Num (Fraction a)`,
+The type [`Frac a`](#fractions) is defined to be an alias for `Num (Fraction a)`,
 so `3.0 : Num (Fraction *)` is the same value as `3.0 : Frac *`.
-Similarly, the type [`Int a`](#Int) is defined to be an alias for
+Similarly, the type [`Int a`](#integers) is defined to be an alias for
 `Num (Integer a)`, so `2 : Num (Integer *)` is the same value as
 `2 : Int *`.
 
@@ -386,7 +390,7 @@ These values are different from ordinary numbers in that they only occur
 when a floating-point calculation encounters an error. For example:
 * Dividing a positive [F64] by `0.0` returns ∞.
 * Dividing a negative [F64] by `0.0` returns -∞.
-* Dividing a [F64] of `0.0` by `0.0` returns [*NaN*](Num#is_nan).
+* Dividing a [F64] of `0.0` by `0.0` returns [*NaN*](../Num#F64.is_nan).
 
 These rules come from the [IEEE-754](https://en.wikipedia.org/wiki/IEEE_754)
 floating point standard. Because almost all modern processors are built to
@@ -419,3 +423,7 @@ single instruction, whereas [Dec] needs entire custom procedures - which use
 loops and conditionals. If you need to do performance-critical trigonometry
 or square roots, either [F64] or [F32] is probably a better choice than the
 usual default choice of [Dec], despite the precision problems they bring.
+
+## Ranges
+
+TODO

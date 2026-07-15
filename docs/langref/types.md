@@ -246,3 +246,7 @@ Pair : (U64, U64)
 Reach for an alias when you only want a shorter or clearer name; reach for a
 [nominal type](#nominal-types) when you want a genuinely distinct type the
 compiler keeps separate.
+
+## Mutually Recursive Types {#mutually-recursive}
+
+TODO

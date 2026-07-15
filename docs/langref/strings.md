@@ -15,7 +15,7 @@ This guide will provide a basic overview of Unicode, including the relevant diff
 * Graphemes
 * UTF-8
 
-It will also explain why some operations are included in Roc's builtin [Str](https://www.roc-lang.org/builtins/Str)
+It will also explain why some operations are included in Roc's builtin [Str](../Str)
 module, and why others are in separate packages like [roc-lang/unicode](https://github.com/roc-lang/unicode). 
 
 ## Graphemes
@@ -157,12 +157,12 @@ Deciding when to use each of these can be nonobvious to say the least! When is i
 
 The way Roc organizes the `Str` module and supporting packages is designed to help answer this question. Every situation is different, but the following rules of thumb are typical:
 
-* Most often, using `Str` values along with helper functions like [`split`](https://www.roc-lang.org/builtins/Str#split), [`joinWith`](https://www.roc-lang.org/builtins/Str#joinWith), and so on, is the best option.
-* If you are specifically implementing a parser, working in UTF-8 bytes is usually the best option. So functions like [`walkUtf8`](https://www.roc-lang.org/builtins/Str#walkUtf8), [toUtf8](https://www.roc-lang.org/builtins/Str#toUtf8), and so on. (Note that single-quote literals produce number literals, so ASCII-range literals like `'a'` gives an integer literal that works with a UTF-8 `U8`.)
+* Most often, using `Str` values along with helper functions like [`split_on`](../Str#split_on), [`join_with`](../Str#join_with), and so on, is the best option.
+* If you are specifically implementing a parser, working in UTF-8 bytes is usually the best option. So functions like [`to_utf8`](../Str#to_utf8), [`from_utf8`](../Str#from_utf8), and so on. (Note that single-quote literals produce number literals, so ASCII-range literals like `'a'` gives an integer literal that works with a UTF-8 `U8`.)
 * If you are implementing a Unicode library like [roc-lang/unicode](https://github.com/roc-lang/unicode), working in terms of code points will be unavoidable. Aside from basic readability considerations like `\u(...)` in string literals, if you have the option to avoid working in terms of code points, it is almost always correct to avoid them.
 * If it seems like a good idea to split a string into "characters" (graphemes), you should definitely stop and reconsider whether this is really the best design. Almost always, doing this is some combination of more error-prone or slower (usually both) than doing something else that does not require taking graphemes into consideration.
 
-For this reason (among others), grapheme functions live in [roc-lang/unicode](https://github.com/roc-lang/unicode) rather than in [`Str`](https://www.roc-lang.org/builtins/Str). They are more niche than they seem, so they should not be reached for all the time! Another reason is that 
+For this reason (among others), grapheme functions live in [roc-lang/unicode](https://github.com/roc-lang/unicode) rather than in [`Str`](../Str). They are more niche than they seem, so they should not be reached for all the time! Another reason is that 
 
 
 ## Low-Level

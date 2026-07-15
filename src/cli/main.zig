@@ -970,7 +970,7 @@ pub fn createTempDirStructure(ctx: *CliCtx, exe_path: []const u8, exe_display_na
     return error.FailedToCreateUniqueTempDir;
 }
 
-var debug_allocator: std.heap.DebugAllocator(.{}) = .{
+var debug_allocator: std.heap.DebugAllocator(.{ .stack_trace_frames = build_options.debug_gpa_stack_trace_frames }) = .{
     .backing_allocator = std.heap.page_allocator,
 };
 
@@ -1029,8 +1029,7 @@ pub fn main(init: std.process.Init) Allocator.Error!void {
     };
     defer restoreWindowsConsoleCodePage();
     defer if (is_safe) {
-        const mem_state = debug_allocator.deinit();
-        std.debug.assert(mem_state == .ok);
+        std.debug.assert(build_options.debugGpaOk(debug_allocator.deinit()));
     };
 
     if (tracy.enable_allocation) {

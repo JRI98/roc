@@ -15798,7 +15798,7 @@ pub fn LirCodeGen(comptime target: RocTarget) type {
         // touches the same switch references one instance; freed by `switch_end`.
         const SwitchState = struct {
             owner: CFStmtId,
-            cond_reg: GeneralReg,
+            cond: LocalId,
             switch_env: StmtEnvSnapshot,
             end_patches: std.ArrayList(usize),
             branches: lir.LirStore.StoreSpanBorrow(lir.CFSwitchBranch, "cf_switch_branches"),
@@ -15829,7 +15829,7 @@ pub fn LirCodeGen(comptime target: RocTarget) type {
         const StrMatchSetState = struct {
             owner: CFStmtId,
             before_env: StmtEnvSnapshot,
-            source: StrMatchSourceRegs,
+            source: LocalId,
             arms: lir.LirStore.StoreSpanBorrow(LIR.StrMatchArm, "str_match_arms"),
             on_miss: CFStmtId,
             index: usize,
@@ -16137,15 +16137,13 @@ pub fn LirCodeGen(comptime target: RocTarget) type {
                         },
 
                         .switch_stmt => |sw| {
-                            // Evaluate condition
-                            const cond_loc = try self.emitValueLocal(sw.cond);
-                            const cond_reg = try self.ensureInGeneralReg(cond_loc);
-
                             const branches = self.store.getCFSwitchBranches(sw.branches);
                             const switch_env = try self.captureStmtEnv();
 
                             if (branches.len == 1) {
                                 // Single branch (bool switch): compare and branch
+                                const cond_loc = try self.emitValueLocal(sw.cond);
+                                const cond_reg = try self.ensureInGeneralReg(cond_loc);
                                 const branch = GuardedList.at(branches, 0);
                                 try self.emitCmpImm(cond_reg, @bitCast(branch.value));
                                 const else_patch = try self.emitJumpIfNotEqual();
@@ -16166,7 +16164,7 @@ pub fn LirCodeGen(comptime target: RocTarget) type {
                                 const state = try self.allocator.create(SwitchState);
                                 state.* = .{
                                     .owner = stmt_id,
-                                    .cond_reg = cond_reg,
+                                    .cond = sw.cond,
                                     .switch_env = switch_env,
                                     .end_patches = std.ArrayList(usize).empty,
                                     .branches = branches,
@@ -16225,12 +16223,11 @@ pub fn LirCodeGen(comptime target: RocTarget) type {
                         .str_match_set => |str_match_set| {
                             const arms = self.store.getStrMatchArms(str_match_set.arms);
                             const before_env = try self.captureStmtEnv();
-                            const source = try self.emitStrMatchSourceRegs(str_match_set.source);
                             const state = try self.allocator.create(StrMatchSetState);
                             state.* = .{
                                 .owner = stmt_id,
                                 .before_env = before_env,
-                                .source = source,
+                                .source = str_match_set.source,
                                 .arms = arms,
                                 .on_miss = str_match_set.on_miss,
                                 .index = 0,
@@ -16350,10 +16347,13 @@ pub fn LirCodeGen(comptime target: RocTarget) type {
 
                 .switch_branch => |state| {
                     self.current_stmt_id = state.owner;
-                    const branch = GuardedList.at(state.branches, state.index);
-                    try self.emitCmpImm(state.cond_reg, @bitCast(branch.value));
-                    const skip_patch = try self.emitJumpIfNotEqual();
                     try self.restoreStmtEnv(&state.switch_env);
+                    const cond_loc = try self.emitValueLocal(state.cond);
+                    const cond_reg = try self.ensureInGeneralReg(cond_loc);
+                    const branch = GuardedList.at(state.branches, state.index);
+                    try self.emitCmpImm(cond_reg, @bitCast(branch.value));
+                    const skip_patch = try self.emitJumpIfNotEqual();
+                    self.codegen.freeGeneral(cond_reg);
                     try work.append(wa, .{ .switch_branch_after = .{ .state = state, .skip_patch = skip_patch } });
                     try work.append(wa, .{ .node = branch.body });
                 },
@@ -16374,7 +16374,6 @@ pub fn LirCodeGen(comptime target: RocTarget) type {
 
                 .switch_default => |state| {
                     self.current_stmt_id = state.owner;
-                    self.codegen.freeGeneral(state.cond_reg);
                     try self.restoreStmtEnv(&state.switch_env);
                     try work.append(wa, .{ .switch_end = state });
                     try work.append(wa, .{ .node = state.default_branch });
@@ -16437,7 +16436,12 @@ pub fn LirCodeGen(comptime target: RocTarget) type {
                         std.debug.panic("Dev/codegen invariant violated: string-match-set arm index exceeded arm count", .{});
                     }
                     const arm = GuardedList.at(state.arms, state.index);
-                    state.miss_patches = try self.generateStrMatchWithSource(arm, state.source);
+                    const source = try self.emitStrMatchSourceRegs(state.source);
+                    state.miss_patches = try self.generateStrMatchWithSource(arm, source);
+                    self.codegen.freeGeneral(source.allocation);
+                    self.codegen.freeGeneral(source.is_small);
+                    self.codegen.freeGeneral(source.len);
+                    self.codegen.freeGeneral(source.bytes);
                     try work.append(wa, .{ .str_match_set_after_arm = state });
                     try work.append(wa, .{ .node = arm.on_match });
                 },
@@ -16477,10 +16481,6 @@ pub fn LirCodeGen(comptime target: RocTarget) type {
                     state.before_env.deinit();
                     state.miss_patches.deinit(self.allocator);
                     state.end_patches.deinit(self.allocator);
-                    self.codegen.freeGeneral(state.source.allocation);
-                    self.codegen.freeGeneral(state.source.is_small);
-                    self.codegen.freeGeneral(state.source.len);
-                    self.codegen.freeGeneral(state.source.bytes);
                     self.allocator.destroy(state);
                 },
             };
