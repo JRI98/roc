@@ -13028,11 +13028,11 @@ fn rocFormat(ctx: *CliCtx, args: cli_args.FormatArgs) CliMainError!void {
 
         elapsed = @as(u64, @intCast(std.Io.Timestamp.now(ctx.io.std_io, .real).nanoseconds - timer_start_ns));
         if (unformatted_files.items.len > 0) {
-            try stdout.print("The following file(s) failed `roc format --check`:", .{});
+            try stdout.print("The following file(s) failed `roc fmt --check`:", .{});
             for (unformatted_files.items) |file_name| {
                 try stdout.print("    {s}\n", .{file_name});
             }
-            try stdout.print("You can fix this with `roc format FILENAME.roc`.", .{});
+            try stdout.print("You can fix this with `roc fmt FILENAME.roc`.", .{});
             had_errors = true;
         } else {
             try stdout.print("All formatting valid.\n", .{});

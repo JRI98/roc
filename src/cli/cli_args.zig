@@ -193,7 +193,7 @@ pub const TestArgs = struct {
     resolve_limits: ResolveLimitArgs = .{}, // package download size limits
 };
 
-/// Arguments for `roc format`
+/// Arguments for `roc fmt`
 pub const FormatArgs = struct {
     paths: []const []const u8, // the paths of files to be formatted
     stdin: bool = false, // if the input should be read in from stdin and output to stdout

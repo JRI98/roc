@@ -2391,7 +2391,7 @@ fn renderDocTypeHtml(
                                 .indent = item.indent,
                             } });
                         } else {
-                            // Multi-line layout mirrors how `roc format` lays
+                            // Multi-line layout mirrors how `roc fmt` lays
                             // out where clauses; the enclosing block uses
                             // white-space: pre-wrap so the literal newlines and
                             // indentation render as written.
