@@ -1442,6 +1442,11 @@ pub fn getCollectionLayout(store: *const NodeStore, idx: anytype) AST.Collection
     return store.nodes.items.items(.collection_layout)[@intFromEnum(idx)];
 }
 
+/// Returns the number of nodes in the store.
+pub fn nodeCount(store: *const NodeStore) usize {
+    return store.nodes.len();
+}
+
 /// Retrieves header data from a stored header node, reconstructing the appropriate header type.
 pub fn getHeader(store: *const NodeStore, header_idx: AST.Header.Idx) AST.Header {
     const node = store.nodes.get(@enumFromInt(@intFromEnum(header_idx)));
