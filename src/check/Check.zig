@@ -5491,7 +5491,7 @@ fn checkFileInternal(self: *Self, skip_numeric_defaults: bool) std.mem.Allocator
     // (top-level defs and local bindings) for infinite types
     try self.checkBindingRootsForInfiniteTypes();
 
-    if (!self.has_can_error_diagnostics()) {
+    if (!self.hasCanErrorDiagnostics()) {
         try self.poisonErroneousValueUses();
         try self.poisonErroneousValueExprs();
     }
@@ -23072,7 +23072,7 @@ fn flatTypeContainsError(self: *Self, flat_type: FlatType, visited: *std.AutoHas
     };
 }
 
-fn has_can_error_diagnostics(self: *Self) bool {
+fn hasCanErrorDiagnostics(self: *Self) bool {
     const diagnostics = self.cir.store.sliceDiagnostics(self.cir.diagnostics);
     for (diagnostics) |diagnostic_idx| {
         const diagnostic = self.cir.store.getDiagnostic(diagnostic_idx);
