@@ -79,3 +79,40 @@ test "nested type declaration has an outer-scope shadowing warning" {
     }
     try testing.expectEqual(@as(usize, 1), diag_count);
 }
+
+test "type redeclaration in the same scope is an error" {
+    const source =
+        \\{
+        \\    Item := [First]
+        \\    Item := [Second]
+        \\    {}
+        \\}
+    ;
+
+    var test_env = try TestEnv.init(source);
+    defer test_env.deinit();
+
+    _ = try test_env.canonicalizeExpr();
+
+    const diagnostics = try test_env.getDiagnostics();
+    defer testing.allocator.free(diagnostics);
+
+    var redeclaration_count: usize = 0;
+    for (diagnostics) |diag| {
+        switch (diag) {
+            .type_redeclared => {
+                redeclaration_count += 1;
+                var report = try test_env.module_env.diagnosticToReport(
+                    diag,
+                    testing.allocator,
+                    test_env.module_env.module_name,
+                );
+                defer report.deinit();
+                try testing.expectEqualStrings("Type Redeclared", report.title);
+            },
+            .type_shadowed_warning, .builtin_type_shadowed_warning => return error.UnexpectedShadowingWarning,
+            else => {},
+        }
+    }
+    try testing.expectEqual(@as(usize, 1), redeclaration_count);
+}
