@@ -263,6 +263,11 @@ fn buildJson(
     try json.appendSlice(allocator, "{\n  \"");
     try json.appendSlice(allocator, long_unknown_key);
     try json.appendSlice(allocator, "\" : \"ignored\"");
+    // Include a number in a skipped field: skipping a scalar must not allocate,
+    // and only a document built at runtime can check that. The documents in
+    // app.roc are hardcoded, so the compiler parses them at build time and they
+    // never reach the allocation trap.
+    try json.appendSlice(allocator, ",\n  \"skipped_scalar\" : 12345");
     try json.appendSlice(allocator, ",\n  \"foo\" : \"");
     try json.appendSlice(allocator, required_foo_value);
     try json.appendSlice(allocator, "\"");
