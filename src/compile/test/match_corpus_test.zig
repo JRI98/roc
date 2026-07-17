@@ -1,10 +1,9 @@
-//! Generated-corpus tests for the decision-tree match compiler. During the
-//! migration these compared the deleted per-branch chain against the tree;
-//! they now run each generated program through compilation (compile-time
-//! finalization executes tree-lowered LIR on the dev backend) and the LIR
-//! interpreter, catching lowering panics, statement-count lint violations,
-//! ARC issues, and evaluation crashes. Cross-executor agreement is covered by
-//! `zig build run-test-eval`.
+//! Generated-corpus tests for the decision-tree match compiler
+//! (src/postcheck/match_tree.zig). Each generated program runs through
+//! compilation (compile-time finalization executes tree-lowered LIR on the
+//! dev backend) and the LIR interpreter, catching lowering panics,
+//! statement-count lint violations, ARC issues, and evaluation crashes.
+//! Cross-executor agreement is covered by `zig build run-test-eval`.
 //!
 //! Programs are generated from fixed seeds (never wall-clock), covering
 //! random nesting of tags, records, tuples, lists (with rests), strings

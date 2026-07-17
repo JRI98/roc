@@ -1,10 +1,8 @@
 //! LIR-shape and statement-count tests for the decision-tree match compiler
-//! (src/postcheck/match_tree.zig), per
-//! projects/big/decision-tree-match-compiler.md:
+//! (src/postcheck/match_tree.zig):
 //!
 //! - An N-branch tag match on one scrutinee lowers to exactly ONE multiway
-//!   `switch_stmt` with ONE discriminant read (the deleted chain emitted N
-//!   one-armed switches with N reads).
+//!   `switch_stmt` with ONE discriminant read.
 //! - The PR 9707 list-match family grows linearly in statement count.
 //! - Guard, string, list, and nominal matches pass ARC certification (the
 //!   harness runs the certifier).

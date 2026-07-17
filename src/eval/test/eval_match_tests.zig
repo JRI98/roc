@@ -2,9 +2,8 @@
 //!
 //! These cases lock in the semantics of `match` compilation — branch order,
 //! guard order, binding visibility, exhaustiveness defaults, and every pattern
-//! kind — so the decision-tree match compiler
-//! (projects/big/decision-tree-match-compiler.md) can be verified against the
-//! same behavior on all executors.
+//! kind — so the decision-tree match compiler (src/postcheck/match_tree.zig)
+//! is verified against the same behavior on all executors.
 
 const TestCase = @import("parallel_runner.zig").TestCase;
 
