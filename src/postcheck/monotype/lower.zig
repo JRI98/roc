@@ -15809,17 +15809,26 @@ const BodyContext = struct {
         const key_ty = self.builder.recordFieldType(options_ty, try self.builder.program.names.internRecordFieldLabel("tag"));
         const encoding_ty = self.builder.recordFieldType(options_ty, try self.builder.program.names.internRecordFieldLabel("encoding"));
         const state_ty = self.builder.recordFieldType(options_ty, try self.builder.program.names.internRecordFieldLabel("state"));
+        const start_payloads_ty = self.builder.recordFieldType(options_ty, try self.builder.program.names.internRecordFieldLabel("start_payloads"));
+        const next_payload_ty = self.builder.recordFieldType(options_ty, try self.builder.program.names.internRecordFieldLabel("next_payload"));
+        const finish_payloads_ty = self.builder.recordFieldType(options_ty, try self.builder.program.names.internRecordFieldLabel("finish_payloads"));
         const missing_ty = self.builder.recordFieldType(options_ty, try self.builder.program.names.internRecordFieldLabel("missing"));
 
         const options_local = try self.addLocal(self.builder.symbols.fresh(), options_ty);
         const key_value = try self.recordPayloadFieldAccess(options_local, options_ty, "tag");
         const encoding_value = try self.recordPayloadFieldAccess(options_local, options_ty, "encoding");
         const slot_value = try self.recordPayloadFieldAccess(options_local, options_ty, "state");
+        const start_payloads_value = try self.recordPayloadFieldAccess(options_local, options_ty, "start_payloads");
+        const next_payload_value = try self.recordPayloadFieldAccess(options_local, options_ty, "next_payload");
+        const finish_payloads_value = try self.recordPayloadFieldAccess(options_local, options_ty, "finish_payloads");
         const missing_value = try self.recordPayloadFieldAccess(options_local, options_ty, "missing");
 
         const key_local = try self.addLocal(self.builder.symbols.fresh(), key_ty);
         const encoding_local = try self.addLocal(self.builder.symbols.fresh(), encoding_ty);
         const slot_local = try self.addLocal(self.builder.symbols.fresh(), state_ty);
+        const start_payloads_local = try self.addLocal(self.builder.symbols.fresh(), start_payloads_ty);
+        const next_payload_local = try self.addLocal(self.builder.symbols.fresh(), next_payload_ty);
+        const finish_payloads_local = try self.addLocal(self.builder.symbols.fresh(), finish_payloads_ty);
         const missing_local = try self.addLocal(self.builder.symbols.fresh(), missing_ty);
         const tags = try GuardedList.dupe(self.allocator, Type.Tag, self.builder.program.types.tagSpan(tag_span));
         defer self.allocator.free(tags);
@@ -15852,6 +15861,12 @@ const BodyContext = struct {
                 encoding_ty,
                 slot_local,
                 state_ty,
+                start_payloads_local,
+                start_payloads_ty,
+                next_payload_local,
+                next_payload_ty,
+                finish_payloads_local,
+                finish_payloads_ty,
                 if (maybe_spec_backing_ty != null) &precomputed_plan else null,
             );
             const cond = try self.parseTagExactMatch(key_local, key_ty, tags[index]);
@@ -15859,6 +15874,9 @@ const BodyContext = struct {
         }
 
         body = try self.wrapLet(missing_local, missing_ty, missing_value, body, ret_ty);
+        body = try self.wrapLet(finish_payloads_local, finish_payloads_ty, finish_payloads_value, body, ret_ty);
+        body = try self.wrapLet(next_payload_local, next_payload_ty, next_payload_value, body, ret_ty);
+        body = try self.wrapLet(start_payloads_local, start_payloads_ty, start_payloads_value, body, ret_ty);
         body = try self.wrapLet(slot_local, state_ty, slot_value, body, ret_ty);
         body = try self.wrapLet(encoding_local, encoding_ty, encoding_value, body, ret_ty);
         body = try self.wrapLet(key_local, key_ty, key_value, body, ret_ty);
@@ -15894,129 +15912,196 @@ const BodyContext = struct {
         encoding_ty: Type.TypeId,
         slot_local: DraftLocalId,
         slot_ty: Type.TypeId,
+        start_payloads_local: DraftLocalId,
+        start_payloads_ty: Type.TypeId,
+        next_payload_local: DraftLocalId,
+        next_payload_ty: Type.TypeId,
+        finish_payloads_local: DraftLocalId,
+        finish_payloads_ty: Type.TypeId,
         precomputed_plan: ?*const ParserPrecomputedPlan,
     ) Allocator.Error!DraftExprId {
         const ret_info = self.tryInfo(ret_ty);
         const payload_tys = try GuardedList.dupe(self.allocator, Type.TypeId, self.builder.program.types.span(tag.payloads));
         defer self.allocator.free(payload_tys);
-        if (payload_tys.len > 1) {
-            return try self.decodedTagUnionArrayPayloadValue(
-                tag,
-                union_ty,
-                ret_ty,
-                encoding_local,
-                encoding_ty,
-                slot_local,
-                slot_ty,
-                payload_tys,
-                precomputed_plan,
-            );
-        }
-
-        const payloads = try self.allocator.alloc(DraftExprId, payload_tys.len);
-        defer self.allocator.free(payloads);
-        const payload_parse_ok_tys = try self.allocator.alloc(Type.TypeId, payload_tys.len);
-        defer self.allocator.free(payload_parse_ok_tys);
-        const payload_parse_ret_tys = try self.allocator.alloc(Type.TypeId, payload_tys.len);
-        defer self.allocator.free(payload_parse_ret_tys);
-        const payload_parse_locals = try self.allocator.alloc(DraftLocalId, payload_tys.len);
-        defer self.allocator.free(payload_parse_locals);
-        const value_name = try self.builder.program.names.internRecordFieldLabel("value");
-        const rest_name = try self.builder.program.names.internRecordFieldLabel("rest");
+        const payload_locals = try self.allocator.alloc(DraftLocalId, payload_tys.len);
+        defer self.allocator.free(payload_locals);
         for (payload_tys, 0..) |payload_ty, index| {
-            payload_parse_ok_tys[index] = try self.parseResultOkType(payload_ty, slot_ty);
-            payload_parse_ret_tys[index] = try self.tryTypeLike(ret_ty, payload_parse_ok_tys[index], ret_info.err_ty);
-            payload_parse_locals[index] = try self.addLocal(self.builder.symbols.fresh(), payload_parse_ok_tys[index]);
-            payloads[index] = try self.addExpr(.{
-                .ty = payload_ty,
-                .data = .{ .field_access = .{
-                    .receiver = try self.localExpr(payload_parse_locals[index], payload_parse_ok_tys[index]),
-                    .field = value_name,
-                } },
-            });
+            payload_locals[index] = try self.addLocal(self.builder.symbols.fresh(), payload_ty);
         }
-        const tag_expr = try self.tagUnionValue(union_ty, tag, payloads);
-        const final_rest_expr = if (payload_tys.len == 0)
-            try self.localExpr(slot_local, slot_ty)
-        else
-            try self.addExpr(.{
-                .ty = slot_ty,
-                .data = .{ .field_access = .{
-                    .receiver = try self.localExpr(payload_parse_locals[payload_tys.len - 1], payload_parse_ok_tys[payload_tys.len - 1]),
-                    .field = rest_name,
-                } },
-            });
-        var body = try self.parseResultOk(ret_ty, tag_expr, final_rest_expr, slot_ty);
-        var index = payload_tys.len;
-        while (index > 0) {
-            index -= 1;
-            const slot_expr = if (index == 0)
-                try self.localExpr(slot_local, slot_ty)
-            else
-                try self.addExpr(.{
-                    .ty = slot_ty,
-                    .data = .{ .field_access = .{
-                        .receiver = try self.localExpr(payload_parse_locals[index - 1], payload_parse_ok_tys[index - 1]),
-                        .field = rest_name,
-                    } },
-                });
-            const payload_parse = try self.lowerParseShapeHelperCall(
-                payload_tys[index],
-                try self.localExpr(encoding_local, encoding_ty),
-                encoding_ty,
-                slot_expr,
-                slot_ty,
-                payload_parse_ret_tys[index],
-                precomputed_plan,
-            );
-            body = try self.sequenceTry(payload_parse, payload_parse_ret_tys[index], payload_parse_locals[index], body, ret_ty);
-        }
-        return body;
+        const boundary_try_ty = try self.tryTypeLike(ret_ty, slot_ty, ret_info.err_ty);
+        const u64_ty = try self.builder.primitiveType(.u64);
+        const count_expr = try self.intLiteralExpr(@intCast(payload_tys.len), u64_ty);
+        self.assertTagPayloadBoundaryType(start_payloads_ty, &.{ slot_ty, u64_ty }, boundary_try_ty);
+        self.assertTagPayloadBoundaryType(next_payload_ty, &.{ slot_ty, u64_ty, u64_ty }, boundary_try_ty);
+        self.assertTagPayloadBoundaryType(finish_payloads_ty, &.{ slot_ty, u64_ty }, boundary_try_ty);
+
+        const started_try = try self.addExpr(.{
+            .ty = boundary_try_ty,
+            .data = .{ .call_value = .{
+                .callee = try self.localExpr(start_payloads_local, start_payloads_ty),
+                .args = try self.addExprSpan(&[_]DraftExprId{
+                    try self.localExpr(slot_local, slot_ty),
+                    count_expr,
+                }),
+            } },
+        });
+        const started_local = try self.addLocal(self.builder.symbols.fresh(), slot_ty);
+        const body = try self.decodedTagPayloadsFromState(
+            tag,
+            union_ty,
+            ret_ty,
+            encoding_local,
+            encoding_ty,
+            try self.localExpr(started_local, slot_ty),
+            slot_ty,
+            payload_tys,
+            payload_locals,
+            0,
+            next_payload_local,
+            next_payload_ty,
+            finish_payloads_local,
+            finish_payloads_ty,
+            count_expr,
+            boundary_try_ty,
+            precomputed_plan,
+        );
+        return try self.sequenceTry(started_try, boundary_try_ty, started_local, body, ret_ty);
     }
 
-    fn decodedTagUnionArrayPayloadValue(
+    fn assertTagPayloadBoundaryType(
+        self: *BodyContext,
+        fn_ty: Type.TypeId,
+        expected_args: []const Type.TypeId,
+        expected_ret: Type.TypeId,
+    ) void {
+        const fn_shape = self.builder.functionShape(fn_ty, "tag payload boundary was not a function");
+        const args = self.builder.program.types.span(fn_shape.args);
+        if (args.len != expected_args.len) Common.invariant("tag payload boundary had an unexpected arity");
+        for (expected_args, 0..) |expected, index| {
+            if (!self.sameType(GuardedList.at(args, index), expected)) Common.invariant("tag payload boundary argument type differed from expected type");
+        }
+        if (!self.sameType(fn_shape.ret, expected_ret)) Common.invariant("tag payload boundary return type differed from expected type");
+    }
+
+    fn decodedTagPayloadsFromState(
         self: *BodyContext,
         tag: Type.Tag,
         union_ty: Type.TypeId,
         ret_ty: Type.TypeId,
         encoding_local: DraftLocalId,
         encoding_ty: Type.TypeId,
-        slot_local: DraftLocalId,
-        slot_ty: Type.TypeId,
+        state_expr: DraftExprId,
+        state_ty: Type.TypeId,
         payload_tys: []const Type.TypeId,
+        payload_locals: []const DraftLocalId,
+        payload_index: usize,
+        next_payload_local: DraftLocalId,
+        next_payload_ty: Type.TypeId,
+        finish_payloads_local: DraftLocalId,
+        finish_payloads_ty: Type.TypeId,
+        count_expr: DraftExprId,
+        boundary_try_ty: Type.TypeId,
         precomputed_plan: ?*const ParserPrecomputedPlan,
     ) Allocator.Error!DraftExprId {
+        if (payload_index == payload_tys.len) {
+            const payloads = try self.allocator.alloc(DraftExprId, payload_tys.len);
+            defer self.allocator.free(payloads);
+            for (payload_tys, 0..) |payload_ty, index| {
+                payloads[index] = try self.localExpr(payload_locals[index], payload_ty);
+            }
+            const tag_expr = try self.tagUnionValue(union_ty, tag, payloads);
+            const finished_try = try self.addExpr(.{
+                .ty = boundary_try_ty,
+                .data = .{ .call_value = .{
+                    .callee = try self.localExpr(finish_payloads_local, finish_payloads_ty),
+                    .args = try self.addExprSpan(&[_]DraftExprId{ state_expr, count_expr }),
+                } },
+            });
+            const finished_local = try self.addLocal(self.builder.symbols.fresh(), state_ty);
+            const finished = try self.parseResultOk(ret_ty, tag_expr, try self.localExpr(finished_local, state_ty), state_ty);
+            return try self.sequenceTry(finished_try, boundary_try_ty, finished_local, finished, ret_ty);
+        }
+
         const ret_info = self.tryInfo(ret_ty);
-        const tuple_ty = try self.builder.program.types.add(.{ .tuple = try self.builder.program.types.addSpan(payload_tys) });
-        const tuple_parse_ok_ty = try self.parseResultOkType(tuple_ty, slot_ty);
-        const tuple_parse_ret_ty = try self.tryTypeLike(ret_ty, tuple_parse_ok_ty, ret_info.err_ty);
-        const tuple_parse = try self.lowerParseTupleFromState(
-            payload_tys,
-            tuple_ty,
+        const payload_ty = payload_tys[payload_index];
+        const payload_ok_ty = try self.parseResultOkType(payload_ty, state_ty);
+        const payload_try_ty = try self.tryTypeLike(ret_ty, payload_ok_ty, ret_info.err_ty);
+        const payload_try = try self.lowerParseShapeHelperCall(
+            payload_ty,
             try self.localExpr(encoding_local, encoding_ty),
             encoding_ty,
-            try self.localExpr(slot_local, slot_ty),
-            slot_ty,
-            tuple_parse_ret_ty,
+            state_expr,
+            state_ty,
+            payload_try_ty,
             precomputed_plan,
         );
-
+        const rest_local = try self.addLocal(self.builder.symbols.fresh(), state_ty);
+        const rest_expr = try self.localExpr(rest_local, state_ty);
+        const next_body = if (payload_index + 1 < payload_tys.len) blk: {
+            const u64_ty = try self.builder.primitiveType(.u64);
+            const next_try = try self.addExpr(.{
+                .ty = boundary_try_ty,
+                .data = .{ .call_value = .{
+                    .callee = try self.localExpr(next_payload_local, next_payload_ty),
+                    .args = try self.addExprSpan(&[_]DraftExprId{
+                        rest_expr,
+                        try self.intLiteralExpr(@intCast(payload_index + 1), u64_ty),
+                        count_expr,
+                    }),
+                } },
+            });
+            const next_local = try self.addLocal(self.builder.symbols.fresh(), state_ty);
+            const body = try self.decodedTagPayloadsFromState(
+                tag,
+                union_ty,
+                ret_ty,
+                encoding_local,
+                encoding_ty,
+                try self.localExpr(next_local, state_ty),
+                state_ty,
+                payload_tys,
+                payload_locals,
+                payload_index + 1,
+                next_payload_local,
+                next_payload_ty,
+                finish_payloads_local,
+                finish_payloads_ty,
+                count_expr,
+                boundary_try_ty,
+                precomputed_plan,
+            );
+            break :blk try self.sequenceTry(next_try, boundary_try_ty, next_local, body, ret_ty);
+        } else try self.decodedTagPayloadsFromState(
+            tag,
+            union_ty,
+            ret_ty,
+            encoding_local,
+            encoding_ty,
+            rest_expr,
+            state_ty,
+            payload_tys,
+            payload_locals,
+            payload_index + 1,
+            next_payload_local,
+            next_payload_ty,
+            finish_payloads_local,
+            finish_payloads_ty,
+            count_expr,
+            boundary_try_ty,
+            precomputed_plan,
+        );
         const value_name = try self.builder.program.names.internRecordFieldLabel("value");
         const rest_name = try self.builder.program.names.internRecordFieldLabel("rest");
-        const tuple_local = try self.addLocal(self.builder.symbols.fresh(), tuple_ty);
-        const rest_local = try self.addLocal(self.builder.symbols.fresh(), slot_ty);
-        const tuple_expr = try self.localExpr(tuple_local, tuple_ty);
-        const payloads = try self.allocator.alloc(DraftExprId, payload_tys.len);
-        defer self.allocator.free(payloads);
-        for (payload_tys, 0..) |payload_ty, index| {
-            payloads[index] = try self.addExpr(.{ .ty = payload_ty, .data = .{ .tuple_access = .{
-                .tuple = tuple_expr,
-                .elem_index = @intCast(index),
-            } } });
-        }
-        const tag_expr = try self.tagUnionValue(union_ty, tag, payloads);
-        const ok_body = try self.parseResultOk(ret_ty, tag_expr, try self.localExpr(rest_local, slot_ty), slot_ty);
-        return try self.sequenceTryRecord(tuple_parse, tuple_parse_ret_ty, tuple_local, value_name, rest_local, rest_name, ok_body, ret_ty);
+        return try self.sequenceTryRecord(
+            payload_try,
+            payload_try_ty,
+            payload_locals[payload_index],
+            value_name,
+            rest_local,
+            rest_name,
+            next_body,
+            ret_ty,
+        );
     }
 
     fn tagUnionValue(
@@ -22211,94 +22296,12 @@ const BodyContext = struct {
         if (payload_exprs.len != payload_tys.len) Common.invariant("tag union encode payload arity mismatch");
 
         const tag_name_expr = try self.stringExpr(self.builder.program.names.tagLabelText(tag.name), try self.builder.primitiveType(.str));
-        if (payload_tys.len == 0) {
-            return try self.lowerEncodeFormatMethod(
-                "encode_str",
-                &.{ tag_name_expr, state_expr },
-                &.{ try self.builder.primitiveType(.str), state_ty },
-                encoding_ty,
-                ret_ty,
-            );
-        }
-
-        const u64_ty = try self.builder.primitiveType(.u64);
-        const field_writer_ty = try self.encodeFieldWriterType(state_ty, ret_ty);
-        const body_ty = try self.encodeContainerBodyType(state_ty, field_writer_ty, ret_ty);
-        const body_state_local = try self.addLocal(self.builder.symbols.fresh(), state_ty);
-        const field_writer_local = try self.addLocal(self.builder.symbols.fresh(), field_writer_ty);
-        const payload_state_local = try self.addLocal(self.builder.symbols.fresh(), state_ty);
-        const payload_body = if (payload_tys.len == 1)
-            try self.lowerEncodeShapeToState(
-                payload_tys[0],
-                payload_exprs[0],
-                encoding_expr,
-                encoding_ty,
-                try self.localExpr(payload_state_local, state_ty),
-                state_ty,
-                ret_ty,
-                precomputed_plan,
-            )
-        else
-            try self.lowerEncodePayloadArrayToState(
-                payload_exprs,
-                payload_tys,
-                encoding_expr,
-                encoding_ty,
-                try self.localExpr(payload_state_local, state_ty),
-                state_ty,
-                ret_ty,
-                precomputed_plan,
-            );
-        const payload_writer = try self.lowerGeneratedEncoderCallbackLambda(
-            try self.encodeValueThunkType(state_ty, ret_ty),
-            &.{.{ .local = payload_state_local, .ty = state_ty }},
-            payload_body,
-        );
-        const field_body = try self.addExpr(.{
-            .ty = ret_ty,
-            .data = .{ .call_value = .{
-                .callee = try self.localExpr(field_writer_local, field_writer_ty),
-                .args = try self.addExprSpan(&[_]DraftExprId{
-                    try self.localExpr(body_state_local, state_ty),
-                    tag_name_expr,
-                    payload_writer,
-                }),
-            } },
-        });
-        const fields_lambda = try self.lowerGeneratedEncoderCallbackLambda(
-            body_ty,
-            &.{
-                .{ .local = body_state_local, .ty = state_ty },
-                .{ .local = field_writer_local, .ty = field_writer_ty },
-            },
-            field_body,
-        );
-        return try self.lowerEncodeFormatMethod(
-            "encode_record",
-            &.{ state_expr, try self.intLiteralExpr(1, u64_ty), fields_lambda },
-            &.{ state_ty, u64_ty, body_ty },
-            encoding_ty,
-            ret_ty,
-        );
-    }
-
-    fn lowerEncodePayloadArrayToState(
-        self: *BodyContext,
-        payload_exprs: []const DraftExprId,
-        payload_tys: []const Type.TypeId,
-        encoding_expr: DraftExprId,
-        encoding_ty: Type.TypeId,
-        state_expr: DraftExprId,
-        state_ty: Type.TypeId,
-        ret_ty: Type.TypeId,
-        precomputed_plan: ?*const ParserPrecomputedPlan,
-    ) Allocator.Error!DraftExprId {
         const u64_ty = try self.builder.primitiveType(.u64);
         const element_writer_ty = try self.encodeElementWriterType(state_ty, ret_ty);
         const body_ty = try self.encodeContainerBodyType(state_ty, element_writer_ty, ret_ty);
         const body_state_local = try self.addLocal(self.builder.symbols.fresh(), state_ty);
         const element_writer_local = try self.addLocal(self.builder.symbols.fresh(), element_writer_ty);
-        const body = try self.lowerEncodePayloadArrayItemsFromState(
+        const body = try self.lowerEncodeTagPayloadsFromState(
             payload_exprs,
             payload_tys,
             encoding_expr,
@@ -22310,7 +22313,7 @@ const BodyContext = struct {
             0,
             precomputed_plan,
         );
-        const body_lambda = try self.lowerGeneratedEncoderCallbackLambda(
+        const payloads_lambda = try self.lowerGeneratedEncoderCallbackLambda(
             body_ty,
             &.{
                 .{ .local = body_state_local, .ty = state_ty },
@@ -22319,15 +22322,15 @@ const BodyContext = struct {
             body,
         );
         return try self.lowerEncodeFormatMethod(
-            "encode_tuple",
-            &.{ state_expr, try self.intLiteralExpr(@intCast(payload_tys.len), u64_ty), body_lambda },
-            &.{ state_ty, u64_ty, body_ty },
+            "encode_tag",
+            &.{ state_expr, tag_name_expr, try self.intLiteralExpr(@intCast(payload_tys.len), u64_ty), payloads_lambda },
+            &.{ state_ty, try self.builder.primitiveType(.str), u64_ty, body_ty },
             encoding_ty,
             ret_ty,
         );
     }
 
-    fn lowerEncodePayloadArrayItemsFromState(
+    fn lowerEncodeTagPayloadsFromState(
         self: *BodyContext,
         payload_exprs: []const DraftExprId,
         payload_tys: []const Type.TypeId,
@@ -22361,7 +22364,7 @@ const BodyContext = struct {
             } },
         });
         const item_done_local = try self.addLocal(self.builder.symbols.fresh(), state_ty);
-        const rest = try self.lowerEncodePayloadArrayItemsFromState(
+        const rest = try self.lowerEncodeTagPayloadsFromState(
             payload_exprs,
             payload_tys,
             encoding_expr,
