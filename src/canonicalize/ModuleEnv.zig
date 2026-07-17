@@ -3179,7 +3179,17 @@ pub fn diagnosticToReport(self: *Self, diagnostic: CIR.Diagnostic, allocator: st
                 self.getIdent(data.name),
                 new_region_info,
                 original_region_info,
-                data.cross_scope,
+                filename,
+                self.getSourceAll(),
+                self.getLineStartsAll(),
+            );
+        },
+        .builtin_type_shadowed_warning => |data| blk: {
+            const new_region_info = self.calcRegionInfo(data.region);
+            break :blk try CIR.Diagnostic.buildBuiltinTypeShadowedWarningReport(
+                allocator,
+                self.getIdent(data.name),
+                new_region_info,
                 filename,
                 self.getSourceAll(),
                 self.getLineStartsAll(),
