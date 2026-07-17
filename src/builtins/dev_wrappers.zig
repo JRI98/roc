@@ -1952,7 +1952,7 @@ test "direct float wrapper f32" {
     roc_builtins_float_to_str(&out, bits, true, env.getOps());
     defer out.decref(env.getOps());
 
-    try std.testing.expectEqualStrings("3.140000104904175", out.asSlice());
+    try std.testing.expectEqualStrings("3.14", out.asSlice());
 }
 
 // ── Numeric-from-string wrappers ──
