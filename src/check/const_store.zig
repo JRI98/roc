@@ -179,7 +179,7 @@ pub const ConstEvidence = union(enum) {
         method: static_dispatch.MethodTarget,
         nested: ConstNestedEvidence,
     },
-    structural: static_dispatch.StructuralKind,
+    structural: static_dispatch.StructuralDerivation,
     unreachable_value,
     checked_error,
 };
@@ -946,7 +946,7 @@ test "ConstStore: build, serialize/relocate, and read back values, fns, strings"
     const loaded_target = loaded_evidence[0].target;
     try std.testing.expectEqual(@as(u32, 4), loaded_target.method.module_idx);
     try std.testing.expectEqual(@as(usize, 1), loaded.evidenceSlice(loaded_target.nested.resolved).len);
-    try std.testing.expectEqual(static_dispatch.StructuralKind.hash, loaded.evidenceSlice(loaded_target.nested.resolved)[0].structural);
+    try std.testing.expectEqual(static_dispatch.StructuralDerivation.hash, loaded.evidenceSlice(loaded_target.nested.resolved)[0].structural);
 }
 
 test "ConstStore.appendFn: no leak or double-free under allocation failure" {

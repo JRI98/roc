@@ -193,7 +193,7 @@ const MethodLookup = struct {
 /// vector is self-contained (dictionary passing evaluated at compile time).
 const SpecEvidence = union(enum) {
     target: *const SpecEvidenceTarget,
-    structural: static_dispatch.StructuralKind,
+    structural: static_dispatch.StructuralDerivation,
     /// The edge left the requirement's dispatcher unsolved: no value of that
     /// type can ever reach the dispatch, which lowers to an explicit
     /// unreachable crash.
@@ -270,7 +270,7 @@ fn specEvidenceEql(a: SpecEvidence, b: SpecEvidence) bool {
             else => false,
         },
         .structural => |a_kind| switch (b) {
-            .structural => |b_kind| a_kind == b_kind,
+            .structural => |b_kind| std.meta.eql(a_kind, b_kind),
             else => false,
         },
         .unreachable_value => b == .unreachable_value,
@@ -7293,6 +7293,16 @@ const BodyContext = struct {
             return try self.addExpr(.{ .ty = layer.named, .data = .{ .nominal = backing_expr } });
         }
         return try self.addExpr(.{ .ty = ty, .data = data });
+    }
+
+    /// Pattern counterpart to `addConstructorExpr`, used by compiler-generated
+    /// exhaustive matches whose constructor pattern has no checked source node.
+    fn addConstructorPat(self: *BodyContext, ty: Type.TypeId, data: BodyPatData) Allocator.Error!DraftPatId {
+        if (self.builder.nominalConstructionLayer(ty)) |layer| {
+            const backing_pat = try self.addConstructorPat(layer.backing, data);
+            return try self.addPat(.{ .ty = layer.named, .data = .{ .nominal = backing_pat } });
+        }
+        return try self.addPat(.{ .ty = ty, .data = data });
     }
 
     fn addPat(self: *BodyContext, pat: BodyPat) Allocator.Error!DraftPatId {
@@ -19326,12 +19336,14 @@ const BodyContext = struct {
         // genuinely reachable ownerless dispatch was rejected at check time.
         const resolved = switch (self.consumeDispatchResolution(plan.resolution)) {
             .target => |target| target,
-            .structural => |kind| return switch (kind) {
+            .structural => |derivation| return switch (derivation) {
                 // Equality and hash share the binary structural lowering,
                 // which distinguishes their result modes internally.
                 .equality, .hash => try self.lowerStructuralEquality(plan, callable_mono_ty, plan_ret_ty, self, pre_lowered),
                 .parser => try self.lowerStructuralParser(plan, callable_mono_ty, plan_ret_ty, self, pre_lowered),
                 .encoder => try self.lowerStructuralEncoderFor(plan, callable_mono_ty, plan_ret_ty, self, pre_lowered),
+                .map => |map_plan| try self.lowerStructuralMap("map", plan, map_plan, callable_mono_ty, plan_ret_ty, self, pre_lowered),
+                .map_effectful => |map_plan| try self.lowerStructuralMap("map!", plan, map_plan, callable_mono_ty, plan_ret_ty, self, pre_lowered),
             },
             .unreachable_value => {
                 const crash_ty = expected_ret_ty orelse plan_ret_ty;
@@ -19380,6 +19392,8 @@ const BodyContext = struct {
             .value => expr,
             .parser_for => expr,
             .encoder_for => expr,
+            .map => expr,
+            .map_effectful => expr,
             .equality => |eq| if (eq.negated) blk: {
                 if (!self.typeHasBuiltinOwner(expr_ty, .bool)) Common.invariant("checked equality dispatch returned a non-Bool value");
                 break :blk try self.lowLevelExpr(.bool_not, &.{expr}, expr_ty);
@@ -20139,7 +20153,7 @@ const BodyContext = struct {
     /// classification consumed by every Monotype dispatch lowering path.
     const ConsumedDispatchResolution = union(enum) {
         target: MethodLookup,
-        structural: static_dispatch.StructuralKind,
+        structural: static_dispatch.StructuralDerivation,
         unreachable_value,
         checked_error,
     };
@@ -20171,7 +20185,7 @@ const BodyContext = struct {
     /// synthesis.
     fn structuralKindForMethodText(method_text: []const u8) ?static_dispatch.StructuralKind {
         inline for (static_dispatch.structural_method_kinds) |entry| {
-            if (std.mem.eql(u8, method_text, entry.name)) return entry.kind;
+            if (std.mem.eql(u8, method_text, entry.method_name)) return entry.kind;
         }
         return null;
     }
@@ -20399,7 +20413,7 @@ const BodyContext = struct {
     ) Allocator.Error!SpecEvidence {
         if (try self.builder.componentMethodTargetForView(self.method_scope, component_ty, view, method)) |found| {
             if (found.target.kind == .structural) {
-                return .{ .structural = found.target.kind.structural };
+                return .{ .structural = structuralDerivationWithoutMap(found.target.kind.structural) };
             }
             const arena = self.builder.evidence_arena.allocator();
             const target = try arena.create(SpecEvidenceTarget);
@@ -20407,9 +20421,19 @@ const BodyContext = struct {
             return .{ .target = target };
         }
         if (structuralKindForMethodText(view.names.methodNameText(method))) |kind| {
-            return .{ .structural = kind };
+            return .{ .structural = structuralDerivationWithoutMap(kind) };
         }
         return .unreachable_value;
+    }
+
+    fn structuralDerivationWithoutMap(kind: static_dispatch.StructuralKind) static_dispatch.StructuralDerivation {
+        return switch (kind) {
+            .equality => .equality,
+            .hash => .hash,
+            .parser => .parser,
+            .encoder => .encoder,
+            .map, .map_effectful => Common.invariant("compiler-generated evidence cannot synthesize a derived map payload selection"),
+        };
     }
 
     /// Walk a checked dispatcher path over a concrete monomorphic type.
@@ -20596,6 +20620,7 @@ const BodyContext = struct {
             .value => Common.invariant("value dispatch plan reached structural equality lowering"),
             .parser_for => Common.invariant("parser_for dispatch plan reached structural equality lowering"),
             .encoder_for => Common.invariant("encoder_for dispatch plan reached structural equality lowering"),
+            .map, .map_effectful => Common.invariant("map dispatch plan reached structural equality lowering"),
         };
     }
 
@@ -20660,6 +20685,110 @@ const BodyContext = struct {
         else
             try arg_ctx.lowerDispatchOperandAtType(plan_args[1], arg_tys[1]);
         return .{ .first = first, .second = second, .derived_ty = arg_tys[0] };
+    }
+
+    /// Lower derived `map`/`map!` into the exhaustive tag match selected by
+    /// checking. The payload-slot plan is explicit evidence; Monotype never
+    /// re-runs eligibility or guesses which payload should be transformed.
+    fn lowerStructuralMap(
+        self: *BodyContext,
+        comptime noun: []const u8,
+        plan: static_dispatch.StaticDispatchCallPlan,
+        map_plan: static_dispatch.DerivedMapPlan,
+        callable_mono_ty: Type.TypeId,
+        ret_ty: Type.TypeId,
+        arg_ctx: *BodyContext,
+        pre_lowered: ?PreLoweredOperand,
+    ) Allocator.Error!DraftExprId {
+        switch (plan.result_mode) {
+            .map => |mode| if (!mode.structural_allowed) Common.invariant("structural map dispatch plan did not permit structural map lowering"),
+            .map_effectful => |mode| if (!mode.structural_allowed) Common.invariant("structural map! dispatch plan did not permit structural map! lowering"),
+            else => Common.invariant("non-map dispatch plan reached structural map lowering"),
+        }
+
+        const operands = try self.lowerStructuralBinaryOperands(noun, plan, callable_mono_ty, arg_ctx, pre_lowered);
+        const input_ty = operands.derived_ty;
+        const transform_ty = try self.exprType(operands.second);
+        const transform_fn = self.builder.functionShape(transform_ty, "checked derived map transform had a non-function type");
+        const transform_arg_tys = try GuardedList.dupe(self.allocator, Type.TypeId, self.builder.program.types.span(transform_fn.args));
+        defer self.allocator.free(transform_arg_tys);
+        if (transform_arg_tys.len != 1) Common.invariant("checked derived map transform did not have one argument");
+
+        const selected_name = try self.builder.tagName(self.view, map_plan.tag);
+        const input_selected_tag = self.builder.tagByName(input_ty, selected_name);
+        const output_selected_tag = self.builder.tagByName(ret_ty, selected_name);
+        const input_selected_payloads = self.builder.program.types.span(input_selected_tag.payloads);
+        const output_selected_payloads = self.builder.program.types.span(output_selected_tag.payloads);
+        if (map_plan.payload_index >= input_selected_payloads.len or map_plan.payload_index >= output_selected_payloads.len) {
+            Common.invariant("checked derived map payload plan was outside the selected tag's payloads");
+        }
+        const selected_index: usize = @intCast(map_plan.payload_index);
+        if (!self.sameType(transform_arg_tys[0], GuardedList.at(input_selected_payloads, selected_index))) {
+            Common.invariant("checked derived map transform argument differed from the selected input payload");
+        }
+        if (!self.sameType(transform_fn.ret, GuardedList.at(output_selected_payloads, selected_index))) {
+            Common.invariant("checked derived map transform result differed from the selected output payload");
+        }
+
+        const input_tags = try GuardedList.dupe(self.allocator, Type.Tag, self.builder.tagUnionTags(input_ty));
+        defer self.allocator.free(input_tags);
+        const branches = try self.allocator.alloc(DraftBranch, input_tags.len);
+        defer self.allocator.free(branches);
+
+        const transform_local = try self.addLocal(self.builder.symbols.fresh(), transform_ty);
+        for (input_tags, 0..) |input_tag, branch_index| {
+            const input_payload_tys = try GuardedList.dupe(self.allocator, Type.TypeId, self.builder.program.types.span(input_tag.payloads));
+            defer self.allocator.free(input_payload_tys);
+            const output_tag = self.builder.tagByName(ret_ty, input_tag.name);
+            const output_payload_tys = try GuardedList.dupe(self.allocator, Type.TypeId, self.builder.program.types.span(output_tag.payloads));
+            defer self.allocator.free(output_payload_tys);
+            if (input_payload_tys.len != output_payload_tys.len) {
+                Common.invariant("derived map changed an unselected tag's payload arity");
+            }
+
+            const payload_pats = try self.allocator.alloc(DraftPatId, input_payload_tys.len);
+            defer self.allocator.free(payload_pats);
+            const output_payloads = try self.allocator.alloc(DraftExprId, output_payload_tys.len);
+            defer self.allocator.free(output_payloads);
+            for (input_payload_tys, output_payload_tys, 0..) |input_payload_ty, output_payload_ty, payload_index| {
+                const payload_local = try self.addLocal(self.builder.symbols.fresh(), input_payload_ty);
+                payload_pats[payload_index] = try self.bindPat(payload_local, input_payload_ty);
+                const input_payload = try self.localExpr(payload_local, input_payload_ty);
+                if (input_tag.name == selected_name and payload_index == selected_index) {
+                    const transform = try self.localExpr(transform_local, transform_ty);
+                    output_payloads[payload_index] = try self.addExpr(.{
+                        .ty = output_payload_ty,
+                        .data = .{ .call_value = .{
+                            .callee = transform,
+                            .args = try self.addExprSpan(&.{input_payload}),
+                        } },
+                    });
+                } else {
+                    if (!self.sameType(input_payload_ty, output_payload_ty)) {
+                        Common.invariant("derived map changed an unselected payload type");
+                    }
+                    output_payloads[payload_index] = input_payload;
+                }
+            }
+
+            const body = try self.addConstructorExpr(ret_ty, .{ .tag = .{
+                .name = output_tag.name,
+                .payloads = try self.addExprSpan(output_payloads),
+            } });
+            const branch_pat = try self.addConstructorPat(input_ty, .{ .tag = .{
+                .name = input_tag.name,
+                .payloads = try self.addPatSpan(payload_pats),
+            } });
+            branches[branch_index] = .{ .pat = branch_pat, .body = body };
+        }
+
+        const input_local = try self.addLocal(self.builder.symbols.fresh(), input_ty);
+        const match_expr = try self.addExpr(.{ .ty = ret_ty, .data = .{ .match_ = .{
+            .scrutinee = try self.localExpr(input_local, input_ty),
+            .branches = try self.addBranchSpan(branches),
+        } } });
+        const bind_transform = try self.wrapLet(transform_local, transform_ty, operands.second, match_expr, ret_ty);
+        return try self.wrapLet(input_local, input_ty, operands.first, bind_transform, ret_ty);
     }
 
     fn lowerStructuralParser(
@@ -22608,11 +22737,11 @@ const BodyContext = struct {
     }
 
     fn optionalParseTryInfo(self: *BodyContext, try_ty: Type.TypeId) ?TryInfo {
-        if (self.typeHasParserForTarget(try_ty)) return null;
         if (self.tryJsonInfo(try_ty)) |info| {
             if (!info.has_missing) return null;
             return self.tryInfoOptional(try_ty) orelse Common.invariant("JSON Try info was not backed by a Try type");
         }
+        if (self.typeHasParserForTarget(try_ty)) return null;
         return self.tryInfoOptional(try_ty);
     }
 
@@ -22906,7 +23035,14 @@ const BodyContext = struct {
             else => return false,
         };
         if (named.builtin_owner != null) return false;
-        return self.builder.findComponentMethodTargetByName(self.method_scope, ty, "parser_for") != null;
+        const lookup = self.builder.findComponentMethodTargetByName(self.method_scope, ty, "parser_for") orelse return false;
+        return switch (lookup.target.kind) {
+            .structural => |kind| switch (kind) {
+                .parser => false,
+                else => Common.invariant("parser_for lookup resolved to a different structural method kind"),
+            },
+            .procedure, .local_proc => true,
+        };
     }
 
     fn customParserLookupReadOnly(self: *BodyContext, ty: Type.TypeId) ?MethodLookup {

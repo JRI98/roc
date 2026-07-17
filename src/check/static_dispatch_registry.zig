@@ -326,8 +326,12 @@ fn generatedStructuralTargetForMethodBinding(
     if (module.moduleEnvConst().store.getTypeAnno(module.moduleEnvConst().store.getAnnotation(annotation_idx).anno) != .underscore) return null;
 
     const common = module.commonIdents();
+    if (method_ident.eql(common.is_eq)) return .equality;
+    if (method_ident.eql(common.to_hash)) return .hash;
     if (method_ident.eql(common.parser_for)) return .parser;
     if (method_ident.eql(common.encoder_for)) return .encoder;
+    if (method_ident.eql(common.map)) return .map;
+    if (method_ident.eql(common.map_bang)) return .map_effectful;
     return null;
 }
 
@@ -768,6 +772,12 @@ pub const StaticDispatchResultMode = union(enum) {
     encoder_for: struct {
         structural_allowed: bool,
     },
+    map: struct {
+        structural_allowed: bool,
+    },
+    map_effectful: struct {
+        structural_allowed: bool,
+    },
 };
 
 /// Public `StaticDispatchDispatcher` declaration.
@@ -796,6 +806,36 @@ pub const StructuralKind = enum(u8) {
     hash,
     parser,
     encoder,
+    map,
+    map_effectful,
+};
+
+/// Canonical payload-slot identity selected by the checker for derived map.
+pub const DerivedMapPlan = struct {
+    tag: canonical.TagNameId,
+    payload_index: u32,
+};
+
+/// A concrete compiler-derived implementation. Mapping carries the exact
+/// payload slot selected during checking; later stages consume this plan.
+pub const StructuralDerivation = union(enum) {
+    equality,
+    hash,
+    parser,
+    encoder,
+    map: DerivedMapPlan,
+    map_effectful: DerivedMapPlan,
+
+    pub fn kind(self: StructuralDerivation) StructuralKind {
+        return switch (self) {
+            .equality => .equality,
+            .hash => .hash,
+            .parser => .parser,
+            .encoder => .encoder,
+            .map => .map,
+            .map_effectful => .map_effectful,
+        };
+    }
 };
 
 /// Public `structural_method_kinds` declaration.
@@ -806,11 +846,13 @@ pub const StructuralKind = enum(u8) {
 /// via `@field` over this table while monotype lowering's component synthesis
 /// classifies its view-local method names by text — both from this single
 /// source.
-pub const structural_method_kinds = [_]struct { name: [:0]const u8, kind: StructuralKind }{
-    .{ .name = "is_eq", .kind = .equality },
-    .{ .name = "to_hash", .kind = .hash },
-    .{ .name = "parser_for", .kind = .parser },
-    .{ .name = "encoder_for", .kind = .encoder },
+pub const structural_method_kinds = [_]struct { method_name: [:0]const u8, common_ident: [:0]const u8, kind: StructuralKind }{
+    .{ .method_name = "is_eq", .common_ident = "is_eq", .kind = .equality },
+    .{ .method_name = "to_hash", .common_ident = "to_hash", .kind = .hash },
+    .{ .method_name = "parser_for", .common_ident = "parser_for", .kind = .parser },
+    .{ .method_name = "encoder_for", .common_ident = "encoder_for", .kind = .encoder },
+    .{ .method_name = "map", .common_ident = "map", .kind = .map },
+    .{ .method_name = "map!", .common_ident = "map_bang", .kind = .map_effectful },
 };
 
 /// Public `EvidenceNodeId` declaration. Index into
@@ -839,7 +881,7 @@ pub const EvidenceChainIndex = struct {
 pub const CheckedEvidence = union(enum) {
     direct: EvidenceNodeId,
     constraint: EvidenceChainIndex,
-    structural: StructuralKind,
+    structural: StructuralDerivation,
     checked_error,
     /// The edge left this obligation's dispatcher unsolved: no value of that
     /// type can ever reach the dispatch (e.g. the `Ok` payload of a `Try` that
@@ -900,7 +942,7 @@ pub const StaticDispatchResolution = union(enum) {
     /// vars; each specialization edge supplies the target as evidence.
     constraint: EvidenceChainIndex,
     /// The checker chose a compiler-derived structural implementation.
-    structural: StructuralKind,
+    structural: StructuralDerivation,
     /// Checking rejected this site; lowering must never consume the plan.
     checked_error,
     /// The dispatcher is a constrained var no specialization edge can ever
@@ -1609,6 +1651,12 @@ fn staticDispatchResultModeForCheckedValueCall(
         return .{ .encoder_for = .{
             .structural_allowed = true,
         } };
+    }
+    if (method_name.eql(common.map)) {
+        return .{ .map = .{ .structural_allowed = true } };
+    }
+    if (method_name.eql(common.map_bang)) {
+        return .{ .map_effectful = .{ .structural_allowed = true } };
     }
 
     if (!method_name.eql(common.is_eq)) return .value;

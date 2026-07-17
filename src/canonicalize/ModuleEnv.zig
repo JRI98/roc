@@ -118,6 +118,8 @@ pub const CommonIdents = extern struct {
     to_hash: Ident.Idx,
     parser_for: Ident.Idx,
     encoder_for: Ident.Idx,
+    map: Ident.Idx,
+    map_bang: Ident.Idx,
 
     // Type/module names
     @"try": Ident.Idx,
@@ -241,6 +243,8 @@ pub const CommonIdents = extern struct {
             .to_hash = try common.insertIdent(gpa, Ident.for_text("to_hash")),
             .parser_for = try common.insertIdent(gpa, Ident.for_text("parser_for")),
             .encoder_for = try common.insertIdent(gpa, Ident.for_text("encoder_for")),
+            .map = try common.insertIdent(gpa, Ident.for_text("map")),
+            .map_bang = try common.insertIdent(gpa, Ident.for_text("map!")),
             .@"try" = try common.insertIdent(gpa, Ident.for_text("Try")),
             .out_of_range = try common.insertIdent(gpa, Ident.for_text("OutOfRange")),
             .builtin_module = try common.insertIdent(gpa, Ident.for_text("Builtin")),
@@ -360,6 +364,8 @@ pub const CommonIdents = extern struct {
             .to_hash = common.findIdent("to_hash") orelse unreachable,
             .parser_for = common.findIdent("parser_for") orelse unreachable,
             .encoder_for = common.findIdent("encoder_for") orelse unreachable,
+            .map = common.findIdent("map") orelse unreachable,
+            .map_bang = common.findIdent("map!") orelse unreachable,
             .@"try" = common.findIdent("Try") orelse unreachable,
             .out_of_range = common.findIdent("OutOfRange") orelse unreachable,
             .builtin_module = common.findIdent("Builtin") orelse unreachable,

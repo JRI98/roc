@@ -391,6 +391,7 @@ fn problemBlocksCheckedArtifact(problem: check.problem.Problem) bool {
             .dispatcher_not_nominal,
             .dispatcher_does_not_impl_method,
             .type_does_not_support_equality,
+            .type_does_not_support_map,
             .recursive_dispatch,
             => true,
         },
@@ -449,6 +450,7 @@ fn staticDispatchAllowsLoweringWithUserErrors(static_dispatch: check.problem.Sta
         .dispatcher_not_nominal,
         .dispatcher_does_not_impl_method,
         .type_does_not_support_equality,
+        .type_does_not_support_map,
         .recursive_dispatch,
         => false,
     };
@@ -503,6 +505,7 @@ fn staticDispatchLoweringWithUserErrorsRationale(kind: std.meta.Tag(check.proble
         .dispatcher_not_nominal => "A non-nominal dispatcher has no method table target for lowering.",
         .dispatcher_does_not_impl_method => "A missing method leaves no resolved callable target for lowering.",
         .type_does_not_support_equality => "Unsupported equality has no resolved equality implementation for lowering.",
+        .type_does_not_support_map => "Unsupported mapping has no checker-selected payload transformation plan for lowering.",
         .recursive_dispatch => "Recursive dispatch has no finite resolved callable target for lowering.",
     };
 }
