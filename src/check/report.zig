@@ -288,6 +288,7 @@ pub const ReportBuilder = struct {
 
     const ProblemRegion = union(enum) {
         simple: Region.Idx,
+        direct: Region,
         focused: struct { outer: Region.Idx, highlight: Region.Idx },
     };
 
@@ -527,6 +528,9 @@ pub const ReportBuilder = struct {
             .simple => |region_idx| {
                 try self.addSourceHighlight(&report, region_idx);
             },
+            .direct => |direct_region| {
+                try self.addSourceHighlightRegion(&report, direct_region);
+            },
             .focused => |ctx| {
                 try self.addFocusedSourceHighlight(&report, ctx.outer, ctx.highlight);
             },
@@ -597,6 +601,7 @@ pub const ReportBuilder = struct {
         // Add the region to highlight
         switch (region) {
             .simple => |region_idx| try self.addSourceHighlight(&report, region_idx),
+            .direct => |direct_region| try self.addSourceHighlightRegion(&report, direct_region),
             .focused => |ctx| try self.addFocusedSourceHighlight(&report, ctx.outer, ctx.highlight),
         }
         try report.document.addLineBreak();
@@ -634,6 +639,9 @@ pub const ReportBuilder = struct {
         switch (region) {
             .simple => |region_idx| {
                 try self.addSourceHighlight(&report, region_idx);
+            },
+            .direct => |direct_region| {
+                try self.addSourceHighlightRegion(&report, direct_region);
             },
             .focused => |ctx| {
                 try self.addFocusedSourceHighlight(&report, ctx.outer, ctx.highlight);
@@ -810,6 +818,7 @@ pub const ReportBuilder = struct {
                     .match_alt_binder => |ctx| self.buildMatchAltBinderReport(mismatch.types, ctx),
                     .match_branch => |ctx| self.buildMatchBranchReport(mismatch.types, ctx),
                     .list_entry => |ctx| self.buildListEntryReport(mismatch.types, ctx),
+                    .interpolation_part => |region| self.buildGenericMismatchAtRegion(mismatch.types, .{ .direct = region }),
                     .fn_call_arity => |ctx| self.buildIncompatibleFnCallArity(mismatch.types, ctx),
                     .fn_call_arg => |ctx| self.buildIncompatibleFnCallArg(mismatch.types, ctx),
                     .binop_lhs => |ctx| self.buildBinopReport(mismatch.types, ctx, .lhs),
@@ -950,8 +959,12 @@ pub const ReportBuilder = struct {
     // type mismatch //
 
     fn buildGenericMismatch(self: *Self, types: TypePair) Allocator.Error!Report {
+        return self.buildGenericMismatchAtRegion(types, .{ .simple = regionIdxFrom(types.actual_var) });
+    }
+
+    fn buildGenericMismatchAtRegion(self: *Self, types: TypePair, region: ProblemRegion) Allocator.Error!Report {
         return try self.makeMismatchReport(
-            ProblemRegion{ .simple = regionIdxFrom(types.actual_var) },
+            region,
             &.{D.bytes("This expression is used in an unexpected way.")},
             &.{D.bytes("It has the type:")},
             types.actual_snapshot,

@@ -59,15 +59,21 @@ const no_def_group = std.math.maxInt(u32);
 
 const InterpolationConstraintId = enum(u32) { _ };
 
+const InterpolationPartMetadata = struct {
+    var_: Var,
+    /// The interpolation use site's region. This remains stable when `var_` is
+    /// remapped to a fresh variable during instantiation.
+    region: Region,
+};
+
 const InterpolationConstraintMetadata = struct {
     expr_idx: CIR.Expr.Idx,
     item_var: Var,
-    /// The interpolated-part expression vars (the even-indexed entries of the
-    /// `e_interpolation` `parts`). Captured here, and remapped through the
-    /// instantiation var-map in `copyConstraintMetadata`, so that per-instantiation
-    /// re-checking unifies the dispatch item type against the *instantiated* part
-    /// vars rather than the shared original CIR vars. Owned; freed in `deinit`.
-    interpolated_vars: []Var,
+    /// The interpolated expressions (the even-indexed entries of the
+    /// `e_interpolation` `parts`). Their vars are remapped through the
+    /// instantiation var-map in `copyConstraintMetadata`; their source regions
+    /// remain the original interpolation use sites. Owned; freed in `deinit`.
+    interpolated_parts: []InterpolationPartMetadata,
     checked_parts: bool = false,
 };
 
@@ -1588,7 +1594,7 @@ pub fn deinit(self: *Self) void {
     self.method_field_access_exprs.deinit(self.gpa);
     self.interpolation_constraint_ids_by_fn_var.deinit();
     for (self.interpolation_constraint_metadata.items) |meta| {
-        self.gpa.free(meta.interpolated_vars);
+        self.gpa.free(meta.interpolated_parts);
     }
     self.interpolation_constraint_metadata.deinit(self.gpa);
     self.reported_constraint_errors.deinit();
@@ -7118,16 +7124,21 @@ fn recordInterpolationConstraintMetadata(
     expr_idx: CIR.Expr.Idx,
     item_var: Var,
 ) std.mem.Allocator.Error!void {
-    // Capture the interpolated-part vars now so per-instantiation re-checking can unify the
-    // item type against the instantiated copies of these vars (see `copyConstraintMetadata`).
+    // Capture each part's type var and interpolation use-site region now. Re-checking remaps
+    // the vars per instantiation while keeping the source regions stable (see
+    // `copyConstraintMetadata`).
     const interpolation = self.cir.store.getExpr(expr_idx).e_interpolation;
     const parts = self.cir.store.sliceExpr(interpolation.parts);
     std.debug.assert(parts.len % 2 == 0);
-    const interpolated_vars = try self.gpa.alloc(Var, parts.len / 2);
-    errdefer self.gpa.free(interpolated_vars);
+    const interpolated_parts = try self.gpa.alloc(InterpolationPartMetadata, parts.len / 2);
+    errdefer self.gpa.free(interpolated_parts);
     var part_i: usize = 0;
     while (part_i < parts.len) : (part_i += 2) {
-        interpolated_vars[part_i / 2] = ModuleEnv.varFrom(parts[part_i]);
+        const part_expr_idx = parts[part_i];
+        interpolated_parts[part_i / 2] = .{
+            .var_ = ModuleEnv.varFrom(part_expr_idx),
+            .region = self.cir.store.getNodeRegion(ModuleEnv.nodeIdxFrom(part_expr_idx)),
+        };
     }
 
     const id: InterpolationConstraintId = @enumFromInt(self.interpolation_constraint_metadata.items.len);
@@ -7135,7 +7146,7 @@ fn recordInterpolationConstraintMetadata(
     try self.interpolation_constraint_metadata.append(self.gpa, .{
         .expr_idx = expr_idx,
         .item_var = item_var,
-        .interpolated_vars = interpolated_vars,
+        .interpolated_parts = interpolated_parts,
     });
 }
 
@@ -7183,10 +7194,13 @@ fn copyConstraintMetadata(
         // Remap each interpolated-part var through the instantiation var-map, exactly as
         // `item_var` is remapped, so the re-check unifies instantiated item type against
         // instantiated part vars (the original CIR part vars belong to the generalized copy).
-        const new_interpolated_vars = try self.gpa.alloc(Var, old_metadata.interpolated_vars.len);
-        errdefer self.gpa.free(new_interpolated_vars);
-        for (old_metadata.interpolated_vars, 0..) |old_part_var, i| {
-            new_interpolated_vars[i] = self.instantiatedMetadataVar(old_part_var);
+        const new_interpolated_parts = try self.gpa.alloc(InterpolationPartMetadata, old_metadata.interpolated_parts.len);
+        errdefer self.gpa.free(new_interpolated_parts);
+        for (old_metadata.interpolated_parts, 0..) |old_part, i| {
+            new_interpolated_parts[i] = .{
+                .var_ = self.instantiatedMetadataVar(old_part.var_),
+                .region = old_part.region,
+            };
         }
         const new_item_var = self.instantiatedMetadataVar(old_metadata.item_var);
         const new_id: InterpolationConstraintId = @enumFromInt(self.interpolation_constraint_metadata.items.len);
@@ -7197,7 +7211,7 @@ fn copyConstraintMetadata(
         try self.interpolation_constraint_metadata.append(self.gpa, .{
             .expr_idx = old_metadata.expr_idx,
             .item_var = new_item_var,
-            .interpolated_vars = new_interpolated_vars,
+            .interpolated_parts = new_interpolated_parts,
         });
     }
 }
@@ -19690,15 +19704,7 @@ fn reportEffectfulDispatchInExpect(
     } });
 }
 
-fn interpolationExprForConstraint(self: *Self, constraint: StaticDispatchConstraint) ?CIR.Expr.Idx {
-    if (constraint.origin.literalKind() != .interpolation) return null;
-    const id = self.interpolationConstraintIdForFnVar(constraint.fn_var) orelse return null;
-    const expr_idx = self.interpolation_constraint_metadata.items[@intFromEnum(id)].expr_idx;
-    if (self.cir.store.getExpr(expr_idx) != .e_interpolation) return null;
-    return expr_idx;
-}
-
-fn recordInterpolationPartTypeMismatch(self: *Self, expected_var: Var, actual_var: Var) Allocator.Error!void {
+fn recordInterpolationPartTypeMismatch(self: *Self, expected_var: Var, actual_var: Var, region: Region) Allocator.Error!void {
     const expected_snapshot = try self.snapshots.snapshotVarForError(self.types, &self.type_writer, expected_var);
     const actual_snapshot = try self.snapshots.snapshotVarForError(self.types, &self.type_writer, actual_var);
     _ = try self.problems.appendProblem(self.gpa, .{ .type_mismatch = .{
@@ -19708,27 +19714,26 @@ fn recordInterpolationPartTypeMismatch(self: *Self, expected_var: Var, actual_va
             .actual_var = actual_var,
             .actual_snapshot = actual_snapshot,
         },
-        .context = .none,
+        .context = .{ .interpolation_part = region },
     } });
 }
 
-fn constrainInterpolationExprToStr(self: *Self, expr_idx: CIR.Expr.Idx, expected_str_var: Var, env: *Env) Allocator.Error!bool {
-    const expr_var = ModuleEnv.varFrom(expr_idx);
-    const resolved_expr = self.types.resolveVar(expr_var);
+fn constrainInterpolationPartToStr(self: *Self, part: InterpolationPartMetadata, expected_str_var: Var, env: *Env) Allocator.Error!bool {
+    const resolved_expr = self.types.resolveVar(part.var_);
     if (resolved_expr.desc.content == .err) return false;
 
     const compatible = blk: {
         var probe = try self.beginProbe();
         defer probe.rollback();
-        break :blk try self.probeUnifyWithoutRecordingProblems(expected_str_var, expr_var);
+        break :blk try self.probeUnifyWithoutRecordingProblems(expected_str_var, part.var_);
     };
 
     if (!compatible) {
-        try self.recordInterpolationPartTypeMismatch(expected_str_var, expr_var);
+        try self.recordInterpolationPartTypeMismatch(expected_str_var, part.var_, part.region);
         return true;
     }
 
-    const result = try self.unify(expected_str_var, expr_var, env);
+    const result = try self.unify(expected_str_var, part.var_, env);
     std.debug.assert(result.isOk());
     return false;
 }
@@ -19739,17 +19744,19 @@ fn satisfyBuiltinStrInterpolation(
     constraint: StaticDispatchConstraint,
     env: *Env,
 ) Allocator.Error!bool {
-    const expr_idx = self.interpolationExprForConstraint(constraint) orelse return false;
-    const interpolation = self.cir.store.getExpr(expr_idx).e_interpolation;
-    const expr_region = self.cir.store.getNodeRegion(ModuleEnv.nodeIdxFrom(expr_idx));
+    const metadata_id = self.interpolationConstraintIdForFnVar(constraint.fn_var) orelse {
+        if (builtin.mode == .Debug) {
+            std.debug.panic("type checker invariant violated: builtin Str interpolation constraint had no metadata", .{});
+        }
+        unreachable;
+    };
+    const metadata = self.interpolation_constraint_metadata.items[@intFromEnum(metadata_id)];
+    const expr_region = self.cir.store.getNodeRegion(ModuleEnv.nodeIdxFrom(metadata.expr_idx));
     const expected_str_var = try self.freshStr(env, expr_region);
 
     var did_err = false;
-    const parts = self.cir.store.sliceExpr(interpolation.parts);
-    std.debug.assert(parts.len % 2 == 0);
-    var part_i: usize = 0;
-    while (part_i < parts.len) : (part_i += 2) {
-        did_err = (try self.constrainInterpolationExprToStr(parts[part_i], expected_str_var, env)) or did_err;
+    for (metadata.interpolated_parts) |part| {
+        did_err = (try self.constrainInterpolationPartToStr(part, expected_str_var, env)) or did_err;
     }
 
     if (did_err) {
@@ -19775,14 +19782,15 @@ fn ensureCustomInterpolationPartsChecked(
     self.interpolation_constraint_metadata.items[metadata_index].checked_parts = true;
 
     const item_var = self.interpolation_constraint_metadata.items[metadata_index].item_var;
-    // Use the captured part vars (remapped per instantiation), not the original CIR `parts`,
-    // so an instantiated call site unifies the item type against its instantiated arguments.
-    const interpolated_vars = self.interpolation_constraint_metadata.items[metadata_index].interpolated_vars;
+    // Use the captured part metadata, not the original CIR `parts`, so an instantiated call
+    // site unifies the item type against its instantiated arguments and reports at the
+    // interpolation use site.
+    const interpolated_parts = self.interpolation_constraint_metadata.items[metadata_index].interpolated_parts;
 
     var did_err = false;
-    for (interpolated_vars) |interpolated_var| {
-        const result = try self.unify(item_var, interpolated_var, env);
-        did_err = did_err or result.isProblem() or self.types.resolveVar(interpolated_var).desc.content == .err;
+    for (interpolated_parts) |part| {
+        const result = try self.unifyInContext(item_var, part.var_, env, .{ .interpolation_part = part.region });
+        did_err = did_err or result.isProblem() or self.types.resolveVar(part.var_).desc.content == .err;
     }
 
     if (did_err) {
