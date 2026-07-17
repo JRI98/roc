@@ -4541,6 +4541,40 @@ Builtin :: [].{
 			(Ok(a), Ok(b)) => Ok(transform!(a, b))
 		}
 
+		## If the result is `Err`, runs a recovery function on the value it holds. That
+		## function returns a new result, so recovering can itself fail — with a
+		## different error type if you like. If the result is `Ok`, this has no effect.
+		## Use [Try.map_err] when the recovery cannot fail.
+		## ```roc
+		## expect {
+		## 	err : Try(I64, Str)
+		## 	err = Err("uh oh")
+		## 	err.on_err(|_| Ok(0)) == Ok(0)
+		## }
+		##
+		## expect {
+		## 	ok : Try(I64, Str)
+		## 	ok = Ok(7)
+		## 	ok.on_err(|_| Ok(0)) == Ok(7)
+		## }
+		## ```
+		on_err : Try(ok, a), (a -> Try(ok, b)) -> Try(ok, b)
+		on_err = |try, recover| match try {
+			Err(a) => recover(a)
+			Ok(ok) => Ok(ok)
+		}
+
+		## Like [Try.on_err], but the recovery function is effectful. It runs only when
+		## the result is an `Err`.
+		## ```roc
+		## config_try.on_err!(|_| Http.get!("https://example.com/fallback-config"))
+		## ```
+		on_err! : Try(ok, a), (a => Try(ok, b)) => Try(ok, b)
+		on_err! = |try, recover!| match try {
+			Err(a) => recover!(a)
+			Ok(ok) => Ok(ok)
+		}
+
 		## Returns `Bool.True` if the two `Try` values are the same variant (`Ok` or `Err`) and their contents are pairwise equal. Otherwise, returns `Bool.False`.
 		is_eq : Try(ok, err), Try(ok, err) -> Bool
 			where [
