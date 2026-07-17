@@ -824,16 +824,12 @@ const core_tests = [_]TestCase{
         .expected = .{ .inspect_str = "((True, True, True, True, True), (False, False, False, False, False))" },
     },
     .{
-        .name = "allocation - string interpolation pattern capture returns seamless heap slice",
+        .name = "allocation - string interpolation pattern capture returns seamless slice without allocation",
         .source =
         \\{
-        \\    prefix = "MATCH_PREFIX:"
-        \\    payload = Str.repeat("abcdefghijklmnopqrstuvwxyz0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ", 1)
-        \\    source = Str.concat(prefix, payload)
-        \\
-        \\    match source {
+        \\    match "MATCH_PREFIX:abcdefghijklmnopqrstuvwxyz0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ" {
         \\        "MATCH_PREFIX:${rest}" =>
-        \\            if Str.contains(rest, "mnop") and Str.caseless_ascii_equals(rest, payload) {
+        \\            if Str.contains(rest, "mnop") and Str.caseless_ascii_equals(rest, "abcdefghijklmnopqrstuvwxyz0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ") {
         \\                rest
         \\            } else {
         \\                ""
@@ -844,18 +840,14 @@ const core_tests = [_]TestCase{
         ,
         .expected = .{ .allocations_at_most = .{
             .output = "abcdefghijklmnopqrstuvwxyz0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ",
-            .max_allocations = 2,
+            .max_allocations = 0,
         } },
     },
     .{
         .name = "allocation - string interpolation pattern capture feeds drop prefix suffix without copy",
         .source =
         \\{
-        \\    prefix = "MATCH_PREFIX:"
-        \\    payload = Str.repeat("DROPabcdefghijklmnopqrstuvwxyz0123456789KEEP", 1)
-        \\    source = Str.concat(prefix, payload)
-        \\
-        \\    match source {
+        \\    match "MATCH_PREFIX:DROPabcdefghijklmnopqrstuvwxyz0123456789KEEP" {
         \\        "MATCH_PREFIX:${rest}" => Str.drop_suffix(Str.drop_prefix(rest, "DROP"), "KEEP")
         \\        _ => ""
         \\    }
@@ -863,17 +855,14 @@ const core_tests = [_]TestCase{
         ,
         .expected = .{ .allocations_at_most = .{
             .output = "abcdefghijklmnopqrstuvwxyz0123456789",
-            .max_allocations = 2,
+            .max_allocations = 0,
         } },
     },
     .{
-        .name = "allocation - string interpolation pattern middle capture remains heap slice",
+        .name = "allocation - string interpolation pattern middle capture remains slice without allocation",
         .source =
         \\{
-        \\    payload = Str.repeat("abcdefghijklmnopqrstuvwxyz0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ", 1)
-        \\    source = Str.concat(Str.concat("prefix/user/", payload), "/posts/tail")
-        \\
-        \\    match source {
+        \\    match "prefix/user/abcdefghijklmnopqrstuvwxyz0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ/posts/tail" {
         \\        "${_}/user/${id}/posts/${_}" => id
         \\        _ => ""
         \\    }
@@ -881,7 +870,7 @@ const core_tests = [_]TestCase{
         ,
         .expected = .{ .allocations_at_most = .{
             .output = "abcdefghijklmnopqrstuvwxyz0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ",
-            .max_allocations = 3,
+            .max_allocations = 0,
         } },
     },
     .{
