@@ -57,6 +57,27 @@ const TypeDeclGenerationState = enum {
 
 const no_def_group = std.math.maxInt(u32);
 
+const FunctionEffectState = enum {
+    pure,
+    effectful,
+    unresolved,
+};
+
+const FunctionEffectResolution = enum {
+    visiting,
+    pure,
+    effectful,
+    unresolved,
+
+    fn state(self: @This()) FunctionEffectState {
+        return switch (self) {
+            .visiting, .pure => .pure,
+            .effectful => .effectful,
+            .unresolved => .unresolved,
+        };
+    }
+};
+
 const InterpolationConstraintId = enum(u32) { _ };
 
 const InterpolationPartMetadata = struct {
@@ -536,6 +557,14 @@ checked_lambda_params: std.ArrayListUnmanaged(CIR.Pattern.Span),
 /// output so binding-name diagnostics do not infer effectfulness from
 /// annotations that only make a pure body have an effectful function type.
 effectful_lambda_bodies: std.AutoHashMap(CIR.Expr.Idx, void),
+/// Directed function-effect dependencies accumulated for the lambda body
+/// currently being checked. Each active lambda owns the suffix beginning at
+/// its matching frame start; nested lambda dependencies are copied into the
+/// nested function type and removed before returning to the parent body.
+pending_function_effect_dependencies: std.ArrayListUnmanaged(Var),
+function_effect_dependency_frame_starts: std.ArrayListUnmanaged(usize),
+/// Reusable sparse memo for one directed function-effect graph query.
+function_effect_resolution: std.AutoHashMap(Var, FunctionEffectResolution),
 /// Scratch for `beginCommitProbe`: the caller env's var-pool length per rank
 /// at probe start, restored on a failed probe's rollback. One buffer suffices
 /// because commit-probes never nest — but the type store's trail-based
@@ -1521,6 +1550,9 @@ fn initAssumePrepared(
         .known_empty_payload_vars_match = .empty,
         .checked_lambda_params = .empty,
         .effectful_lambda_bodies = std.AutoHashMap(CIR.Expr.Idx, void).init(gpa),
+        .pending_function_effect_dependencies = .empty,
+        .function_effect_dependency_frame_starts = .empty,
+        .function_effect_resolution = std.AutoHashMap(Var, FunctionEffectResolution).init(gpa),
         .probe_var_pool_lens = .empty,
     };
 
@@ -1643,6 +1675,9 @@ pub fn deinit(self: *Self) void {
     self.known_empty_payload_vars_match.deinit(self.gpa);
     self.checked_lambda_params.deinit(self.gpa);
     self.effectful_lambda_bodies.deinit();
+    self.pending_function_effect_dependencies.deinit(self.gpa);
+    self.function_effect_dependency_frame_starts.deinit(self.gpa);
+    self.function_effect_resolution.deinit();
     self.probe_var_pool_lens.deinit(self.gpa);
 }
 
@@ -7829,23 +7864,73 @@ fn zeroArgFunctionReturnVar(self: *Self, var_: Var) ?Var {
     }
 }
 
-fn varIsEffectfulFunction(self: *Self, var_: Var) bool {
-    var current = var_;
-    while (true) {
-        const resolved = self.types.resolveVar(current);
-        switch (resolved.desc.content) {
-            .alias => |alias| {
-                current = self.types.getAliasBackingVar(alias);
-                continue;
+fn varIsEffectfulFunction(self: *Self, var_: Var) Allocator.Error!bool {
+    return try self.functionEffectState(var_) == .effectful;
+}
+
+/// Resolve the directed effect formula carried by a function type. The memo is
+/// per query because union-find roots can change after any subsequent
+/// unification. A visiting back-edge contributes no effect by itself; this is
+/// the SCC base case, while any positive or unresolved dependency reachable
+/// outside the cycle still propagates back to every caller in the cycle.
+fn functionEffectState(self: *Self, var_: Var) Allocator.Error!FunctionEffectState {
+    self.function_effect_resolution.clearRetainingCapacity();
+    return self.functionEffectStateHelp(var_);
+}
+
+fn functionEffectStateHelp(self: *Self, var_: Var) Allocator.Error!FunctionEffectState {
+    const resolved = self.types.resolveVar(var_);
+    const root = resolved.var_;
+    if (self.function_effect_resolution.get(root)) |memo| return memo.state();
+
+    try self.function_effect_resolution.put(root, .visiting);
+    const state: FunctionEffectState = switch (resolved.desc.content) {
+        .alias => |alias| try self.functionEffectStateHelp(self.types.getAliasBackingVar(alias)),
+        .err => .pure,
+        .flex, .rigid => .unresolved,
+        .structure => |flat| switch (flat) {
+            .fn_pure, .fn_effectful, .fn_unbound => |func| blk: {
+                var result: FunctionEffectState = switch (flat) {
+                    .fn_pure => .pure,
+                    .fn_effectful => .effectful,
+                    .fn_unbound => if (func.effect_deps.len() == 0) .unresolved else .pure,
+                    else => unreachable,
+                };
+                if (result == .effectful) break :blk result;
+
+                var i: u32 = 0;
+                while (i < func.effect_deps.len()) : (i += 1) {
+                    switch (try self.functionEffectStateHelp(self.types.getVarAt(func.effect_deps, i))) {
+                        .effectful => {
+                            result = .effectful;
+                            break;
+                        },
+                        .unresolved => result = .unresolved,
+                        .pure => {},
+                    }
+                }
+                break :blk result;
             },
-            .structure => |flat| return switch (flat) {
-                .fn_effectful => true,
-                .fn_pure, .fn_unbound => false,
-                else => false,
-            },
-            .err, .flex, .rigid => return false,
-        }
+            else => .pure,
+        },
+    };
+
+    try self.function_effect_resolution.put(root, switch (state) {
+        .pure => .pure,
+        .effectful => .effectful,
+        .unresolved => .unresolved,
+    });
+    return state;
+}
+
+fn recordCurrentFunctionEffectDependency(self: *Self, function_var: Var) Allocator.Error!void {
+    if (self.function_effect_dependency_frame_starts.items.len == 0) return;
+    const root = self.types.resolveVar(function_var).var_;
+    const start = self.function_effect_dependency_frame_starts.items[self.function_effect_dependency_frame_starts.items.len - 1];
+    for (self.pending_function_effect_dependencies.items[start..]) |existing| {
+        if (self.types.resolveVar(existing).var_ == root) return;
     }
+    try self.pending_function_effect_dependencies.append(self.gpa, root);
 }
 
 /// A dispatch can be evaluated as one module-level constant only when checking
@@ -7856,17 +7941,28 @@ fn varIsEffectfulFunction(self: *Self, var_: Var) bool {
 /// evidence, so selecting it as a caller-less compile-time root would erase the
 /// evidence scope that gives the dispatch meaning.
 fn staticDispatchAllowsHoistedRoot(self: *Self, dispatcher_var: Var, callable_var: Var) Allocator.Error!bool {
-    if (!self.varIsFunctionType(callable_var) or self.varIsEffectfulFunction(callable_var)) return false;
+    if (!self.varIsFunctionType(callable_var) or try self.varIsEffectfulFunction(callable_var)) return false;
     return try self.varIsConcreteHoistedConstType(dispatcher_var);
 }
 
-fn exprHasEffectfulFunctionBody(self: *const Self, expr_idx: CIR.Expr.Idx) bool {
+fn exprHasEffectfulFunctionBody(self: *Self, expr_idx: CIR.Expr.Idx) Allocator.Error!bool {
     return switch (self.cir.store.getExpr(expr_idx)) {
-        .e_lambda => self.effectful_lambda_bodies.contains(expr_idx),
-        .e_closure => |closure| self.effectful_lambda_bodies.contains(closure.lambda_idx),
+        .e_lambda => self.lambdaBodyIsEffectful(expr_idx),
+        .e_closure => |closure| self.lambdaBodyIsEffectful(closure.lambda_idx),
         .e_hosted_lambda => true,
         else => false,
     };
+}
+
+fn lambdaBodyIsEffectful(self: *Self, lambda_idx: CIR.Expr.Idx) Allocator.Error!bool {
+    if (self.effectful_lambda_bodies.contains(lambda_idx)) return true;
+    const resolved = self.types.resolveVar(ModuleEnv.varFrom(lambda_idx));
+    const func = resolved.desc.content.unwrapFunc() orelse return false;
+    var i: u32 = 0;
+    while (i < func.effect_deps.len()) : (i += 1) {
+        if (try self.functionEffectState(self.types.getVarAt(func.effect_deps, i)) == .effectful) return true;
+    }
+    return false;
 }
 
 /// Whether `def_idx` belongs to a binding group that is still on the check
@@ -7906,7 +8002,7 @@ fn callTargetIsInFlightRecursiveRef(self: *const Self, func_expr_idx: CIR.Expr.I
 fn checkEffectfulFunctionName(self: *Self, pattern_idx: CIR.Pattern.Idx, expr_idx: CIR.Expr.Idx) std.mem.Allocator.Error!void {
     const ident = self.getPatternIdent(pattern_idx) orelse return;
     if (ident.attributes.effectful) return;
-    if (!self.exprHasEffectfulFunctionBody(expr_idx)) return;
+    if (!try self.exprHasEffectfulFunctionBody(expr_idx)) return;
 
     _ = try self.problems.appendProblem(self.gpa, .{ .effectful_function_name = .{
         .region = self.cir.store.getNodeRegion(ModuleEnv.nodeIdxFrom(pattern_idx)),
@@ -9083,7 +9179,7 @@ fn checkDef(self: *Self, def_idx: CIR.Def.Idx, env: *Env) std.mem.Allocator.Erro
         try self.erroneous_value_patterns.put(self.gpa, def.pattern, {});
     }
     try self.closeAbsentConstructedPayloadVars(def.expr, expr_var);
-    if (isFunctionDef(&self.cir.store, self.cir.store.getExpr(def.expr))) {
+    if (isFunctionDef(&self.cir.store, self.cir.store.getExpr(def.expr)) and !self.defInCurrentRecursiveGroup(def_idx)) {
         try self.checkEffectfulFunctionName(def.pattern, def.expr);
     }
 
@@ -9433,6 +9529,12 @@ fn checkGroup(self: *Self, group_index: u32, env: *Env) std.mem.Allocator.Error!
         }
 
         try self.runGroupBoundary(member_roots, env);
+        for (scc.defs) |member_def_idx| {
+            const member_def = self.cir.store.getDef(member_def_idx);
+            if (isFunctionDef(&self.cir.store, self.cir.store.getExpr(member_def.expr))) {
+                try self.checkEffectfulFunctionName(member_def.pattern, member_def.expr);
+            }
+        }
         try self.generalizer.generalize(self.gpa, &env.var_pool, env.rank());
         try self.judgeAmbiguityCandidatesAtGeneralizationMultiRoot(member_roots);
         env.var_pool.popRank();
@@ -9466,9 +9568,39 @@ fn runGroupBoundary(self: *Self, roots: []const Var, env: *Env) std.mem.Allocato
         try self.defaultLiteralsAtGeneralizationBoundaryMultiRoot(roots, env);
         if (self.pending_dispatch_targets.items.len == pending_before) break;
     }
+    try self.finalizeFunctionEffectsAtBoundary(roots, env);
     // Invariant D: every remaining deferred dispatch constraint targets a
     // checked def, an annotated scheme, or a still-flex receiver.
     std.debug.assert(self.pending_dispatch_targets.items.len == self.currentFramePendingTargetsTop());
+}
+
+/// Materialize positive directed-effect results before the enclosing type
+/// scheme generalizes. Unresolved results remain `fn_unbound` because their
+/// dependency formula is part of the generalized scheme and will be resolved
+/// after call-site arguments instantiate and unify it.
+fn finalizeFunctionEffectsAtBoundary(self: *Self, roots: []const Var, env: *Env) Allocator.Error!void {
+    for (roots) |root| {
+        const resolved = self.types.resolveVar(root);
+        const flat = switch (resolved.desc.content) {
+            .structure => |flat| flat,
+            else => continue,
+        };
+        if (try self.functionEffectState(resolved.var_) != .effectful) continue;
+        switch (flat) {
+            .fn_unbound => |func| try self.types.setVarContent(resolved.var_, .{ .structure = .{ .fn_effectful = func } }),
+            .fn_pure => |func| {
+                // The body was still effect-polymorphic when it met a pure
+                // annotation, but a dependency became positive later in this
+                // recursive group. Re-run ordinary effect unification now so
+                // the annotation mismatch is reported instead of mutating the
+                // annotated type behind the user's back.
+                const effectful = try self.freshFromContent(.{ .structure = .{ .fn_effectful = func } }, env, self.getRegionAt(resolved.var_));
+                _ = try self.unifyInContext(resolved.var_, effectful, env, .type_annotation);
+            },
+            .fn_effectful => {},
+            else => continue,
+        }
+    }
 }
 
 /// Drain the current frame's pending dispatch targets: check each target's
@@ -12812,6 +12944,13 @@ fn checkExpr(self: *Self, expr_idx: CIR.Expr.Idx, env: *Env, expected: Expected)
             var return_constraints_processed = false;
             defer if (!return_constraints_processed) self.discardReturnConstraintFrame(expr_idx);
 
+            const effect_dependencies_start = self.pending_function_effect_dependencies.items.len;
+            try self.function_effect_dependency_frame_starts.append(self.gpa, effect_dependencies_start);
+            defer {
+                _ = self.function_effect_dependency_frame_starts.pop();
+                self.pending_function_effect_dependencies.shrinkRetainingCapacity(effect_dependencies_start);
+            }
+
             const body_does_fx = if (mb_anno_func) |expected_func| blk: {
                 const lambda_body_does_fx = try self.checkExpr(lambda.body, env, lambda_body_expected.withBranchResult(expected_func.ret));
                 try self.closeAbsentConstructedPayloadVars(lambda.body, body_var);
@@ -12838,12 +12977,34 @@ fn checkExpr(self: *Self, expr_idx: CIR.Expr.Idx, env: *Env, expected: Expected)
             // running occurs per syntactic lambda re-traversed the whole body
             // type graph once per nesting level.
 
+            // A dependency may already have become positive while checking a
+            // later argument or definition. Materialize that result before
+            // unifying with an annotation; only genuinely unresolved formulas
+            // remain attached to an unbound function type.
+            var body_is_effectful = body_does_fx;
+            if (!body_is_effectful) {
+                for (self.pending_function_effect_dependencies.items[effect_dependencies_start..]) |dependency| {
+                    if (try self.functionEffectState(dependency) == .effectful) {
+                        body_is_effectful = true;
+                        break;
+                    }
+                }
+            }
+
             // Create the function type
-            if (body_does_fx) {
+            if (body_is_effectful) {
                 try self.effectful_lambda_bodies.put(expr_idx, {});
                 try self.unifyWith(expr_var, try self.types.mkFuncEffectful(arg_vars, body_var), env);
             } else {
-                try self.unifyWith(expr_var, try self.types.mkFuncUnbound(arg_vars, body_var), env);
+                try self.unifyWith(
+                    expr_var,
+                    try self.types.mkFuncUnboundWithEffectDeps(
+                        arg_vars,
+                        body_var,
+                        self.pending_function_effect_dependencies.items[effect_dependencies_start..],
+                    ),
+                    env,
+                );
             }
 
             // Note that so far, we have not yet unified against the
@@ -12927,10 +13088,11 @@ fn checkExpr(self: *Self, expr_idx: CIR.Expr.Idx, env: *Env, expected: Expected)
                         // without doing any additional work
                         try self.unifyWith(expr_var, .err, env);
                     } else {
-                        // From the base function type, extract the actual function info
-                        // and also track whether the function is effectful
-                        const FuncInfo = struct { func: types_mod.Func, is_effectful: bool };
-                        const mb_func_info: ?FuncInfo = inner_blk: {
+                        // From the base function type, extract its shape. Effect
+                        // classification happens only after arguments unify below:
+                        // those unifications may resolve directed higher-order
+                        // effect dependencies carried by this function type.
+                        const mb_func: ?types_mod.Func = inner_blk: {
                             // Here, we unwrap the function, following aliases, to get
                             // the actual function we want to check against
                             var var_ = func_var;
@@ -12940,9 +13102,7 @@ fn checkExpr(self: *Self, expr_idx: CIR.Expr.Idx, env: *Env, expected: Expected)
                                 switch (self.types.resolveVar(var_).desc.content) {
                                     .structure => |flat_type| {
                                         switch (flat_type) {
-                                            .fn_pure => |func| break :inner_blk FuncInfo{ .func = func, .is_effectful = false },
-                                            .fn_unbound => |func| break :inner_blk FuncInfo{ .func = func, .is_effectful = false },
-                                            .fn_effectful => |func| break :inner_blk FuncInfo{ .func = func, .is_effectful = true },
+                                            .fn_pure, .fn_unbound, .fn_effectful => |func| break :inner_blk func,
                                             else => break :inner_blk null,
                                         }
                                     },
@@ -12953,19 +13113,6 @@ fn checkExpr(self: *Self, expr_idx: CIR.Expr.Idx, env: *Env, expected: Expected)
                                 }
                             }
                         };
-                        const mb_func = if (mb_func_info) |info| info.func else null;
-
-                        // If the function being called is effectful, mark this
-                        // expression as effectful. A recursive call within the
-                        // current binding group is exempt: the group's own
-                        // declared `=>` scheme must not seed its effectfulness
-                        // fixpoint (see callTargetIsInFlightRecursiveRef).
-                        if (mb_func_info) |info| {
-                            if (info.is_effectful and !self.callTargetIsInFlightRecursiveRef(call.func)) {
-                                does_fx = true;
-                            }
-                        }
-
                         // Get the name of the function (for error messages)
                         const func_name: ?Ident.Idx = self.getExprPatternIdent(call.func);
 
@@ -13110,18 +13257,46 @@ fn checkExpr(self: *Self, expr_idx: CIR.Expr.Idx, env: *Env, expected: Expected)
                             _ = try self.unify(expr_var, call_func_ret, env);
                         }
 
+                        // Argument unification above is the point at which an
+                        // effect-polymorphic callback can become pure or
+                        // effectful. Resolve the directed formula now, never from
+                        // the pre-unification function tag.
+                        const call_effect_state: FunctionEffectState = if (self.callTargetIsInFlightRecursiveRef(call.func)) recursive_effect: {
+                            // A declared pure/effectful tag on an in-flight
+                            // recursive scheme must not seed the body's
+                            // fixpoint. An inferred unbound slot, however, is a
+                            // real directed edge between SCC members and must
+                            // survive until the boundary resolves the group.
+                            const recursive_func = self.types.resolveVar(func_var).desc.content;
+                            break :recursive_effect switch (recursive_func) {
+                                .structure => |flat| switch (flat) {
+                                    .fn_unbound => .unresolved,
+                                    .fn_pure, .fn_effectful => .pure,
+                                    else => .unresolved,
+                                },
+                                else => .unresolved,
+                            };
+                        } else try self.functionEffectState(func_var);
+                        switch (call_effect_state) {
+                            .effectful => does_fx = true,
+                            .unresolved => try self.recordCurrentFunctionEffectDependency(func_var),
+                            .pure => {},
+                        }
+
                         const published_constraint_args: []Var = @ptrCast(call_arg_expr_idxs);
                         const published_constraint_func = Func{
                             .args = try self.types.appendVars(published_constraint_args),
                             .ret = expr_var,
-                        };
-                        const published_constraint_flat: FlatType = if (mb_func_info) |info|
-                            if (info.is_effectful)
-                                .{ .fn_effectful = published_constraint_func }
+                            .effect_deps = if (call_effect_state == .unresolved)
+                                try self.types.appendVars(&.{func_var})
                             else
-                                .{ .fn_pure = published_constraint_func }
-                        else
-                            .{ .fn_unbound = published_constraint_func };
+                                Var.SafeList.Range.empty(),
+                        };
+                        const published_constraint_flat: FlatType = switch (call_effect_state) {
+                            .effectful => .{ .fn_effectful = published_constraint_func },
+                            .pure => .{ .fn_pure = published_constraint_func },
+                            .unresolved => .{ .fn_unbound = published_constraint_func },
+                        };
                         const published_constraint_fn_var = try self.freshFromContent(.{ .structure = published_constraint_flat }, env, expr_region);
 
                         try self.cir.store.replaceExprWithCallConstraint(
@@ -13282,7 +13457,7 @@ fn checkExpr(self: *Self, expr_idx: CIR.Expr.Idx, env: *Env, expected: Expected)
                     constraint_fn_var,
                     .method_call,
                 );
-                if (self.varIsEffectfulFunction(constraint_fn_var)) {
+                if (try self.varIsEffectfulFunction(constraint_fn_var)) {
                     self.markCurrentHoistObservableEffect();
                     does_fx = true;
                 }
@@ -13301,7 +13476,7 @@ fn checkExpr(self: *Self, expr_idx: CIR.Expr.Idx, env: *Env, expected: Expected)
             if (did_err) {
                 try self.unifyWith(expr_var, .err, env);
             }
-            if (self.varIsEffectfulFunction(method_call.constraint_fn_var)) {
+            if (try self.varIsEffectfulFunction(method_call.constraint_fn_var)) {
                 self.markCurrentHoistObservableEffect();
                 does_fx = true;
             }
@@ -13397,7 +13572,7 @@ fn checkExpr(self: *Self, expr_idx: CIR.Expr.Idx, env: *Env, expected: Expected)
                     method_call.args,
                     constraint_fn_var,
                 );
-                if (self.varIsEffectfulFunction(constraint_fn_var)) {
+                if (try self.varIsEffectfulFunction(constraint_fn_var)) {
                     self.markCurrentHoistObservableEffect();
                     does_fx = true;
                 }
@@ -13414,7 +13589,7 @@ fn checkExpr(self: *Self, expr_idx: CIR.Expr.Idx, env: *Env, expected: Expected)
             if (did_err) {
                 try self.unifyWith(expr_var, .err, env);
             }
-            if (self.varIsEffectfulFunction(method_call.constraint_fn_var)) {
+            if (try self.varIsEffectfulFunction(method_call.constraint_fn_var)) {
                 self.markCurrentHoistObservableEffect();
                 does_fx = true;
             }
@@ -19694,7 +19869,7 @@ fn reportEffectfulDispatchInExpect(
     self: *Self,
     constraint: StaticDispatchConstraint,
 ) std.mem.Allocator.Error!void {
-    if (!self.varIsEffectfulFunction(constraint.fn_var)) return;
+    if (!try self.varIsEffectfulFunction(constraint.fn_var)) return;
     const expect_region = constraint.provenance.expect_region.get() orelse return;
     // Report each constraint once even though constraint checking revisits it
     // across passes — the dedup set replaces the old side table's fetchRemove.
