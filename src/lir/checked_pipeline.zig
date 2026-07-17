@@ -66,6 +66,10 @@ pub const TargetConfig = struct {
     /// is enabled for optimized builds and kept off for dev and compile-time
     /// evaluation.
     tag_reachability: bool = false,
+    /// Debug-only: forwarded to `SolvedLirLower.Options.debug_materialized_out`
+    /// so a differential harness can execute the Debug verifier's materialized
+    /// Lambda Mono program. The slot receives a value only in Debug builds.
+    debug_materialized_out: ?*?postcheck.LambdaMono.Ast.Program = null,
 };
 
 /// Whether the root checked module is complete or inside checking finalization.
@@ -81,6 +85,10 @@ pub const RuntimeTagUnionSchema = postcheck.SolvedLirLower.RuntimeTagUnionSchema
 pub const InlineMode = postcheck.SolvedInline.Mode;
 pub const InlineExpectMode = postcheck.SolvedLirLower.InlineExpectMode;
 pub const MonotypeCacheControl = postcheck.Monotype.Lower.SpecializationCacheControl;
+
+/// Materialized Lambda Mono program type, re-exported for harnesses that
+/// receive one through `TargetConfig.debug_materialized_out`.
+pub const LambdaMonoProgram = postcheck.LambdaMono.Ast.Program;
 
 /// Runtime record and tag-union schemas needed by dev tooling.
 pub const RuntimeValueSchemaStore = struct {
@@ -264,6 +272,7 @@ pub fn lowerCheckedModulesToLir(
         .proc_debug_names = target.proc_debug_names,
         .layout_request_const_plans = target.layout_request_const_plans,
         .test_plan_metadata = roots.test_plan_metadata,
+        .debug_materialized_out = target.debug_materialized_out,
     });
     solved_owned = false;
     solved = undefined;
