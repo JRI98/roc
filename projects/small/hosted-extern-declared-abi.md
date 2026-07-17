@@ -142,5 +142,7 @@ generated-code change for valid programs.
 
 - [../small/audit-solver-mutating-rewrites.md](../small/audit-solver-mutating-rewrites.md)
   — classifies the checker rewrite this project makes non-load-bearing.
-- [../big/platform-relation-from-checking.md](../big/platform-relation-from-checking.md)
-  — the substitutions this project's invariant is stated relative to.
+- Carry the platform-app relation from checking — landed: the platform-root
+  substitutions this project's invariant is stated relative to are now the
+  requirement solutions recorded at check time (see design.md's
+  "Platform/App Relation" section).

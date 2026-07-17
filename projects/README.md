@@ -94,10 +94,11 @@ Within this batch: land `lambda-mono-oracle-fidelity` before
    — classifies every probe-then-mutate solver rewrite as mechanism or
    declared policy (the 9834→9921→9966 lesson); depends on Chain B step 1
    to make the 9966 rewrite non-load-bearing before judging it.
-3. [big/platform-relation-from-checking.md](big/platform-relation-from-checking.md)
-   — the app↔platform correspondence becomes a checked fact carried to
-   finalization, retiring the last name-keyed cross-module resolution and
-   the double platform publication.
+
+The platform-relation migration that concluded this chain has landed:
+checking records each platform requirement's solution in the app's checked
+artifact, finalization consumes it, and the platform root is published
+once — the name-keyed re-resolution and double publication are deleted.
 
 ### Chain C — specialization sealing
 
@@ -136,8 +137,7 @@ front-loads leverage and keeps prerequisites satisfied:
 6. `small/hoist-consumes-dispatch-evidence.md`
 7. `small/hosted-extern-declared-abi.md`
 8. `small/audit-solver-mutating-rewrites.md`
-9. `big/platform-relation-from-checking.md`
-10. `small/frame-partitioned-checker-state.md`
-11. `small/compact-constant-aggregates.md`
-12. `big/single-source-builtin-registration.md`
-13. `big/decision-tree-match-compiler.md`
+9. `small/frame-partitioned-checker-state.md`
+10. `small/compact-constant-aggregates.md`
+11. `big/single-source-builtin-registration.md`
+12. `big/decision-tree-match-compiler.md`
