@@ -314,6 +314,14 @@ jobs:
       - name: Install Rust wasm target
         run: rustup target add wasm32-unknown-unknown
 
+      # The RustGlue glue-runtime contract case compiles a `#![no_std]` host
+      # with `rustc --target <arch>-unknown-linux-musl --crate-type staticlib`,
+      # which needs that target's precompiled `core`. Install the native musl
+      # target per runner arch (x64 and arm64 Linux both run run-test-cli here).
+      - name: Install Rust musl target (Linux)
+        if: runner.os == 'Linux'
+        run: rustup target add ${{ runner.arch == 'ARM64' && 'aarch64-unknown-linux-musl' || 'x86_64-unknown-linux-musl' }}
+
       - name: Cache Zig dependency packages
         uses: actions/cache@v4 # ratchet:actions/cache@v4
         with:
