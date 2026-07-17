@@ -4510,6 +4510,37 @@ Builtin :: [].{
 			Ok(a) => Ok(ok_transform!(a))
 		}
 
+		## Combines two results by running a function on both `Ok` values. If either
+		## is an `Err`, that `Err` is returned instead and the function is not run.
+		## When both are `Err`, the first one wins.
+		## ```roc
+		## expect Try.map2(Try.Ok(2.I64), Try.Ok(3), |a, b| a * b) == Ok(6)
+		##
+		## expect {
+		## 	err : Try(I64, Str)
+		## 	err = Err("uh oh")
+		## 	Try.map2(Try.Ok(2), err, |a, b| a * b) == Err("uh oh")
+		## }
+		## ```
+		map2 : Try(a, err), Try(b, err), (a, b -> c) -> Try(c, err)
+		map2 = |first, second, transform| match (first, second) {
+			(Err(err), _) => Err(err)
+			(_, Err(err)) => Err(err)
+			(Ok(a), Ok(b)) => Ok(transform(a, b))
+		}
+
+		## Like [Try.map2], but the combining function is effectful. It runs only when
+		## both arguments are `Ok`.
+		## ```roc
+		## Try.map2!(user_try, album_try, |u, a| SQL.execute!("INSERT INTO plays (user, album) VALUES (?, ?)", [u.id, a.id]))
+		## ```
+		map2! : Try(a, err), Try(b, err), (a, b => c) => Try(c, err)
+		map2! = |first, second, transform!| match (first, second) {
+			(Err(err), _) => Err(err)
+			(_, Err(err)) => Err(err)
+			(Ok(a), Ok(b)) => Ok(transform!(a, b))
+		}
+
 		## Returns `Bool.True` if the two `Try` values are the same variant (`Ok` or `Err`) and their contents are pairwise equal. Otherwise, returns `Bool.False`.
 		is_eq : Try(ok, err), Try(ok, err) -> Bool
 			where [
