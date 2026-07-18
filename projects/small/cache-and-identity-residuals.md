@@ -125,9 +125,10 @@ unchanged (assert via the existing cache CLI tests).
 
 ## Related projects
 
-- [../big/platform-relation-from-checking.md](../big/platform-relation-from-checking.md)
-  — retires the one *large* name-keyed resolution this doc's item 1 is
-  the small sibling of.
+- Carry the platform-app relation from checking — landed: checking records
+  requirement solutions in the app's checked artifact and finalization
+  consumes them, so the one *large* name-keyed resolution this doc's item 1
+  is the small sibling of no longer exists.
 - [../small/silent-drift-guards.md](../small/silent-drift-guards.md) —
   same philosophy: every mirrored or composed fact gets a structural
   guard.

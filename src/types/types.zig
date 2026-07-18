@@ -46,7 +46,10 @@ test {
     // The optional derived-map payload selection adds its tag, payload index,
     // and optional discriminant without affecting type identity.
     try std.testing.expectEqual(76, @sizeOf(StaticDispatchConstraint));
-    try std.testing.expectEqual(12, @sizeOf(Func));
+    // Directed effect dependencies must survive type generalization,
+    // instantiation, and cross-module copying, so they live with the function
+    // payload rather than in checker-only side state.
+    try std.testing.expectEqual(20, @sizeOf(Func));
 }
 
 test "source declaration checked constructors enforce packed statement capacity" {
@@ -649,6 +652,13 @@ pub const NominalDecl = struct {
 pub const Func = struct {
     args: Var.SafeList.Range,
     ret: Var,
+    /// Function types whose effects flow into this function's effect.
+    ///
+    /// This is a directed dependency list, not type equality: an effectful
+    /// dependency makes this function effectful, while an independently
+    /// effectful caller does not make its dependencies effectful. The range is
+    /// empty for functions whose effect kind is already self-contained.
+    effect_deps: Var.SafeList.Range = Var.SafeList.Range.empty(),
 };
 
 // records //

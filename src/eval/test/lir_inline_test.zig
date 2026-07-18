@@ -1385,12 +1385,13 @@ test "issue 10121 shared JSON helpers preserve optional nested round trips" {
         \\}
     ;
 
-    var compiled = try helpers.compileInspectedProgramWithBuiltin(
+    var compiled = try helpers.compileInspectedProgramForTargetWithBuiltin(
         allocator,
         std.testing.io,
         .module,
         source,
         &.{},
+        .native,
         try sharedPrePublishedBuiltin(),
         null,
     );
@@ -5565,7 +5566,7 @@ test "compiler-generated dispatch classes lower via checked evidence" {
         \\}
     ;
 
-    var compiled = try helpers.compileInspectedProgramWithBuiltin(allocator, std.testing.io, .module, source, &.{}, try sharedPrePublishedBuiltin(), null);
+    var compiled = try helpers.compileInspectedProgramForTargetWithBuiltin(allocator, std.testing.io, .module, source, &.{}, .native, try sharedPrePublishedBuiltin(), null);
     defer compiled.deinit(allocator);
 
     // The program must check cleanly: a reported problem would resolve the

@@ -910,7 +910,13 @@ test "NodeStore round trip - Diagnostics" {
             .name = rand_ident_idx(),
             .region = rand_region(),
             .original_region = rand_region(),
-            .cross_scope = rand.random().boolean(),
+        },
+    });
+
+    try diagnostics.append(gpa, CIR.Diagnostic{
+        .builtin_type_shadowed_warning = .{
+            .name = rand_ident_idx(),
+            .region = rand_region(),
         },
     });
 

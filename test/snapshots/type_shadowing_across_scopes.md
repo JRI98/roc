@@ -21,7 +21,7 @@ EXPECTED TYPE FIELD - type_shadowing_across_scopes.md:9:5:9:8
 EXPECTED RECORD TYPE SEPARATOR - type_shadowing_across_scopes.md:9:21:9:28
 UNEXPECTED STATEMENT - type_shadowing_across_scopes.md:9:28:9:29
 UNEXPECTED STATEMENT - type_shadowing_across_scopes.md:10:1:10:2
-DUPLICATE DEFINITION - type_shadowing_across_scopes.md:1:1:1:28
+BUILTIN TYPE SHADOWED - type_shadowing_across_scopes.md:1:1:1:28
 UNUSED VARIABLE - type_shadowing_across_scopes.md:4:16:4:20
 MALFORMED TYPE - type_shadowing_across_scopes.md:9:21:9:28
 # PROBLEMS
@@ -101,19 +101,17 @@ MALFORMED TYPE - type_shadowing_across_scopes.md:9:21:9:28
     missing item before it.
 
 
-┌──────────────────────┐
-│ DUPLICATE DEFINITION ├─ The name `Try` is being redeclared here. ───────────┐
-└┬─────────────────────┘                                                      │
+┌───────────────────────┐
+│ BUILTIN TYPE SHADOWED ├─ The type `Try` shadows a builtin type. ────────────┐
+└┬──────────────────────┘                                                     │
  │                                                                            │
  │  Try(a, b) : [Ok(a), Err(b)]                                               │
  │  ‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾                                               │
  └─────────────────────────────────────── type_shadowing_across_scopes.md:1:1 ┘
 
-    In this scope, `Try` was already defined here:
-      ┌───────────────────────────────────────────────────────────────────────┐
-    1 │  Try(a, b) : [Ok(a), Err(b)]                                          │
-      │  ‾                                                                    │
-      └────────────────────────────────── type_shadowing_across_scopes.md:1:1 ┘
+    This may make the builtin type inaccessible in this scope.
+
+    The new declaration is here:
 
 
 ┌─────────────────┐

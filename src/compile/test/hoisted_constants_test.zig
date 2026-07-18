@@ -72,6 +72,20 @@ const HoistedConstantsTestError = std.mem.Allocator.Error ||
         WriteFailed,
     };
 
+var shared_test_builtins: ?eval.BuiltinModules = null;
+var shared_test_builtins_mutex: std.Io.Mutex = .init;
+
+fn sharedBuiltinModules() eval.BuiltinModules.InitError!*eval.BuiltinModules {
+    shared_test_builtins_mutex.lockUncancelable(std.testing.io);
+    defer shared_test_builtins_mutex.unlock(std.testing.io);
+
+    if (shared_test_builtins == null) {
+        shared_test_builtins = try eval.BuiltinModules.init(std.heap.page_allocator);
+    }
+
+    return &shared_test_builtins.?;
+}
+
 test "hoisted local constants are finalized and restored during runtime lowering" {
     const gpa = std.testing.allocator;
 
@@ -196,15 +210,14 @@ test "hoisted local constants are finalized and restored during runtime lowering
     defer arena_impl.deinit();
     const arena = arena_impl.allocator();
 
-    var builtin_modules = try eval.BuiltinModules.init(gpa);
-    defer builtin_modules.deinit();
+    const builtin_modules = try sharedBuiltinModules();
 
     var coord = try Coordinator.init(
         gpa,
         .single_threaded,
         1,
         roc_target.RocTarget.detectNative(),
-        &builtin_modules,
+        builtin_modules,
         build_options.compiler_version,
         null,
         CoreCtx.default(gpa, arena, std.testing.io),
@@ -368,15 +381,14 @@ test "imported checked bodies restore their module's hoisted constants" {
     defer arena_impl.deinit();
     const arena = arena_impl.allocator();
 
-    var builtin_modules = try eval.BuiltinModules.init(gpa);
-    defer builtin_modules.deinit();
+    const builtin_modules = try sharedBuiltinModules();
 
     var coord = try Coordinator.init(
         gpa,
         .single_threaded,
         1,
         roc_target.RocTarget.detectNative(),
-        &builtin_modules,
+        builtin_modules,
         build_options.compiler_version,
         null,
         CoreCtx.default(gpa, arena, std.testing.io),
@@ -457,15 +469,14 @@ test "hoisted list constants lower to internal static data" {
     defer arena_impl.deinit();
     const arena = arena_impl.allocator();
 
-    var builtin_modules = try eval.BuiltinModules.init(gpa);
-    defer builtin_modules.deinit();
+    const builtin_modules = try sharedBuiltinModules();
 
     var coord = try Coordinator.init(
         gpa,
         .single_threaded,
         1,
         .x64linux,
-        &builtin_modules,
+        builtin_modules,
         build_options.compiler_version,
         null,
         CoreCtx.default(gpa, arena, std.testing.io),
@@ -589,15 +600,14 @@ fn expectInlineListStaticDataLiteral(gpa: std.mem.Allocator, source: []const u8)
     defer arena_impl.deinit();
     const arena = arena_impl.allocator();
 
-    var builtin_modules = try eval.BuiltinModules.init(gpa);
-    defer builtin_modules.deinit();
+    const builtin_modules = try sharedBuiltinModules();
 
     var coord = try Coordinator.init(
         gpa,
         .single_threaded,
         1,
         .x64linux,
-        &builtin_modules,
+        builtin_modules,
         build_options.compiler_version,
         null,
         CoreCtx.default(gpa, arena, std.testing.io),
@@ -722,15 +732,14 @@ test "callable binding with alias annotation is const-evaluated" {
     defer arena_impl.deinit();
     const arena = arena_impl.allocator();
 
-    var builtin_modules = try eval.BuiltinModules.init(gpa);
-    defer builtin_modules.deinit();
+    const builtin_modules = try sharedBuiltinModules();
 
     var coord = try Coordinator.init(
         gpa,
         .single_threaded,
         1,
         roc_target.RocTarget.detectNative(),
-        &builtin_modules,
+        builtin_modules,
         build_options.compiler_version,
         null,
         CoreCtx.default(gpa, arena, std.testing.io),
@@ -817,15 +826,14 @@ test "hoisted constant crash reports original source region" {
     defer arena_impl.deinit();
     const arena = arena_impl.allocator();
 
-    var builtin_modules = try eval.BuiltinModules.init(gpa);
-    defer builtin_modules.deinit();
+    const builtin_modules = try sharedBuiltinModules();
 
     var coord = try Coordinator.init(
         gpa,
         .single_threaded,
         1,
         roc_target.RocTarget.detectNative(),
-        &builtin_modules,
+        builtin_modules,
         build_options.compiler_version,
         null,
         CoreCtx.default(gpa, arena, std.testing.io),
@@ -919,15 +927,14 @@ test "inlined hoisted constant crash reports hoisted source region" {
     defer arena_impl.deinit();
     const arena = arena_impl.allocator();
 
-    var builtin_modules = try eval.BuiltinModules.init(gpa);
-    defer builtin_modules.deinit();
+    const builtin_modules = try sharedBuiltinModules();
 
     var coord = try Coordinator.init(
         gpa,
         .single_threaded,
         1,
         roc_target.RocTarget.detectNative(),
-        &builtin_modules,
+        builtin_modules,
         build_options.compiler_version,
         null,
         CoreCtx.default(gpa, arena, std.testing.io),
@@ -1016,15 +1023,14 @@ test "hoisted pattern extraction failure reports original destructure region" {
     defer arena_impl.deinit();
     const arena = arena_impl.allocator();
 
-    var builtin_modules = try eval.BuiltinModules.init(gpa);
-    defer builtin_modules.deinit();
+    const builtin_modules = try sharedBuiltinModules();
 
     var coord = try Coordinator.init(
         gpa,
         .single_threaded,
         1,
         roc_target.RocTarget.detectNative(),
-        &builtin_modules,
+        builtin_modules,
         build_options.compiler_version,
         null,
         CoreCtx.default(gpa, arena, std.testing.io),
@@ -1115,15 +1121,14 @@ test "hoisted pattern extraction base match failure reports match" {
     defer arena_impl.deinit();
     const arena = arena_impl.allocator();
 
-    var builtin_modules = try eval.BuiltinModules.init(gpa);
-    defer builtin_modules.deinit();
+    const builtin_modules = try sharedBuiltinModules();
 
     var coord = try Coordinator.init(
         gpa,
         .single_threaded,
         1,
         roc_target.RocTarget.detectNative(),
-        &builtin_modules,
+        builtin_modules,
         build_options.compiler_version,
         null,
         CoreCtx.default(gpa, arena, std.testing.io),
@@ -1217,15 +1222,14 @@ test "hoisted pattern extraction successful base match resolves pending diagnost
     defer arena_impl.deinit();
     const arena = arena_impl.allocator();
 
-    var builtin_modules = try eval.BuiltinModules.init(gpa);
-    defer builtin_modules.deinit();
+    const builtin_modules = try sharedBuiltinModules();
 
     var coord = try Coordinator.init(
         gpa,
         .single_threaded,
         1,
         roc_target.RocTarget.detectNative(),
-        &builtin_modules,
+        builtin_modules,
         build_options.compiler_version,
         null,
         CoreCtx.default(gpa, arena, std.testing.io),
@@ -1271,15 +1275,14 @@ test "hoisted match guard does not report unused branch warning" {
     defer arena_impl.deinit();
     const arena = arena_impl.allocator();
 
-    var builtin_modules = try eval.BuiltinModules.init(gpa);
-    defer builtin_modules.deinit();
+    const builtin_modules = try sharedBuiltinModules();
 
     var coord = try Coordinator.init(
         gpa,
         .single_threaded,
         1,
         roc_target.RocTarget.detectNative(),
-        &builtin_modules,
+        builtin_modules,
         build_options.compiler_version,
         null,
         CoreCtx.default(gpa, arena, std.testing.io),
@@ -1348,15 +1351,14 @@ test "hoisted successful call does not clear runtime reachable helper exhaustive
     defer arena_impl.deinit();
     const arena = arena_impl.allocator();
 
-    var builtin_modules = try eval.BuiltinModules.init(gpa);
-    defer builtin_modules.deinit();
+    const builtin_modules = try sharedBuiltinModules();
 
     var coord = try Coordinator.init(
         gpa,
         .single_threaded,
         1,
         roc_target.RocTarget.detectNative(),
-        &builtin_modules,
+        builtin_modules,
         build_options.compiler_version,
         null,
         CoreCtx.default(gpa, arena, std.testing.io),
@@ -1420,15 +1422,14 @@ test "hoisted failing call into runtime reachable helper reports static diagnost
     defer arena_impl.deinit();
     const arena = arena_impl.allocator();
 
-    var builtin_modules = try eval.BuiltinModules.init(gpa);
-    defer builtin_modules.deinit();
+    const builtin_modules = try sharedBuiltinModules();
 
     var coord = try Coordinator.init(
         gpa,
         .single_threaded,
         1,
         roc_target.RocTarget.detectNative(),
-        &builtin_modules,
+        builtin_modules,
         build_options.compiler_version,
         null,
         CoreCtx.default(gpa, arena, std.testing.io),
@@ -2013,15 +2014,14 @@ test "issue 9733: nested expect statements are collected as test roots" {
     defer arena_impl.deinit();
     const arena = arena_impl.allocator();
 
-    var builtin_modules = try eval.BuiltinModules.init(gpa);
-    defer builtin_modules.deinit();
+    const builtin_modules = try sharedBuiltinModules();
 
     var coord = try Coordinator.init(
         gpa,
         .single_threaded,
         1,
         roc_target.RocTarget.detectNative(),
-        &builtin_modules,
+        builtin_modules,
         build_options.compiler_version,
         null,
         CoreCtx.default(gpa, arena, std.testing.io),

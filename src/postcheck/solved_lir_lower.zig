@@ -4288,9 +4288,9 @@ const Lowerer = struct {
     };
 
     /// Lower a match through the shared decision-tree compiler
-    /// (src/postcheck/match_tree.zig). Replaces the per-branch backtracking
-    /// chain: one multiway test per tested occurrence, one discriminant/
-    /// length/field read per position, and branch bodies lowered exactly once.
+    /// (src/postcheck/match_tree.zig): one multiway test per tested
+    /// occurrence, one discriminant/length/field read per position, and
+    /// branch bodies lowered exactly once.
     fn lowerBranchTree(
         self: *Lowerer,
         scrutinee: LIR.LocalId,

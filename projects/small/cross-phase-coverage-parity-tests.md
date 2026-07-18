@@ -134,6 +134,6 @@ Nothing in the compiler's runtime path changes; the suite is tests only.
 
 ## Related projects
 
-- [../big/decision-tree-match-compiler.md](../big/decision-tree-match-compiler.md)
-  — replaces the per-IR `patternCanMiss` adapter walks over the shared
-  refutability predicate with one authoritative match analysis.
+- The decision-tree match compiler has landed: match lowering goes through
+  one authoritative analysis in src/postcheck/match_tree.zig, so pattern
+  coverage no longer depends on per-IR refutability adapter walks.

@@ -434,7 +434,7 @@ pub fn relocate(store: *NodeStore, offset: isize) void {
 /// when adding/removing variants from ModuleEnv unions. Update these when modifying the unions.
 ///
 /// Count of the diagnostic nodes in the ModuleEnv
-pub const MODULEENV_DIAGNOSTIC_NODE_COUNT = 84;
+pub const MODULEENV_DIAGNOSTIC_NODE_COUNT = 85;
 /// Count of the expression nodes in the ModuleEnv
 pub const MODULEENV_EXPR_NODE_COUNT = 55;
 /// Count of the statement nodes in the ModuleEnv
@@ -4503,12 +4503,16 @@ pub fn addDiagnosticUnregistered(store: *NodeStore, reason: CIR.Diagnostic) Allo
         .type_shadowed_warning => |r| {
             node.tag = .diag_type_shadowed_warning;
             region = r.region;
-            const region_span2_idx: u32 = @intCast(store.span2_data.len());
-            _ = try store.span2_data.append(store.gpa, .{
-                .start = r.original_region.start.offset,
-                .len = r.original_region.end.offset,
-            });
-            node.setPayload(.{ .diag_two_idents_extra = .{ .ident1 = @bitCast(r.name), .ident2 = @intFromBool(r.cross_scope), .region_span2_idx = region_span2_idx } });
+            node.setPayload(.{ .diag_ident_with_region = .{
+                .ident = @bitCast(r.name),
+                .region_start = r.original_region.start.offset,
+                .region_end = r.original_region.end.offset,
+            } });
+        },
+        .builtin_type_shadowed_warning => |r| {
+            node.tag = .diag_builtin_type_shadowed_warning;
+            region = r.region;
+            node.setPayload(.{ .diag_single_ident = .{ .ident = @bitCast(r.name) } });
         },
         .type_parameter_conflict => |r| {
             node.tag = .diag_type_parameter_conflict;
@@ -4964,18 +4968,20 @@ pub fn getDiagnostic(store: *const NodeStore, diagnostic: CIR.Diagnostic.Idx) CI
             } };
         },
         .diag_type_shadowed_warning => {
-            const p = payload.diag_two_idents_extra;
-            const region_data = store.span2_data.items.items[p.region_span2_idx];
+            const p = payload.diag_ident_with_region;
             return CIR.Diagnostic{ .type_shadowed_warning = .{
-                .name = @bitCast(p.ident1),
+                .name = @bitCast(p.ident),
                 .region = store.getRegionAt(node_idx),
-                .cross_scope = p.ident2 != 0,
                 .original_region = .{
-                    .start = .{ .offset = region_data.start },
-                    .end = .{ .offset = region_data.len },
+                    .start = .{ .offset = p.region_start },
+                    .end = .{ .offset = p.region_end },
                 },
             } };
         },
+        .diag_builtin_type_shadowed_warning => return CIR.Diagnostic{ .builtin_type_shadowed_warning = .{
+            .name = @bitCast(payload.diag_single_ident.ident),
+            .region = store.getRegionAt(node_idx),
+        } },
         .diag_type_parameter_conflict => {
             const p = payload.diag_two_idents_extra;
             const region_data = store.span2_data.items.items[p.region_span2_idx];

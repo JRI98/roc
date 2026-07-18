@@ -289,7 +289,8 @@ fn formatIRNode(ast: AST, writer: *std.Io.Writer, formatter: *const fn (*Formatt
     const trace = tracy.trace(@src());
     defer trace.end();
 
-    var fmt = Formatter.init(ast, writer);
+    var fmt = try Formatter.init(ast, writer);
+    defer fmt.deinit();
 
     try formatter(&fmt);
     try fmt.flush();
@@ -333,8 +334,16 @@ fn formatExprNode(fmt: *Formatter) FormatAstError!void {
 
 /// Formatter for the roc parse ast.
 const Formatter = struct {
+    const TypeLayout = enum(u8) {
+        unknown,
+        compact,
+        expanded,
+    };
+
     ast: AST,
     writer: *std.Io.Writer,
+    /// Cached output layout for type annotations and their record fields.
+    type_layouts: []TypeLayout,
     curr_indent: u32 = 0,
     flags: FormatFlags = .no_debug,
     // This starts true since beginning of file is considered a newline.
@@ -342,11 +351,19 @@ const Formatter = struct {
     has_multiline_string: bool = false,
 
     /// Creates a new Formatter for the given parse IR.
-    fn init(ast: AST, writer: *std.Io.Writer) Formatter {
+    fn init(ast: AST, writer: *std.Io.Writer) Allocator.Error!Formatter {
+        const type_layouts = try ast.gpa.alloc(TypeLayout, ast.store.nodeCount());
+        @memset(type_layouts, .unknown);
+
         return .{
             .ast = ast,
             .writer = writer,
+            .type_layouts = type_layouts,
         };
+    }
+
+    fn deinit(fmt: *Formatter) void {
+        fmt.ast.gpa.free(fmt.type_layouts);
     }
 
     /// Deinits all data owned by the formatter object.
@@ -3548,32 +3565,10 @@ const Formatter = struct {
                 return false;
             },
             AST.TypeAnno.Idx => {
-                const typeAnno = fmt.ast.store.getTypeAnno(item);
-                const type_has_comment = fmt.regionHasInteriorComment(typeAnno.to_tokenized_region());
-                return switch (typeAnno) {
-                    .apply => |a| type_has_comment or fmt.ast.store.getCollectionLayout(item) == .expanded or
-                        fmt.nodesWillBeMultiline(AST.TypeAnno.Idx, fmt.ast.store.typeAnnoSlice(a.args)),
-                    .tuple => |t| type_has_comment or fmt.ast.store.getCollectionLayout(item) == .expanded or
-                        fmt.nodesWillBeMultiline(AST.TypeAnno.Idx, fmt.ast.store.typeAnnoSlice(t.annos)),
-                    .record => |r| type_has_comment or fmt.ast.store.getCollectionLayout(item) == .expanded or
-                        fmt.nodesWillBeMultiline(AST.AnnoRecordField.Idx, fmt.ast.store.annoRecordFieldSlice(r.fields)),
-                    .tag_union => |t| type_has_comment or fmt.ast.store.getCollectionLayout(item) == .expanded or
-                        fmt.nodesWillBeMultiline(AST.TypeAnno.Idx, fmt.ast.store.typeAnnoSlice(t.tags)),
-                    .@"fn" => |f| type_has_comment or fmt.ast.regionIsMultiline(typeAnno.to_tokenized_region()) or
-                        fmt.nodesWillBeMultiline(AST.TypeAnno.Idx, fmt.ast.store.typeAnnoSlice(f.args)) or
-                        fmt.nodeWillBeMultiline(AST.TypeAnno.Idx, f.ret),
-                    .parens => |p| type_has_comment or fmt.ast.regionIsMultiline(typeAnno.to_tokenized_region()) or
-                        fmt.nodeWillBeMultiline(AST.TypeAnno.Idx, p.anno),
-                    else => fmt.ast.regionIsMultiline(typeAnno.to_tokenized_region()),
-                };
+                return fmt.typeAnnoWillBeMultiline(item);
             },
             AST.AnnoRecordField.Idx => {
-                const annoRecordField = fmt.ast.store.getAnnoRecordField(item) catch return false;
-                if (fmt.regionHasInteriorComment(annoRecordField.region)) {
-                    return true;
-                }
-
-                return fmt.nodeWillBeMultiline(AST.TypeAnno.Idx, annoRecordField.ty);
+                return fmt.annoRecordFieldWillBeMultiline(item);
             },
             AST.WhereClause.Idx => {
                 const whereClause = fmt.ast.store.getWhereClause(item);
@@ -3618,6 +3613,55 @@ const Formatter = struct {
             },
             else => return false,
         }
+    }
+
+    fn typeAnnoWillBeMultiline(fmt: *Formatter, item: AST.TypeAnno.Idx) bool {
+        const cache_entry = &fmt.type_layouts[@intFromEnum(item)];
+        switch (cache_entry.*) {
+            .compact => return false,
+            .expanded => return true,
+            .unknown => {},
+        }
+
+        const type_anno = fmt.ast.store.getTypeAnno(item);
+        const has_comment = fmt.regionHasInteriorComment(type_anno.to_tokenized_region());
+        const multiline = switch (type_anno) {
+            .apply => |apply| has_comment or fmt.ast.store.getCollectionLayout(item) == .expanded or
+                fmt.nodesWillBeMultiline(AST.TypeAnno.Idx, fmt.ast.store.typeAnnoSlice(apply.args)),
+            .tuple => |tuple| has_comment or fmt.ast.store.getCollectionLayout(item) == .expanded or
+                fmt.nodesWillBeMultiline(AST.TypeAnno.Idx, fmt.ast.store.typeAnnoSlice(tuple.annos)),
+            .record => |record| has_comment or fmt.ast.store.getCollectionLayout(item) == .expanded or
+                fmt.nodesWillBeMultiline(AST.AnnoRecordField.Idx, fmt.ast.store.annoRecordFieldSlice(record.fields)),
+            .tag_union => |tag_union| has_comment or fmt.ast.store.getCollectionLayout(item) == .expanded or
+                fmt.nodesWillBeMultiline(AST.TypeAnno.Idx, fmt.ast.store.typeAnnoSlice(tag_union.tags)),
+            .@"fn" => |function| has_comment or
+                fmt.nodesWillBeMultiline(AST.TypeAnno.Idx, fmt.ast.store.typeAnnoSlice(function.args)) or
+                fmt.typeAnnoWillBeMultiline(function.ret),
+            .parens => |parens| has_comment or fmt.ast.regionIsMultiline(type_anno.to_tokenized_region()) or
+                fmt.typeAnnoWillBeMultiline(parens.anno),
+            else => fmt.ast.regionIsMultiline(type_anno.to_tokenized_region()),
+        };
+
+        cache_entry.* = if (multiline) .expanded else .compact;
+        return multiline;
+    }
+
+    fn annoRecordFieldWillBeMultiline(fmt: *Formatter, item: AST.AnnoRecordField.Idx) bool {
+        const cache_entry = &fmt.type_layouts[@intFromEnum(item)];
+        switch (cache_entry.*) {
+            .compact => return false,
+            .expanded => return true,
+            .unknown => {},
+        }
+
+        const field = fmt.ast.store.getAnnoRecordField(item) catch {
+            cache_entry.* = .compact;
+            return false;
+        };
+        const multiline = fmt.regionHasInteriorComment(field.region) or fmt.typeAnnoWillBeMultiline(field.ty);
+
+        cache_entry.* = if (multiline) .expanded else .compact;
+        return multiline;
     }
 
     fn nodesWillBeMultiline(fmt: *Formatter, comptime T: type, items: []T) bool {
@@ -3730,6 +3774,55 @@ test "function type expands when its return type is multiline" {
         "(() -> d) -> (\n" ++
         "\tc,\n" ++
         ")\n", result);
+}
+
+test "issue 10140: nested record function type formatting is idempotent" {
+    // Repro for https://github.com/roc-lang/roc/issues/10140
+    const result = try moduleFmtsStable(std.testing.allocator,
+        \\p:{e:
+        \\{n:U
+        \\}=>U}=>r
+    , false);
+    defer std.testing.allocator.free(result);
+}
+
+test "compact function argument collections ignore removable source newlines" {
+    const cases = [_]struct {
+        input: []const u8,
+        expected: []const u8,
+    }{
+        .{
+            .input = "p:{e:\nList(\nU)=>U}=>r",
+            .expected = "p : { e : List(U) => U } => r\n",
+        },
+        .{
+            .input = "p:{e:\n[A\n]=>U}=>r",
+            .expected = "p : { e : [A] => U } => r\n",
+        },
+    };
+
+    for (cases) |case| {
+        const result = try moduleFmtsStable(std.testing.allocator, case.input, false);
+        defer std.testing.allocator.free(result);
+        try std.testing.expectEqualStrings(case.expected, result);
+    }
+}
+
+test "explicitly expanded function argument collections remain expanded" {
+    const result = try moduleFmtsStable(std.testing.allocator,
+        \\p:{e:{n:U,
+        \\}=>U}=>r
+    , false);
+    defer std.testing.allocator.free(result);
+
+    try std.testing.expectEqualStrings(
+        "p : {\n" ++
+            "\te : {\n" ++
+            "\t\tn : U,\n" ++
+            "\t} => U,\n" ++
+            "} => r\n",
+        result,
+    );
 }
 
 test "issue 8851: arrow call with space before field access is idempotent" {

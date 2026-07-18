@@ -8948,7 +8948,7 @@ const BodyContext = struct {
                 const wrapper = self.view.intrinsic_wrappers.get(wrapper_id);
                 return switch (wrapper.intrinsic) {
                     .str_inspect => try self.lowerStrInspectIntrinsic(fn_ty, ret_ty),
-                    .structural_eq => Common.invariant("structural equality intrinsic wrapper must lower through checked dispatch plans"),
+                    .structural_eq => try self.lowerStructuralEqIntrinsic(fn_ty, ret_ty),
                 };
             },
         }
@@ -8966,6 +8966,32 @@ const BodyContext = struct {
         const body = try self.inspectCall(local_expr, arg_tys[0], ret_ty);
         return .{
             .args = try self.addTypedLocalSpan(&.{typed_arg}),
+            .body = body,
+            .ret = try self.draftTypeCellPreservingGenerated(ret_ty),
+        };
+    }
+
+    fn lowerStructuralEqIntrinsic(self: *BodyContext, fn_ty: Type.TypeId, ret_ty: Type.TypeId) Allocator.Error!LoweredTemplateBody {
+        const fn_data = self.builder.functionShape(fn_ty, "structural equality intrinsic had a non-function type");
+        const arg_tys = try GuardedList.dupe(self.allocator, Type.TypeId, self.builder.program.types.span(fn_data.args));
+        defer self.allocator.free(arg_tys);
+        if (arg_tys.len != 2) Common.invariant("structural equality intrinsic requires exactly two arguments");
+
+        const lhs_local = try self.addLocal(self.builder.symbols.fresh(), arg_tys[0]);
+        const rhs_local = try self.addLocal(self.builder.symbols.fresh(), arg_tys[1]);
+        const typed_lhs = BodyTypedLocal{ .local = lhs_local, .ty = arg_tys[0] };
+        const typed_rhs = BodyTypedLocal{ .local = rhs_local, .ty = arg_tys[1] };
+        const lhs_expr = try self.addExpr(.{ .ty = arg_tys[0], .data = .{ .local = lhs_local } });
+        const rhs_expr = try self.addExpr(.{ .ty = arg_tys[1], .data = .{ .local = rhs_local } });
+        // This wrapper IS its type's `is_eq` method target, so the body must
+        // expand the top layer structurally: `lowerEqualityExpr` would resolve
+        // the method lookup back to this wrapper and emit an infinite self-call.
+        const body = try self.lowerDerivationExpansion(EqDeriver, arg_tys[0], .{ .lhs = lhs_expr, .rhs = rhs_expr }, .{
+            .method_name = "is_eq",
+            .result_ty = ret_ty,
+        });
+        return .{
+            .args = try self.addTypedLocalSpan(&.{ typed_lhs, typed_rhs }),
             .body = body,
             .ret = try self.draftTypeCellPreservingGenerated(ret_ty),
         };
@@ -23551,6 +23577,23 @@ const BodyContext = struct {
             else => {},
         }
 
+        return try self.lowerDerivationExpansion(D, ty, operand, ctx);
+    }
+
+    /// Expands `ty` structurally without consulting its exact method target.
+    /// Components still derive through `lowerDerivation`, so only the top
+    /// layer skips method dispatch. This is the entry point for lowering the
+    /// body of a procedure that IS the type's method (the structural_eq
+    /// intrinsic wrapper): routing it through `lowerDerivation` would resolve
+    /// the method lookup straight back to that procedure and emit a self-call.
+    fn lowerDerivationExpansion(
+        self: *BodyContext,
+        comptime D: type,
+        ty: Type.TypeId,
+        operand: D.Operand,
+        ctx: DerivationCtx,
+    ) Allocator.Error!DraftExprId {
+        const shape = self.builder.program.types.get(ty);
         const expands_structurally = structurallyExpands(shape);
         var remove_active_expansion = false;
         const stack = D.expansionStack(self);
@@ -23566,7 +23609,7 @@ const BodyContext = struct {
         }
 
         return switch (shape) {
-            .list => unreachable,
+            .list => Common.invariant("structural derivation expansion reached a List; List derivations dispatch to a method target"),
             .record => |fields| try self.derivationRecord(D, self.builder.program.types.fieldSpan(fields), operand, ctx),
             .tuple => |items| try self.derivationTuple(D, self.builder.program.types.span(items), operand, ctx),
             .tag_union => |tags| try D.tagUnion(self, ty, tags, operand, ctx),

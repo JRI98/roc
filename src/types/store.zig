@@ -734,10 +734,23 @@ pub const Store = struct {
     // Make a function data type with unbound effectfulness
     // Does not insert content into the types store.
     pub fn mkFuncUnbound(self: *Self, args: []const Var, ret: Var) std.mem.Allocator.Error!Content {
+        return self.mkFuncUnboundWithEffectDeps(args, ret, &.{});
+    }
+
+    /// Make a function data type whose effect is inferred from directed
+    /// dependencies on other function types.
+    pub fn mkFuncUnboundWithEffectDeps(
+        self: *Self,
+        args: []const Var,
+        ret: Var,
+        effect_deps: []const Var,
+    ) std.mem.Allocator.Error!Content {
         const args_range = try self.appendVars(args);
+        const effect_deps_range = try self.appendVars(effect_deps);
         return Content{ .structure = .{ .fn_unbound = .{
             .args = args_range,
             .ret = ret,
+            .effect_deps = effect_deps_range,
         } } };
     }
 

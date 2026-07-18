@@ -2369,10 +2369,10 @@ fn pushTypeRedeclarationForBinding(
             .redeclared_region = redeclared_region,
             .name = name_ident,
         } }),
-        .external_nominal => try self.env.pushDiagnostic(Diagnostic{ .shadowing_warning = .{
-            .ident = name_ident,
-            .region = redeclared_region,
+        .external_nominal => try self.env.pushDiagnostic(Diagnostic{ .type_redeclared = .{
+            .name = name_ident,
             .original_region = original_region,
+            .redeclared_region = redeclared_region,
         } }),
     }
 }
@@ -2383,13 +2383,25 @@ fn pushTypeShadowingWarning(
     region: Region,
     shadowed: Scope.TypeBinding,
 ) std.mem.Allocator.Error!void {
-    try self.env.pushDiagnostic(Diagnostic{
-        .shadowing_warning = .{
-            .ident = name_ident,
+    switch (shadowed) {
+        .external_nominal => |external| if (self.externalTypeBindingIsCompilerBuiltin(external)) {
+            try self.env.pushDiagnostic(Diagnostic{ .builtin_type_shadowed_warning = .{
+                .name = name_ident,
+                .region = region,
+            } });
+        } else {
+            try self.env.pushDiagnostic(Diagnostic{ .type_shadowed_warning = .{
+                .name = name_ident,
+                .region = region,
+                .original_region = external.origin_region,
+            } });
+        },
+        .local_nominal, .local_alias, .associated_nominal => try self.env.pushDiagnostic(Diagnostic{ .type_shadowed_warning = .{
+            .name = name_ident,
             .region = region,
             .original_region = self.typeBindingOriginalRegion(shadowed),
-        },
-    });
+        } }),
+    }
 }
 
 fn handleTypeBindingDecision(
@@ -2409,10 +2421,15 @@ fn handleTypeBindingDecision(
             }
         },
         .replaced_current_external => |external| {
-            try self.pushTypeShadowingWarning(name_ident, region, Scope.TypeBinding{ .external_nominal = external });
+            const existing = Scope.TypeBinding{ .external_nominal = external };
+            if (self.externalTypeBindingIsCompilerBuiltin(external)) {
+                try self.pushTypeShadowingWarning(name_ident, region, existing);
+            } else {
+                try self.pushTypeRedeclarationForBinding(existing, name_ident, region);
+            }
         },
         .rejected_current_conflict => |existing| {
-            try self.pushTypeShadowingWarning(name_ident, region, existing);
+            try self.pushTypeRedeclarationForBinding(existing, name_ident, region);
         },
         .redeclared_current => |existing| {
             try self.pushTypeRedeclarationForBinding(existing, name_ident, region);

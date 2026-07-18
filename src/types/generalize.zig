@@ -355,6 +355,9 @@ pub const Generalizer = struct {
                         for (self.store.sliceVars(func.args)) |arg_var| {
                             next_rank = next_rank.max(try self.adjustRank(arg_var, group_rank, vars_to_generalize));
                         }
+                        for (self.store.sliceVars(func.effect_deps)) |effect_dep| {
+                            next_rank = next_rank.max(try self.adjustRank(effect_dep, group_rank, vars_to_generalize));
+                        }
                         return next_rank;
                     },
                     .fn_effectful => |func| {
@@ -362,12 +365,18 @@ pub const Generalizer = struct {
                         for (self.store.sliceVars(func.args)) |arg_var| {
                             next_rank = next_rank.max(try self.adjustRank(arg_var, group_rank, vars_to_generalize));
                         }
+                        for (self.store.sliceVars(func.effect_deps)) |effect_dep| {
+                            next_rank = next_rank.max(try self.adjustRank(effect_dep, group_rank, vars_to_generalize));
+                        }
                         return next_rank;
                     },
                     .fn_unbound => |func| {
                         var next_rank = try self.adjustRank(func.ret, group_rank, vars_to_generalize);
                         for (self.store.sliceVars(func.args)) |arg_var| {
                             next_rank = next_rank.max(try self.adjustRank(arg_var, group_rank, vars_to_generalize));
+                        }
+                        for (self.store.sliceVars(func.effect_deps)) |effect_dep| {
+                            next_rank = next_rank.max(try self.adjustRank(effect_dep, group_rank, vars_to_generalize));
                         }
                         return next_rank;
                     },

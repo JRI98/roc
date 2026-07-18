@@ -208,7 +208,7 @@ test "typed numeric suffix uses local shadow of builtin numeric type" {
     var found_shadowing_warning = false;
     for (diagnostics) |diagnostic| {
         switch (diagnostic) {
-            .shadowing_warning => found_shadowing_warning = true,
+            .builtin_type_shadowed_warning => found_shadowing_warning = true,
             else => {},
         }
     }

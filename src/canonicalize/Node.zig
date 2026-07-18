@@ -255,6 +255,7 @@ pub const Tag = enum {
     diag_too_many_exports,
     diag_nominal_type_redeclared,
     diag_type_shadowed_warning,
+    diag_builtin_type_shadowed_warning,
     diag_type_parameter_conflict,
     diag_unused_variable,
     diag_used_underscore_variable,
@@ -1091,7 +1092,7 @@ pub const Payload = extern union {
     };
 
     /// Diagnostics with an identifier and inline region offsets.
-    /// Used by: diag_shadowing_warning, diag_type_redeclared, diag_duplicate_record_field, diag_duplicate_tag, etc.
+    /// Used by: diag_shadowing_warning, diag_type_redeclared, diag_type_shadowed_warning, diag_duplicate_record_field, diag_duplicate_tag, etc.
     pub const DiagIdentWithRegion = extern struct {
         ident: u32, // @bitCast(Ident.Idx)
         region_start: u32, // offset
@@ -1099,7 +1100,7 @@ pub const Payload = extern union {
     };
 
     /// Diagnostics with two values plus region stored in span2_data.
-    /// Used by: diag_type_shadowed_warning, diag_type_parameter_conflict, diag_mutually_recursive_type_aliases
+    /// Used by: diag_type_parameter_conflict, diag_mutually_recursive_type_aliases
     pub const DiagTwoIdentsExtra = extern struct {
         ident1: u32, // @bitCast(Ident.Idx) or value
         ident2: u32, // @bitCast(Ident.Idx) or bool flag
