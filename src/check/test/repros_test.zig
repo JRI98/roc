@@ -853,6 +853,26 @@ test "check - repro - issue 9670 - minimal: multi-param alias, passthrough + wra
     try test_env.assertNoErrors();
 }
 
+test "check - effect dependency resolved after a pure annotation reports a mismatch" {
+    const src =
+        \\effect! : () => I64
+        \\effect! = || 42.I64
+        \\
+        \\first : U64, (() => I64) -> I64
+        \\first = |n, effect_arg!| {
+        \\    if n == 0.U64 0.I64 else second!(n - 1.U64, effect_arg!)
+        \\}
+        \\second! = |n, effect_arg!| {
+        \\    if n == 0.U64 effect_arg!() else first(n - 1.U64, effect_arg!)
+        \\}
+    ;
+
+    var test_env = try TestEnv.init("Test", src);
+    defer test_env.deinit();
+
+    try test_env.assertOneTypeError("Type Mismatch");
+}
+
 test "check - repro - issue 9491 follow-up - top-level mutually recursive parametric fns" {
     // Mutually recursive functions over a parametric recursive nominal type must
     // type-check: each cross-call instantiates the callee, so the two members'

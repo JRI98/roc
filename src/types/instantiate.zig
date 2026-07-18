@@ -428,10 +428,24 @@ pub const Instantiator = struct {
         }
 
         const fresh_ret = try self.instantiateVar(func.ret);
+
+        var fresh_effect_deps_sfa = std.heap.stackFallback(8 * @sizeOf(Var), self.store.gpa);
+        const fresh_effect_deps_alloc = fresh_effect_deps_sfa.get();
+        var fresh_effect_deps = try std.ArrayList(Var).initCapacity(fresh_effect_deps_alloc, func.effect_deps.count);
+        defer fresh_effect_deps.deinit(fresh_effect_deps_alloc);
+
+        const effect_deps_start: usize = @intFromEnum(func.effect_deps.start);
+        for (0..func.effect_deps.count) |i| {
+            const effect_dep = self.store.vars.items.items[effect_deps_start + i];
+            fresh_effect_deps.appendAssumeCapacity(try self.instantiateVar(effect_dep));
+        }
+
         const fresh_args_range = try self.store.appendVars(fresh_args.items);
+        const fresh_effect_deps_range = try self.store.appendVars(fresh_effect_deps.items);
         return Func{
             .args = fresh_args_range,
             .ret = fresh_ret,
+            .effect_deps = fresh_effect_deps_range,
         };
     }
 
