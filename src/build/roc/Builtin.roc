@@ -19,7 +19,21 @@ Builtin :: [].{
 		}
 
 		ParseTagUnionSpec(_shape) :: {}.{
-			parse : ParseTagUnionSpec(_shape), { tag : Str, encoding : _encoding, state : _state, missing : _err } -> Try({ value : _shape, rest : _state }, _err)
+
+			## After a format reads the tag name, the generated parser calls
+			## start_payloads once, next_payload before each payload after the
+			## first (with its zero-based index and the total count), and
+			## finish_payloads once after the final payload.
+			parse : ParseTagUnionSpec(_shape),
+			{
+				tag : Str,
+				encoding : _encoding,
+				state : _state,
+				start_payloads : _state, U64 -> Try(_state, _err),
+				next_payload : _state, U64, U64 -> Try(_state, _err),
+				finish_payloads : _state, U64 -> Try(_state, _err),
+				missing : _err,
+			} -> Try({ value : _shape, rest : _state }, _err)
 		}
 
 		JsonState :: [Input(Str)]
@@ -131,6 +145,10 @@ Builtin :: [].{
 
 			encode_null : JsonEncoding, JsonEncodeState -> Try(JsonEncodeState, _never_fails)
 			encode_null = |_, state| JsonEncoding.encode_null(state)
+
+			## write_payloads supplies each tag payload in source order.
+			encode_tag : JsonEncoding, JsonEncodeState, Str, U64, (JsonEncodeState, (JsonEncodeState, (JsonEncodeState -> Try(JsonEncodeState, err)) -> Try(JsonEncodeState, err)) -> Try(JsonEncodeState, err)) -> Try(JsonEncodeState, err)
+			encode_tag = |_, state, tag, count, write_payloads| JsonEncoding.encode_tag(state, tag, count, write_payloads)
 
 			encode_record : JsonEncoding, JsonEncodeState, U64, (JsonEncodeState, (JsonEncodeState, Str, (JsonEncodeState -> Try(JsonEncodeState, err)) -> Try(JsonEncodeState, err)) -> Try(JsonEncodeState, err)) -> Try(JsonEncodeState, err)
 			encode_record = |_, state, count, write_fields| JsonEncoding.encode_record(state, count, write_fields)
@@ -930,6 +948,9 @@ Builtin :: [].{
 							tag: key_split.value,
 							encoding,
 							state: JsonState.Input(key_split.after),
+							start_payloads: Json.start_string_tag_payloads,
+							next_payload: Json.next_string_tag_payload,
+							finish_payloads: Json.finish_string_tag_payloads,
 							missing: Json.invalid_json,
 						},
 					)
@@ -972,6 +993,9 @@ Builtin :: [].{
 								tag: tag_name,
 								encoding,
 								state: JsonState.Input(payload),
+								start_payloads: |state, count| Json.start_object_tag_payloads(encoding, state, count),
+								next_payload: |state, index, count| Json.next_object_tag_payload(encoding, state, index, count),
+								finish_payloads: |state, count| Json.finish_object_tag_payloads(encoding, state, count),
 								missing: Json.invalid_json,
 							},
 						)?
@@ -983,6 +1007,62 @@ Builtin :: [].{
 					Err(_) => Err(Json.invalid_json)
 				}
 			}
+
+			start_string_tag_payloads : JsonState, U64 -> Try(JsonState, Json.ParseErr)
+			start_string_tag_payloads = |state, count|
+				if count == 0 Ok(state) else Err(Json.invalid_json)
+
+			next_string_tag_payload : JsonState, U64, U64 -> Try(JsonState, Json.ParseErr)
+			next_string_tag_payload = |_, _, _| Err(Json.invalid_json)
+
+			finish_string_tag_payloads : JsonState, U64 -> Try(JsonState, Json.ParseErr)
+			finish_string_tag_payloads = |state, count|
+				if count == 0 Ok(state) else Err(Json.invalid_json)
+
+			start_object_tag_payloads : JsonEncoding, JsonState, U64 -> Try(JsonState, Json.ParseErr)
+			start_object_tag_payloads = |encoding, state, count|
+				if count == 0 {
+					match state {
+						Input(raw) => {
+							empty = Json.consume_empty_json_object(raw)?
+							Ok(JsonState.Input(Str.trim_start(empty.after)))
+						}
+					}
+				} else if count == 1 {
+					Ok(state)
+				} else {
+					started = JsonEncoding.parse_array_start(encoding, state)?
+					match JsonEncoding.parse_array_next(encoding, started)? {
+						Element(payload_state) => Ok(payload_state)
+						Done(_) => Err(Json.invalid_json)
+					}
+				}
+
+			next_object_tag_payload : JsonEncoding, JsonState, U64, U64 -> Try(JsonState, Json.ParseErr)
+			next_object_tag_payload = |encoding, state, _, count|
+				if count <= 1 {
+					Err(Json.invalid_json)
+				} else {
+					match JsonEncoding.parse_array_after_element(encoding, state)? {
+						Continue(next_state) =>
+							match JsonEncoding.parse_array_next(encoding, next_state)? {
+								Element(payload_state) => Ok(payload_state)
+								Done(_) => Err(Json.invalid_json)
+							}
+						Done(_) => Err(Json.invalid_json)
+					}
+				}
+
+			finish_object_tag_payloads : JsonEncoding, JsonState, U64 -> Try(JsonState, Json.ParseErr)
+			finish_object_tag_payloads = |encoding, state, count|
+				if count <= 1 {
+					Ok(state)
+				} else {
+					match JsonEncoding.parse_array_after_element(encoding, state)? {
+						Done(done_state) => Ok(done_state)
+						Continue(_) => Err(Json.invalid_json)
+					}
+				}
 
 			finish_tag_payload : JsonEncoding, a, Str -> Try({ value : a, rest : JsonState }, Json.ParseErr)
 			finish_tag_payload = |encoding, value, raw| {
@@ -1006,26 +1086,7 @@ Builtin :: [].{
 					return Err(Json.invalid_json)
 				}
 
-				empty_payload = Json.consume_empty_json_object(remaining)?
-				after_payload = json_trim_start(empty_payload.after)
-
-				if Str.starts_with(after_payload, "}") {
-					after_close = json_trim_start(Str.drop_prefix(after_payload, "}"))
-					Ok({ value, rest: JsonState.Input(after_close) })
-				} else if Str.starts_with(after_payload, ",") {
-					after_comma = json_trim_start(Str.drop_prefix(after_payload, ","))
-
-					if JsonEncoding.allows_trailing_commas(encoding) {
-						if Str.starts_with(after_comma, "}") {
-							after_close = json_trim_start(Str.drop_prefix(after_comma, "}"))
-							return Ok({ value, rest: JsonState.Input(after_close) })
-						}
-					}
-
-					Err(Json.invalid_json)
-				} else {
-					Err(Json.invalid_json)
-				}
+				Err(Json.invalid_json)
 			}
 
 			consume_empty_json_object : Str -> Try({ after : Str }, Json.ParseErr)
@@ -1485,6 +1546,28 @@ Builtin :: [].{
 			parse_tag_union = |encoding, spec, state|
 				match state {
 					Input(value) => Json.parse_tag_union_from_json(value, encoding, spec)
+				}
+
+			encode_tag : JsonEncodeState, Str, U64, (JsonEncodeState, (JsonEncodeState, (JsonEncodeState -> Try(JsonEncodeState, err)) -> Try(JsonEncodeState, err)) -> Try(JsonEncodeState, err)) -> Try(JsonEncodeState, err)
+			encode_tag = |state, tag, count, write_payloads|
+				if count == 0 {
+					JsonEncoding.encode_str(tag, state)
+				} else {
+					JsonEncoding.encode_record(
+						state,
+						1,
+						|record_state, write_field|
+							write_field(
+								record_state,
+								tag,
+								|payload_state|
+									if count == 1 {
+										write_payloads(payload_state, |item_state, write_value| write_value(item_state))
+									} else {
+										JsonEncoding.encode_tuple(payload_state, count, write_payloads)
+									},
+							),
+					)
 				}
 
 			encode_record : JsonEncodeState, U64, (JsonEncodeState, (JsonEncodeState, Str, (JsonEncodeState -> Try(JsonEncodeState, err)) -> Try(JsonEncodeState, err)) -> Try(JsonEncodeState, err)) -> Try(JsonEncodeState, err)

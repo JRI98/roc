@@ -21620,6 +21620,7 @@ const BuiltinEncodeSpecDecl = enum {
     dec,
     f32,
     f64,
+    tag,
     record,
     tuple,
     list,
@@ -21781,6 +21782,7 @@ fn encodeFormatMethodName(self: *Self, decl: BuiltinEncodeSpecDecl) Allocator.Er
         .dec => "encode_dec",
         .f32 => "encode_f32",
         .f64 => "encode_f64",
+        .tag => "encode_tag",
         .record => "encode_record",
         .tuple => "encode_tuple",
         .list => "encode_list",
@@ -21967,12 +21969,16 @@ fn validateEncodeFormatMethod(
             const write_fields_var = try self.freshFromContent(try self.types.mkFuncUnbound(&.{ state_var, field_writer_var }, expected_ret), env, region);
             break :blk try self.freshFromContent(try self.types.mkFuncUnbound(&.{ state_var, count_var, write_fields_var }, expected_ret), env, region);
         },
-        .tuple, .list => blk: {
+        .tag, .tuple, .list => blk: {
             const count_var = try self.freshU64(env, region);
             const value_writer_var = try self.freshFromContent(try self.types.mkFuncUnbound(&.{state_var}, expected_ret), env, region);
             const element_writer_var = try self.freshFromContent(try self.types.mkFuncUnbound(&.{ state_var, value_writer_var }, expected_ret), env, region);
             const write_elements_var = try self.freshFromContent(try self.types.mkFuncUnbound(&.{ state_var, element_writer_var }, expected_ret), env, region);
-            break :blk try self.freshFromContent(try self.types.mkFuncUnbound(&.{ state_var, count_var, write_elements_var }, expected_ret), env, region);
+            const args: []const Var = if (spec_decl == .tag) blk_args: {
+                const str_var = try self.freshStr(env, region);
+                break :blk_args &[_]Var{ state_var, str_var, count_var, write_elements_var };
+            } else &[_]Var{ state_var, count_var, write_elements_var };
+            break :blk try self.freshFromContent(try self.types.mkFuncUnbound(args, expected_ret), env, region);
         },
     };
     const result = try self.unifyInContext(method.var_, expected_fn, env, .{
@@ -22376,27 +22382,15 @@ fn validateDerivedParseTagUnion(
         .unsupported, .reported_error => |result| return result,
     }
 
-    var has_multi_payload_tag = false;
     const tags = self.types.getTagsSlice(tag_union.tags);
     for (tags.items(.args)) |tag_args_range| {
         const tag_args = try self.gpa.dupe(Var, self.types.sliceVars(tag_args_range));
         defer self.gpa.free(tag_args);
-        if (tag_args.len > 1) has_multi_payload_tag = true;
         for (tag_args) |tag_arg| {
             switch (try self.validateDerivedParseVar(tag_arg, encoding_var, state_var, err_var, constraint, env, region, visited, .shape)) {
                 .ok => {},
                 .unsupported, .reported_error => |result| return result,
             }
-        }
-    }
-    if (has_multi_payload_tag) {
-        switch (try self.validateDerivedParseArrayMethods(encoding_var, state_var, state_var, err_var, constraint, env, region)) {
-            .ok => {},
-            .unsupported, .reported_error => |result| return result,
-        }
-        switch (try self.validateInvalidValueMethod(encoding_var, state_var, err_var, constraint, env, region)) {
-            .ok => {},
-            .unsupported, .reported_error => |result| return result,
         }
     }
     return try self.validateDerivedParseTagExt(tag_union.ext, encoding_var, state_var, err_var, constraint, env, region, visited);
@@ -22675,19 +22669,10 @@ fn validateDerivedEncodeTagUnion(
 ) Allocator.Error!DerivedParseValidation {
     if (!try self.derivedParseTagUnionHasAnyTag(tag_union)) return .unsupported;
 
-    var has_unit_tag = false;
-    var has_payload_tag = false;
-    var has_multi_payload_tag = false;
     const tags = self.types.getTagsSlice(tag_union.tags);
     for (tags.items(.args)) |tag_args_range| {
         const tag_args = try self.gpa.dupe(Var, self.types.sliceVars(tag_args_range));
         defer self.gpa.free(tag_args);
-        if (tag_args.len == 0) {
-            has_unit_tag = true;
-        } else {
-            has_payload_tag = true;
-            if (tag_args.len > 1) has_multi_payload_tag = true;
-        }
         for (tag_args) |tag_arg| {
             switch (try self.validateDerivedEncodeVar(tag_arg, encoding_var, state_var, err_var, constraint, env, region, visited)) {
                 .ok => {},
@@ -22696,11 +22681,7 @@ fn validateDerivedEncodeTagUnion(
         }
     }
 
-    switch (try self.validateDerivedEncodeTagUnionMethods(encoding_var, state_var, err_var, constraint, env, region, .{
-        .has_unit_tag = has_unit_tag,
-        .has_payload_tag = has_payload_tag,
-        .has_multi_payload_tag = has_multi_payload_tag,
-    })) {
+    switch (try self.validateDerivedEncodeTagUnionMethods(encoding_var, state_var, err_var, constraint, env, region)) {
         .ok => {},
         .unsupported, .reported_error => |result| return result,
     }
@@ -22736,12 +22717,6 @@ fn validateDerivedEncodeTagExt(
     };
 }
 
-const EncodeTagUnionMethodNeeds = struct {
-    has_unit_tag: bool,
-    has_payload_tag: bool,
-    has_multi_payload_tag: bool,
-};
-
 fn validateDerivedEncodeTagUnionMethods(
     self: *Self,
     encoding_var: Var,
@@ -22750,26 +22725,10 @@ fn validateDerivedEncodeTagUnionMethods(
     constraint: StaticDispatchConstraint,
     env: *Env,
     region: Region,
-    needs: EncodeTagUnionMethodNeeds,
 ) Allocator.Error!DerivedParseValidation {
-    if (needs.has_unit_tag) {
-        const str_var = try self.freshStr(env, region);
-        switch (try self.validateEncodeFormatMethod(encoding_var, state_var, str_var, .str, err_var, constraint, env, region)) {
-            .ok => {},
-            .unsupported, .reported_error => |result| return result,
-        }
-    }
-    if (needs.has_payload_tag) {
-        switch (try self.validateEncodeFormatMethod(encoding_var, state_var, state_var, .record, err_var, constraint, env, region)) {
-            .ok => {},
-            .unsupported, .reported_error => |result| return result,
-        }
-    }
-    if (needs.has_multi_payload_tag) {
-        switch (try self.validateDerivedEncodeTupleMethods(encoding_var, state_var, err_var, constraint, env, region)) {
-            .ok => {},
-            .unsupported, .reported_error => |result| return result,
-        }
+    switch (try self.validateEncodeFormatMethod(encoding_var, state_var, state_var, .tag, err_var, constraint, env, region)) {
+        .ok => {},
+        .unsupported, .reported_error => |result| return result,
     }
     return .ok;
 }

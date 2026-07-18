@@ -573,3 +573,52 @@ expect {
 
 	result == Ok(Multi("tag", 9, True))
 }
+
+expect {
+	value : [One(Str)]
+	value = One("payload")
+
+	Json.to_str(value) == "{\"One\":\"payload\"}"
+}
+
+expect {
+	result : Try([One(Str)], Json.ParseErr)
+	result = Json.parse("{\"One\":\"payload\"}")
+
+	result == Ok(One("payload"))
+}
+
+expect {
+	result : Try([Active, Paused], Json.ParseErr)
+	result = Json.parse("{\"Active\":{}}")
+
+	result == Ok(Active)
+}
+
+expect {
+	result : Try([Multi(Str, U64, Bool)], Json.ParseErr)
+	result = Json.parse("\"Multi\"")
+
+	result == Err(Json.invalid_json)
+}
+
+expect {
+	result : Try([Multi(Str, U64, Bool)], Json.ParseErr)
+	result = Json.parse("{\"Multi\":[\"tag\",9]}")
+
+	result == Err(Json.invalid_json)
+}
+
+expect {
+	result : Try([Multi(Str, U64, Bool)], Json.ParseErr)
+	result = Json.parse("{\"Multi\":[\"tag\",9,true,0]}")
+
+	result == Err(Json.invalid_json)
+}
+
+expect {
+	result : Try([Multi(Str, U64, Bool)], Json.ParseErr)
+	result = Json.parse("{\"Multi\":[\"tag\",9,true] {}}")
+
+	result == Err(Json.invalid_json)
+}
