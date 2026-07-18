@@ -9,7 +9,7 @@ can't be wrapped in parentheses without causing an error. Some examples:
 - `foo(1)` is a valid expression. It evaluates to a value. `(foo(1))` is valid.
 - `1` is a valid expression. It's already a value. `(1)` is valid.
 - `import Foo` is a [statement](statements.md) not an expression. `(import Foo)` is invalid.
-- `# Something` is a [comment](comments.md), not an expression. `(# Something)` is invalid.
+- `# Something` is a [comment](comments-and-docs.md), not an expression. `(# Something)` is invalid.
 - `package […]` is a [module header](modules.md#module-headers), not an expression. `(package […])` is invalid.
 
 Another way to think of an expression is that you can always assign it to a name—so, you

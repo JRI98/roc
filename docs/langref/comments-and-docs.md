@@ -37,8 +37,8 @@ Doc comments add documentation to an assignment. They have a special comment syn
 
 - Each line of a doc comment begins with `"## "` - so, two `#`s and then a space, at the very beginning of the line.
 - Each consecutive line that begins with `"## "` continues the doc comment.
-- The next line after a doc comment's final `"## "` line must begin with an [assignment statement](statements#assignments).
-    - If one or more lines beginning with `"## "` are not followed immediately by an assignment satement at the beginning of the next line, then none of them are considered a doc comment; they are instead treated as an ordinary comment.
+- The next line after a doc comment's final `"## "` line must begin with an [assignment statement](statements.md#assignment).
+    - If one or more lines beginning with `"## "` are not followed immediately by an assignment statement at the beginning of the next line, then none of them are considered a doc comment; they are instead treated as an ordinary comment.
 
 For example:
 
@@ -51,13 +51,12 @@ For example:
 ## expect negate_if_odd(2) == 2
 ## ```
 negate_if_odd = |num| if num.is_odd() {
-	num.neg()
+	num.negate()
 } else {
 	num
 }
 ````
 
-TODO: explain code blocks in here.
 TODO: explain code blocks in here.
 TODO: explain [autolink] syntax inside doc comments.
 
