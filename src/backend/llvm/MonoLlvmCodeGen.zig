@@ -529,8 +529,7 @@ pub const MonoLlvmCodeGen = struct {
                 \\    lea 8(%rbx), %rsi
                 \\    call roc_shim_default_main
                 \\    mov %rax, %rdi
-                \\    mov $60, %rax
-                \\    syscall
+                \\    call roc_default_exit
                 \\    ud2
                 \\.size _start, .-_start
                 \\
@@ -545,8 +544,7 @@ pub const MonoLlvmCodeGen = struct {
                 \\    ldr x0, [x19]
                 \\    add x1, x19, #8
                 \\    bl roc_shim_default_main
-                \\    mov x8, #94
-                \\    svc #0
+                \\    bl roc_default_exit
                 \\    brk #0
                 \\.size _start, .-_start
                 \\
@@ -574,8 +572,7 @@ pub const MonoLlvmCodeGen = struct {
                 \\    call roc_default_runtime_init
                 \\    call {s}
                 \\    mov %rax, %rdi
-                \\    mov $60, %rax
-                \\    syscall
+                \\    call roc_default_exit
                 \\    ud2
                 \\.size _start, .-_start
                 \\
@@ -587,8 +584,7 @@ pub const MonoLlvmCodeGen = struct {
                 \\_start:
                 \\    bl roc_default_runtime_init
                 \\    bl {s}
-                \\    mov x8, #94
-                \\    svc #0
+                \\    bl roc_default_exit
                 \\    brk #0
                 \\.size _start, .-_start
                 \\
