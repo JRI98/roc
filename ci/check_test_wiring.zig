@@ -577,7 +577,7 @@ fn enqueueForScan(
     try scan_queue.append(allocator, try allocator.dupe(u8, path));
 }
 
-/// Marks every `@import("....zig")` in `file_path` as referenced and queues it
+/// Marks every .zig file import in `file_path` as referenced and queues it
 /// for its own import scan, so wiring is followed transitively.
 fn collectFileImports(
     allocator: Allocator,
