@@ -1528,22 +1528,16 @@ test "fx platform divergent if with all crash branches does not hit postcheck in
 }
 
 test "external platform memory alignment regression" {
-    // SKIPPED: aoc_day2.roc crashes at runtime due to a dev backend bug with
-    // mutable variables + for loops + closures (.contains/.append).
-    // See https://github.com/roc-lang/roc/issues/8946
-    return error.SkipZigTest;
+    // Regression test for https://github.com/roc-lang/roc/issues/8946
+    // aoc_day2.roc combines mutable variables, for loops, and closures
+    // (.contains/.append/.fold), and must run to completion without crashing.
+    const allocator = testing.allocator;
 
-    // This test verifies that external platforms with the memory alignment fix work correctly.
-    // The bug was in roc-platform-template-zig < 0.6 where rocDeallocFn used
-    // `roc_dealloc.alignment` directly instead of `@max(roc_dealloc.alignment, @alignOf(usize))`.
-    // Fixed in https://github.com/lukewilliamboswell/roc-platform-template-zig/releases/tag/0.6
-    // const allocator = testing.allocator;
+    const run_result = try util.runRoc(std.testing.io, allocator, &.{}, "test/fx/aoc_day2.roc");
+    defer allocator.free(run_result.stdout);
+    defer allocator.free(run_result.stderr);
 
-    // const run_result = try util.runRoc(std.testing.io, allocator, &.{}, "test/fx/aoc_day2.roc");
-    // defer allocator.free(run_result.stdout);
-    // defer allocator.free(run_result.stderr);
-
-    // try util.checkSuccess(run_result);
+    try util.checkSuccess(run_result);
 }
 
 test "fx platform issue8826 app vs platform type mismatch" {
