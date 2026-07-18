@@ -376,6 +376,7 @@ pub const StaticDispatch = union(enum) {
     dispatcher_not_nominal: DispatcherNotNominal,
     dispatcher_does_not_impl_method: DispatcherDoesNotImplMethod,
     type_does_not_support_equality: TypeDoesNotSupportEquality,
+    type_does_not_support_map: TypeDoesNotSupportMap,
     unresolved_dispatcher: UnresolvedDispatcher,
     recursive_dispatch: RecursiveDispatch,
 };
@@ -447,6 +448,14 @@ pub const TypeDoesNotSupportEquality = struct {
     dispatcher_var: Var,
     dispatcher_snapshot: SnapshotContentIdx,
     fn_var: Var,
+};
+
+/// Error when compiler-derived `map`/`map!` cannot select one direct tag
+/// payload to transform under the language's zero-sized-payload rules.
+pub const TypeDoesNotSupportMap = struct {
+    dispatcher_snapshot: SnapshotContentIdx,
+    fn_var: Var,
+    method_name: Ident.Idx,
 };
 
 /// Error when satisfying a static-dispatch constraint immediately requires the

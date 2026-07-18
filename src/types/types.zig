@@ -43,7 +43,9 @@ test {
     // not a size win: the literal-origin variant still embeds a full `NumeralInfo`,
     // so the `Origin` union dominates the struct. Provenance adds a raw expr index
     // (4B) plus a where-clause expect region (8B), both `maxInt`-sentinel packed.
-    try std.testing.expectEqual(64, @sizeOf(StaticDispatchConstraint));
+    // The optional derived-map payload selection adds its tag, payload index,
+    // and optional discriminant without affecting type identity.
+    try std.testing.expectEqual(76, @sizeOf(StaticDispatchConstraint));
     // Directed effect dependencies must survive type generalization,
     // instantiation, and cross-module copying, so they live with the function
     // payload rather than in checker-only side state.
@@ -930,6 +932,10 @@ pub const StaticDispatchConstraint = struct {
     /// so two structurally identical constraints with different provenance stay
     /// equal.
     provenance: Provenance = .{},
+    /// The direct tag payload selected by checked derived `map`/`map!`.
+    /// This is checker-owned derivation metadata and, like `provenance`, does
+    /// not participate in type identity or constraint equality.
+    derived_map_plan: ?DerivedMapPlan = null,
 
     /// The introducing site of a static dispatch constraint. `intro_expr` is the
     /// raw `CIR.Expr.Idx` of the expression that created the constraint, stored
@@ -1074,6 +1080,13 @@ pub const StaticDispatchConstraint = struct {
         const b_text = store.getText(b.fn_name);
         return std.mem.order(u8, a_text, b_text);
     }
+};
+
+/// Source-type identity for the payload slot selected by derived mapping.
+/// The checked artifact translates `tag_name` into its canonical tag name.
+pub const DerivedMapPlan = struct {
+    tag_name: Ident.Idx,
+    payload_index: u32,
 };
 
 /// Two record fields

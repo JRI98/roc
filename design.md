@@ -1710,6 +1710,50 @@ output as a callable target. The concrete monomorphic dispatcher type owns
 the method owner identity; post-check code may consult the registry only after
 that owner is already explicit.
 
+The compiler-derived method set is `is_eq`, `to_hash`, `parser_for`,
+`encoder_for`, `map`, and `map!`. Ownerless structural types receive every
+derived method for which their checked shape is eligible. A nominal or opaque
+type receives none of these implicitly: its declaration must opt in to each
+one with an annotation-only method such as `is_eq : _` or `map : _`. An exact
+method body remains an ordinary method implementation. Inspection is the sole
+exception to this opt-in rule: every type is inspectable, opaque values use the
+opaque representation, and an exact `to_inspect` method may override it.
+
+Derived `map` and `map!` apply only to tag-union backing shapes. The checker
+selects one direct tag payload slot; it never descends into records, tuples, or
+other payload types to find the slot. Normally the selected slot is the only
+non-zero-sized direct payload in the entire union, and every other direct
+payload must be zero-sized. When all direct payloads are zero-sized, there is
+one structural tie-breaker: exactly one tag may have exactly one payload and
+every other tag must be nullary, in which case that sole payload is selected.
+An eligible parameterized type has at most one non-zero-sized type argument,
+and a type variable that occurs in more than one direct payload disqualifies
+the shape.
+
+The checked-stage zero-sized classification is target-independent and does not
+consult layouts. Empty records and empty tag unions are zero-sized; closed
+records and tuples are zero-sized when every component is; and a tag union is
+zero-sized only when it is empty or has exactly one tag whose payloads are all
+zero-sized. Transparent aliases and nominal wrappers are classified through
+their backing type. Opaque types are always classified as non-zero-sized,
+including in their defining module. Scalars, functions, collections, and
+recursive cycles are non-zero-sized.
+
+For a structural union, the selected payload has input type `a`, the transform
+has type `a -> b` (`a => b` for `map!`), and the result is the same structural
+union with only that payload changed to `b`. A named opt-in is likewise
+type-changing when the selected payload is exactly its one remaining uniquely
+occurring type parameter. Otherwise its transform and result are endomorphic.
+Derived mapping closes an open tag-union row, because its generated match is
+exhaustive. `map!` has the same selection rules as `map`; only the transform
+arrow and the derived method's effect differ.
+
+Checking records the selected tag identity and direct payload index in the
+structural dispatch evidence. Monotype consumes that explicit plan to build a
+single exhaustive match, passes every unselected payload through unchanged,
+and calls the transform only in the selected branch. It does not select or
+reconstruct a mapping slot from Monotype shapes.
+
 Each checked module also outputs the ordered checked-module id span that defines
 method-registry visibility after its own registry. The span preserves checking
 order and contains only modules with non-empty registries. The same owner and
@@ -2874,10 +2918,11 @@ its plan:
 - `constraint(depth, k)` — the dispatcher is the k-th evidence param of the
   d-th enclosing generalized callable. Each specialization edge supplies the
   answer: dictionary passing resolved entirely at compile time.
-- `structural(kind)` — the checker chose the compiler-derived structural
-  implementation (equality, hashing, parsing, encoding), either from an
-  explicit structural registry declaration on an owned type or for an
-  ownerless shape.
+- `structural(derivation)` — the checker chose the compiler-derived structural
+  implementation (equality, hashing, parsing, encoding, or mapping), either
+  from an explicit structural registry declaration on an owned type or for an
+  ownerless shape. Mapping derivations include the checker-selected tag and
+  direct payload index.
 - `checked_error` — checking rejected the site; executing it anyway (running a
   program with reported errors) lowers to an explicit crash.
 - `unreachable_dispatch` — the dispatcher is a constrained variable no

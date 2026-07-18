@@ -572,7 +572,9 @@ pub const tests = [_]TestCase{
         .name = "regression B101: monotype function template was assigned two lifted function ids",
         .source_kind = .module,
         .source =
-        \\Foo(a) := [Bar(a), Baz]
+        \\Foo(a) := [Bar(a), Baz].{
+        \\    is_eq : _
+        \\}
         \\
         \\combine : Foo(a), Foo(b), (a, b -> c) -> Foo(c)
         \\combine = |ma, mb, f|

@@ -13201,6 +13201,8 @@ const EvidencePass = struct {
             .hash => |hash| if (hash.structural_allowed) .hash else null,
             .parser_for => |parser_for| if (parser_for.structural_allowed) .parser else null,
             .encoder_for => |encoder_for| if (encoder_for.structural_allowed) .encoder else null,
+            .map => |map| if (map.structural_allowed) .map else null,
+            .map_effectful => |map| if (map.structural_allowed) .map_effectful else null,
         };
         // Nested evidence built for this plan's target forwards enclosing
         // where-vars against the same chain.
@@ -13311,11 +13313,11 @@ const EvidencePass = struct {
                     // structurally, so a miss there is a publication bug
                     // (every view the checker resolved against is searched
                     // above).
-                    if (structural_kind) |kind| return .{ .structural = kind };
+                    if (structural_kind) |kind| return .{ .structural = try self.structuralDerivation(kind, constraint_fn_var) };
                     std.debug.panic("publication could not resolve a checked dispatch target for an owned method", .{});
                 }
                 // No owner head: a genuinely structural shape.
-                if (structural_kind) |kind| return .{ .structural = kind };
+                if (structural_kind) |kind| return .{ .structural = try self.structuralDerivation(kind, constraint_fn_var) };
                 // Checking already reported the missing method; the site is
                 // erroneous.
                 return .checked_error;
@@ -13380,8 +13382,43 @@ const EvidencePass = struct {
         // modes the vacuous shape decomposes structurally (equality of values
         // that never exist is defined); a value dispatch is statically
         // unreachable and lowers to an explicit crash.
-        if (structural_kind) |kind| return .{ .structural = kind };
+        if (structural_kind) |kind| switch (kind) {
+            .map, .map_effectful => return .unreachable_dispatch,
+            else => return .{ .structural = try self.structuralDerivation(kind, constraint_fn_var) },
+        };
         return .unreachable_dispatch;
+    }
+
+    fn structuralDerivation(
+        self: *EvidencePass,
+        kind: static_dispatch.StructuralKind,
+        constraint_fn_var: ?Var,
+    ) Allocator.Error!static_dispatch.StructuralDerivation {
+        return switch (kind) {
+            .equality => .equality,
+            .hash => .hash,
+            .parser => .parser,
+            .encoder => .encoder,
+            .map, .map_effectful => blk: {
+                const fn_var = constraint_fn_var orelse checkedArtifactInvariant("derived map evidence had no constraint function", .{});
+                const fn_root = self.types.resolveVar(fn_var).var_;
+                var source_plan: ?types.DerivedMapPlan = null;
+                for (self.types.static_dispatch_constraints.items.items) |constraint| {
+                    if (self.types.resolveVar(constraint.fn_var).var_ != fn_root) continue;
+                    source_plan = constraint.derived_map_plan orelse continue;
+                    break;
+                }
+                const plan = source_plan orelse checkedArtifactInvariant("derived map evidence had no checked payload selection", .{});
+                const canonical_plan = static_dispatch.DerivedMapPlan{
+                    .tag = try self.names.internTagIdent(self.module.identStoreConst(), plan.tag_name),
+                    .payload_index = plan.payload_index,
+                };
+                break :blk if (kind == .map)
+                    .{ .map = canonical_plan }
+                else
+                    .{ .map_effectful = canonical_plan };
+            },
+        };
     }
 
     /// The method owner of a settled source var, walking alias content
@@ -13435,7 +13472,7 @@ const EvidencePass = struct {
                 if (structural_kind == null or structural_kind.? != kind) {
                     checkedArtifactInvariant("structural method registry result did not match the checked dispatch result mode", .{});
                 }
-                break :blk .{ .structural = kind };
+                break :blk .{ .structural = try self.structuralDerivation(kind, constraint_fn_var) };
             },
             .procedure, .local_proc => .{ .direct = try self.evidenceNodeForTarget(target, constraint_fn_var) },
         };
@@ -13559,7 +13596,7 @@ const EvidencePass = struct {
     fn structuralKindForMethodIdent(self: *EvidencePass, fn_name: anytype) ?static_dispatch.StructuralKind {
         const common = self.module.commonIdents();
         inline for (static_dispatch.structural_method_kinds) |entry| {
-            if (fn_name.eql(@field(common, entry.name))) return entry.kind;
+            if (fn_name.eql(@field(common, entry.common_ident))) return entry.kind;
         }
         return null;
     }
@@ -23030,7 +23067,7 @@ pub const CheckedModuleArtifact = struct {
     /// Manual discriminant for `SERIALIZED_VERSION_HASH`: bump to force a cache /
     /// baked-blob invalidation for a layout change the structural fingerprint below
     /// cannot observe (e.g. a semantic change to how a field is interpreted).
-    const serialized_layout_version: u32 = 23;
+    const serialized_layout_version: u32 = 24;
 
     /// Comptime fingerprint of `Serialized`'s layout, mirroring
     /// `cache_module.MODULE_ENV_VERSION_HASH`. It is appended to the baked builtin
@@ -27643,8 +27680,8 @@ test "SERIALIZED_VERSION_HASH golden value" {
     // change, bump `serialized_layout_version` and replace the golden bytes below with
     // the ones this assertion prints.
     const golden: [32]u8 = .{
-        0x51, 0xD0, 0x48, 0x7E, 0xE0, 0x82, 0xB8, 0x2C, 0xF7, 0x9F, 0x0D, 0xF7, 0x74, 0x46, 0x34, 0x7C,
-        0x9F, 0xC5, 0x4D, 0x68, 0x30, 0x15, 0xFA, 0x13, 0x18, 0xDC, 0x1E, 0xC9, 0xEA, 0x12, 0xA9, 0xC3,
+        0x6A, 0x38, 0x1B, 0x6C, 0x78, 0x7F, 0x16, 0xA6, 0x0E, 0x22, 0x6A, 0xEE, 0x36, 0xF1, 0x13, 0x36,
+        0x78, 0x77, 0x71, 0xD2, 0x9D, 0x19, 0xB6, 0x80, 0x73, 0x8D, 0xE3, 0x5D, 0x02, 0x71, 0xC0, 0xFB,
     };
     try std.testing.expectEqualSlices(u8, &golden, &CheckedModuleArtifact.SERIALIZED_VERSION_HASH);
 }

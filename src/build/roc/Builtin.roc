@@ -1963,6 +1963,9 @@ Builtin :: [].{
 	}
 
 	Str :: [ProvidedByCompiler].{
+		parser_for : _
+		encoder_for : _
+
 		Utf8Problem := [
 			InvalidStartByte,
 			UnexpectedEndOfSequence,
@@ -3263,6 +3266,7 @@ Builtin :: [].{
 	}
 
 	List(_item) :: [ProvidedByCompiler].{
+		parser_for : _
 
 		## Returns the length of the list, which is equal to the number of elements it contains.
 		##
@@ -4318,6 +4322,8 @@ Builtin :: [].{
 	}
 
 	Bool := [False, True].{
+		parser_for : _
+		encoder_for : _
 
 		## Returns `Bool.False` when given `Bool.True`, and vice versa. This is
 		## equivalent to the logic [NOT](https://en.wikipedia.org/wiki/Negation)
@@ -4366,6 +4372,8 @@ Builtin :: [].{
 	}
 
 	Box(item) :: [ProvidedByCompiler].{
+		parser_for : _
+		encoder_for : _
 
 		## Wraps a value in a generic, opaque representation (box) that can easily be passed to the platform.
 		## Boxing is an expensive process because it copies the value from the stack to the heap.
@@ -4377,6 +4385,8 @@ Builtin :: [].{
 	}
 
 	Try(ok, err) := [Ok(ok), Err(err)].{
+		parser_for : _
+		encoder_for : _
 
 		## Returns `Bool.True` if the result indicates a success, else returns `Bool.False`.
 		## ```roc
@@ -4534,6 +4544,9 @@ Builtin :: [].{
 	Dict(k, v) :: [
 		HashMap({ entries : List((k, v)), buckets : List({ dist_and_fingerprint : U32, entry_index : U32 }), max_entries_before_grow : U64, shifts : U8 }),
 	].{
+		parser_for : _
+		encoder_for : _
+
 		DictBucket : { dist_and_fingerprint : U32, entry_index : U32 }
 
 		# INTERNAL SEED-DOMAIN REPRESENTATION INVARIANT
@@ -5079,6 +5092,8 @@ Builtin :: [].{
 	}
 
 	Set(item) :: [Items(List(item))].{
+		parser_for : _
+		encoder_for : _
 
 		## Returns `Bool.True` if the two sets contain the same values, and `Bool.False` otherwise.
 		is_eq : Set(a), Set(a) -> Bool
@@ -5364,6 +5379,8 @@ Builtin :: [].{
 		}
 
 		U8 :: [].{
+			parser_for : _
+			encoder_for : _
 
 			## Returns the default [U8] value, which is `0`. Functions like [List.sum]
 			## use this as the starting value when adding up a list of numbers.
@@ -5986,6 +6003,8 @@ Builtin :: [].{
 		}
 
 		I8 :: [].{
+			parser_for : _
+			encoder_for : _
 
 			## Returns the default [I8] value, which is `0`. Functions like [List.sum]
 			## use this as the starting value when adding up a list of numbers.
@@ -6765,6 +6784,8 @@ Builtin :: [].{
 		}
 
 		U16 :: [].{
+			parser_for : _
+			encoder_for : _
 
 			## Returns the default [U16] value, which is `0`. Functions like [List.sum]
 			## use this as the starting value when adding up a list of numbers.
@@ -7419,6 +7440,8 @@ Builtin :: [].{
 		}
 
 		I16 :: [].{
+			parser_for : _
+			encoder_for : _
 
 			## Returns the default [I16] value, which is `0`. Functions like [List.sum]
 			## use this as the starting value when adding up a list of numbers.
@@ -8213,6 +8236,8 @@ Builtin :: [].{
 		}
 
 		U32 :: [].{
+			parser_for : _
+			encoder_for : _
 
 			## Returns the default [U32] value, which is `0`. Functions like [List.sum]
 			## use this as the starting value when adding up a list of numbers.
@@ -8899,6 +8924,8 @@ Builtin :: [].{
 		}
 
 		I32 :: [].{
+			parser_for : _
+			encoder_for : _
 
 			## Returns the default [I32] value, which is `0`. Functions like [List.sum]
 			## use this as the starting value when adding up a list of numbers.
@@ -9709,6 +9736,8 @@ Builtin :: [].{
 		}
 
 		U64 :: [].{
+			parser_for : _
+			encoder_for : _
 
 			## Returns the default [U64] value, which is `0`. Functions like [List.sum]
 			## use this as the starting value when adding up a list of numbers.
@@ -10435,6 +10464,8 @@ Builtin :: [].{
 		}
 
 		I64 :: [].{
+			parser_for : _
+			encoder_for : _
 
 			## Returns the default [I64] value, which is `0`. Functions like [List.sum]
 			## use this as the starting value when adding up a list of numbers.
@@ -11273,6 +11304,8 @@ Builtin :: [].{
 		}
 
 		U128 :: [].{
+			parser_for : _
+			encoder_for : _
 
 			## Returns the default [U128] value, which is `0`. Functions like [List.sum]
 			## use this as the starting value when adding up a list of numbers.
@@ -12042,6 +12075,8 @@ Builtin :: [].{
 		}
 
 		I128 :: [].{
+			parser_for : _
+			encoder_for : _
 
 			## Returns the default [I128] value, which is `0`. Functions like [List.sum]
 			## use this as the starting value when adding up a list of numbers.
@@ -12913,6 +12948,8 @@ Builtin :: [].{
 		}
 
 		Dec :: [].{
+			parser_for : _
+			encoder_for : _
 
 			## Returns the default [Dec] value, which is `0.0`. Functions like
 			## [List.sum] use this as the starting value when adding up a list of
@@ -13872,6 +13909,8 @@ Builtin :: [].{
 		}
 
 		F32 :: [].{
+			parser_for : _
+			encoder_for : _
 
 			## Returns the default [F32] value, which is `0.0`. Functions like
 			## [List.sum] use this as the starting value when adding up a list of
@@ -14022,6 +14061,8 @@ Builtin :: [].{
 			## expect !F32.is_float_eq(F32.nan, F32.nan)
 			## ```
 			is_float_eq : F32, F32 -> Bool
+
+			is_eq : _
 
 			## Feed an [F32] into a [Hasher].
 			to_hash : F32, Hasher -> Hasher
@@ -14817,6 +14858,8 @@ Builtin :: [].{
 		}
 
 		F64 :: [].{
+			parser_for : _
+			encoder_for : _
 
 			## Returns the default [F64] value, which is `0.0`. Functions like
 			## [List.sum] use this as the starting value when adding up a list of
@@ -14967,6 +15010,8 @@ Builtin :: [].{
 			## expect !F64.is_float_eq(F64.nan, F64.nan)
 			## ```
 			is_float_eq : F64, F64 -> Bool
+
+			is_eq : _
 
 			## Feed an [F64] into a [Hasher].
 			to_hash : F64, Hasher -> Hasher
