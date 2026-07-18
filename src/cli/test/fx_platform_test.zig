@@ -1751,8 +1751,55 @@ test "fx platform issue9118 try operator on tuple in type method (interpreter)" 
 }
 
 test "fx platform issue9118 try operator on tuple in type method (dev backend)" {
-    // TODO: dev backend crashes with signal 6 (SIGABRT)
-    return error.SkipZigTest;
+    // Regression test for https://github.com/roc-lang/roc/issues/9118
+    // The bug was that using the ? operator on a tuple (instead of a Try type)
+    // inside a type method would cause a crash in the dev backend.
+    // The ? operator expects a Try type [Ok(a), Err(e)] but was given a tuple.
+    const allocator = testing.allocator;
+
+    const run_result = try util.runRoc(std.testing.io, allocator, &.{ "test", "--opt=dev" }, "test/fx/for_var_in_type_method.roc");
+    defer allocator.free(run_result.stdout);
+    defer allocator.free(run_result.stderr);
+
+    // This file is expected to fail with a TYPE MISMATCH error because
+    // the ? operator is used on a tuple (Value, [Ok, Err(Str)]) instead of
+    // a Try type [Ok(Value), Err(Str)].
+    // The important thing is that it should NOT crash - it should report
+    // the type error gracefully.
+
+    switch (run_result.term) {
+        .exited => |code| {
+            if (code == 0) {
+                std.debug.print("Expected type error but test succeeded\n", .{});
+                return error.UnexpectedSuccess;
+            }
+            // Expected to fail - check for type mismatch error message
+            const has_type_error = std.mem.find(u8, run_result.stderr, "TYPE MISMATCH") != null;
+            if (!has_type_error) {
+                std.debug.print("Expected 'TYPE MISMATCH' error but got:\n", .{});
+                std.debug.print("STDERR: {s}\n", .{run_result.stderr});
+                return error.ExpectedTypeError;
+            }
+            // Verify it mentions the ? operator and Try type
+            const mentions_try = std.mem.find(u8, run_result.stderr, "Try") != null;
+            if (!mentions_try) {
+                std.debug.print("Expected error to mention 'Try' type but got:\n", .{});
+                std.debug.print("STDERR: {s}\n", .{run_result.stderr});
+                return error.ExpectedTryMention;
+            }
+        },
+        .signal => |sig| {
+            // This is the bug we're testing for - it should NOT crash with a signal
+            std.debug.print("CRITICAL: Test crashed with signal {} (this is the bug we're testing for)\n", .{sig});
+            std.debug.print("STDERR: {s}\n", .{run_result.stderr});
+            return error.Segfault;
+        },
+        else => {
+            std.debug.print("Run terminated abnormally: {}\n", .{run_result.term});
+            std.debug.print("STDERR: {s}\n", .{run_result.stderr});
+            return error.RunTerminatedAbnormally;
+        },
+    }
 }
 
 test "default app resolves a sibling type module imported with exposing" {
