@@ -8,9 +8,9 @@ can't be wrapped in parentheses without causing an error. Some examples:
 - `x` is a valid expression. It evaluates to a value. `(x)` is valid.
 - `foo(1)` is a valid expression. It evaluates to a value. `(foo(1))` is valid.
 - `1` is a valid expression. It's already a value. `(1)` is valid.
-- `import Foo` is a [statement](statements.md) not an expression. `(import Foo)` is invalid.
-- `# Something` is a [comment](comments-and-docs.md), not an expression. `(# Something)` is invalid.
-- `package […]` is a [module header](modules.md#module-headers), not an expression. `(package […])` is invalid.
+- `import Foo` is a [statement](statements) not an expression. `(import Foo)` is invalid.
+- `# Something` is a [comment](comments-and-docs), not an expression. `(# Something)` is invalid.
+- `package […]` is a [module header](modules#module-headers), not an expression. `(package […])` is invalid.
 
 Another way to think of an expression is that you can always assign it to a name—so, you
 can always put it after an `=` sign.
@@ -28,7 +28,7 @@ Here are all the different types of expressions in Roc:
 - Function literals (aka "lambdas"), e.g. `|a, b| a + b` or `|| c + d`
 - Lookups, e.g. `blah` or `(blah)` or `$blah` or `($blah)` or `blah!` or `(blah!)`
 - Calls, e.g. `blah(arg)` or `foo.bar(baz)`
-- Operator applications, e.g. `a + b` or `!x`, which [desugar to calls](operators.md#desugaring)
+- Operator applications, e.g. `a + b` or `!x`, which [desugar to calls](operators#desugaring)
 - [Block expressions](#block-expressions), e.g. `{ foo() }`
 
 There are no other types of expressions in the language.
@@ -73,7 +73,7 @@ For example, when [`List.set`](../List#set) is passed a unique list (reference c
 
 ## [Block Expressions](#block-expressions) {#block-expressions}
 
-A _block expression_ is an expression with some optional [statements](statements.md)
+A _block expression_ is an expression with some optional [statements](statements)
 before the expression. It has its own scope, so anything assigned in it can't be accessed
 outside the block. The entire block evaluates to the expression at its end.
 
@@ -88,7 +88,7 @@ x = if foo {
 }
 ```
 
-> Note that `{ x, y }` is a [record](records.md) with two fields (it's syntax sugar for `{ x: x, y: y }`),
+> Note that `{ x, y }` is a [record](records) with two fields (it's syntax sugar for `{ x: x, y: y }`),
 > but `{ x }` is always a block expression. That's because it's much more useful to have `{ x }`
 > be a block expression, for situations like `else { x }`, than syntax sugar for a single-field
 > record like `{ x: x }`. Single-field records are much less common than blocks in
@@ -107,16 +107,16 @@ may require multiple steps to evaluate to a value.
 
 ### [Side Effects during evaluation](#side-effects-during-evaluation) {#side-effects-during-evaluation}
 
-Normally, only evaluating [effectful functions](functions.md#effectful-functions) can
-cause [side effects](functions.md#side-effects), but evaluating any other type of expression cannot.
+Normally, only evaluating [effectful functions](functions#effectful-functions) can
+cause [side effects](functions#side-effects), but evaluating any other type of expression cannot.
 
-One exception to this rule is [`dbg` statements](statements.md#dbg), which perform the side effect of
+One exception to this rule is [`dbg` statements](statements#dbg), which perform the side effect of
 logging a value for debugging purposes. This is intended to be an interface for debugging, much
 like a [step debugger](https://en.wikipedia.org/wiki/Debugger), not part of a program's semantics,
 and so the side effect is allowed outside effectful functions (just like step debugging works on
 any expression, not just calling effectful functions).
 
-The only other exception to the rule is [`expect` statements](statements.md#expect), which similarly perform the side effect of reporting failed expectations. Like `dbg`, this output is intended for the programmer only, and is not part of a program's semantics.
+The only other exception to the rule is [`expect` statements](statements#expect), which similarly perform the side effect of reporting failed expectations. Like `dbg`, this output is intended for the programmer only, and is not part of a program's semantics.
 
 > Note that platform authors are in charge of what happens when memory gets allocated and
 > deallocated, and can therefore decide to perform side effects during memory allocation
@@ -135,7 +135,7 @@ following are not known at compile time:
 - Values returned from effectful function calls (which can vary based on runtime state)
 - Values provided by the platform
 
-If a [`crash`](statements.md#crash) is encountered during compile-time evaluation,
+If a [`crash`](statements#crash) is encountered during compile-time evaluation,
 it will be reported at compile time just like any other compilation errors (such as
 syntax errors, naming errors, and type mismatches).
 

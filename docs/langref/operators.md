@@ -2,7 +2,7 @@
 
 ## Desugaring
 
-Several operators are syntax for [well-known static-dispatch methods](static-dispatch.md#well-known-methods).
+Several operators are syntax for [well-known static-dispatch methods](static-dispatch#well-known-methods).
 The method is selected at compile time from the operand types.
 
 | Operator | Method |
@@ -38,13 +38,13 @@ TODO
 
 Arithmetic operators dispatch to methods on the left operand. Their result type
 is the left operand's type, but the right operand can have a different type if
-the method signature allows it. See [Operators](static-dispatch.md#operators)
+the method signature allows it. See [Operators](static-dispatch#operators)
 in the static dispatch page.
 
 ### Comparison Operators
 
 Comparison operators dispatch to methods that return `Bool`. Both operands must
-have the same type. See [Operators](static-dispatch.md#operators) in the static
+have the same type. See [Operators](static-dispatch#operators) in the static
 dispatch page.
 
 ### Range Operators
@@ -54,7 +54,7 @@ numbers from `start` up to `end` — excluding `end` with `..<`, including it
 with `..=`. They dispatch to methods on the bound type: `..<` calls
 `range_exclusive` and `..=` calls `range_inclusive`. Both operands must have
 the same type, and the result is an `Iter` of that type. See
-[Ranges](numbers.md#ranges) in the numbers page.
+[Ranges](numbers#ranges) in the numbers page.
 
 Range operators bind more loosely than the other binary operators, so
 `1..<n + 1` parses as `1..<(n + 1)`. They cannot be chained: `1..<5..<10` is

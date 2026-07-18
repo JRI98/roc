@@ -62,7 +62,7 @@ You can use these type parameters in type aliases:
 Letters(others) : [A, B, ..others]
 ```
 
-If you match on a [catch-all underscore pattern](pattern-matching.md#catch-all-patterns-_), 
+If you match on a [catch-all underscore pattern](pattern-matching#catch-all-patterns-_), 
 you can accept a tag union containing _at least_ some tags, but also arbitrary others:
 
 ```roc

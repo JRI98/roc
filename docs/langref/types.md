@@ -27,7 +27,7 @@ cases:
   types.
 - **Number literals** default rather than generalize: an unsuffixed literal
   resolves to a concrete type, ultimately falling back to `Dec`. See
-  [numbers](numbers.md).
+  [numbers](numbers).
 - **An explicitly annotated value** is generalized to its annotated scheme.
   Annotating a value with a free type variable opts into a type scheme, so
   the binding is generalized to it (`empty : List(a)` is then reusable at any
@@ -64,7 +64,7 @@ Capitalized declarations introduce *types* rather than values — see
 
 ### Where Clauses
 
-A `where` clause lists the [methods](static-dispatch.md) a type variable must
+A `where` clause lists the [methods](static-dispatch) a type variable must
 provide. Each constraint has the form `var.method : signature`:
 
 ```roc
@@ -83,9 +83,9 @@ items = []
 Structural types are defined by their shape: two of them are the same type when
 their shapes match, with no declaration required.
 
-- **Records** — `{ name : Str, age : U64 }`. See [records](records.md).
-- **Tag unions** — `[Ok(a), Err(e)]`. See [tag unions](tag-unions.md).
-- **Tuples** — `(Str, U64)`. See [tuples](tuples.md).
+- **Records** — `{ name : Str, age : U64 }`. See [records](records).
+- **Tag unions** — `[Ok(a), Err(e)]`. See [tag unions](tag-unions).
+- **Tuples** — `(Str, U64)`. See [tuples](tuples).
 
 Records and tag unions are either **closed** (exactly the listed fields or tags)
 or **open**, ending in an extension variable that stands for "and possibly
@@ -156,7 +156,7 @@ literal *is* the backing shape, so it lifts by unification.
 
 **Number and string** literals do not implicitly become a nominal. They coerce
 only into a builtin number/string type, or into a nominal that declares its own
-[`from_numeral` / `from_quote`](static-dispatch.md#literal-conversion). For
+[`from_numeral` / `from_quote`](static-dispatch#literal-conversion). For
 any other nominal — including a transparent newtype like `UserId := U64` — use
 explicit construction (`UserId.(0)`).
 

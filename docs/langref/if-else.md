@@ -4,7 +4,7 @@ Like most languages, Roc has `if` and `else` keywords that determine which code 
 
 ## `if` and `else`
 
-Roc's `if` keyword works exactly like a [`match`](pattern-matching.md#match) on a boolean. This code:
+Roc's `if` keyword works exactly like a [`match`](pattern-matching#match) on a boolean. This code:
 
 ```roc
 if foo {
@@ -55,7 +55,7 @@ if foo {
 
 ## `if` without `else`
 
-You can write an `if` without an `else`, but only when the body of the `if` evaluates to [`{}`](records.md#empty-record). For example, this is allowed:
+You can write an `if` without an `else`, but only when the body of the `if` evaluates to [`{}`](records#empty-record). For example, this is allowed:
 
 ```roc
 if foo {
@@ -73,7 +73,7 @@ It is essentially equivalent to:
 }
 ```
 
-...except that you don't have to write the `{} =` or the `else`. The rules are the same, though; the body of the `if` must evaluate to `{}`, which in practice only makes sense for [effectful functions](functions.md#effectful-functions), or statements like [`return`](statements.md#return), [`crash`](statements.md#crash), or [`expect`](statements.md#expect).
+...except that you don't have to write the `{} =` or the `else`. The rules are the same, though; the body of the `if` must evaluate to `{}`, which in practice only makes sense for [effectful functions](functions#effectful-functions), or statements like [`return`](statements#return), [`crash`](statements#crash), or [`expect`](statements#expect).
 
 ## `and` / `or`
 
@@ -101,4 +101,4 @@ a() and b()
 if a() b() else False
 ```
 
-Note that Roc does not have `&&` or `||` operators for boolean logic like some languages do. This is mostly because Roc uses `|` to define [functions](functions.md), and `||` means a function with no arguments. Using the keyword _or_ avoids overloading `||` to mean a function sometimes and a conditional other times.
+Note that Roc does not have `&&` or `||` operators for boolean logic like some languages do. This is mostly because Roc uses `|` to define [functions](functions), and `||` means a function with no arguments. Using the keyword _or_ avoids overloading `||` to mean a function sometimes and a conditional other times.

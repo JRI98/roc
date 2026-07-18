@@ -9,9 +9,9 @@ Roc number literals can consist of any combination of the following:
 * **Letter Digits** (a-f, optionally capitalized; these represent the digits 10 through 15 in hexadecimal number literals)
 * **Base Prefix** (`0x` in front of the number means the digits will be treated as hexadecimal, which is base-16 instead of base-10. The other options are `0o` for octal, which is base-8, and `0b`, for binary, which is base-2. If there's no prefix, the digits default to being interpreted as decimal, which is base-10. The letter must be lowercase.)
 * **Scientific Notation Suffix** (if the number is base-10 and ends in `e___`, everything before the `e` will be multiplied by 10 to the power of the number in the `___`. This suffix can't be used if any base prefix is specified.)
-* **A decimal point** (can optionally be combined with scientific notation, but cannot be used if a base prefix is specified because uppercase hexadecimal letters after the decimal point would be ambiguous with a [type suffix](type-suffix.md) such as `.F64`.)
+* **A decimal point** (can optionally be combined with scientific notation, but cannot be used if a base prefix is specified because uppercase hexadecimal letters after the decimal point would be ambiguous with a [type suffix](type-suffix) such as `.F64`.)
 * **Underscores** (the compiler skips over these; they're just for making long numbers easier to read. They can appear in between any digits, including letter digits, and digits after the decimal point, but each underscore must always have a digit on either side of it.)
-* **Minus sign in front** (for negative numbers, not to be confused with [the unary negate operator](operators.md#--negate) which is an operator that applies to expressions. For example, `-x` applies the unary negate operator to `x`, but `-1` is just an ordinary number literal and no negate operation will be executed. This distinction can matter for [custom number types](#custom-number-types).)
+* **Minus sign in front** (for negative numbers, not to be confused with [the unary negate operator](operators#--negate) which is an operator that applies to expressions. For example, `-x` applies the unary negate operator to `x`, but `-1` is just an ordinary number literal and no negate operation will be executed. This distinction can matter for [custom number types](#custom-number-types).)
 
 Here are some examples of valid number literals:
 
@@ -40,7 +40,7 @@ If you want to specify an explicit type for the number (perhaps for documentatio
 -12.34.Dec
 ```
 
-This not only works with builtin number types, but also with any [custom number type](#custom-number-types) you might make—the only requirement is that the type name must be in scope (which you can accomplish using [`import`](modules.md#import-statements) as long as it's accessible to your module).
+This not only works with builtin number types, but also with any [custom number type](#custom-number-types) you might make—the only requirement is that the type name must be in scope (which you can accomplish using [`import`](modules#import-statements) as long as it's accessible to your module).
 
 ## Defaulting to `Dec`
 
@@ -117,7 +117,7 @@ general trade-offs are:
 
 ## Ranges
 
-The range operators build an [iterator](iterators.md) over a span of numbers.
+The range operators build an [iterator](iterators) over a span of numbers.
 `start..<end` counts up from `start` to `end` without including `end`, and
 `start..=end` includes `end`:
 
@@ -141,7 +141,7 @@ types support ranges, including the fractional ones: `0.5..<3.5` yields `0.5`,
 adding 1 can no longer produce a bigger float, the range yields that value once
 and then ends.
 
-Like the other operators, ranges use [static dispatch](static-dispatch.md#operators):
+Like the other operators, ranges use [static dispatch](static-dispatch#operators):
 `start..<end` calls the `range_exclusive` method on the bounds' type, and
 `start..=end` calls `range_inclusive`, so custom number types can support range
 syntax by defining those methods.
@@ -169,11 +169,11 @@ Here's what will happen if you write this:
 * Just based on the syntax here, at compile time, Roc will call `Ratio.from_numeral(...)` 
 * It will pass an argument to specify that this is a negative number with the digits `12` before the decimal point and `34` after it.
 * `Ratio.from_numeral` will return a `Try` representing whether the specified digits are a valid `Ratio`. (Some custom number types may have limits on the size of the numbers they store, may or may not support negative numbers, may or may not support digits after the decimal point, etc.)
-  * If `Ratio.from_numeral` returned a [`Try.Ok`](../Try) tag, then that tag's [payload](tag-unions.md#tags) will contain the actual number value that these digits resolved to.
+  * If `Ratio.from_numeral` returned a [`Try.Ok`](../Try) tag, then that tag's [payload](tag-unions#tags) will contain the actual number value that these digits resolved to.
   * If it returned an `Err`, then (since this is all being evaluated at compile time), the compiler will report an error for this number literal before the program even runs.
 
 `from_numeral` is one of Roc's
-[well-known static-dispatch methods](static-dispatch.md#literal-conversion).
+[well-known static-dispatch methods](static-dispatch#literal-conversion).
   
 ### Inferred Custom Number Types
 

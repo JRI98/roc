@@ -85,7 +85,7 @@ Try putting `'👩'` into `roc repl`. You should see this:
 128105.0
 ```
 
-The single-quote `'` syntax lets you put a grapheme directly into your source code (so you can see what it looks like) as long as that grapheme contains only one code point, like 👩 does (namely, the code point 128105). At runtime, the single-quoted value will be treated the same as an ordinary number literal—in other words, `'👩'` is syntax sugar for writing `128105`. (The repl displays it as `128105.0` because number literals [default to `Dec`](numbers.md#defaulting-to-dec) when nothing pins them to a particular number type.)
+The single-quote `'` syntax lets you put a grapheme directly into your source code (so you can see what it looks like) as long as that grapheme contains only one code point, like 👩 does (namely, the code point 128105). At runtime, the single-quoted value will be treated the same as an ordinary number literal—in other words, `'👩'` is syntax sugar for writing `128105`. (The repl displays it as `128105.0` because number literals [default to `Dec`](numbers#defaulting-to-dec) when nothing pins them to a particular number type.)
 
 You can verify this in `roc repl`:
 
@@ -101,10 +101,10 @@ Double quotes (`"`), on the other hand, are not type-compatible with integers—
 
 Double-quoted literals default to `Str`. When a quoted literal has a nominal
 target type, that type can opt in by defining
-[`from_quote`](static-dispatch.md#literal-conversion).
+[`from_quote`](static-dispatch#literal-conversion).
 
 Interpolated string literals use
-[`from_interpolation`](static-dispatch.md#literal-conversion) on the result
+[`from_interpolation`](static-dispatch#literal-conversion) on the result
 type. The literal segments are `Str` values, and each interpolated value is
 paired with the literal segment that follows it.
 

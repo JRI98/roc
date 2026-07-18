@@ -37,7 +37,7 @@ Doc comments add documentation to an assignment. They have a special comment syn
 
 - Each line of a doc comment begins with `"## "` - so, two `#`s and then a space, at the very beginning of the line.
 - Each consecutive line that begins with `"## "` continues the doc comment.
-- The next line after a doc comment's final `"## "` line must begin with an [assignment statement](statements.md#assignment).
+- The next line after a doc comment's final `"## "` line must begin with an [assignment statement](statements#assignment).
     - If one or more lines beginning with `"## "` are not followed immediately by an assignment statement at the beginning of the next line, then none of them are considered a doc comment; they are instead treated as an ordinary comment.
 
 For example:
