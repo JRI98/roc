@@ -1,8 +1,12 @@
 ParserTagPayloadProtocol :: [].{}
 
-Token := [TagName(Str), Start, Next, Finish, StrValue(Str), U64Value(U64)]
+Token := [TagName(Str), Start, Next, Finish, StrValue(Str), U64Value(U64)].{
+	is_eq : _
+}
 
-ParseErr := [Invalid]
+ParseErr := [Invalid].{
+	is_eq : _
+}
 
 Format := [Default].{
 	parse_tag_union : Format, Encoding.ParseTagUnionSpec(a), List(Token) -> Try({ value : a, rest : List(Token) }, ParseErr)
