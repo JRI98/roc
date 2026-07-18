@@ -1417,23 +1417,47 @@ pub const Evaluator = struct {
             .negate => return .{ .dec = -%a },
             .abs => return .{ .dec = if (a < 0) -%a else a },
             .abs_diff => return .{ .dec = if (a > b) a -% b else b -% a },
-            // The interpreter runs these through a crash boundary that yields 0
-            // on any divide-by-zero or overflow, so the observable result is 0
-            // in every failing case; this mirrors that outcome without a crash.
-            .div => return .{ .dec = decDivRaw(a, b) },
-            .div_trunc => return .{ .dec = decTrunc(decDivRaw(a, b)) },
+            .div => return .{ .dec = try self.decDiv(a, b) },
+            .div_trunc => return .{ .dec = decTrunc(try self.decDiv(a, b)) },
             .rem => {
-                if (b == 0) return .{ .dec = 0 };
+                if (b == 0) return self.crashAbort("Decimal remainder by 0!");
                 return .{ .dec = @rem(a, b) };
             },
             .mod => {
-                if (b == 0) return .{ .dec = 0 };
+                if (b == 0) return self.crashAbort("Decimal modulo by 0!");
                 const remainder = @rem(a, b);
                 if (remainder == 0) return .{ .dec = 0 };
                 if ((remainder > 0) != (b > 0)) return .{ .dec = remainder +% b };
                 return .{ .dec = remainder };
             },
         }
+    }
+
+    fn decDiv(self: *Evaluator, a: i128, b: i128) EvalError!i128 {
+        if (b == 0) return self.crashAbort("Decimal division by 0!");
+        if (a == 0) return 0;
+
+        const one = RocDec.one_point_zero_i128;
+        const max_i128: u128 = @intCast(std.math.maxInt(i128));
+        const is_negative = (a < 0) != (b < 0);
+        const numerator = absU128(a);
+        if (numerator > max_i128) {
+            if (b == one) return a;
+            return self.crashAbort("Decimal division overflow in numerator!");
+        }
+
+        const denominator = absU128(b);
+        if (denominator > max_i128) {
+            if (a == one) return b;
+            return self.crashAbort("Decimal division overflow in denominator!");
+        }
+
+        const scaled: u256 = @as(u256, numerator) * @as(u256, @intCast(one));
+        const quotient: u256 = scaled / @as(u256, denominator);
+        if (quotient > @as(u256, max_i128)) return self.crashAbort("Decimal division overflow!");
+
+        const magnitude: i128 = @intCast(quotient);
+        return if (is_negative) -magnitude else magnitude;
     }
 
     // transcendental / rounding
@@ -2305,25 +2329,6 @@ fn intType(comptime prim: Primitive) type {
 
 fn absU128(x: i128) u128 {
     return if (x < 0) @bitCast(-%x) else @intCast(x);
-}
-
-/// Divide two Dec fixed-point values, mirroring `RocDec.div`. The production
-/// path catches every divide-by-zero and overflow crash and yields 0, so this
-/// returns 0 in exactly those cases and the scaled quotient otherwise.
-fn decDivRaw(a: i128, b: i128) i128 {
-    if (b == 0 or a == 0) return 0;
-    const one = RocDec.one_point_zero_i128;
-    const max_i128: u128 = @intCast(std.math.maxInt(i128));
-    const neg = (a < 0) != (b < 0);
-    const num_u = absU128(a);
-    if (num_u > max_i128) return if (b == one) a else 0;
-    const den_u = absU128(b);
-    if (den_u > max_i128) return if (a == one) b else 0;
-    const scaled: u256 = @as(u256, num_u) * @as(u256, @intCast(one));
-    const quotient: u256 = scaled / @as(u256, den_u);
-    if (quotient > @as(u256, max_i128)) return 0;
-    const magnitude: i128 = @intCast(quotient);
-    return if (neg) -magnitude else magnitude;
 }
 
 /// Truncate a Dec fixed-point value toward zero, mirroring `RocDec.trunc`.

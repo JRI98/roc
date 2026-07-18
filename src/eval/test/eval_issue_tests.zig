@@ -626,4 +626,20 @@ pub const tests = [_]TestCase{
         ,
         .expected = .{ .inspect_str = "42" },
     },
+    .{
+        // https://github.com/roc-lang/roc/issues/10210
+        .name = "issue 10210: Dec division by zero crashes on every executor",
+        .source =
+        \\{
+        \\    f = |a, b| a / b
+        \\    f(1.0.Dec, 0.0.Dec)
+        \\}
+        ,
+        .expected = .{ .crash = {} },
+    },
+    .{
+        .name = "issue 10210: Dec truncating division by zero crashes on every executor",
+        .source = "Dec.div_trunc_by(1.0, 0.0)",
+        .expected = .{ .crash = {} },
+    },
 };

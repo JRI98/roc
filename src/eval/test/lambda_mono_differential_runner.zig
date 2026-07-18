@@ -59,10 +59,6 @@ const Case = struct {
     /// pre-existing bug tracked in the generated corpus). Such a child
     /// failure is reported but does not fail the run.
     known_panic: bool = false,
-    /// Generated case with a known pre-existing interpreter-vs-dev backend
-    /// disagreement; the dev comparison is skipped, the tree-evaluator
-    /// comparison still runs.
-    skip_dev: bool = false,
 };
 
 const CaseStatus = enum {
@@ -491,7 +487,6 @@ pub fn main(init: std.process.Init) RunnerError!void {
                 .source_kind = if (case.module) .module else .expr,
                 .origin = .generated,
                 .known_panic = case.known_panic,
-                .skip_dev = case.skip_dev,
             });
         }
     }
@@ -708,7 +703,7 @@ fn runCase(gpa: std.mem.Allocator, io: std.Io, case: Case) std.mem.Allocator.Err
 
     // Cross-backend agreement for the sweep corpus: the dev JIT must agree
     // with the interpreter on the same compile.
-    if (case.origin == .generated and !case.skip_dev) {
+    if (case.origin == .generated) {
         if (try compareDevBackend(gpa, case, &compiled.lowered, &transcript)) |detail| {
             return CaseResult{ .status = .dev_diverged, .detail = detail };
         }

@@ -7134,6 +7134,14 @@ pub const Interpreter = struct {
         };
     }
 
+    fn callDecBinaryBuiltin(self: *LirInterpreter, comptime func: anytype, av: i128, bv: i128) Error!i128 {
+        var crash_boundary = self.enterCrashBoundary();
+        defer crash_boundary.deinit();
+        const sj = crash_boundary.set();
+        if (sj != 0) return error.Crash;
+        return func(RocDec{ .num = av }, RocDec{ .num = bv }, &self.roc_ops);
+    }
+
     /// Dec (fixed-point i128 with 10^18 scale) binary operation.
     fn decBinOp(self: *LirInterpreter, av: i128, bv: i128, op: NumOp) Error!i128 {
         return switch (op) {
@@ -7147,28 +7155,10 @@ pub const Interpreter = struct {
                 if (result.has_overflowed) return self.triggerCrash("Decimal multiplication overflowed!");
                 break :blk result.value.num;
             },
-            .div => blk: {
-                var crash_boundary = self.enterCrashBoundary();
-                defer crash_boundary.deinit();
-                const sj = crash_boundary.set();
-                if (sj != 0) break :blk @as(i128, 0);
-                break :blk builtins.dec.divC(RocDec{ .num = av }, RocDec{ .num = bv }, &self.roc_ops);
-            },
-            .div_trunc => blk: {
-                var crash_boundary = self.enterCrashBoundary();
-                defer crash_boundary.deinit();
-                const sj = crash_boundary.set();
-                if (sj != 0) break :blk @as(i128, 0);
-                break :blk builtins.dec.divTruncC(RocDec{ .num = av }, RocDec{ .num = bv }, &self.roc_ops);
-            },
-            .rem => blk: {
-                if (bv == 0) break :blk @as(i128, 0);
-                break :blk builtins.dec.remC(RocDec{ .num = av }, RocDec{ .num = bv }, &self.roc_ops);
-            },
-            .mod => blk: {
-                if (bv == 0) break :blk @as(i128, 0);
-                break :blk builtins.dec.modC(RocDec{ .num = av }, RocDec{ .num = bv }, &self.roc_ops);
-            },
+            .div => self.callDecBinaryBuiltin(builtins.dec.divC, av, bv),
+            .div_trunc => self.callDecBinaryBuiltin(builtins.dec.divTruncC, av, bv),
+            .rem => self.callDecBinaryBuiltin(builtins.dec.remC, av, bv),
+            .mod => self.callDecBinaryBuiltin(builtins.dec.modC, av, bv),
         };
     }
 
