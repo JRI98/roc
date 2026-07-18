@@ -642,4 +642,16 @@ pub const tests = [_]TestCase{
         .source = "Dec.div_trunc_by(1.0, 0.0)",
         .expected = .{ .crash = {} },
     },
+    .{
+        // https://github.com/roc-lang/roc/issues/10209
+        // A concrete-number lambda remains callable directly from its record field.
+        .name = "issue 10209: concrete-number function stored in record field remains callable",
+        .source =
+        \\{
+        \\    r = { op: |x| x * 11.I64 }
+        \\    (r.op)(4.I64)
+        \\}
+        ,
+        .expected = .{ .inspect_str = "44" },
+    },
 };

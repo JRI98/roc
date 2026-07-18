@@ -619,12 +619,14 @@ pub const NumeralDispatchPlan = extern struct {
 pub const SchemeUseRecord = extern struct {
     node_idx: u32,
     /// `Slot` — distinguishes several schemes instantiated at one node (a value
-    /// use vs. the target of a dispatch constraint).
+    /// use, an expression-position function stored as a value, or the target
+    /// of a dispatch constraint).
     slot_kind: u32,
     /// For `dispatch_target` slots, the raw fn `Var` of the constraint whose
     /// discharge instantiated this scheme — unique per constraint
     /// instantiation, so nested evidence chains resolve without ambiguity.
-    /// 0 for `value_use` slots (keyed by `node_idx` instead).
+    /// 0 for value and nested-function use slots (keyed by `node_idx`
+    /// instead).
     slot_data: u32,
     /// The scheme root `Var` used at this edge. For imported schemes this is
     /// the pristine local copy; for shared uses it is the in-flight local root.
@@ -639,6 +641,10 @@ pub const SchemeUseRecord = extern struct {
         /// The scheme of a value that was referenced (e.g. an `e_lookup` of a
         /// generalized definition).
         value_use,
+        /// A generalized expression-position function instantiated when a
+        /// containing value (record, tuple, list, tag, or nominal) stores it.
+        /// The nested function specialization consumes this edge's evidence.
+        nested_function_use,
         /// The scheme of the method target chosen while discharging a static
         /// dispatch constraint originating at this node.
         dispatch_target,
@@ -3764,7 +3770,7 @@ pub fn recordQuoteDispatchPlan(
 
 /// Record a constrained-scheme use for static-dispatch evidence.
 /// `slot_data` is the raw fn `Var` of the discharged constraint for
-/// `dispatch_target` slots and 0 for value-use slots.
+/// `dispatch_target` slots and 0 for value and nested-function use slots.
 pub fn recordSchemeUse(
     self: *Self,
     node_idx: u32,

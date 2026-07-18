@@ -156,7 +156,6 @@ pub const cases = [_]Case{
         \\    }
         \\}
         ,
-        .known_panic = true,
     },
     .{
         .name = "gen: closures stored in a list",
@@ -170,7 +169,6 @@ pub const cases = [_]Case{
         \\    }
         \\}
         ,
-        .known_panic = true,
     },
     .{
         .name = "gen: closure stored in a record field",
@@ -181,7 +179,6 @@ pub const cases = [_]Case{
         \\    (r.op)(4.I64)
         \\}
         ,
-        .known_panic = true,
     },
     .{
         .name = "gen: capturing closure called via List.first",
@@ -195,7 +192,6 @@ pub const cases = [_]Case{
         \\    }
         \\}
         ,
-        .known_panic = true,
     },
     .{
         .name = "gen: capturing closure rebound from record field",

@@ -468,6 +468,11 @@ instantiation_source_expr: ?CIR.Expr.Idx = null,
 /// recorded against that node's `dispatch_target` evidence slot (see
 /// `recordSchemeUse`).
 evidence_target_site: ?EvidenceTargetSite = null,
+/// One-shot attribution for the outer scheme instantiation performed when a
+/// containing value stores a generalized expression-position function. It is
+/// consumed at `instantiateVarHelp` entry so any instantiations triggered
+/// while processing that edge cannot be misattributed to the same site.
+pending_nested_function_use: ?CIR.Expr.Idx = null,
 /// Scratch buffer for the (scheme var → fresh var) pairs of one constrained
 /// scheme instantiation, flushed into `cir.scheme_uses`.
 scratch_evidence_pairs: std.ArrayListUnmanaged(ModuleEnv.SchemeUsePair) = .empty,
@@ -3888,6 +3893,9 @@ fn instantiateVarHelp(
     const trace = tracy.trace(@src());
     defer trace.end();
 
+    const nested_function_use = self.pending_nested_function_use;
+    self.pending_nested_function_use = null;
+
     // First, reset state
     instantiator.var_map.clearRetainingCapacity();
     self.constraint_fn_var_map.clearRetainingCapacity();
@@ -4037,7 +4045,15 @@ fn instantiateVarHelp(
     // evidence: publication resolves the fresh vars once checking settles to
     // decide how each of the scheme's dispatch constraints was satisfied here.
     if (self.scratch_evidence_pairs.items.len > 0) {
-        if (self.evidence_target_site) |target| {
+        if (nested_function_use) |source_expr| {
+            try self.cir.recordSchemeUse(
+                @intFromEnum(source_expr),
+                .nested_function_use,
+                0,
+                var_to_instantiate,
+                self.scratch_evidence_pairs.items,
+            );
+        } else if (self.evidence_target_site) |target| {
             try self.cir.recordSchemeUse(
                 target.node_idx,
                 .dispatch_target,
@@ -4047,9 +4063,10 @@ fn instantiateVarHelp(
             );
         } else if (self.instantiation_source_expr) |source_expr| {
             // Only value uses of definitions instantiate schemes whose
-            // constraints later need per-site evidence; other in-expression
-            // instantiations (nominal constructors, Try copies, iterator
-            // declarations, …) never become specialization edges.
+            // constraints later need per-site evidence here; the explicit
+            // nested-function construction edge is handled above. Other
+            // in-expression instantiations (nominal constructors, Try copies,
+            // iterator declarations, …) never become specialization edges.
             switch (self.cir.store.nodes.get(@enumFromInt(@intFromEnum(source_expr))).tag) {
                 .expr_var,
                 .expr_external_lookup,
@@ -12085,6 +12102,41 @@ fn unifyMatchAltPatternBindings(
 
 // expr //
 
+const CheckedStoredValue = struct {
+    does_fx: bool,
+    var_: Var,
+};
+
+/// Check an expression that a containing value stores, instantiating an
+/// expression-position function scheme at this exact construction edge. The
+/// containing value must refer to the fresh instance: embedding the pristine
+/// generalized scheme would let later projections bypass the scheme-use edge
+/// that supplies the nested function's static-dispatch evidence.
+fn checkStoredValueExpr(
+    self: *Self,
+    expr_idx: CIR.Expr.Idx,
+    env: *Env,
+    expected: Expected,
+) std.mem.Allocator.Error!CheckedStoredValue {
+    const does_fx = try self.checkExpr(expr_idx, env, expected);
+    const source_var = ModuleEnv.varFrom(expr_idx);
+    if (self.types.resolveVar(source_var).desc.rank != .generalized) {
+        return .{ .does_fx = does_fx, .var_ = source_var };
+    }
+
+    const previous_source = self.instantiation_source_expr;
+    self.instantiation_source_expr = expr_idx;
+    defer self.instantiation_source_expr = previous_source;
+    std.debug.assert(self.pending_nested_function_use == null);
+    self.pending_nested_function_use = expr_idx;
+    const instance_var = try self.instantiateVar(source_var, env, .use_last_var);
+    std.debug.assert(self.pending_nested_function_use == null);
+    return .{
+        .does_fx = does_fx,
+        .var_ = instance_var,
+    };
+}
+
 fn checkExpr(self: *Self, expr_idx: CIR.Expr.Idx, env: *Env, expected: Expected) std.mem.Allocator.Error!bool {
     const trace = tracy.trace(@src());
     defer trace.end();
@@ -12355,14 +12407,16 @@ fn checkExpr(self: *Self, expr_idx: CIR.Expr.Idx, env: *Env, expected: Expected)
                 // constrain the rest of the list
 
                 // Check the first elem
-                does_fx = try self.checkExpr(elems[0], env, child_expected) or does_fx;
+                const first_elem = try self.checkStoredValueExpr(elems[0], env, child_expected);
+                does_fx = first_elem.does_fx or does_fx;
 
                 // Iterate over the remaining elements
-                const elem_var = ModuleEnv.varFrom(elems[0]);
+                const elem_var = first_elem.var_;
                 var last_elem_expr_idx = elems[0];
                 for (elems[1..], 1..) |elem_expr_idx, i| {
-                    does_fx = try self.checkExpr(elem_expr_idx, env, child_expected) or does_fx;
-                    const cur_elem_var = ModuleEnv.varFrom(elem_expr_idx);
+                    const current_elem = try self.checkStoredValueExpr(elem_expr_idx, env, child_expected);
+                    does_fx = current_elem.does_fx or does_fx;
+                    const cur_elem_var = current_elem.var_;
 
                     // Unify each element's var with the list's elem var
                     const result = try self.unifyInContext(elem_var, cur_elem_var, env, .{ .list_entry = .{
@@ -12375,7 +12429,8 @@ fn checkExpr(self: *Self, expr_idx: CIR.Expr.Idx, env: *Env, expected: Expected)
                     // to the elem_var to catch their individual errors
                     if (!result.isOk()) {
                         for (elems[i + 1 ..]) |remaining_elem_expr_idx| {
-                            does_fx = try self.checkExpr(remaining_elem_expr_idx, env, child_expected) or does_fx;
+                            const remaining_elem = try self.checkStoredValueExpr(remaining_elem_expr_idx, env, child_expected);
+                            does_fx = remaining_elem.does_fx or does_fx;
                         }
 
                         // Break to avoid cascading errors
@@ -12394,12 +12449,15 @@ fn checkExpr(self: *Self, expr_idx: CIR.Expr.Idx, env: *Env, expected: Expected)
         .e_tuple => |tuple| {
             // Check tuple elements
             const elems_slice = self.cir.store.exprSlice(tuple.elems);
+            const scratch_vars_top = self.scratch_vars.top();
+            defer self.scratch_vars.clearFrom(scratch_vars_top);
             for (elems_slice) |single_elem_expr_idx| {
-                does_fx = try self.checkExpr(single_elem_expr_idx, env, child_expected) or does_fx;
+                const elem = try self.checkStoredValueExpr(single_elem_expr_idx, env, child_expected);
+                does_fx = elem.does_fx or does_fx;
+                try self.scratch_vars.append(elem.var_);
             }
 
-            // Cast the elems idxs to vars (this works because Anno Idx are 1-1 with type Vars)
-            const elem_vars_slice = try self.types.appendVars(@ptrCast(elems_slice));
+            const elem_vars_slice = try self.types.appendVars(self.scratch_vars.sliceFromStart(scratch_vars_top));
 
             // Set the type in the store
             try self.unifyWith(expr_var, .{ .structure = .{
@@ -12438,13 +12496,14 @@ fn checkExpr(self: *Self, expr_idx: CIR.Expr.Idx, env: *Env, expected: Expected)
                     const field = self.cir.store.getRecordField(field_idx);
 
                     // Check the field value expression
-                    does_fx = try self.checkExpr(field.value, env, child_expected) or does_fx;
+                    const field_value = try self.checkStoredValueExpr(field.value, env, child_expected);
+                    does_fx = field_value.does_fx or does_fx;
 
                     // Create an unbound record with this field
                     const single_field_record = try self.freshFromContent(.{ .structure = .{
                         .record_unbound = try self.types.appendRecordFields(&.{types_mod.RecordField{
                             .name = field.name,
-                            .var_ = ModuleEnv.varFrom(field.value),
+                            .var_ = field_value.var_,
                         }}),
                     } }, env, expr_region);
 
@@ -12469,12 +12528,13 @@ fn checkExpr(self: *Self, expr_idx: CIR.Expr.Idx, env: *Env, expected: Expected)
                     const field = self.cir.store.getRecordField(field_idx);
 
                     // Check the field value expression
-                    does_fx = try self.checkExpr(field.value, env, child_expected) or does_fx;
+                    const field_value = try self.checkStoredValueExpr(field.value, env, child_expected);
+                    does_fx = field_value.does_fx or does_fx;
 
                     // Append it to the scratch records array
                     try self.scratch_record_fields.append(types_mod.RecordField{
                         .name = field.name,
-                        .var_ = ModuleEnv.varFrom(field.value),
+                        .var_ = field_value.var_,
                     });
                 }
 
@@ -12513,14 +12573,18 @@ fn checkExpr(self: *Self, expr_idx: CIR.Expr.Idx, env: *Env, expected: Expected)
 
             // Process each tag arg
             const arg_expr_idx_slice = self.cir.store.sliceExpr(e.args);
+            const scratch_vars_top = self.scratch_vars.top();
+            defer self.scratch_vars.clearFrom(scratch_vars_top);
             for (arg_expr_idx_slice) |arg_expr_idx| {
-                does_fx = try self.checkExpr(arg_expr_idx, env, child_expected) or does_fx;
+                const arg = try self.checkStoredValueExpr(arg_expr_idx, env, child_expected);
+                does_fx = arg.does_fx or does_fx;
+                try self.scratch_vars.append(arg.var_);
             }
 
             // Create the type
             const ext_var = try self.fresh(env, expr_region);
 
-            const tag = try self.types.mkTag(e.name, @ptrCast(arg_expr_idx_slice));
+            const tag = try self.types.mkTag(e.name, self.scratch_vars.sliceFromStart(scratch_vars_top));
             const tag_union_content = try self.types.mkTagUnion(&[_]types_mod.Tag{tag}, ext_var);
 
             // Update the expr to point to the new type
@@ -12529,8 +12593,9 @@ fn checkExpr(self: *Self, expr_idx: CIR.Expr.Idx, env: *Env, expected: Expected)
         // nominal //
         .e_nominal => |nominal| {
             // Check the backing expression first
-            does_fx = try self.checkExpr(nominal.backing_expr, env, child_expected) or does_fx;
-            const actual_backing_var = ModuleEnv.varFrom(nominal.backing_expr);
+            const backing = try self.checkStoredValueExpr(nominal.backing_expr, env, child_expected);
+            does_fx = backing.does_fx or does_fx;
+            const actual_backing_var = backing.var_;
 
             // Use shared nominal type checking logic
             _ = try self.checkNominalTypeUsage(
@@ -12544,8 +12609,9 @@ fn checkExpr(self: *Self, expr_idx: CIR.Expr.Idx, env: *Env, expected: Expected)
         },
         .e_nominal_external => |nominal| {
             // Check the backing expression first
-            does_fx = try self.checkExpr(nominal.backing_expr, env, child_expected) or does_fx;
-            const actual_backing_var = ModuleEnv.varFrom(nominal.backing_expr);
+            const backing = try self.checkStoredValueExpr(nominal.backing_expr, env, child_expected);
+            does_fx = backing.does_fx or does_fx;
+            const actual_backing_var = backing.var_;
 
             // Resolve the external type declaration
             if (try self.resolveVarFromExternal(nominal.module_idx, nominal.target_node_idx)) |ext_ref| {

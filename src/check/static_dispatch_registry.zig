@@ -1479,9 +1479,10 @@ pub const StaticDispatchPlanTable = struct {
         return self.evidence_refs[node.nested.start .. node.nested.start + node.nested.len];
     }
 
-    /// Evidence for the scheme instantiated at `expr` (a value use of a
-    /// constrained definition), in the callee scheme's canonical
-    /// evidence-param order; null when the use needed no evidence.
+    /// Evidence for the scheme instantiated at `expr` (a constrained
+    /// definition reference or an expression-position function construction
+    /// edge), in the scheme's canonical evidence-param order; null when the
+    /// use needed no evidence.
     pub fn siteEvidence(self: *const StaticDispatchPlanTable, expr: CheckedExprId) ?[]const CheckedEvidence {
         const found = artifact_serialize.binarySearchByKey(SiteEvidenceEntry, u32, self.site_evidence, @intFromEnum(expr), siteEvidenceOrder) orelse return null;
         return self.evidence_refs[found.start .. found.start + found.len];

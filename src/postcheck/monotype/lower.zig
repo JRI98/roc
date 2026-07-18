@@ -19200,8 +19200,9 @@ const BodyContext = struct {
                     .nested => {},
                     else => Common.invariant("closure expression was not assigned a nested function identity"),
                 }
+                const evidence = try self.evidenceForUseSite(expr_id);
                 break :blk .{ .fn_def = .{
-                    .fn_id = draftFinalFn(try self.builder.lowerNestedFnFromContext(self, expr_id, nested, null)),
+                    .fn_id = draftFinalFn(try self.builder.lowerNestedFnFromContext(self, expr_id, nested, if (evidence.len > 0) evidence else null)),
                     .captures = try self.lowerClosureCaptureExprSpan(closure.captures),
                 } };
             },
@@ -19270,7 +19271,8 @@ const BodyContext = struct {
             .nested => {},
             else => Common.invariant("expression-position lambda was not assigned a nested function identity"),
         }
-        return .{ .fn_def = .{ .fn_id = draftFinalFn(try self.builder.lowerNestedFnFromContext(self, expr_id, nested, null)) } };
+        const evidence = try self.evidenceForUseSite(expr_id);
+        return .{ .fn_def = .{ .fn_id = draftFinalFn(try self.builder.lowerNestedFnFromContext(self, expr_id, nested, if (evidence.len > 0) evidence else null)) } };
     }
 
     fn lowerDispatchExpr(
@@ -20135,8 +20137,8 @@ const BodyContext = struct {
     }
 
     /// Evidence vector for the constrained scheme instantiated at `expr` (a
-    /// value use resolved in this context's module), or empty when the use
-    /// carries no requirements.
+    /// value reference or nested function construction edge resolved in this
+    /// context's module), or empty when the use carries no requirements.
     fn evidenceForUseSite(self: *BodyContext, expr: checked.CheckedExprId) Allocator.Error![]const SpecEvidence {
         const refs = self.view.static_dispatch_plans.siteEvidence(expr) orelse return &.{};
         return self.materializeEvidence(refs);

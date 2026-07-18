@@ -12583,6 +12583,11 @@ const RefScopeRecord = struct {
 /// Sentinel scope id: the template's own evidence params.
 const ref_scope_root: u32 = std.math.maxInt(u32);
 
+const CollectedSchemeUseSite = struct {
+    record_idx: u32,
+    checked_expr: CheckedExprId,
+};
+
 /// Build-time-only per-template data collected by
 /// `sealCheckedProcedureTemplateRefs` for the total-resolution pass; never
 /// serialized (mono looks iterator plans up by node and receives evidence
@@ -12601,6 +12606,12 @@ const TemplateIteratorRefs = struct {
     value_ref_scopes: []u32 = &.{},
     /// Scope of each collected iterator plan ref (parallel to `pool`).
     iterator_scopes: []u32 = &.{},
+    /// Expression-position function instantiation sites, grouped per template.
+    scheme_use_spans: []artifact_serialize.Span = &.{},
+    scheme_use_sites: []CollectedSchemeUseSite = &.{},
+    /// Scope of each collected scheme-use site (parallel to
+    /// `scheme_use_sites`).
+    scheme_use_scopes: []u32 = &.{},
 
     fn deinit(self: *TemplateIteratorRefs, allocator: Allocator) void {
         allocator.free(self.spans);
@@ -12609,6 +12620,9 @@ const TemplateIteratorRefs = struct {
         allocator.free(self.plan_scopes);
         allocator.free(self.value_ref_scopes);
         allocator.free(self.iterator_scopes);
+        allocator.free(self.scheme_use_spans);
+        allocator.free(self.scheme_use_sites);
+        allocator.free(self.scheme_use_scopes);
         self.* = .{};
     }
 };
@@ -12623,11 +12637,14 @@ fn sealCheckedProcedureTemplateRefs(
     resolved_value_refs: *ResolvedValueRefTable,
     template_iterator_refs: *TemplateIteratorRefs,
 ) Allocator.Error!void {
-    // Generalized local function decls with dispatch obligations: entering one
-    // while collecting pushes an evidence scope (checked lambda expr id ->
-    // decl pattern var).
+    // Generalized local functions with dispatch obligations: entering one
+    // while collecting pushes an evidence scope. Declarations map to their
+    // pattern scheme; expression-position functions stored in a containing
+    // value map to the pristine scheme instantiated at that construction edge.
     var local_schemes = std.AutoHashMap(u32, Var).init(allocator);
     defer local_schemes.deinit();
+    var nested_function_uses = std.AutoHashMap(u32, u32).init(allocator);
+    defer nested_function_uses.deinit();
     {
         const types_store = module.typeStoreConst();
         var enum_scratch = dispatch_evidence.Scratch{};
@@ -12655,9 +12672,16 @@ fn sealCheckedProcedureTemplateRefs(
             const checked_expr = checked_bodies.exprIdForSource(decl.expr) orelse continue;
             try local_schemes.put(@intFromEnum(checked_expr), pattern_var);
         }
+
+        for (module.moduleEnvConst().scheme_uses.items.items, 0..) |record, record_idx| {
+            if (record.slot_kind != @intFromEnum(ModuleEnv.SchemeUseRecord.Slot.nested_function_use)) continue;
+            const checked_expr = checked_bodies.exprIdForSource(@enumFromInt(record.node_idx)) orelse continue;
+            try local_schemes.put(@intFromEnum(checked_expr), @enumFromInt(record.scheme_root));
+            try nested_function_uses.put(@intFromEnum(checked_expr), @intCast(record_idx));
+        }
     }
 
-    var collector = CheckedTemplateRefCollector.init(allocator, checked_bodies, static_dispatch_plans, &local_schemes);
+    var collector = CheckedTemplateRefCollector.init(allocator, checked_bodies, static_dispatch_plans, &local_schemes, &nested_function_uses);
     defer collector.deinit();
 
     // Flatten each template's collected refs into the two shared per-table pools,
@@ -12676,8 +12700,14 @@ fn sealCheckedProcedureTemplateRefs(
     errdefer dispatch_ref_scope_pool.deinit(allocator);
     var iterator_scope_pool = std.ArrayList(u32).empty;
     errdefer iterator_scope_pool.deinit(allocator);
+    var scheme_use_pool = std.ArrayList(CollectedSchemeUseSite).empty;
+    errdefer scheme_use_pool.deinit(allocator);
+    var scheme_use_scope_pool = std.ArrayList(u32).empty;
+    errdefer scheme_use_scope_pool.deinit(allocator);
     const iterator_spans = try allocator.alloc(artifact_serialize.Span, templates.templates.len);
     errdefer allocator.free(iterator_spans);
+    const scheme_use_spans = try allocator.alloc(artifact_serialize.Span, templates.templates.len);
+    errdefer allocator.free(scheme_use_spans);
 
     for (templates.templates, 0..) |*template, template_index| {
         collector.clear();
@@ -12697,9 +12727,11 @@ fn sealCheckedProcedureTemplateRefs(
         template.resolved_value_refs = try artifact_serialize.appendSpan(ResolvedValueRefTableRef, ResolvedValueRefId, &value_ref_pool, allocator, collector.value_refs.items);
         template.static_dispatch_plans = try artifact_serialize.appendSpan(@TypeOf(template.static_dispatch_plans), static_dispatch.StaticDispatchPlanId, &dispatch_ref_pool, allocator, collector.dispatch_refs.items);
         iterator_spans[template_index] = try artifact_serialize.appendSpan(artifact_serialize.Span, static_dispatch.IteratorForPlanId, &iterator_ref_pool, allocator, collector.iterator_refs.items);
+        scheme_use_spans[template_index] = try artifact_serialize.appendSpan(artifact_serialize.Span, CollectedSchemeUseSite, &scheme_use_pool, allocator, collector.scheme_use_sites.items);
         try value_ref_scope_pool.appendSlice(allocator, collector.value_ref_scopes.items);
         try dispatch_ref_scope_pool.appendSlice(allocator, collector.dispatch_ref_scopes.items);
         try iterator_scope_pool.appendSlice(allocator, collector.iterator_ref_scopes.items);
+        try scheme_use_scope_pool.appendSlice(allocator, collector.scheme_use_scopes.items);
     }
 
     resolved_value_refs.template_refs = try value_ref_pool.toOwnedSlice(allocator);
@@ -12711,6 +12743,9 @@ fn sealCheckedProcedureTemplateRefs(
         .plan_scopes = try dispatch_ref_scope_pool.toOwnedSlice(allocator),
         .value_ref_scopes = try value_ref_scope_pool.toOwnedSlice(allocator),
         .iterator_scopes = try iterator_scope_pool.toOwnedSlice(allocator),
+        .scheme_use_spans = scheme_use_spans,
+        .scheme_use_sites = try scheme_use_pool.toOwnedSlice(allocator),
+        .scheme_use_scopes = try scheme_use_scope_pool.toOwnedSlice(allocator),
     };
 }
 
@@ -12956,6 +12991,13 @@ const EvidencePass = struct {
                 const chain = try self.chainFor(self.template_iterator_refs.value_ref_scopes[value_ref_start + i], params.items);
                 try self.emitSiteEvidence(ref_id, chain);
             }
+
+            const scheme_use_span = self.template_iterator_refs.scheme_use_spans[template_index];
+            const scheme_use_sites = self.template_iterator_refs.scheme_use_sites[scheme_use_span.start .. scheme_use_span.start + scheme_use_span.len];
+            for (scheme_use_sites, 0..) |site, i| {
+                const chain = try self.chainFor(self.template_iterator_refs.scheme_use_scopes[scheme_use_span.start + i], params.items);
+                try self.emitSchemeUseSiteEvidence(site.record_idx, @intFromEnum(site.checked_expr), chain);
+            }
         }
 
         // Root edges are their templates' only callers (nothing instantiates
@@ -13037,6 +13079,7 @@ const EvidencePass = struct {
                     const entry = try self.target_by_fn_var.getOrPut(@intFromEnum(root));
                     if (!entry.found_existing) entry.value_ptr.* = @intCast(i);
                 },
+                .nested_function_use => {},
             }
         }
 
@@ -13617,26 +13660,36 @@ const EvidencePass = struct {
 
         const source_node = self.source_by_checked_expr.get(site_key) orelse return;
 
-        self.current_chain = chain;
-        defer self.current_chain = &.{};
-
         if (self.value_use_by_node.get(source_node)) |record_idx| {
-            const record = self.module.moduleEnvConst().scheme_uses.items.items[record_idx];
-            const shared = record.slot_kind == @intFromEnum(ModuleEnv.SchemeUseRecord.Slot.shared_value_use);
-            const span = (try self.evidenceRefsForRecord(record_idx, !shared)) orelse {
-                try self.deferred_use_sites.append(self.allocator, .{ .record_idx = record_idx, .site_key = site_key });
-                return;
-            };
-            if (span.len == 0) return;
-            try self.site_seen.put(site_key, {});
-            try self.site_evidence.append(self.allocator, .{ .key = site_key, .start = span.start, .len = span.len });
-            return;
+            try self.emitSchemeUseSiteEvidence(record_idx, site_key, chain);
         }
 
         // References that do not become specialization edges intentionally
         // have no site evidence. Shared recursive uses are explicit records
         // and therefore returned through the branch above.
         return;
+    }
+
+    fn emitSchemeUseSiteEvidence(
+        self: *EvidencePass,
+        record_idx: u32,
+        site_key: u32,
+        chain: []const []const EvidenceParam,
+    ) Allocator.Error!void {
+        if (self.site_seen.contains(site_key)) return;
+
+        self.current_chain = chain;
+        defer self.current_chain = &.{};
+
+        const record = self.module.moduleEnvConst().scheme_uses.items.items[record_idx];
+        const shared = record.slot_kind == @intFromEnum(ModuleEnv.SchemeUseRecord.Slot.shared_value_use);
+        const span = (try self.evidenceRefsForRecord(record_idx, !shared)) orelse {
+            try self.deferred_use_sites.append(self.allocator, .{ .record_idx = record_idx, .site_key = site_key });
+            return;
+        };
+        if (span.len == 0) return;
+        try self.site_seen.put(site_key, {});
+        try self.site_evidence.append(self.allocator, .{ .key = site_key, .start = span.start, .len = span.len });
     }
 
     /// `pairFor`, but comparing RESOLVED roots on both sides: finalization
@@ -13747,6 +13800,9 @@ const CheckedTemplateRefCollector = struct {
     /// id -> decl pattern var), prebuilt by the seal pass; entering one pushes
     /// an evidence scope.
     local_schemes: *const std.AutoHashMap(u32, Var),
+    /// Checked nested function expr -> `SchemeUseRecord` index for the
+    /// construction edge that instantiated it.
+    nested_function_uses: *const std.AutoHashMap(u32, u32),
     value_refs: std.ArrayList(ResolvedValueRefId),
     dispatch_refs: std.ArrayList(static_dispatch.StaticDispatchPlanId),
     iterator_refs: std.ArrayList(static_dispatch.IteratorForPlanId),
@@ -13754,6 +13810,8 @@ const CheckedTemplateRefCollector = struct {
     value_ref_scopes: std.ArrayList(u32),
     dispatch_ref_scopes: std.ArrayList(u32),
     iterator_ref_scopes: std.ArrayList(u32),
+    scheme_use_sites: std.ArrayList(CollectedSchemeUseSite),
+    scheme_use_scopes: std.ArrayList(u32),
     /// Pooled across templates (ids are global); the stack resets per template.
     scopes: std.ArrayList(RefScopeRecord),
     scope_stack: std.ArrayList(u32),
@@ -13766,18 +13824,22 @@ const CheckedTemplateRefCollector = struct {
         checked_bodies: *const CheckedBodyStore,
         static_dispatch_plans: *const static_dispatch.StaticDispatchPlanTable,
         local_schemes: *const std.AutoHashMap(u32, Var),
+        nested_function_uses: *const std.AutoHashMap(u32, u32),
     ) CheckedTemplateRefCollector {
         return .{
             .allocator = allocator,
             .checked_bodies = checked_bodies,
             .static_dispatch_plans = static_dispatch_plans,
             .local_schemes = local_schemes,
+            .nested_function_uses = nested_function_uses,
             .value_refs = .empty,
             .dispatch_refs = .empty,
             .iterator_refs = .empty,
             .value_ref_scopes = .empty,
             .dispatch_ref_scopes = .empty,
             .iterator_ref_scopes = .empty,
+            .scheme_use_sites = .empty,
+            .scheme_use_scopes = .empty,
             .scopes = .empty,
             .scope_stack = .empty,
             .visited_exprs = std.AutoHashMap(CheckedExprId, void).init(allocator),
@@ -13796,6 +13858,8 @@ const CheckedTemplateRefCollector = struct {
         self.value_ref_scopes.deinit(self.allocator);
         self.dispatch_ref_scopes.deinit(self.allocator);
         self.iterator_ref_scopes.deinit(self.allocator);
+        self.scheme_use_sites.deinit(self.allocator);
+        self.scheme_use_scopes.deinit(self.allocator);
         self.scopes.deinit(self.allocator);
         self.scope_stack.deinit(self.allocator);
     }
@@ -13807,6 +13871,8 @@ const CheckedTemplateRefCollector = struct {
         self.value_ref_scopes.clearRetainingCapacity();
         self.dispatch_ref_scopes.clearRetainingCapacity();
         self.iterator_ref_scopes.clearRetainingCapacity();
+        self.scheme_use_sites.clearRetainingCapacity();
+        self.scheme_use_scopes.clearRetainingCapacity();
         // `scopes` pools across templates; only the stack resets.
         self.scope_stack.clearRetainingCapacity();
         self.visited_exprs.clearRetainingCapacity();
@@ -13832,6 +13898,27 @@ const CheckedTemplateRefCollector = struct {
     fn collectExpr(self: *CheckedTemplateRefCollector, expr_id: CheckedExprId) Allocator.Error!void {
         const entry = try self.visited_exprs.getOrPut(expr_id);
         if (entry.found_existing) return;
+
+        const raw_expr = @intFromEnum(expr_id);
+        if (self.nested_function_uses.get(raw_expr)) |record_idx| {
+            try self.scheme_use_sites.append(self.allocator, .{
+                .record_idx = record_idx,
+                .checked_expr = expr_id,
+            });
+            // The construction edge lives in the enclosing scope; the nested
+            // function's own evidence scope begins below.
+            try self.scheme_use_scopes.append(self.allocator, self.currentScope());
+        }
+
+        const local_scheme = self.local_schemes.get(raw_expr);
+        if (local_scheme) |scheme_var| {
+            const scope_id: u32 = @intCast(self.scopes.items.len);
+            try self.scopes.append(self.allocator, .{ .parent = self.currentScope(), .scheme_var = scheme_var });
+            try self.scope_stack.append(self.allocator, scope_id);
+        }
+        defer {
+            if (local_scheme != null) _ = self.scope_stack.pop();
+        }
 
         const expr = self.checked_bodies.expr(expr_id);
         switch (expr.data) {
@@ -14068,18 +14155,7 @@ const CheckedTemplateRefCollector = struct {
         switch (statement.data) {
             .decl => |decl| {
                 try self.collectPattern(decl.pattern);
-                if (self.local_schemes.get(@intFromEnum(decl.expr))) |scheme_var| {
-                    // A generalized local function with dispatch obligations:
-                    // plans and refs inside its body resolve against its own
-                    // evidence params at depth 0.
-                    const scope_id: u32 = @intCast(self.scopes.items.len);
-                    try self.scopes.append(self.allocator, .{ .parent = self.currentScope(), .scheme_var = scheme_var });
-                    try self.scope_stack.append(self.allocator, scope_id);
-                    defer _ = self.scope_stack.pop();
-                    try self.collectExpr(decl.expr);
-                } else {
-                    try self.collectExpr(decl.expr);
-                }
+                try self.collectExpr(decl.expr);
             },
             .var_ => |var_| {
                 try self.collectPattern(var_.pattern);
