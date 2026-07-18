@@ -364,7 +364,6 @@ test "parseUrlPath extracts url id" {
         try std.testing.expectEqualStrings("example.com/foo/1.2.x", parsed.urlIdPrefix(url));
         try std.testing.expectEqual(Version.none, parsed.version);
     }
-
 }
 
 test "parseUrlPath finds the version anywhere before the hash" {

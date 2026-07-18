@@ -1345,4 +1345,3 @@ test "isUnique with different scenarios" {
     const ptr = allocateWithRefcount(64, 8, false, ops);
     try std.testing.expect(@import("utils.zig").isUnique(ptr, ops));
 }
-

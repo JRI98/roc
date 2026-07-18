@@ -219,10 +219,6 @@ const TestEnv = struct {
         return try self.mkNominalTypeWithOpacity(name, backing_var, args, true);
     }
 
-    fn mkList(self: *Self, elem_var: Var) std.mem.Allocator.Error!Content {
-        return try self.mkNominalType("List", elem_var, &[_]Var{elem_var});
-    }
-
     fn mkBox(self: *Self, elem_var: Var) std.mem.Allocator.Error!Content {
         return try self.mkNominalType("Box", elem_var, &[_]Var{elem_var});
     }

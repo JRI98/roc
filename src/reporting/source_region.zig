@@ -217,4 +217,3 @@ test "printSpaces" {
     try printSpaces(&writer.writer, 5);
     try testing.expectEqualStrings("     ", writer.written());
 }
-
