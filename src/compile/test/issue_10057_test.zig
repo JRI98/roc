@@ -8,6 +8,8 @@ test "issue 10057: recursive binary search tree equality lowers to LIR" {
     // pass ARC certification without crashing or exhausting compiler memory.
     try expectLowersToLir(
         \\BinarySearchTree := [Alpha, Bravo, Charlie, Delta, Node({ value : U64, left : BinarySearchTree, right : BinarySearchTree })].{
+        \\    is_eq : _
+        \\
         \\    build_tree : {} -> BinarySearchTree
         \\    build_tree = |_| Node({
         \\        value: 4,

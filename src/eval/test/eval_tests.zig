@@ -31,6 +31,7 @@ const core_tests = [_]TestCase{
     .{ .name = "problem: int div dec type mismatch", .source = "1.I64 / 2.0.Dec", .expected = .{ .problem = {} } },
     .{ .name = "problem: F32.is_eq is intentionally unavailable", .source = "F32.is_eq(1.0.F32, 1.0.F32)", .expected = .{ .problem = {} } },
     .{ .name = "problem: F64.is_eq is intentionally unavailable", .source = "F64.is_eq(1.0.F64, 1.0.F64)", .expected = .{ .problem = {} } },
+    .{ .name = "inspect: F32 opts in to receiver is_eq dispatch", .source = "1.0.F32.is_eq(1.0.F32)", .expected = .{ .inspect_str = "True" } },
     .{
         .name = "problem: annotation-only top-level value is not a runtime value",
         .source_kind = .module,
@@ -2982,6 +2983,8 @@ const core_tests = [_]TestCase{
         .source_kind = .module,
         .source =
         \\Iter(s) :: [It(s)].{
+        \\    is_eq : _
+        \\
         \\    identity : Iter(s) -> Iter(s)
         \\    identity = |It(s_)| It(s_)
         \\}
@@ -4493,6 +4496,11 @@ const core_tests = [_]TestCase{
     .{
         .name = "crash: Dec.pow rejects negative base with fractional exponent",
         .source = "Dec.pow(-2.0, 0.5)",
+        .expected = .{ .crash = {} },
+    },
+    .{
+        .name = "crash: Dec multiply overflow crashes on every backend",
+        .source = "100000000000000000000.0 * 100.0.Dec",
         .expected = .{ .crash = {} },
     },
     .{

@@ -1017,6 +1017,49 @@ pub fn compileInspectedExpr(allocator: Allocator, io: std.Io, source: []const u8
     return compileInspectedProgram(allocator, io, .expr, source, &.{});
 }
 
+/// Debug-only: compile an inspect-wrapped program for the native target while
+/// capturing the Debug verifier's materialized Lambda Mono program in
+/// `materialized_out`. Compiles with the specialization cache disabled (so
+/// every function body materializes locally rather than loading as an
+/// imported shard) and the in-place List.map path off (so the materialized
+/// tree stays on the copy path a tree evaluator executes).
+pub fn compileInspectedProgramWithLambdaMono(
+    allocator: Allocator,
+    io: std.Io,
+    source_kind: SourceKind,
+    source: []const u8,
+    imports: []const ModuleSource,
+    pre_published_builtin: ?PrePublishedBuiltin,
+    materialized_out: *?lir.CheckedPipeline.LambdaMonoProgram,
+) TestHelperError!CompiledTargetProgram {
+    var resources = try parseAndCanonicalizeProgramWithRootMode(
+        allocator,
+        source_kind,
+        source,
+        imports,
+        true,
+        .{ .eval_root = true },
+        pre_published_builtin,
+        null,
+    );
+    errdefer cleanupParseAndCanonical(allocator, resources);
+
+    const lowered = try lowerParsedProgramToLirWithOptions(allocator, io, &resources, .native, .{
+        .list_in_place_map = false,
+        .monotype_cache = lir.CheckedPipeline.MonotypeCacheControl.disabled,
+        .debug_materialized_out = materialized_out,
+    });
+    errdefer {
+        var owned = lowered;
+        owned.deinit(allocator);
+    }
+
+    return .{
+        .resources = resources,
+        .lowered = lowered,
+    };
+}
+
 /// Free all resources held by a ParsedResources value.
 pub fn cleanupParseAndCanonical(allocator: Allocator, resources: ParsedResources) void {
     var owned = resources;
@@ -1549,6 +1592,17 @@ fn lowerParsedProgramToLir(
 const LowerToLirOptions = struct {
     inline_mode: lir.CheckedPipeline.InlineMode = .none,
     tag_reachability: bool = false,
+    /// Match optimized builds so every backend exercises the in-place
+    /// List.map path; the copy path is still covered by shared-list,
+    /// slice, and layout-mismatch cases. The Lambda Mono differential
+    /// harness disables this so its tree stays on the copy path.
+    list_in_place_map: bool = true,
+    /// Specialization cache control; the differential harness disables the
+    /// cache so every function body materializes locally.
+    monotype_cache: lir.CheckedPipeline.MonotypeCacheControl = .{},
+    /// Debug-only capture slot for the verifier's materialized Lambda Mono
+    /// program.
+    debug_materialized_out: ?*?lir.CheckedPipeline.LambdaMonoProgram = null,
 };
 
 fn lowerParsedProgramToLirWithOptions(
@@ -1625,11 +1679,10 @@ fn lowerCheckedRootWithViews(
         .{
             .target_usize = target_usize,
             .inline_mode = options.inline_mode,
-            // Match optimized builds so every backend exercises the in-place
-            // List.map path; the copy path is still covered by shared-list,
-            // slice, and layout-mismatch cases.
-            .list_in_place_map = true,
+            .list_in_place_map = options.list_in_place_map,
+            .monotype_cache = options.monotype_cache,
             .tag_reachability = options.tag_reachability,
+            .debug_materialized_out = options.debug_materialized_out,
         },
     );
 
@@ -2658,6 +2711,123 @@ pub fn lirInterpreterStrWithStats(allocator: Allocator, lowered: *const LoweredP
     return .{
         .output = output,
         .allocation_count = runtime_env.allocationCallCount(),
+    };
+}
+
+/// Abort classification for a differential interpreter run.
+pub const InterpreterAbortKind = enum { crash, runtime_error, comptime_exhaustiveness, expect_err };
+
+/// Abort record for a differential interpreter run.
+pub const InterpreterAbort = struct {
+    kind: InterpreterAbortKind,
+    message: ?[]u8,
+};
+
+/// Final outcome of a differential interpreter run.
+pub const InterpreterOutcome = union(enum) {
+    output: []u8,
+    aborted: InterpreterAbort,
+};
+
+/// Interpreter run transcript for differential harnesses: final outcome plus
+/// host-observable events in execution order. All slices are owned by the
+/// caller's allocator.
+pub const InterpreterTranscript = struct {
+    outcome: InterpreterOutcome,
+    dbg_events: [][]u8,
+    expect_failures: [][]u8,
+
+    pub fn deinit(self: *InterpreterTranscript, allocator: Allocator) void {
+        switch (self.outcome) {
+            .output => |bytes| allocator.free(bytes),
+            .aborted => |aborted| if (aborted.message) |msg| allocator.free(msg),
+        }
+        for (self.dbg_events) |bytes| allocator.free(bytes);
+        allocator.free(self.dbg_events);
+        for (self.expect_failures) |bytes| allocator.free(bytes);
+        allocator.free(self.expect_failures);
+    }
+};
+
+/// Evaluate via the LIR interpreter, returning the full transcript a
+/// differential harness compares against an independent execution.
+pub fn lirInterpreterTranscript(allocator: Allocator, lowered: *const LoweredProgram) TestHelperError!InterpreterTranscript {
+    var runtime_env = RuntimeHostEnv.init(allocator);
+    defer runtime_env.deinit();
+
+    var interp = try Interpreter.init(
+        allocator,
+        &lowered.view.store,
+        &lowered.view.layouts,
+        runtime_env.get_ops(),
+    );
+    defer interp.deinit();
+
+    const arg_layouts = try mainProcArgLayouts(allocator, lowered);
+    defer allocator.free(arg_layouts);
+
+    var outcome: InterpreterOutcome = undefined;
+    var outcome_owned = true;
+    errdefer if (outcome_owned) switch (outcome) {
+        .output => |bytes| allocator.free(bytes),
+        .aborted => |aborted| if (aborted.message) |msg| allocator.free(msg),
+    };
+    if (interp.eval(.{ .proc_id = lowered.mainProc(), .arg_layouts = arg_layouts })) |result| {
+        const ret_layout = lowered.view.store.getProcSpec(lowered.mainProc()).ret_layout;
+        outcome = .{ .output = try copyReturnedRocStr(
+            allocator,
+            &lowered.view.layouts,
+            ret_layout,
+            result.value.ptr,
+            null,
+        ) };
+    } else |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.Crash, error.DivisionByZero => {
+            const message: ?[]u8 = switch (runtime_env.crashState()) {
+                .crashed => |msg| try allocator.dupe(u8, msg),
+                .did_not_crash => null,
+            };
+            outcome = .{ .aborted = .{ .kind = .crash, .message = message } };
+        },
+        error.RuntimeError => outcome = .{ .aborted = .{ .kind = .runtime_error, .message = null } },
+        error.ComptimeExhaustiveness => outcome = .{ .aborted = .{ .kind = .comptime_exhaustiveness, .message = null } },
+        error.ExpectErr => {
+            const message: ?[]u8 = if (interp.getExpectErrMessage()) |msg|
+                try allocator.dupe(u8, msg)
+            else
+                null;
+            outcome = .{ .aborted = .{ .kind = .expect_err, .message = message } };
+        },
+    }
+
+    var dbg_list = std.ArrayList([]u8).empty;
+    errdefer {
+        for (dbg_list.items) |bytes| allocator.free(bytes);
+        dbg_list.deinit(allocator);
+    }
+    var expect_list = std.ArrayList([]u8).empty;
+    errdefer {
+        for (expect_list.items) |bytes| allocator.free(bytes);
+        expect_list.deinit(allocator);
+    }
+    for (runtime_env.events.items) |event| switch (event) {
+        .dbg => |bytes| try dbg_list.append(allocator, try allocator.dupe(u8, bytes)),
+        .expect_failed => |bytes| try expect_list.append(allocator, try allocator.dupe(u8, bytes)),
+        .crashed => {},
+    };
+
+    const dbg_events = try dbg_list.toOwnedSlice(allocator);
+    errdefer {
+        for (dbg_events) |bytes| allocator.free(bytes);
+        allocator.free(dbg_events);
+    }
+    const expect_failures = try expect_list.toOwnedSlice(allocator);
+    outcome_owned = false;
+    return .{
+        .outcome = outcome,
+        .dbg_events = dbg_events,
+        .expect_failures = expect_failures,
     };
 }
 

@@ -7,6 +7,7 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const base = @import("base");
+const builtins = @import("builtins");
 
 const CIR = @import("CIR.zig");
 const DependencyGraph = @import("DependencyGraph.zig");
@@ -17,30 +18,28 @@ pub fn isBuiltinModule(env: *const ModuleEnv) bool {
     return env.module_role == .builtin;
 }
 
-/// Returns whether an annotation-only Builtin declaration is handled as an intrinsic wrapper.
+/// Returns whether an annotation-only Builtin declaration is handled as an
+/// intrinsic wrapper. The set of intrinsic names is declared in the builtin
+/// registry alongside the rest of the builtin membership data.
 pub fn isIntrinsicAnnotation(env: *const ModuleEnv, ident: base.Ident.Idx) bool {
-    if (ident.eql(env.idents.builtin_str_inspect)) return true;
-
-    if (env.common.findIdent("Builtin.Str.Utf8Problem.is_eq")) |utf8_problem_eq| {
-        if (ident.eql(utf8_problem_eq)) return true;
-    }
-
-    const parse_intrinsics = [_][]const u8{
-        "Builtin.Encoding.ParseTagUnionSpec.parse",
-        "Builtin.Encoding.FieldName.FieldNames.rename_fields",
-        "Builtin.Encoding.FieldName.FieldNames.shortest_name",
-        "Builtin.Encoding.FieldName.FieldNames.longest_name",
-        "Builtin.Encoding.FieldName.FieldNames.iter",
-        "Builtin.Encoding.FieldName.FieldNames.for_size",
-        "Builtin.Encoding.FieldName.name",
-    };
-    for (parse_intrinsics) |name| {
+    for (builtins.builtin_registry.intrinsic_annotation_names) |name| {
         if (env.common.findIdent(name)) |intrinsic| {
             if (ident.eql(intrinsic)) return true;
         }
     }
-
     return false;
+}
+
+/// Returns whether an annotation-only declaration opts into a compiler-derived method.
+pub fn isDerivedMethodMarker(env: *const ModuleEnv, ident: base.Ident.Idx, annotation: CIR.Annotation.Idx) bool {
+    if (env.store.getTypeAnno(env.store.getAnnotation(annotation).anno) != .underscore) return false;
+    const text = env.getIdent(ident);
+    return base.Ident.textEndsWith(text, ".is_eq") or
+        base.Ident.textEndsWith(text, ".to_hash") or
+        base.Ident.textEndsWith(text, ".parser_for") or
+        base.Ident.textEndsWith(text, ".encoder_for") or
+        base.Ident.textEndsWith(text, ".map") or
+        base.Ident.textEndsWith(text, ".map!");
 }
 
 /// Replaces Builtin.roc annotation-only primitive declarations with low-level operation lambdas.
@@ -1374,6 +1373,7 @@ fn replaceProvidedByCompilerLowLevels(env: *ModuleEnv) (Allocator.Error || error
                 // Check if this identifier matches a low-level operation
                 const entry = low_level_map.fetchRemove(ident) orelse {
                     if (isIntrinsicAnnotation(env, ident)) continue;
+                    if (isDerivedMethodMarker(env, ident, def.annotation.?)) continue;
 
                     return error.UnsupportedBuiltinAnnotationOnly;
                 };

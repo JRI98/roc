@@ -2402,6 +2402,8 @@ pub fn build(b: *std.Build) void {
     const run_test_eval_step = b.step("run-test-eval", "Run eval tests in parallel across enabled backends");
     const build_test_eval_host_effects_runner_step = b.step("build-test-eval-host-effects-runner", "Build runtime host-effects eval test runner");
     const run_test_eval_host_effects_step = b.step("run-test-eval-host-effects", "Run runtime host-effects eval tests across supported backends");
+    const build_test_lambda_mono_differential_step = b.step("build-test-lambda-mono-differential", "Build the Lambda Mono differential harness");
+    const run_test_lambda_mono_differential_step = b.step("run-test-lambda-mono-differential", "Run the Lambda Mono body-lowering differential harness (Debug only)");
     const build_playground_step = b.step("build-playground", "Build the WASM playground");
     const build_test_playground_runner_step = b.step("build-test-playground-runner", "Build the integration test suite for the WASM playground");
     const run_test_playground_step = b.step("run-test-playground", "Run the integration test suite for the WASM playground");
@@ -2859,6 +2861,7 @@ pub fn build(b: *std.Build) void {
     const llvm_codegen_module = b.addModule("llvm_codegen", .{
         .root_source_file = b.path("src/backend/llvm/MonoLlvmCodeGen.zig"),
     });
+    llvm_codegen_module.addImport("base", roc_modules.base);
     llvm_codegen_module.addImport("layout", roc_modules.layout);
     llvm_codegen_module.addImport("lir", roc_modules.lir);
     llvm_codegen_module.addImport("ctx", roc_modules.ctx);
@@ -2955,6 +2958,7 @@ pub fn build(b: *std.Build) void {
                     .{ .name = "test_harness", .module = createTestHarnessModule(b, roc_modules) },
                     .{ .name = "collections", .module = roc_modules.collections },
                     .{ .name = "backend", .module = roc_modules.backend },
+                    .{ .name = "builtins", .module = roc_modules.builtins },
                     .{ .name = "bytebox", .module = bytebox.module("bytebox") },
                     .{ .name = "build_options", .module = roc_modules.build_options },
                 },
@@ -3021,6 +3025,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "vendor_llvm_compile_bindings", .module = roc_modules.vendor_llvm_compile_bindings },
             .{ .name = "build_options", .module = roc_modules.build_options },
             .{ .name = "roc_target", .module = roc_modules.roc_target },
+            .{ .name = "builtins", .module = roc_modules.builtins },
             .{ .name = "embedded_lld", .module = roc_modules.embedded_lld },
         },
     });
@@ -3305,6 +3310,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "vendor_llvm_compile_bindings", .module = roc_modules.vendor_llvm_compile_bindings },
             .{ .name = "build_options", .module = roc_modules.build_options },
             .{ .name = "roc_target", .module = roc_modules.roc_target },
+            .{ .name = "builtins", .module = roc_modules.builtins },
             .{ .name = "llvm_embedded", .module = llvm_embedded_module },
             .{ .name = "embedded_lld", .module = roc_modules.embedded_lld },
         },
@@ -3466,6 +3472,65 @@ pub fn build(b: *std.Build) void {
         build_test_eval_host_effects_runner_step,
         run_test_eval_host_effects_step,
         eval_host_effects_run_args,
+    );
+
+    const lambda_mono_differential_exe = b.addExecutable(.{
+        .name = "lambda-mono-differential-runner",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/eval/test/lambda_mono_differential_runner.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+        }),
+    });
+    // The tree evaluator and the deepest eval corpus programs both recurse;
+    // match the eval runner's generous stack.
+    lambda_mono_differential_exe.stack_size = 64 * 1024 * 1024;
+    configureBackend(lambda_mono_differential_exe, target);
+    roc_modules.addAll(lambda_mono_differential_exe);
+    lambda_mono_differential_exe.root_module.addImport("compiled_builtins", compiled_builtins_module);
+    lambda_mono_differential_exe.root_module.addImport("bytebox", bytebox.module("bytebox"));
+    lambda_mono_differential_exe.root_module.addImport("test_harness", createTestHarnessModule(b, roc_modules));
+    lambda_mono_differential_exe.root_module.addOptions("coverage_options", blk: {
+        const opts = b.addOptions();
+        opts.addOption(bool, "coverage", false);
+        break :blk opts;
+    });
+    lambda_mono_differential_exe.step.dependOn(&write_compiled_builtins.step);
+    try addLlvmSupportToStep(
+        b,
+        lambda_mono_differential_exe,
+        target,
+        use_system_llvm,
+        user_llvm_path,
+        roc_modules,
+        llvm_codegen_module,
+        llvm_embedded_module,
+        zstd,
+    );
+    if (lambda_mono_differential_exe.root_module.resolved_target.?.result.os.tag != .windows or
+        lambda_mono_differential_exe.root_module.resolved_target.?.result.abi != .msvc)
+    {
+        lambda_mono_differential_exe.root_module.link_libcpp = true;
+    }
+    const lambda_mono_differential_run_args = if (test_filters.len > 0) blk: {
+        var lm_args_list = std.ArrayList([]const u8).empty;
+        for (run_args) |arg| {
+            lm_args_list.append(b.allocator, arg) catch @panic("OOM");
+        }
+        for (test_filters) |f| {
+            lm_args_list.append(b.allocator, "--filter") catch @panic("OOM");
+            lm_args_list.append(b.allocator, f) catch @panic("OOM");
+        }
+        break :blk lm_args_list.toOwnedSlice(b.allocator) catch @panic("OOM");
+    } else run_args;
+    _ = install_and_run(
+        b,
+        no_bin,
+        lambda_mono_differential_exe,
+        build_test_lambda_mono_differential_step,
+        run_test_lambda_mono_differential_step,
+        lambda_mono_differential_run_args,
     );
 
     const playground_exe = b.addExecutable(.{
@@ -6185,6 +6250,7 @@ fn addLlvmSupportToStep(
             .{ .name = "vendor_llvm_compile_bindings", .module = roc_modules.vendor_llvm_compile_bindings },
             .{ .name = "build_options", .module = roc_modules.build_options },
             .{ .name = "roc_target", .module = roc_modules.roc_target },
+            .{ .name = "builtins", .module = roc_modules.builtins },
             .{ .name = "llvm_embedded", .module = llvm_embedded_module },
             .{ .name = "embedded_lld", .module = roc_modules.embedded_lld },
         },

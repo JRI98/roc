@@ -231,10 +231,18 @@ fn copyFunc(ctx: *const CopyContext, func: Func) std.mem.Allocator.Error!Func {
 
     const dest_ret = try copyVarCtx(ctx, func.ret);
 
+    var dest_effect_deps = std.ArrayList(Var).empty;
+    defer dest_effect_deps.deinit(ctx.dest_store.gpa);
+    for (ctx.source_store.sliceVars(func.effect_deps)) |effect_dep| {
+        try dest_effect_deps.append(ctx.dest_store.gpa, try copyVarCtx(ctx, effect_dep));
+    }
+
     const dest_args_range = try ctx.dest_store.appendVars(dest_args.items);
+    const dest_effect_deps_range = try ctx.dest_store.appendVars(dest_effect_deps.items);
     return Func{
         .args = dest_args_range,
         .ret = dest_ret,
+        .effect_deps = dest_effect_deps_range,
     };
 }
 
@@ -457,6 +465,12 @@ fn copyStaticDispatchConstraints(
         var dest_constraint = source_constraint;
         dest_constraint.fn_name = translated_fn_name;
         dest_constraint.fn_var = try copyVarCtx(ctx, source_constraint.fn_var);
+        if (source_constraint.derived_map_plan) |plan| {
+            dest_constraint.derived_map_plan = .{
+                .tag_name = try ctx.copyIdent(plan.tag_name),
+                .payload_index = plan.payload_index,
+            };
+        }
         // Provenance (introducing expression + expect region) is module-scoped:
         // its indices refer to the SOURCE module's CIR and are meaningless here.
         // Clear it on the boundary crossing so a consumer never dereferences a

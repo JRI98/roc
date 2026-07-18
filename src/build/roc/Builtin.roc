@@ -19,7 +19,21 @@ Builtin :: [].{
 		}
 
 		ParseTagUnionSpec(_shape) :: {}.{
-			parse : ParseTagUnionSpec(_shape), { tag : Str, encoding : _encoding, state : _state, missing : _err } -> Try({ value : _shape, rest : _state }, _err)
+
+			## After a format reads the tag name, the generated parser calls
+			## start_payloads once, next_payload before each payload after the
+			## first (with its zero-based index and the total count), and
+			## finish_payloads once after the final payload.
+			parse : ParseTagUnionSpec(_shape),
+			{
+				tag : Str,
+				encoding : _encoding,
+				state : _state,
+				start_payloads : _state, U64 -> Try(_state, _err),
+				next_payload : _state, U64, U64 -> Try(_state, _err),
+				finish_payloads : _state, U64 -> Try(_state, _err),
+				missing : _err,
+			} -> Try({ value : _shape, rest : _state }, _err)
 		}
 
 		JsonState :: [Input(Str)]
@@ -131,6 +145,10 @@ Builtin :: [].{
 
 			encode_null : JsonEncoding, JsonEncodeState -> Try(JsonEncodeState, _never_fails)
 			encode_null = |_, state| JsonEncoding.encode_null(state)
+
+			## write_payloads supplies each tag payload in source order.
+			encode_tag : JsonEncoding, JsonEncodeState, Str, U64, (JsonEncodeState, (JsonEncodeState, (JsonEncodeState -> Try(JsonEncodeState, err)) -> Try(JsonEncodeState, err)) -> Try(JsonEncodeState, err)) -> Try(JsonEncodeState, err)
+			encode_tag = |_, state, tag, count, write_payloads| JsonEncoding.encode_tag(state, tag, count, write_payloads)
 
 			encode_record : JsonEncoding, JsonEncodeState, U64, (JsonEncodeState, (JsonEncodeState, Str, (JsonEncodeState -> Try(JsonEncodeState, err)) -> Try(JsonEncodeState, err)) -> Try(JsonEncodeState, err)) -> Try(JsonEncodeState, err)
 			encode_record = |_, state, count, write_fields| JsonEncoding.encode_record(state, count, write_fields)
@@ -930,6 +948,9 @@ Builtin :: [].{
 							tag: key_split.value,
 							encoding,
 							state: JsonState.Input(key_split.after),
+							start_payloads: Json.start_string_tag_payloads,
+							next_payload: Json.next_string_tag_payload,
+							finish_payloads: Json.finish_string_tag_payloads,
 							missing: Json.invalid_json,
 						},
 					)
@@ -972,6 +993,9 @@ Builtin :: [].{
 								tag: tag_name,
 								encoding,
 								state: JsonState.Input(payload),
+								start_payloads: |state, count| Json.start_object_tag_payloads(encoding, state, count),
+								next_payload: |state, index, count| Json.next_object_tag_payload(encoding, state, index, count),
+								finish_payloads: |state, count| Json.finish_object_tag_payloads(encoding, state, count),
 								missing: Json.invalid_json,
 							},
 						)?
@@ -983,6 +1007,62 @@ Builtin :: [].{
 					Err(_) => Err(Json.invalid_json)
 				}
 			}
+
+			start_string_tag_payloads : JsonState, U64 -> Try(JsonState, Json.ParseErr)
+			start_string_tag_payloads = |state, count|
+				if count == 0 Ok(state) else Err(Json.invalid_json)
+
+			next_string_tag_payload : JsonState, U64, U64 -> Try(JsonState, Json.ParseErr)
+			next_string_tag_payload = |_, _, _| Err(Json.invalid_json)
+
+			finish_string_tag_payloads : JsonState, U64 -> Try(JsonState, Json.ParseErr)
+			finish_string_tag_payloads = |state, count|
+				if count == 0 Ok(state) else Err(Json.invalid_json)
+
+			start_object_tag_payloads : JsonEncoding, JsonState, U64 -> Try(JsonState, Json.ParseErr)
+			start_object_tag_payloads = |encoding, state, count|
+				if count == 0 {
+					match state {
+						Input(raw) => {
+							empty = Json.consume_empty_json_object(raw)?
+							Ok(JsonState.Input(Str.trim_start(empty.after)))
+						}
+					}
+				} else if count == 1 {
+					Ok(state)
+				} else {
+					started = JsonEncoding.parse_array_start(encoding, state)?
+					match JsonEncoding.parse_array_next(encoding, started)? {
+						Element(payload_state) => Ok(payload_state)
+						Done(_) => Err(Json.invalid_json)
+					}
+				}
+
+			next_object_tag_payload : JsonEncoding, JsonState, U64, U64 -> Try(JsonState, Json.ParseErr)
+			next_object_tag_payload = |encoding, state, _, count|
+				if count <= 1 {
+					Err(Json.invalid_json)
+				} else {
+					match JsonEncoding.parse_array_after_element(encoding, state)? {
+						Continue(next_state) =>
+							match JsonEncoding.parse_array_next(encoding, next_state)? {
+								Element(payload_state) => Ok(payload_state)
+								Done(_) => Err(Json.invalid_json)
+							}
+						Done(_) => Err(Json.invalid_json)
+					}
+				}
+
+			finish_object_tag_payloads : JsonEncoding, JsonState, U64 -> Try(JsonState, Json.ParseErr)
+			finish_object_tag_payloads = |encoding, state, count|
+				if count <= 1 {
+					Ok(state)
+				} else {
+					match JsonEncoding.parse_array_after_element(encoding, state)? {
+						Done(done_state) => Ok(done_state)
+						Continue(_) => Err(Json.invalid_json)
+					}
+				}
 
 			finish_tag_payload : JsonEncoding, a, Str -> Try({ value : a, rest : JsonState }, Json.ParseErr)
 			finish_tag_payload = |encoding, value, raw| {
@@ -1006,26 +1086,7 @@ Builtin :: [].{
 					return Err(Json.invalid_json)
 				}
 
-				empty_payload = Json.consume_empty_json_object(remaining)?
-				after_payload = json_trim_start(empty_payload.after)
-
-				if Str.starts_with(after_payload, "}") {
-					after_close = json_trim_start(Str.drop_prefix(after_payload, "}"))
-					Ok({ value, rest: JsonState.Input(after_close) })
-				} else if Str.starts_with(after_payload, ",") {
-					after_comma = json_trim_start(Str.drop_prefix(after_payload, ","))
-
-					if JsonEncoding.allows_trailing_commas(encoding) {
-						if Str.starts_with(after_comma, "}") {
-							after_close = json_trim_start(Str.drop_prefix(after_comma, "}"))
-							return Ok({ value, rest: JsonState.Input(after_close) })
-						}
-					}
-
-					Err(Json.invalid_json)
-				} else {
-					Err(Json.invalid_json)
-				}
+				Err(Json.invalid_json)
 			}
 
 			consume_empty_json_object : Str -> Try({ after : Str }, Json.ParseErr)
@@ -1487,6 +1548,28 @@ Builtin :: [].{
 					Input(value) => Json.parse_tag_union_from_json(value, encoding, spec)
 				}
 
+			encode_tag : JsonEncodeState, Str, U64, (JsonEncodeState, (JsonEncodeState, (JsonEncodeState -> Try(JsonEncodeState, err)) -> Try(JsonEncodeState, err)) -> Try(JsonEncodeState, err)) -> Try(JsonEncodeState, err)
+			encode_tag = |state, tag, count, write_payloads|
+				if count == 0 {
+					JsonEncoding.encode_str(tag, state)
+				} else {
+					JsonEncoding.encode_record(
+						state,
+						1,
+						|record_state, write_field|
+							write_field(
+								record_state,
+								tag,
+								|payload_state|
+									if count == 1 {
+										write_payloads(payload_state, |item_state, write_value| write_value(item_state))
+									} else {
+										JsonEncoding.encode_tuple(payload_state, count, write_payloads)
+									},
+							),
+					)
+				}
+
 			encode_record : JsonEncodeState, U64, (JsonEncodeState, (JsonEncodeState, Str, (JsonEncodeState -> Try(JsonEncodeState, err)) -> Try(JsonEncodeState, err)) -> Try(JsonEncodeState, err)) -> Try(JsonEncodeState, err)
 			encode_record = |state, _, write_fields| {
 				started = Json.write_record_start(state)?
@@ -1880,6 +1963,9 @@ Builtin :: [].{
 	}
 
 	Str :: [ProvidedByCompiler].{
+		parser_for : _
+		encoder_for : _
+
 		Utf8Problem := [
 			InvalidStartByte,
 			UnexpectedEndOfSequence,
@@ -3180,6 +3266,7 @@ Builtin :: [].{
 	}
 
 	List(_item) :: [ProvidedByCompiler].{
+		parser_for : _
 
 		## Returns the length of the list, which is equal to the number of elements it contains.
 		##
@@ -4235,6 +4322,8 @@ Builtin :: [].{
 	}
 
 	Bool := [False, True].{
+		parser_for : _
+		encoder_for : _
 
 		## Returns `Bool.False` when given `Bool.True`, and vice versa. This is
 		## equivalent to the logic [NOT](https://en.wikipedia.org/wiki/Negation)
@@ -4283,6 +4372,8 @@ Builtin :: [].{
 	}
 
 	Box(item) :: [ProvidedByCompiler].{
+		parser_for : _
+		encoder_for : _
 
 		## Wraps a value in a generic, opaque representation (box) that can easily be passed to the platform.
 		## Boxing is an expensive process because it copies the value from the stack to the heap.
@@ -4294,6 +4385,8 @@ Builtin :: [].{
 	}
 
 	Try(ok, err) := [Ok(ok), Err(err)].{
+		parser_for : _
+		encoder_for : _
 
 		## Returns `Bool.True` if the result indicates a success, else returns `Bool.False`.
 		## ```roc
@@ -4451,6 +4544,9 @@ Builtin :: [].{
 	Dict(k, v) :: [
 		HashMap({ entries : List((k, v)), buckets : List({ dist_and_fingerprint : U32, entry_index : U32 }), max_entries_before_grow : U64, shifts : U8 }),
 	].{
+		parser_for : _
+		encoder_for : _
+
 		DictBucket : { dist_and_fingerprint : U32, entry_index : U32 }
 
 		# INTERNAL SEED-DOMAIN REPRESENTATION INVARIANT
@@ -4996,6 +5092,8 @@ Builtin :: [].{
 	}
 
 	Set(item) :: [Items(List(item))].{
+		parser_for : _
+		encoder_for : _
 
 		## Returns `Bool.True` if the two sets contain the same values, and `Bool.False` otherwise.
 		is_eq : Set(a), Set(a) -> Bool
@@ -5281,6 +5379,8 @@ Builtin :: [].{
 		}
 
 		U8 :: [].{
+			parser_for : _
+			encoder_for : _
 
 			## Returns the default [U8] value, which is `0`. Functions like [List.sum]
 			## use this as the starting value when adding up a list of numbers.
@@ -5903,6 +6003,8 @@ Builtin :: [].{
 		}
 
 		I8 :: [].{
+			parser_for : _
+			encoder_for : _
 
 			## Returns the default [I8] value, which is `0`. Functions like [List.sum]
 			## use this as the starting value when adding up a list of numbers.
@@ -6682,6 +6784,8 @@ Builtin :: [].{
 		}
 
 		U16 :: [].{
+			parser_for : _
+			encoder_for : _
 
 			## Returns the default [U16] value, which is `0`. Functions like [List.sum]
 			## use this as the starting value when adding up a list of numbers.
@@ -7336,6 +7440,8 @@ Builtin :: [].{
 		}
 
 		I16 :: [].{
+			parser_for : _
+			encoder_for : _
 
 			## Returns the default [I16] value, which is `0`. Functions like [List.sum]
 			## use this as the starting value when adding up a list of numbers.
@@ -8130,6 +8236,8 @@ Builtin :: [].{
 		}
 
 		U32 :: [].{
+			parser_for : _
+			encoder_for : _
 
 			## Returns the default [U32] value, which is `0`. Functions like [List.sum]
 			## use this as the starting value when adding up a list of numbers.
@@ -8816,6 +8924,8 @@ Builtin :: [].{
 		}
 
 		I32 :: [].{
+			parser_for : _
+			encoder_for : _
 
 			## Returns the default [I32] value, which is `0`. Functions like [List.sum]
 			## use this as the starting value when adding up a list of numbers.
@@ -9626,6 +9736,8 @@ Builtin :: [].{
 		}
 
 		U64 :: [].{
+			parser_for : _
+			encoder_for : _
 
 			## Returns the default [U64] value, which is `0`. Functions like [List.sum]
 			## use this as the starting value when adding up a list of numbers.
@@ -10352,6 +10464,8 @@ Builtin :: [].{
 		}
 
 		I64 :: [].{
+			parser_for : _
+			encoder_for : _
 
 			## Returns the default [I64] value, which is `0`. Functions like [List.sum]
 			## use this as the starting value when adding up a list of numbers.
@@ -11190,6 +11304,8 @@ Builtin :: [].{
 		}
 
 		U128 :: [].{
+			parser_for : _
+			encoder_for : _
 
 			## Returns the default [U128] value, which is `0`. Functions like [List.sum]
 			## use this as the starting value when adding up a list of numbers.
@@ -11959,6 +12075,8 @@ Builtin :: [].{
 		}
 
 		I128 :: [].{
+			parser_for : _
+			encoder_for : _
 
 			## Returns the default [I128] value, which is `0`. Functions like [List.sum]
 			## use this as the starting value when adding up a list of numbers.
@@ -12830,6 +12948,8 @@ Builtin :: [].{
 		}
 
 		Dec :: [].{
+			parser_for : _
+			encoder_for : _
 
 			## Returns the default [Dec] value, which is `0.0`. Functions like
 			## [List.sum] use this as the starting value when adding up a list of
@@ -13789,6 +13909,8 @@ Builtin :: [].{
 		}
 
 		F32 :: [].{
+			parser_for : _
+			encoder_for : _
 
 			## Returns the default [F32] value, which is `0.0`. Functions like
 			## [List.sum] use this as the starting value when adding up a list of
@@ -13939,6 +14061,8 @@ Builtin :: [].{
 			## expect !F32.is_float_eq(F32.nan, F32.nan)
 			## ```
 			is_float_eq : F32, F32 -> Bool
+
+			is_eq : _
 
 			## Feed an [F32] into a [Hasher].
 			to_hash : F32, Hasher -> Hasher
@@ -14734,6 +14858,8 @@ Builtin :: [].{
 		}
 
 		F64 :: [].{
+			parser_for : _
+			encoder_for : _
 
 			## Returns the default [F64] value, which is `0.0`. Functions like
 			## [List.sum] use this as the starting value when adding up a list of
@@ -14884,6 +15010,8 @@ Builtin :: [].{
 			## expect !F64.is_float_eq(F64.nan, F64.nan)
 			## ```
 			is_float_eq : F64, F64 -> Bool
+
+			is_eq : _
 
 			## Feed an [F64] into a [Hasher].
 			to_hash : F64, Hasher -> Hasher

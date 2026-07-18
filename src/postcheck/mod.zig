@@ -31,6 +31,7 @@ pub const LambdaMono = struct {
     pub const Type = @import("lambda_mono/type.zig");
     pub const Lower = @import("lambda_mono/lower.zig");
     pub const Specialize = @import("lambda_mono/specialize.zig");
+    pub const Eval = @import("lambda_mono/eval.zig");
 };
 /// Decision-tree match compiler shared by both LIR lowerers.
 pub const MatchTree = @import("match_tree.zig");

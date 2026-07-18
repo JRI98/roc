@@ -421,11 +421,6 @@ const SuppliedSlot = struct {
     demoted: bool,
 };
 
-const ActiveCallable = struct {
-    source: Ast.FnId,
-    specialized: Ast.FnId,
-};
-
 /// A function currently being inlined, with the number of known-constructor
 /// nodes carried by the call's arguments and captures. A same-function call
 /// nested inside its own inlining may re-enter only when its known-constructor
@@ -469,6 +464,13 @@ const Pass = struct {
     /// Functions that directly call themselves. Let-substitution-aware call
     /// patterns are always relevant at these recursive worker boundaries.
     self_recursive_fns: []bool,
+    /// One rewritten callable body per source lifted function. Capture values
+    /// are explicit operands and therefore do not create new body identities.
+    callable_workers: std.AutoHashMap(Ast.FnId, Ast.FnId),
+    /// Reverse index from each rewritten callable body to its source function.
+    /// This keeps later materialization rooted at the source instead of cloning
+    /// an already-rewritten worker.
+    callable_sources: std.AutoHashMap(Ast.FnId, Ast.FnId),
     fn init(allocator: Allocator, program: *Ast.Program) Allocator.Error!Pass {
         var arena = std.heap.ArenaAllocator.init(allocator);
         errdefer arena.deinit();
@@ -564,10 +566,14 @@ const Pass = struct {
             .whole_body_cloned = whole_body_cloned,
             .shape_demand_fns = shape_demand_fns,
             .self_recursive_fns = self_recursive_fns,
+            .callable_workers = std.AutoHashMap(Ast.FnId, Ast.FnId).init(allocator),
+            .callable_sources = std.AutoHashMap(Ast.FnId, Ast.FnId).init(allocator),
         };
     }
 
     fn deinit(self: *Pass) void {
+        self.callable_sources.deinit();
+        self.callable_workers.deinit();
         self.allocator.free(self.self_recursive_fns);
         self.allocator.free(self.shape_demand_fns);
         self.allocator.free(self.fn_may_crash);
@@ -677,6 +683,7 @@ const Pass = struct {
             const fn_id: Ast.FnId = @enumFromInt(@as(u32, @intCast(index)));
             var cloner = Cloner.initForRewrite(self);
             cloner.rewrite_call_patterns = false;
+            cloner.emit_callable_workers = false;
             cloner.allow_nonrecursive_value_patterns = self.shape_demand_fns[index];
             defer cloner.deinit();
             try cloner.collectCallPatternsInExpr(fn_id, body);
@@ -1244,6 +1251,7 @@ const Pass = struct {
             const fn_id: Ast.FnId = @enumFromInt(@as(u32, @intCast(index)));
             var cloner = Cloner.initForRewrite(self);
             cloner.value_aware_detect_only = true;
+            cloner.emit_callable_workers = false;
             cloner.allow_nonrecursive_value_patterns = index < self.shape_demand_fns.len and self.shape_demand_fns[index];
             defer cloner.deinit();
             try cloner.rewriteCallsWithValuesInExpr(body);
@@ -3165,7 +3173,6 @@ const Cloner = struct {
     binder_subst: std.AutoHashMap(BinderIdentity, Value),
     changes: std.ArrayList(BindingChange),
     inline_stack: std.ArrayList(InlineFrame),
-    callable_stack: std.ArrayList(ActiveCallable),
     loop_stack: std.ArrayList(LoopPattern),
     /// Bindings created while producing a structured value, not yet emitted.
     /// Each holds a fresh local the value's leaves reference. They are
@@ -3181,6 +3188,9 @@ const Cloner = struct {
     inline_direct_calls: bool,
     inline_direct_requires_known_arg: bool,
     rewrite_call_patterns: bool,
+    /// Pattern discovery and detect-only walks do not own output functions.
+    /// Production clones reserve callable workers through the pass-wide table.
+    emit_callable_workers: bool,
     value_aware_rewrite_changed: bool,
     value_aware_detect_only: bool,
     /// Shape-demanding owners may specialize nonrecursive callees; all other
@@ -3221,7 +3231,6 @@ const Cloner = struct {
             .binder_subst = std.AutoHashMap(BinderIdentity, Value).init(pass.allocator),
             .changes = .empty,
             .inline_stack = .empty,
-            .callable_stack = .empty,
             .loop_stack = .empty,
             .pending = .empty,
             .effect_marks = 0,
@@ -3229,6 +3238,7 @@ const Cloner = struct {
             .inline_direct_calls = true,
             .inline_direct_requires_known_arg = true,
             .rewrite_call_patterns = true,
+            .emit_callable_workers = true,
             .value_aware_rewrite_changed = false,
             .value_aware_detect_only = false,
             .allow_nonrecursive_value_patterns = false,
@@ -3248,7 +3258,6 @@ const Cloner = struct {
             .binder_subst = std.AutoHashMap(BinderIdentity, Value).init(pass.allocator),
             .changes = .empty,
             .inline_stack = .empty,
-            .callable_stack = .empty,
             .loop_stack = .empty,
             .pending = .empty,
             .effect_marks = 0,
@@ -3256,6 +3265,7 @@ const Cloner = struct {
             .inline_direct_calls = true,
             .inline_direct_requires_known_arg = false,
             .rewrite_call_patterns = true,
+            .emit_callable_workers = true,
             .value_aware_rewrite_changed = false,
             .value_aware_detect_only = false,
             .allow_nonrecursive_value_patterns = false,
@@ -3269,7 +3279,6 @@ const Cloner = struct {
     fn deinit(self: *Cloner) void {
         self.pending.deinit(self.pass.allocator);
         self.inline_stack.deinit(self.pass.allocator);
-        self.callable_stack.deinit(self.pass.allocator);
         self.loop_stack.deinit(self.pass.allocator);
         self.changes.deinit(self.pass.allocator);
         self.binder_subst.deinit();
@@ -6907,52 +6916,32 @@ const Cloner = struct {
             }
         }
 
-        if (!all_original) {
-            var active_index = self.callable_stack.items.len;
-            while (active_index > 0) {
-                active_index -= 1;
-                const active = self.callable_stack.items[active_index];
-                if (active.source == callable.fn_id) {
-                    const active_fn = self.pass.program.getFn(active.specialized);
-                    return try self.materializeCallableWithCaptures(
-                        callable.ty,
-                        active.specialized,
-                        active_fn.captures,
-                        callable.captures,
-                    );
-                }
-            }
-            return try self.specializedCallableRef(callable);
-        }
+        if (!all_original and self.emit_callable_workers) return try self.materializeCallableWorker(callable);
 
         return try self.materializeCallableWithCaptures(callable.ty, callable.fn_id, fn_.captures, callable.captures);
     }
 
-    fn specializedCallableRef(self: *Cloner, callable: CallableValue) Common.LowerError!Ast.ExprId {
-        const source_fn = self.pass.program.getFn(callable.fn_id);
+    fn materializeCallableWorker(self: *Cloner, callable: CallableValue) Common.LowerError!Ast.ExprId {
+        const source_fn_id = self.pass.callable_sources.get(callable.fn_id) orelse callable.fn_id;
+        if (self.pass.callable_workers.get(source_fn_id)) |worker_fn_id| {
+            const worker = self.pass.program.getFn(worker_fn_id);
+            return try self.materializeCallableWithCaptures(callable.ty, worker_fn_id, worker.captures, callable.captures);
+        }
+
+        const source_fn = self.pass.program.getFn(source_fn_id);
         const source_body = switch (source_fn.body) {
             .roc => |body| body,
-            .hosted => Common.invariant("hosted callable value needed capture substitution"),
+            .hosted => Common.invariant("hosted callable value needed a rewritten body"),
         };
-
         const source_captures = try GuardedList.dupe(self.pass.allocator, Ast.TypedLocal, self.pass.program.typedLocalSpan(source_fn.captures));
         defer self.pass.allocator.free(source_captures);
         if (source_captures.len != callable.captures.len) {
             Common.invariant("callable value capture count differed from lifted function capture count");
         }
 
-        // Reuse the source function's capture local ids rather than allocating
-        // fresh ones. Captures are carried implicitly by the lambda type, not
-        // passed as call arguments, so a leftover direct call to the
-        // un-specialized recursive callee still references the SOURCE capture
-        // locals. If the specialized function bound fresh capture locals, that
-        // implicit reference would point at a local never defined in the
-        // specialized body, surfacing as an unbound local in the lowered LIR.
-        // Args still get fresh locals below: they are always explicit and fully
-        // remapped through the subst map, so they carry no implicit references.
-        const captures = try self.pass.allocator.dupe(Ast.TypedLocal, source_captures);
-        defer self.pass.allocator.free(captures);
-        const captures_span = try self.pass.program.addTypedLocalSpan(captures);
+        // Capture locals are the worker's dynamic inputs. Their values belong
+        // on each function reference, not in the worker identity or body.
+        const captures_span = source_fn.captures;
 
         const source_args = try GuardedList.dupe(self.pass.allocator, Ast.TypedLocal, self.pass.program.typedLocalSpan(source_fn.args));
         defer self.pass.allocator.free(source_args);
@@ -6964,8 +6953,11 @@ const Cloner = struct {
         }
         const args_span = try self.pass.program.addTypedLocalSpan(args);
 
+        // Reserve and index the worker before cloning. Recursive references
+        // therefore reuse this exact function id, and cloning can never start
+        // from a worker produced by an earlier materialization.
         const symbol = self.pass.symbols.fresh();
-        const fn_id = try self.pass.program.addFn(.{
+        const worker_fn_id = try self.pass.program.addFn(.{
             .symbol = symbol,
             .source = source_fn.source,
             .args = args_span,
@@ -6973,26 +6965,17 @@ const Cloner = struct {
             .body = .hosted,
             .ret = source_fn.ret,
         });
+        try self.pass.callable_workers.put(source_fn_id, worker_fn_id);
+        try self.pass.callable_sources.put(worker_fn_id, source_fn_id);
         try self.pass.copyProcDebugName(source_fn.symbol, symbol);
-
-        try self.callable_stack.append(self.pass.allocator, .{
-            .source = callable.fn_id,
-            .specialized = fn_id,
-        });
-        defer {
-            const popped = self.callable_stack.pop() orelse Common.invariant("callable specialization stack underflow");
-            if (popped.source != callable.fn_id or popped.specialized != fn_id) {
-                Common.invariant("callable specialization stack was corrupted");
-            }
-        }
 
         const change_start = self.changes.items.len;
         defer self.restore(change_start);
 
-        for (source_captures, captures) |source_capture, capture| {
+        for (source_captures) |source_capture| {
             const local_expr = try self.addExpr(.{
-                .ty = capture.ty,
-                .data = .{ .local = capture.local },
+                .ty = source_capture.ty,
+                .data = .{ .local = source_capture.local },
             });
             try self.putSubst(source_capture.local, .{ .expr = local_expr });
         }
@@ -7004,53 +6987,20 @@ const Cloner = struct {
             try self.putSubst(source_arg.local, .{ .expr = arg_expr });
         }
 
-        // Build the body before writing the final function slot. The clone can
-        // re-enter callable materialization for this active specialization,
-        // reading the reserved slot's declared captures.
-        const cloned_body = try self.cloneExpr(source_body);
-
-        // The arg-specializing clone above can dissolve a captured value's only
-        // use, so the specialized body may reference fewer captures than the
-        // source declared. `recomputeCaptures` shrinks the function's capture
-        // slots to exactly what the body reads; pin the slots to that same set
-        // now and build the reference operands to match. A callable reference
-        // left dangling by a speculative caller keeps the operand span produced
-        // here, and `verifyCaptureInvariants` checks every expression, so the
-        // span must already agree with the settled capture set rather than the
-        // source's larger one. A capture the recompute keeps is one whose local
-        // is read by the body (directly or as a residual call's capture
-        // operand), which is exactly what a use count over the body detects.
-        var used_captures = std.ArrayList(Ast.TypedLocal).empty;
-        defer used_captures.deinit(self.pass.allocator);
-        var used_values = std.ArrayList(CaptureValue).empty;
-        defer used_values.deinit(self.pass.allocator);
-        for (captures) |capture| {
-            if (localUseCountInExpr(self.pass.program, capture.local, cloned_body) == 0) continue;
-            try used_captures.append(self.pass.allocator, capture);
-            const id = self.pass.program.captureIdOfLocal(capture.local);
-            const value = callableCaptureValueForId(callable.captures, id) orelse
-                Common.invariant("specialized callable had no value for a used capture slot");
-            try used_values.append(self.pass.allocator, .{ .id = id, .value = value });
-        }
-
-        const used_span = if (used_captures.items.len == captures.len)
-            captures_span
-        else
-            try self.pass.program.addTypedLocalSpan(used_captures.items);
-        self.pass.program.setFn(fn_id, .{
+        self.pass.program.setFn(worker_fn_id, .{
             .symbol = symbol,
             .source = source_fn.source,
             .args = args_span,
-            .captures = used_span,
-            .body = .{ .roc = cloned_body },
+            .captures = captures_span,
+            .body = .{ .roc = try self.cloneExpr(source_body) },
             .ret = source_fn.ret,
         });
 
         return try self.materializeCallableWithCaptures(
             callable.ty,
-            fn_id,
-            used_span,
-            used_values.items,
+            worker_fn_id,
+            captures_span,
+            callable.captures,
         );
     }
 

@@ -119,7 +119,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # ratchet:actions/checkout@v6.0.2
 
-      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # 2.2.1
+      - uses: xyzzylabs/setup-zig@09d85d9dbb73308882e7a26e61a8f706eed40df1 # ratchet:xyzzylabs/setup-zig@v1.0.2
         with:
           version: 0.16.0
           use-cache: true
@@ -132,14 +132,14 @@ jobs:
         run: rustup target add x86_64-unknown-linux-musl
 
       - name: Cache Zig dependency packages
-        uses: actions/cache@v4 # ratchet:actions/cache@v4
+        uses: actions/cache@v6.1.0 # ratchet:actions/cache@v6.1.0
         with:
           # Zig stores fetched packages in the `p/` subdir of the global cache.
           # Caching just that under a stable build.zig.zon-hash key keeps deps
           # present across runs: it is read every run, so it stays warm and is
-          # not evicted by mlugg's churnier per-run cache. A cold runner then no
+          # not evicted by the setup action's churnier per-run cache. A cold runner then no
           # longer re-downloads deps from GitHub and hits HttpConnectionClosing,
-          # while mlugg's own cache still handles build artifacts for speed.
+          # while the setup action's own cache still handles build artifacts for speed.
           path: ${{ env.ZIG_GLOBAL_CACHE_DIR }}/p
           key: zig-deps-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('build.zig.zon') }}
           restore-keys: |
@@ -150,7 +150,7 @@ jobs:
       # run-test-cli / run-test-dylib / run-test-archive inside minici).
       - name: Setup MSVC (Windows)
         if: runner.os == 'Windows'
-        uses: ilammy/msvc-dev-cmd@0b201ec74fa43914dc39ae48a89fd1d8cb592756 # ratchet:ilammy/msvc-dev-cmd@v1.13.0
+        uses: TheMrMilchmann/setup-msvc-dev@79dac248aac9d0059f86eae9d8b5bfab4e95e97c # ratchet:TheMrMilchmann/setup-msvc-dev@v4.0.0
         with:
           arch: x64
 
@@ -170,7 +170,7 @@ jobs:
 
       - name: Upload MiniCI report and logs
         if: failure()
-        uses: actions/upload-artifact@v4 # ratchet:actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7.0.1 # ratchet:actions/upload-artifact@v7.0.1
         with:
           name: minici-${{ matrix.os }}
           path: zig-out/minici/

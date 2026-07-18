@@ -13201,6 +13201,8 @@ const EvidencePass = struct {
             .hash => |hash| if (hash.structural_allowed) .hash else null,
             .parser_for => |parser_for| if (parser_for.structural_allowed) .parser else null,
             .encoder_for => |encoder_for| if (encoder_for.structural_allowed) .encoder else null,
+            .map => |map| if (map.structural_allowed) .map else null,
+            .map_effectful => |map| if (map.structural_allowed) .map_effectful else null,
         };
         // Nested evidence built for this plan's target forwards enclosing
         // where-vars against the same chain.
@@ -13302,8 +13304,7 @@ const EvidencePass = struct {
             .alias, .structure => {
                 if (self.methodOwnerForSourceContent(resolved.var_)) |owner| {
                     if (self.lookupMethodTargetAcrossViews(owner, method)) |target| {
-                        const node = try self.evidenceNodeForTarget(target, constraint_fn_var);
-                        return .{ .direct = node };
+                        return try self.resolutionForMethodTarget(target, structural_kind, constraint_fn_var);
                     }
                     // The dispatcher has an owner, checking passed, and no
                     // registry-visible view declares the method: the checker
@@ -13312,11 +13313,11 @@ const EvidencePass = struct {
                     // structurally, so a miss there is a publication bug
                     // (every view the checker resolved against is searched
                     // above).
-                    if (structural_kind) |kind| return .{ .structural = kind };
+                    if (structural_kind) |kind| return .{ .structural = try self.structuralDerivation(kind, constraint_fn_var) };
                     std.debug.panic("publication could not resolve a checked dispatch target for an owned method", .{});
                 }
                 // No owner head: a genuinely structural shape.
-                if (structural_kind) |kind| return .{ .structural = kind };
+                if (structural_kind) |kind| return .{ .structural = try self.structuralDerivation(kind, constraint_fn_var) };
                 // Checking already reported the missing method; the site is
                 // erroneous.
                 return .checked_error;
@@ -13372,8 +13373,7 @@ const EvidencePass = struct {
                 .checking_finalized => return .checked_error,
             };
             if (self.lookupMethodTargetAcrossViews(owner, method)) |target| {
-                const node = try self.evidenceNodeForTarget(target, null);
-                return .{ .direct = node };
+                return try self.resolutionForMethodTarget(target, structural_kind, null);
             }
         }
 
@@ -13382,8 +13382,43 @@ const EvidencePass = struct {
         // modes the vacuous shape decomposes structurally (equality of values
         // that never exist is defined); a value dispatch is statically
         // unreachable and lowers to an explicit crash.
-        if (structural_kind) |kind| return .{ .structural = kind };
+        if (structural_kind) |kind| switch (kind) {
+            .map, .map_effectful => return .unreachable_dispatch,
+            else => return .{ .structural = try self.structuralDerivation(kind, constraint_fn_var) },
+        };
         return .unreachable_dispatch;
+    }
+
+    fn structuralDerivation(
+        self: *EvidencePass,
+        kind: static_dispatch.StructuralKind,
+        constraint_fn_var: ?Var,
+    ) Allocator.Error!static_dispatch.StructuralDerivation {
+        return switch (kind) {
+            .equality => .equality,
+            .hash => .hash,
+            .parser => .parser,
+            .encoder => .encoder,
+            .map, .map_effectful => blk: {
+                const fn_var = constraint_fn_var orelse checkedArtifactInvariant("derived map evidence had no constraint function", .{});
+                const fn_root = self.types.resolveVar(fn_var).var_;
+                var source_plan: ?types.DerivedMapPlan = null;
+                for (self.types.static_dispatch_constraints.items.items) |constraint| {
+                    if (self.types.resolveVar(constraint.fn_var).var_ != fn_root) continue;
+                    source_plan = constraint.derived_map_plan orelse continue;
+                    break;
+                }
+                const plan = source_plan orelse checkedArtifactInvariant("derived map evidence had no checked payload selection", .{});
+                const canonical_plan = static_dispatch.DerivedMapPlan{
+                    .tag = try self.names.internTagIdent(self.module.identStoreConst(), plan.tag_name),
+                    .payload_index = plan.payload_index,
+                };
+                break :blk if (kind == .map)
+                    .{ .map = canonical_plan }
+                else
+                    .{ .map_effectful = canonical_plan };
+            },
+        };
     }
 
     /// The method owner of a settled source var, walking alias content
@@ -13423,6 +13458,26 @@ const EvidencePass = struct {
         }
     }
 
+    /// Preserve the checked registry's semantic resolution. Compiler-derived
+    /// structural declarations are evidence themselves and must never enter a
+    /// callable target's evidence-node graph.
+    fn resolutionForMethodTarget(
+        self: *EvidencePass,
+        target: static_dispatch.MethodTarget,
+        structural_kind: ?static_dispatch.StructuralKind,
+        constraint_fn_var: ?Var,
+    ) Allocator.Error!static_dispatch.StaticDispatchResolution {
+        return switch (target.kind) {
+            .structural => |kind| blk: {
+                if (structural_kind == null or structural_kind.? != kind) {
+                    checkedArtifactInvariant("structural method registry result did not match the checked dispatch result mode", .{});
+                }
+                break :blk .{ .structural = try self.structuralDerivation(kind, constraint_fn_var) };
+            },
+            .procedure, .local_proc => .{ .direct = try self.evidenceNodeForTarget(target, constraint_fn_var) },
+        };
+    }
+
     /// Build (memoized) the evidence node for `target`, with nested evidence
     /// from the discharge record keyed by `constraint_fn_var`.
     fn evidenceNodeForTarget(
@@ -13430,6 +13485,9 @@ const EvidencePass = struct {
         target: static_dispatch.MethodTarget,
         constraint_fn_var: ?Var,
     ) Allocator.Error!static_dispatch.EvidenceNodeId {
+        if (target.kind == .structural) {
+            checkedArtifactInvariant("structural method registry result reached the callable evidence-node graph", .{});
+        }
         const record_idx: ?u32 = if (constraint_fn_var) |fn_var|
             self.target_by_fn_var.get(@intFromEnum(self.types.resolveVar(fn_var).var_))
         else
@@ -13538,7 +13596,7 @@ const EvidencePass = struct {
     fn structuralKindForMethodIdent(self: *EvidencePass, fn_name: anytype) ?static_dispatch.StructuralKind {
         const common = self.module.commonIdents();
         inline for (static_dispatch.structural_method_kinds) |entry| {
-            if (fn_name.eql(@field(common, entry.name))) return entry.kind;
+            if (fn_name.eql(@field(common, entry.common_ident))) return entry.kind;
         }
         return null;
     }
@@ -14272,6 +14330,10 @@ pub const CheckedProcedureTemplateTable = struct {
             try by_def.append(allocator, .{
                 .def = def_idx,
                 .template = template_ref,
+                .kind = if (intrinsic) |intrinsic_id| switch (intrinsic_id) {
+                    .str_inspect => .callable,
+                    .structural_eq => .{ .structural = .equality },
+                } else .callable,
             });
             const source_checked_fn_root = checked_type_publication.rootForSourceVar(module, module.defType(def_idx)) orelse {
                 if (builtin.mode == .Debug) {
@@ -15977,7 +16039,6 @@ fn specializeResolvedStaticDispatchPlanCallables(
     names: *canonical.CanonicalNameStore,
     store: *CheckedTypeStore,
     artifact_key: CheckedModuleArtifactKey,
-    module_idx: u32,
     direct_imports: []const PublishImportArtifact,
     available_artifacts: []const ImportedModuleView,
     plans: *static_dispatch.StaticDispatchPlanTable,
@@ -15993,7 +16054,6 @@ fn specializeResolvedStaticDispatchPlanCallables(
             names,
             store,
             artifact_key,
-            module_idx,
             direct_imports,
             available_artifacts,
             target,
@@ -16016,7 +16076,6 @@ fn specializeResolvedStaticDispatchPlanCallables(
                         names,
                         store,
                         artifact_key,
-                        module_idx,
                         direct_imports,
                         available_artifacts,
                         target,
@@ -16040,27 +16099,13 @@ fn projectResolvedDispatchTargetCallable(
     names: *canonical.CanonicalNameStore,
     store: *CheckedTypeStore,
     artifact_key: CheckedModuleArtifactKey,
-    module_idx: u32,
     direct_imports: []const PublishImportArtifact,
     available_artifacts: []const ImportedModuleView,
     target: static_dispatch.MethodTarget,
 ) Allocator.Error!CheckedTypeId {
     const target_key = switch (target.kind) {
         .local_proc => return target.callable_ty,
-        .generated_structural_parser,
-        .generated_structural_encoder,
-        => {
-            if (target.module_idx == module_idx) return target.callable_ty;
-            const imported = importedModuleViewByModuleIdx(available_artifacts, target.module_idx) orelse direct: {
-                for (direct_imports) |import| {
-                    if (import.view.module_identity.module_idx == target.module_idx) break :direct import.view;
-                }
-                checkedArtifactInvariant("resolved generated structural dispatch target module was not available during checked publication", .{});
-            };
-            var projector = CheckedTypeStoreImportProjector.init(allocator, store, names, imported);
-            defer projector.deinit();
-            return try projector.project(target.callable_ty);
-        },
+        .structural => checkedArtifactInvariant("structural method registry result was published as a direct callable target", .{}),
         .procedure => |procedure| checkedArtifactKeyFromArtifactRef(procedure.template.artifact),
     };
     if (checkedArtifactKeyEql(target_key, artifact_key)) return target.callable_ty;
@@ -16874,16 +16919,6 @@ fn appendUniqueCheckedTypeSubstitution(
     }
     try formals.append(allocator, formal);
     try actuals.append(allocator, actual);
-}
-
-fn importedModuleViewByModuleIdx(
-    artifacts: []const ImportedModuleView,
-    module_idx: u32,
-) ?ImportedModuleView {
-    for (artifacts) |artifact| {
-        if (artifact.module_identity.module_idx == module_idx) return artifact;
-    }
-    return null;
 }
 
 fn importedModuleViewByKey(
@@ -23032,7 +23067,7 @@ pub const CheckedModuleArtifact = struct {
     /// Manual discriminant for `SERIALIZED_VERSION_HASH`: bump to force a cache /
     /// baked-blob invalidation for a layout change the structural fingerprint below
     /// cannot observe (e.g. a semantic change to how a field is interpreted).
-    const serialized_layout_version: u32 = 22;
+    const serialized_layout_version: u32 = 24;
 
     /// Comptime fingerprint of `Serialized`'s layout, mirroring
     /// `cache_module.MODULE_ENV_VERSION_HASH`. It is appended to the baked builtin
@@ -25593,7 +25628,6 @@ pub fn publishFromTypedModule(
         &canonical_names,
         checked_types,
         artifact_key,
-        module_idx,
         inputs.imports,
         inputs.available_artifacts,
         &static_dispatch_plans,
@@ -27646,8 +27680,8 @@ test "SERIALIZED_VERSION_HASH golden value" {
     // change, bump `serialized_layout_version` and replace the golden bytes below with
     // the ones this assertion prints.
     const golden: [32]u8 = .{
-        0x5D, 0xF6, 0xAB, 0x64, 0xC5, 0x46, 0xD5, 0xE6, 0x71, 0xAD, 0x77, 0xC1, 0x91, 0xAA, 0x46, 0xD9,
-        0x2C, 0xD9, 0x8D, 0x55, 0x1E, 0xD5, 0x56, 0xD8, 0x30, 0x61, 0xF3, 0x15, 0x60, 0x76, 0x2C, 0x86,
+        0x6A, 0x38, 0x1B, 0x6C, 0x78, 0x7F, 0x16, 0xA6, 0x0E, 0x22, 0x6A, 0xEE, 0x36, 0xF1, 0x13, 0x36,
+        0x78, 0x77, 0x71, 0xD2, 0x9D, 0x19, 0xB6, 0x80, 0x73, 0x8D, 0xE3, 0x5D, 0x02, 0x71, 0xC0, 0xFB,
     };
     try std.testing.expectEqualSlices(u8, &golden, &CheckedModuleArtifact.SERIALIZED_VERSION_HASH);
 }

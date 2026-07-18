@@ -144,6 +144,11 @@ pub const Options = struct {
     layout_request_const_plans: bool = true,
     /// Optional command-level test-plan metadata keyed by checked root order.
     test_plan_metadata: []const Common.RootTestPlanMetadata = &.{},
+    /// Debug-only: when set, the verifier's materialized Lambda Mono program is
+    /// moved into this slot after decision verification instead of being
+    /// destroyed, so a differential harness can execute it. The slot receives a
+    /// value only in Debug builds; release builds never materialize the tree.
+    debug_materialized_out: ?*?LambdaMono.Program = null,
 };
 
 /// Lower Lambda Solved directly into LIR.
@@ -346,6 +351,7 @@ const Lowerer = struct {
     current_fn: ?Type.FnId = null,
     current_proc: ?LIR.LirProcSpecId = null,
     erased_capture_ptr_ty: ?Type.TypeId = null,
+    debug_materialized_out: ?*?LambdaMono.Program = null,
 
     const ProcLocalSet = std.AutoArrayHashMapUnmanaged(u32, void);
 
@@ -394,6 +400,7 @@ const Lowerer = struct {
             .dict_seed_mode = options.dict_seed_mode,
             .proc_debug_names = options.proc_debug_names,
             .layout_request_const_plans = options.layout_request_const_plans,
+            .debug_materialized_out = options.debug_materialized_out,
             .root_requests = .{ .test_plan_metadata = options.test_plan_metadata },
             .folded_map_matches = .empty,
             .source_symbols = std.AutoHashMap(Common.Symbol, Lifted.FnId).init(allocator),
@@ -1901,7 +1908,8 @@ const Lowerer = struct {
             },
         });
         clone_owned = false;
-        defer materialized.deinit();
+        var materialized_owned = true;
+        defer if (materialized_owned) materialized.deinit();
 
         var type_equivalence = TypeEquivalence.init(self.allocator, self, &materialized.types);
         defer type_equivalence.deinit();
@@ -1910,6 +1918,11 @@ const Lowerer = struct {
         try self.verifyRootsMatch(&materialized);
         try self.verifyLayoutRequestsMatch(&materialized, &type_equivalence);
         try self.verifyRuntimeSchemaRequestsMatch(&materialized, &type_equivalence);
+
+        if (self.debug_materialized_out) |out| {
+            out.* = materialized;
+            materialized_owned = false;
+        }
     }
 
     fn verifyFnEntriesMatch(self: *Lowerer, materialized: *const LambdaMono.Program) Common.LowerError!void {

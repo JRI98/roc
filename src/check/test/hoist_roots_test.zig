@@ -1248,6 +1248,109 @@ test "hoist roots are not selected for effectful static dispatch calls" {
     try std.testing.expectEqual(@as(usize, 0), test_env.checker.selectedHoistedRoots().len);
 }
 
+test "hoist roots are not selected when an effectful function argument is called" {
+    // Repro for https://github.com/roc-lang/roc/issues/10154
+    var test_env = try TestEnv.init("Test",
+        \\effect! : () => I64
+        \\effect! = || 42.I64
+        \\
+        \\call! = |effect_arg!| effect_arg!()
+        \\
+        \\main! = |runtime| {
+        \\    value = call!(effect!)
+        \\    value + runtime
+        \\}
+    );
+    defer test_env.deinit();
+
+    try test_env.assertNoErrors();
+    try std.testing.expectEqual(@as(usize, 0), test_env.checker.selectedHoistedRoots().len);
+}
+
+test "hoist roots remain selectable when a pure function argument is called" {
+    var test_env = try TestEnv.init("Test",
+        \\pure : () -> I64
+        \\pure = || 42.I64
+        \\
+        \\call! = |function| function()
+        \\
+        \\main! = |runtime| {
+        \\    value = call!(pure)
+        \\    value + runtime
+        \\}
+    );
+    defer test_env.deinit();
+
+    try test_env.assertNoErrors();
+    try std.testing.expectEqual(@as(usize, 1), test_env.checker.selectedHoistedRoots().len);
+}
+
+test "hoist roots are not selected through transitive function effect dependencies" {
+    var test_env = try TestEnv.init("Test",
+        \\effect! : () => I64
+        \\effect! = || 42.I64
+        \\
+        \\call_once! = |effect_arg!| effect_arg!()
+        \\call_transitively! = |effect_arg!| call_once!(effect_arg!)
+        \\
+        \\main! = |runtime| {
+        \\    value = call_transitively!(effect!)
+        \\    value + runtime
+        \\}
+    );
+    defer test_env.deinit();
+
+    try test_env.assertNoErrors();
+    try std.testing.expectEqual(@as(usize, 0), test_env.checker.selectedHoistedRoots().len);
+}
+
+test "hoist roots resolve function effect dependencies through a recursive group" {
+    var test_env = try TestEnv.init("Test",
+        \\effect! : () => I64
+        \\effect! = || 42.I64
+        \\
+        \\first! = |n, effect_arg!| {
+        \\    if n == 0.U64 effect_arg!() else second!(n - 1.U64, effect_arg!)
+        \\}
+        \\second! = |n, effect_arg!| {
+        \\    if n == 0.U64 0.I64 else first!(n - 1.U64, effect_arg!)
+        \\}
+        \\
+        \\main! = |runtime| {
+        \\    value = second!(1.U64, effect!)
+        \\    value + runtime
+        \\}
+    );
+    defer test_env.deinit();
+
+    try test_env.assertNoErrors();
+    try std.testing.expectEqual(@as(usize, 0), test_env.checker.selectedHoistedRoots().len);
+}
+
+test "hoist roots preserve function effect dependencies across modules" {
+    var helper_env = try TestEnv.init("Helper",
+        \\call! = |effect_arg!| effect_arg!()
+    );
+    defer helper_env.deinit();
+    try helper_env.assertNoErrors();
+
+    var test_env = try TestEnv.initWithImport("Test",
+        \\import Helper
+        \\
+        \\effect! : () => I64
+        \\effect! = || 42.I64
+        \\
+        \\main! = |runtime| {
+        \\    value = Helper.call!(effect!)
+        \\    value + runtime
+        \\}
+    , "Helper", &helper_env);
+    defer test_env.deinit();
+
+    try test_env.assertNoErrors();
+    try std.testing.expectEqual(@as(usize, 0), test_env.checker.selectedHoistedRoots().len);
+}
+
 test "hoist roots are not selected for dict pseudo-seed dependent values" {
     var test_env = try TestEnv.init("Test",
         \\main! = || {

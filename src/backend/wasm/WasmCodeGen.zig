@@ -48,6 +48,7 @@ const FunctionIndex = index_types.FunctionIndex;
 const LocalFunctionIndex = index_types.LocalFunctionIndex;
 const SymbolIndex = index_types.SymbolIndex;
 const BuiltinKind = BuiltinSignatures.BuiltinKind;
+const LowLevelBuiltins = base.LowLevelBuiltins;
 const HostBuiltinImports = std.enums.EnumArray(BuiltinKind, ?u32);
 
 const LirProcSpec = LIR.LirProcSpec;
@@ -331,9 +332,9 @@ str_eq_import: ?u32 = null,
 /// Wasm function index for imported roc_list_eq host function.
 list_eq_import: ?u32 = null,
 /// Wasm function index for imported roc_i128_div_s host function.
-i128_div_s_import: ?u32 = null,
+num_div_trunc_i128_import: ?u32 = null,
 /// Wasm function index for imported roc_i128_mod_s host function.
-i128_mod_s_import: ?u32 = null,
+num_rem_trunc_i128_import: ?u32 = null,
 /// Wasm function index for imported roc_builtins_num_mod_i128 host function
 /// (signed i128 modulo whose result carries the sign of the divisor).
 num_mod_i128_import: ?u32 = null,
@@ -358,9 +359,9 @@ u32_mod_by_import: ?u32 = null,
 /// Wasm function index for imported roc_u64_mod_by host function.
 u64_mod_by_import: ?u32 = null,
 /// Wasm function index for imported roc_u128_div host function.
-u128_div_import: ?u32 = null,
+num_div_trunc_u128_import: ?u32 = null,
 /// Wasm function index for imported roc_u128_mod host function.
-u128_mod_import: ?u32 = null,
+num_rem_trunc_u128_import: ?u32 = null,
 /// Wasm function index for imported roc_dec_div host function.
 dec_div_import: ?u32 = null,
 /// Wasm function index for imported roc_dec_div_trunc host function.
@@ -406,15 +407,15 @@ float_atan_import: ?u32 = null,
 /// Wasm function index for imported roc_str_escape_and_quote host function.
 str_escape_and_quote_import: ?u32 = null,
 /// Wasm function index for imported roc_u128_to_dec host function.
-u128_to_dec_import: ?u32 = null,
+u128_to_dec_try_unsafe_import: ?u32 = null,
 /// Wasm function index for imported roc_i128_to_dec host function.
-i128_to_dec_import: ?u32 = null,
+i128_to_dec_try_unsafe_import: ?u32 = null,
 /// Wasm function index for imported roc_dec_to_i128 host function.
 dec_to_i128_import: ?u32 = null,
 /// Wasm function index for imported roc_dec_to_u128 host function.
 dec_to_u128_import: ?u32 = null,
 /// Wasm function index for imported roc_dec_to_f32 host function.
-dec_to_f32_import: ?u32 = null,
+dec_to_f32_try_unsafe_import: ?u32 = null,
 /// Wasm function index for imported roc_list_str_eq host function.
 list_str_eq_import: ?u32 = null,
 /// Wasm function index for imported roc_list_list_eq host function.
@@ -668,17 +669,17 @@ fn hostBuiltinImports(self: *const Self) HostBuiltinImports {
             .dec_acos => self.dec_acos_import,
             .dec_atan => self.dec_atan_import,
             .dec_to_str => self.dec_to_str_import,
-            .i128_div_s => self.i128_div_s_import,
-            .i128_mod_s => self.i128_mod_s_import,
+            .num_div_trunc_i128 => self.num_div_trunc_i128_import,
+            .num_rem_trunc_i128 => self.num_rem_trunc_i128_import,
             .num_mod_i128 => self.num_mod_i128_import,
-            .u128_div => self.u128_div_import,
-            .u128_mod => self.u128_mod_import,
+            .num_div_trunc_u128 => self.num_div_trunc_u128_import,
+            .num_rem_trunc_u128 => self.num_rem_trunc_u128_import,
             .num_mul_with_overflow_i128 => self.num_mul_with_overflow_i128_import,
             .num_mul_with_overflow_u128 => self.num_mul_with_overflow_u128_import,
-            .i128_to_dec => self.i128_to_dec_import,
-            .u128_to_dec => self.u128_to_dec_import,
+            .i128_to_dec_try_unsafe => self.i128_to_dec_try_unsafe_import,
+            .u128_to_dec_try_unsafe => self.u128_to_dec_try_unsafe_import,
             .dec_to_int_try_unsafe => null,
-            .dec_to_f32 => self.dec_to_f32_import,
+            .dec_to_f32_try_unsafe => self.dec_to_f32_try_unsafe_import,
             .float_to_str => self.float_to_str_import,
             .float_pow => self.float_pow_import,
             .float_sin => self.float_sin_import,
@@ -905,7 +906,7 @@ fn emitStrCaselessEqCall(self: *Self, lhs: u32, rhs: u32) Allocator.Error!void {
         try self.emitLocalGet(lhs);
         try self.emitLocalGet(rhs);
     }
-    try self.emitBuiltinCall(.str_caseless_ascii_equals, self.str_caseless_ascii_equals_import);
+    try self.emitBuiltinCall(BuiltinSignatures.kindOf(comptime LowLevelBuiltins.strOp(.str_caseless_ascii_equals)), self.str_caseless_ascii_equals_import);
 }
 
 fn emitAddressOffsetToLocal(self: *Self, base_local: u32, offset: u32) Allocator.Error!u32 {
@@ -925,11 +926,11 @@ fn emitStrEqCall(self: *Self, lhs_str_ptr: u32, rhs_str_ptr: u32) Allocator.Erro
         const rhs = try self.loadRocStrFields(rhs_str_ptr);
         try self.emitRocStrFields(lhs);
         try self.emitRocStrFields(rhs);
-        try self.emitBuiltinCall(.str_equal, self.str_eq_import);
+        try self.emitBuiltinCall(BuiltinSignatures.kindOf(comptime LowLevelBuiltins.strOp(.str_is_eq)), self.str_eq_import);
     } else {
         try self.emitLocalGet(lhs_str_ptr);
         try self.emitLocalGet(rhs_str_ptr);
-        try self.emitBuiltinCall(.str_equal, self.str_eq_import);
+        try self.emitBuiltinCall(BuiltinSignatures.kindOf(comptime LowLevelBuiltins.strOp(.str_is_eq)), self.str_eq_import);
     }
 }
 
@@ -1016,11 +1017,11 @@ fn emitHasherU128Parts(self: *Self, value: ProcLocalId) Allocator.Error!void {
 fn emitHasherLowLevel(self: *Self, op: lir.LowLevel, args: anytype) Allocator.Error!void {
     switch (op) {
         .dict_pseudo_seed => {
-            try self.emitBuiltinCall(.dict_pseudo_seed, self.dict_pseudo_seed_import);
+            try self.emitBuiltinCall(BuiltinSignatures.kindOf(comptime LowLevelBuiltins.hasherOp(.dict_pseudo_seed)), self.dict_pseudo_seed_import);
         },
         .hasher_finish => {
             try self.emitHasherState(GuardedList.at(args, 0));
-            try self.emitBuiltinCall(.hasher_finish, self.hasher_finish_import);
+            try self.emitBuiltinCall(BuiltinSignatures.kindOf(comptime LowLevelBuiltins.hasherOp(.hasher_finish)), self.hasher_finish_import);
         },
         .hasher_write_bool,
         .hasher_write_u8,
@@ -1036,19 +1037,19 @@ fn emitHasherLowLevel(self: *Self, op: lir.LowLevel, args: anytype) Allocator.Er
             try self.emitI32Const(@intCast(@intFromEnum(lir.hasherDomain(op))));
             try self.emitHasherScalarAsI64(GuardedList.at(args, 1));
             try self.emitI32Const(@intCast(lir.hasherU64Width(op)));
-            try self.emitBuiltinCall(.hasher_write_u64, self.hasher_write_u64_import);
+            try self.emitBuiltinCall(BuiltinSignatures.kindOf(comptime LowLevelBuiltins.hasherOp(.hasher_write_u64)), self.hasher_write_u64_import);
             try self.emitHasherRecordFromI64();
         },
         .hasher_write_f32 => {
             try self.emitHasherState(GuardedList.at(args, 0));
             try self.emitHasherFloatBits(GuardedList.at(args, 1), true);
-            try self.emitBuiltinCall(.hasher_write_f32_bits, self.hasher_write_f32_bits_import);
+            try self.emitBuiltinCall(BuiltinSignatures.kindOf(comptime LowLevelBuiltins.hasherOp(.hasher_write_f32)), self.hasher_write_f32_bits_import);
             try self.emitHasherRecordFromI64();
         },
         .hasher_write_f64 => {
             try self.emitHasherState(GuardedList.at(args, 0));
             try self.emitHasherFloatBits(GuardedList.at(args, 1), false);
-            try self.emitBuiltinCall(.hasher_write_f64_bits, self.hasher_write_f64_bits_import);
+            try self.emitBuiltinCall(BuiltinSignatures.kindOf(comptime LowLevelBuiltins.hasherOp(.hasher_write_f64)), self.hasher_write_f64_bits_import);
             try self.emitHasherRecordFromI64();
         },
         .hasher_write_u128,
@@ -1058,7 +1059,7 @@ fn emitHasherLowLevel(self: *Self, op: lir.LowLevel, args: anytype) Allocator.Er
             try self.emitHasherState(GuardedList.at(args, 0));
             try self.emitI32Const(@intCast(@intFromEnum(lir.hasherDomain(op))));
             try self.emitHasherU128Parts(GuardedList.at(args, 1));
-            try self.emitBuiltinCall(.hasher_write_u128, self.hasher_write_u128_import);
+            try self.emitBuiltinCall(BuiltinSignatures.kindOf(comptime LowLevelBuiltins.hasherOp(.hasher_write_u128)), self.hasher_write_u128_import);
             try self.emitHasherRecordFromI64();
         },
         .hasher_write_bytes => {
@@ -1071,7 +1072,7 @@ fn emitHasherLowLevel(self: *Self, op: lir.LowLevel, args: anytype) Allocator.Er
             try self.emitI32Const(@intCast(@intFromEnum(lir.hasherDomain(op))));
             try self.emitLocalGet(fields.bytes);
             try self.emitLocalGet(fields.len);
-            try self.emitBuiltinCall(.hasher_write_bytes, self.hasher_write_bytes_import);
+            try self.emitBuiltinCall(BuiltinSignatures.kindOf(comptime LowLevelBuiltins.hasherOp(.hasher_write_bytes)), self.hasher_write_bytes_import);
             try self.emitHasherRecordFromI64();
         },
         .hasher_write_str => {
@@ -1093,7 +1094,7 @@ fn emitHasherLowLevel(self: *Self, op: lir.LowLevel, args: anytype) Allocator.Er
             // The host import ignores capacity; pass the decoded length as a filler
             // so the call shape stays (hasher, ptr, len, cap).
             try self.emitLocalGet(str_len_local);
-            try self.emitBuiltinCall(.hasher_write_str, self.hasher_write_str_import);
+            try self.emitBuiltinCall(BuiltinSignatures.kindOf(comptime LowLevelBuiltins.hasherOp(.hasher_write_str)), self.hasher_write_str_import);
             try self.emitHasherRecordFromI64();
         },
         else => unreachable,
@@ -1109,14 +1110,14 @@ fn emitCryptoLowLevel(self: *Self, op: lir.LowLevel, args: anytype) Allocator.Er
     };
 
     const call: CryptoCall = switch (op) {
-        .crypto_sha256_hash_bytes => .{ .arity = .one, .kind = .crypto_sha256_hash_bytes, .host_import = self.crypto_sha256_hash_bytes_import },
-        .crypto_sha256_hasher_empty => .{ .arity = .zero, .kind = .crypto_sha256_hasher_empty, .host_import = self.crypto_sha256_hasher_empty_import },
-        .crypto_sha256_hasher_write => .{ .arity = .two, .kind = .crypto_sha256_hasher_write, .host_import = self.crypto_sha256_hasher_write_import },
-        .crypto_sha256_hasher_finish => .{ .arity = .one, .kind = .crypto_sha256_hasher_finish, .host_import = self.crypto_sha256_hasher_finish_import },
-        .crypto_blake3_hash_bytes => .{ .arity = .one, .kind = .crypto_blake3_hash_bytes, .host_import = self.crypto_blake3_hash_bytes_import },
-        .crypto_blake3_hasher_empty => .{ .arity = .zero, .kind = .crypto_blake3_hasher_empty, .host_import = self.crypto_blake3_hasher_empty_import },
-        .crypto_blake3_hasher_write => .{ .arity = .two, .kind = .crypto_blake3_hasher_write, .host_import = self.crypto_blake3_hasher_write_import },
-        .crypto_blake3_hasher_finish => .{ .arity = .one, .kind = .crypto_blake3_hasher_finish, .host_import = self.crypto_blake3_hasher_finish_import },
+        .crypto_sha256_hash_bytes => .{ .arity = .one, .kind = BuiltinSignatures.kindOf(comptime LowLevelBuiltins.cryptoOp(.crypto_sha256_hash_bytes)), .host_import = self.crypto_sha256_hash_bytes_import },
+        .crypto_sha256_hasher_empty => .{ .arity = .zero, .kind = BuiltinSignatures.kindOf(comptime LowLevelBuiltins.cryptoOp(.crypto_sha256_hasher_empty)), .host_import = self.crypto_sha256_hasher_empty_import },
+        .crypto_sha256_hasher_write => .{ .arity = .two, .kind = BuiltinSignatures.kindOf(comptime LowLevelBuiltins.cryptoOp(.crypto_sha256_hasher_write)), .host_import = self.crypto_sha256_hasher_write_import },
+        .crypto_sha256_hasher_finish => .{ .arity = .one, .kind = BuiltinSignatures.kindOf(comptime LowLevelBuiltins.cryptoOp(.crypto_sha256_hasher_finish)), .host_import = self.crypto_sha256_hasher_finish_import },
+        .crypto_blake3_hash_bytes => .{ .arity = .one, .kind = BuiltinSignatures.kindOf(comptime LowLevelBuiltins.cryptoOp(.crypto_blake3_hash_bytes)), .host_import = self.crypto_blake3_hash_bytes_import },
+        .crypto_blake3_hasher_empty => .{ .arity = .zero, .kind = BuiltinSignatures.kindOf(comptime LowLevelBuiltins.cryptoOp(.crypto_blake3_hasher_empty)), .host_import = self.crypto_blake3_hasher_empty_import },
+        .crypto_blake3_hasher_write => .{ .arity = .two, .kind = BuiltinSignatures.kindOf(comptime LowLevelBuiltins.cryptoOp(.crypto_blake3_hasher_write)), .host_import = self.crypto_blake3_hasher_write_import },
+        .crypto_blake3_hasher_finish => .{ .arity = .one, .kind = BuiltinSignatures.kindOf(comptime LowLevelBuiltins.cryptoOp(.crypto_blake3_hasher_finish)), .host_import = self.crypto_blake3_hasher_finish_import },
         else => unreachable,
     };
 
@@ -1656,10 +1657,10 @@ fn registerHostImports(self: *Self) Allocator.Error!void {
         &.{ .i32, .i32, .i32 },
         &.{},
     );
-    self.i128_div_s_import = try self.module.addImport("env", "roc_i128_div_s", i128_binop_type);
-    self.i128_mod_s_import = try self.module.addImport("env", "roc_i128_mod_s", i128_binop_type);
-    self.u128_div_import = try self.module.addImport("env", "roc_u128_div", i128_binop_type);
-    self.u128_mod_import = try self.module.addImport("env", "roc_u128_mod", i128_binop_type);
+    self.num_div_trunc_i128_import = try self.module.addImport("env", "roc_i128_div_s", i128_binop_type);
+    self.num_rem_trunc_i128_import = try self.module.addImport("env", "roc_i128_mod_s", i128_binop_type);
+    self.num_div_trunc_u128_import = try self.module.addImport("env", "roc_u128_div", i128_binop_type);
+    self.num_rem_trunc_u128_import = try self.module.addImport("env", "roc_u128_mod", i128_binop_type);
     self.dec_div_import = try self.module.addImport("env", "roc_dec_div", i128_binop_type);
     self.dec_div_trunc_import = try self.module.addImport("env", "roc_dec_div_trunc", i128_binop_type);
     self.dec_pow_import = try self.module.addImport("env", "roc_dec_pow", i128_binop_type);
@@ -1668,8 +1669,8 @@ fn registerHostImports(self: *Self) Allocator.Error!void {
         &.{ .i32, .i32, .i64, .i64, .i64, .i64 },
         &.{.i32},
     );
-    self.num_mul_with_overflow_i128_import = try self.module.addImport("env", "roc_builtins_num_mul_with_overflow_i128", i128_mul_overflow_type);
-    self.num_mul_with_overflow_u128_import = try self.module.addImport("env", "roc_builtins_num_mul_with_overflow_u128", i128_mul_overflow_type);
+    self.num_mul_with_overflow_i128_import = try self.module.addImport("env", BuiltinSignatures.sigOf(.num_mul_with_overflow_i128).name, i128_mul_overflow_type);
+    self.num_mul_with_overflow_u128_import = try self.module.addImport("env", BuiltinSignatures.sigOf(.num_mul_with_overflow_u128).name, i128_mul_overflow_type);
 
     // Signed i128 modulo (decomposed wrapper ABI):
     // (out_low_ptr, out_high_ptr, a_low, a_high, b_low, b_high, roc_ops) -> void
@@ -1677,7 +1678,7 @@ fn registerHostImports(self: *Self) Allocator.Error!void {
         &.{ .i32, .i32, .i64, .i64, .i64, .i64, .i32 },
         &.{},
     );
-    self.num_mod_i128_import = try self.module.addImport("env", "roc_builtins_num_mod_i128", i128_mod_type);
+    self.num_mod_i128_import = try self.module.addImport("env", BuiltinSignatures.sigOf(.num_mod_i128).name, i128_mod_type);
 
     const dec_unary_type = try self.module.addFuncType(
         &.{ .i32, .i32 },
@@ -1751,8 +1752,8 @@ fn registerHostImports(self: *Self) Allocator.Error!void {
         &.{ .i32, .i32 },
         &.{.i32},
     );
-    self.u128_to_dec_import = try self.module.addImport("env", "roc_u128_to_dec", i128_dec_conv_type);
-    self.i128_to_dec_import = try self.module.addImport("env", "roc_i128_to_dec", i128_dec_conv_type);
+    self.u128_to_dec_try_unsafe_import = try self.module.addImport("env", "roc_u128_to_dec", i128_dec_conv_type);
+    self.i128_to_dec_try_unsafe_import = try self.module.addImport("env", "roc_i128_to_dec", i128_dec_conv_type);
     self.dec_to_i128_import = try self.module.addImport("env", "roc_dec_to_i128", i128_dec_conv_type);
     self.dec_to_u128_import = try self.module.addImport("env", "roc_dec_to_u128", i128_dec_conv_type);
 
@@ -1761,7 +1762,7 @@ fn registerHostImports(self: *Self) Allocator.Error!void {
         &.{.i32},
         &.{.f32},
     );
-    self.dec_to_f32_import = try self.module.addImport("env", "roc_dec_to_f32", dec_to_f32_type);
+    self.dec_to_f32_try_unsafe_import = try self.module.addImport("env", "roc_dec_to_f32", dec_to_f32_type);
 
     // List of strings equality: (list_a_ptr, list_b_ptr) -> i32
     const list_str_eq_type = try self.module.addFuncType(
@@ -4320,11 +4321,11 @@ fn expandField(
             const rhs_list_local = try self.emitAddressOffsetToLocal(rhs_local, field_offset);
 
             if (elem_layout == .str) {
-                try self.emitListEqCall(lhs_list_local, rhs_list_local, .list_str_eq, self.list_str_eq_import, null);
+                try self.emitListEqCall(lhs_list_local, rhs_list_local, BuiltinSignatures.kindOf(comptime LowLevelBuiltins.listEq(.str)), self.list_str_eq_import, null);
             } else if (ls.getLayout(elem_layout).tag == .list) {
                 const inner_elem_layout = ls.getLayout(elem_layout).getIdx();
                 const inner_elem_size = try self.layoutByteSize(inner_elem_layout);
-                try self.emitListEqCall(lhs_list_local, rhs_list_local, .list_list_eq, self.list_list_eq_import, inner_elem_size);
+                try self.emitListEqCall(lhs_list_local, rhs_list_local, BuiltinSignatures.kindOf(comptime LowLevelBuiltins.listEq(.list)), self.list_list_eq_import, inner_elem_size);
             } else if (builtinInternalLayoutContainsRefcounted(ls, "wasm.compareFieldByLayout.builtin_elem_rc", elem_layout)) {
                 // Composite elements (records/tuples/tag-unions with refcounted fields):
                 // inline element-by-element structural comparison loop.
@@ -4337,7 +4338,7 @@ fn expandField(
                 } });
             } else {
                 const elem_size = try self.layoutByteSize(elem_layout);
-                try self.emitListEqCall(lhs_list_local, rhs_list_local, .list_eq, self.list_eq_import, elem_size);
+                try self.emitListEqCall(lhs_list_local, rhs_list_local, BuiltinSignatures.kindOf(comptime LowLevelBuiltins.listEq(.flat)), self.list_eq_import, elem_size);
             }
         },
         .struct_, .tag_union => {
@@ -4698,34 +4699,34 @@ fn emitCompositeNumericOp(self: *Self, op: anytype, args: anytype, ret_layout: l
             .num_minus => try self.emitI128Sub(lhs_local, rhs_local),
             .num_times => {
                 if (operand_layout == .dec) {
-                    try self.emitI128BuiltinBinOp(lhs_local, rhs_local, .dec_mul, self.dec_mul_import);
+                    try self.emitI128BuiltinBinOp(lhs_local, rhs_local, BuiltinSignatures.kindOf(comptime LowLevelBuiltins.decBinaryArith(.num_times)), self.dec_mul_import);
                     return;
                 }
                 try self.emitI128Mul(lhs_local, rhs_local);
             },
             .num_div_by => {
                 if (operand_layout == .dec) {
-                    try self.emitI128BuiltinBinOp(lhs_local, rhs_local, .dec_div, self.dec_div_import);
+                    try self.emitI128BuiltinBinOp(lhs_local, rhs_local, BuiltinSignatures.kindOf(comptime LowLevelBuiltins.decBinaryArith(.num_div_by)), self.dec_div_import);
                 } else if (operand_layout == .i128) {
-                    try self.emitI128BuiltinBinOp(lhs_local, rhs_local, .i128_div_s, self.i128_div_s_import);
+                    try self.emitI128BuiltinBinOp(lhs_local, rhs_local, BuiltinSignatures.kindOf(comptime LowLevelBuiltins.i128DivRem(false, false)), self.num_div_trunc_i128_import);
                 } else {
-                    try self.emitI128BuiltinBinOp(lhs_local, rhs_local, .u128_div, self.u128_div_import);
+                    try self.emitI128BuiltinBinOp(lhs_local, rhs_local, BuiltinSignatures.kindOf(comptime LowLevelBuiltins.i128DivRem(false, true)), self.num_div_trunc_u128_import);
                 }
             },
             .num_div_trunc_by => {
                 if (operand_layout == .dec) {
-                    try self.emitI128BuiltinBinOp(lhs_local, rhs_local, .dec_div_trunc, self.dec_div_trunc_import);
+                    try self.emitI128BuiltinBinOp(lhs_local, rhs_local, BuiltinSignatures.kindOf(comptime LowLevelBuiltins.decBinaryArith(.num_div_trunc_by)), self.dec_div_trunc_import);
                 } else if (operand_layout == .i128) {
-                    try self.emitI128BuiltinBinOp(lhs_local, rhs_local, .i128_div_s, self.i128_div_s_import);
+                    try self.emitI128BuiltinBinOp(lhs_local, rhs_local, BuiltinSignatures.kindOf(comptime LowLevelBuiltins.i128DivRem(false, false)), self.num_div_trunc_i128_import);
                 } else {
-                    try self.emitI128BuiltinBinOp(lhs_local, rhs_local, .u128_div, self.u128_div_import);
+                    try self.emitI128BuiltinBinOp(lhs_local, rhs_local, BuiltinSignatures.kindOf(comptime LowLevelBuiltins.i128DivRem(false, true)), self.num_div_trunc_u128_import);
                 }
             },
             .num_rem_by => {
                 if (operand_layout == .i128 or operand_layout == .dec) {
-                    try self.emitI128BuiltinBinOp(lhs_local, rhs_local, .i128_mod_s, self.i128_mod_s_import);
+                    try self.emitI128BuiltinBinOp(lhs_local, rhs_local, BuiltinSignatures.kindOf(comptime LowLevelBuiltins.i128DivRem(true, false)), self.num_rem_trunc_i128_import);
                 } else {
-                    try self.emitI128BuiltinBinOp(lhs_local, rhs_local, .u128_mod, self.u128_mod_import);
+                    try self.emitI128BuiltinBinOp(lhs_local, rhs_local, BuiltinSignatures.kindOf(comptime LowLevelBuiltins.i128DivRem(true, true)), self.num_rem_trunc_u128_import);
                 }
             },
             .num_mod_by => {
@@ -4733,7 +4734,7 @@ fn emitCompositeNumericOp(self: *Self, op: anytype, args: anytype, ret_layout: l
                     try self.emitI128ModBuiltin(lhs_local, rhs_local);
                 } else {
                     // Unsigned modulo equals the truncated remainder.
-                    try self.emitI128BuiltinBinOp(lhs_local, rhs_local, .u128_mod, self.u128_mod_import);
+                    try self.emitI128BuiltinBinOp(lhs_local, rhs_local, BuiltinSignatures.kindOf(comptime LowLevelBuiltins.i128Mod(true)), self.num_rem_trunc_u128_import);
                 }
             },
             .num_is_gt => {
@@ -4840,7 +4841,7 @@ fn emitI128ModBuiltin(self: *Self, lhs_local: u32, rhs_local: u32) Allocator.Err
     try self.emitLocalGet(rhs_local);
     try self.emitLoadOp(.i64, 8);
     try self.emitLocalGet(self.roc_ops_local);
-    try self.emitBuiltinCall(.num_mod_i128, self.num_mod_i128_import);
+    try self.emitBuiltinCall(BuiltinSignatures.kindOf(comptime LowLevelBuiltins.i128Mod(false)), self.num_mod_i128_import);
 
     try self.emitLocalGet(result_local);
 }
@@ -4978,9 +4979,9 @@ fn emitCheckedI128Mul(self: *Self, checked_op: LIR.LowLevel, lhs_local: u32, rhs
     try self.emitLocalGet(rhs_local);
     try self.emitLoadOp(.i64, 8);
     if (operand_layout == .u128) {
-        try self.emitBuiltinCall(.num_mul_with_overflow_u128, self.num_mul_with_overflow_u128_import);
+        try self.emitBuiltinCall(BuiltinSignatures.kindOf(comptime LowLevelBuiltins.checkedMul128(true)), self.num_mul_with_overflow_u128_import);
     } else {
-        try self.emitBuiltinCall(.num_mul_with_overflow_i128, self.num_mul_with_overflow_i128_import);
+        try self.emitBuiltinCall(BuiltinSignatures.kindOf(comptime LowLevelBuiltins.checkedMul128(false)), self.num_mul_with_overflow_i128_import);
     }
     try self.emitCrashIfStackBool(checkedOverflowMessage(checked_op));
     try self.emitLocalGet(result_local);
@@ -5023,9 +5024,9 @@ fn emitCheckedCompositeNumericOp(self: *Self, checked_op: LIR.LowLevel, plain_op
                 try self.emitCrashIfStackBool(checkedOverflowMessage(checked_op));
             }
             if (operand_layout == .i128) {
-                try self.emitI128BuiltinBinOp(lhs_local, rhs_local, .i128_div_s, self.i128_div_s_import);
+                try self.emitI128BuiltinBinOp(lhs_local, rhs_local, BuiltinSignatures.kindOf(comptime LowLevelBuiltins.i128DivRem(false, false)), self.num_div_trunc_i128_import);
             } else {
-                try self.emitI128BuiltinBinOp(lhs_local, rhs_local, .u128_div, self.u128_div_import);
+                try self.emitI128BuiltinBinOp(lhs_local, rhs_local, BuiltinSignatures.kindOf(comptime LowLevelBuiltins.i128DivRem(false, true)), self.num_div_trunc_u128_import);
             }
         },
         .num_rem_by, .num_mod_by => {
@@ -5040,11 +5041,11 @@ fn emitCheckedCompositeNumericOp(self: *Self, checked_op: LIR.LowLevel, plain_op
                 if (plain_op == .num_mod_by) {
                     try self.emitI128ModBuiltin(lhs_local, rhs_local);
                 } else {
-                    try self.emitI128BuiltinBinOp(lhs_local, rhs_local, .i128_mod_s, self.i128_mod_s_import);
+                    try self.emitI128BuiltinBinOp(lhs_local, rhs_local, BuiltinSignatures.kindOf(comptime LowLevelBuiltins.i128DivRem(true, false)), self.num_rem_trunc_i128_import);
                 }
                 self.currentCode().append(self.allocator, Op.end) catch return error.OutOfMemory;
             } else {
-                try self.emitI128BuiltinBinOp(lhs_local, rhs_local, .u128_mod, self.u128_mod_import);
+                try self.emitI128BuiltinBinOp(lhs_local, rhs_local, BuiltinSignatures.kindOf(comptime LowLevelBuiltins.i128DivRem(true, true)), self.num_rem_trunc_u128_import);
             }
         },
         else => unreachable,
@@ -5417,14 +5418,14 @@ fn emitCheckedScalarModuloBuiltin(self: *Self, lhs: u32, rhs: u32, layout_idx: l
     try self.emitLocalGet(rhs);
 
     switch (layout_idx) {
-        .i8 => try self.emitBuiltinCall(.i8_mod_by, self.i8_mod_by_import),
-        .u8 => try self.emitBuiltinCall(.u8_mod_by, self.u8_mod_by_import),
-        .i16 => try self.emitBuiltinCall(.i16_mod_by, self.i16_mod_by_import),
-        .u16 => try self.emitBuiltinCall(.u16_mod_by, self.u16_mod_by_import),
-        .i32 => try self.emitBuiltinCall(.i32_mod_by, self.i32_mod_by_import),
-        .u32 => try self.emitBuiltinCall(.u32_mod_by, self.u32_mod_by_import),
-        .i64 => try self.emitBuiltinCall(.i64_mod_by, self.i64_mod_by_import),
-        .u64 => try self.emitBuiltinCall(.u64_mod_by, self.u64_mod_by_import),
+        .i8 => try self.emitBuiltinCall(BuiltinSignatures.kindOf(comptime LowLevelBuiltins.scalarModBy(8, true)), self.i8_mod_by_import),
+        .u8 => try self.emitBuiltinCall(BuiltinSignatures.kindOf(comptime LowLevelBuiltins.scalarModBy(8, false)), self.u8_mod_by_import),
+        .i16 => try self.emitBuiltinCall(BuiltinSignatures.kindOf(comptime LowLevelBuiltins.scalarModBy(16, true)), self.i16_mod_by_import),
+        .u16 => try self.emitBuiltinCall(BuiltinSignatures.kindOf(comptime LowLevelBuiltins.scalarModBy(16, false)), self.u16_mod_by_import),
+        .i32 => try self.emitBuiltinCall(BuiltinSignatures.kindOf(comptime LowLevelBuiltins.scalarModBy(32, true)), self.i32_mod_by_import),
+        .u32 => try self.emitBuiltinCall(BuiltinSignatures.kindOf(comptime LowLevelBuiltins.scalarModBy(32, false)), self.u32_mod_by_import),
+        .i64 => try self.emitBuiltinCall(BuiltinSignatures.kindOf(comptime LowLevelBuiltins.scalarModBy(64, true)), self.i64_mod_by_import),
+        .u64 => try self.emitBuiltinCall(BuiltinSignatures.kindOf(comptime LowLevelBuiltins.scalarModBy(64, false)), self.u64_mod_by_import),
         else => unreachable,
     }
 }
@@ -10825,56 +10826,56 @@ fn generateLowLevel(self: *Self, ll: anytype) Allocator.Error!void {
         // Float math functions (direct wasm opcodes)
         .num_pow => {
             if (ll.ret_layout == .dec) {
-                try self.emitDecBinaryMath(args, .dec_pow, self.dec_pow_import);
+                try self.emitDecBinaryMath(args, BuiltinSignatures.kindOf(comptime LowLevelBuiltins.decBinaryArith(.num_pow)), self.dec_pow_import);
             } else {
                 try self.emitFloatPow(args, ll.ret_layout);
             }
         },
         .num_sin => {
             if (ll.ret_layout == .dec) {
-                try self.emitDecUnaryMath(GuardedList.at(args, 0), .dec_sin, self.dec_sin_import);
+                try self.emitDecUnaryMath(GuardedList.at(args, 0), BuiltinSignatures.kindOf(comptime LowLevelBuiltins.unaryMathDec(.num_sin)), self.dec_sin_import);
             } else {
-                try self.emitFloatUnaryMath(GuardedList.at(args, 0), ll.ret_layout, .float_sin, self.float_sin_import);
+                try self.emitFloatUnaryMath(GuardedList.at(args, 0), ll.ret_layout, BuiltinSignatures.kindOf(comptime LowLevelBuiltins.unaryMathFloat(.num_sin)), self.float_sin_import);
             }
         },
         .num_cos => {
             if (ll.ret_layout == .dec) {
-                try self.emitDecUnaryMath(GuardedList.at(args, 0), .dec_cos, self.dec_cos_import);
+                try self.emitDecUnaryMath(GuardedList.at(args, 0), BuiltinSignatures.kindOf(comptime LowLevelBuiltins.unaryMathDec(.num_cos)), self.dec_cos_import);
             } else {
-                try self.emitFloatUnaryMath(GuardedList.at(args, 0), ll.ret_layout, .float_cos, self.float_cos_import);
+                try self.emitFloatUnaryMath(GuardedList.at(args, 0), ll.ret_layout, BuiltinSignatures.kindOf(comptime LowLevelBuiltins.unaryMathFloat(.num_cos)), self.float_cos_import);
             }
         },
         .num_tan => {
             if (ll.ret_layout == .dec) {
-                try self.emitDecUnaryMath(GuardedList.at(args, 0), .dec_tan, self.dec_tan_import);
+                try self.emitDecUnaryMath(GuardedList.at(args, 0), BuiltinSignatures.kindOf(comptime LowLevelBuiltins.unaryMathDec(.num_tan)), self.dec_tan_import);
             } else {
-                try self.emitFloatUnaryMath(GuardedList.at(args, 0), ll.ret_layout, .float_tan, self.float_tan_import);
+                try self.emitFloatUnaryMath(GuardedList.at(args, 0), ll.ret_layout, BuiltinSignatures.kindOf(comptime LowLevelBuiltins.unaryMathFloat(.num_tan)), self.float_tan_import);
             }
         },
         .num_asin => {
             if (ll.ret_layout == .dec) {
-                try self.emitDecUnaryMath(GuardedList.at(args, 0), .dec_asin, self.dec_asin_import);
+                try self.emitDecUnaryMath(GuardedList.at(args, 0), BuiltinSignatures.kindOf(comptime LowLevelBuiltins.unaryMathDec(.num_asin)), self.dec_asin_import);
             } else {
-                try self.emitFloatUnaryMath(GuardedList.at(args, 0), ll.ret_layout, .float_asin, self.float_asin_import);
+                try self.emitFloatUnaryMath(GuardedList.at(args, 0), ll.ret_layout, BuiltinSignatures.kindOf(comptime LowLevelBuiltins.unaryMathFloat(.num_asin)), self.float_asin_import);
             }
         },
         .num_acos => {
             if (ll.ret_layout == .dec) {
-                try self.emitDecUnaryMath(GuardedList.at(args, 0), .dec_acos, self.dec_acos_import);
+                try self.emitDecUnaryMath(GuardedList.at(args, 0), BuiltinSignatures.kindOf(comptime LowLevelBuiltins.unaryMathDec(.num_acos)), self.dec_acos_import);
             } else {
-                try self.emitFloatUnaryMath(GuardedList.at(args, 0), ll.ret_layout, .float_acos, self.float_acos_import);
+                try self.emitFloatUnaryMath(GuardedList.at(args, 0), ll.ret_layout, BuiltinSignatures.kindOf(comptime LowLevelBuiltins.unaryMathFloat(.num_acos)), self.float_acos_import);
             }
         },
         .num_atan => {
             if (ll.ret_layout == .dec) {
-                try self.emitDecUnaryMath(GuardedList.at(args, 0), .dec_atan, self.dec_atan_import);
+                try self.emitDecUnaryMath(GuardedList.at(args, 0), BuiltinSignatures.kindOf(comptime LowLevelBuiltins.unaryMathDec(.num_atan)), self.dec_atan_import);
             } else {
-                try self.emitFloatUnaryMath(GuardedList.at(args, 0), ll.ret_layout, .float_atan, self.float_atan_import);
+                try self.emitFloatUnaryMath(GuardedList.at(args, 0), ll.ret_layout, BuiltinSignatures.kindOf(comptime LowLevelBuiltins.unaryMathFloat(.num_atan)), self.float_atan_import);
             }
         },
         .num_sqrt => {
             if (ll.ret_layout == .dec) {
-                try self.emitDecUnaryMath(GuardedList.at(args, 0), .dec_sqrt, self.dec_sqrt_import);
+                try self.emitDecUnaryMath(GuardedList.at(args, 0), BuiltinSignatures.kindOf(comptime LowLevelBuiltins.unaryMathDec(.num_sqrt)), self.dec_sqrt_import);
             } else {
                 try self.emitProcLocal(GuardedList.at(args, 0));
                 const vt = try self.resolveValType(ll.ret_layout);
@@ -11810,7 +11811,7 @@ fn generateLowLevel(self: *Self, ll: anytype) Allocator.Error!void {
                 try self.emitI32Const(@intCast(before_offset));
                 try self.emitI32Const(@intCast(found_offset));
             }
-            try self.emitBuiltinCall(.str_find_first, self.str_find_first_import);
+            try self.emitBuiltinCall(BuiltinSignatures.kindOf(comptime LowLevelBuiltins.strOp(.str_find_first)), self.str_find_first_import);
             try self.emitFpOffset(result_offset);
         },
 
@@ -11862,7 +11863,7 @@ fn generateLowLevel(self: *Self, ll: anytype) Allocator.Error!void {
                 try self.emitI32Const(@intCast(after_offset));
                 try self.emitI32Const(@intCast(found_offset));
             }
-            try self.emitBuiltinCall(.str_drop_prefix_caseless_ascii, self.str_drop_prefix_caseless_ascii_import);
+            try self.emitBuiltinCall(BuiltinSignatures.kindOf(comptime LowLevelBuiltins.strOp(.str_drop_prefix_caseless_ascii)), self.str_drop_prefix_caseless_ascii_import);
             try self.emitFpOffset(result_offset);
         },
 
@@ -11986,12 +11987,12 @@ fn generateLowLevel(self: *Self, ll: anytype) Allocator.Error!void {
         .str_release_excess_capacity,
         => {
             const call: struct { kind: BuiltinKind, host_import: ?u32 } = switch (ll.op) {
-                .str_trim => .{ .kind = .str_trim, .host_import = self.str_trim_import },
-                .str_trim_start => .{ .kind = .str_trim_start, .host_import = self.str_trim_start_import },
-                .str_trim_end => .{ .kind = .str_trim_end, .host_import = self.str_trim_end_import },
-                .str_with_ascii_lowercased => .{ .kind = .str_with_ascii_lowercased, .host_import = self.str_with_ascii_lowercased_import },
-                .str_with_ascii_uppercased => .{ .kind = .str_with_ascii_uppercased, .host_import = self.str_with_ascii_uppercased_import },
-                .str_release_excess_capacity => .{ .kind = .str_release_excess_capacity, .host_import = self.str_release_excess_capacity_import },
+                .str_trim => .{ .kind = BuiltinSignatures.kindOf(comptime LowLevelBuiltins.strOp(.str_trim)), .host_import = self.str_trim_import },
+                .str_trim_start => .{ .kind = BuiltinSignatures.kindOf(comptime LowLevelBuiltins.strOp(.str_trim_start)), .host_import = self.str_trim_start_import },
+                .str_trim_end => .{ .kind = BuiltinSignatures.kindOf(comptime LowLevelBuiltins.strOp(.str_trim_end)), .host_import = self.str_trim_end_import },
+                .str_with_ascii_lowercased => .{ .kind = BuiltinSignatures.kindOf(comptime LowLevelBuiltins.strOp(.str_with_ascii_lowercased)), .host_import = self.str_with_ascii_lowercased_import },
+                .str_with_ascii_uppercased => .{ .kind = BuiltinSignatures.kindOf(comptime LowLevelBuiltins.strOp(.str_with_ascii_uppercased)), .host_import = self.str_with_ascii_uppercased_import },
+                .str_release_excess_capacity => .{ .kind = BuiltinSignatures.kindOf(comptime LowLevelBuiltins.strOp(.str_release_excess_capacity)), .host_import = self.str_release_excess_capacity_import },
                 else => unreachable,
             };
             try self.emitProcLocal(GuardedList.at(args, 0));
@@ -12003,8 +12004,8 @@ fn generateLowLevel(self: *Self, ll: anytype) Allocator.Error!void {
         },
         .str_drop_prefix, .str_drop_suffix => {
             const call: struct { kind: BuiltinKind, host_import: ?u32 } = switch (ll.op) {
-                .str_drop_prefix => .{ .kind = .str_drop_prefix, .host_import = self.str_drop_prefix_import },
-                .str_drop_suffix => .{ .kind = .str_drop_suffix, .host_import = self.str_drop_suffix_import },
+                .str_drop_prefix => .{ .kind = BuiltinSignatures.kindOf(comptime LowLevelBuiltins.strOp(.str_drop_prefix)), .host_import = self.str_drop_prefix_import },
+                .str_drop_suffix => .{ .kind = BuiltinSignatures.kindOf(comptime LowLevelBuiltins.strOp(.str_drop_suffix)), .host_import = self.str_drop_suffix_import },
                 else => unreachable,
             };
             try self.emitProcLocal(GuardedList.at(args, 0));
@@ -12032,12 +12033,12 @@ fn generateLowLevel(self: *Self, ll: anytype) Allocator.Error!void {
                 try self.emitRocStrFields(a_fields);
                 try self.emitRocStrFields(b_fields);
                 try self.emitLocalGet(self.roc_ops_local);
-                try self.emitBuiltinCall(.str_split, null);
+                try self.emitBuiltinCall(BuiltinSignatures.kindOf(comptime LowLevelBuiltins.strOp(.str_split_on)), null);
             } else {
                 try self.emitLocalGet(a);
                 try self.emitLocalGet(b);
                 try self.emitFpOffset(result_offset);
-                try self.emitBuiltinCall(.str_split, self.str_split_import);
+                try self.emitBuiltinCall(BuiltinSignatures.kindOf(comptime LowLevelBuiltins.strOp(.str_split_on)), self.str_split_import);
             }
             try self.emitFpOffset(result_offset);
         },
@@ -12061,13 +12062,13 @@ fn generateLowLevel(self: *Self, ll: anytype) Allocator.Error!void {
                 try self.emitLocalGet(b);
                 try self.emitFpOffset(result_offset);
             }
-            try self.emitBuiltinCall(.str_join_with, self.str_join_with_import);
+            try self.emitBuiltinCall(BuiltinSignatures.kindOf(comptime LowLevelBuiltins.strOp(.str_join_with)), self.str_join_with_import);
             try self.emitFpOffset(result_offset);
         },
         .str_repeat, .str_reserve => {
             const call: struct { kind: BuiltinKind, host_import: ?u32, update_mode: ?i32 } = switch (ll.op) {
-                .str_repeat => .{ .kind = .str_repeat, .host_import = self.str_repeat_import, .update_mode = null },
-                .str_reserve => .{ .kind = .str_reserve, .host_import = self.str_reserve_import, .update_mode = updateModeImmForArg(ll.unique_args, 0) },
+                .str_repeat => .{ .kind = BuiltinSignatures.kindOf(comptime LowLevelBuiltins.strOp(.str_repeat)), .host_import = self.str_repeat_import, .update_mode = null },
+                .str_reserve => .{ .kind = BuiltinSignatures.kindOf(comptime LowLevelBuiltins.strOp(.str_reserve)), .host_import = self.str_reserve_import, .update_mode = updateModeImmForArg(ll.unique_args, 0) },
                 else => unreachable,
             };
             try self.emitProcLocal(GuardedList.at(args, 0));
@@ -12102,7 +12103,7 @@ fn generateLowLevel(self: *Self, ll: anytype) Allocator.Error!void {
                 try self.emitLocalGet(int_local);
                 try self.emitFpOffset(result_offset);
             }
-            try self.emitBuiltinCall(.str_with_capacity, self.str_with_capacity_import);
+            try self.emitBuiltinCall(BuiltinSignatures.kindOf(comptime LowLevelBuiltins.strOp(.str_with_capacity)), self.str_with_capacity_import);
             try self.emitFpOffset(result_offset);
         },
         .str_caseless_ascii_equals => {
@@ -12264,7 +12265,7 @@ fn generateLowLevel(self: *Self, ll: anytype) Allocator.Error!void {
                     try self.emitRocListFields(list);
                     try self.emitLocalGet(layout_ptr);
                     try self.emitLocalGet(self.roc_ops_local);
-                    try self.emitBuiltinCall(.str_from_utf8_result, null);
+                    try self.emitBuiltinCall(BuiltinSignatures.kindOf(comptime LowLevelBuiltins.strOp(.str_from_utf8)), null);
                 },
                 .unconfigured => wasmInvariantFmt(
                     "WASM/codegen invariant violated: external calls not configured before str_from_utf8",
@@ -12310,7 +12311,7 @@ fn generateLowLevel(self: *Self, ll: anytype) Allocator.Error!void {
                         try self.emitFpOffset(result_offset);
                     }
                     try self.emitI32Const(@intCast(disc_offset));
-                    try self.emitBuiltinCall(.dec_from_str, self.dec_from_str_import);
+                    try self.emitBuiltinCall(BuiltinSignatures.kindOf(comptime LowLevelBuiltins.numFromStr(.dec)), self.dec_from_str_import);
                 },
                 .float => |float| {
                     if (self.externalCallsUseRelocs()) {
@@ -12323,7 +12324,7 @@ fn generateLowLevel(self: *Self, ll: anytype) Allocator.Error!void {
                     }
                     try self.emitI32Const(float.width_bytes);
                     try self.emitI32Const(@intCast(disc_offset));
-                    try self.emitBuiltinCall(.float_from_str, self.float_from_str_import);
+                    try self.emitBuiltinCall(BuiltinSignatures.kindOf(comptime LowLevelBuiltins.numFromStr(.float)), self.float_from_str_import);
                 },
                 .int => |int| {
                     if (self.externalCallsUseRelocs()) {
@@ -12333,14 +12334,14 @@ fn generateLowLevel(self: *Self, ll: anytype) Allocator.Error!void {
                         try self.emitI32Const(int.width_bytes);
                         try self.emitI32Const(if (int.signed) 1 else 0);
                         try self.emitI32Const(@intCast(disc_offset));
-                        try self.emitBuiltinCall(.int_from_str, null);
+                        try self.emitBuiltinCall(BuiltinSignatures.kindOf(comptime LowLevelBuiltins.numFromStr(.int)), null);
                     } else {
                         try self.emitLocalGet(input);
                         try self.emitFpOffset(result_offset);
                         try self.emitI32Const(int.width_bytes);
                         try self.emitI32Const(if (int.signed) 1 else 0);
                         try self.emitI32Const(@intCast(disc_offset));
-                        try self.emitBuiltinCall(.int_from_str, self.int_from_str_import);
+                        try self.emitBuiltinCall(BuiltinSignatures.kindOf(comptime LowLevelBuiltins.numFromStr(.int)), self.int_from_str_import);
                     }
                 },
             }
@@ -13790,15 +13791,15 @@ fn generateLowLevel(self: *Self, ll: anytype) Allocator.Error!void {
                 try self.emitLoadOp(.i64, 8);
                 try self.emitI32Const(@intCast(offsets.success));
                 try self.emitI32Const(@intCast(offsets.value));
-                try self.emitBuiltinCall(if (is_signed) .i128_to_dec else .u128_to_dec, null);
+                try self.emitBuiltinCall(if (is_signed) .i128_to_dec_try_unsafe else .u128_to_dec_try_unsafe, null);
             } else {
                 try self.emitLocalGet(val_ptr);
                 try self.emitLocalGet(result_local);
                 try self.emitI32Const(@intCast(offsets.value));
                 self.currentCode().append(self.allocator, Op.i32_add) catch return error.OutOfMemory;
                 try self.emitBuiltinCall(
-                    if (is_signed) .i128_to_dec else .u128_to_dec,
-                    if (is_signed) self.i128_to_dec_import else self.u128_to_dec_import,
+                    if (is_signed) .i128_to_dec_try_unsafe else .u128_to_dec_try_unsafe,
+                    if (is_signed) self.i128_to_dec_try_unsafe_import else self.u128_to_dec_try_unsafe_import,
                 );
                 const success_flag = self.storage.allocAnonymousLocal(.i32) catch return error.OutOfMemory;
                 try self.emitLocalSet(success_flag);
@@ -13902,7 +13903,7 @@ fn generateLowLevel(self: *Self, ll: anytype) Allocator.Error!void {
             try self.emitStoreOp(.i64, 8);
 
             // Call roc_i128_div_s(dec_ptr, divisor_ptr, result_ptr)
-            try self.emitI128BuiltinBinOp(dec_local, divisor_local, .i128_div_s, self.i128_div_s_import);
+            try self.emitI128BuiltinBinOp(dec_local, divisor_local, BuiltinSignatures.kindOf(comptime LowLevelBuiltins.i128DivRem(false, false)), self.num_div_trunc_i128_import);
             // Result is an i32 pointer to the 16-byte quotient; load low i64
             try self.emitLoadOp(.i64, 0);
 
@@ -13946,7 +13947,7 @@ fn generateLowLevel(self: *Self, ll: anytype) Allocator.Error!void {
             WasmModule.leb128WriteI64(self.allocator, self.currentCode(), 0) catch return error.OutOfMemory;
             try self.emitStoreOp(.i64, 8);
 
-            try self.emitI128BuiltinBinOp(dec_local, divisor_local, .i128_div_s, self.i128_div_s_import);
+            try self.emitI128BuiltinBinOp(dec_local, divisor_local, BuiltinSignatures.kindOf(comptime LowLevelBuiltins.i128DivRem(false, false)), self.num_div_trunc_i128_import);
         },
         .dec_to_f64 => {
             // Dec → f64: load i128 as i64 (low word), convert to f64, divide by 10^18.0
@@ -14055,10 +14056,10 @@ fn generateLowLevel(self: *Self, ll: anytype) Allocator.Error!void {
                 try self.emitLoadOp(.i64, 8);
                 try self.emitI32Const(@intCast(offsets.success));
                 try self.emitI32Const(@intCast(offsets.value));
-                try self.emitBuiltinCall(.dec_to_f32, null);
+                try self.emitBuiltinCall(.dec_to_f32_try_unsafe, null);
             } else {
                 try self.emitLocalGet(val_ptr);
-                try self.emitBuiltinCall(.dec_to_f32, self.dec_to_f32_import);
+                try self.emitBuiltinCall(.dec_to_f32_try_unsafe, self.dec_to_f32_try_unsafe_import);
                 const f32_val = self.storage.allocAnonymousLocal(.f32) catch return error.OutOfMemory;
                 try self.emitLocalSet(f32_val);
 
@@ -14493,28 +14494,28 @@ fn emitNumericLowLevel(self: *Self, op: anytype, args: anytype, ret_layout: layo
 
             switch (mod_layout_idx) {
                 .i8 => {
-                    try self.emitBuiltinCall(.i8_mod_by, self.i8_mod_by_import);
+                    try self.emitBuiltinCall(BuiltinSignatures.kindOf(comptime LowLevelBuiltins.scalarModBy(8, true)), self.i8_mod_by_import);
                 },
                 .u8 => {
-                    try self.emitBuiltinCall(.u8_mod_by, self.u8_mod_by_import);
+                    try self.emitBuiltinCall(BuiltinSignatures.kindOf(comptime LowLevelBuiltins.scalarModBy(8, false)), self.u8_mod_by_import);
                 },
                 .i16 => {
-                    try self.emitBuiltinCall(.i16_mod_by, self.i16_mod_by_import);
+                    try self.emitBuiltinCall(BuiltinSignatures.kindOf(comptime LowLevelBuiltins.scalarModBy(16, true)), self.i16_mod_by_import);
                 },
                 .u16 => {
-                    try self.emitBuiltinCall(.u16_mod_by, self.u16_mod_by_import);
+                    try self.emitBuiltinCall(BuiltinSignatures.kindOf(comptime LowLevelBuiltins.scalarModBy(16, false)), self.u16_mod_by_import);
                 },
                 .i32 => {
-                    try self.emitBuiltinCall(.i32_mod_by, self.i32_mod_by_import);
+                    try self.emitBuiltinCall(BuiltinSignatures.kindOf(comptime LowLevelBuiltins.scalarModBy(32, true)), self.i32_mod_by_import);
                 },
                 .u32 => {
-                    try self.emitBuiltinCall(.u32_mod_by, self.u32_mod_by_import);
+                    try self.emitBuiltinCall(BuiltinSignatures.kindOf(comptime LowLevelBuiltins.scalarModBy(32, false)), self.u32_mod_by_import);
                 },
                 .i64 => {
-                    try self.emitBuiltinCall(.i64_mod_by, self.i64_mod_by_import);
+                    try self.emitBuiltinCall(BuiltinSignatures.kindOf(comptime LowLevelBuiltins.scalarModBy(64, true)), self.i64_mod_by_import);
                 },
                 .u64 => {
-                    try self.emitBuiltinCall(.u64_mod_by, self.u64_mod_by_import);
+                    try self.emitBuiltinCall(BuiltinSignatures.kindOf(comptime LowLevelBuiltins.scalarModBy(64, false)), self.u64_mod_by_import);
                 },
                 else => switch (vt) {
                     .f32, .f64 => try self.emitFloatMod(vt),
@@ -14779,21 +14780,21 @@ fn emitListEqWithElemLayout(self: *Self, lhs: ProcLocalId, rhs: ProcLocalId, ele
 
     // Determine which comparison to use based on element type
     if (elem_layout == .str) {
-        try self.emitListEqCall(lhs_local, rhs_local, .list_str_eq, self.list_str_eq_import, null);
+        try self.emitListEqCall(lhs_local, rhs_local, BuiltinSignatures.kindOf(comptime LowLevelBuiltins.listEq(.str)), self.list_str_eq_import, null);
     } else {
         const ls = self.getLayoutStore();
         const elem_l = ls.getLayout(elem_layout);
         if (elem_l.tag == .list) {
             const inner_elem_layout = elem_l.getIdx();
             const inner_elem_size = try self.layoutByteSize(inner_elem_layout);
-            try self.emitListEqCall(lhs_local, rhs_local, .list_list_eq, self.list_list_eq_import, inner_elem_size);
+            try self.emitListEqCall(lhs_local, rhs_local, BuiltinSignatures.kindOf(comptime LowLevelBuiltins.listEq(.list)), self.list_list_eq_import, inner_elem_size);
         } else if (builtinInternalLayoutContainsRefcounted(ls, "wasm.emitListEqWithElemLayout.builtin_elem_rc", elem_layout)) {
             // Composite elements with refcounted fields: inline structural loop
             const elem_size = try self.layoutByteSize(elem_layout);
             try self.emitListEqLoop(lhs_local, rhs_local, elem_layout, elem_size);
         } else {
             const elem_size = try self.layoutByteSize(elem_layout);
-            try self.emitListEqCall(lhs_local, rhs_local, .list_eq, self.list_eq_import, elem_size);
+            try self.emitListEqCall(lhs_local, rhs_local, BuiltinSignatures.kindOf(comptime LowLevelBuiltins.listEq(.flat)), self.list_eq_import, elem_size);
         }
     }
 
@@ -15260,7 +15261,7 @@ fn emitIntToStr(self: *Self, value: ProcLocalId, int_width_bytes: u8, is_signed:
         self.currentCode().append(self.allocator, Op.i32_const) catch return error.OutOfMemory;
         WasmModule.leb128WriteI32(self.allocator, self.currentCode(), if (is_signed) 1 else 0) catch return error.OutOfMemory;
         try self.emitLocalGet(self.roc_ops_local);
-        try self.emitBuiltinCall(.int_to_str, self.int_to_str_import);
+        try self.emitBuiltinCall(BuiltinSignatures.kindOf(comptime LowLevelBuiltins.numToStr(.int)), self.int_to_str_import);
         try self.emitLocalGet(result_local);
         return;
     }
@@ -15276,7 +15277,7 @@ fn emitIntToStr(self: *Self, value: ProcLocalId, int_width_bytes: u8, is_signed:
     self.currentCode().append(self.allocator, Op.i32_const) catch return error.OutOfMemory;
     WasmModule.leb128WriteI32(self.allocator, self.currentCode(), if (is_signed) 1 else 0) catch return error.OutOfMemory;
     try self.emitLocalGet(buf_ptr);
-    try self.emitBuiltinCall(.int_to_str, self.int_to_str_import);
+    try self.emitBuiltinCall(BuiltinSignatures.kindOf(comptime LowLevelBuiltins.numToStr(.int)), self.int_to_str_import);
     const len_local = self.storage.allocAnonymousLocal(.i32) catch return error.OutOfMemory;
     try self.emitLocalSet(len_local);
 
@@ -15300,7 +15301,7 @@ fn emitDecToStr(self: *Self, value: ProcLocalId) Allocator.Error!void {
         try self.emitLocalGet(dec_ptr);
         try self.emitLoadOp(.i64, 8);
         try self.emitLocalGet(self.roc_ops_local);
-        try self.emitBuiltinCall(.dec_to_str, self.dec_to_str_import);
+        try self.emitBuiltinCall(BuiltinSignatures.kindOf(comptime LowLevelBuiltins.numToStr(.dec)), self.dec_to_str_import);
         try self.emitLocalGet(result_local);
         return;
     }
@@ -15311,7 +15312,7 @@ fn emitDecToStr(self: *Self, value: ProcLocalId) Allocator.Error!void {
 
     try self.emitLocalGet(dec_ptr);
     try self.emitLocalGet(buf_ptr);
-    try self.emitBuiltinCall(.dec_to_str, self.dec_to_str_import);
+    try self.emitBuiltinCall(BuiltinSignatures.kindOf(comptime LowLevelBuiltins.numToStr(.dec)), self.dec_to_str_import);
     const len_local = self.storage.allocAnonymousLocal(.i32) catch return error.OutOfMemory;
     try self.emitLocalSet(len_local);
 
@@ -15348,7 +15349,7 @@ fn emitFloatToStr(self: *Self, value: ProcLocalId, is_f32: bool) Allocator.Error
         self.currentCode().append(self.allocator, Op.i32_const) catch return error.OutOfMemory;
         WasmModule.leb128WriteI32(self.allocator, self.currentCode(), if (is_f32) 1 else 0) catch return error.OutOfMemory;
         try self.emitLocalGet(self.roc_ops_local);
-        try self.emitBuiltinCall(.float_to_str, self.float_to_str_import);
+        try self.emitBuiltinCall(BuiltinSignatures.kindOf(comptime LowLevelBuiltins.numToStr(.float)), self.float_to_str_import);
         try self.emitLocalGet(result_local);
         return;
     }
@@ -15361,7 +15362,7 @@ fn emitFloatToStr(self: *Self, value: ProcLocalId, is_f32: bool) Allocator.Error
     self.currentCode().append(self.allocator, Op.i32_const) catch return error.OutOfMemory;
     WasmModule.leb128WriteI32(self.allocator, self.currentCode(), if (is_f32) 1 else 0) catch return error.OutOfMemory;
     try self.emitLocalGet(buf_ptr);
-    try self.emitBuiltinCall(.float_to_str, self.float_to_str_import);
+    try self.emitBuiltinCall(BuiltinSignatures.kindOf(comptime LowLevelBuiltins.numToStr(.float)), self.float_to_str_import);
     const len_local = self.storage.allocAnonymousLocal(.i32) catch return error.OutOfMemory;
     try self.emitLocalSet(len_local);
 
@@ -15387,7 +15388,7 @@ fn emitFloatPow(self: *Self, args: anytype, ret_layout: layout.Idx) Allocator.Er
         self.currentCode().append(self.allocator, Op.f64_promote_f32) catch return error.OutOfMemory;
     }
     try self.emitI32Const(if (is_f32) 4 else 8);
-    try self.emitBuiltinCall(.float_pow, self.float_pow_import);
+    try self.emitBuiltinCall(BuiltinSignatures.kindOf(comptime LowLevelBuiltins.floatPow()), self.float_pow_import);
     if (is_f32) {
         self.currentCode().append(self.allocator, Op.f32_demote_f64) catch return error.OutOfMemory;
     }
@@ -15429,7 +15430,7 @@ fn emitStrEscapeAndQuote(self: *Self, value: ProcLocalId) Allocator.Error!void {
         try self.emitLocalGet(str_ptr);
         try self.emitFpOffset(result_offset);
     }
-    try self.emitBuiltinCall(.str_escape_and_quote, self.str_escape_and_quote_import);
+    try self.emitBuiltinCall(BuiltinSignatures.kindOf(comptime LowLevelBuiltins.strOp(.str_inspect)), self.str_escape_and_quote_import);
     try self.emitFpOffset(result_offset);
 }
 
@@ -16780,7 +16781,7 @@ fn generateLLListAppend(self: *Self, args: anytype, ret_layout: layout.Idx) Allo
             try self.emitI32Const(@intCast(elem_size));
             try self.emitI32Const(@intCast(elem_align));
             try self.emitFpOffset(result_offset);
-            try self.emitBuiltinCall(.list_append_unsafe, self.list_append_unsafe_import);
+            try self.emitBuiltinCall(BuiltinSignatures.kindOf(comptime LowLevelBuiltins.listOp(.list_append_unsafe)), self.list_append_unsafe_import);
         },
         .builtin_relocs => {
             const fields = try self.loadRocListFields(list_ptr);
@@ -16789,7 +16790,7 @@ fn generateLLListAppend(self: *Self, args: anytype, ret_layout: layout.Idx) Allo
             try self.emitLocalGet(elem_ptr);
             try self.emitI32Const(@intCast(elem_size));
             try self.emitLocalGet(self.roc_ops_local);
-            try self.emitBuiltinCall(.list_append_unsafe, null);
+            try self.emitBuiltinCall(BuiltinSignatures.kindOf(comptime LowLevelBuiltins.listOp(.list_append_unsafe)), null);
         },
         .unconfigured => wasmInvariantFmt("WASM/codegen invariant violated: external calls not configured before list_append_unsafe", .{}),
     }
@@ -16940,7 +16941,7 @@ fn generateLLListConcat(self: *Self, args: anytype, ret_layout: layout.Idx, uniq
             try self.emitI32Const(@intCast(elem_size));
             try self.emitI32Const(@intCast(elem_align));
             try self.emitFpOffset(result_offset);
-            try self.emitBuiltinCall(.list_concat, self.list_concat_import);
+            try self.emitBuiltinCall(BuiltinSignatures.kindOf(comptime LowLevelBuiltins.listOp(.list_concat)), self.list_concat_import);
         },
         .builtin_relocs => {
             const a_fields = try self.loadRocListFields(a_ptr);
@@ -16960,7 +16961,7 @@ fn generateLLListConcat(self: *Self, args: anytype, ret_layout: layout.Idx, uniq
             self.currentCode().append(self.allocator, Op.i64_const) catch return error.OutOfMemory;
             WasmModule.leb128WriteI64(self.allocator, self.currentCode(), @intCast(unique_args & 0b11)) catch return error.OutOfMemory;
             try self.emitLocalGet(self.roc_ops_local);
-            try self.emitBuiltinCall(.list_concat, null);
+            try self.emitBuiltinCall(BuiltinSignatures.kindOf(comptime LowLevelBuiltins.listOp(.list_concat)), null);
         },
         .unconfigured => wasmInvariantFmt("WASM/codegen invariant violated: external calls not configured before list_concat", .{}),
     }
@@ -16991,7 +16992,7 @@ fn generateLLListDropAt(self: *Self, args: anytype, ret_layout: layout.Idx, uniq
             try self.emitLocalGet(index_local);
             self.currentCode().append(self.allocator, Op.i32_wrap_i64) catch return error.OutOfMemory;
             try self.emitFpOffset(result_offset);
-            try self.emitBuiltinCall(.list_drop_at, self.list_drop_at_import);
+            try self.emitBuiltinCall(BuiltinSignatures.kindOf(comptime LowLevelBuiltins.listOp(.list_drop_at)), self.list_drop_at_import);
         },
         .builtin_relocs => {
             const fields = try self.loadRocListFields(list_ptr);
@@ -17007,7 +17008,7 @@ fn generateLLListDropAt(self: *Self, args: anytype, ret_layout: layout.Idx, uniq
             try self.emitI32Const(@intCast(callbacks.decref_table_idx));
             try self.emitI32Const(updateModeImmForArg(unique_args, 0));
             try self.emitLocalGet(self.roc_ops_local);
-            try self.emitBuiltinCall(.list_drop_at, null);
+            try self.emitBuiltinCall(BuiltinSignatures.kindOf(comptime LowLevelBuiltins.listOp(.list_drop_at)), null);
         },
         .unconfigured => wasmInvariantFmt("WASM/codegen invariant violated: external calls not configured before list_drop_at", .{}),
     }
@@ -17036,7 +17037,7 @@ fn generateLLListReverse(self: *Self, args: anytype, ret_layout: layout.Idx, uni
             try self.emitI32Const(@intCast(elem_size));
             try self.emitI32Const(@intCast(elem_align));
             try self.emitFpOffset(result_offset);
-            try self.emitBuiltinCall(.list_reverse, self.list_reverse_import);
+            try self.emitBuiltinCall(BuiltinSignatures.kindOf(comptime LowLevelBuiltins.listOp(.list_reverse)), self.list_reverse_import);
         },
         .builtin_relocs => {
             const fields = try self.loadRocListFields(list_ptr);
@@ -17051,7 +17052,7 @@ fn generateLLListReverse(self: *Self, args: anytype, ret_layout: layout.Idx, uni
             try self.emitI32Const(@intCast(callbacks.decref_table_idx));
             try self.emitI32Const(updateModeImmForArg(unique_args, 0));
             try self.emitLocalGet(self.roc_ops_local);
-            try self.emitBuiltinCall(.list_reverse, null);
+            try self.emitBuiltinCall(BuiltinSignatures.kindOf(comptime LowLevelBuiltins.listOp(.list_reverse)), null);
         },
         .unconfigured => wasmInvariantFmt("WASM/codegen invariant violated: external calls not configured before list_reverse", .{}),
     }
@@ -17206,7 +17207,7 @@ fn emitListReplaceCall(
             try self.emitLocalGet(elem_ptr);
             try self.emitFpOffset(out_element_offset);
             try self.emitFpOffset(out_list_offset);
-            try self.emitBuiltinCall(.list_replace, self.list_replace_import);
+            try self.emitBuiltinCall(BuiltinSignatures.kindOf(comptime LowLevelBuiltins.listOp(.list_set)), self.list_replace_import);
         },
         .builtin_relocs => {
             const fields = try self.loadRocListFields(list_ptr);
@@ -17223,7 +17224,7 @@ fn emitListReplaceCall(
             try self.emitI32Const(@intCast(callbacks.decref_table_idx));
             try self.emitI32Const(updateModeImmForArg(unique_args, 0));
             try self.emitLocalGet(self.roc_ops_local);
-            try self.emitBuiltinCall(.list_replace, null);
+            try self.emitBuiltinCall(BuiltinSignatures.kindOf(comptime LowLevelBuiltins.listOp(.list_set)), null);
         },
         .unconfigured => wasmInvariantFmt("WASM/codegen invariant violated: external calls not configured before list_replace", .{}),
     }
@@ -17341,7 +17342,7 @@ fn generateLLListSwap(self: *Self, args: anytype, ret_layout: layout.Idx, unique
             try self.emitLocalGet(index_1_local);
             try self.emitLocalGet(index_2_local);
             try self.emitFpOffset(result_offset);
-            try self.emitBuiltinCall(.list_swap, self.list_swap_import);
+            try self.emitBuiltinCall(BuiltinSignatures.kindOf(comptime LowLevelBuiltins.listOp(.list_swap)), self.list_swap_import);
         },
         .builtin_relocs => {
             const fields = try self.loadRocListFields(list_ptr);
@@ -17357,7 +17358,7 @@ fn generateLLListSwap(self: *Self, args: anytype, ret_layout: layout.Idx, unique
             try self.emitI32Const(@intCast(callbacks.decref_table_idx));
             try self.emitI32Const(updateModeImmForArg(unique_args, 0));
             try self.emitLocalGet(self.roc_ops_local);
-            try self.emitBuiltinCall(.list_swap, null);
+            try self.emitBuiltinCall(BuiltinSignatures.kindOf(comptime LowLevelBuiltins.listOp(.list_swap)), null);
         },
         .unconfigured => wasmInvariantFmt("WASM/codegen invariant violated: external calls not configured before list_swap", .{}),
     }
@@ -17387,7 +17388,7 @@ fn generateLLListReserve(self: *Self, args: anytype, ret_layout: layout.Idx, uni
             try self.emitI32Const(@intCast(elem_size));
             try self.emitI32Const(@intCast(elem_align));
             try self.emitFpOffset(result_offset);
-            try self.emitBuiltinCall(.list_reserve, self.list_reserve_import);
+            try self.emitBuiltinCall(BuiltinSignatures.kindOf(comptime LowLevelBuiltins.listOp(.list_reserve)), self.list_reserve_import);
         },
         .builtin_relocs => {
             const fields = try self.loadRocListFields(list_ptr);
@@ -17403,7 +17404,7 @@ fn generateLLListReserve(self: *Self, args: anytype, ret_layout: layout.Idx, uni
             try self.emitI32Const(@intCast(callbacks.decref_table_idx));
             try self.emitI32Const(updateModeImmForArg(unique_args, 0));
             try self.emitLocalGet(self.roc_ops_local);
-            try self.emitBuiltinCall(.list_reserve, null);
+            try self.emitBuiltinCall(BuiltinSignatures.kindOf(comptime LowLevelBuiltins.listOp(.list_reserve)), null);
         },
         .unconfigured => wasmInvariantFmt("WASM/codegen invariant violated: external calls not configured before list_reserve", .{}),
     }

@@ -158,7 +158,9 @@ compare; measure Debug corpus wall time, require parity within noise.
 - [pin-lambda-solved-invariants.md](./pin-lambda-solved-invariants.md) —
   G1's assert is the downstream detector for that project's root-sharing
   invariant; land in either order, they reinforce each other.
-- [../big/solved-lir-body-verification.md](../big/solved-lir-body-verification.md)
-  — extends what the oracle *covers*; this project fixes what the oracle
-  *is*. Do this one first — it is days, not weeks, and a higher-fidelity
-  oracle strengthens whatever body-verification design that project picks.
+- The Lambda Mono differential harness
+  (`src/eval/test/lambda_mono_differential_runner.zig`, run with
+  `zig build run-test-lambda-mono-differential`) executes the materialized
+  oracle tree against the LIR interpreter over the eval corpus — it extends
+  what the oracle *covers*; this project fixes what the oracle *is*. A
+  higher-fidelity oracle strengthens every comparison that harness makes.

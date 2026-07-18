@@ -133,7 +133,7 @@ test "resolve maps known compiler-rt symbols and rejects others" {
     try std.testing.expect(resolve("__fixsfti") != null);
     try std.testing.expect(resolve("__floatuntidf") != null);
     try std.testing.expect(resolve("not_a_runtime_symbol") == null);
-    try std.testing.expect(resolve("roc_builtins_float_tan") == null);
+    try std.testing.expect(resolve(@import("builtin_registry.zig").BuiltinFn.float_tan.symbolName()) == null);
 }
 
 test "resolved division and remainder match native i128 arithmetic" {
