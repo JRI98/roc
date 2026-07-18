@@ -4496,6 +4496,11 @@ const core_tests = [_]TestCase{
         .expected = .{ .crash = {} },
     },
     .{
+        .name = "crash: Dec multiply overflow crashes on every backend",
+        .source = "100000000000000000000.0 * 100.0.Dec",
+        .expected = .{ .crash = {} },
+    },
+    .{
         .name = "inspect: numeric inclusive ranges stop at highest",
         .source =
         \\{

@@ -7,6 +7,7 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const base = @import("base");
+const builtins = @import("builtins");
 
 const CIR = @import("CIR.zig");
 const DependencyGraph = @import("DependencyGraph.zig");
@@ -17,29 +18,15 @@ pub fn isBuiltinModule(env: *const ModuleEnv) bool {
     return env.module_role == .builtin;
 }
 
-/// Returns whether an annotation-only Builtin declaration is handled as an intrinsic wrapper.
+/// Returns whether an annotation-only Builtin declaration is handled as an
+/// intrinsic wrapper. The set of intrinsic names is declared in the builtin
+/// registry alongside the rest of the builtin membership data.
 pub fn isIntrinsicAnnotation(env: *const ModuleEnv, ident: base.Ident.Idx) bool {
-    if (ident.eql(env.idents.builtin_str_inspect)) return true;
-
-    if (env.common.findIdent("Builtin.Str.Utf8Problem.is_eq")) |utf8_problem_eq| {
-        if (ident.eql(utf8_problem_eq)) return true;
-    }
-
-    const parse_intrinsics = [_][]const u8{
-        "Builtin.Encoding.ParseTagUnionSpec.parse",
-        "Builtin.Encoding.FieldName.FieldNames.rename_fields",
-        "Builtin.Encoding.FieldName.FieldNames.shortest_name",
-        "Builtin.Encoding.FieldName.FieldNames.longest_name",
-        "Builtin.Encoding.FieldName.FieldNames.iter",
-        "Builtin.Encoding.FieldName.FieldNames.for_size",
-        "Builtin.Encoding.FieldName.name",
-    };
-    for (parse_intrinsics) |name| {
+    for (builtins.builtin_registry.intrinsic_annotation_names) |name| {
         if (env.common.findIdent(name)) |intrinsic| {
             if (ident.eql(intrinsic)) return true;
         }
     }
-
     return false;
 }
 

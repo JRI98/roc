@@ -119,6 +119,6 @@ specializations; nothing may see more.
 - The shared cycle-guarded checked-type traversal utility
   (`src/check/checked_traverse.zig`) — same file-family; the identity
   visitor should compose with its digest variant.
-- [Single-Source Builtin
-  Registration](../big/single-source-builtin-registration.md) — the
-  big-scale version of "two encodings of one rule".
+- The builtin registry (`src/builtins/builtin_registry.zig`) — the completed
+  big-scale version of "two encodings of one rule": the seven hand-typed
+  `roc_builtins_*` symbol/ABI tables now derive from one comptime registry.

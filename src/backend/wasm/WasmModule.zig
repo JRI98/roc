@@ -11,6 +11,8 @@ const WasmLinking = @import("WasmLinking.zig");
 const StaticDataExport = @import("../dev/StaticDataExport.zig").StaticDataExport;
 const StaticDataRelocation = @import("../dev/StaticDataExport.zig").StaticDataRelocation;
 const index_types = @import("index_types.zig");
+const builtin_signatures = @import("builtin_signatures.zig");
+const BuiltinKind = builtin_signatures.BuiltinKind;
 const DefinedFunction = index_types.DefinedFunction;
 const FunctionIndex = index_types.FunctionIndex;
 const LocalFunctionIndex = index_types.LocalFunctionIndex;
@@ -1411,174 +1413,39 @@ pub const MergeMode = enum {
 
 /// Maps builtin operations to their symbol indices in the merged module.
 ///
-/// After `mergeModule` incorporates `roc_builtins.o`, this struct is populated
-/// by looking up each `roc_builtins_*` symbol name in the merged module's
-/// symbol table. WasmCodeGen uses these symbol indices with
+/// After `mergeModule` incorporates `roc_builtins.o`, this is populated by
+/// looking up each builtin's `roc_builtins_*` symbol name in the merged
+/// module's symbol table. WasmCodeGen uses these symbol indices with
 /// `emitRelocatableCall` to emit calls to builtins.
+///
+/// The struct is keyed by `BuiltinKind`, and every symbol name comes from
+/// `builtin_signatures.sigOf(kind).name`, so there is no hand-written name or
+/// field list to drift from the signature table.
 pub const BuiltinSymbols = struct {
-    // --- Decimal / i128 arithmetic ---
-    dec_mul: u32, // roc_builtins_dec_mul
-    dec_div: u32, // roc_builtins_dec_div
-    dec_div_trunc: u32, // roc_builtins_dec_div_trunc
-    dec_to_str: u32, // roc_builtins_dec_to_str
-    i128_div_s: u32, // roc_builtins_num_div_trunc_i128
-    i128_mod_s: u32, // roc_builtins_num_rem_trunc_i128
-    u128_div: u32, // roc_builtins_num_div_trunc_u128
-    u128_mod: u32, // roc_builtins_num_rem_trunc_u128
-
-    // --- Numeric conversions ---
-    i128_to_dec: u32, // roc_builtins_i128_to_dec_try_unsafe
-    u128_to_dec: u32, // roc_builtins_u128_to_dec_try_unsafe
-    dec_to_int_try_unsafe: u32, // roc_builtins_dec_to_int_try_unsafe
-    dec_to_f32: u32, // roc_builtins_dec_to_f32_try_unsafe
-    float_to_str: u32, // roc_builtins_float_to_str
-    float_pow: u32, // roc_builtins_float_pow
-    float_sin: u32, // roc_builtins_float_sin
-    float_cos: u32, // roc_builtins_float_cos
-    float_tan: u32, // roc_builtins_float_tan
-    float_asin: u32, // roc_builtins_float_asin
-    float_acos: u32, // roc_builtins_float_acos
-    float_atan: u32, // roc_builtins_float_atan
-    int_to_str: u32, // roc_builtins_int_to_str
-    int_from_str: u32, // roc_builtins_int_from_str
-    dec_from_str: u32, // roc_builtins_dec_from_str
-    float_from_str: u32, // roc_builtins_float_from_str
-
-    // --- String operations ---
-    str_equal: u32, // roc_builtins_str_equal
-    str_concat: u32, // roc_builtins_str_concat
-    str_repeat: u32, // roc_builtins_str_repeat
-    str_trim: u32, // roc_builtins_str_trim
-    str_trim_start: u32, // roc_builtins_str_trim_start
-    str_trim_end: u32, // roc_builtins_str_trim_end
-    str_split: u32, // roc_builtins_str_split
-    str_join_with: u32, // roc_builtins_str_join_with
-    str_reserve: u32, // roc_builtins_str_reserve
-    str_release_excess_capacity: u32, // roc_builtins_str_release_excess_capacity
-    str_with_capacity: u32, // roc_builtins_str_with_capacity
-    str_drop_prefix: u32, // roc_builtins_str_drop_prefix
-    str_drop_prefix_caseless_ascii: u32, // roc_builtins_str_drop_prefix_caseless_ascii
-    str_drop_suffix: u32, // roc_builtins_str_drop_suffix
-    str_with_ascii_lowercased: u32, // roc_builtins_str_with_ascii_lowercased
-    str_with_ascii_uppercased: u32, // roc_builtins_str_with_ascii_uppercased
-    str_caseless_ascii_equals: u32, // roc_builtins_str_caseless_ascii_equals
-    str_from_utf8: u32, // roc_builtins_str_from_utf8
-
-    // --- List operations ---
-    list_append_unsafe: u32, // roc_builtins_list_append_unsafe
-    list_eq: u32, // roc_builtins_list_eq
-    list_str_eq: u32, // roc_builtins_list_str_eq
-    list_list_eq: u32, // roc_builtins_list_list_eq
-    list_reverse: u32, // roc_builtins_list_reverse
-
-    // --- Memory management ---
-    allocate_with_refcount: u32, // roc_builtins_allocate_with_refcount
-
-    // --- Integer modulo ---
-    i8_mod_by: u32, // roc_builtins_i8_mod_by
-    u8_mod_by: u32, // roc_builtins_u8_mod_by
-    i16_mod_by: u32, // roc_builtins_i16_mod_by
-    u16_mod_by: u32, // roc_builtins_u16_mod_by
-    i32_mod_by: u32, // roc_builtins_i32_mod_by
-    u32_mod_by: u32, // roc_builtins_u32_mod_by
-    i64_mod_by: u32, // roc_builtins_i64_mod_by
-    u64_mod_by: u32, // roc_builtins_u64_mod_by
-
-    // --- Crypto ---
-    crypto_sha256_hash_bytes: u32, // roc_builtins_crypto_sha256_hash_bytes
-    crypto_sha256_hasher_empty: u32, // roc_builtins_crypto_sha256_hasher_empty
-    crypto_sha256_hasher_write: u32, // roc_builtins_crypto_sha256_hasher_write
-    crypto_sha256_hasher_finish: u32, // roc_builtins_crypto_sha256_hasher_finish
-    crypto_blake3_hash_bytes: u32, // roc_builtins_crypto_blake3_hash_bytes
-    crypto_blake3_hasher_empty: u32, // roc_builtins_crypto_blake3_hasher_empty
-    crypto_blake3_hasher_write: u32, // roc_builtins_crypto_blake3_hasher_write
-    crypto_blake3_hasher_finish: u32, // roc_builtins_crypto_blake3_hasher_finish
-
-    /// Name → field mapping used by `populate` to fill this struct.
-    const mapping = .{
-        .{ "roc_builtins_dec_mul", "dec_mul" },
-        .{ "roc_builtins_dec_div", "dec_div" },
-        .{ "roc_builtins_dec_div_trunc", "dec_div_trunc" },
-        .{ "roc_builtins_dec_to_str", "dec_to_str" },
-        .{ "roc_builtins_num_div_trunc_i128", "i128_div_s" },
-        .{ "roc_builtins_num_rem_trunc_i128", "i128_mod_s" },
-        .{ "roc_builtins_num_div_trunc_u128", "u128_div" },
-        .{ "roc_builtins_num_rem_trunc_u128", "u128_mod" },
-        .{ "roc_builtins_i128_to_dec_try_unsafe", "i128_to_dec" },
-        .{ "roc_builtins_u128_to_dec_try_unsafe", "u128_to_dec" },
-        .{ "roc_builtins_dec_to_int_try_unsafe", "dec_to_int_try_unsafe" },
-        .{ "roc_builtins_dec_to_f32_try_unsafe", "dec_to_f32" },
-        .{ "roc_builtins_float_to_str", "float_to_str" },
-        .{ "roc_builtins_float_pow", "float_pow" },
-        .{ "roc_builtins_float_sin", "float_sin" },
-        .{ "roc_builtins_float_cos", "float_cos" },
-        .{ "roc_builtins_float_tan", "float_tan" },
-        .{ "roc_builtins_float_asin", "float_asin" },
-        .{ "roc_builtins_float_acos", "float_acos" },
-        .{ "roc_builtins_float_atan", "float_atan" },
-        .{ "roc_builtins_int_to_str", "int_to_str" },
-        .{ "roc_builtins_int_from_str", "int_from_str" },
-        .{ "roc_builtins_dec_from_str", "dec_from_str" },
-        .{ "roc_builtins_float_from_str", "float_from_str" },
-        .{ "roc_builtins_str_equal", "str_equal" },
-        .{ "roc_builtins_str_concat", "str_concat" },
-        .{ "roc_builtins_str_repeat", "str_repeat" },
-        .{ "roc_builtins_str_trim", "str_trim" },
-        .{ "roc_builtins_str_trim_start", "str_trim_start" },
-        .{ "roc_builtins_str_trim_end", "str_trim_end" },
-        .{ "roc_builtins_str_split", "str_split" },
-        .{ "roc_builtins_str_join_with", "str_join_with" },
-        .{ "roc_builtins_str_reserve", "str_reserve" },
-        .{ "roc_builtins_str_release_excess_capacity", "str_release_excess_capacity" },
-        .{ "roc_builtins_str_with_capacity", "str_with_capacity" },
-        .{ "roc_builtins_str_drop_prefix", "str_drop_prefix" },
-        .{ "roc_builtins_str_drop_prefix_caseless_ascii", "str_drop_prefix_caseless_ascii" },
-        .{ "roc_builtins_str_drop_suffix", "str_drop_suffix" },
-        .{ "roc_builtins_str_with_ascii_lowercased", "str_with_ascii_lowercased" },
-        .{ "roc_builtins_str_with_ascii_uppercased", "str_with_ascii_uppercased" },
-        .{ "roc_builtins_str_caseless_ascii_equals", "str_caseless_ascii_equals" },
-        .{ "roc_builtins_str_from_utf8", "str_from_utf8" },
-        .{ "roc_builtins_list_append_unsafe", "list_append_unsafe" },
-        .{ "roc_builtins_list_eq", "list_eq" },
-        .{ "roc_builtins_list_str_eq", "list_str_eq" },
-        .{ "roc_builtins_list_list_eq", "list_list_eq" },
-        .{ "roc_builtins_list_reverse", "list_reverse" },
-        .{ "roc_builtins_allocate_with_refcount", "allocate_with_refcount" },
-        .{ "roc_builtins_i8_mod_by", "i8_mod_by" },
-        .{ "roc_builtins_u8_mod_by", "u8_mod_by" },
-        .{ "roc_builtins_i16_mod_by", "i16_mod_by" },
-        .{ "roc_builtins_u16_mod_by", "u16_mod_by" },
-        .{ "roc_builtins_i32_mod_by", "i32_mod_by" },
-        .{ "roc_builtins_u32_mod_by", "u32_mod_by" },
-        .{ "roc_builtins_i64_mod_by", "i64_mod_by" },
-        .{ "roc_builtins_u64_mod_by", "u64_mod_by" },
-        .{ "roc_builtins_crypto_sha256_hash_bytes", "crypto_sha256_hash_bytes" },
-        .{ "roc_builtins_crypto_sha256_hasher_empty", "crypto_sha256_hasher_empty" },
-        .{ "roc_builtins_crypto_sha256_hasher_write", "crypto_sha256_hasher_write" },
-        .{ "roc_builtins_crypto_sha256_hasher_finish", "crypto_sha256_hasher_finish" },
-        .{ "roc_builtins_crypto_blake3_hash_bytes", "crypto_blake3_hash_bytes" },
-        .{ "roc_builtins_crypto_blake3_hasher_empty", "crypto_blake3_hasher_empty" },
-        .{ "roc_builtins_crypto_blake3_hasher_write", "crypto_blake3_hasher_write" },
-        .{ "roc_builtins_crypto_blake3_hasher_finish", "crypto_blake3_hasher_finish" },
-    };
+    indices: std.enums.EnumArray(BuiltinKind, u32),
 
     pub const PopulateError = error{MissingBuiltinSymbol};
 
-    /// Populate this struct by looking up each builtin symbol name in the
-    /// module's merged symbol table. Returns the actual function index for
-    /// each builtin (from sym.index), not the symbol table index.
+    /// Merged-module function index for `kind`.
+    pub fn get(self: BuiltinSymbols, kind: BuiltinKind) u32 {
+        return self.indices.get(kind);
+    }
+
+    /// Populate by looking up each builtin's symbol name in the module's merged
+    /// symbol table. Returns the actual function index for each builtin (from
+    /// `sym.index`), not the symbol table index. Every `BuiltinKind` symbol must
+    /// be present or this fails with `error.MissingBuiltinSymbol`.
     pub fn populate(module: *const Self) PopulateError!BuiltinSymbols {
-        var result: BuiltinSymbols = undefined;
-        inline for (mapping) |entry| {
-            const sym_name = entry[0];
-            const field_name = entry[1];
+        var result = BuiltinSymbols{ .indices = std.enums.EnumArray(BuiltinKind, u32).initUndefined() };
+        inline for (comptime std.enums.values(BuiltinKind)) |kind| {
+            const sym_name = builtin_signatures.sigOf(kind).name;
             const sym_table_idx = module.linking.findSymbolByName(
                 sym_name,
                 module.imports.items,
                 module.global_imports.items,
                 module.table_imports.items,
             ) orelse return error.MissingBuiltinSymbol;
-            @field(result, field_name) = module.linking.symbol_table.items[sym_table_idx].index;
+            result.indices.set(kind, module.linking.symbol_table.items[sym_table_idx].index);
         }
         return result;
     }
@@ -5755,8 +5622,8 @@ fn buildMergeBuiltinsModule(allocator: Allocator) Allocator.Error!Self {
     // Symbol table
     try module.linking.symbol_table.appendSlice(allocator, &.{
         .{ .kind = .function, .flags = WasmLinking.SymFlag.UNDEFINED, .name = null, .index = 0 },
-        .{ .kind = .function, .flags = 0, .name = "roc_builtins_str_trim", .index = 1 },
-        .{ .kind = .function, .flags = 0, .name = "roc_builtins_str_concat", .index = 2 },
+        .{ .kind = .function, .flags = 0, .name = builtin_signatures.sigOf(.str_trim).name, .index = 1 },
+        .{ .kind = .function, .flags = 0, .name = builtin_signatures.sigOf(.str_concat).name, .index = 2 },
         .{ .kind = .data, .flags = 0, .name = ".rodata", .index = 0, .data_offset = 0, .data_size = 4 },
     });
 
@@ -5836,13 +5703,13 @@ test "mergeModule — function indices remapped correctly" {
     const trim_sym_idx = result.symbol_remap[1]; // src sym 1 → host sym
     const trim_sym = host.linking.symbol_table.items[trim_sym_idx];
     try std.testing.expectEqual(@as(u32, 3), trim_sym.index); // global fn index 3
-    try std.testing.expectEqualStrings("roc_builtins_str_trim", trim_sym.name.?);
+    try std.testing.expectEqualStrings(builtin_signatures.sigOf(.str_trim).name, trim_sym.name.?);
 
     // Check roc_builtins_str_concat (was source global index 2)
     const concat_sym_idx = result.symbol_remap[2];
     const concat_sym = host.linking.symbol_table.items[concat_sym_idx];
     try std.testing.expectEqual(@as(u32, 4), concat_sym.index); // global fn index 4
-    try std.testing.expectEqualStrings("roc_builtins_str_concat", concat_sym.name.?);
+    try std.testing.expectEqualStrings(builtin_signatures.sigOf(.str_concat).name, concat_sym.name.?);
 }
 
 test "mergeModule — code bytes appended at correct offset" {
@@ -6265,10 +6132,11 @@ test "BuiltinSymbols — all symbols found after merge" {
     module.import_fn_count = 1;
 
     // Add a defined function symbol for each builtin that BuiltinSymbols expects.
+    const kinds = comptime std.enums.values(BuiltinKind);
     const names = comptime blk: {
-        var result: [BuiltinSymbols.mapping.len][]const u8 = undefined;
-        for (BuiltinSymbols.mapping, 0..) |entry, i| {
-            result[i] = entry[0];
+        var result: [kinds.len][]const u8 = undefined;
+        for (kinds, 0..) |kind, i| {
+            result[i] = builtin_signatures.sigOf(kind).name;
         }
         break :blk result;
     };
@@ -6287,9 +6155,10 @@ test "BuiltinSymbols — all symbols found after merge" {
         return err;
     };
 
-    // Spot check a few fields (populate returns function index = i + 1, since index 0 is the import)
-    try std.testing.expectEqual(@as(u32, 1), syms.dec_mul); // function index 1 (first defined fn after import)
-    try std.testing.expectEqual(@as(u32, 28), syms.str_trim); // function index 28
+    // Spot check a few builtins (populate returns function index = enum index + 1,
+    // since index 0 is the import and symbols are added in `BuiltinKind` order).
+    try std.testing.expectEqual(@as(u32, 1), syms.get(.dec_mul)); // first defined fn after import
+    try std.testing.expectEqual(@as(u32, @intFromEnum(BuiltinKind.str_trim)) + 1, syms.get(.str_trim));
 }
 
 test "BuiltinSymbols — fails when symbol missing" {
@@ -6596,7 +6465,7 @@ test "verifyNoLinkObjectContract - rejects undefined Roc builtin function symbol
     try module.linking.symbol_table.append(allocator, .{
         .kind = .function,
         .flags = WasmLinking.SymFlag.UNDEFINED | WasmLinking.SymFlag.EXPLICIT_NAME,
-        .name = "roc_builtins_int_to_str",
+        .name = builtin_signatures.sigOf(.int_to_str).name,
         .index = 0,
     });
 
@@ -7498,6 +7367,24 @@ test "encode — reloc.CODE section NOT present in output" {
         }
 
         pos = section_end;
+    }
+}
+
+test "builtins payload defines exactly the registry's linkable members" {
+    const allocator = std.testing.allocator;
+    const registry = @import("builtins").builtin_registry;
+
+    const wasm32_builtins = @import("wasm32_builtins");
+    var builtins_module = try preload(allocator, wasm32_builtins.bytes, false);
+    defer builtins_module.deinit();
+
+    inline for (comptime std.enums.values(registry.BuiltinFn)) |f| {
+        const found = builtins_module.findDefinedFunctionSymbolExact(f.symbolName());
+        if (comptime f.payload() == .jit_only) {
+            try std.testing.expectError(error.MissingSymbol, found);
+        } else {
+            _ = try found;
+        }
     }
 }
 

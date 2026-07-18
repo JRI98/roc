@@ -27,6 +27,8 @@ const platform_config = @import("platform_config.zig");
 const util = @import("util.zig");
 const collections = @import("collections");
 const bytebox = @import("bytebox");
+const builtins = @import("builtins");
+const BuiltinFn = builtins.builtin_registry.BuiltinFn;
 
 /// Error returned when a hosted function reports a Roc panic to the runner.
 pub const HostFunctionError = error{RocPanic};
@@ -2605,8 +2607,8 @@ const hot_reload_host_c_source =
     \\
     \\extern uint64_t roc_main(uint64_t);
     \\extern void *roc_shim_get_ops(void);
-    \\extern void roc_builtins_erased_callable_incref(unsigned char *, intptr_t, void *);
-    \\extern void roc_builtins_erased_callable_decref(unsigned char *, void *);
+++ "\nextern void " ++ BuiltinFn.erased_callable_incref.symbolName() ++ "(unsigned char *, intptr_t, void *);" ++
+    "\nextern void " ++ BuiltinFn.erased_callable_decref.symbolName() ++ "(unsigned char *, void *);\n" ++
     \\
     \\#ifndef ROC_TARGET_NAME
     \\#error "ROC_TARGET_NAME must be defined"
@@ -2678,10 +2680,10 @@ const hot_reload_host_c_source =
     \\void roc_host_store_boxed(unsigned char *boxed) {
     \\    void *ops = roc_shim_get_ops();
     \\    if (stored_boxed != NULL) {
-    \\        roc_builtins_erased_callable_decref(stored_boxed, ops);
+++ "\n        " ++ BuiltinFn.erased_callable_decref.symbolName() ++ "(stored_boxed, ops);\n" ++
     \\    }
     \\    if (boxed != NULL) {
-    \\        roc_builtins_erased_callable_incref(boxed, 1, ops);
+++ "\n        " ++ BuiltinFn.erased_callable_incref.symbolName() ++ "(boxed, 1, ops);\n" ++
     \\    }
     \\    stored_boxed = boxed;
     \\}
@@ -2694,9 +2696,9 @@ const hot_reload_host_c_source =
     \\    void *ops = roc_shim_get_ops();
     \\    if (stored_boxed == NULL) return 1;
     \\    if (retained_boxed != NULL) {
-    \\        roc_builtins_erased_callable_decref(retained_boxed, ops);
+++ "\n        " ++ BuiltinFn.erased_callable_decref.symbolName() ++ "(retained_boxed, ops);\n" ++
     \\    }
-    \\    roc_builtins_erased_callable_incref(stored_boxed, 1, ops);
+++ "\n    " ++ BuiltinFn.erased_callable_incref.symbolName() ++ "(stored_boxed, 1, ops);\n" ++
     \\    retained_boxed = stored_boxed;
     \\    return 0;
     \\}
@@ -2978,7 +2980,7 @@ const hot_reload_host_c_source =
     \\    printf("boxed-wide-old-after-shrink:%lld\n", (long long)old_wide_result);
     \\    fflush(stdout);
     \\    if (old_wide_result != 159) return 1;
-    \\    roc_builtins_erased_callable_decref(retained_boxed, roc_shim_get_ops());
+++ "\n    " ++ BuiltinFn.erased_callable_decref.symbolName() ++ "(retained_boxed, roc_shim_get_ops());\n" ++
     \\    retained_boxed = NULL;
     \\
     \\    if (write_app(app_path, app_const_thirteen)) return 1;
@@ -2987,7 +2989,7 @@ const hot_reload_host_c_source =
     \\    printf("boxed-old-after-reload:%lld\n", (long long)old_boxed_result);
     \\    fflush(stdout);
     \\    if (old_boxed_result != 12) return 1;
-    \\    roc_builtins_erased_callable_decref(stored_boxed, roc_shim_get_ops());
+++ "\n    " ++ BuiltinFn.erased_callable_decref.symbolName() ++ "(stored_boxed, roc_shim_get_ops());\n" ++
     \\    stored_boxed = NULL;
     \\    puts("boxed-released");
     \\    fflush(stdout);
@@ -4596,7 +4598,7 @@ fn customListBuiltinInlined(
 
     const archive_bytes = std.Io.Dir.cwd().readFileAlloc(io, archive_path, allocator, .limited(64 * 1024 * 1024)) catch |err|
         return customInfraFailure(allocator, timer, "failed to read archive {s}: {}", .{ archive_path, err });
-    if (std.mem.find(u8, archive_bytes, "roc_builtins_list_append_unsafe") != null) {
+    if (std.mem.find(u8, archive_bytes, BuiltinFn.list_append_unsafe.symbolName()) != null) {
         return customFailure(allocator, timer, "list_append_unsafe was not inlined into the --opt=speed archive object (it still references the builtin symbol)", .{});
     }
     return null;

@@ -8,6 +8,7 @@ const builtin = @import("builtin");
 const builtins = @import("builtins");
 const bytebox = @import("bytebox");
 const collections = @import("collections");
+const BuiltinSignatures = @import("backend").wasm.BuiltinSignatures;
 const i128h = builtins.compiler_rt_128;
 const is_freestanding = builtin.target.os.tag == .freestanding;
 /// Dec's scaling factor (10^18) as an i128, sourced from the canonical Dec type.
@@ -30,6 +31,23 @@ else
             std.debug.print(fmt, args);
         }
     }.print;
+
+/// Convert a builtin signature's wasm `ValType` list into the `bytebox.ValType`
+/// list `addHostFunction` expects, so a host row can take its ABI straight from
+/// `builtin_signatures` instead of a hand-written param/result list.
+fn byteboxValTypes(comptime vts: []const BuiltinSignatures.ValType) []const bytebox.ValType {
+    comptime {
+        var arr: [vts.len]bytebox.ValType = undefined;
+        for (vts, 0..) |vt, i| arr[i] = switch (vt) {
+            .i32 => .I32,
+            .i64 => .I64,
+            .f32 => .F32,
+            .f64 => .F64,
+        };
+        const frozen = arr;
+        return &frozen;
+    }
+}
 
 fn readIntLittle(comptime T: type, buffer: []const u8, offset: usize) T {
     const UInt = std.meta.Int(.unsigned, @bitSizeOf(T));
@@ -198,9 +216,20 @@ pub fn runWasmStrWithStats(
         env_imports.addHostFunction("roc_i128_mod_s", &[_]bytebox.ValType{ .I32, .I32, .I32 }, &[_]bytebox.ValType{}, hostI128ModS, null) catch return error.WasmExecFailed;
         env_imports.addHostFunction("roc_u128_div", &[_]bytebox.ValType{ .I32, .I32, .I32 }, &[_]bytebox.ValType{}, hostU128Div, null) catch return error.WasmExecFailed;
         env_imports.addHostFunction("roc_u128_mod", &[_]bytebox.ValType{ .I32, .I32, .I32 }, &[_]bytebox.ValType{}, hostU128Mod, null) catch return error.WasmExecFailed;
-        env_imports.addHostFunction("roc_builtins_num_mod_i128", &[_]bytebox.ValType{ .I32, .I32, .I64, .I64, .I64, .I64, .I32 }, &[_]bytebox.ValType{}, hostI128Mod, null) catch return error.WasmExecFailed;
-        env_imports.addHostFunction("roc_builtins_num_mul_with_overflow_i128", &[_]bytebox.ValType{ .I32, .I32, .I64, .I64, .I64, .I64 }, &[_]bytebox.ValType{.I32}, hostI128MulWithOverflow, null) catch return error.WasmExecFailed;
-        env_imports.addHostFunction("roc_builtins_num_mul_with_overflow_u128", &[_]bytebox.ValType{ .I32, .I32, .I64, .I64, .I64, .I64 }, &[_]bytebox.ValType{.I32}, hostU128MulWithOverflow, null) catch return error.WasmExecFailed;
+        inline for (.{
+            .{ BuiltinSignatures.BuiltinKind.num_mod_i128, hostI128Mod },
+            .{ BuiltinSignatures.BuiltinKind.num_mul_with_overflow_i128, hostI128MulWithOverflow },
+            .{ BuiltinSignatures.BuiltinKind.num_mul_with_overflow_u128, hostU128MulWithOverflow },
+        }) |entry| {
+            const sig = comptime BuiltinSignatures.sigOf(entry[0]);
+            env_imports.addHostFunction(
+                sig.name,
+                comptime byteboxValTypes(sig.wasm_params),
+                comptime byteboxValTypes(sig.wasm_results),
+                entry[1],
+                null,
+            ) catch return error.WasmExecFailed;
+        }
         env_imports.addHostFunction("roc_dec_div", &[_]bytebox.ValType{ .I32, .I32, .I32 }, &[_]bytebox.ValType{}, hostDecDiv, null) catch return error.WasmExecFailed;
         env_imports.addHostFunction("roc_dec_div_trunc", &[_]bytebox.ValType{ .I32, .I32, .I32 }, &[_]bytebox.ValType{}, hostDecDivTrunc, null) catch return error.WasmExecFailed;
         env_imports.addHostFunction("roc_dec_pow", &[_]bytebox.ValType{ .I32, .I32, .I32 }, &[_]bytebox.ValType{}, hostDecPow, null) catch return error.WasmExecFailed;

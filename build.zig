@@ -2859,6 +2859,7 @@ pub fn build(b: *std.Build) void {
     const llvm_codegen_module = b.addModule("llvm_codegen", .{
         .root_source_file = b.path("src/backend/llvm/MonoLlvmCodeGen.zig"),
     });
+    llvm_codegen_module.addImport("base", roc_modules.base);
     llvm_codegen_module.addImport("layout", roc_modules.layout);
     llvm_codegen_module.addImport("lir", roc_modules.lir);
     llvm_codegen_module.addImport("ctx", roc_modules.ctx);
@@ -2955,6 +2956,7 @@ pub fn build(b: *std.Build) void {
                     .{ .name = "test_harness", .module = createTestHarnessModule(b, roc_modules) },
                     .{ .name = "collections", .module = roc_modules.collections },
                     .{ .name = "backend", .module = roc_modules.backend },
+                    .{ .name = "builtins", .module = roc_modules.builtins },
                     .{ .name = "bytebox", .module = bytebox.module("bytebox") },
                     .{ .name = "build_options", .module = roc_modules.build_options },
                 },
@@ -3021,6 +3023,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "vendor_llvm_compile_bindings", .module = roc_modules.vendor_llvm_compile_bindings },
             .{ .name = "build_options", .module = roc_modules.build_options },
             .{ .name = "roc_target", .module = roc_modules.roc_target },
+            .{ .name = "builtins", .module = roc_modules.builtins },
             .{ .name = "embedded_lld", .module = roc_modules.embedded_lld },
         },
     });
@@ -3305,6 +3308,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "vendor_llvm_compile_bindings", .module = roc_modules.vendor_llvm_compile_bindings },
             .{ .name = "build_options", .module = roc_modules.build_options },
             .{ .name = "roc_target", .module = roc_modules.roc_target },
+            .{ .name = "builtins", .module = roc_modules.builtins },
             .{ .name = "llvm_embedded", .module = llvm_embedded_module },
             .{ .name = "embedded_lld", .module = roc_modules.embedded_lld },
         },
@@ -6185,6 +6189,7 @@ fn addLlvmSupportToStep(
             .{ .name = "vendor_llvm_compile_bindings", .module = roc_modules.vendor_llvm_compile_bindings },
             .{ .name = "build_options", .module = roc_modules.build_options },
             .{ .name = "roc_target", .module = roc_modules.roc_target },
+            .{ .name = "builtins", .module = roc_modules.builtins },
             .{ .name = "llvm_embedded", .module = llvm_embedded_module },
             .{ .name = "embedded_lld", .module = roc_modules.embedded_lld },
         },
