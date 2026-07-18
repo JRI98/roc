@@ -126,6 +126,8 @@ comptime {
     @export(&dw.roc_builtins_int_try_unsigned, .{ .name = "roc_builtins_int_try_unsigned" });
     @export(&dw.roc_builtins_dec_to_int_try_unsafe, .{ .name = "roc_builtins_dec_to_int_try_unsafe" });
     @export(&dw.roc_builtins_f64_to_int_try_unsafe, .{ .name = "roc_builtins_f64_to_int_try_unsafe" });
+    @export(&dw.roc_builtins_f32_to_int_wrap, .{ .name = "roc_builtins_f32_to_int_wrap" });
+    @export(&dw.roc_builtins_f64_to_int_wrap, .{ .name = "roc_builtins_f64_to_int_wrap" });
     @export(&dw.roc_builtins_dec_to_f32_try_unsafe, .{ .name = "roc_builtins_dec_to_f32_try_unsafe" });
     @export(&dw.roc_builtins_f64_to_f32_try_unsafe, .{ .name = "roc_builtins_f64_to_f32_try_unsafe" });
     @export(&dw.roc_builtins_i128_to_dec_try_unsafe, .{ .name = "roc_builtins_i128_to_dec_try_unsafe" });

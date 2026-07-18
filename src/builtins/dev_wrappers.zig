@@ -1503,6 +1503,20 @@ pub fn roc_builtins_f64_to_int_try_unsafe(out: [*]u8, val: f64, target_bits: u32
     out[success_offset] = @intFromBool(bits != null);
 }
 
+/// f32 → integer wrapping conversion (writes val_size result bytes to out)
+pub fn roc_builtins_f32_to_int_wrap(out: [*]u8, val: f32, target_bits: u32, target_is_signed: u32, val_size: u32) callconv(.c) void {
+    const bits = numeric_conversions.floatToIntWrapBits(f32, val, target_bits, target_is_signed != 0);
+    const v_bytes: [16]u8 = @bitCast(bits);
+    @memcpy(out[0..val_size], v_bytes[0..val_size]);
+}
+
+/// f64 → integer wrapping conversion (writes val_size result bytes to out)
+pub fn roc_builtins_f64_to_int_wrap(out: [*]u8, val: f64, target_bits: u32, target_is_signed: u32, val_size: u32) callconv(.c) void {
+    const bits = numeric_conversions.floatToIntWrapBits(f64, val, target_bits, target_is_signed != 0);
+    const v_bytes: [16]u8 = @bitCast(bits);
+    @memcpy(out[0..val_size], v_bytes[0..val_size]);
+}
+
 /// Dec → f32 try unsafe
 pub fn roc_builtins_dec_to_f32_try_unsafe(out: [*]u8, dec_low: u64, dec_high: u64, success_offset: u32, value_offset: u32) callconv(.c) void {
     const dec_val: i128 = @bitCast(i128h.from_u64_pair(dec_low, dec_high));

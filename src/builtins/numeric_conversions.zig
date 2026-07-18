@@ -97,6 +97,44 @@ pub fn f64ToIntTryBits(value: f64, target_bits: u32, target_signed: bool) ?u128 
     return int_value;
 }
 
+/// Convert a float to raw target integer bits using Roc's wrapping
+/// float-to-integer semantics: NaN and the infinities produce 0, the
+/// fractional part truncates toward zero, targets of at most 64 bits wrap
+/// modulo 2^bits, and wider targets produce 0 when the truncated value is
+/// out of range.
+pub fn floatToIntWrapBits(comptime Float: type, value: Float, target_bits: u32, target_signed: bool) u128 {
+    if (!std.math.isFinite(value)) return 0;
+
+    const truncated = @trunc(value);
+
+    if (target_bits <= 64) {
+        const modulus: Float = @floatFromInt(i128h.shl(1, @intCast(target_bits)));
+        var remainder = @mod(truncated, modulus);
+        if (remainder < 0) remainder += modulus;
+        if (remainder >= modulus) remainder = 0;
+        return @as(u64, @intFromFloat(remainder));
+    }
+
+    if (!truncatedFloatFitsTarget(Float, truncated, target_bits, target_signed)) {
+        return 0;
+    }
+
+    const as_f64: f64 = @floatCast(truncated);
+    if (target_signed) {
+        return @bitCast(i128h.f64_to_i128(as_f64));
+    }
+    return i128h.f64_to_u128(as_f64);
+}
+
+/// Convert a float to an integer using Roc's wrapping float-to-integer
+/// semantics (see `floatToIntWrapBits`).
+pub fn floatToIntWrap(comptime Float: type, comptime Int: type, value: Float) Int {
+    const int_info = @typeInfo(Int).int;
+    const bits = floatToIntWrapBits(Float, value, int_info.bits, int_info.signedness == .signed);
+    const U = std.meta.Int(.unsigned, int_info.bits);
+    return @bitCast(@as(U, @truncate(bits)));
+}
+
 /// Convert a Roc Dec payload to raw target integer bits after truncating.
 pub fn decToIntTryBits(dec_value: i128, target_bits: u32, target_signed: bool) ?u128 {
     const whole_part = i128h.divTrunc_i128(dec_value, dec.RocDec.one_point_zero_i128);
@@ -144,6 +182,25 @@ test "float to int conversions truncate and reject target boundary violations" {
     try std.testing.expectEqual(@as(?u8, null), floatToIntTry(f64, u8, -1.0));
     try std.testing.expectEqual(@as(?i8, null), floatToIntTry(f64, i8, std.math.inf(f64)));
     try std.testing.expectEqual(@as(?i8, null), floatToIntTry(f64, i8, std.math.nan(f64)));
+}
+
+test "wrapping float to int conversions wrap modulo 2^bits and zero non-finite inputs" {
+    try std.testing.expectEqual(@as(i8, 42), floatToIntWrap(f64, i8, 42.7));
+    try std.testing.expectEqual(@as(i8, -42), floatToIntWrap(f64, i8, -42.7));
+    try std.testing.expectEqual(@as(i8, -128), floatToIntWrap(f64, i8, 128.0));
+    try std.testing.expectEqual(@as(i8, -56), floatToIntWrap(f64, i8, 200.0));
+    try std.testing.expectEqual(@as(u8, 255), floatToIntWrap(f64, u8, -1.0));
+    try std.testing.expectEqual(@as(i8, -128), floatToIntWrap(f32, i8, 128.0));
+    try std.testing.expectEqual(@as(i8, 0), floatToIntWrap(f64, i8, std.math.nan(f64)));
+    try std.testing.expectEqual(@as(i8, 0), floatToIntWrap(f64, i8, std.math.inf(f64)));
+    try std.testing.expectEqual(@as(i8, 0), floatToIntWrap(f64, i8, -std.math.inf(f64)));
+    try std.testing.expectEqual(@as(i128, 1) << 100, floatToIntWrap(f64, i128, 0x1p100));
+    try std.testing.expectEqual(@as(i128, 0), floatToIntWrap(f64, i128, 0x1p127));
+    try std.testing.expectEqual(@as(u128, 1) << 127, floatToIntWrap(f64, u128, 0x1p127));
+    try std.testing.expectEqual(@as(u128, 0), floatToIntWrap(f64, u128, -1.0));
+
+    try std.testing.expectEqual(@as(u128, @as(u8, @bitCast(@as(i8, -128)))), floatToIntWrapBits(f64, 128.0, 8, true));
+    try std.testing.expectEqual(@as(u128, 0), floatToIntWrapBits(f64, std.math.nan(f64), 8, true));
 }
 
 test "raw float and Dec conversion bits preserve signed integer representation" {
