@@ -271,6 +271,15 @@ const Unifier = struct {
                     .tag_union => |tag_union| {
                         return Content{ .structure = FlatType{ .tag_union = try self.tagUnionForMerge(vars, tag_union) } };
                     },
+                    .fn_pure => |func| {
+                        return Content{ .structure = FlatType{ .fn_pure = try self.funcForMerge(vars, func) } };
+                    },
+                    .fn_effectful => |func| {
+                        return Content{ .structure = FlatType{ .fn_effectful = try self.funcForMerge(vars, func) } };
+                    },
+                    .fn_unbound => |func| {
+                        return Content{ .structure = FlatType{ .fn_unbound = try self.funcForMerge(vars, func) } };
+                    },
                     else => return content,
                 }
             },
@@ -2059,6 +2068,43 @@ const Unifier = struct {
             .only_in_b = scratch.only_in_b_fields.rangeToEnd(b_fields_start),
             .in_both = scratch.in_both_fields.rangeToEnd(both_fields_start),
         };
+    }
+
+    /// Preserve every directed effect dependency when two representations of
+    /// the same function type merge. Function argument and result types unify;
+    /// their effect dependencies form a union because either side may carry
+    /// body-derived information that the other side (for example an annotation)
+    /// does not contain.
+    fn funcForMerge(self: *Self, vars: *const ResolvedVarDescs, selected: Func) std.mem.Allocator.Error!Func {
+        const a_func = vars.a.desc.content.unwrapFunc() orelse return selected;
+        const b_func = vars.b.desc.content.unwrapFunc() orelse return selected;
+        const capacity = a_func.effect_deps.len() + b_func.effect_deps.len();
+        if (capacity == 0) return selected;
+
+        var deps_sfa = std.heap.stackFallback(8 * @sizeOf(Var), self.scratch.gpa);
+        const deps_alloc = deps_sfa.get();
+        var deps = try std.ArrayList(Var).initCapacity(deps_alloc, capacity);
+        defer deps.deinit(deps_alloc);
+
+        for ([_]Var.SafeList.Range{ a_func.effect_deps, b_func.effect_deps }) |range| {
+            var i: u32 = 0;
+            while (i < range.len()) : (i += 1) {
+                const dep = self.types_store.getVarAt(range, i);
+                const dep_root = self.types_store.resolveVar(dep).var_;
+                var seen = false;
+                for (deps.items) |existing| {
+                    if (self.types_store.resolveVar(existing).var_ == dep_root) {
+                        seen = true;
+                        break;
+                    }
+                }
+                if (!seen) deps.appendAssumeCapacity(dep_root);
+            }
+        }
+
+        var merged = selected;
+        merged.effect_deps = try self.types_store.appendVars(deps.items);
+        return merged;
     }
 
     /// Given a list of shared fields & a list of extended fields, unify the shared

@@ -4678,6 +4678,20 @@ const PatternExtractionRegionStatsError = error{
     PatternExtractionLookupWasNotResolved,
 };
 
+var shared_test_builtins: ?eval.BuiltinModules = null;
+var shared_test_builtins_mutex: std.Io.Mutex = .init;
+
+fn sharedBuiltinModules() eval.BuiltinModules.InitError!*eval.BuiltinModules {
+    shared_test_builtins_mutex.lockUncancelable(std.testing.io);
+    defer shared_test_builtins_mutex.unlock(std.testing.io);
+
+    if (shared_test_builtins == null) {
+        shared_test_builtins = try eval.BuiltinModules.init(std.heap.page_allocator);
+    }
+
+    return &shared_test_builtins.?;
+}
+
 fn compileAppWithCheckedModuleCache(
     allocator: Allocator,
     cache_dir: []const u8,
@@ -4689,15 +4703,14 @@ fn compileAppWithCheckedModuleCache(
         .cache_dir = cache_dir,
     }, roc_ctx);
 
-    var builtin_modules = try eval.BuiltinModules.init(allocator);
-    defer builtin_modules.deinit();
+    const builtin_modules = try sharedBuiltinModules();
 
     var coord = try Coordinator.init(
         allocator,
         .single_threaded,
         1,
         roc_target.RocTarget.detectNative(),
-        &builtin_modules,
+        builtin_modules,
         build_options.compiler_version,
         &cache_manager,
         roc_ctx,
@@ -4782,15 +4795,14 @@ fn compileAppRootIdentity(
         .cache_dir = cache_dir,
     }, roc_ctx);
 
-    var builtin_modules = try eval.BuiltinModules.init(allocator);
-    defer builtin_modules.deinit();
+    const builtin_modules = try sharedBuiltinModules();
 
     var coord = try Coordinator.init(
         allocator,
         .single_threaded,
         1,
         roc_target.RocTarget.detectNative(),
-        &builtin_modules,
+        builtin_modules,
         build_options.compiler_version,
         &cache_manager,
         roc_ctx,
@@ -5059,15 +5071,14 @@ test "app artifact records platform requirement solutions from checking" {
     defer allocator.free(app_path);
 
     const roc_ctx = CoreCtx.os(allocator, allocator, std.testing.io);
-    var builtin_modules = try eval.BuiltinModules.init(allocator);
-    defer builtin_modules.deinit();
+    const builtin_modules = try sharedBuiltinModules();
 
     var coord = try Coordinator.init(
         allocator,
         .single_threaded,
         1,
         roc_target.RocTarget.detectNative(),
-        &builtin_modules,
+        builtin_modules,
         build_options.compiler_version,
         null,
         roc_ctx,
@@ -5163,15 +5174,14 @@ test "platform requirement relation specializes identity reached through app ali
     defer allocator.free(app_path);
 
     const roc_ctx = CoreCtx.os(allocator, allocator, std.testing.io);
-    var builtin_modules = try eval.BuiltinModules.init(allocator);
-    defer builtin_modules.deinit();
+    const builtin_modules = try sharedBuiltinModules();
 
     var coord = try Coordinator.init(
         allocator,
         .single_threaded,
         1,
         roc_target.RocTarget.detectNative(),
-        &builtin_modules,
+        builtin_modules,
         build_options.compiler_version,
         null,
         roc_ctx,
@@ -5223,14 +5233,13 @@ test "diagnostic-only mode publishes the platform root during checking" {
     defer allocator.free(app_path);
 
     const roc_ctx = CoreCtx.os(allocator, allocator, std.testing.io);
-    var builtin_modules = try eval.BuiltinModules.init(allocator);
-    defer builtin_modules.deinit();
+    const builtin_modules = try sharedBuiltinModules();
     var coord = try Coordinator.init(
         allocator,
         .single_threaded,
         1,
         roc_target.RocTarget.detectNative(),
-        &builtin_modules,
+        builtin_modules,
         build_options.compiler_version,
         null,
         roc_ctx,
@@ -5288,14 +5297,13 @@ test "deferred platform publication retains compile-time diagnostics" {
     defer allocator.free(app_path);
 
     const roc_ctx = CoreCtx.os(allocator, allocator, std.testing.io);
-    var builtin_modules = try eval.BuiltinModules.init(allocator);
-    defer builtin_modules.deinit();
+    const builtin_modules = try sharedBuiltinModules();
     var coord = try Coordinator.init(
         allocator,
         .single_threaded,
         1,
         roc_target.RocTarget.detectNative(),
-        &builtin_modules,
+        builtin_modules,
         build_options.compiler_version,
         null,
         roc_ctx,
@@ -5353,15 +5361,14 @@ test "requires signature naming a for-clause alias resolves to the app declarati
     defer allocator.free(app_path);
 
     const roc_ctx = CoreCtx.os(allocator, allocator, std.testing.io);
-    var builtin_modules = try eval.BuiltinModules.init(allocator);
-    defer builtin_modules.deinit();
+    const builtin_modules = try sharedBuiltinModules();
 
     var coord = try Coordinator.init(
         allocator,
         .single_threaded,
         1,
         roc_target.RocTarget.detectNative(),
-        &builtin_modules,
+        builtin_modules,
         build_options.compiler_version,
         null,
         roc_ctx,
@@ -5482,15 +5489,14 @@ test "hosted distinctness: identical hosted declarations bound to different plat
         .cache_dir = cache_dir,
     }, roc_ctx);
 
-    var builtin_modules = try eval.BuiltinModules.init(allocator);
-    defer builtin_modules.deinit();
+    const builtin_modules = try sharedBuiltinModules();
 
     var coord = try Coordinator.init(
         allocator,
         .single_threaded,
         1,
         roc_target.RocTarget.detectNative(),
-        &builtin_modules,
+        builtin_modules,
         build_options.compiler_version,
         &cache_manager,
         roc_ctx,

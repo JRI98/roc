@@ -1,8 +1,8 @@
-//! Checked static-dispatch target registry and normalized dispatch-site records.
+//! Checked static-dispatch registry and normalized dispatch-site records.
 //!
 //! The registry is built at checked-module publication. Post-check lowering uses
-//! it as a target table only; the dispatch-site record chooses the dispatcher
-//! type variable explicitly.
+//! its exact callable-or-structural resolutions; the dispatch-site record
+//! chooses the dispatcher type variable explicitly.
 
 const std = @import("std");
 const base = @import("base");
@@ -40,9 +40,9 @@ pub const ProcedureTemplateLookup = struct {
     module_idx: u32,
     by_def: []const ProcedureTemplateLookupEntry = &.{},
 
-    pub fn templateForDef(self: *const ProcedureTemplateLookup, def_idx: CIR.Def.Idx) ?canonical.ProcedureTemplateRef {
+    pub fn entryForDef(self: *const ProcedureTemplateLookup, def_idx: CIR.Def.Idx) ?ProcedureTemplateLookupEntry {
         const found = artifact_serialize.binarySearchByKey(ProcedureTemplateLookupEntry, CIR.Def.Idx, self.by_def, def_idx, templateEntryOrder) orelse return null;
-        return found.template;
+        return found.*;
     }
 };
 
@@ -50,10 +50,21 @@ fn templateEntryOrder(e: ProcedureTemplateLookupEntry, key: CIR.Def.Idx) std.mat
     return std.math.order(@intFromEnum(e.def), @intFromEnum(key));
 }
 
+/// Public `ProcedureTemplateKind` declaration.
+///
+/// The semantic lowering kind published with a checked procedure template.
+/// Structural intrinsics are declarations of compiler-derived behavior, not
+/// callable procedure bodies.
+pub const ProcedureTemplateKind = union(enum) {
+    callable,
+    structural: StructuralKind,
+};
+
 /// Public `ProcedureTemplateLookupEntry` declaration.
 pub const ProcedureTemplateLookupEntry = struct {
     def: CIR.Def.Idx,
     template: canonical.ProcedureTemplateRef,
+    kind: ProcedureTemplateKind,
 
     pub fn lessThan(_: void, lhs: ProcedureTemplateLookupEntry, rhs: ProcedureTemplateLookupEntry) bool {
         return @intFromEnum(lhs.def) < @intFromEnum(rhs.def);
@@ -132,12 +143,12 @@ pub const LocalProcedureMethodTarget = struct {
     expr: CheckedExprId,
 };
 
-/// Public `MethodTargetKind` declaration.
+/// Public `MethodTargetKind` declaration. Structural entries explicitly mark
+/// compiler-derived implementations and have no callable procedure body.
 pub const MethodTargetKind = union(enum) {
     procedure: ProcedureMethodTarget,
     local_proc: LocalProcedureMethodTarget,
-    generated_structural_parser,
-    generated_structural_encoder,
+    structural: StructuralKind,
 };
 
 /// Public `MethodTarget` declaration.
@@ -227,31 +238,34 @@ pub const MethodRegistry = struct {
             const def_idx = entry.value.def_idx;
             var referenced_callable_var: ?Var = null;
             const target_kind: MethodTargetKind = if (generatedStructuralTargetForMethodBinding(module, entry.value, entry.key.methodIdent())) |generated|
-                generated
-            else if (local_templates.templateForDef(def_idx)) |template| blk: {
-                const export_name = try names.internExportIdent(idents, method_ident);
-                const proc_base = try names.internProcBase(.{
-                    .module_name = module_name,
-                    .export_name = export_name,
-                    .kind = .checked_source,
-                    .ordinal = @intFromEnum(def_idx),
-                    .source_def_idx = @intFromEnum(def_idx),
-                });
-                break :blk .{ .procedure = .{
-                    .proc = .{ .artifact = template.artifact, .proc_base = proc_base },
-                    .template = template,
-                } };
+                .{ .structural = generated }
+            else if (local_templates.entryForDef(def_idx)) |template_entry| blk: {
+                break :blk switch (template_entry.kind) {
+                    .structural => |kind| .{ .structural = kind },
+                    .callable => callable: {
+                        const export_name = try names.internExportIdent(idents, method_ident);
+                        const proc_base = try names.internProcBase(.{
+                            .module_name = module_name,
+                            .export_name = export_name,
+                            .kind = .checked_source,
+                            .ordinal = @intFromEnum(def_idx),
+                            .source_def_idx = @intFromEnum(def_idx),
+                        });
+                        break :callable .{ .procedure = .{
+                            .proc = .{ .artifact = template_entry.template.artifact, .proc_base = proc_base },
+                            .template = template_entry.template,
+                        } };
+                    },
+                };
             } else if (localProcedureTargetForMethodBinding(module, checked_bodies, entry.value)) |local|
                 .{ .local_proc = local }
             else if (referencedProcedureTargetForMethodBinding(module, local_templates, checked_bodies, entry.value)) |referenced| blk: {
                 referenced_callable_var = referenced.callable_var;
                 break :blk referenced.kind;
             } else
-                // Associated values that do not resolve to a procedure are
-                // checked field access, not static-dispatch call targets. The
-                // method registry is a procedure-target table for Monotype
-                // static dispatch lowering, so only procedure-backed entries
-                // belong here.
+                // Associated values that resolve to neither a callable nor an
+                // explicitly structural declaration are checked field access,
+                // not static-dispatch resolutions.
                 continue;
             const callable_var = referenced_callable_var orelse methodTargetCallableVar(module, def_idx, entry.value, target_kind);
 
@@ -283,9 +297,7 @@ fn methodTargetCallableVar(
 ) Var {
     return switch (target_kind) {
         .procedure => module.defType(def_idx),
-        .generated_structural_parser,
-        .generated_structural_encoder,
-        => ModuleEnv.varFrom(binding.type_node_idx),
+        .structural => ModuleEnv.varFrom(binding.type_node_idx),
         .local_proc => blk: {
             const raw_node = @intFromEnum(binding.type_node_idx);
             const statement: CIR.Statement.Idx = @enumFromInt(raw_node);
@@ -302,7 +314,7 @@ fn generatedStructuralTargetForMethodBinding(
     module: TypedCIR.Module,
     binding: ModuleEnv.MethodBinding,
     method_ident: Ident.Idx,
-) ?MethodTargetKind {
+) ?StructuralKind {
     const expr_idx = methodBindingExpr(module, binding) orelse return null;
     switch (module.expr(expr_idx).data) {
         .e_anno_only,
@@ -314,8 +326,8 @@ fn generatedStructuralTargetForMethodBinding(
     if (module.moduleEnvConst().store.getTypeAnno(module.moduleEnvConst().store.getAnnotation(annotation_idx).anno) != .underscore) return null;
 
     const common = module.commonIdents();
-    if (method_ident.eql(common.parser_for)) return .generated_structural_parser;
-    if (method_ident.eql(common.encoder_for)) return .generated_structural_encoder;
+    if (method_ident.eql(common.parser_for)) return .parser;
+    if (method_ident.eql(common.encoder_for)) return .encoder;
     return null;
 }
 
@@ -450,12 +462,15 @@ fn referencedProcedureTargetForMethodBinding(
             else => return null,
         };
         if (defForBoundPattern(module_env, pattern_idx)) |target_def_idx| {
-            if (local_templates.templateForDef(target_def_idx)) |template| {
+            if (local_templates.entryForDef(target_def_idx)) |template_entry| {
                 return .{
-                    .kind = .{ .procedure = .{
-                        .proc = .{ .artifact = template.artifact, .proc_base = template.proc_base },
-                        .template = template,
-                    } },
+                    .kind = switch (template_entry.kind) {
+                        .callable => .{ .procedure = .{
+                            .proc = .{ .artifact = template_entry.template.artifact, .proc_base = template_entry.template.proc_base },
+                            .template = template_entry.template,
+                        } },
+                        .structural => |kind| .{ .structural = kind },
+                    },
                     .callable_var = module.defType(target_def_idx),
                 };
             }
@@ -1701,8 +1716,8 @@ pub fn builtinOwnerForCheckedBuiltin(builtin: anytype) BuiltinOwner {
     };
 }
 
-/// Public `lookupCheckedMethodTarget` declaration: exact registry lookup in
-/// the local registry, then the imported views.
+/// Public `lookupCheckedMethodTarget` declaration: exact callable-or-structural
+/// registry lookup in the local registry, then the imported views.
 pub fn lookupCheckedMethodTarget(
     names: *canonical.CanonicalNameStore,
     local_method_registry: *const MethodRegistry,
@@ -1718,10 +1733,7 @@ pub fn lookupCheckedMethodTarget(
         const imported_method = imported.canonical_names.lookupMethodName(method_name) orelse continue;
         if (imported.method_registry.lookup(.{ .owner = imported_owner, .method = imported_method })) |target| {
             switch (target.kind) {
-                .procedure => return target,
-                .generated_structural_parser,
-                .generated_structural_encoder,
-                => return target,
+                .procedure, .structural => return target,
                 .local_proc => continue,
             }
         }
@@ -1855,6 +1867,7 @@ test "method registry finalization sorts entries for binary lookup" {
         .key = .{ .owner = .{ .builtin = .box }, .method = @enumFromInt(2) },
         .target = testMethodTarget(@enumFromInt(20)),
     };
+    entries[0].target.kind = .{ .structural = .equality };
     entries[1] = .{
         .key = .{ .owner = .{ .builtin = .list }, .method = @enumFromInt(1) },
         .target = testMethodTarget(@enumFromInt(10)),
@@ -1869,6 +1882,8 @@ test "method registry finalization sorts entries for binary lookup" {
     var registry = MethodRegistry{ .entries = entries };
     const found = registry.lookup(.{ .owner = .{ .builtin = .box }, .method = @enumFromInt(1) }) orelse return error.MissingSortedMethodTarget;
     try std.testing.expectEqual(@as(CIR.Def.Idx, @enumFromInt(15)), found.def_idx);
+    const structural = registry.lookup(.{ .owner = .{ .builtin = .box }, .method = @enumFromInt(2) }) orelse return error.MissingStructuralMethodTarget;
+    try std.testing.expectEqual(StructuralKind.equality, structural.kind.structural);
     try std.testing.expect(registry.lookup(.{ .owner = .{ .builtin = .list }, .method = @enumFromInt(2) }) == null);
 }
 

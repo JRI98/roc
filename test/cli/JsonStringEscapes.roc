@@ -98,6 +98,48 @@ expect {
 	result == Err(Json.invalid_json)
 }
 
+# the control-character boundaries: raw 0x00 and raw 0x1F are both rejected
+expect {
+	document = Str.from_utf8([34, 0, 34])
+
+	result : Try(Str, Json.ParseErr)
+	result = match document {
+		Ok(value) => Json.parse(value)
+		Err(_) => Err(Json.invalid_json)
+	}
+
+	result == Err(Json.invalid_json)
+}
+
+expect {
+	document = Str.from_utf8([34, 31, 34])
+
+	result : Try(Str, Json.ParseErr)
+	result = match document {
+		Ok(value) => Json.parse(value)
+		Err(_) => Err(Json.invalid_json)
+	}
+
+	result == Err(Json.invalid_json)
+}
+
+# raw DEL (0x7F) is just past the control range and is valid unescaped
+expect {
+	document = Str.from_utf8([34, 127, 34])
+	expected = Str.from_utf8([127])
+
+	result : Try(Str, Json.ParseErr)
+	result = match document {
+		Ok(value) => Json.parse(value)
+		Err(_) => Err(Json.invalid_json)
+	}
+
+	match (result, expected) {
+		(Ok(parsed), Ok(want)) => parsed == want
+		_ => False
+	}
+}
+
 # unknown escape character
 expect {
 	result : Try({ s : Str }, Json.ParseErr)
@@ -303,6 +345,21 @@ expect {
 expect {
 	result : Try({ a : U64 }, Json.ParseErr)
 	result = Json.parse("{\"skip\":{\"deep\":[\"ok\",\"bad\\qx\"]},\"a\":7}")
+
+	result == Err(Json.invalid_json)
+}
+
+# a raw control byte inside a skipped string is still rejected
+expect {
+	prefix = Str.to_utf8("{\"skip\":\"ab")
+	suffix = Str.to_utf8("cd\",\"a\":7}")
+	document = Str.from_utf8(List.concat(prefix, List.concat([1], suffix)))
+
+	result : Try({ a : U64 }, Json.ParseErr)
+	result = match document {
+		Ok(value) => Json.parse(value)
+		Err(_) => Err(Json.invalid_json)
+	}
 
 	result == Err(Json.invalid_json)
 }

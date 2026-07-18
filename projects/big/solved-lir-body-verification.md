@@ -65,12 +65,12 @@ All symbols verified in the current tree (post-#10079).
   (`:1876`) — Debug-gated (`:1877`), checks fn entries, roots, layout
   requests, runtime schema requests (`:~1896-1899`), nothing below the
   proc-signature level; the direct body lowering it does not cover:
-  pattern/match chains (`lowerBranchChain`, `:~4222`), capture record
-  build (`lowerCaptureRecordFromCaptureExprsInto`, `:~2364`) and bind
-  (`bindCaptureRecord`, `:~799`), callable dispatch
-  (`lowerCallableValueCallInto`, `:~3374`), list patterns
-  (`lowerListPatternThen`, `:~2588` in the deleted twin's numbering —
-  re-locate).
+  decision-tree match lowering (`lowerBranchTree`, `:~4294`, via
+  src/postcheck/match_tree.zig), capture record build
+  (`lowerCaptureRecordFromCaptureExprsInto`, `:~2398`) and bind
+  (`bindCaptureRecord`, `:~818`), callable dispatch
+  (`lowerCallableValueCallInto`, `:~3418`), list patterns
+  (`lowerListPatternThen`, `:~5216`).
 - `src/postcheck/lambda_mono/lower.zig`: the Debug oracle already
   materializes full Lambda Mono **bodies** (expressions, patterns,
   statements) — the tree exists in Debug runs; only the comparison
@@ -185,6 +185,6 @@ guarded-list violation harness pattern).
 - [../small/pin-lambda-solved-invariants.md](../small/pin-lambda-solved-invariants.md)
   — its dispatch matrix tests become early members of this project's
   corpus.
-- [decision-tree-match-compiler.md](./decision-tree-match-compiler.md) —
-  if that lands first, match lowering changes shape; land this harness
-  before or alongside it so the rewrite inherits a body-level net.
+- The decision-tree match compiler has landed: match lowering now goes
+  through the shared tree module (src/postcheck/match_tree.zig), so this
+  harness verifies tree-shaped match bodies from the start.

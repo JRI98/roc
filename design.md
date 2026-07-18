@@ -1704,8 +1704,11 @@ for every future monomorphic specialization. Concrete target selection needs
 monomorphic type information, so it happens while producing Monotype IR.
 
 The method registry is an exact table keyed by `(MethodOwner, MethodNameId)`.
-It is not an owner-discovery mechanism. Post-check code may use it only after a
-concrete monomorphic dispatcher type has already determined the owner.
+Each entry explicitly identifies either a callable target or a compiler-derived
+structural implementation; an intrinsic structural declaration is never
+output as a callable target. The concrete monomorphic dispatcher type owns
+the method owner identity; post-check code may consult the registry only after
+that owner is already explicit.
 
 Each checked module also outputs the ordered checked-module id span that defines
 method-registry visibility after its own registry. The span preserves checking
@@ -2872,8 +2875,9 @@ its plan:
   d-th enclosing generalized callable. Each specialization edge supplies the
   answer: dictionary passing resolved entirely at compile time.
 - `structural(kind)` — the checker chose the compiler-derived structural
-  implementation (equality, hashing, parsing, encoding) for an ownerless
-  shape.
+  implementation (equality, hashing, parsing, encoding), either from an
+  explicit structural registry declaration on an owned type or for an
+  ownerless shape.
 - `checked_error` — checking rejected the site; executing it anyway (running a
   program with reported errors) lowers to an explicit crash.
 - `unreachable_dispatch` — the dispatcher is a constrained variable no
@@ -2930,8 +2934,8 @@ callable to the dispatcher's first occurrence (argument positions, type
 arguments, row labels — labels rather than positions, because Monotype sorts
 rows). Monotype resolves such a target's requirements by walking those paths
 over the concrete monomorphic callable at the consumption site, recursively:
-component owners resolve through exact registry lookups, ownerless shapes take
-the structural implementations.
+component owners consume the registry's explicit callable-or-structural result;
+ownerless shapes take the structural implementations.
 
 Exact registry lookups — `(MethodOwner, MethodNameId)` — happen during
 checking, and during path synthesis for compiler-generated

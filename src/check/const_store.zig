@@ -891,7 +891,7 @@ test "ConstStore: build, serialize/relocate, and read back values, fns, strings"
         .method = .{
             .module_idx = 4,
             .def_idx = @enumFromInt(5),
-            .kind = .generated_structural_parser,
+            .kind = .{ .structural = .parser },
             .callable_ty = @enumFromInt(6),
         },
         .nested = .{ .resolved = nested_evidence },

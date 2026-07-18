@@ -2537,20 +2537,6 @@ const Builder = struct {
         Common.invariant("checked module id was not present in the lowering input");
     }
 
-    fn moduleForModuleIndex(self: *Builder, module_idx: u32) ModuleView {
-        const root = moduleView(self.root_view);
-        if (root.module_identity.module_idx == module_idx) return root;
-        for (self.modules.imports) |imported| {
-            const view = moduleView(imported);
-            if (view.module_identity.module_idx == module_idx) return view;
-        }
-        for (self.modules.root.relation_modules) |relation| {
-            const view = moduleView(relation);
-            if (view.module_identity.module_idx == module_idx) return view;
-        }
-        Common.invariant("method target referenced a checked module that is not in the lowering input");
-    }
-
     const NominalDeclLookup = struct {
         view: ModuleView,
         declaration: checked.CheckedNominalDeclaration,
@@ -4625,7 +4611,7 @@ const Builder = struct {
         const lookup = (try self.componentMethodTargetByName(moduleView(self.root_view), value_ty, "to_inspect")) orelse return null;
         const procedure = switch (lookup.target.kind) {
             .procedure => |procedure| procedure,
-            .generated_structural_parser, .generated_structural_encoder, .local_proc => return null,
+            .structural, .local_proc => return null,
         };
         const template = procedure.template;
 
@@ -8952,7 +8938,7 @@ const BodyContext = struct {
                 const wrapper = self.view.intrinsic_wrappers.get(wrapper_id);
                 return switch (wrapper.intrinsic) {
                     .str_inspect => try self.lowerStrInspectIntrinsic(fn_ty, ret_ty),
-                    .structural_eq => Common.invariant("structural equality intrinsic wrapper must lower through checked dispatch plans"),
+                    .structural_eq => try self.lowerStructuralEqIntrinsic(fn_ty, ret_ty),
                 };
             },
         }
@@ -8970,6 +8956,32 @@ const BodyContext = struct {
         const body = try self.inspectCall(local_expr, arg_tys[0], ret_ty);
         return .{
             .args = try self.addTypedLocalSpan(&.{typed_arg}),
+            .body = body,
+            .ret = try self.draftTypeCellPreservingGenerated(ret_ty),
+        };
+    }
+
+    fn lowerStructuralEqIntrinsic(self: *BodyContext, fn_ty: Type.TypeId, ret_ty: Type.TypeId) Allocator.Error!LoweredTemplateBody {
+        const fn_data = self.builder.functionShape(fn_ty, "structural equality intrinsic had a non-function type");
+        const arg_tys = try GuardedList.dupe(self.allocator, Type.TypeId, self.builder.program.types.span(fn_data.args));
+        defer self.allocator.free(arg_tys);
+        if (arg_tys.len != 2) Common.invariant("structural equality intrinsic requires exactly two arguments");
+
+        const lhs_local = try self.addLocal(self.builder.symbols.fresh(), arg_tys[0]);
+        const rhs_local = try self.addLocal(self.builder.symbols.fresh(), arg_tys[1]);
+        const typed_lhs = BodyTypedLocal{ .local = lhs_local, .ty = arg_tys[0] };
+        const typed_rhs = BodyTypedLocal{ .local = rhs_local, .ty = arg_tys[1] };
+        const lhs_expr = try self.addExpr(.{ .ty = arg_tys[0], .data = .{ .local = lhs_local } });
+        const rhs_expr = try self.addExpr(.{ .ty = arg_tys[1], .data = .{ .local = rhs_local } });
+        // This wrapper IS its type's `is_eq` method target, so the body must
+        // expand the top layer structurally: `lowerEqualityExpr` would resolve
+        // the method lookup back to this wrapper and emit an infinite self-call.
+        const body = try self.lowerDerivationExpansion(EqDeriver, arg_tys[0], .{ .lhs = lhs_expr, .rhs = rhs_expr }, .{
+            .method_name = "is_eq",
+            .result_ty = ret_ty,
+        });
+        return .{
+            .args = try self.addTypedLocalSpan(&.{ typed_lhs, typed_rhs }),
             .body = body,
             .ret = try self.draftTypeCellPreservingGenerated(ret_ty),
         };
@@ -19362,16 +19374,6 @@ const BodyContext = struct {
                 return try self.runtimeCrashExpr(crash_ty, "method dispatch failed to check");
             },
         };
-        if (self.generatedStructuralDispatchKind(resolved)) |generated| {
-            try self.constrainTypeToMono(checked_ret_ty, plan_ret_ty);
-            if (expected_ret_ty) |expected| {
-                if (!self.sameType(expected, plan_ret_ty)) Common.invariant("checked generated structural dispatch lowered at a type different from its call operand type");
-            }
-            return switch (generated) {
-                .parser => try self.lowerStructuralParser(plan, callable_mono_ty, plan_ret_ty, self, pre_lowered),
-                .encoder => try self.lowerStructuralEncoderFor(plan, callable_mono_ty, plan_ret_ty, self, pre_lowered),
-            };
-        }
         const target_mono_ty = (try self.generatedIteratorMethodTargetFunctionType(resolved, callable_mono_ty, plan_args, expected_ret_ty)) orelse
             try self.methodTargetMonoTypeFromPlan(resolved, callable_mono_ty);
         try call_ctx.constrainTypeToMono(plan.callable_ty, target_mono_ty);
@@ -20060,10 +20062,6 @@ const BodyContext = struct {
                 return plan_ret_ty;
             },
         };
-        if (self.generatedStructuralDispatchKind(resolved) != null) {
-            try self.constrainTypeToMono(checked_ret_ty, plan_ret_ty);
-            return plan_ret_ty;
-        }
         const target_mono_ty = (try self.generatedIteratorMethodTargetFunctionType(resolved, callable_mono_ty, plan_args, expected_ret_ty)) orelse
             try self.methodTargetMonoTypeFromPlan(resolved, callable_mono_ty);
         try call_ctx.constrainTypeToMono(plan.callable_ty, target_mono_ty);
@@ -20217,12 +20215,7 @@ const BodyContext = struct {
                 .view = self.view,
                 .target = target,
             },
-            .generated_structural_parser,
-            .generated_structural_encoder,
-            => .{
-                .view = self.builder.moduleForModuleIndex(target.module_idx),
-                .target = target,
-            },
+            .structural => Common.invariant("structural method registry result reached callable checked evidence"),
         };
     }
 
@@ -20236,9 +20229,7 @@ const BodyContext = struct {
                 self.requireLocalMethodTargetInCurrentView(lookup);
                 break :blk self.owner_template;
             },
-            .generated_structural_parser,
-            .generated_structural_encoder,
-            => self.owner_template,
+            .structural => Common.invariant("structural method registry result has no callable body context"),
         };
         return BodyContext.initWithMethodScope(self.allocator, self.builder, lookup.view, self.method_scope, owner_template, self.graph, self.draft);
     }
@@ -20300,10 +20291,7 @@ const BodyContext = struct {
     fn builtinProcedureTextForMethodLookup(_: *BodyContext, lookup: MethodLookup) ?[]const u8 {
         return switch (lookup.target.kind) {
             .procedure => |procedure| builtinProcedureTextForTemplate(lookup.view, procedure.template),
-            .local_proc,
-            .generated_structural_parser,
-            .generated_structural_encoder,
-            => null,
+            .local_proc, .structural => null,
         };
     }
 
@@ -20366,9 +20354,7 @@ const BodyContext = struct {
                 self.requireLocalMethodTargetInCurrentView(lookup);
                 break :blk self.owner_template;
             },
-            .generated_structural_parser,
-            .generated_structural_encoder,
-            => self.owner_template,
+            .structural => Common.invariant("structural method registry result has no callable specialization context"),
         };
         var body_draft = BodyDraftStore.init(self.allocator);
         defer body_draft.deinit();
@@ -20426,10 +20412,11 @@ const BodyContext = struct {
         return out;
     }
 
-    /// One synthesized requirement on a concrete component type: its method
-    /// target (whose own requirements synthesize at their consumption sites),
-    /// the structural implementation for ownerless shapes, or unreachable for
-    /// components no value inhabits.
+    /// One synthesized requirement on a concrete component type: its callable
+    /// target (whose own requirements synthesize at consumption), the explicit
+    /// structural registry implementation for an owned component, the derived
+    /// structural implementation for an ownerless shape, or unreachable for a
+    /// component no value inhabits.
     fn synthesizeComponentEvidence(
         self: *BodyContext,
         view: ModuleView,
@@ -20437,6 +20424,9 @@ const BodyContext = struct {
         component_ty: Type.TypeId,
     ) Allocator.Error!SpecEvidence {
         if (try self.builder.componentMethodTargetForView(self.method_scope, component_ty, view, method)) |found| {
+            if (found.target.kind == .structural) {
+                return .{ .structural = found.target.kind.structural };
+            }
             const arena = self.builder.evidence_arena.allocator();
             const target = try arena.create(SpecEvidenceTarget);
             target.* = .{ .view = found.view, .target = found.target, .nested = .synthesize };
@@ -20588,21 +20578,7 @@ const BodyContext = struct {
                     evidence,
                 ) };
             },
-            .generated_structural_parser,
-            .generated_structural_encoder,
-            => Common.invariant("generated structural dispatch target has no callable procedure body"),
-        };
-    }
-
-    const GeneratedStructuralDispatchKind = enum { parser, encoder };
-
-    fn generatedStructuralDispatchKind(_: *BodyContext, lookup: MethodLookup) ?GeneratedStructuralDispatchKind {
-        return switch (lookup.target.kind) {
-            .generated_structural_parser => .parser,
-            .generated_structural_encoder => .encoder,
-            .procedure,
-            .local_proc,
-            => null,
+            .structural => Common.invariant("structural method registry result has no callable procedure body"),
         };
     }
 
@@ -22940,8 +22916,10 @@ const BodyContext = struct {
         const lookup = (try self.builder.componentMethodTargetByName(self.method_scope, ty, "parser_for")) orelse
             Common.invariant("checked method registry is missing custom parser_for target");
         return switch (lookup.target.kind) {
-            .generated_structural_parser => null,
-            .generated_structural_encoder => Common.invariant("parser_for lookup resolved to generated encoder_for target"),
+            .structural => |kind| switch (kind) {
+                .parser => null,
+                else => Common.invariant("parser_for lookup resolved to a different structural method kind"),
+            },
             .procedure,
             .local_proc,
             => lookup,
@@ -22970,8 +22948,10 @@ const BodyContext = struct {
         const lookup = self.builder.findComponentMethodTargetByName(self.method_scope, ty, "parser_for") orelse
             Common.invariant("checked method registry is missing custom parser_for target");
         return switch (lookup.target.kind) {
-            .generated_structural_parser => null,
-            .generated_structural_encoder => Common.invariant("parser_for lookup resolved to generated encoder_for target"),
+            .structural => |kind| switch (kind) {
+                .parser => null,
+                else => Common.invariant("parser_for lookup resolved to a different structural method kind"),
+            },
             .procedure, .local_proc => lookup,
         };
     }
@@ -22989,8 +22969,10 @@ const BodyContext = struct {
         const lookup = (try self.builder.componentMethodTargetByName(self.method_scope, ty, "encoder_for")) orelse
             Common.invariant("checked method registry is missing custom encoder_for target");
         return switch (lookup.target.kind) {
-            .generated_structural_encoder => null,
-            .generated_structural_parser => Common.invariant("encoder_for lookup resolved to generated parser_for target"),
+            .structural => |kind| switch (kind) {
+                .encoder => null,
+                else => Common.invariant("encoder_for lookup resolved to a different structural method kind"),
+            },
             .procedure,
             .local_proc,
             => lookup,
@@ -23010,8 +22992,10 @@ const BodyContext = struct {
         const lookup = self.builder.findComponentMethodTargetByName(self.method_scope, ty, "encoder_for") orelse
             Common.invariant("checked method registry is missing custom encoder_for target");
         return switch (lookup.target.kind) {
-            .generated_structural_encoder => null,
-            .generated_structural_parser => Common.invariant("encoder_for lookup resolved to generated parser_for target"),
+            .structural => |kind| switch (kind) {
+                .encoder => null,
+                else => Common.invariant("encoder_for lookup resolved to a different structural method kind"),
+            },
             .procedure, .local_proc => lookup,
         };
     }
@@ -23439,16 +23423,41 @@ const BodyContext = struct {
             .list => {
                 const lookup = (try self.builder.componentMethodTargetByName(self.method_scope, ty, ctx.method_name)) orelse
                     Common.invariant(D.missing_component_method_msg);
+                if (lookup.target.kind == .structural) {
+                    Common.invariant("owned list derivation resolved to a structural registry implementation");
+                }
                 return try self.derivationMethodCall(D, lookup, ty, operand, ctx);
             },
             .named => {
                 if (try self.builder.componentMethodTargetByName(self.method_scope, ty, ctx.method_name)) |lookup| {
-                    return try self.derivationMethodCall(D, lookup, ty, operand, ctx);
+                    switch (lookup.target.kind) {
+                        .structural => |kind| if (kind != D.structural_kind) {
+                            Common.invariant("structural registry implementation did not match the active derivation");
+                        },
+                        .procedure, .local_proc => return try self.derivationMethodCall(D, lookup, ty, operand, ctx),
+                    }
                 }
             },
             else => {},
         }
 
+        return try self.lowerDerivationExpansion(D, ty, operand, ctx);
+    }
+
+    /// Expands `ty` structurally without consulting its exact method target.
+    /// Components still derive through `lowerDerivation`, so only the top
+    /// layer skips method dispatch. This is the entry point for lowering the
+    /// body of a procedure that IS the type's method (the structural_eq
+    /// intrinsic wrapper): routing it through `lowerDerivation` would resolve
+    /// the method lookup straight back to that procedure and emit a self-call.
+    fn lowerDerivationExpansion(
+        self: *BodyContext,
+        comptime D: type,
+        ty: Type.TypeId,
+        operand: D.Operand,
+        ctx: DerivationCtx,
+    ) Allocator.Error!DraftExprId {
+        const shape = self.builder.program.types.get(ty);
         const expands_structurally = structurallyExpands(shape);
         var remove_active_expansion = false;
         const stack = D.expansionStack(self);
@@ -23464,7 +23473,7 @@ const BodyContext = struct {
         }
 
         return switch (shape) {
-            .list => unreachable,
+            .list => Common.invariant("structural derivation expansion reached a List; List derivations dispatch to a method target"),
             .record => |fields| try self.derivationRecord(D, self.builder.program.types.fieldSpan(fields), operand, ctx),
             .tuple => |items| try self.derivationTuple(D, self.builder.program.types.span(items), operand, ctx),
             .tag_union => |tags| try D.tagUnion(self, ty, tags, operand, ctx),
@@ -27122,17 +27131,24 @@ const BodyContext = struct {
         const scrutinee = try self.localExpr(entry.local, entry.ty);
         const expected = try self.lowerExpr(conversion);
         if (try self.builder.componentMethodTargetByName(self.method_scope, entry.ty, "is_eq")) |lookup| {
-            var target_ctx = try self.methodTargetContext(lookup);
-            defer target_ctx.deinit();
-            const target_fn = target_ctx.checkedFunctionType(lookup.target.callable_ty);
-            const bool_ty = try self.builder.lowerType(lookup.view, target_fn.ret);
-            const arg_tys = [_]Type.TypeId{ entry.ty, entry.ty };
-            const callable_mono_ty = try self.methodTargetMonoTypeFromArgs(lookup, &arg_tys, bool_ty);
-            const callee = try self.methodTargetCalleeWithMono(lookup, callable_mono_ty, .synthesize);
-            return try self.addExpr(.{ .ty = bool_ty, .data = .{ .call_proc = .{
-                .callee = draftProcCalleeFromAst(Ast.procCalleeForSlot(callee)),
-                .args = try self.addExprSpan(&.{ scrutinee, expected }),
-            } } });
+            switch (lookup.target.kind) {
+                .structural => |kind| if (kind != .equality) {
+                    Common.invariant("is_eq pattern guard resolved to a different structural method kind");
+                },
+                .procedure, .local_proc => {
+                    var target_ctx = try self.methodTargetContext(lookup);
+                    defer target_ctx.deinit();
+                    const target_fn = target_ctx.checkedFunctionType(lookup.target.callable_ty);
+                    const bool_ty = try self.builder.lowerType(lookup.view, target_fn.ret);
+                    const arg_tys = [_]Type.TypeId{ entry.ty, entry.ty };
+                    const callable_mono_ty = try self.methodTargetMonoTypeFromArgs(lookup, &arg_tys, bool_ty);
+                    const callee = try self.methodTargetCalleeWithMono(lookup, callable_mono_ty, .synthesize);
+                    return try self.addExpr(.{ .ty = bool_ty, .data = .{ .call_proc = .{
+                        .callee = draftProcCalleeFromAst(Ast.procCalleeForSlot(callee)),
+                        .args = try self.addExprSpan(&.{ scrutinee, expected }),
+                    } } });
+                },
+            }
         }
         return try self.lowerEqualityExpr(entry.ty, scrutinee, expected, "is_eq", try self.builder.primitiveType(.bool));
     }
@@ -27252,6 +27268,8 @@ test "monotype sameType keeps failed alias alternatives out of recursion stack" 
 /// component access on each, and conjoins the per-component bools with AND so
 /// the first inequality short-circuits to `false`.
 const EqDeriver = struct {
+    const structural_kind: static_dispatch.StructuralKind = .equality;
+
     const Operand = struct {
         lhs: DraftExprId,
         rhs: DraftExprId,
@@ -27479,6 +27497,8 @@ const EqDeriver = struct {
 /// threads a single value plus a running Hasher accumulator: each component
 /// feeds the hasher accumulated so far, left to right.
 const HashDeriver = struct {
+    const structural_kind: static_dispatch.StructuralKind = .hash;
+
     const Operand = struct {
         value: DraftExprId,
         hasher: DraftExprId,
