@@ -34,7 +34,7 @@ fn appendf(buf: *Buf, alloc: std.mem.Allocator, comptime fmt: []const u8, args: 
 /// checker rejects) is an acceptable outcome; a RUN_ERROR is not — every
 /// generated match ends in a wildcard branch and its bodies cannot crash.
 fn runProgram(alloc: std.mem.Allocator, source: []const u8) std.mem.Allocator.Error![]u8 {
-    var compiled = helpers.compileInspectedProgram(alloc, std.testing.io, .module, source, &.{}) catch |err| {
+    var compiled = helpers.compileInspectedProgramForTarget(alloc, std.testing.io, .module, source, &.{}, .native) catch |err| {
         return try std.fmt.allocPrint(alloc, "COMPILE_ERROR:{s}", .{@errorName(err)});
     };
     defer compiled.deinit(alloc);
