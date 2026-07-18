@@ -807,6 +807,91 @@ fn liftModuleAfterSpecConstr(
     };
 }
 
+test "issue 10153 nested loops do not multiply SpecConstr callable functions" {
+    const allocator = std.testing.allocator;
+    // Repro for https://github.com/roc-lang/roc/issues/10153. Adding one fixed
+    // nested loop may add its own worker family, but must not duplicate the
+    // already-specialized callable graph produced by the generic Json wrapper.
+    const single_loop_source =
+        \\module [main]
+        \\
+        \\outer : List(U8) -> List(U8)
+        \\outer = |xs| {
+        \\    var $out = []
+        \\    for x in xs {
+        \\        $out = List.concat($out, inner(x))
+        \\    }
+        \\    $out
+        \\}
+        \\
+        \\inner : U8 -> List(U8)
+        \\inner = |x| [x]
+        \\
+        \\parse_response = |body|
+        \\    match Json.parse(body) {
+        \\        Ok(v) => Ok(v)
+        \\        Err(_) => Err(Bad)
+        \\    }
+        \\
+        \\main : {}
+        \\main = {
+        \\    _xs = outer([1, 2])
+        \\    decoded : Try({ id : I32 }, _)
+        \\    decoded = parse_response("{\"id\": 1}")
+        \\    match decoded {
+        \\        Ok(_) => {}
+        \\        Err(_) => {}
+        \\    }
+        \\}
+    ;
+    const nested_loop_source =
+        \\module [main]
+        \\
+        \\outer : List(U8) -> List(U8)
+        \\outer = |xs| {
+        \\    var $out = []
+        \\    for x in xs {
+        \\        $out = List.concat($out, inner(x))
+        \\    }
+        \\    $out
+        \\}
+        \\
+        \\inner : U8 -> List(U8)
+        \\inner = |x| {
+        \\    var $out = []
+        \\    for _y in 0..<1 {
+        \\        $out = List.append($out, x)
+        \\    }
+        \\    $out
+        \\}
+        \\
+        \\parse_response = |body|
+        \\    match Json.parse(body) {
+        \\        Ok(v) => Ok(v)
+        \\        Err(_) => Err(Bad)
+        \\    }
+        \\
+        \\main : {}
+        \\main = {
+        \\    _xs = outer([1, 2])
+        \\    decoded : Try({ id : I32 }, _)
+        \\    decoded = parse_response("{\"id\": 1}")
+        \\    match decoded {
+        \\        Ok(_) => {}
+        \\        Err(_) => {}
+        \\    }
+        \\}
+    ;
+
+    var single_loop = try liftModuleAfterSpecConstr(allocator, single_loop_source);
+    defer single_loop.deinit(allocator);
+    var nested_loop = try liftModuleAfterSpecConstr(allocator, nested_loop_source);
+    defer nested_loop.deinit(allocator);
+
+    try std.testing.expect(nested_loop.lifted.fnCount() <= single_loop.lifted.fnCount() * 2);
+    try std.testing.expect(nested_loop.lifted.exprCount() <= single_loop.lifted.exprCount() * 2);
+}
+
 fn expectInlinePlanDecision(
     source: []const u8,
     fn_name: []const u8,
