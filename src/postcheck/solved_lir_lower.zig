@@ -333,7 +333,6 @@ const Lowerer = struct {
     layout_requests: std.ArrayList(LayoutRequest),
     runtime_schema_requests: std.ArrayList(RuntimeSchemaRequest),
     type_layouts: std.AutoHashMap(Type.TypeId, layout.Idx),
-    layout_owner_types: std.AutoHashMap(Type.TypeId, Type.TypeId),
     const_plan_map: std.AutoHashMap(Type.TypeId, LirProgram.ConstPlanId),
     const_type_map: std.AutoHashMap(Type.TypeId, const_store.ConstTypeId),
     callable_source_fn_map: std.AutoHashMap(Type.TypeId, SolvedType.TypeVarId),
@@ -410,7 +409,6 @@ const Lowerer = struct {
             .layout_requests = .empty,
             .runtime_schema_requests = .empty,
             .type_layouts = std.AutoHashMap(Type.TypeId, layout.Idx).init(allocator),
-            .layout_owner_types = std.AutoHashMap(Type.TypeId, Type.TypeId).init(allocator),
             .const_plan_map = std.AutoHashMap(Type.TypeId, LirProgram.ConstPlanId).init(allocator),
             .const_type_map = std.AutoHashMap(Type.TypeId, const_store.ConstTypeId).init(allocator),
             .callable_source_fn_map = std.AutoHashMap(Type.TypeId, SolvedType.TypeVarId).init(allocator),
@@ -435,7 +433,6 @@ const Lowerer = struct {
         self.const_type_map.deinit();
         self.callable_source_fn_map.deinit();
         self.allocator.free(self.static_data_map);
-        self.layout_owner_types.deinit();
         self.type_layouts.deinit();
         self.runtime_schema_requests.deinit(self.allocator);
         self.layout_requests.deinit(self.allocator);
@@ -470,7 +467,6 @@ const Lowerer = struct {
         self.const_type_map.deinit();
         self.callable_source_fn_map.deinit();
         self.allocator.free(self.static_data_map);
-        self.layout_owner_types.deinit();
         self.type_layouts.deinit();
         self.runtime_schema_requests.deinit(self.allocator);
         self.layout_requests.deinit(self.allocator);
@@ -6283,8 +6279,7 @@ const Lowerer = struct {
     }
 
     fn storageTypeOfLocalOr(self: *Lowerer, local: LIR.LocalId, fallback: Type.TypeId) Type.TypeId {
-        const logical_ty = self.typeOfLocalOr(local, fallback);
-        return self.layout_owner_types.get(logical_ty) orelse logical_ty;
+        return self.typeOfLocalOr(local, fallback);
     }
 
     fn localFor(self: *Lowerer, local: Lifted.LocalId) Common.LowerError!LIR.LocalId {
@@ -7016,46 +7011,6 @@ const Lowerer = struct {
         try self.type_layouts.put(ty, layout_idx);
     }
 
-    const EquivalentNamedLayout = struct {
-        ty: Type.TypeId,
-        layout_idx: layout.Idx,
-    };
-
-    fn knownLayoutForEquivalentNamedType(self: *Lowerer, ty: Type.TypeId) Common.LowerError!?EquivalentNamedLayout {
-        if (self.types.get(ty) != .named) return null;
-
-        var iterator = self.type_layouts.iterator();
-        while (iterator.next()) |entry| {
-            const other_ty = entry.key_ptr.*;
-            if (other_ty == ty) continue;
-            if (self.types.get(other_ty) != .named) continue;
-            var visited = std.AutoHashMap(u64, void).init(self.allocator);
-            defer visited.deinit();
-            if (try self.publicTypesEquivalent(ty, other_ty, &visited) and
-                try self.namedBackingsEquivalentForLayoutReuse(ty, other_ty))
-            {
-                return .{ .ty = other_ty, .layout_idx = entry.value_ptr.* };
-            }
-        }
-        return null;
-    }
-
-    fn namedBackingsEquivalentForLayoutReuse(self: *Lowerer, lhs_ty: Type.TypeId, rhs_ty: Type.TypeId) Common.LowerError!bool {
-        const lhs = switch (self.types.get(lhs_ty)) {
-            .named => |named| named,
-            else => return false,
-        };
-        const rhs = switch (self.types.get(rhs_ty)) {
-            .named => |named| named,
-            else => return false,
-        };
-        if (lhs.backing == null or rhs.backing == null) return lhs.backing == null and rhs.backing == null;
-        if (lhs.backing.?.use != rhs.backing.?.use) return false;
-        var visited = std.AutoHashMap(u64, void).init(self.allocator);
-        defer visited.deinit();
-        return try self.publicTypesEquivalent(lhs.backing.?.ty, rhs.backing.?.ty, &visited);
-    }
-
     fn publicTypesEquivalent(
         self: *Lowerer,
         lhs_ty: Type.TypeId,
@@ -7283,11 +7238,6 @@ const Lowerer = struct {
 
     fn layoutOfType(self: *Lowerer, ty: Type.TypeId) Common.LowerError!layout.Idx {
         if (self.knownLayoutForType(ty)) |existing| return existing;
-        if (try self.knownLayoutForEquivalentNamedType(ty)) |existing| {
-            try self.rememberLayoutForType(ty, existing.layout_idx);
-            try self.layout_owner_types.put(ty, existing.ty);
-            return existing.layout_idx;
-        }
 
         var graph = layout.Graph{};
         defer graph.deinit(self.allocator);
@@ -7326,11 +7276,6 @@ const Lowerer = struct {
         fn inputForType(self: *LayoutGraphBuilder, ty: Type.TypeId) Common.LowerError!layout.GraphInput {
             const index = @intFromEnum(ty);
             if (self.lowerer.knownLayoutForType(ty)) |layout_idx| return layout.committedGraphInput(layout_idx);
-            if (try self.lowerer.knownLayoutForEquivalentNamedType(ty)) |layout_idx| {
-                try self.lowerer.rememberLayoutForType(ty, layout_idx.layout_idx);
-                try self.lowerer.layout_owner_types.put(ty, layout_idx.ty);
-                return layout.committedGraphInput(layout_idx.layout_idx);
-            }
             if (self.local_nodes[index]) |node| return layout.localGraphInput(node);
 
             switch (self.lowerer.types.get(ty)) {

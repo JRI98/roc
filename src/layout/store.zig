@@ -97,6 +97,12 @@ pub const Store = struct {
     interned_layouts: std.StringHashMap(Idx),
     scratch_intern_key: std.ArrayList(u8),
 
+    // Recursive layout graphs need a representation-complete key because their
+    // ordinary layout keys necessarily contain provisional cycle indices.
+    // These keys encode the rooted logical graph with allocation-order-neutral
+    // backreferences, so only isomorphic runtime representations are reused.
+    interned_recursive_graphs: std.StringHashMap(Idx),
+
     // The target's usize type (32-bit or 64-bit) - used for layout calculations
     // This is critical for cross-compilation (e.g., compiling for wasm32 on a 64-bit host)
     target_usize: target.TargetUsize,
@@ -255,6 +261,7 @@ pub const Store = struct {
             .tag_union_data = tag_union_data,
             .interned_layouts = std.StringHashMap(Idx).init(allocator),
             .scratch_intern_key = .empty,
+            .interned_recursive_graphs = std.StringHashMap(Idx).init(allocator),
             .target_usize = target_usize,
         };
 
@@ -292,6 +299,11 @@ pub const Store = struct {
         }
         self.interned_layouts.deinit();
         self.scratch_intern_key.deinit(self.allocator);
+        var recursive_keys = self.interned_recursive_graphs.keyIterator();
+        while (recursive_keys.next()) |key_ptr| {
+            self.allocator.free(key_ptr.*);
+        }
+        self.interned_recursive_graphs.deinit();
     }
 
     fn appendInternKeyValue(self: *Self, value: anytype) std.mem.Allocator.Error!void {
@@ -750,10 +762,425 @@ pub const Store = struct {
         return Layout.tagUnion(self.tagUnionVariantsSortKey(variant_layouts, discriminant_size), .{ .int_idx = @intCast(tag_union_data_idx) });
     }
 
+    const RecursiveGraphAnalysis = struct {
+        allocator: Allocator,
+        cyclic_nodes: []bool,
+        keys: []?[]u8,
+
+        fn init(allocator: Allocator, graph: *const LayoutGraph) Allocator.Error!RecursiveGraphAnalysis {
+            const cyclic_nodes = try allocator.alloc(bool, graph.nodes.items.len);
+            errdefer allocator.free(cyclic_nodes);
+            @memset(cyclic_nodes, false);
+            try markCyclicNodes(allocator, graph, cyclic_nodes);
+
+            const keys = try allocator.alloc(?[]u8, graph.nodes.items.len);
+            errdefer allocator.free(keys);
+            @memset(keys, null);
+            errdefer {
+                for (keys) |maybe_key| {
+                    if (maybe_key) |key| allocator.free(key);
+                }
+            }
+
+            for (cyclic_nodes, 0..) |is_cyclic, i| {
+                if (!is_cyclic) continue;
+                if (graph.getNode(@enumFromInt(i)) == .nominal) continue;
+
+                var key = std.ArrayList(u8).empty;
+                defer key.deinit(allocator);
+                var visited = std.AutoHashMap(GraphNodeId, u32).init(allocator);
+                defer visited.deinit();
+
+                try key.append(allocator, 1); // Recursive graph key format version.
+                try appendRefKey(graph, allocator, &key, &visited, .{ .local = @enumFromInt(i) });
+                keys[i] = try key.toOwnedSlice(allocator);
+            }
+
+            return .{
+                .allocator = allocator,
+                .cyclic_nodes = cyclic_nodes,
+                .keys = keys,
+            };
+        }
+
+        fn deinit(self_analysis: *RecursiveGraphAnalysis) void {
+            for (self_analysis.keys) |maybe_key| {
+                if (maybe_key) |key| self_analysis.allocator.free(key);
+            }
+            self_analysis.allocator.free(self_analysis.keys);
+            self_analysis.allocator.free(self_analysis.cyclic_nodes);
+        }
+
+        fn appendValue(key: *std.ArrayList(u8), allocator: Allocator, value: anytype) Allocator.Error!void {
+            var copy = value;
+            try key.appendSlice(allocator, std.mem.asBytes(&copy));
+        }
+
+        fn resolveNominalRef(graph: *const LayoutGraph, start: GraphRef) GraphRef {
+            var current = start;
+            var remaining = graph.nodes.items.len + 1;
+            while (remaining > 0) : (remaining -= 1) {
+                switch (current) {
+                    .canonical => return current,
+                    .local => |node_id| switch (graph.getNode(node_id)) {
+                        .nominal => |child| current = child,
+                        .pending, .box, .list, .closure, .erased_callable, .struct_, .tag_union => return current,
+                    },
+                }
+            }
+            std.debug.panic("layout.Store invariant violated: logical layout graph contained a nominal-only cycle", .{});
+        }
+
+        fn appendRefKey(
+            graph: *const LayoutGraph,
+            allocator: Allocator,
+            key: *std.ArrayList(u8),
+            visited: *std.AutoHashMap(GraphNodeId, u32),
+            unresolved_ref: GraphRef,
+        ) Allocator.Error!void {
+            const ref = resolveNominalRef(graph, unresolved_ref);
+            switch (ref) {
+                .canonical => |layout_idx| {
+                    try key.append(allocator, 0);
+                    try appendValue(key, allocator, @as(u32, @intFromEnum(layout_idx)));
+                },
+                .local => |node_id| {
+                    if (visited.get(node_id)) |backref| {
+                        try key.append(allocator, 1);
+                        try appendValue(key, allocator, backref);
+                        return;
+                    }
+
+                    const canonical_node_id: u32 = @intCast(visited.count());
+                    try visited.put(node_id, canonical_node_id);
+                    try key.append(allocator, 2);
+                    try appendValue(key, allocator, canonical_node_id);
+                    try appendNodeKey(graph, allocator, key, visited, node_id);
+                },
+            }
+        }
+
+        fn appendNodeKey(
+            graph: *const LayoutGraph,
+            allocator: Allocator,
+            key: *std.ArrayList(u8),
+            visited: *std.AutoHashMap(GraphNodeId, u32),
+            node_id: GraphNodeId,
+        ) Allocator.Error!void {
+            switch (graph.getNode(node_id)) {
+                .pending, .nominal => unreachable,
+                .box => |child| {
+                    try key.append(allocator, 0);
+                    try appendRefKey(graph, allocator, key, visited, child);
+                },
+                .list => |child| {
+                    try key.append(allocator, 1);
+                    try appendRefKey(graph, allocator, key, visited, child);
+                },
+                .closure => |child| {
+                    try key.append(allocator, 2);
+                    try appendRefKey(graph, allocator, key, visited, child);
+                },
+                .erased_callable => try key.append(allocator, 3),
+                .struct_ => |span| {
+                    try key.append(allocator, 4);
+                    const fields = graph.getFields(span);
+                    var has_padding = false;
+                    for (fields) |field| has_padding = has_padding or field.is_padding;
+                    try key.append(allocator, @intFromBool(graph.isNominalStruct(node_id) and has_padding));
+                    try appendValue(key, allocator, @as(u16, @intCast(fields.len)));
+                    for (fields) |field| {
+                        try appendValue(key, allocator, field.index);
+                        try key.append(allocator, @intFromBool(field.is_padding));
+                        try appendRefKey(graph, allocator, key, visited, field.child);
+                    }
+                },
+                .tag_union => |span| {
+                    try key.append(allocator, 5);
+                    const refs = graph.getRefs(span);
+                    try appendValue(key, allocator, @as(u16, @intCast(refs.len)));
+                    for (refs) |child| {
+                        try appendRefKey(graph, allocator, key, visited, child);
+                    }
+                },
+            }
+        }
+
+        fn markCyclicNodes(allocator: Allocator, graph: *const LayoutGraph, cyclic_nodes: []bool) Allocator.Error!void {
+            const visit_index = try allocator.alloc(i32, graph.nodes.items.len);
+            defer allocator.free(visit_index);
+            const lowlink = try allocator.alloc(i32, graph.nodes.items.len);
+            defer allocator.free(lowlink);
+            const on_stack = try allocator.alloc(bool, graph.nodes.items.len);
+            defer allocator.free(on_stack);
+            @memset(visit_index, -1);
+            @memset(lowlink, 0);
+            @memset(on_stack, false);
+
+            var stack = std.ArrayList(GraphNodeId).empty;
+            defer stack.deinit(allocator);
+
+            const Finder = struct {
+                allocator: Allocator,
+                graph: *const LayoutGraph,
+                visit_index: []i32,
+                lowlink: []i32,
+                on_stack: []bool,
+                stack: *std.ArrayList(GraphNodeId),
+                cyclic_nodes: []bool,
+                next_index: i32 = 0,
+
+                fn visitRef(self_finder: *@This(), child: GraphRef, parent_index: usize) Allocator.Error!void {
+                    const child_id = switch (child) {
+                        .canonical => return,
+                        .local => |id| id,
+                    };
+                    const child_index = @intFromEnum(child_id);
+                    if (self_finder.visit_index[child_index] == -1) {
+                        try self_finder.strongConnect(child_id);
+                        self_finder.lowlink[parent_index] = @min(self_finder.lowlink[parent_index], self_finder.lowlink[child_index]);
+                    } else if (self_finder.on_stack[child_index]) {
+                        self_finder.lowlink[parent_index] = @min(self_finder.lowlink[parent_index], self_finder.visit_index[child_index]);
+                    }
+                }
+
+                fn hasSelfEdge(self_finder: *@This(), node_id: GraphNodeId) bool {
+                    return switch (self_finder.graph.getNode(node_id)) {
+                        .pending, .erased_callable => false,
+                        .nominal, .box, .list, .closure => |child| switch (child) {
+                            .canonical => false,
+                            .local => |child_id| child_id == node_id,
+                        },
+                        .struct_ => |span| blk: {
+                            for (self_finder.graph.getFields(span)) |field| {
+                                switch (field.child) {
+                                    .canonical => {},
+                                    .local => |child_id| if (child_id == node_id) break :blk true,
+                                }
+                            }
+                            break :blk false;
+                        },
+                        .tag_union => |span| blk: {
+                            for (self_finder.graph.getRefs(span)) |child| {
+                                switch (child) {
+                                    .canonical => {},
+                                    .local => |child_id| if (child_id == node_id) break :blk true,
+                                }
+                            }
+                            break :blk false;
+                        },
+                    };
+                }
+
+                fn strongConnect(self_finder: *@This(), node_id: GraphNodeId) Allocator.Error!void {
+                    const index = @intFromEnum(node_id);
+                    self_finder.visit_index[index] = self_finder.next_index;
+                    self_finder.lowlink[index] = self_finder.next_index;
+                    self_finder.next_index += 1;
+                    try self_finder.stack.append(self_finder.allocator, node_id);
+                    self_finder.on_stack[index] = true;
+
+                    switch (self_finder.graph.getNode(node_id)) {
+                        .pending, .erased_callable => {},
+                        .nominal, .box, .list, .closure => |child| try self_finder.visitRef(child, index),
+                        .struct_ => |span| {
+                            for (self_finder.graph.getFields(span)) |field| {
+                                try self_finder.visitRef(field.child, index);
+                            }
+                        },
+                        .tag_union => |span| {
+                            for (self_finder.graph.getRefs(span)) |child| {
+                                try self_finder.visitRef(child, index);
+                            }
+                        },
+                    }
+
+                    if (self_finder.lowlink[index] != self_finder.visit_index[index]) return;
+
+                    var component = std.ArrayList(GraphNodeId).empty;
+                    defer component.deinit(self_finder.allocator);
+                    while (true) {
+                        const member = self_finder.stack.pop() orelse unreachable;
+                        self_finder.on_stack[@intFromEnum(member)] = false;
+                        try component.append(self_finder.allocator, member);
+                        if (member == node_id) break;
+                    }
+
+                    if (component.items.len > 1 or self_finder.hasSelfEdge(node_id)) {
+                        for (component.items) |member| {
+                            self_finder.cyclic_nodes[@intFromEnum(member)] = true;
+                        }
+                    }
+                }
+            };
+
+            var finder = Finder{
+                .allocator = allocator,
+                .graph = graph,
+                .visit_index = visit_index,
+                .lowlink = lowlink,
+                .on_stack = on_stack,
+                .stack = &stack,
+                .cyclic_nodes = cyclic_nodes,
+            };
+            for (graph.nodes.items, 0..) |_, i| {
+                if (visit_index[i] == -1) try finder.strongConnect(@enumFromInt(i));
+            }
+        }
+    };
+
+    fn translateGraphRef(mapping: []const GraphRef, ref: GraphRef) GraphRef {
+        return switch (ref) {
+            .canonical => ref,
+            .local => |node_id| mapping[@intFromEnum(node_id)],
+        };
+    }
+
     /// Canonically intern a whole temporary logical layout graph.
     /// This is the one shared commit point where recursive nominal size cycles
     /// become explicit box layouts for final executable `LIR` consumption.
-    pub fn commitGraph(self: *Self, graph: *const LayoutGraph, root: GraphRef) std.mem.Allocator.Error!GraphCommit {
+    pub fn commitGraph(self: *Self, graph: *const LayoutGraph, root: GraphRef) Allocator.Error!GraphCommit {
+        switch (root) {
+            .canonical => |layout_idx| return .{
+                .root_idx = layout_idx,
+                .raw_layouts = try self.allocator.alloc(Idx, 0),
+                .value_layouts = try self.allocator.alloc(Idx, 0),
+            },
+            .local => {},
+        }
+
+        var analysis = try RecursiveGraphAnalysis.init(self.allocator, graph);
+        defer analysis.deinit();
+
+        const mapping = try self.allocator.alloc(GraphRef, graph.nodes.items.len);
+        defer self.allocator.free(mapping);
+        var working = LayoutGraph{};
+        defer working.deinit(self.allocator);
+        var pending_recursive = std.StringHashMap(GraphRef).init(self.allocator);
+        defer pending_recursive.deinit();
+
+        for (graph.nodes.items, 0..) |_, i| {
+            if (analysis.keys[i]) |key| {
+                if (self.interned_recursive_graphs.get(key)) |layout_idx| {
+                    mapping[i] = .{ .canonical = layout_idx };
+                    continue;
+                }
+                if (pending_recursive.get(key)) |existing| {
+                    mapping[i] = existing;
+                    continue;
+                }
+            }
+
+            const local: GraphRef = .{ .local = try working.reserveNode(self.allocator) };
+            mapping[i] = local;
+            if (analysis.keys[i]) |key| try pending_recursive.put(key, local);
+        }
+
+        const initialized = try self.allocator.alloc(bool, working.nodes.items.len);
+        defer self.allocator.free(initialized);
+        @memset(initialized, false);
+
+        for (graph.nodes.items, 0..) |node, i| {
+            const working_node_id = switch (mapping[i]) {
+                .canonical => continue,
+                .local => |node_id| node_id,
+            };
+            const working_index = @intFromEnum(working_node_id);
+            if (initialized[working_index]) continue;
+            initialized[working_index] = true;
+
+            const translated_node: graph_mod.Node = switch (node) {
+                .pending => unreachable,
+                .nominal => |child| .{ .nominal = translateGraphRef(mapping, child) },
+                .box => |child| .{ .box = translateGraphRef(mapping, child) },
+                .list => |child| .{ .list = translateGraphRef(mapping, child) },
+                .closure => |child| .{ .closure = translateGraphRef(mapping, child) },
+                .erased_callable => .erased_callable,
+                .struct_ => |span| blk: {
+                    var fields = std.ArrayList(graph_mod.Field).empty;
+                    defer fields.deinit(self.allocator);
+                    try fields.ensureTotalCapacity(self.allocator, span.len);
+                    for (graph.getFields(span)) |field| {
+                        fields.appendAssumeCapacity(.{
+                            .index = field.index,
+                            .child = translateGraphRef(mapping, field.child),
+                            .is_padding = field.is_padding,
+                        });
+                    }
+                    break :blk .{ .struct_ = try working.appendFields(self.allocator, fields.items) };
+                },
+                .tag_union => |span| blk: {
+                    var refs = std.ArrayList(GraphRef).empty;
+                    defer refs.deinit(self.allocator);
+                    try refs.ensureTotalCapacity(self.allocator, span.len);
+                    for (graph.getRefs(span)) |child| {
+                        refs.appendAssumeCapacity(translateGraphRef(mapping, child));
+                    }
+                    break :blk .{ .tag_union = try working.appendRefs(self.allocator, refs.items) };
+                },
+            };
+            working.setNode(working_node_id, translated_node);
+            if (graph.isNominalStruct(@enumFromInt(i))) {
+                try working.markNominalStruct(self.allocator, working_node_id);
+            }
+        }
+
+        const raw_layouts = try self.allocator.alloc(Idx, graph.nodes.items.len);
+        errdefer self.allocator.free(raw_layouts);
+        const value_layouts = try self.allocator.alloc(Idx, graph.nodes.items.len);
+        errdefer self.allocator.free(value_layouts);
+
+        var working_commit: ?GraphCommit = null;
+        defer if (working_commit) |*commit| commit.deinit(self.allocator);
+        if (working.nodes.items.len != 0) {
+            const translated_root = translateGraphRef(mapping, root);
+            const working_root: GraphRef = switch (translated_root) {
+                .local => translated_root,
+                .canonical => .{ .local = @enumFromInt(0) },
+            };
+            working_commit = try self.commitGraphUncached(&working, working_root);
+        }
+
+        for (mapping, 0..) |mapped, i| {
+            switch (mapped) {
+                .canonical => |layout_idx| {
+                    raw_layouts[i] = layout_idx;
+                    value_layouts[i] = layout_idx;
+                },
+                .local => |node_id| {
+                    const commit = &working_commit.?;
+                    raw_layouts[i] = commit.raw_layouts[@intFromEnum(node_id)];
+                    value_layouts[i] = commit.value_layouts[@intFromEnum(node_id)];
+                },
+            }
+        }
+
+        for (analysis.keys, 0..) |maybe_key, i| {
+            const key = maybe_key orelse continue;
+            if (self.interned_recursive_graphs.get(key)) |existing| {
+                if (comptime builtin.mode == .Debug) {
+                    std.debug.assert(existing == value_layouts[i]);
+                } else if (existing != value_layouts[i]) {
+                    unreachable;
+                }
+            } else {
+                try self.interned_recursive_graphs.put(key, value_layouts[i]);
+                analysis.keys[i] = null;
+            }
+        }
+
+        const root_idx = switch (translateGraphRef(mapping, root)) {
+            .canonical => |layout_idx| layout_idx,
+            .local => |node_id| working_commit.?.value_layouts[@intFromEnum(node_id)],
+        };
+        return .{
+            .root_idx = root_idx,
+            .raw_layouts = raw_layouts,
+            .value_layouts = value_layouts,
+        };
+    }
+
+    fn commitGraphUncached(self: *Self, graph: *const LayoutGraph, root: GraphRef) std.mem.Allocator.Error!GraphCommit {
         switch (root) {
             .canonical => |layout_idx| return .{
                 .root_idx = layout_idx,
@@ -2654,6 +3081,34 @@ fn expectRecursiveGraphInterning() LayoutStoreTestError!void {
     graph_b.setNode(node_b, .{ .tag_union = refs_b });
     var commit_b = try store.commitGraph(&graph_b, .{ .local = node_b });
     defer commit_b.deinit(testing.allocator);
+
+    try testing.expectEqual(commit_a.root_idx, commit_b.root_idx);
+
+    var graph_c = LayoutGraph{};
+    defer graph_c.deinit(testing.allocator);
+    const node_c = try graph_c.reserveNode(testing.allocator);
+    const box_c = try graph_c.reserveNode(testing.allocator);
+    graph_c.setNode(box_c, .{ .box = .{ .local = node_c } });
+    const refs_c = try graph_c.appendRefs(testing.allocator, &[_]GraphRef{ .{ .canonical = .u8 }, .{ .local = box_c } });
+    graph_c.setNode(node_c, .{ .tag_union = refs_c });
+    var commit_c = try store.commitGraph(&graph_c, .{ .local = node_c });
+    defer commit_c.deinit(testing.allocator);
+
+    try testing.expect(commit_a.root_idx != commit_c.root_idx);
+
+    var graph_d = LayoutGraph{};
+    defer graph_d.deinit(testing.allocator);
+    const nominal_d = try graph_d.reserveNode(testing.allocator);
+    const box_d = try graph_d.reserveNode(testing.allocator);
+    const node_d = try graph_d.reserveNode(testing.allocator);
+    graph_d.setNode(nominal_d, .{ .nominal = .{ .local = node_d } });
+    graph_d.setNode(box_d, .{ .box = .{ .local = nominal_d } });
+    const refs_d = try graph_d.appendRefs(testing.allocator, &[_]GraphRef{ .{ .canonical = .zst }, .{ .local = box_d } });
+    graph_d.setNode(node_d, .{ .tag_union = refs_d });
+    var commit_d = try store.commitGraph(&graph_d, .{ .local = node_d });
+    defer commit_d.deinit(testing.allocator);
+
+    try testing.expectEqual(commit_a.root_idx, commit_d.root_idx);
 
     const root_a = store.getLayout(commit_a.root_idx);
     const root_b = store.getLayout(commit_b.root_idx);

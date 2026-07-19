@@ -214,6 +214,7 @@ pub const LayoutStoreImage = extern struct {
             .tag_union_data = try safeListFromRef(layout_mod.TagUnionData, base_ptr, image_size, self.tag_union_data),
             .interned_layouts = std.StringHashMap(layout_mod.Idx).init(allocator),
             .scratch_intern_key = .empty,
+            .interned_recursive_graphs = std.StringHashMap(layout_mod.Idx).init(allocator),
             .target_usize = target_usize,
         };
     }
@@ -228,7 +229,7 @@ comptime {
     // omission (a new store field left out of the image plumbing) is otherwise
     // silent, since `FORMAT_VERSION` only guards cross-version mismatches.
     std.debug.assert(@typeInfo(LirStore).@"struct".fields.len == 25);
-    std.debug.assert(@typeInfo(layout_mod.Store).@"struct".fields.len == 11);
+    std.debug.assert(@typeInfo(layout_mod.Store).@"struct".fields.len == 12);
     std.debug.assert(@typeInfo(base.StringLiteral.Store).@"struct".fields.len == 1);
 }
 
@@ -557,6 +558,7 @@ test "LIR image round-trips every populated store field" {
         .tag_union_data = try h.safeList(layout_mod.TagUnionData, fba, 9, 0xa0),
         .interned_layouts = undefined,
         .scratch_intern_key = undefined,
+        .interned_recursive_graphs = undefined,
         .target_usize = target_usize,
     };
 
