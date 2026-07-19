@@ -804,6 +804,8 @@ fn parseTest(args: []const []const u8) CliArgs {
             max_threads = std.fmt.parseInt(usize, value, 10) catch {
                 return CliArgs{ .problem = ArgProblem{ .invalid_flag_value = .{ .flag = "-j", .value = value, .valid_options = "positive integer" } } };
             };
+        } else if (mem.startsWith(u8, arg, "-")) {
+            return CliArgs{ .problem = ArgProblem{ .unexpected_argument = .{ .cmd = "test", .arg = arg } } };
         } else {
             if (path != null) {
                 return CliArgs{ .problem = ArgProblem{ .unexpected_argument = .{ .cmd = "test", .arg = arg } } };
@@ -1667,6 +1669,16 @@ test "roc test" {
         const result = try parse(gpa, testing.io, &[_][]const u8{ "test", "foo.roc", "bar.roc" });
         defer result.deinit(gpa);
         try testing.expectEqualStrings("bar.roc", result.problem.unexpected_argument.arg);
+    }
+    {
+        const result = try parse(gpa, testing.io, &[_][]const u8{ "test", "--target=wasm32", "foo.roc" });
+        defer result.deinit(gpa);
+        try testing.expectEqualStrings("--target=wasm32", result.problem.unexpected_argument.arg);
+    }
+    {
+        const result = try parse(gpa, testing.io, &[_][]const u8{ "test", "foo.roc", "--target=wasm32" });
+        defer result.deinit(gpa);
+        try testing.expectEqualStrings("--target=wasm32", result.problem.unexpected_argument.arg);
     }
     {
         const result = try parse(gpa, testing.io, &[_][]const u8{ "test", "-h" });

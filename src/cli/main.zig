@@ -2314,30 +2314,6 @@ fn rocRunSharedMemoryShim(ctx: *CliCtx, args: cli_args.RunArgs, arg0: []const u8
         if (platform_validation.validatePlatformHeader(ctx.arena, ctx.io.std_io, platform_source)) |validation| {
             targets_config = validation.config;
 
-            // Check if this is a library- or object-only platform (no exe targets)
-            var has_exe_output = false;
-            var has_shared_output = false;
-            for (validation.config.targets) |spec| {
-                switch (spec.output) {
-                    .exe => has_exe_output = true,
-                    .shared => has_shared_output = true,
-                    .archive => {},
-                }
-            }
-            if (!has_exe_output and has_shared_output) {
-                ctx.io.stderr().print("Error: This platform only produces shared libraries.\n\n", .{}) catch {};
-                ctx.io.stderr().print("Shared library platforms produce .so/.dylib/.dll files that must be\n", .{}) catch {};
-                ctx.io.stderr().print("loaded by a host application. Use 'roc build' instead to produce\n", .{}) catch {};
-                ctx.io.stderr().print("the library artifact.\n", .{}) catch {};
-                return error.UnsupportedTarget;
-            } else if (!has_exe_output) {
-                ctx.io.stderr().print("Error: This platform only produces static archives.\n\n", .{}) catch {};
-                ctx.io.stderr().print("Archive platforms produce .a/.lib files that must be linked\n", .{}) catch {};
-                ctx.io.stderr().print("by another build. Use 'roc build' instead to produce\n", .{}) catch {};
-                ctx.io.stderr().print("the archive.\n", .{}) catch {};
-                return error.UnsupportedTarget;
-            }
-
             const selected = try selectRunPlatformTarget(ctx, validation.config, platform_source, args.target);
             link_spec = selected.link_spec;
         } else |err| {
@@ -6819,6 +6795,7 @@ fn selectBuildPlatformTarget(
             renderValidationError(ctx.gpa, result, ctx.io.stderr());
             return error.UnsupportedTarget;
         },
+        .requires_executable => unreachable,
         .no_default => {
             if (targets_config.targets.len == 0) {
                 renderValidationError(ctx.gpa, .{
@@ -6860,6 +6837,10 @@ fn selectRunPlatformTarget(
             );
             renderValidationError(ctx.gpa, result, ctx.io.stderr());
             return error.UnsupportedTarget;
+        },
+        .requires_executable => |selected| {
+            try rejectRequiredExecutableOutput(ctx, selected);
+            unreachable;
         },
         .no_default => {
             if (targets_config.targets.len == 0) {
@@ -7009,9 +6990,9 @@ fn writeArchiveOutput(
     };
 }
 
-fn rejectRequiredExecutableOutput(ctx: *CliCtx, link_type: roc_target.OutputKind) error{ UnsupportedTarget, WriteFailed }!void {
+fn rejectRequiredExecutableOutput(ctx: *CliCtx, selected: target_selection.SelectedTarget) error{ UnsupportedTarget, WriteFailed }!void {
     const stderr = ctx.io.stderr();
-    switch (link_type) {
+    switch (selected.output) {
         .archive => {
             try stderr.print("Error: The selected target only produces static archives.\n\n", .{});
             try stderr.print("Archive platforms produce .a/.lib files that must be linked\n", .{});
@@ -7019,10 +7000,16 @@ fn rejectRequiredExecutableOutput(ctx: *CliCtx, link_type: roc_target.OutputKind
             try stderr.print("the archive.\n", .{});
         },
         .shared => {
-            try stderr.print("Error: The selected target only produces shared libraries.\n\n", .{});
-            try stderr.print("Shared library platforms produce .so/.dylib/.dll files that must be\n", .{});
-            try stderr.print("loaded by a host application. Use 'roc build' instead to produce\n", .{});
-            try stderr.print("the library artifact.\n", .{});
+            if (selected.target == .wasm32) {
+                try stderr.print("Error: This platform cannot be run directly.\n\n", .{});
+                try stderr.print("This platform targets wasm32 and produces a .wasm module. Use 'roc build'\n", .{});
+                try stderr.print("to produce the wasm artifact, then load it with the host application.\n", .{});
+            } else {
+                try stderr.print("Error: The selected target only produces shared libraries.\n\n", .{});
+                try stderr.print("Shared library platforms produce .so/.dylib/.dll files that must be\n", .{});
+                try stderr.print("loaded by a host application. Use 'roc build' instead to produce\n", .{});
+                try stderr.print("the library artifact.\n", .{});
+            }
         },
         .exe => unreachable,
     }
@@ -8129,7 +8116,7 @@ fn rocBuildLlvm(ctx: *CliCtx, args: cli_args.BuildArgs) CliMainError!void {
     }
 
     if (args.require_executable_output and link_type != .exe) {
-        return rejectRequiredExecutableOutput(ctx, link_type);
+        return rejectRequiredExecutableOutput(ctx, selected);
     }
 
     const final_output_path = if (args.output != null)
@@ -8413,7 +8400,7 @@ fn rocBuildNative(ctx: *CliCtx, args: cli_args.BuildArgs) CliMainError!void {
     const link_type = selected.output;
 
     if (args.require_executable_output and link_type != .exe) {
-        return rejectRequiredExecutableOutput(ctx, link_type);
+        return rejectRequiredExecutableOutput(ctx, selected);
     }
 
     const target_arch = target.toCpuArch();
@@ -8748,7 +8735,7 @@ fn rocBuildEmbedded(ctx: *CliCtx, args: cli_args.BuildArgs) CliMainError!void {
     }
 
     if (args.require_executable_output and link_type != .exe) {
-        return rejectRequiredExecutableOutput(ctx, link_type);
+        return rejectRequiredExecutableOutput(ctx, selected);
     }
 
     const target_arch = target.toCpuArch();
