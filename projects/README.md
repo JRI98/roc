@@ -137,10 +137,13 @@ batches and of each other:
 1. [small/hosted-extern-declared-abi.md](small/hosted-extern-declared-abi.md)
    — the invariant that a hosted extern is only specialized at its declared
    type, enforced at the producer instead of by a checker rewrite.
-2. [small/audit-solver-mutating-rewrites.md](small/audit-solver-mutating-rewrites.md)
-   — classifies every probe-then-mutate solver rewrite as mechanism or
-   declared policy (the 9834→9921→9966 lesson); depends on Chain B step 1
-   to make the 9966 rewrite non-load-bearing before judging it.
+
+The solver-rewrite audit that followed this chain has landed: design.md's
+"Solver-Mutating Rewrites" section holds the mechanism/policy inventory,
+`Store.dangerousSetVarRedirect` requires a declared `RedirectRule` at every
+call site, and the 9966 widening is the declared Hosted Try Question
+Widening rule, scoped to direct hosted calls with both sides pinned by
+tests.
 
 The platform-relation migration that concluded this chain has landed:
 checking records each platform requirement's solution in the app's checked
@@ -188,6 +191,5 @@ front-loads leverage and keeps prerequisites satisfied:
 5. `small/pin-deferred-spec-requests.md`
 6. `small/hoist-consumes-dispatch-evidence.md`
 7. `small/hosted-extern-declared-abi.md`
-8. `small/audit-solver-mutating-rewrites.md`
-9. `small/frame-partitioned-checker-state.md`
-10. `small/compact-constant-aggregates.md`
+8. `small/frame-partitioned-checker-state.md`
+9. `small/compact-constant-aggregates.md`

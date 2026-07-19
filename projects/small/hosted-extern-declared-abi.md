@@ -140,8 +140,11 @@ generated-code change for valid programs.
 
 ## Related projects
 
-- [../small/audit-solver-mutating-rewrites.md](../small/audit-solver-mutating-rewrites.md)
-  — classifies the checker rewrite this project makes non-load-bearing.
+- The solver-rewrite audit (landed): design.md's "Solver-Mutating Rewrites"
+  section classifies the checker rewrite, which is now the declared Hosted
+  Try Question Widening rule, scoped to direct hosted calls with both sides
+  pinned by tests. This project's producer-side guard remains the structural
+  half: the ABI must hold even if the checker rule changes.
 - Carry the platform-app relation from checking — landed: the platform-root
   substitutions this project's invariant is stated relative to are now the
   requirement solutions recorded at check time (see design.md's
