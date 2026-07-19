@@ -16,6 +16,7 @@ const build_options = @import("build_options");
 const SourceLoc = lir.SourceLoc;
 const LowLevelBuiltins = @import("base").LowLevelBuiltins;
 const builtins = @import("builtins");
+const shim_symbols = builtins.shim_symbols;
 const layout = @import("layout");
 const lir = @import("lir");
 const GuardedList = lir.LirStore.GuardedList;
@@ -488,16 +489,16 @@ pub const MonoLlvmCodeGen = struct {
             try fn_consts.append(self.allocator, builder.nullConst(ptr_ty) catch return error.OutOfMemory);
         }
         const table_ty = builder.arrayType(table_len, ptr_ty) catch return error.OutOfMemory;
-        const table_var = builder.addVariable(builder.strtabString("roc_shim_hosted_fns_table") catch return error.OutOfMemory, table_ty, .default) catch return error.OutOfMemory;
+        const table_var = builder.addVariable(builder.strtabString(shim_symbols.roc_shim_hosted_fns_table) catch return error.OutOfMemory, table_ty, .default) catch return error.OutOfMemory;
         table_var.ptrConst(&builder).global.setLinkage(.internal, &builder);
         table_var.setMutability(.constant, &builder);
         table_var.setInitializer(builder.arrayConst(table_ty, fn_consts.items) catch return error.OutOfMemory, &builder) catch return error.OutOfMemory;
 
-        const table_ptr_var = builder.addVariable(builder.strtabString("roc_shim_hosted_fns") catch return error.OutOfMemory, ptr_ty, .default) catch return error.OutOfMemory;
+        const table_ptr_var = builder.addVariable(builder.strtabString(shim_symbols.roc_shim_hosted_fns) catch return error.OutOfMemory, ptr_ty, .default) catch return error.OutOfMemory;
         table_ptr_var.setMutability(.constant, &builder);
         table_ptr_var.setInitializer(table_var.toConst(&builder), &builder) catch return error.OutOfMemory;
 
-        const count_var = builder.addVariable(builder.strtabString("roc_shim_hosted_count") catch return error.OutOfMemory, usize_ty, .default) catch return error.OutOfMemory;
+        const count_var = builder.addVariable(builder.strtabString(shim_symbols.roc_shim_hosted_count) catch return error.OutOfMemory, usize_ty, .default) catch return error.OutOfMemory;
         count_var.setMutability(.constant, &builder);
         count_var.setInitializer(builder.intConst(usize_ty, hosted_symbols.len) catch return error.OutOfMemory, &builder) catch return error.OutOfMemory;
 
@@ -535,40 +536,40 @@ pub const MonoLlvmCodeGen = struct {
         const w = &aw.writer;
 
         switch (self.target.cpu.arch) {
-            .x86_64 => w.writeAll(
+            .x86_64 => w.print(
                 \\.text
                 \\.globl _start
                 \\.type _start,@function
                 \\_start:
                 \\    mov %rsp, %rbx
                 \\    and $-16, %rsp
-                \\    call roc_default_runtime_init
+                \\    call {s}
                 \\    mov (%rbx), %rdi
                 \\    lea 8(%rbx), %rsi
-                \\    call roc_shim_default_main
+                \\    call {s}
                 \\    mov %rax, %rdi
                 \\    mov $60, %rax
                 \\    syscall
                 \\    ud2
                 \\.size _start, .-_start
                 \\
-            ) catch return error.OutOfMemory,
-            .aarch64 => w.writeAll(
+            , .{ shim_symbols.roc_default_runtime_init, shim_symbols.roc_shim_default_main }) catch return error.OutOfMemory,
+            .aarch64 => w.print(
                 \\.text
                 \\.globl _start
                 \\.type _start,%function
                 \\_start:
                 \\    mov x19, sp
-                \\    bl roc_default_runtime_init
+                \\    bl {s}
                 \\    ldr x0, [x19]
                 \\    add x1, x19, #8
-                \\    bl roc_shim_default_main
+                \\    bl {s}
                 \\    mov x8, #94
                 \\    svc #0
                 \\    brk #0
                 \\.size _start, .-_start
                 \\
-            ) catch return error.OutOfMemory,
+            , .{ shim_symbols.roc_default_runtime_init, shim_symbols.roc_shim_default_main }) catch return error.OutOfMemory,
             else => return error.CompilationFailed,
         }
 
@@ -812,11 +813,11 @@ pub const MonoLlvmCodeGen = struct {
         table_data.setMutability(.constant, builder);
         table_data.setInitializer(builder.arrayConst(table_ty, entries.items) catch return error.OutOfMemory, builder) catch return error.OutOfMemory;
 
-        const table_var = builder.addVariable(builder.strtabString("roc_default_backtrace_table") catch return error.OutOfMemory, ptr_ty, .default) catch return error.OutOfMemory;
+        const table_var = builder.addVariable(builder.strtabString(shim_symbols.roc_default_backtrace_table) catch return error.OutOfMemory, ptr_ty, .default) catch return error.OutOfMemory;
         table_var.setMutability(.constant, builder);
         table_var.setInitializer(table_data.toConst(builder), builder) catch return error.OutOfMemory;
 
-        const count_var = builder.addVariable(builder.strtabString("roc_default_backtrace_count") catch return error.OutOfMemory, usize_ty, .default) catch return error.OutOfMemory;
+        const count_var = builder.addVariable(builder.strtabString(shim_symbols.roc_default_backtrace_count) catch return error.OutOfMemory, usize_ty, .default) catch return error.OutOfMemory;
         count_var.setMutability(.constant, builder);
         count_var.setInitializer(builder.intConst(usize_ty, self.proc_registry.count()) catch return error.OutOfMemory, builder) catch return error.OutOfMemory;
     }
@@ -1591,7 +1592,7 @@ pub const MonoLlvmCodeGen = struct {
             // The interpreter needs a real RocOps; the prelinked shim builds
             // one over the host's extern symbols.
             const get_ops_ty = builder.fnType(ptr_ty, &.{}, .normal) catch return error.OutOfMemory;
-            const get_ops = try self.declareExternSymbol("roc_shim_get_ops", get_ops_ty);
+            const get_ops = try self.declareExternSymbol(shim_symbols.roc_shim_get_ops, get_ops_ty);
             break :blk wip.call(.normal, .ccc, .none, get_ops_ty, get_ops.toValue(builder), &.{}, "") catch return error.OutOfMemory;
         } else builder.nullValue(ptr_ty) catch return error.OutOfMemory;
         self.roc_ops_arg = ops_value;
@@ -1637,12 +1638,12 @@ pub const MonoLlvmCodeGen = struct {
             const usize_ty: LlvmBuilder.Type = if (self.targetWordSize() == 8) .i64 else .i32;
             if (sh.image) |img| {
                 const entry_ty = builder.fnType(.void, &.{ .i32, ptr_ty, ptr_ty, ptr_ty, ptr_ty, usize_ty }, .normal) catch return error.OutOfMemory;
-                const entry_fn = try self.declareExternSymbol("roc_entrypoint_from_image", entry_ty);
+                const entry_fn = try self.declareExternSymbol(shim_symbols.roc_entrypoint_from_image, entry_ty);
                 const len_value = builder.intValue(usize_ty, img.len) catch return error.OutOfMemory;
                 _ = wip.call(.normal, .ccc, .none, entry_ty, entry_fn.toValue(builder), &.{ idx_value, ops_value, ret_slot, args_buf, img.value, len_value }, "") catch return error.OutOfMemory;
             } else {
                 const entry_ty = builder.fnType(.void, &.{ .i32, ptr_ty, ptr_ty, ptr_ty }, .normal) catch return error.OutOfMemory;
-                const entry_fn = try self.declareExternSymbol("roc_entrypoint", entry_ty);
+                const entry_fn = try self.declareExternSymbol(shim_symbols.roc_entrypoint, entry_ty);
                 _ = wip.call(.normal, .ccc, .none, entry_ty, entry_fn.toValue(builder), &.{ idx_value, ops_value, ret_slot, args_buf }, "") catch return error.OutOfMemory;
             }
         } else {
@@ -8257,7 +8258,7 @@ pub const MonoLlvmCodeGen = struct {
     ) Error!bool {
         if (!self.enable_default_platform_hosted_calls) return false;
         if (self.host_call_mode != .extern_symbols) return false;
-        if (!std.mem.eql(u8, self.store.getString(hosted.symbol), "roc_default_echo_line")) return false;
+        if (!std.mem.eql(u8, self.store.getString(hosted.symbol), shim_symbols.roc_default_echo_line)) return false;
 
         switch (self.target.os.tag) {
             .linux, .macos, .windows => {},

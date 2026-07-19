@@ -1865,6 +1865,7 @@ fn createTestPlatformHostLib(
     }
     lib.root_module.addImport("builtins", roc_modules.builtins);
     lib.root_module.addImport("build_options", roc_modules.build_options);
+    lib.root_module.addImport("host_alloc", roc_modules.host_alloc);
     lib.root_module.addImport("vendor_parse_float", roc_modules.vendor_parse_float);
     lib.root_module.addImport("vendor_ryu", roc_modules.vendor_ryu);
     lib.root_module.addImport("shim_io", b.addModule("shim_io", .{
@@ -6139,6 +6140,7 @@ fn addMainExe(
                 }),
             });
             default_platform_runtime_obj.root_module.addImport("roc_str_view", roc_modules.roc_str_view);
+            default_platform_runtime_obj.root_module.addImport("shim_symbols", roc_modules.shim_symbols);
             default_platform_runtime_obj.root_module.stack_check = false;
             default_platform_runtime_obj.root_module.link_libc = false;
             default_platform_runtime_obj.bundle_compiler_rt = false;

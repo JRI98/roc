@@ -7,6 +7,7 @@
 const builtin = @import("builtin");
 
 const RocStr = @import("roc_str_view").RocStr;
+const shim_symbols = @import("shim_symbols");
 
 const c = switch (builtin.os.tag) {
     .windows => struct {
@@ -33,39 +34,51 @@ const AllocationHeader = extern struct {
     len: usize,
 };
 
-export fn roc_default_runtime_init() callconv(.c) void {}
+comptime {
+    @export(&runtimeInit, .{ .name = shim_symbols.roc_default_runtime_init });
+    @export(&defaultExit, .{ .name = shim_symbols.roc_default_exit });
+    @export(&defaultEchoLine, .{ .name = shim_symbols.roc_default_echo_line });
+    @export(&rocDbg, .{ .name = shim_symbols.roc_dbg });
+    @export(&rocExpectFailed, .{ .name = shim_symbols.roc_expect_failed });
+    @export(&rocCrashed, .{ .name = shim_symbols.roc_crashed });
+    @export(&rocAlloc, .{ .name = shim_symbols.roc_alloc });
+    @export(&rocRealloc, .{ .name = shim_symbols.roc_realloc });
+    @export(&rocDealloc, .{ .name = shim_symbols.roc_dealloc });
+}
 
-export fn roc_default_exit(code: u8) callconv(.c) noreturn {
+fn runtimeInit() callconv(.c) void {}
+
+fn defaultExit(code: u8) callconv(.c) noreturn {
     c.exit(code);
 }
 
-export fn roc_default_echo_line(str: RocStr) callconv(.c) void {
+fn defaultEchoLine(str: RocStr) callconv(.c) void {
     var owned = str;
     const message = owned.asSlice();
     writeAll(1, message);
-    owned.decref(roc_dealloc);
+    owned.decref(rocDealloc);
 }
 
-export fn roc_dbg(bytes: [*]const u8, len: usize) callconv(.c) void {
+fn rocDbg(bytes: [*]const u8, len: usize) callconv(.c) void {
     writeAll(2, bytes[0..len]);
     writeAll(2, "\n");
 }
 
-export fn roc_expect_failed(bytes: [*]const u8, len: usize) callconv(.c) noreturn {
+fn rocExpectFailed(bytes: [*]const u8, len: usize) callconv(.c) noreturn {
     writeAll(2, "Roc expect failed: ");
     writeAll(2, bytes[0..len]);
     writeAll(2, "\n");
     c.exit(1);
 }
 
-export fn roc_crashed(bytes: [*]const u8, len: usize) callconv(.c) noreturn {
+fn rocCrashed(bytes: [*]const u8, len: usize) callconv(.c) noreturn {
     writeAll(2, "Roc application crashed with this message:\n\n\t");
     writeAll(2, bytes[0..len]);
     writeAll(2, "\n\n");
     c.exit(1);
 }
 
-export fn roc_alloc(length: usize, alignment: usize) callconv(.c) ?*anyopaque {
+fn rocAlloc(length: usize, alignment: usize) callconv(.c) ?*anyopaque {
     const byte_alignment = normalizedAlignment(alignment);
     const total = length + byte_alignment + @sizeOf(AllocationHeader);
     const raw_any = c.malloc(total) orelse return null;
@@ -76,10 +89,10 @@ export fn roc_alloc(length: usize, alignment: usize) callconv(.c) ?*anyopaque {
     return @ptrCast(user);
 }
 
-export fn roc_realloc(ptr: *anyopaque, new_length: usize, alignment: usize) callconv(.c) ?*anyopaque {
+fn rocRealloc(ptr: *anyopaque, new_length: usize, alignment: usize) callconv(.c) ?*anyopaque {
     const old_user: [*]u8 = @ptrCast(ptr);
     const old_header = allocationHeader(old_user).*;
-    const new_ptr = roc_alloc(new_length, alignment) orelse return null;
+    const new_ptr = rocAlloc(new_length, alignment) orelse return null;
     const new_user: [*]u8 = @ptrCast(new_ptr);
 
     const copy_len = @min(old_header.len, new_length);
@@ -87,11 +100,11 @@ export fn roc_realloc(ptr: *anyopaque, new_length: usize, alignment: usize) call
     while (i < copy_len) : (i += 1) {
         new_user[i] = old_user[i];
     }
-    roc_dealloc(ptr, alignment);
+    rocDealloc(ptr, alignment);
     return new_ptr;
 }
 
-export fn roc_dealloc(ptr: *anyopaque, _: usize) callconv(.c) void {
+fn rocDealloc(ptr: *anyopaque, _: usize) callconv(.c) void {
     const user: [*]u8 = @ptrCast(ptr);
     c.free(@ptrCast(allocationHeader(user).raw));
 }

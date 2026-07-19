@@ -8,6 +8,7 @@ const builtin = @import("builtin");
 const linux = std.os.linux;
 
 const RocStr = @import("roc_str_view").RocStr;
+const shim_symbols = @import("shim_symbols");
 
 pub const panic = std.debug.no_panic;
 
@@ -33,11 +34,11 @@ const BacktraceEntry = extern struct {
 };
 
 const roc_default_backtrace_table = @extern(*const [*]const BacktraceEntry, .{
-    .name = "roc_default_backtrace_table",
+    .name = shim_symbols.roc_default_backtrace_table,
     .linkage = .weak,
 });
 const roc_default_backtrace_count = @extern(*const usize, .{
-    .name = "roc_default_backtrace_count",
+    .name = shim_symbols.roc_default_backtrace_count,
     .linkage = .weak,
 });
 
@@ -50,18 +51,28 @@ comptime {
     @export(&defaultMemmove, .{ .name = "memmove", .linkage = .weak });
     @export(&defaultMemset, .{ .name = "memset", .linkage = .weak });
     @export(&defaultTrunc, .{ .name = "trunc", .linkage = .weak });
+
+    @export(&runtimeInit, .{ .name = shim_symbols.roc_default_runtime_init });
+    @export(&rocDbg, .{ .name = shim_symbols.roc_dbg });
+    @export(&rocExpectFailed, .{ .name = shim_symbols.roc_expect_failed });
+    @export(&rocCrashed, .{ .name = shim_symbols.roc_crashed });
+    @export(&defaultEchoLine, .{ .name = shim_symbols.roc_default_echo_line });
+    @export(&defaultExit, .{ .name = shim_symbols.roc_default_exit });
+    @export(&rocAlloc, .{ .name = shim_symbols.roc_alloc });
+    @export(&rocRealloc, .{ .name = shim_symbols.roc_realloc });
+    @export(&rocDealloc, .{ .name = shim_symbols.roc_dealloc });
 }
 
-export fn roc_default_runtime_init() callconv(.c) void {
+fn runtimeInit() callconv(.c) void {
     installSignalHandlers();
 }
 
-export fn roc_dbg(bytes: [*]const u8, len: usize) callconv(.c) void {
+fn rocDbg(bytes: [*]const u8, len: usize) callconv(.c) void {
     writeAll(stderr_fd, bytes[0..len]);
     writeLiteral(stderr_fd, "\n");
 }
 
-export fn roc_expect_failed(bytes: [*]const u8, len: usize) callconv(.c) noreturn {
+fn rocExpectFailed(bytes: [*]const u8, len: usize) callconv(.c) noreturn {
     writeLiteral(stderr_fd, "Roc expect failed: ");
     writeAll(stderr_fd, bytes[0..len]);
     writeLiteral(stderr_fd, "\n");
@@ -69,7 +80,7 @@ export fn roc_expect_failed(bytes: [*]const u8, len: usize) callconv(.c) noretur
     exitFailure();
 }
 
-export fn roc_crashed(bytes: [*]const u8, len: usize) callconv(.c) noreturn {
+fn rocCrashed(bytes: [*]const u8, len: usize) callconv(.c) noreturn {
     writeLiteral(stderr_fd, "Roc application crashed with this message:\n\n\t");
     writeAll(stderr_fd, bytes[0..len]);
     writeLiteral(stderr_fd, "\n\n");
@@ -77,18 +88,18 @@ export fn roc_crashed(bytes: [*]const u8, len: usize) callconv(.c) noreturn {
     exitFailure();
 }
 
-export fn roc_default_echo_line(str: RocStr) callconv(.c) void {
+fn defaultEchoLine(str: RocStr) callconv(.c) void {
     var owned = str;
     const message = owned.asSlice();
     writeAll(stdout_fd, message);
-    owned.decref(roc_dealloc);
+    owned.decref(rocDealloc);
 }
 
-export fn roc_default_exit(code: u8) callconv(.c) noreturn {
+fn defaultExit(code: u8) callconv(.c) noreturn {
     linux.exit_group(code);
 }
 
-export fn roc_alloc(length: usize, alignment: usize) callconv(.c) ?*anyopaque {
+fn rocAlloc(length: usize, alignment: usize) callconv(.c) ?*anyopaque {
     const byte_alignment = normalizedAlignment(alignment);
     const prefix = alignForward(allocation_header_size, byte_alignment);
     const total = pageAlign(prefix + length);
@@ -108,22 +119,22 @@ export fn roc_alloc(length: usize, alignment: usize) callconv(.c) ?*anyopaque {
     return @ptrCast(user);
 }
 
-export fn roc_realloc(ptr: *anyopaque, new_length: usize, alignment: usize) callconv(.c) ?*anyopaque {
+fn rocRealloc(ptr: *anyopaque, new_length: usize, alignment: usize) callconv(.c) ?*anyopaque {
     const old_user: [*]u8 = @ptrCast(ptr);
     const old_len = allocationHeaderValue(old_user, 2);
 
-    const new_ptr = roc_alloc(new_length, alignment) orelse return null;
+    const new_ptr = rocAlloc(new_length, alignment) orelse return null;
     const new_user: [*]u8 = @ptrCast(new_ptr);
     const copy_len = @min(old_len, new_length);
     var i: usize = 0;
     while (i < copy_len) : (i += 1) {
         new_user[i] = old_user[i];
     }
-    roc_dealloc(ptr, alignment);
+    rocDealloc(ptr, alignment);
     return new_ptr;
 }
 
-export fn roc_dealloc(ptr: *anyopaque, _: usize) callconv(.c) void {
+fn rocDealloc(ptr: *anyopaque, _: usize) callconv(.c) void {
     const user: [*]u8 = @ptrCast(ptr);
     const prefix = allocationHeaderValue(user, 0);
     const total = allocationHeaderValue(user, 1);

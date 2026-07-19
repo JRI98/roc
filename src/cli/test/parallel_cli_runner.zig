@@ -29,6 +29,7 @@ const collections = @import("collections");
 const bytebox = @import("bytebox");
 const builtins = @import("builtins");
 const BuiltinFn = builtins.builtin_registry.BuiltinFn;
+const shim_symbols = builtins.shim_symbols;
 
 /// Error returned when a hosted function reports a Roc panic to the runner.
 pub const HostFunctionError = error{RocPanic};
@@ -2616,8 +2617,8 @@ const hot_reload_host_c_source =
     \\#include <unistd.h>
     \\
     \\extern uint64_t roc_main(uint64_t);
-    \\extern void *roc_shim_get_ops(void);
-++ "\nextern void " ++ BuiltinFn.erased_callable_incref.symbolName() ++ "(unsigned char *, intptr_t, void *);" ++
+++ "\nextern void *" ++ shim_symbols.roc_shim_get_ops ++ "(void);" ++
+    "\nextern void " ++ BuiltinFn.erased_callable_incref.symbolName() ++ "(unsigned char *, intptr_t, void *);" ++
     "\nextern void " ++ BuiltinFn.erased_callable_decref.symbolName() ++ "(unsigned char *, void *);\n" ++
     \\
     \\#ifndef ROC_TARGET_NAME
@@ -2683,12 +2684,12 @@ const hot_reload_host_c_source =
     \\    struct RocErasedCallablePayload *payload = (struct RocErasedCallablePayload *)boxed;
     \\    struct I64Args args = { .arg0 = value };
     \\    int64_t result = 0;
-    \\    payload->callable(roc_shim_get_ops(), &result, &args, boxed + 16);
+++ "\n    payload->callable(" ++ shim_symbols.roc_shim_get_ops ++ "(), &result, &args, boxed + 16);\n" ++
     \\    return result;
     \\}
     \\
     \\void roc_host_store_boxed(unsigned char *boxed) {
-    \\    void *ops = roc_shim_get_ops();
+++ "\n    void *ops = " ++ shim_symbols.roc_shim_get_ops ++ "();\n" ++
     \\    if (stored_boxed != NULL) {
 ++ "\n        " ++ BuiltinFn.erased_callable_decref.symbolName() ++ "(stored_boxed, ops);\n" ++
     \\    }
@@ -2703,7 +2704,7 @@ const hot_reload_host_c_source =
     \\}
     \\
     \\static int retain_stored_boxed(void) {
-    \\    void *ops = roc_shim_get_ops();
+++ "\n    void *ops = " ++ shim_symbols.roc_shim_get_ops ++ "();\n" ++
     \\    if (stored_boxed == NULL) return 1;
     \\    if (retained_boxed != NULL) {
 ++ "\n        " ++ BuiltinFn.erased_callable_decref.symbolName() ++ "(retained_boxed, ops);\n" ++
@@ -2990,7 +2991,7 @@ const hot_reload_host_c_source =
     \\    printf("boxed-wide-old-after-shrink:%lld\n", (long long)old_wide_result);
     \\    fflush(stdout);
     \\    if (old_wide_result != 159) return 1;
-++ "\n    " ++ BuiltinFn.erased_callable_decref.symbolName() ++ "(retained_boxed, roc_shim_get_ops());\n" ++
+++ "\n    " ++ BuiltinFn.erased_callable_decref.symbolName() ++ "(retained_boxed, " ++ shim_symbols.roc_shim_get_ops ++ "());\n" ++
     \\    retained_boxed = NULL;
     \\
     \\    if (write_app(app_path, app_const_thirteen)) return 1;
@@ -2999,7 +3000,7 @@ const hot_reload_host_c_source =
     \\    printf("boxed-old-after-reload:%lld\n", (long long)old_boxed_result);
     \\    fflush(stdout);
     \\    if (old_boxed_result != 12) return 1;
-++ "\n    " ++ BuiltinFn.erased_callable_decref.symbolName() ++ "(stored_boxed, roc_shim_get_ops());\n" ++
+++ "\n    " ++ BuiltinFn.erased_callable_decref.symbolName() ++ "(stored_boxed, " ++ shim_symbols.roc_shim_get_ops ++ "());\n" ++
     \\    stored_boxed = NULL;
     \\    puts("boxed-released");
     \\    fflush(stdout);

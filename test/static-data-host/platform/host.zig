@@ -9,6 +9,7 @@ const std = @import("std");
 const build_options = @import("build_options");
 const builtin = @import("builtin");
 const builtins = @import("builtins");
+const host_alloc = @import("host_alloc");
 const shim_io = @import("shim_io");
 
 // Route std.debug's IO through shim_io instead of the default std.Io.Threaded.
@@ -37,6 +38,10 @@ const HostEnv = struct {
     // -> i128 division -> __divti3/__modti3, which this archive does not link).
     gpa: std.heap.DebugAllocator(.{ .thread_safe = false, .stack_trace_frames = build_options.debug_gpa_stack_trace_frames }),
     dealloc_count: usize,
+
+    pub fn rocAllocator(self: *HostEnv) std.mem.Allocator {
+        return self.gpa.allocator();
+    }
 };
 
 const Counts = extern struct {
@@ -99,37 +104,12 @@ extern fn roc_main() callconv(.c) void;
 // before any Roc code runs.
 var g_roc_ops: ?*RocOps = null;
 
-fn hostAlloc(length: usize, alignment: usize) callconv(.c) ?*anyopaque {
-    return rocAllocFn(g_roc_ops.?, length, alignment);
-}
-
-fn hostDealloc(ptr: *anyopaque, alignment: usize) callconv(.c) void {
-    rocDeallocFn(g_roc_ops.?, ptr, alignment);
-}
-
-fn hostRealloc(ptr: *anyopaque, new_length: usize, alignment: usize) callconv(.c) ?*anyopaque {
-    return rocReallocFn(g_roc_ops.?, ptr, new_length, alignment);
-}
-
-fn hostDbg(bytes: [*]const u8, len: usize) callconv(.c) void {
-    rocDbgFn(g_roc_ops.?, bytes, len);
-}
-
-fn hostExpectFailed(bytes: [*]const u8, len: usize) callconv(.c) void {
-    rocExpectFailedFn(g_roc_ops.?, bytes, len);
-}
-
-fn hostCrashed(bytes: [*]const u8, len: usize) callconv(.c) void {
-    rocCrashedFn(g_roc_ops.?, bytes, len);
+fn getOps() *RocOps {
+    return g_roc_ops.?;
 }
 
 comptime {
-    @export(&hostAlloc, .{ .name = "roc_alloc", .visibility = .hidden });
-    @export(&hostDealloc, .{ .name = "roc_dealloc", .visibility = .hidden });
-    @export(&hostRealloc, .{ .name = "roc_realloc", .visibility = .hidden });
-    @export(&hostDbg, .{ .name = "roc_dbg", .visibility = .hidden });
-    @export(&hostExpectFailed, .{ .name = "roc_expect_failed", .visibility = .hidden });
-    @export(&hostCrashed, .{ .name = "roc_crashed", .visibility = .hidden });
+    host_alloc.exportRuntimeSymbols(getOps, .{});
 }
 
 comptime {
@@ -154,9 +134,9 @@ fn main(argc: c_int, argv: [*][*:0]u8) callconv(.c) c_int {
 
     var roc_ops = RocOps{
         .env = @ptrCast(&host_env),
-        .roc_alloc = rocAllocFn,
+        .roc_alloc = callbacks.rocAllocFn,
         .roc_dealloc = rocDeallocFn,
-        .roc_realloc = rocReallocFn,
+        .roc_realloc = callbacks.rocReallocFn,
         .roc_dbg = rocDbgFn,
         .roc_expect_failed = rocExpectFailedFn,
         .roc_crashed = rocCrashedFn,
@@ -429,62 +409,12 @@ fn fail(message: []const u8) CheckError {
     return CheckError.StaticDataHostCheckFailed;
 }
 
-fn rocAllocFn(ops: *RocOps, length: usize, alignment: usize) callconv(.c) ?*anyopaque {
-    const host: *HostEnv = @ptrCast(@alignCast(ops.env));
-    const allocator = host.gpa.allocator();
-
-    const min_alignment: usize = @max(alignment, @alignOf(usize));
-    const align_enum = std.mem.Alignment.fromByteUnits(min_alignment);
-    const size_storage_bytes = min_alignment;
-    const total_size = length + size_storage_bytes;
-
-    const base_ptr = allocator.rawAlloc(total_size, align_enum, @returnAddress()) orelse {
-        std.debug.print("host allocation failed for {d} bytes\n", .{total_size});
-        std.process.exit(1);
-    };
-
-    const size_ptr: *usize = @ptrFromInt(@intFromPtr(base_ptr) + size_storage_bytes - @sizeOf(usize));
-    size_ptr.* = total_size;
-    return @ptrFromInt(@intFromPtr(base_ptr) + size_storage_bytes);
-}
+const callbacks = host_alloc.Callbacks(HostEnv);
 
 fn rocDeallocFn(ops: *RocOps, ptr: *anyopaque, alignment: usize) callconv(.c) void {
     const host: *HostEnv = @ptrCast(@alignCast(ops.env));
     host.dealloc_count += 1;
-
-    const allocator = host.gpa.allocator();
-    const min_alignment: usize = @max(alignment, @alignOf(usize));
-    const align_enum = std.mem.Alignment.fromByteUnits(min_alignment);
-    const size_storage_bytes = min_alignment;
-    const size_ptr: *const usize = @ptrFromInt(@intFromPtr(ptr) - @sizeOf(usize));
-    const total_size = size_ptr.*;
-    const base_ptr: [*]u8 = @ptrFromInt(@intFromPtr(ptr) - size_storage_bytes);
-
-    allocator.rawFree(base_ptr[0..total_size], align_enum, @returnAddress());
-}
-
-fn rocReallocFn(ops: *RocOps, ptr: *anyopaque, new_length: usize, alignment: usize) callconv(.c) ?*anyopaque {
-    const host: *HostEnv = @ptrCast(@alignCast(ops.env));
-    const allocator = host.gpa.allocator();
-
-    const min_alignment: usize = @max(alignment, @alignOf(usize));
-    const align_enum = std.mem.Alignment.fromByteUnits(min_alignment);
-    const size_storage_bytes = min_alignment;
-    const old_size_ptr: *const usize = @ptrFromInt(@intFromPtr(ptr) - @sizeOf(usize));
-    const old_total_size = old_size_ptr.*;
-    const old_base_ptr: [*]u8 = @ptrFromInt(@intFromPtr(ptr) - size_storage_bytes);
-
-    const new_total_size = new_length + size_storage_bytes;
-    const new_ptr = allocator.rawAlloc(new_total_size, align_enum, @returnAddress()) orelse {
-        std.debug.print("host reallocation failed for {d} bytes\n", .{new_total_size});
-        std.process.exit(1);
-    };
-    @memcpy(new_ptr[0..@min(old_total_size, new_total_size)], old_base_ptr[0..@min(old_total_size, new_total_size)]);
-    allocator.rawFree(old_base_ptr[0..old_total_size], align_enum, @returnAddress());
-
-    const new_size_ptr: *usize = @ptrFromInt(@intFromPtr(new_ptr) + size_storage_bytes - @sizeOf(usize));
-    new_size_ptr.* = new_total_size;
-    return @ptrFromInt(@intFromPtr(new_ptr) + size_storage_bytes);
+    callbacks.rocDeallocFn(ops, ptr, alignment);
 }
 
 fn rocDbgFn(ops: *RocOps, bytes: [*]const u8, len: usize) callconv(.c) void {
