@@ -4555,6 +4555,14 @@ pub fn build(b: *std.Build) void {
         tests_summary.setRunSerialization();
     }
 
+    const test_suites = TestSuiteRegistry{
+        .b = b,
+        .summary = tests_summary,
+        .build_test_zig_step = build_test_zig_step,
+        .wiring_run = if (enumerate_tests_for_wiring_check) run_test_wiring else null,
+        .run_args = run_args,
+    };
+
     const guarded_list_violation_exe = b.addExecutable(.{
         .name = "guarded_list_violation_test",
         .root_module = b.createModule(.{
@@ -4764,16 +4772,11 @@ pub fn build(b: *std.Build) void {
         }),
         .filters = test_filters,
     });
-    build_test_zig_step.dependOn(&build_helpers_test.step);
-    if (enumerate_tests_for_wiring_check) run_test_wiring.addArtifactArg(build_helpers_test);
-    const run_build_helpers_test_for_summary = addTestRunArtifact(b, build_helpers_test, run_args);
-    tests_summary.addRun(&run_build_helpers_test_for_summary.step);
-    const run_build_helpers_test = addTestRunArtifact(b, build_helpers_test, run_args);
-    const run_build_helpers_step = b.step(
-        "run-test-zig-build-helpers",
-        "Run build-helper Zig unit tests",
-    );
-    run_build_helpers_step.dependOn(&run_build_helpers_test.step);
+    test_suites.register(.{
+        .step_suffix = "build-helpers",
+        .description = "Run build-helper Zig unit tests",
+        .compile = build_helpers_test,
+    });
 
     // CLI runner unit tests: parallel_cli_runner.zig is an executable root, so
     // its test decls are only collected by this dedicated test compile.
@@ -4794,16 +4797,11 @@ pub fn build(b: *std.Build) void {
         }),
         .filters = test_filters,
     });
-    build_test_zig_step.dependOn(&cli_runner_unit_test.step);
-    if (enumerate_tests_for_wiring_check) run_test_wiring.addArtifactArg(cli_runner_unit_test);
-    const run_cli_runner_unit_test_for_summary = addTestRunArtifact(b, cli_runner_unit_test, run_args);
-    tests_summary.addRun(&run_cli_runner_unit_test_for_summary.step);
-    const run_cli_runner_unit_test = addTestRunArtifact(b, cli_runner_unit_test, run_args);
-    const run_cli_runner_unit_step = b.step(
-        "run-test-zig-cli-runner-unit",
-        "Run CLI runner Zig unit tests",
-    );
-    run_cli_runner_unit_step.dependOn(&run_cli_runner_unit_test.step);
+    test_suites.register(.{
+        .step_suffix = "cli-runner-unit",
+        .description = "Run CLI runner Zig unit tests",
+        .compile = cli_runner_unit_test,
+    });
 
     // LLVM backend aggregator test: src/backend/llvm/mod.zig is not the root of
     // the llvm_codegen module, so its refAllDecls compile coverage needs its own
@@ -4843,16 +4841,11 @@ pub fn build(b: *std.Build) void {
     {
         backend_llvm_test.root_module.link_libcpp = true;
     }
-    build_test_zig_step.dependOn(&backend_llvm_test.step);
-    if (enumerate_tests_for_wiring_check) run_test_wiring.addArtifactArg(backend_llvm_test);
-    const run_backend_llvm_test_for_summary = addTestRunArtifact(b, backend_llvm_test, run_args);
-    tests_summary.addRun(&run_backend_llvm_test_for_summary.step);
-    const run_backend_llvm_test = addTestRunArtifact(b, backend_llvm_test, run_args);
-    const run_backend_llvm_step = b.step(
-        "run-test-zig-backend-llvm",
-        "Run LLVM backend aggregator Zig tests",
-    );
-    run_backend_llvm_step.dependOn(&run_backend_llvm_test.step);
+    test_suites.register(.{
+        .step_suffix = "backend-llvm",
+        .description = "Run LLVM backend aggregator Zig tests",
+        .compile = backend_llvm_test,
+    });
 
     // Add snapshot tool test
     const enable_snapshot_tests = b.option(bool, "snapshot-tests", "Enable snapshot tests") orelse true;
@@ -4888,25 +4881,21 @@ pub fn build(b: *std.Build) void {
         }
 
         add_tracy(b, roc_modules.build_options, snapshot_test, target, true, flag_enable_tracy);
-        build_test_zig_step.dependOn(&snapshot_test.step);
-        if (enumerate_tests_for_wiring_check) run_test_wiring.addArtifactArg(snapshot_test);
 
-        const run_snapshot_test_for_summary = addTestRunArtifact(b, snapshot_test, run_args);
-        if (snapshot_exe_install) |install| {
-            run_snapshot_test_for_summary.step.dependOn(&install.step);
-        }
-        tests_summary.addRun(&run_snapshot_test_for_summary.step);
+        // The install step is optional, so hoist the dep list into a local with
+        // an explicit type: peer-type resolution on an inline
+        // `if (c) &.{x} else &.{}` inside a struct literal field is fragile.
+        const snapshot_deps: []const *Step = if (snapshot_exe_install) |install|
+            &.{&install.step}
+        else
+            &.{};
 
-        const run_snapshot_test = addTestRunArtifact(b, snapshot_test, run_args);
-        if (snapshot_exe_install) |install| {
-            run_snapshot_test.step.dependOn(&install.step);
-        }
-
-        const run_snapshot_tool_test_step = b.step(
-            "run-test-zig-snapshot-tool",
-            "Run snapshot tool Zig tests",
-        );
-        run_snapshot_tool_test_step.dependOn(&run_snapshot_test.step);
+        test_suites.register(.{
+            .step_suffix = "snapshot-tool",
+            .description = "Run snapshot tool Zig tests",
+            .compile = snapshot_test,
+            .deps = snapshot_deps,
+        });
     }
 
     // Add Builtin.roc doc code-block tests. Verifies every ```roc block in
@@ -4945,19 +4934,12 @@ pub fn build(b: *std.Build) void {
             builtin_doc_test.root_module.link_libcpp = true;
         }
         add_tracy(b, roc_modules.build_options, builtin_doc_test, target, true, flag_enable_tracy);
-        build_test_zig_step.dependOn(&builtin_doc_test.step);
-        if (enumerate_tests_for_wiring_check) run_test_wiring.addArtifactArg(builtin_doc_test);
 
-        const run_builtin_doc_test_for_summary = addTestRunArtifact(b, builtin_doc_test, run_args);
-        tests_summary.addRun(&run_builtin_doc_test_for_summary.step);
-
-        const run_builtin_doc_test = addTestRunArtifact(b, builtin_doc_test, run_args);
-
-        const run_builtin_doc_test_step = b.step(
-            "run-test-zig-builtin-doc",
-            "Run Builtin.roc doc code-block Zig tests",
-        );
-        run_builtin_doc_test_step.dependOn(&run_builtin_doc_test.step);
+        test_suites.register(.{
+            .step_suffix = "builtin-doc",
+            .description = "Run Builtin.roc doc code-block Zig tests",
+            .compile = builtin_doc_test,
+        });
     }
 
     const lir_inline_test = b.addTest(.{
@@ -4990,19 +4972,12 @@ pub fn build(b: *std.Build) void {
         lir_inline_test.root_module.link_libcpp = true;
     }
     add_tracy(b, roc_modules.build_options, lir_inline_test, target, true, flag_enable_tracy);
-    build_test_zig_step.dependOn(&lir_inline_test.step);
-    if (enumerate_tests_for_wiring_check) run_test_wiring.addArtifactArg(lir_inline_test);
 
-    const run_lir_inline_test_for_summary = addTestRunArtifact(b, lir_inline_test, run_args);
-    tests_summary.addRun(&run_lir_inline_test_for_summary.step);
-
-    const run_lir_inline_test = addTestRunArtifact(b, lir_inline_test, run_args);
-
-    const run_lir_inline_test_step = b.step(
-        "run-test-zig-lir-inline",
-        "Run LIR inline Zig tests",
-    );
-    run_lir_inline_test_step.dependOn(&run_lir_inline_test.step);
+    test_suites.register(.{
+        .step_suffix = "lir-inline",
+        .description = "Run LIR inline Zig tests",
+        .compile = lir_inline_test,
+    });
 
     const trmc_lir_test = b.addTest(.{
         .name = "trmc_lir_test",
@@ -5034,19 +5009,12 @@ pub fn build(b: *std.Build) void {
         trmc_lir_test.root_module.link_libcpp = true;
     }
     add_tracy(b, roc_modules.build_options, trmc_lir_test, target, true, flag_enable_tracy);
-    build_test_zig_step.dependOn(&trmc_lir_test.step);
-    if (enumerate_tests_for_wiring_check) run_test_wiring.addArtifactArg(trmc_lir_test);
 
-    const run_trmc_lir_test_for_summary = addTestRunArtifact(b, trmc_lir_test, run_args);
-    tests_summary.addRun(&run_trmc_lir_test_for_summary.step);
-
-    const run_trmc_lir_test = addTestRunArtifact(b, trmc_lir_test, run_args);
-
-    const run_trmc_lir_test_step = b.step(
-        "run-test-zig-trmc-lir",
-        "Run TRMC LIR Zig tests",
-    );
-    run_trmc_lir_test_step.dependOn(&run_trmc_lir_test.step);
+    test_suites.register(.{
+        .step_suffix = "trmc-lir",
+        .description = "Run TRMC LIR Zig tests",
+        .compile = trmc_lir_test,
+    });
 
     // Add CLI test
     const enable_cli_tests = b.option(bool, "cli-tests", "Enable cli tests") orelse true;
@@ -5083,19 +5051,12 @@ pub fn build(b: *std.Build) void {
         add_tracy(b, roc_modules.build_options, cli_test, target, true, flag_enable_tracy);
         cli_test.root_module.addImport("compiled_builtins", compiled_builtins_module);
         cli_test.step.dependOn(&write_compiled_builtins.step);
-        build_test_zig_step.dependOn(&cli_test.step);
-        if (enumerate_tests_for_wiring_check) run_test_wiring.addArtifactArg(cli_test);
 
-        const run_cli_test_for_summary = addTestRunArtifact(b, cli_test, run_args);
-        tests_summary.addRun(&run_cli_test_for_summary.step);
-
-        const run_cli_test = addTestRunArtifact(b, cli_test, run_args);
-
-        const run_cli_main_test_step = b.step(
-            "run-test-zig-cli-main",
-            "Run roc CLI main Zig tests",
-        );
-        run_cli_main_test_step.dependOn(&run_cli_test.step);
+        test_suites.register(.{
+            .step_suffix = "cli-main",
+            .description = "Run roc CLI main Zig tests",
+            .compile = cli_test,
+        });
     }
 
     // Add watch tests
@@ -5117,25 +5078,19 @@ pub fn build(b: *std.Build) void {
         // Link platform-specific libraries for file watching
         linkWatchPlatformLibs(watch_test, target);
 
-        build_test_zig_step.dependOn(&watch_test.step);
-        if (enumerate_tests_for_wiring_check) run_test_wiring.addArtifactArg(watch_test);
-
-        const run_watch_test_for_summary = addTestRunArtifact(b, watch_test, run_args);
-        tests_summary.addRun(&run_watch_test_for_summary.step);
-
-        const run_watch_test = addTestRunArtifact(b, watch_test, run_args);
-
-        const run_watch_cli_test_step = b.step(
-            "run-test-zig-watch-cli",
-            "Run watch command Zig tests",
-        );
-        run_watch_cli_test_step.dependOn(&run_watch_test.step);
+        test_suites.register(.{
+            .step_suffix = "watch-cli",
+            .description = "Run watch command Zig tests",
+            .compile = watch_test,
+        });
     }
 
     // MiniCI output-filter tests. MiniCI is a standalone host build tool that
     // only imports `std`, so it needs no module wiring.
-    {
-        const minici_test = b.addTest(.{
+    test_suites.register(.{
+        .step_suffix = "minici",
+        .description = "Run MiniCI output-filter Zig tests",
+        .compile = b.addTest(.{
             .name = "minici_test",
             .root_module = b.createModule(.{
                 .root_source_file = b.path("src/build/minici.zig"),
@@ -5143,21 +5098,8 @@ pub fn build(b: *std.Build) void {
                 .optimize = .Debug,
             }),
             .filters = test_filters,
-        });
-        build_test_zig_step.dependOn(&minici_test.step);
-        if (enumerate_tests_for_wiring_check) run_test_wiring.addArtifactArg(minici_test);
-
-        const run_minici_test_for_summary = addTestRunArtifact(b, minici_test, run_args);
-        tests_summary.addRun(&run_minici_test_for_summary.step);
-
-        const run_minici_test = addTestRunArtifact(b, minici_test, run_args);
-
-        const run_minici_test_step = b.step(
-            "run-test-zig-minici",
-            "Run MiniCI output-filter Zig tests",
-        );
-        run_minici_test_step.dependOn(&run_minici_test.step);
-    }
+        }),
+    });
 
     // Add check for forbidden patterns in type checker code
     const check_patterns = CheckTypeCheckerPatternsStep.create(b);
@@ -5539,27 +5481,18 @@ pub fn build(b: *std.Build) void {
             .filters = test_filters,
         });
 
-        build_test_zig_step.dependOn(&fx_platform_test.step);
-        if (enumerate_tests_for_wiring_check) run_test_wiring.addArtifactArg(fx_platform_test);
-
-        const run_fx_platform_test_for_summary = addTestRunArtifact(b, fx_platform_test, run_args);
-        run_fx_platform_test_for_summary.step.dependOn(final_fx_host_step);
-        run_fx_platform_test_for_summary.step.dependOn(final_static_data_platform_step);
-        run_fx_platform_test_for_summary.step.dependOn(build_roc_step);
-        tests_summary.addRun(&run_fx_platform_test_for_summary.step);
-
-        const run_fx_platform_test = addTestRunArtifact(b, fx_platform_test, run_args);
-        // Ensure host library is copied AND fixed before running the test
-        run_fx_platform_test.step.dependOn(final_fx_host_step);
-        run_fx_platform_test.step.dependOn(final_static_data_platform_step);
-        // Ensure roc binary is built before running the test (tests invoke roc CLI)
-        run_fx_platform_test.step.dependOn(build_roc_step);
-
-        const run_fx_platform_zig_test_step = b.step(
-            "run-test-zig-fx-platform",
-            "Run fx platform Zig tests",
-        );
-        run_fx_platform_zig_test_step.dependOn(&run_fx_platform_test.step);
+        test_suites.register(.{
+            .step_suffix = "fx-platform",
+            .description = "Run fx platform Zig tests",
+            .compile = fx_platform_test,
+            .deps = &.{
+                // The host library must be copied AND fixed before the test runs.
+                final_fx_host_step,
+                final_static_data_platform_step,
+                // The tests shell out to the roc CLI.
+                build_roc_step,
+            },
+        });
 
         const http_host_target, const http_host_target_dir: ?[]const u8 = switch (target.result.os.tag) {
             .linux => switch (target.result.cpu.arch) {
