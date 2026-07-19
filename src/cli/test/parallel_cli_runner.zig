@@ -2328,9 +2328,13 @@ fn customCliCacheRootsDistinct(io: std.Io, allocator: Allocator, timer: *harness
     const first = util.createIsolatedTestCacheDirs(io, allocator) catch |err|
         return customInfraFailure(allocator, timer, "failed to create first cache dirs: {}", .{err});
     defer first.deinit(allocator);
+    // Registered after the deinit defers so they run first, and after the
+    // openability assertions below, which need the directories to still exist.
+    defer util.cleanupTestCacheDirs(io, first);
     const second = util.createIsolatedTestCacheDirs(io, allocator) catch |err|
         return customInfraFailure(allocator, timer, "failed to create second cache dirs: {}", .{err});
     defer second.deinit(allocator);
+    defer util.cleanupTestCacheDirs(io, second);
 
     if (std.mem.eql(u8, first.roc_cache_dir, second.roc_cache_dir)) {
         return customFailure(allocator, timer, "ROC_CACHE_DIR paths were not distinct", .{});

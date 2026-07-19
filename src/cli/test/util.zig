@@ -14,6 +14,10 @@ pub const default_child_timeout_ms: u64 = 5 * std.time.ms_per_min;
 
 /// Absolute cache directory paths reserved for a single CLI test subprocess.
 pub const IsolatedCacheDirs = struct {
+    /// The reserved tree that contains the three directories below. Kept so the
+    /// whole thing can be deleted again; without it there was nothing to pass to
+    /// deleteTree and these trees accumulated, one per subprocess, forever.
+    root: []u8,
     roc_cache_dir: []u8,
     zig_local_cache_dir: []u8,
     /// Per-subprocess temp dir; see TestProcessDirs.temp_dir for why this must
@@ -24,6 +28,7 @@ pub const IsolatedCacheDirs = struct {
         allocator.free(self.temp_dir);
         allocator.free(self.zig_local_cache_dir);
         allocator.free(self.roc_cache_dir);
+        allocator.free(self.root);
     }
 };
 
@@ -311,10 +316,32 @@ pub fn createIsolatedTestCacheDirs(io: std.Io, allocator: std.mem.Allocator) Tes
     try std.Io.Dir.cwd().createDirPath(io, temp_rel);
 
     return .{
+        .root = try std.fs.path.join(allocator, &.{ cwd_path, cache_root_rel }),
         .roc_cache_dir = try std.fs.path.join(allocator, &.{ cwd_path, roc_cache_rel }),
         .zig_local_cache_dir = try std.fs.path.join(allocator, &.{ cwd_path, zig_local_cache_rel }),
         .temp_dir = try std.fs.path.join(allocator, &.{ cwd_path, temp_rel }),
     };
+}
+
+/// Remove the per-subprocess cache tree reserved by createIsolatedTestCacheDirs.
+///
+/// Unlike the work dir, this is cleaned *unconditionally* rather than only on
+/// pass. Three reasons:
+///
+///   - It holds a private roc module cache and Zig local cache. Nothing in it
+///     is read by a human triaging a failure; the artifacts that are (compiled
+///     app, copied sources, watch inputs) live in the work dir, whose
+///     preserve-on-failure policy is deliberately left alone.
+///   - The scope that owns one of these trees is a single subprocess, which
+///     cannot see the test's verdict.
+///   - Keying it on the child's exit code would be actively wrong: many CLI
+///     cases assert a *non-zero* exit, so that rule would preserve a tree for
+///     most passing tests and delete it for failing ones.
+///
+/// Deletes the root rather than the three children, so the leaf directory goes
+/// too and the reservation counter stays honest.
+pub fn cleanupTestCacheDirs(io: std.Io, dirs: IsolatedCacheDirs) void {
+    std.Io.Dir.cwd().deleteTree(io, dirs.root) catch {};
 }
 
 /// Create unique Roc cache, Zig local cache, and work directories for one CLI test job.
@@ -350,14 +377,38 @@ pub fn cleanupTestWorkDir(io: std.Io, work_dir: []const u8) void {
     std.Io.Dir.cwd().deleteTree(io, work_dir) catch {};
 }
 
+/// An environment map for a test Roc subprocess, together with any scratch
+/// directories that were reserved on its behalf.
+///
+/// The directories are bundled with the map rather than returned separately so
+/// that a caller cannot take the environment and forget the cleanup: a single
+/// `defer env.deinit(io, allocator)` releases both.
+pub const IsolatedTestEnv = struct {
+    env_map: std.process.Environ.Map,
+    /// Null when the caller had already supplied all three cache variables, in
+    /// which case nothing was reserved and there is nothing to remove.
+    owned_cache: ?IsolatedCacheDirs,
+
+    pub fn deinit(self: *IsolatedTestEnv, io: std.Io, allocator: std.mem.Allocator) void {
+        self.env_map.deinit();
+        if (self.owned_cache) |dirs| {
+            cleanupTestCacheDirs(io, dirs);
+            dirs.deinit(allocator);
+        }
+    }
+};
+
 /// Build an environment map for a test Roc subprocess.
 /// Unless the caller already set them, this gives the subprocess unique Roc,
 /// URL package, and Zig local cache roots.
+///
+/// Returns the reserved directories alongside the map so the caller can delete
+/// them when the subprocess is done; see `IsolatedTestEnv`.
 pub fn buildIsolatedTestEnvMap(
     io: std.Io,
     allocator: std.mem.Allocator,
     extra_env: ?*const std.process.Environ.Map,
-) EnvMapError!std.process.Environ.Map {
+) EnvMapError!IsolatedTestEnv {
     // In Zig 0.16, Environ.Block is GlobalBlock on Windows (read from PEB on use) and
     // PosixBlock on POSIX (must point at std.c.environ).
     const environ: std.process.Environ = if (builtin.os.tag == .windows) .{
@@ -381,7 +432,10 @@ pub fn buildIsolatedTestEnvMap(
         env_map.get("ZIG_LOCAL_CACHE_DIR") == null)
     {
         const cache_dirs = try createIsolatedTestCacheDirs(io, allocator);
-        defer cache_dirs.deinit(allocator);
+        errdefer {
+            cleanupTestCacheDirs(io, cache_dirs);
+            cache_dirs.deinit(allocator);
+        }
 
         if (env_map.get("ROC_CACHE_DIR") == null) {
             try env_map.put("ROC_CACHE_DIR", cache_dirs.roc_cache_dir);
@@ -398,9 +452,11 @@ pub fn buildIsolatedTestEnvMap(
         // Isolate the temp dir too, so roc's background temp-cleanup thread
         // can't race other concurrent roc processes' temp files.
         try putIsolatedTempEnv(&env_map, cache_dirs.temp_dir);
+
+        return .{ .env_map = env_map, .owned_cache = cache_dirs };
     }
 
-    return env_map;
+    return .{ .env_map = env_map, .owned_cache = null };
 }
 
 fn runChild(
@@ -410,12 +466,12 @@ fn runChild(
     cwd_path: []const u8,
     extra_env: ?*const std.process.Environ.Map,
 ) RocRunError!RocResult {
-    var env_map = try buildIsolatedTestEnvMap(io, allocator, extra_env);
-    defer env_map.deinit();
+    var env = try buildIsolatedTestEnvMap(io, allocator, extra_env);
+    defer env.deinit(io, allocator);
 
     const result = try runChildWithTimeout(io, allocator, argv, .{
         .cwd = cwd_path,
-        .env_map = &env_map,
+        .env_map = &env.env_map,
         .max_output_bytes = 10 * 1024 * 1024, // 10MB
     });
 
@@ -604,11 +660,11 @@ pub fn runRocWithStdin(io: std.Io, allocator: std.mem.Allocator, args: []const [
     });
     defer allocator.free(argv);
 
-    var env_map = try buildIsolatedTestEnvMap(io, allocator, null);
-    defer env_map.deinit();
+    var env = try buildIsolatedTestEnvMap(io, allocator, null);
+    defer env.deinit(io, allocator);
     const result = try runChildWithTimeout(io, allocator, argv, .{
         .cwd = cwd_path,
-        .env_map = &env_map,
+        .env_map = &env.env_map,
         .max_output_bytes = 10 * 1024 * 1024,
         .stdin = stdin_input,
     });
