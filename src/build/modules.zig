@@ -322,6 +322,7 @@ pub const ModuleType = enum {
     docs,
     bump,
     glue,
+    host_alloc,
 
     /// Returns the dependencies for this module type
     pub fn getDependencies(self: ModuleType) []const ModuleType {
@@ -362,6 +363,7 @@ pub const ModuleType = enum {
             .docs => &.{ .tracy, .builtins, .collections, .base, .parse, .types, .can, .check, .reporting },
             .bump => &.{ .tracy, .builtins, .collections, .base, .parse, .types, .can, .check, .reporting },
             .glue => &.{ .base, .parse, .compile, .can, .check, .reporting, .echo_platform, .builtins, .roc_target, .types, .layout, .backend, .eval, .lir },
+            .host_alloc => &.{ .builtins, .build_options },
         };
     }
 };
@@ -412,6 +414,18 @@ pub const RocModules = struct {
     // module instead of restating it. It is wired into the `builtins` module too
     // so a `builtins` test can assert the view matches the canonical `RocStr`.
     roc_str_view: *Module,
+
+    // Boundary symbol names (`src/builtins/shim_symbols.zig`) as a standalone
+    // module for consumers compiled without the `builtins` module (the
+    // default-platform runtimes); everything else reaches the same file through
+    // `builtins.shim_symbols`.
+    shim_symbols: *Module,
+
+    // The size-tracking host allocator (`src/host_alloc/mod.zig`) shared by
+    // the test platform hosts. Part of the module dependency graph so its
+    // tests run with the other module tests, but consumed only by hosts, never
+    // by the compiler.
+    host_alloc: *Module,
 
     // Vendored-from-Zig modules. Kept out of the `ModuleType` dependency graph
     // (like `embedded_lld`) and wired into their specific consumers via
@@ -470,6 +484,8 @@ pub const RocModules = struct {
             .glue = b.addModule("glue", .{ .root_source_file = b.path("src/glue/mod.zig") }),
             .embedded_lld = b.addModule("embedded_lld", .{ .root_source_file = b.path("src/build/embedded_lld.zig") }),
             .roc_str_view = b.addModule("roc_str_view", .{ .root_source_file = b.path("src/default_platform/roc_str_view.zig") }),
+            .shim_symbols = b.addModule("shim_symbols", .{ .root_source_file = b.path("src/builtins/shim_symbols.zig") }),
+            .host_alloc = b.addModule("host_alloc", .{ .root_source_file = b.path("src/host_alloc/mod.zig") }),
 
             .vendor_parse_float = b.addModule("vendor_parse_float", .{ .root_source_file = b.path("vendor/parse_float/parse_float.zig") }),
             .vendor_ryu = b.addModule("vendor_ryu", .{ .root_source_file = b.path("vendor/ryu.zig") }),
@@ -549,6 +565,7 @@ pub const RocModules = struct {
             .docs,
             .bump,
             .glue,
+            .host_alloc,
         };
 
         // Setup dependencies for each module
@@ -675,6 +692,7 @@ pub const RocModules = struct {
             .docs => self.docs,
             .bump => self.bump,
             .glue => self.glue,
+            .host_alloc => self.host_alloc,
         };
     }
 
@@ -728,6 +746,7 @@ pub const RocModules = struct {
             .echo_platform,
             .docs,
             .bump,
+            .host_alloc,
         };
 
         const tests = b.allocator.alloc(ModuleTest, test_configs.len) catch

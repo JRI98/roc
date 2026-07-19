@@ -5,6 +5,7 @@
 //! for surgical linking.
 
 const std = @import("std");
+const shim_symbols = @import("builtins").shim_symbols;
 const Allocator = std.mem.Allocator;
 const roc_base = @import("base");
 const WasmLinking = @import("WasmLinking.zig");
@@ -2357,15 +2358,7 @@ pub fn materializeFuncBodies(self: *Self) Allocator.Error!void {
 /// `roc_panic` is also tolerated because current host platforms still import it
 /// behind the `roc_crashed` wrapper, and verification runs before DCE.
 pub fn verifyNoBuiltinImports(self: *const Self) error{UnresolvedBuiltinImport}!void {
-    const allowed = [_][]const u8{
-        "roc_alloc",
-        "roc_dealloc",
-        "roc_realloc",
-        "roc_dbg",
-        "roc_expect_failed",
-        "roc_crashed",
-        "roc_panic",
-    };
+    const allowed = shim_symbols.runtime_set ++ [_][:0]const u8{"roc_panic"};
     for (self.imports.items) |imp| {
         var is_allowed = false;
         for (allowed) |name| {

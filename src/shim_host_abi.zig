@@ -13,11 +13,14 @@ const RocList = builtins.list.RocList;
 const RocStr = builtins.str.RocStr;
 
 const extern_host = builtins.host_abi.extern_host;
+const shim_symbols = builtins.shim_symbols;
 
 /// Hosted dispatch table defined by the generated platform shim module, in
 /// hosted-section order.
-extern const roc_shim_hosted_fns: [*]const builtins.host_abi.HostedFn;
-extern const roc_shim_hosted_count: usize;
+const roc_shim_hosted_fns: *const [*]const builtins.host_abi.HostedFn =
+    @extern(*const [*]const builtins.host_abi.HostedFn, .{ .name = shim_symbols.roc_shim_hosted_fns });
+const roc_shim_hosted_count: *const usize =
+    @extern(*const usize, .{ .name = shim_symbols.roc_shim_hosted_count });
 
 fn shimAlloc(_: *RocOps, length: usize, alignment: usize) callconv(.c) ?*anyopaque {
     return extern_host.roc_alloc(length, alignment);
@@ -58,8 +61,8 @@ pub fn getOps() *RocOps {
             .roc_expect_failed = shimExpectFailed,
             .roc_crashed = shimCrashed,
             .hosted_fns = .{
-                .count = @intCast(roc_shim_hosted_count),
-                .fns = @constCast(roc_shim_hosted_fns),
+                .count = @intCast(roc_shim_hosted_count.*),
+                .fns = @constCast(roc_shim_hosted_fns.*),
             },
         };
         shim_ops_initialized = true;

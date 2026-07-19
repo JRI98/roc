@@ -1920,6 +1920,7 @@ fn createTestPlatformHostLib(
     }
     lib.root_module.addImport("builtins", roc_modules.builtins);
     lib.root_module.addImport("build_options", roc_modules.build_options);
+    lib.root_module.addImport("host_alloc", roc_modules.host_alloc);
     lib.root_module.addImport("vendor_parse_float", roc_modules.vendor_parse_float);
     lib.root_module.addImport("vendor_ryu", roc_modules.vendor_ryu);
     lib.root_module.addImport("shim_io", b.addModule("shim_io", .{
@@ -2051,6 +2052,7 @@ fn buildAndCopyWasmHostObject(
     configureBackend(obj, target);
     obj.root_module.addImport("builtins", roc_modules.builtins);
     obj.root_module.addImport("build_options", roc_modules.build_options);
+    obj.root_module.addImport("host_alloc", roc_modules.host_alloc);
     // Per-function/data sections so wasm final-link DCE can strip unused host code.
     obj.link_function_sections = true;
     obj.link_data_sections = true;
@@ -2448,6 +2450,7 @@ pub fn build(b: *std.Build) void {
     const run_check_cli_global_stdio_step = b.step("run-check-cli-global-stdio", "Check forbidden global stdio usage in CLI code");
     const run_check_test_wiring_step = b.step("run-check-test-wiring", "Check test files are wired");
     const run_check_builtin_format_step = b.step("run-check-builtin-format", "Check Builtin.roc formatting");
+    const run_check_glue_abi_step = b.step("run-check-glue-abi", "Check generated Zig glue against the canonical host ABI");
     const build_snapshot_tool_step = b.step("build-snapshot-tool", "Build the snapshot tool");
     const run_check_snapshots_step = b.step("run-check-snapshots", "Regenerate snapshots and fail if tracked snapshots changed");
     const build_test_zig_step = b.step("build-test-zig", "Build Zig unit-test binaries");
@@ -2947,6 +2950,42 @@ pub fn build(b: *std.Build) void {
     run_builtin_format.addArgs(&.{ "fmt", "--check", "src/build/roc/Builtin.roc" });
     run_builtin_format.step.dependOn(build_roc_step);
     run_check_builtin_format_step.dependOn(&run_builtin_format.step);
+
+    // Glue ABI lock: generate Zig glue with the freshly built compiler, then
+    // compile test/glue/zig_abi_lock.zig against the generated file and the
+    // canonical builtins definitions on both pointer widths. This is the
+    // enforcement for the ABI text the glue templates restate: template drift
+    // from host_abi/RocStr/RocList/erased-callable is a compile error here.
+    {
+        const run_glue_abi = b.addRunArtifact(roc_exe);
+        run_glue_abi.addArgs(&.{ "glue", "--no-cache" });
+        run_glue_abi.addFileArg(b.path("src/glue/src/ZigGlue.roc"));
+        const glue_abi_dir = run_glue_abi.addOutputDirectoryArg("glue-zig-abi");
+        run_glue_abi.addFileArg(b.path("test/fx/platform/main.roc"));
+        // The spec and platform import sibling .roc files the run step cannot
+        // track as inputs, so always regenerate.
+        run_glue_abi.has_side_effects = true;
+
+        const lock_targets = [_]std.Build.ResolvedTarget{
+            target,
+            b.resolveTargetQuery(.{ .cpu_arch = .wasm32, .os_tag = .freestanding, .abi = .none }),
+        };
+        for (lock_targets) |lock_target| {
+            const lock_obj = b.addObject(.{
+                .name = b.fmt("glue_zig_abi_lock_{s}", .{@tagName(lock_target.result.cpu.arch)}),
+                .root_module = b.createModule(.{
+                    .root_source_file = b.path("test/glue/zig_abi_lock.zig"),
+                    .target = lock_target,
+                    .optimize = optimize,
+                }),
+            });
+            lock_obj.root_module.addImport("builtins", roc_modules.builtins);
+            lock_obj.root_module.addAnonymousImport("glue_abi", .{
+                .root_source_file = glue_abi_dir.path(b, "roc_platform_abi.zig"),
+            });
+            run_check_glue_abi_step.dependOn(&lock_obj.step);
+        }
+    }
 
     var release_exe_for_llvm_embedded: ?*Step.Compile = null;
 
@@ -6331,6 +6370,7 @@ fn addMainExe(
                 }),
             });
             default_platform_runtime_obj.root_module.addImport("roc_str_view", roc_modules.roc_str_view);
+            default_platform_runtime_obj.root_module.addImport("shim_symbols", roc_modules.shim_symbols);
             default_platform_runtime_obj.root_module.stack_check = false;
             default_platform_runtime_obj.root_module.link_libc = false;
             default_platform_runtime_obj.bundle_compiler_rt = false;

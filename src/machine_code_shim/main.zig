@@ -26,6 +26,7 @@ pub const std_options = shim_io.std_options_no_stack_tracing;
 
 const Allocator = std.mem.Allocator;
 const RocOps = builtins.host_abi.RocOps;
+const shim_symbols = builtins.shim_symbols;
 const SharedMemoryAllocator = ipc.SharedMemoryAllocator;
 const hot_reload = ipc.hot_reload;
 const RunImage = backend.RunImage;
@@ -747,11 +748,17 @@ pub fn roc_hot_reload_retain_current(return_address: usize) ?*anyopaque {
     return roc_hot_reload_enter(return_address);
 }
 
-export fn roc_shim_get_ops() callconv(.c) *anyopaque {
+comptime {
+    @export(&shimGetOps, .{ .name = shim_symbols.roc_shim_get_ops });
+    @export(&shimEntrypoint, .{ .name = shim_symbols.roc_entrypoint });
+    @export(&shimDefaultMain, .{ .name = shim_symbols.roc_shim_default_main });
+}
+
+fn shimGetOps() callconv(.c) *anyopaque {
     return shim_host_abi.getOpsOpaque();
 }
 
-export fn roc_entrypoint(
+fn shimEntrypoint(
     entry_idx: u32,
     ops: *RocOps,
     ret_ptr: ?*anyopaque,
@@ -765,7 +772,7 @@ export fn roc_entrypoint(
     };
 }
 
-export fn roc_shim_default_main(argc: usize, argv: [*][*:0]const u8) callconv(.c) usize {
+fn shimDefaultMain(argc: usize, argv: [*][*:0]const u8) callconv(.c) usize {
     const ops = shim_host_abi.getOps();
     const app_args = if (argc > 1) argv[1..argc] else argv[0..0];
     var cli_args_list = shim_host_abi.buildDefaultRunCliArgs(app_args, allocator()) catch {

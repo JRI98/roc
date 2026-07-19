@@ -29,7 +29,7 @@ pub const run_shim_platform_main_source =
     \\    exposes [Echo]
     \\    packages {}
     \\    provides { "roc_main": main_for_host! }
-    \\    hosted { "roc_default_echo_line": Echo.line! }
+++ "\n    hosted { \"" ++ builtins.shim_symbols.roc_default_echo_line ++ "\": Echo.line! }\n" ++
     \\
     \\import Echo
     \\
@@ -54,7 +54,7 @@ pub const build_platform_main_source =
     \\    exposes [Echo]
     \\    packages {}
     \\    provides { "_start": main_for_host! }
-    \\    hosted { "roc_default_echo_line": Echo.line! }
+++ "\n    hosted { \"" ++ builtins.shim_symbols.roc_default_echo_line ++ "\": Echo.line! }\n" ++
     \\    targets: {
     \\        inputs_dir: "targets/",
     \\        x64musl: { inputs: [app] },
@@ -83,8 +83,8 @@ pub const build_c_platform_main_source =
     \\    requires {} { main! : List(Str) => Try(_, [Exit(I8), ..]) }
     \\    exposes [Echo]
     \\    packages {}
-    \\    provides { "roc_default_start_main": main_for_host! }
-    \\    hosted { "roc_default_echo_line": Echo.line! }
+++ "\n    provides { \"" ++ builtins.shim_symbols.roc_default_start_main ++ "\": main_for_host! }" ++
+    "\n    hosted { \"" ++ builtins.shim_symbols.roc_default_echo_line ++ "\": Echo.line! }\n" ++
     \\    targets: {
     \\        inputs_dir: "targets/",
     \\        x64mac: { inputs: [app] },
@@ -114,7 +114,7 @@ pub const build_wasm_archive_platform_main_source =
     \\    exposes [Echo]
     \\    packages {}
     \\    provides { "main": main_for_host! }
-    \\    hosted { "roc_default_echo_line": Echo.line! }
+++ "\n    hosted { \"" ++ builtins.shim_symbols.roc_default_echo_line ++ "\": Echo.line! }\n" ++
     \\    targets: {
     \\        inputs_dir: "targets/",
     \\        wasm32: { inputs: [app], output: Archive },

@@ -17248,7 +17248,7 @@ pub fn LirCodeGen(comptime target: RocTarget) type {
 
             {
                 var builder = try Builder.init(&self.codegen.emit, &self.codegen.stack_offset);
-                try builder.callRelocatable("roc_default_runtime_init", self.allocator, &self.codegen.relocations);
+                try builder.callRelocatable(builtins.shim_symbols.roc_default_runtime_init, self.allocator, &self.codegen.relocations);
             }
 
             const arg_infos_start = self.scratch_arg_infos.top();
@@ -17269,7 +17269,7 @@ pub fn LirCodeGen(comptime target: RocTarget) type {
             {
                 var builder = try Builder.init(&self.codegen.emit, &self.codegen.stack_offset);
                 try builder.addRegArg(exit_code_reg);
-                try builder.callRelocatable("roc_default_exit", self.allocator, &self.codegen.relocations);
+                try builder.callRelocatable(builtins.shim_symbols.roc_default_exit, self.allocator, &self.codegen.relocations);
             }
             try self.emitTrap();
         }

@@ -226,7 +226,7 @@ pub fn openWithHeader(gpa: std.mem.Allocator, name: []const u8, page_size: usize
     const header = @as(*const Header, @ptrCast(@alignCast(header_ptr))).*;
     platform.unmapMemory(header_ptr, @sizeOf(Header));
 
-    if (header.magic != 0x524F4353) {
+    if (header.magic != HEADER_MAGIC) {
         return error.InvalidSharedMemory;
     }
 

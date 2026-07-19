@@ -334,7 +334,7 @@ fn rocGlueInner(gpa: Allocator, stderr: *std.Io.Writer, stdout: *std.Io.Writer, 
     };
     defer lowered.deinit();
 
-    const glue_proc = selectGlueSpecRootProc(root_artifact, &lowered, "roc_make_glue") orelse {
+    const glue_proc = selectGlueSpecRootProc(root_artifact, &lowered, builtins.shim_symbols.roc_make_glue) orelse {
         if (builtin.mode == .Debug) {
             std.debug.panic("glue invariant violated: glue spec produced no published make_glue platform root", .{});
         }
@@ -476,7 +476,7 @@ fn runGlueSpecDev(
 
         const proc = lowered.lir_result.store.getProcSpec(glue_proc);
         const entrypoint = codegen.generateEntrypointWrapper(
-            "roc_make_glue",
+            builtins.shim_symbols.roc_make_glue,
             glue_proc,
             arg_layouts,
             proc.ret_layout,

@@ -39,6 +39,7 @@ var debug_threaded_io_instance: std.Io.Threaded = .init_single_threaded;
 pub const std_options_debug_threaded_io: *std.Io.Threaded = &debug_threaded_io_instance;
 
 const build_options = @import("build_options");
+const shim_symbols = @import("builtins").shim_symbols;
 const base = @import("base");
 const reporting = @import("reporting");
 const parse = @import("parse");
@@ -7603,8 +7604,8 @@ fn staticDataLinkRootSymbols(
         try symbols.append(data_export.symbol_name);
     }
     if (root_default_platform_backtrace) {
-        try symbols.append("roc_default_backtrace_table");
-        try symbols.append("roc_default_backtrace_count");
+        try symbols.append(shim_symbols.roc_default_backtrace_table);
+        try symbols.append(shim_symbols.roc_default_backtrace_count);
     }
     return symbols.items;
 }

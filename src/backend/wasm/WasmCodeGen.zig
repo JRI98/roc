@@ -1633,22 +1633,22 @@ fn registerHostImports(self: *Self) Allocator.Error!void {
     try self.registerIndirectCallTypes();
 
     // Enable table and add each RocOps function as a table element
-    const roc_alloc_idx = try self.module.addImport("env", "roc_alloc", self.roc_alloc_type_idx);
+    const roc_alloc_idx = try self.module.addImport("env", builtins.shim_symbols.roc_alloc, self.roc_alloc_type_idx);
     self.roc_alloc_table_idx = try self.module.addTableElement(roc_alloc_idx);
 
-    const roc_dealloc_idx = try self.module.addImport("env", "roc_dealloc", self.roc_dealloc_type_idx);
+    const roc_dealloc_idx = try self.module.addImport("env", builtins.shim_symbols.roc_dealloc, self.roc_dealloc_type_idx);
     self.roc_dealloc_table_idx = try self.module.addTableElement(roc_dealloc_idx);
 
-    const roc_realloc_idx = try self.module.addImport("env", "roc_realloc", self.roc_realloc_type_idx);
+    const roc_realloc_idx = try self.module.addImport("env", builtins.shim_symbols.roc_realloc, self.roc_realloc_type_idx);
     self.roc_realloc_table_idx = try self.module.addTableElement(roc_realloc_idx);
 
-    const roc_dbg_idx = try self.module.addImport("env", "roc_dbg", self.roc_diag_type_idx);
+    const roc_dbg_idx = try self.module.addImport("env", builtins.shim_symbols.roc_dbg, self.roc_diag_type_idx);
     self.roc_dbg_table_idx = try self.module.addTableElement(roc_dbg_idx);
 
-    const roc_expect_failed_idx = try self.module.addImport("env", "roc_expect_failed", self.roc_diag_type_idx);
+    const roc_expect_failed_idx = try self.module.addImport("env", builtins.shim_symbols.roc_expect_failed, self.roc_diag_type_idx);
     self.roc_expect_failed_table_idx = try self.module.addTableElement(roc_expect_failed_idx);
 
-    const roc_crashed_idx = try self.module.addImport("env", "roc_crashed", self.roc_diag_type_idx);
+    const roc_crashed_idx = try self.module.addImport("env", builtins.shim_symbols.roc_crashed, self.roc_diag_type_idx);
     self.roc_crashed_table_idx = try self.module.addTableElement(roc_crashed_idx);
 
     // i128/u128 division and modulo host functions
@@ -7961,11 +7961,11 @@ fn resolveSymbolTarget(self: *Self, symbol_text: []const u8, params: []const Val
 pub fn registerHostedSymbolTargets(self: *Self, proc_specs: []const LIR.LirProcSpec) Allocator.Error!void {
     if (self.symbol_abi and self.runtime_symbol_targets == null) {
         self.runtime_symbol_targets = .{
-            .alloc = try self.resolveSymbolTarget("roc_alloc", &.{ .i32, .i32 }, &.{.i32}),
-            .dealloc = try self.resolveSymbolTarget("roc_dealloc", &.{ .i32, .i32 }, &.{}),
-            .dbg = try self.resolveSymbolTarget("roc_dbg", &.{ .i32, .i32 }, &.{}),
-            .expect_failed = try self.resolveSymbolTarget("roc_expect_failed", &.{ .i32, .i32 }, &.{}),
-            .crashed = try self.resolveSymbolTarget("roc_crashed", &.{ .i32, .i32 }, &.{}),
+            .alloc = try self.resolveSymbolTarget(builtins.shim_symbols.roc_alloc, &.{ .i32, .i32 }, &.{.i32}),
+            .dealloc = try self.resolveSymbolTarget(builtins.shim_symbols.roc_dealloc, &.{ .i32, .i32 }, &.{}),
+            .dbg = try self.resolveSymbolTarget(builtins.shim_symbols.roc_dbg, &.{ .i32, .i32 }, &.{}),
+            .expect_failed = try self.resolveSymbolTarget(builtins.shim_symbols.roc_expect_failed, &.{ .i32, .i32 }, &.{}),
+            .crashed = try self.resolveSymbolTarget(builtins.shim_symbols.roc_crashed, &.{ .i32, .i32 }, &.{}),
         };
     }
     for (proc_specs) |spec| {

@@ -117,6 +117,21 @@ cp /tmp/cglue-out/roc_platform_abi.h test/glue/fx_platform_cglue_expected.h
 
 Treat an unexpected diff as an emitter bug, not a regen trigger.
 
+## Host ABI Lock
+
+The templates restate the host ABI — the `RocStr`/`RocList`/`RocDec`
+layouts, the `RocHost` callback vtable, the extern runtime symbols, and the
+erased-callable payload — as text in their output languages, so the compiler
+cannot import those restatements. `zig build run-check-glue-abi` is the
+enforcement: it generates Zig glue for `test/fx/platform/main.roc` and
+compiles `test/glue/zig_abi_lock.zig` against both the generated file and the
+canonical `builtins` definitions, on native and wasm32 pointer widths.
+Template drift from `src/builtins/host_abi.zig`, `str.RocStr`,
+`list.RocList`, `dec.RocDec`, or `erased_callable` fails that step at compile
+time. The generated C and Rust files carry matching `offsetof`/`offset_of!`
+static assertions, which the C/Rust compile controls in the runtime matrix
+verify per target.
+
 ## ABI Risk Register and Roc Glue Runtime Controls
 
 Every risk in this section must be covered by at least one Roc glue test
