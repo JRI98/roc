@@ -22,7 +22,7 @@ The name an assignment gives must be a valid Roc _identifier_, which means:
   - The `_` prefix is only for naming things that don't actually get used, and must be followed by an ASCII lowercase letter.
     - The compiler will give a warning if an identifier begins with `_` and is referenced again in the same scope.
     - Note that [the `_` pattern](pattern-matching#underscore) is not an identifier and doesn't actually name anything.
-- It can optionally end with `!` if it's naming an [effectful function](functions#effectful).
+- It can optionally end with `!` if it's naming an [effectful function](functions#effectful-functions).
 
 ### [Pattern matching in assignments](#assignment-patterns) {#assignment-patterns}
 

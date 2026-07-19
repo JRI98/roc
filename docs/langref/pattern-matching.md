@@ -12,7 +12,7 @@ TODO
 
 ## Exhaustiveness
 
-### Catch-all Patterns (`_`) {underscore}
+### Catch-all Patterns (`_`) {#underscore}
 
 TODO
 
