@@ -38,7 +38,7 @@ const Outputs = struct {
     }
 };
 
-fn renderAllTargets(gpa: Allocator, document: *const Document) !Outputs {
+fn renderAllTargets(gpa: Allocator, document: *const Document) (Allocator.Error || error{WriteFailed})!Outputs {
     var terminal_ansi = std.Io.Writer.Allocating.init(gpa);
     errdefer terminal_ansi.deinit();
     try reporting.renderDocumentToTerminal(document, &terminal_ansi.writer, ColorPalette.ANSI, ReportingConfig.initColorTerminal());
@@ -79,7 +79,7 @@ fn countOccurrences(haystack: []const u8, needle: []const u8) usize {
 }
 
 /// Copy `bytes` with every ANSI `ESC [ ... m` sequence removed.
-fn stripAnsi(gpa: Allocator, bytes: []const u8) ![]u8 {
+fn stripAnsi(gpa: Allocator, bytes: []const u8) Allocator.Error![]u8 {
     var out = std.array_list.Managed(u8).init(gpa);
     errdefer out.deinit();
     var i: usize = 0;
@@ -97,7 +97,7 @@ fn stripAnsi(gpa: Allocator, bytes: []const u8) ![]u8 {
 }
 
 /// Copy `bytes` with every occurrence of `char` removed.
-fn stripChar(gpa: Allocator, bytes: []const u8, char: u8) ![]u8 {
+fn stripChar(gpa: Allocator, bytes: []const u8, char: u8) Allocator.Error![]u8 {
     var out = std.array_list.Managed(u8).init(gpa);
     errdefer out.deinit();
     for (bytes) |b| {
@@ -202,7 +202,7 @@ fn payloadFor(comptime tag: std.meta.Tag(DocumentElement)) ?[]const u8 {
 /// Add an element exercising `tag` to `doc`. Exhaustive over the element
 /// tags: adding a `DocumentElement` variant fails to compile here until the
 /// parity corpus covers it.
-fn addElementVariant(comptime tag: std.meta.Tag(DocumentElement), doc: *Document) !void {
+fn addElementVariant(comptime tag: std.meta.Tag(DocumentElement), doc: *Document) Allocator.Error!void {
     switch (tag) {
         .text => try doc.addText("text payload"),
         .annotated => try doc.addAnnotated("annotated payload", .keyword),
@@ -281,7 +281,7 @@ test "every document element variant renders on every target" {
 /// `^`) from a rendered output. For the terminal target the line-number gutter
 /// (everything through `│ `) is stripped first, so rows are comparable with
 /// markdown's gutterless rows. Returned slices point into `out`.
-fn collectCaretRows(gpa: Allocator, out: []const u8, comptime strip_gutter: bool) !std.array_list.Managed([]const u8) {
+fn collectCaretRows(gpa: Allocator, out: []const u8, comptime strip_gutter: bool) Allocator.Error!std.array_list.Managed([]const u8) {
     var rows = std.array_list.Managed([]const u8).init(gpa);
     errdefer rows.deinit();
     var it = std.mem.splitScalar(u8, out, '\n');
@@ -388,7 +388,7 @@ test "source lines appear on every render target" {
 // or hook shows up as a diff here; update them deliberately when output is
 // meant to change.
 
-fn buildPinnedFixture(gpa: Allocator) !Document {
+fn buildPinnedFixture(gpa: Allocator) Allocator.Error!Document {
     var doc = Document.init(gpa);
     errdefer doc.deinit();
     try doc.addText("Expected ");
