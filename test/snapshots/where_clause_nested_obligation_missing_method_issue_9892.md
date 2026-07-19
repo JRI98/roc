@@ -50,7 +50,7 @@ EndOfFile,
 # PARSE
 ~~~clojure
 (file
-	(type-module)
+	(type-mod)
 	(statements
 		(s-type-decl
 			(header (name "Wrap")
@@ -69,7 +69,7 @@ EndOfFile,
 							(ty-var (raw "a")))
 						(ty (name "Str")))
 					(where
-						(method (module-of "a") (name "frobnicate")
+						(method (mod-of "a") (name "frobnicate")
 							(args
 								(ty-var (raw "a")))
 							(ty (name "Str")))))
@@ -88,7 +88,7 @@ EndOfFile,
 				(ty-var (raw "b"))
 				(ty (name "Str")))
 			(where
-				(method (module-of "b") (name "unwrap")
+				(method (mod-of "b") (name "unwrap")
 					(args
 						(ty-var (raw "b")))
 					(ty (name "Str")))))

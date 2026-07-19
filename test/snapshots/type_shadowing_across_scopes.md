@@ -11,8 +11,8 @@ processData : Str -> Str
 processData = |data|
     "processed"
 
-# In a nested module scope, redeclare Try
-InnerModule : {
+# In a nested mod scope, redeclare Try
+InnerMod : {
     Try : [Success, Failure]
 }
 ~~~
@@ -42,7 +42,7 @@ MALFORMED TYPE - type_shadowing_across_scopes.md:9:21:9:28
 
     I found `Try` here.
     Names that start with uppercase letters are used for tags, type names, and
-    module names in Roc.
+    mod names in Roc.
 
 
 ┌────────────────────────────────┐
@@ -60,7 +60,7 @@ MALFORMED TYPE - type_shadowing_across_scopes.md:9:21:9:28
 
     I found `Failure` here.
     Names that start with uppercase letters are used for tags, type names, and
-    module names in Roc.
+    mod names in Roc.
 
 
 ┌──────────────────────┐
@@ -149,7 +149,7 @@ EndOfFile,
 # PARSE
 ~~~clojure
 (file
-	(type-module)
+	(type-mod)
 	(statements
 		(s-type-decl
 			(header (name "Try")
@@ -176,7 +176,7 @@ EndOfFile,
 				(e-string
 					(e-string-part (raw "processed")))))
 		(s-type-decl
-			(header (name "InnerModule")
+			(header (name "InnerMod")
 				(args))
 			(ty-malformed (tag "expected_ty_close_curly_or_comma")))
 		(s-malformed (tag "statement_unexpected_token"))
@@ -190,8 +190,8 @@ processData : Str -> Str
 processData = |data|
 	"processed"
 
-# In a nested module scope, redeclare Try
-InnerModule : 
+# In a nested mod scope, redeclare Try
+InnerMod : 
 
 ~~~
 # CANONICALIZE
@@ -219,7 +219,7 @@ InnerModule :
 			(ty-tag-name (name "Err")
 				(ty-rigid-var-lookup (ty-rigid-var (name "b"))))))
 	(s-alias-decl
-		(ty-header (name "InnerModule"))
+		(ty-header (name "InnerMod"))
 		(ty-malformed)))
 ~~~
 # TYPES
@@ -233,8 +233,8 @@ InnerModule :
 				(ty-args
 					(ty-rigid-var (name "a"))
 					(ty-rigid-var (name "b")))))
-		(alias (type "InnerModule")
-			(ty-header (name "InnerModule"))))
+		(alias (type "InnerMod")
+			(ty-header (name "InnerMod"))))
 	(expressions
 		(expr (type "Str -> Str"))))
 ~~~

@@ -278,7 +278,7 @@ EndOfFile,
 # PARSE
 ~~~clojure
 (file
-	(type-module)
+	(type-mod)
 	(statements
 		(s-import (raw "Foo")
 			(exposing
@@ -687,7 +687,7 @@ comment_forces = [
 			(elems
 				(e-num (value "1"))
 				(e-num (value "2")))))
-	(s-import (module "Foo")
+	(s-import (mod "Foo")
 		(exposes
 			(exposed (name "one") (wildcard false))
 			(exposed (name "two") (wildcard false))))

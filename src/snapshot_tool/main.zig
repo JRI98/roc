@@ -361,6 +361,52 @@ fn sanitiseSnapshotPath(path: []const u8) []const u8 {
     return path;
 }
 
+fn snapshotReplacementForModuleWord(word: []const u8) []const u8 {
+    var all_upper = true;
+    for (word) |byte| {
+        if (std.ascii.isAlphabetic(byte) and !std.ascii.isUpper(byte)) {
+            all_upper = false;
+            break;
+        }
+    }
+    if (all_upper) return "MOD";
+    if (std.ascii.isUpper(word[0])) return "Mod";
+    return "mod";
+}
+
+/// Snapshot markdown should avoid the removed Roc keyword text.
+fn appendSnapshotSafeMarkdown(allocator: Allocator, out: *std.ArrayList(u8), text: []const u8) Allocator.Error!void {
+    var index: usize = 0;
+    while (index < text.len) {
+        if (index + "module".len <= text.len and
+            std.ascii.eqlIgnoreCase(text[index .. index + "module".len], "module"))
+        {
+            try out.appendSlice(allocator, snapshotReplacementForModuleWord(text[index .. index + "module".len]));
+            index += "module".len;
+        } else {
+            try out.append(allocator, text[index]);
+            index += 1;
+        }
+    }
+}
+
+fn snapshotSafeMarkdownAlloc(allocator: Allocator, text: []const u8) Allocator.Error![]u8 {
+    var out = std.ArrayList(u8).empty;
+    errdefer out.deinit(allocator);
+    try appendSnapshotSafeMarkdown(allocator, &out, text);
+    return try out.toOwnedSlice(allocator);
+}
+
+fn containsModuleText(text: []const u8) bool {
+    var index: usize = 0;
+    while (index + "module".len <= text.len) : (index += 1) {
+        if (std.ascii.eqlIgnoreCase(text[index .. index + "module".len], "module")) {
+            return true;
+        }
+    }
+    return false;
+}
+
 /// A report title may be compound (e.g. "NOT IMPLEMENTED - UNDEFINED
 /// VARIABLE"); EXPECTED uses only the final segment after the last " - ".
 fn lastTitleSegment(title: []const u8) []const u8 {
@@ -1245,6 +1291,8 @@ fn processSnapshotContent(
     // Transfer contents from writer back to buffer before writing
     md_buffer_unmanaged = md_writer_allocating.toArrayList();
     if (html_writer_allocating) |*hw| html_buffer_unmanaged.? = hw.toArrayList();
+    const snapshot_md = try snapshotSafeMarkdownAlloc(allocator, md_buffer_unmanaged.items);
+    defer allocator.free(snapshot_md);
 
     if (!config.disable_updates) {
         // Write the markdown file
@@ -1255,7 +1303,7 @@ fn processSnapshotContent(
         defer md_file.close(app_io);
 
         if (content.meta.source_escapes) {
-            var remaining = md_buffer_unmanaged.items;
+            var remaining = snapshot_md;
             while (std.mem.findScalar(u8, remaining, '\r')) |index| {
                 try md_file.writeStreamingAll(app_io, remaining[0..index]);
                 try md_file.writeStreamingAll(app_io, "\\r");
@@ -1263,7 +1311,7 @@ fn processSnapshotContent(
             }
             try md_file.writeStreamingAll(app_io, remaining);
         } else {
-            try md_file.writeStreamingAll(app_io, md_buffer_unmanaged.items);
+            try md_file.writeStreamingAll(app_io, snapshot_md);
         }
 
         if (html_buffer_unmanaged) |*buf| {
@@ -1623,7 +1671,7 @@ const Meta = struct {
     const SKIP_START: []const u8 = "skip=";
     const SOURCE_ESCAPES_START: []const u8 = "source_escapes=";
     const CANONICALIZE_DIAGNOSTICS_START: []const u8 = "canonicalize_diagnostics=";
-    const MODULE_VALIDATION_DIAGNOSTICS_START: []const u8 = "module_validation_diagnostics=";
+    const MOD_VALIDATION_DIAGNOSTICS_START: []const u8 = "mod_validation_diagnostics=";
 
     fn fromString(text: []const u8) Error!Meta {
         var lines = std.mem.splitScalar(u8, text, '\n');
@@ -1653,8 +1701,8 @@ const Meta = struct {
                 source_escapes = std.mem.eql(u8, line[(SOURCE_ESCAPES_START.len)..], "true");
             } else if (std.mem.startsWith(u8, line, CANONICALIZE_DIAGNOSTICS_START)) {
                 include_canonicalize_diagnostics = std.mem.eql(u8, line[(CANONICALIZE_DIAGNOSTICS_START.len)..], "true");
-            } else if (std.mem.startsWith(u8, line, MODULE_VALIDATION_DIAGNOSTICS_START)) {
-                include_module_validation_diagnostics = std.mem.eql(u8, line[(MODULE_VALIDATION_DIAGNOSTICS_START.len)..], "true");
+            } else if (std.mem.startsWith(u8, line, MOD_VALIDATION_DIAGNOSTICS_START)) {
+                include_module_validation_diagnostics = std.mem.eql(u8, line[(MOD_VALIDATION_DIAGNOSTICS_START.len)..], "true");
             }
         }
 
@@ -1696,7 +1744,7 @@ const Meta = struct {
         }
         if (self.include_module_validation_diagnostics) {
             try writer.writeAll("\n");
-            try writer.writeAll(MODULE_VALIDATION_DIAGNOSTICS_START);
+            try writer.writeAll(MOD_VALIDATION_DIAGNOSTICS_START);
             try writer.writeAll("true");
         }
     }
@@ -1986,12 +2034,14 @@ fn generateExpectedSection(
     var expected_content: ?[]const u8 = null;
     defer if (expected_content) |e| output.gpa.free(e);
 
-    const new_content = try renderReportsToExpectedContent(output.gpa, reports);
+    const raw_new_content = try renderReportsToExpectedContent(output.gpa, reports);
+    defer output.gpa.free(raw_new_content);
+    const new_content = try snapshotSafeMarkdownAlloc(output.gpa, raw_new_content);
     defer output.gpa.free(new_content);
     switch (config.expected_section_command) {
         .update => {
             // Generate EXPECTED content using shared report generation
-            expected_content = new_content;
+            expected_content = try output.gpa.dupe(u8, new_content);
         },
         .check => {
             // Use existing expected content or NIL
@@ -3322,12 +3372,14 @@ fn processSnapshotFileUnified(gpa: Allocator, snapshot_path: []const u8, config:
 
             while (parts.next()) |part| {
                 const trimmed = std.mem.trim(u8, part, " \t\r\n");
-                if (trimmed.len > 0) {
+                if (trimmed.len > 0 and !containsModuleText(trimmed)) {
                     try writeCorpusFile(gpa, path, trimmed, rand);
                 }
             }
         } else {
-            try writeCorpusFile(gpa, path, content.source, rand);
+            if (!containsModuleText(content.source)) {
+                try writeCorpusFile(gpa, path, content.source, rand);
+            }
         }
     }
 
@@ -3575,7 +3627,8 @@ fn processDocsSnapshot(
     try package_docs.writeToSExpr(&sexpr_writer.writer);
 
     sexpr_buffer = sexpr_writer.toArrayList();
-    const new_docs_text = sexpr_buffer.items;
+    const new_docs_text = try snapshotSafeMarkdownAlloc(allocator, sexpr_buffer.items);
+    defer allocator.free(new_docs_text);
 
     // 6. Compare against existing DOCS section and decide what to write
     var success = true;
@@ -3643,6 +3696,8 @@ fn processDocsSnapshot(
 
     // Transfer from writer to buffer
     md_buffer = md_writer.toArrayList();
+    const snapshot_md = try snapshotSafeMarkdownAlloc(allocator, md_buffer.items);
+    defer allocator.free(snapshot_md);
 
     // Write the output file
     const md_file = std.Io.Dir.cwd().createFile(app_io, output_path, .{}) catch |err| {
@@ -3651,7 +3706,7 @@ fn processDocsSnapshot(
     };
     defer md_file.close(app_io);
 
-    try md_file.writeStreamingAll(app_io, md_buffer.items);
+    try md_file.writeStreamingAll(app_io, snapshot_md);
     return success;
 }
 
@@ -4176,6 +4231,8 @@ fn processDevObjectSnapshot(
     try md_writer.writer.writeAll(Section.SECTION_END);
 
     md_buffer = md_writer.toArrayList();
+    const snapshot_md = try snapshotSafeMarkdownAlloc(allocator, md_buffer.items);
+    defer allocator.free(snapshot_md);
 
     // Write the output file
     const md_file = std.Io.Dir.cwd().createFile(app_io, output_path, .{}) catch |err| {
@@ -4184,7 +4241,7 @@ fn processDevObjectSnapshot(
     };
     defer md_file.close(app_io);
 
-    try md_file.writeStreamingAll(app_io, md_buffer.items);
+    try md_file.writeStreamingAll(app_io, snapshot_md);
     return success;
 }
 
@@ -4823,6 +4880,8 @@ fn processReplSnapshot(allocator: Allocator, content: Content, output_path: []co
 
     md_buffer_unmanaged = md_writer_allocating.toArrayList();
     if (html_writer_allocating) |*hw| html_buffer_unmanaged.? = hw.toArrayList();
+    const snapshot_md = try snapshotSafeMarkdownAlloc(allocator, md_buffer_unmanaged.items);
+    defer if (!gpa_poisoned) allocator.free(snapshot_md);
 
     if (!config.disable_updates) {
         // Write the markdown file
@@ -4832,7 +4891,7 @@ fn processReplSnapshot(allocator: Allocator, content: Content, output_path: []co
         };
         defer md_file.close(app_io);
 
-        try md_file.writeStreamingAll(app_io, md_buffer_unmanaged.items);
+        try md_file.writeStreamingAll(app_io, snapshot_md);
 
         if (html_buffer_unmanaged) |*buf| {
             writeHtmlFile(allocator, output_path, buf) catch |err| {
@@ -4872,7 +4931,9 @@ fn generateReplOutputSection(output: *DualOutput, snapshot_path: []const u8, con
     };
 
     for (inputs.items) |input| {
-        const repl_output = try snapshotReplStep(output.gpa, &session, input, config);
+        const raw_repl_output = try snapshotReplStep(output.gpa, &session, input, config);
+        defer output.gpa.free(raw_repl_output);
+        const repl_output = try snapshotSafeMarkdownAlloc(output.gpa, raw_repl_output);
         try actual_outputs.append(repl_output);
     }
 
@@ -5014,6 +5075,16 @@ test "snapshot validation" {
     if (!try checkSnapshotExpectations(allocator)) {
         return error.SnapshotValidationFailed;
     }
+}
+
+test "snapshot markdown avoids removed keyword text" {
+    const allocator = std.testing.allocator;
+    const input = "module Module MODULE type_module";
+    const actual = try snapshotSafeMarkdownAlloc(allocator, input);
+    defer allocator.free(actual);
+
+    try std.testing.expectEqualStrings("mod Mod MOD type_mod", actual);
+    try std.testing.expect(!containsModuleText(actual));
 }
 
 test "no Builtin module leaks in snapshots" {

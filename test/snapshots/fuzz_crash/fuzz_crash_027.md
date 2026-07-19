@@ -188,9 +188,9 @@ UNEXPECTED EXPRESSION SYNTAX - fuzz_crash_027.md:153:7:153:8
 UNEXPECTED EXPRESSION SYNTAX - fuzz_crash_027.md:155:1:155:7
 EXPECTED LIST SEPARATOR - fuzz_crash_027.md:160:1:160:1
 EXPECTED CLOSING BRACE - fuzz_crash_027.md:160:1:160:1
-MODULE NOT FOUND - fuzz_crash_027.md:6:1:8:4
-MODULE NOT FOUND - fuzz_crash_027.md:12:1:12:19
-MODULE NOT FOUND - fuzz_crash_027.md:13:1:14:4
+MOD NOT FOUND - fuzz_crash_027.md:6:1:8:4
+MOD NOT FOUND - fuzz_crash_027.md:12:1:12:19
+MOD NOT FOUND - fuzz_crash_027.md:13:1:14:4
 UNDECLARED TYPE - fuzz_crash_027.md:26:8:26:11
 UNDECLARED TYPE - fuzz_crash_027.md:26:13:26:16
 UNDECLARED TYPE - fuzz_crash_027.md:29:2:29:5
@@ -606,7 +606,7 @@ Numbers cannot have leading zeros.
 
 
 ┌──────────────────┐
-│ MODULE NOT FOUND ├─ The module `Stdot` was not found in this Roc project. ──┐
+│ MOD NOT FOUND ├─ The mod `Stdot` was not found in this Roc project. ──┐
 └┬─────────────────┘                                                          │
  │                                                                            │
  │  import Stdot                                                              │
@@ -618,7 +618,7 @@ Numbers cannot have leading zeros.
 
 
 ┌──────────────────┐
-│ MODULE NOT FOUND ├─ The module `Bae` was not found in this Roc project. ────┐
+│ MOD NOT FOUND ├─ The mod `Bae` was not found in this Roc project. ────┐
 └┬─────────────────┘                                                          │
  │                                                                            │
  │  import Bae as Gooe                                                        │
@@ -628,7 +628,7 @@ Numbers cannot have leading zeros.
 
 
 ┌──────────────────┐
-│ MODULE NOT FOUND ├─ The module `Ba` was not found in this Roc project. ─────┐
+│ MOD NOT FOUND ├─ The mod `Ba` was not found in this Roc project. ─────┐
 └┬─────────────────┘                                                          │
  │                                                                            │
  │  import                                                                    │
@@ -1026,7 +1026,7 @@ Numbers cannot have leading zeros.
  │                                                                            │
  └──────────────────────────────────────────────────── fuzz_crash_027.md:28:1 ┘
 
-    Add a value body here, or put hosted functions in a platform type module so
+    Add a value body here, or put hosted functions in a platform type mod so
     they are published through the host boundary.
 
 
@@ -2065,19 +2065,19 @@ main! = |_| { # Yeah Ie
 				(ty-apply (name "Try") (builtin)
 					(ty-record)
 					(ty-underscore)))))
-	(s-import (module "pf.Stdout")
+	(s-import (mod "pf.Stdout")
 		(exposes
 			(exposed (name "line!") (wildcard false))
 			(exposed (name "e!") (wildcard false))))
-	(s-import (module "Stdot")
+	(s-import (mod "Stdot")
 		(exposes))
-	(s-import (module "pkg.S")
+	(s-import (mod "pkg.S")
 		(exposes
 			(exposed (name "func") (alias "fry") (wildcard false))
 			(exposed (name "Custom") (wildcard true))))
-	(s-import (module "Bae")
+	(s-import (mod "Bae")
 		(exposes))
-	(s-import (module "Ba")
+	(s-import (mod "Ba")
 		(exposes))
 	(s-alias-decl
 		(ty-header (name "Map")

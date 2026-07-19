@@ -33,14 +33,14 @@ EndOfFile,
 # PARSE
 ~~~clojure
 (file
-	(type-module)
+	(type-mod)
 	(statements
 		(s-type-anno (name "function")
 			(ty-fn
 				(ty-var (raw "a"))
 				(ty (name "U32")))
 			(where
-				(method (module-of "a") (name "to_u32_try")
+				(method (mod-of "a") (name "to_u32_try")
 					(args
 						(ty-var (raw "a")))
 					(ty-apply

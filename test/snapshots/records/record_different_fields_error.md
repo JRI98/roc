@@ -391,7 +391,7 @@ MISSING METHOD - record_different_fields_error.md:7:19:7:30
  │  ‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾                                                          │
  └────────────────────────────────────── record_different_fields_error.md:2:5 ┘
 
-    Add a value body here, or put hosted functions in a platform type module so
+    Add a value body here, or put hosted functions in a platform type mod so
     they are published through the host boundary.
 
 
@@ -403,7 +403,7 @@ MISSING METHOD - record_different_fields_error.md:7:19:7:30
  │  ‾‾‾‾‾‾‾‾‾                                                                 │
  └────────────────────────────────────── record_different_fields_error.md:3:5 ┘
 
-    Add a value body here, or put hosted functions in a platform type module so
+    Add a value body here, or put hosted functions in a platform type mod so
     they are published through the host boundary.
 
 
@@ -457,7 +457,7 @@ MISSING METHOD - record_different_fields_error.md:7:19:7:30
  │  ‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾                                                          │
  └────────────────────────────────────── record_different_fields_error.md:6:5 ┘
 
-    Add a value body here, or put hosted functions in a platform type module so
+    Add a value body here, or put hosted functions in a platform type mod so
     they are published through the host boundary.
 
 

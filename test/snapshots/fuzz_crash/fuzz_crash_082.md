@@ -47,7 +47,7 @@ MISSING METHOD - fuzz_crash_082.md:3:10:3:11
  │  ‾‾‾                                                                       │
  └───────────────────────────────────────────────────── fuzz_crash_082.md:1:1 ┘
 
-    Add a value body here, or put hosted functions in a platform type module so
+    Add a value body here, or put hosted functions in a platform type mod so
     they are published through the host boundary.
 
 
@@ -59,7 +59,7 @@ MISSING METHOD - fuzz_crash_082.md:3:10:3:11
  │  ‾‾‾                                                                       │
  └───────────────────────────────────────────────────── fuzz_crash_082.md:2:1 ┘
 
-    Add a value body here, or put hosted functions in a platform type module so
+    Add a value body here, or put hosted functions in a platform type mod so
     they are published through the host boundary.
 
 
@@ -86,7 +86,7 @@ EndOfFile,
 # PARSE
 ~~~clojure
 (file
-	(type-module)
+	(type-mod)
 	(statements
 		(s-type-anno (name "i")
 			(ty (name "U")))

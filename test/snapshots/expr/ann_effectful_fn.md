@@ -26,7 +26,7 @@ TYPE MISMATCH - ann_effectful_fn.md:2:37:2:50
  │  ‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾                                                │
  └─────────────────────────────────────────────────── ann_effectful_fn.md:2:5 ┘
 
-    Add a value body here, or put hosted functions in a platform type module so
+    Add a value body here, or put hosted functions in a platform type mod so
     they are published through the host boundary.
 
 

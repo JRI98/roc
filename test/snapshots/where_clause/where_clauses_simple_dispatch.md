@@ -21,14 +21,14 @@ EndOfFile,
 # PARSE
 ~~~clojure
 (file
-	(type-module)
+	(type-mod)
 	(statements
 		(s-type-anno (name "stringify")
 			(ty-fn
 				(ty-var (raw "a"))
 				(ty (name "Str")))
 			(where
-				(method (module-of "a") (name "to_str")
+				(method (mod-of "a") (name "to_str")
 					(args
 						(ty-var (raw "a")))
 					(ty (name "Str")))))

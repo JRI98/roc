@@ -102,14 +102,14 @@ EndOfFile,
 # PARSE
 ~~~clojure
 (file
-	(type-module)
+	(type-mod)
 	(statements
 		(s-type-anno (name "via_arg")
 			(ty-fn
 				(ty-var (raw "a"))
 				(ty (name "I128")))
 			(where
-				(method (module-of "a") (name "to_i128")
+				(method (mod-of "a") (name "to_i128")
 					(args
 						(ty-var (raw "a")))
 					(ty (name "I128")))))
@@ -134,7 +134,7 @@ EndOfFile,
 					(ty-var (raw "a")))
 				(ty (name "I128")))
 			(where
-				(method (module-of "a") (name "to_i128")
+				(method (mod-of "a") (name "to_i128")
 					(args
 						(ty-var (raw "a")))
 					(ty (name "I128")))))
@@ -170,7 +170,7 @@ EndOfFile,
 				(ty-record)
 				(ty-var (raw "a")))
 			(where
-				(method (module-of "a") (name "gen")
+				(method (mod-of "a") (name "gen")
 					(args
 						(ty-record))
 					(ty-var (raw "a")))))
@@ -198,11 +198,11 @@ EndOfFile,
 				(ty (name "Str"))
 				(ty (name "Str")))
 			(where
-				(method (module-of "a") (name "parse")
+				(method (mod-of "a") (name "parse")
 					(args
 						(ty (name "Str")))
 					(ty-var (raw "a")))
-				(method (module-of "a") (name "show")
+				(method (mod-of "a") (name "show")
 					(args
 						(ty-var (raw "a")))
 					(ty (name "Str")))))

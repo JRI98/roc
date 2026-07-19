@@ -409,7 +409,7 @@ Each test follows this pattern:
 
 | Test name | Source code | Position | Verifies |
 |---|---|---|---|
-| `returns module definitions` | `module []\n\nfoo = 42\nbar = \|x\| x + 1` | 3:0 | items array exists |
+| `returns local definitions` | `foo = 42\nbar = \|x\| x + 1` | 2:0 | items array exists |
 | `returns module members after dot` | `app [...]\nimport Str\nresult = Str.` | 2:13 | Str member completions |
 | `returns module names in expression context` | `app [...]\nimport Json\nresult = ` | 2:9 | `Json` appears |
 | `returns types after colon` | `app [...]\nMyList:List(Str)\nx : ` | 2:4 | `Str`, `U64`, `Bool` appear |
