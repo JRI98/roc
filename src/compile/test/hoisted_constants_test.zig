@@ -506,7 +506,8 @@ test "hoisted list constants lower to internal static data" {
         },
         .{
             .requests = lir_roots,
-            .include_static_data_exports = true,
+            .include_provided_data_exports = true,
+            .include_internal_static_data = true,
         },
         .{ .target_usize = base.target.TargetUsize.u64 },
     );
@@ -515,7 +516,7 @@ test "hoisted list constants lower to internal static data" {
     try std.testing.expectEqual(@as(usize, 1), lowered.lir_result.static_data_values.items.len);
     try expectStaticDataLiteralPresent(&lowered.lir_result);
 
-    const exports = try static_data_exports.buildProvidedDataExports(
+    const exports = try static_data_exports.buildStaticData(
         gpa,
         .{
             .root = check.CheckedArtifact.loweringViewWithRelations(root, relations),
@@ -523,8 +524,9 @@ test "hoisted list constants lower to internal static data" {
         },
         &lowered,
         .x64linux,
+        .{ .include_provided_exports = true },
     );
-    defer static_data_exports.deinitProvidedDataExports(gpa, exports);
+    defer static_data_exports.deinitStaticData(gpa, exports);
 
     for (lowered.lir_result.static_data_values.items, 0..) |_, index| {
         const static_data_id: lir.LIR.StaticDataId = @enumFromInt(@as(u32, @intCast(index)));
@@ -637,7 +639,8 @@ fn expectInlineListStaticDataLiteral(gpa: std.mem.Allocator, source: []const u8)
         },
         .{
             .requests = lir_roots,
-            .include_static_data_exports = true,
+            .include_provided_data_exports = true,
+            .include_internal_static_data = true,
         },
         .{
             .target_usize = base.target.TargetUsize.u32,

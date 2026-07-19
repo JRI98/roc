@@ -39,7 +39,10 @@ pub const CheckedModuleSet = struct {
 pub const RootRequestSet = struct {
     requests: []const checked.RootRequest = &.{},
     layout_requests: []const checked.CheckedTypeId = &.{},
-    include_static_data_exports: bool = false,
+    /// Request layouts and materialization roots for host-visible provided data.
+    include_provided_data_exports: bool = false,
+    /// Restore eligible stored constants as internal readonly static values.
+    include_internal_static_data: bool = false,
     test_plan_metadata: []const postcheck.Common.RootTestPlanMetadata = &.{},
 };
 
@@ -212,10 +215,10 @@ pub fn lowerCheckedModulesToLir(
 ) LowerResourceError!LoweredProgram {
     try verifyCheckedBoundary(modules, target);
 
-    const layout_requests = try collectLayoutRequests(allocator, modules.root.module, roots.layout_requests, roots.include_static_data_exports);
+    const layout_requests = try collectLayoutRequests(allocator, modules.root.module, roots.layout_requests, roots.include_provided_data_exports);
     defer allocator.free(layout_requests);
     const static_data_requests = switch (target.checked_module_state) {
-        .complete => if (roots.include_static_data_exports)
+        .complete => if (roots.include_provided_data_exports)
             try collectStaticDataRequests(allocator, modules.root.module)
         else
             try allocator.alloc(postcheck.Common.StaticDataRequest, 0),
@@ -230,7 +233,7 @@ pub fn lowerCheckedModulesToLir(
         .{
             .proc_debug_names = target.proc_debug_names,
             .specialization_cache = target.monotype_cache,
-            .static_data_literals = target.checked_module_state == .complete and roots.include_static_data_exports,
+            .static_data_literals = target.checked_module_state == .complete and roots.include_internal_static_data,
             .target_usize = target.target_usize,
             .inline_expects = switch (target.inline_expects) {
                 .run => .run,
@@ -351,13 +354,13 @@ fn collectLayoutRequests(
     allocator: Allocator,
     root: *const checked.Module,
     explicit: []const checked.CheckedTypeId,
-    include_static_data_exports: bool,
+    include_provided_data_exports: bool,
 ) Allocator.Error![]checked.CheckedTypeId {
     var requests = std.ArrayList(checked.CheckedTypeId).empty;
     errdefer requests.deinit(allocator);
 
     try requests.appendSlice(allocator, explicit);
-    if (!include_static_data_exports) return try requests.toOwnedSlice(allocator);
+    if (!include_provided_data_exports) return try requests.toOwnedSlice(allocator);
 
     const types = root.checked_types.view();
     for (root.provided_exports.exports) |provided| {

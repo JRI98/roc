@@ -183,12 +183,28 @@ const RelocationContext = struct {
             }
         }
 
+        return self.resolveDataSymbol(name);
+    }
+
+    fn resolveDataSymbol(self: *const RelocationContext, name: []const u8) ?usize {
         for (self.view.data_symbols) |symbol| {
             const symbol_name = self.view.dataSymbolName(symbol) catch return null;
             if (std.mem.eql(u8, symbol_name, name)) {
                 return @intFromPtr(self.view.data.ptr) +
                     @as(usize, @intCast(symbol.data_offset)) +
                     @as(usize, @intCast(symbol.symbol_offset));
+            }
+        }
+
+        return null;
+    }
+
+    fn resolveCodeSymbol(self: *const RelocationContext, name: []const u8) ?usize {
+        for (self.view.code_symbols) |symbol| {
+            const symbol_name = self.view.codeSymbolName(symbol) catch return null;
+            if (std.mem.eql(u8, symbol_name, name)) {
+                if (symbol.code_offset >= self.view.code.len) return null;
+                return self.code_base + @as(usize, @intCast(symbol.code_offset));
             }
         }
 
@@ -267,13 +283,6 @@ fn loadDevProgram(
             },
         }
     }
-    for (view.data_relocations) |record| {
-        const name = try view.symbolName(record.symbol);
-        if (resolveShimFunction(name)) |target_addr| {
-            try ensureFunctionStub(gpa, &function_stubs, name, target_addr);
-        }
-    }
-
     const stub_size = try jumpStubSize();
     if (function_stubs.items.len > view.function_stubs.len / stub_size) {
         return error.InvalidDevRunImage;
@@ -334,9 +343,11 @@ fn applyDataRelocations(
     relocation_context: *const RelocationContext,
 ) LoadDevProgramError!void {
     for (view.data_relocations) |record| {
-        if ((try record.relocationKind()) != .linked_data_abs64) return error.InvalidDevRunImage;
         const name = try view.symbolName(record.symbol);
-        const target_addr = RelocationContext.resolve(relocation_context, name) orelse return error.UnresolvedSymbol;
+        const target_addr = switch (try record.targetKind()) {
+            .address => relocation_context.resolveDataSymbol(name),
+            .function_pointer => relocation_context.resolveCodeSymbol(name),
+        } orelse return error.UnresolvedSymbol;
         const value = try relocatedDataAddress(target_addr, record.addend);
         if (record.data_offset > std.math.maxInt(usize)) return error.InvalidDevRunImage;
         const offset: usize = @intCast(record.data_offset);
@@ -369,6 +380,10 @@ fn validateDirectImageLayout(view: *const RunImage.ProgramView) RunImage.ImageEr
     if (!rangeContains(view.executable, view.code)) return error.InvalidDevRunImage;
     if (!rangeContains(view.executable, view.function_stubs)) return error.InvalidDevRunImage;
     if (view.data.len > 0 and @intFromPtr(view.data.ptr) % view.page_size != 0) return error.InvalidDevRunImage;
+    for (view.code_symbols) |symbol| {
+        if (symbol.code_offset >= view.code.len) return error.InvalidDevRunImage;
+        _ = try view.codeSymbolName(symbol);
+    }
     _ = try maxDevDataAlignment(view);
 }
 
@@ -814,6 +829,7 @@ test "loaded dev program borrows direct shared image metadata" {
         &entrypoints,
         &.{},
         &.{},
+        &.{},
     );
     const view = try RunImage.viewMappedImage(header, shm.base_ptr, @intCast(header.image_size));
 
@@ -852,7 +868,7 @@ test "data relocations patch data pointers" {
             .data_offset = 0,
             .symbol = .{ .offset = source_name.len, .len = target_name.len },
             .addend = 2,
-            .kind = @intFromEnum(RunImage.RelocationKind.linked_data_abs64),
+            .target_kind = @intFromEnum(RunImage.StaticDataTargetKind.address),
         },
     };
     const view = RunImage.ProgramView{
@@ -860,6 +876,7 @@ test "data relocations patch data pointers" {
         .code = &.{},
         .function_stubs = &.{},
         .entrypoints = &.{},
+        .code_symbols = &.{},
         .relocations = &.{},
         .data_relocations = &data_relocations,
         .symbol_names = symbol_names,
@@ -877,4 +894,47 @@ test "data relocations patch data pointers" {
 
     const expected = @intFromPtr(data[0..].ptr) + @sizeOf(usize) + 1 + 2;
     try std.testing.expectEqual(expected, std.mem.readInt(usize, data[0..@sizeOf(usize)], .little));
+}
+
+test "function-pointer data relocations patch generated Roc code pointers" {
+    var code = [_]u8{ 0, 0, 0, 0 };
+    var data = [_]u8{0} ** @sizeOf(usize);
+    const proc_name = "roc__proc_2a";
+    const code_symbols = [_]RunImage.CodeSymbol{
+        .{
+            .name = .{ .offset = 0, .len = proc_name.len },
+            .code_offset = 2,
+        },
+    };
+    const data_relocations = [_]RunImage.DataRelocationRecord{
+        .{
+            .data_offset = 0,
+            .symbol = .{ .offset = 0, .len = proc_name.len },
+            .addend = 0,
+            .target_kind = @intFromEnum(RunImage.StaticDataTargetKind.function_pointer),
+        },
+    };
+    const view = RunImage.ProgramView{
+        .executable = &code,
+        .code = &code,
+        .function_stubs = &.{},
+        .entrypoints = &.{},
+        .code_symbols = &code_symbols,
+        .relocations = &.{},
+        .data_relocations = &data_relocations,
+        .symbol_names = proc_name,
+        .data = &data,
+        .data_symbols = &.{},
+        .page_size = 4096,
+    };
+    const relocation_context = RelocationContext{
+        .view = &view,
+        .function_stubs = &.{},
+        .code_base = @intFromPtr(code[0..].ptr),
+    };
+
+    try applyDataRelocations(&view, &relocation_context);
+
+    const expected = @intFromPtr(code[0..].ptr) + 2;
+    try std.testing.expectEqual(expected, std.mem.readInt(usize, data[0..], .little));
 }

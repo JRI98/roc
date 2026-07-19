@@ -2362,6 +2362,7 @@ fn rocRunSharedMemoryShim(ctx: *CliCtx, args: cli_args.RunArgs, arg0: []const u8
             lowered_result = try lowerLirWithBuildEnv(
                 ctx,
                 ctx.gpa,
+                .{ .dev_run_image = validated_link_spec.target },
                 args.path,
                 null,
                 null,
@@ -2698,7 +2699,8 @@ fn rocRunSharedMemoryShim(ctx: *CliCtx, args: cli_args.RunArgs, arg0: []const u8
     if (args.opt == .dev) {
         const result = if (lowered_result) |*value| value else unreachable;
         const lowered = successfulLoweredProgram(result, "default roc command");
-        shm_handle_opt = try publishDevRunImage(ctx, selected_target, entrypoint_names, lowered, args.watch);
+        const internal_static_data = successfulInternalStaticData(result, "default roc command");
+        shm_handle_opt = try publishDevRunImage(ctx, selected_target, entrypoint_names, lowered, internal_static_data, args.watch);
     }
 
     const shm_handle = shm_handle_opt orelse {
@@ -3121,6 +3123,7 @@ fn rocRunDefaultAppSharedMemoryShim(ctx: *CliCtx, args: cli_args.RunArgs, origin
     var lowered_result = try lowerLirWithBuildEnv(
         ctx,
         ctx.gpa,
+        .{ .dev_run_image = selected_target },
         app_path,
         original_source_dir,
         .{ .original_path = args.path, .original_source = original_source },
@@ -3269,7 +3272,8 @@ fn rocRunDefaultAppSharedMemoryShim(ctx: *CliCtx, args: cli_args.RunArgs, origin
 
     // Headerless default apps never hot reload — they compile through throwaway synthetic
     // source files, so there is nothing stable to reload. They just run once.
-    const shm_handle = try publishDevRunImage(ctx, selected_target, entrypoint_names, lowered, false);
+    const internal_static_data = successfulInternalStaticData(&lowered_result, "default app run");
+    const shm_handle = try publishDevRunImage(ctx, selected_target, entrypoint_names, lowered, internal_static_data, false);
     defer closeSharedMemoryHandle(shm_handle);
 
     if (comptime is_windows) {
@@ -4856,6 +4860,7 @@ const CoordinatorReportCounts = struct {
 
 const LoweredCoordinatorResult = struct {
     lowered: ?lir.CheckedPipeline.LoweredProgram,
+    internal_static_data: ?[]backend.StaticDataExport,
     entrypoint_names: []const []const u8,
     hosted_symbols: []const []const u8,
     checked_host_identity: ?[32]u8,
@@ -4864,6 +4869,9 @@ const LoweredCoordinatorResult = struct {
     counts: CoordinatorReportCounts,
 
     fn deinit(self: *LoweredCoordinatorResult) void {
+        if (self.internal_static_data) |static_data| {
+            compile.static_data_exports.deinitStaticData(self.watch_inputs_allocator, static_data);
+        }
         if (self.lowered) |*lowered| {
             lowered.deinit();
         }
@@ -4875,6 +4883,15 @@ const LoweredCoordinatorResult = struct {
         self.watch_inputs = &.{};
     }
 };
+
+fn successfulInternalStaticData(result: *const LoweredCoordinatorResult, label: []const u8) []const backend.StaticDataExport {
+    return result.internal_static_data orelse {
+        if (builtin.mode == .Debug) {
+            std.debug.panic("{s} invariant violated: dev RunImage lowering produced no internal static data bundle", .{label});
+        }
+        unreachable;
+    };
+}
 
 fn successfulLoweredProgram(result: *LoweredCoordinatorResult, label: []const u8) *lir.CheckedPipeline.LoweredProgram {
     return if (result.lowered) |*lowered| lowered else {
@@ -5173,6 +5190,7 @@ fn rocInternalHotReloadDev(ctx: *CliCtx, raw_args: []const []const u8) CliMainEr
     var lowered_result = try lowerLirWithBuildEnv(
         ctx,
         ctx.gpa,
+        .{ .dev_run_image = selected_target },
         args.path,
         if (source_rewrite) |rewrite| rewrite.source_dir_override else null,
         if (source_rewrite) |rewrite| .{
@@ -5212,6 +5230,7 @@ fn rocInternalHotReloadDev(ctx: *CliCtx, raw_args: []const []const u8) CliMainEr
         selected_target,
         lowered_result.entrypoint_names,
         lowered,
+        successfulInternalStaticData(&lowered_result, "hot reload compiler"),
         .{
             .generation = args.generation,
             .descriptor_offset = args.descriptor_offset,
@@ -5237,6 +5256,7 @@ fn writeDevRunImageToSharedMemory(
     selected_target: RocTarget,
     entrypoint_names: []const []const u8,
     lowered: *const lir.CheckedPipeline.LoweredProgram,
+    internal_static_data: []const backend.StaticDataExport,
     hot_reload_allocation: ?HotReloadImageAllocation,
 ) CliMainError!DevRunImagePublication {
     if (comptime !backend.host_lir_codegen_available) {
@@ -5258,6 +5278,12 @@ fn writeDevRunImageToSharedMemory(
         var static_strings = try backend.StaticStringData.build(ctx.gpa, store, native_target);
         defer static_strings.deinit();
 
+        var readonly_data = std.ArrayList(backend.StaticDataExport).empty;
+        defer readonly_data.deinit(ctx.gpa);
+        try readonly_data.ensureTotalCapacity(ctx.gpa, internal_static_data.len + static_strings.exports.len);
+        try readonly_data.appendSlice(ctx.gpa, internal_static_data);
+        try readonly_data.appendSlice(ctx.gpa, static_strings.exports);
+
         var codegen = try backend.HostLirCodeGen.init(
             ctx.gpa,
             store,
@@ -5268,7 +5294,29 @@ fn writeDevRunImageToSharedMemory(
         codegen.generation_mode = .shim_execution;
         codegen.enable_hot_reload = hot_reload_allocation != null;
 
-        try codegen.compileAllProcSpecs(store.getProcSpecs());
+        const proc_specs = store.getProcSpecs();
+        try codegen.compileAllProcSpecs(proc_specs);
+
+        const code_symbols = try ctx.gpa.alloc(backend.RunImage.CodeSymbolInput, proc_specs.len);
+        var initialized_code_symbols: usize = 0;
+        defer {
+            for (code_symbols[0..initialized_code_symbols]) |symbol| ctx.gpa.free(symbol.name);
+            ctx.gpa.free(code_symbols);
+        }
+        for (proc_specs, 0..) |_, i| {
+            const proc_id: lir.LIR.LirProcSpecId = @enumFromInt(@as(u32, @intCast(i)));
+            const compiled = codegen.compiledProcSymbol(proc_id) orelse {
+                if (builtin.mode == .Debug) {
+                    std.debug.panic("dev run invariant violated: LIR proc {d} was not compiled before image symbol publication", .{i});
+                }
+                unreachable;
+            };
+            code_symbols[i] = .{
+                .name = try backend.procSymbolName(ctx.gpa, compiled.name),
+                .code_offset = compiled.code_start,
+            };
+            initialized_code_symbols += 1;
+        }
 
         const platform_entrypoints = try lowered.platformEntrypoints(ctx.gpa);
         defer ctx.gpa.free(platform_entrypoints);
@@ -5325,8 +5373,9 @@ fn writeDevRunImageToSharedMemory(
                 allocation.region_start,
                 generated_code,
                 entrypoints,
+                code_symbols,
                 relocations,
-                static_strings.exports,
+                readonly_data.items,
             );
             const required_capacity = required_bound - allocation.region_start;
 
@@ -5354,8 +5403,9 @@ fn writeDevRunImageToSharedMemory(
             shm.page_size,
             generated_code,
             entrypoints,
+            code_symbols,
             relocations,
-            static_strings.exports,
+            readonly_data.items,
         );
         const image_offset = @intFromPtr(header) - @intFromPtr(shm.base_ptr);
         const image_bound: usize = @intCast(header.image_size);
@@ -5384,6 +5434,7 @@ fn publishDevRunImage(
     selected_target: RocTarget,
     entrypoint_names: []const []const u8,
     lowered: *const lir.CheckedPipeline.LoweredProgram,
+    internal_static_data: []const backend.StaticDataExport,
     enable_hot_reload: bool,
 ) CliMainError!SharedMemoryHandle {
     const page_size = try SharedMemoryAllocator.getSystemPageSize();
@@ -5406,7 +5457,15 @@ fn publishDevRunImage(
             .append_offset = @sizeOf(SharedMemoryAllocator.Header),
         };
     } else null;
-    const publication = try writeDevRunImageToSharedMemory(ctx, &shm, selected_target, entrypoint_names, lowered, hot_reload_allocation);
+    const publication = try writeDevRunImageToSharedMemory(
+        ctx,
+        &shm,
+        selected_target,
+        entrypoint_names,
+        lowered,
+        internal_static_data,
+        hot_reload_allocation,
+    );
     if (enable_hot_reload) {
         ipc.hot_reload.init(
             ipc.hot_reload.controlFromBase(shm.base_ptr),
@@ -5487,9 +5546,17 @@ const SyntheticDefaultAppMapping = struct {
     original_source: []const u8,
 };
 
+const PlatformEntrypointArtifact = union(enum) {
+    /// Pointer-width-independent LIR consumed directly by the interpreter.
+    lir_image,
+    /// Target-specific machine code and readonly data consumed by the dev shim.
+    dev_run_image: RocTarget,
+};
+
 fn lowerLirWithBuildEnv(
     ctx: *CliCtx,
     lir_allocator: Allocator,
+    artifact: PlatformEntrypointArtifact,
     roc_file_path: []const u8,
     source_dir_override: ?[]const u8,
     synthetic_default_app: ?SyntheticDefaultAppMapping,
@@ -5573,6 +5640,7 @@ fn lowerLirWithBuildEnv(
         if (reporter) |r| r.fail();
         return .{
             .lowered = null,
+            .internal_static_data = null,
             .entrypoint_names = &.{},
             .hosted_symbols = &.{},
             .checked_host_identity = null,
@@ -5596,13 +5664,30 @@ fn lowerLirWithBuildEnv(
         root_artifact,
         imported_artifacts,
         relation_artifacts,
-        .platform_entrypoints,
+        .{ .platform_entrypoints = artifact },
         opt,
         base.target.TargetUsize.native,
         false,
     );
     errdefer lowered.deinit();
     if (reporter) |r| r.end();
+
+    const internal_static_data: ?[]backend.StaticDataExport = switch (artifact) {
+        .lir_image => null,
+        .dev_run_image => |target| try compile.static_data_exports.buildStaticData(
+            ctx.gpa,
+            .{
+                .root = check.CheckedArtifact.loweringViewWithRelations(root_artifact, relation_artifacts),
+                .imports = imported_artifacts,
+            },
+            &lowered,
+            target,
+            .{},
+        ),
+    };
+    errdefer if (internal_static_data) |static_data| {
+        compile.static_data_exports.deinitStaticData(ctx.gpa, static_data);
+    };
 
     const entrypoint_names = try lowered.platformEntrypointNames(ctx.arena, root_artifact);
     const hosted_table = try checkedHostedTable(
@@ -5626,6 +5711,7 @@ fn lowerLirWithBuildEnv(
 
     return .{
         .lowered = lowered,
+        .internal_static_data = internal_static_data,
         .entrypoint_names = entrypoint_names,
         .hosted_symbols = hosted_table.symbols,
         .checked_host_identity = checked_host_identity,
@@ -5665,6 +5751,7 @@ pub fn buildLirImageWithBuildEnv(
     var lowered_result = try lowerLirWithBuildEnv(
         ctx,
         shm_allocator,
+        .lir_image,
         roc_file_path,
         source_dir_override,
         synthetic_default_app,
@@ -8177,7 +8264,7 @@ fn rocBuildLlvm(ctx: *CliCtx, args: cli_args.BuildArgs) CliMainError!void {
     const entrypoints = try nativeBuildEntrypoints(ctx, root_artifact, &lowered);
     defer ctx.gpa.free(entrypoints);
 
-    const static_data_exports = try compile.static_data_exports.buildProvidedDataExports(
+    const static_data_exports = try compile.static_data_exports.buildStaticData(
         ctx.gpa,
         .{
             .root = check.CheckedArtifact.loweringViewWithRelations(root_artifact, relation_artifacts),
@@ -8185,8 +8272,9 @@ fn rocBuildLlvm(ctx: *CliCtx, args: cli_args.BuildArgs) CliMainError!void {
         },
         &lowered,
         target,
+        .{ .include_provided_exports = true },
     );
-    defer compile.static_data_exports.deinitProvidedDataExports(ctx.gpa, static_data_exports);
+    defer compile.static_data_exports.deinitStaticData(ctx.gpa, static_data_exports);
 
     if (entrypoints.len == 0 and static_data_exports.len == 0) {
         if (builtin.mode == .Debug) {
@@ -8484,7 +8572,7 @@ fn rocBuildNative(ctx: *CliCtx, args: cli_args.BuildArgs) CliMainError!void {
     const entrypoints = try nativeBuildEntrypoints(ctx, root_artifact, &lowered);
     defer ctx.gpa.free(entrypoints);
 
-    const static_data_exports = try compile.static_data_exports.buildProvidedDataExports(
+    const static_data_exports = try compile.static_data_exports.buildStaticData(
         ctx.gpa,
         .{
             .root = check.CheckedArtifact.loweringViewWithRelations(root_artifact, relation_artifacts),
@@ -8492,8 +8580,9 @@ fn rocBuildNative(ctx: *CliCtx, args: cli_args.BuildArgs) CliMainError!void {
         },
         &lowered,
         target,
+        .{ .include_provided_exports = true },
     );
-    defer compile.static_data_exports.deinitProvidedDataExports(ctx.gpa, static_data_exports);
+    defer compile.static_data_exports.deinitStaticData(ctx.gpa, static_data_exports);
 
     if (target_arch == .wasm32) {
         reporter.begin("Code Generation");
@@ -8792,7 +8881,7 @@ fn rocBuildEmbedded(ctx: *CliCtx, args: cli_args.BuildArgs) CliMainError!void {
         root_artifact,
         imported_artifacts,
         relation_artifacts,
-        .platform_entrypoints,
+        .{ .platform_entrypoints = .lir_image },
         args.opt,
         base.target.TargetUsize.native,
         false,
@@ -9700,7 +9789,7 @@ fn inlineExpectModeForOpt(opt: cli_args.OptLevel) lir.CheckedPipeline.InlineExpe
 const CheckedLirRoots = union(enum) {
     /// Provided exports plus platform-required bindings: LIR consumed by host
     /// shims and interpreters (run, embedded builds, hot reload, glue).
-    platform_entrypoints,
+    platform_entrypoints: PlatformEntrypointArtifact,
     /// Provided exports plus platform-required bindings, with static data
     /// exports materialized: LIR for linked outputs (native/LLVM builds).
     linked_output,
@@ -9746,10 +9835,20 @@ fn lowerCheckedSourceToLir(
         },
         .{
             .requests = selected_roots,
-            // Static data exports exist only in linked outputs.
-            .include_static_data_exports = switch (roots) {
+            // Host-visible data exports exist only in linked outputs.
+            .include_provided_data_exports = switch (roots) {
                 .linked_output => true,
                 else => false,
+            },
+            // Internal readonly values are embedded by linked outputs and dev
+            // RunImages. LirImage deliberately remains pointer-width independent.
+            .include_internal_static_data = switch (roots) {
+                .linked_output => true,
+                .platform_entrypoints => |artifact| switch (artifact) {
+                    .dev_run_image => true,
+                    .lir_image => false,
+                },
+                .test_plan => false,
             },
             .test_plan_metadata = switch (roots) {
                 .test_plan => |plan| plan.metadata,

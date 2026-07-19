@@ -1,4 +1,4 @@
-//! Target-layout readonly data symbols for provided non-function constants.
+//! Target-layout readonly data symbols for internal constants and provided data.
 //!
 //! Static data exports are materialized from checked `ConstStore` nodes and the
 //! layout/const plans output by direct LIR lowering.
@@ -23,7 +23,7 @@ const ConstValue = CheckedModule.ConstValue;
 const StaticDataExport = backend.StaticDataExport;
 const StaticDataRelocation = backend.StaticDataRelocation;
 
-/// Checked modules whose provided data exports can become static data.
+/// Checked modules whose constants can become target static data.
 pub const ModuleViews = struct {
     root: ?Checked.LoweringModuleView = null,
     imports: []const Checked.ImportedModuleView = &.{},
@@ -61,12 +61,18 @@ const ConstStrDataSite = struct {
     data: u32,
 };
 
-/// Build readonly data symbols for provided constants and internal LIR static values.
-pub fn buildProvidedDataExports(
+pub const BuildOptions = struct {
+    /// Include host-visible provided constants as well as internal LIR values.
+    include_provided_exports: bool = false,
+};
+
+/// Build readonly data symbols for internal LIR values and optional provided constants.
+pub fn buildStaticData(
     allocator: Allocator,
     modules: ModuleViews,
     lowered: ?*const lir.CheckedPipeline.LoweredProgram,
     target: roc_target.RocTarget,
+    options: BuildOptions,
 ) MaterializationError![]StaticDataExport {
     const root = modules.root orelse {
         if (hasProvidedData(modules)) staticDataInvariant("provided data exports require a root checked module");
@@ -82,13 +88,13 @@ pub fn buildProvidedDataExports(
         return try allocator.alloc(StaticDataExport, 0);
     };
 
-    var builder = StaticDataBuilder.init(allocator, root, modules.imports, lowered_program, target) orelse
+    var builder = StaticDataBuilder.init(allocator, root, modules.imports, lowered_program, target, options) orelse
         return error.UnsupportedTarget;
     defer builder.deinitScratch();
     return try builder.build();
 }
 
-pub fn deinitProvidedDataExports(allocator: Allocator, exports: []StaticDataExport) void {
+pub fn deinitStaticData(allocator: Allocator, exports: []StaticDataExport) void {
     for (exports) |static_export| {
         allocator.free(static_export.symbol_name);
         allocator.free(static_export.bytes);
@@ -119,6 +125,7 @@ const StaticDataBuilder = struct {
     nodes: std.ArrayList(StaticDataExport),
     str_allocations: std.AutoHashMap(ConstStrDataSite, PointerTarget),
     local_symbol_ordinal: u32,
+    include_provided_exports: bool,
 
     fn init(
         allocator: Allocator,
@@ -126,6 +133,7 @@ const StaticDataBuilder = struct {
         imports: []const Checked.ImportedModuleView,
         lowered: *const lir.CheckedPipeline.LoweredProgram,
         target: roc_target.RocTarget,
+        options: BuildOptions,
     ) ?StaticDataBuilder {
         const target_usize = @import("base").target.TargetUsize.fromPtrBitWidth(target.ptrBitWidth());
         return .{
@@ -138,6 +146,7 @@ const StaticDataBuilder = struct {
             .nodes = .empty,
             .str_allocations = std.AutoHashMap(ConstStrDataSite, PointerTarget).init(allocator),
             .local_symbol_ordinal = 0,
+            .include_provided_exports = options.include_provided_exports,
         };
     }
 
@@ -148,7 +157,7 @@ const StaticDataBuilder = struct {
     fn build(self: *StaticDataBuilder) MaterializationError![]StaticDataExport {
         errdefer self.deinitNodes();
 
-        try self.buildProvidedExports();
+        if (self.include_provided_exports) try self.buildProvidedExports();
         try self.buildInternalStaticValues();
 
         return try self.nodes.toOwnedSlice(self.allocator);

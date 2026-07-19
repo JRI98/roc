@@ -4019,7 +4019,11 @@ fn processDevObjectSnapshot(
                     .root = check.CheckedArtifact.loweringViewWithRelations(root_artifact, relation_artifacts),
                     .imports = imported_artifacts,
                 },
-                .{ .requests = build_roots, .include_static_data_exports = true },
+                .{
+                    .requests = build_roots,
+                    .include_provided_data_exports = true,
+                    .include_internal_static_data = true,
+                },
                 .{
                     .target_usize = target_usize,
                 },
@@ -4034,7 +4038,7 @@ fn processDevObjectSnapshot(
                 }
                 allocator.free(entrypoints);
             }
-            const static_data_exports = compile.static_data_exports.buildProvidedDataExports(
+            const static_data_exports = compile.static_data_exports.buildStaticData(
                 allocator,
                 .{
                     .root = check.CheckedArtifact.loweringViewWithRelations(root_artifact, relation_artifacts),
@@ -4042,13 +4046,14 @@ fn processDevObjectSnapshot(
                 },
                 &lowered,
                 target,
+                .{ .include_provided_exports = true },
             ) catch |err| {
                 std.log.err("Failed to materialize static data exports for {s}: {}", .{ field.name, err });
                 hash_results[i].hash_hex = undefined;
                 hash_results[i].supported = false;
                 break :target_snapshot;
             };
-            defer compile.static_data_exports.deinitProvidedDataExports(allocator, static_data_exports);
+            defer compile.static_data_exports.deinitStaticData(allocator, static_data_exports);
 
             if (object_compiler.compileToObjectFile(
                 &lowered.lir_result.store,
