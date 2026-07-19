@@ -1,6 +1,6 @@
 # META
 ~~~ini
-description=Type module import with multi-module compilation
+description=Type mod import with multi-mod compilation
 type=dev_object
 ~~~
 # SOURCE

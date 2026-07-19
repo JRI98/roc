@@ -1645,6 +1645,85 @@ templates that are part of the checked module contract. Functions generated
 after checking, such as Lambda Mono specializations or adapters, use stage-local
 symbols and are not `FnDef` values.
 
+### RECORD FIELDS AND METHODS ARE ABSOLUTELY DISJOINT
+
+RECORD FIELDS AND METHODS ARE DIFFERENT LANGUAGE FEATURES. THEY DO NOT SHARE A
+LOOKUP RULE, A CALL RULE, AN AST NODE, AN IR NODE, A RESOLUTION PATH, OR A
+FALLBACK. THE COMPILER MUST NEVER REPRESENT THEM AS A GENERALIZED "MEMBER," MUST
+NEVER ASK WHETHER ONE COULD BE REINTERPRETED AS THE OTHER, AND MUST NEVER CHOOSE
+BETWEEN THEM USING TYPE INFORMATION.
+
+THE SOURCE SYNTAX SELECTS THE OPERATION BEFORE TYPE CHECKING, WITH ZERO
+AMBIGUITY:
+
+```roc
+field_value = value.field
+field_result = (value.field)(arg)
+method_result = value.method(arg)
+```
+
+`value.field` IS RECORD FIELD ACCESS. `(value.field)(arg)` IS ORDINARY FUNCTION
+APPLICATION WHOSE CALLEE IS THE VALUE PRODUCED BY THAT FIELD ACCESS. THE
+PARENTHESES ARE REQUIRED WHEN CALLING A FUNCTION STORED IN A RECORD FIELD
+WITHOUT FIRST BINDING IT TO A NEW NAME.
+
+`value.method(arg)` IS METHOD DISPATCH. `value.field(arg)` THEREFORE ALSO HAS
+METHOD-CALL SYNTAX; IT MUST NEVER MEAN "ACCESS THE FIELD AND THEN CALL IT." IF
+THE RECEIVER HAS A FUNCTION-VALUED FIELD NAMED `field` BUT NO METHOD NAMED
+`field`, `value.field(arg)` MUST REPORT A MISSING METHOD. THE EXISTENCE OR TYPE
+OF THE RECORD FIELD IS IRRELEVANT TO THAT METHOD LOOKUP.
+
+THE CANONICAL SPELLING HAS NO WHITESPACE BETWEEN THE RECEIVER AND DOT, BETWEEN
+THE DOT AND NAME, OR BETWEEN A METHOD NAME AND ITS OPENING PARENTHESIS. TRIVIA
+RECOVERY AND FORMAT NORMALIZATION MUST NEVER BE USED AS A SIGNAL FOR CHOOSING
+FIELD ACCESS VERSUS METHOD DISPATCH.
+
+THE PARSER, NOT THE TYPE CHECKER, MAKES THE COMPLETE AND FINAL CHOICE:
+
+- A DOTTED LOWERCASE NAME NOT IMMEDIATELY FOLLOWED BY `NoSpaceOpenRound`
+  PRODUCES RECORD FIELD ACCESS.
+- A DOTTED LOWERCASE NAME IMMEDIATELY FOLLOWED BY `NoSpaceOpenRound` PRODUCES A
+  METHOD CALL.
+- IN `(value.field)(arg)`, THE INNER PARENTHESES END THE FIELD-ACCESS EXPRESSION;
+  THE OUTER ARGUMENT LIST THEREFORE PRODUCES AN ORDINARY FUNCTION APPLICATION.
+
+THE DISTINCTION REMAINS ABSOLUTE WHEN A NOMINAL TYPE HAS A RECORD BACKING AND AN
+ASSOCIATED METHOD USES THE SAME NAME AS ONE OF THAT BACKING RECORD'S FIELDS:
+
+```roc
+Thing := { f : I64 -> I64 }.{
+    f : Thing, I64 -> I64
+    f = |_, arg| arg
+}
+
+from_field = |thing| (thing.f)(1)
+from_method = |thing| thing.f(1)
+```
+
+`from_field` ACCESSES THE BACKING RECORD FIELD AND APPLIES THE RESULTING FUNCTION
+VALUE. `from_method` PERFORMS STATIC METHOD DISPATCH. THE NOMINAL WRAPPER DOES
+NOT TURN FIELDS INTO METHODS, AND THE RECORD BACKING DOES NOT MAKE METHODS INTO
+FIELDS.
+
+THE COMPILER MUST PRESERVE THIS CHOICE THROUGH EVERY STAGE:
+
+- PARSING PRODUCES A FIELD-ACCESS NODE FOR `value.field`, AN ORDINARY-APPLY NODE
+  AROUND THAT FIELD ACCESS FOR `(value.field)(args)`, AND A METHOD-CALL NODE FOR
+  `value.method(args)`.
+- CANONICALIZATION AND CHECKING SEND FIELD ACCESS EXCLUSIVELY THROUGH RECORD-ROW
+  TYPING, ORDINARY APPLICATION EXCLUSIVELY THROUGH FUNCTION-CALL TYPING, AND
+  METHOD CALLS EXCLUSIVELY THROUGH STATIC DISPATCH AND METHOD REGISTRIES.
+- CHECKED CIR CONTAINS DISTINCT FIELD-ACCESS, ORDINARY-CALL, AND METHOD-DISPATCH
+  NODES. NO STAGE MAY REWRITE ONE FAMILY INTO ANOTHER OR INSPECT THE RECEIVER
+  TYPE TO RECOVER A CHOICE THAT SYNTAX ALREADY MADE.
+- LATER STAGES CONSUME THE EXPLICIT CHECKED FORM. THEY NEVER PROBE RECORDS WHILE
+  LOWERING METHODS, PROBE METHOD REGISTRIES WHILE LOWERING FIELDS, OR TOLERATE A
+  PRODUCER THAT EMITTED THE WRONG FORM.
+
+ANY COMPONENT THAT CONFLATES THESE FORMS VIOLATES THE LANGUAGE. THE FIX BELONGS
+AT THE FIRST COMPONENT THAT LOST THE SYNTAX DISTINCTION; DOWNSTREAM PRIORITY
+RULES, TYPE-DIRECTED DISAMBIGUATION, RETRIES, AND FALLBACKS ARE FORBIDDEN.
+
 ### Static Dispatch At The Checked Boundary
 
 Checking reports all user-facing static-dispatch errors. This includes missing
@@ -1697,7 +1776,7 @@ Literal-origin dispatch evidence has the same lifetime as the checked literal
 expression or pattern that owns it. If diagnostic recovery replaces that node,
 its evidence is retired atomically and cannot be output as a dispatch plan.
 An append-only raw-node table that can outlive its owning literal violates the
-checked-boundary invariant even if publication could identify and skip the
+checked-boundary invariant even if the output step could identify and skip the
 stale entry.
 
 Source dispatch, type dispatch, method equality, and iterator `for` plans all
@@ -2122,6 +2201,55 @@ error), and the issue #9798 regression test in
 src/check/test/type_checking_integration.zig (a non-hosted `?` into an open
 annotated row is a type error even when the visible errors are included).
 
+### Derived Parser Required-Field Error Composition
+
+A compiler-derived structural record parser, rather than its input-format
+implementation, owns the failure produced when a required field is absent.
+When a parsed record contains at least one field whose type is not the
+recognized optional-field shape `Try(_, [Missing, ..])`, the checker requires
+the parser's shared error row to contain `MissingRequiredField(Str)`. It does so
+by unifying that row with an open row containing the tag. Records whose fields
+are all optional do not add this error, and non-record shapes do not add it.
+Nested derived shapes contribute the error whenever any reachable derived
+record has a required field.
+
+A custom nominal parser nested inside a derived shape keeps its own minimal
+error row. During checking, `constrainDerivedParserErrorRowIncludes` closes an
+unconstrained extension on the instantiated custom-parser method and requires
+every resulting child error tag to occur with the same payload types in the
+parent parser row. A rigid open extension is rejected because the compiler
+cannot prove which additional errors it may produce. Monotype lowering calls
+the custom parser at that checked child row and explicitly injects each child
+error tag into the parent row. This lets a custom JSON scalar parser retain
+only `InvalidJson(Str)` when it is nested in a record whose generated parser
+also needs `MissingRequiredField(Str)`.
+
+Input formats contribute only errors that arise from reading their syntax and
+values. They do not implement a missing-required-field callback. Monotype
+specialization repeats the declared shape rule when a parser constraint was
+generalized before its concrete dispatcher was known: it constrains the
+instantiated callable's open error extension to include
+`MissingRequiredField(Str)` before materializing the callable monotype. This is
+required even when an enclosing generic function consumes and maps every parse
+error, because the generated parser runtime still constructs the missing-field
+branch. Lowering then consumes that solved error row and directly constructs
+`MissingRequiredField(field_name)` when generated record-finalization observes
+an absent required field; absence of that tag from the checked monotype is an
+invariant violation, not a condition lowering may recover from.
+
+Both sides are pinned by tests: accepted —
+test/cli/ParserRequiredFieldError.roc (a non-JSON derived parser reports the
+generic error with the missing field name), and
+test/cli/JsonParseErrorComposition.roc (JSON scalar parsing has only
+`InvalidJson(Str)`, while a required-record parser composes in
+`MissingRequiredField(Str)`),
+test/cli/JsonParseGenericWrapperErrors.roc (a generalized wrapper may consume
+the parser errors without losing the concrete record's required-field error),
+and test/cli/ParserCustomNominalField.roc (a custom nominal parser's narrower
+error row injects into its containing record row); rejected —
+test/cli/ParserMissingRequiredFieldError.roc (a required-record parser cannot
+use a closed format error row that omits `MissingRequiredField(Str)`).
+
 ### Rewrite Inventory
 
 Every solver-mutating rewrite in checking, classified. A change that adds a
@@ -2158,6 +2286,14 @@ Other solved-graph mutations:
   ignorable payload vars for tags the expression provably never constructs
   close to the empty tag union, so matches on constructed values are
   exhaustive without wildcard arms.
+- `constrainDerivedParserRequiredFieldError` — policy: Derived Parser
+  Required-Field Error Composition (above). A structural probe of derived
+  record fields gates ordinary unification of the parser's shared error row
+  with `[MissingRequiredField(Str), ..]`.
+- `constrainDerivedParserErrorRowIncludes` — policy: Derived Parser
+  Required-Field Error Composition (above). A custom parser method's
+  instantiated error extension is closed, then its concrete tags gate ordinary
+  unification constraints requiring the parent parser row to include them.
 - Literal defaulting (`commitLiteralDefault`, `commitLiteralGroupDefault`)
   — policy: literal defaulting as declared in Static Dispatch At The
   Checked Boundary (the `LITERAL DEFAULTED` warning) and the numeric

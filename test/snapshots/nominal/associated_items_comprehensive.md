@@ -352,9 +352,9 @@ ultimate5 = Ultimate.Branch2.Branch2Inner.usesEverything        # 550
 # INVALID LOOKUPS - These MUST produce errors
 # ============================================================================
 
-# Error 1: Module-level trying to access associated item unqualified
+# Error 1: Mod-level trying to access associated item unqualified
 # "value" is only defined inside Simple's associated block
-errModuleUnqualified = value  # ERROR: 'value' not in scope at module level
+errModUnqualified = value  # ERROR: 'value' not in scope at mod level
 
 # Error 2: Outer scope trying to access inner scope item unqualified
 ErrOuterAccessInner := [ERR1].{
@@ -431,14 +431,14 @@ ErrDeepSiblingAccess := [ERR14].{
     }
 }
 
-# Error 7: Module level trying various unqualified accesses
+# Error 7: Mod level trying various unqualified accesses
 errTryOuter = outerItem      # ERROR: not in scope
 errTrySibA = sibAVal         # ERROR: not in scope
 errTryLeaf = leaf1Val        # ERROR: not in scope
 errTryGrand = grandchildVal  # ERROR: not in scope
 ~~~
 # EXPECTED
-NAME NOT IN SCOPE - associated_items_comprehensive.md:350:24:350:29
+NAME NOT IN SCOPE - associated_items_comprehensive.md:350:21:350:26
 NAME NOT IN SCOPE - associated_items_comprehensive.md:361:17:361:26
 NAME NOT IN SCOPE - associated_items_comprehensive.md:372:28:372:35
 NAME NOT IN SCOPE - associated_items_comprehensive.md:387:31:387:39
@@ -454,9 +454,9 @@ NAME NOT IN SCOPE - associated_items_comprehensive.md:431:15:431:28
 │ NAME NOT IN SCOPE ├─ Nothing is named `value` in this scope. ───────────────┐
 └┬──────────────────┘                                                         │
  │                                                                            │
- │  …ified = value  # ERROR: 'value' not in scope at module level             │
- │           ‾‾‾‾‾                                                            │
- └────────────────────────────────── associated_items_comprehensive.md:350:24 ┘
+ │  errModUnqualified = value  # ERROR: 'value' not in scope at mod level     │
+ │                      ‾‾‾‾‾                                                 │
+ └────────────────────────────────── associated_items_comprehensive.md:350:21 ┘
 
     Is it misspelled, or is there an import missing?
 
@@ -846,7 +846,7 @@ EndOfFile,
 # PARSE
 ~~~clojure
 (file
-	(type-module)
+	(type-mod)
 	(statements
 		(s-type-decl
 			(header (name "Simple")
@@ -1613,7 +1613,7 @@ EndOfFile,
 			(p-ident (raw "ultimate5"))
 			(e-ident (raw "Ultimate.Branch2.Branch2Inner.usesEverything")))
 		(s-decl
-			(p-ident (raw "errModuleUnqualified"))
+			(p-ident (raw "errModUnqualified"))
 			(e-ident (raw "value")))
 		(s-type-decl
 			(header (name "ErrOuterAccessInner")
@@ -2199,9 +2199,9 @@ ultimate5 = Ultimate.Branch2.Branch2Inner.usesEverything # 550
 # INVALID LOOKUPS - These MUST produce errors
 # ============================================================================
 
-# Error 1: Module-level trying to access associated item unqualified
+# Error 1: Mod-level trying to access associated item unqualified
 # "value" is only defined inside Simple's associated block
-errModuleUnqualified = value # ERROR: 'value' not in scope at module level
+errModUnqualified = value # ERROR: 'value' not in scope at mod level
 
 # Error 2: Outer scope trying to access inner scope item unqualified
 ErrOuterAccessInner := [ERR1].{
@@ -2278,7 +2278,7 @@ ErrDeepSiblingAccess := [ERR14].{
 	}
 }
 
-# Error 7: Module level trying various unqualified accesses
+# Error 7: Mod level trying various unqualified accesses
 errTryOuter = outerItem # ERROR: not in scope
 
 errTrySibA = sibAVal # ERROR: not in scope
@@ -2797,7 +2797,7 @@ errTryGrand = grandchildVal # ERROR: not in scope
 		(e-lookup-local
 			(p-assign (ident "associated_items_comprehensive.Ultimate.Branch2.Branch2Inner.usesEverything"))))
 	(d-let
-		(p-assign (ident "errModuleUnqualified"))
+		(p-assign (ident "errModUnqualified"))
 		(e-runtime-error (tag "ident_not_in_scope")))
 	(d-let
 		(p-assign (ident "associated_items_comprehensive.ErrOuterAccessInner.outerItem"))

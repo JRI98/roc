@@ -2,7 +2,7 @@
 
 ## Desugaring
 
-Several operators are syntax for [well-known static-dispatch methods](static-dispatch.md#well-known-methods).
+Several operators are syntax for [well-known static-dispatch methods](static-dispatch#well-known-methods).
 The method is selected at compile time from the operand types.
 
 | Operator | Method |
@@ -38,13 +38,13 @@ TODO
 
 Arithmetic operators dispatch to methods on the left operand. Their result type
 is the left operand's type, but the right operand can have a different type if
-the method signature allows it. See [Operators](static-dispatch.md#operators)
+the method signature allows it. See [Operators](static-dispatch#operators)
 in the static dispatch page.
 
 ### Comparison Operators
 
 Comparison operators dispatch to methods that return `Bool`. Both operands must
-have the same type. See [Operators](static-dispatch.md#operators) in the static
+have the same type. See [Operators](static-dispatch#operators) in the static
 dispatch page.
 
 ### Range Operators
@@ -72,8 +72,8 @@ This desugars to:
 
 ```roc
 value = match fallible_expr {
-    Ok(val) -> val
-    Err(_) -> default_value
+    Ok(val) => val
+    Err(_) => default_value
 }
 ```
 

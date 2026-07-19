@@ -81,6 +81,23 @@ pub fn tokenTagToSemanticType(tag: Token.Tag) ?u32 {
     };
 }
 
+/// Classifies a token using the syntax encoded by its neighboring token tags.
+/// A dotted lowercase name followed immediately by `(` cannot be record field
+/// access. The parser separately distinguishes an attached method call from an
+/// uppercase-qualified lookup; both use the LSP `function` token category.
+fn tokenSemanticTypeAt(tags: []const Token.Tag, token_index: usize) ?u32 {
+    const tag = tags[token_index];
+
+    if (tag == .NoSpaceDotLowerIdent and
+        token_index + 1 < tags.len and
+        tags[token_index + 1] == .NoSpaceOpenRound)
+    {
+        return @intFromEnum(SemanticType.function);
+    }
+
+    return tokenTagToSemanticType(tag);
+}
+
 /// Extracts semantic tokens from Roc source code.
 /// Returns a list of SemanticToken structs with absolute positions.
 pub fn extractSemanticTokens(
@@ -111,8 +128,8 @@ pub fn extractSemanticTokens(
     var tokens: std.ArrayListUnmanaged(SemanticToken) = .empty;
     errdefer tokens.deinit(allocator);
 
-    for (tags, regions) |tag, region| {
-        const semantic_type = tokenTagToSemanticType(tag) orelse continue;
+    for (tags, regions, 0..) |_, region, token_index| {
+        const semantic_type = tokenSemanticTypeAt(tags, token_index) orelse continue;
 
         const start_offset = region.start.offset;
         const end_offset = region.end.offset;
@@ -455,13 +472,13 @@ const SemanticCollector = struct {
         var prev_tag: ?Token.Tag = null;
         var prev_region: ?base.Region = null;
 
-        for (tags, regions) |tag, region| {
+        for (tags, regions, 0..) |tag, region, token_index| {
             defer {
                 prev_tag = tag;
                 prev_region = region;
             }
 
-            var semantic_type = tokenTagToSemanticType(tag) orelse continue;
+            var semantic_type = tokenSemanticTypeAt(tags, token_index) orelse continue;
 
             const start_offset = region.start.offset;
             const end_offset = region.end.offset;
@@ -469,9 +486,7 @@ const SemanticCollector = struct {
 
             if (length == 0) continue;
 
-            // Check for Module.function pattern:
-            // Previous token was UpperIdent (module name) and current is DotLowerIdent
-            if ((tag == .DotLowerIdent or tag == .NoSpaceDotLowerIdent) and
+            if (tag == .NoSpaceDotLowerIdent and
                 prev_tag != null and prev_tag.? == .UpperIdent)
             {
                 if (prev_region) |prev_reg| {

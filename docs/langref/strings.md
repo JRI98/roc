@@ -82,17 +82,17 @@ Try putting `'👩'` into `roc repl`. You should see this:
 ```
 » '👩'
 
-128105 : Int *
+128105.0
 ```
 
-The single-quote `'` syntax lets you put a grapheme directly into your source code (so you can see what it looks like) as long as that grapheme contains only one code point, like 👩 does (namely, the code point 128105). At runtime, the single-quoted value will be treated the same as an ordinary number literal—in other words, `'👩'` is syntax sugar for writing `128105`.
+The single-quote `'` syntax lets you put a grapheme directly into your source code (so you can see what it looks like) as long as that grapheme contains only one code point, like 👩 does (namely, the code point 128105). At runtime, the single-quoted value will be treated the same as an ordinary number literal—in other words, `'👩'` is syntax sugar for writing `128105`. (The repl displays it as `128105.0` because number literals [default to `Dec`](numbers#defaulting-to-dec) when nothing pins them to a particular number type.)
 
 You can verify this in `roc repl`:
 
 ```
 » '👩' == 128105
 
-Bool.true : Bool
+True
 ```
 
 Double quotes (`"`), on the other hand, are not type-compatible with integers—not only because strings can be empty (`""` is valid, but `''` is not) but also because there may be more than one code point involved in any given string!
@@ -101,10 +101,10 @@ Double quotes (`"`), on the other hand, are not type-compatible with integers—
 
 Double-quoted literals default to `Str`. When a quoted literal has a nominal
 target type, that type can opt in by defining
-[`from_quote`](static-dispatch.md#literal-conversion).
+[`from_quote`](static-dispatch#literal-conversion).
 
 Interpolated string literals use
-[`from_interpolation`](static-dispatch.md#literal-conversion) on the result
+[`from_interpolation`](static-dispatch#literal-conversion) on the result
 type. The literal segments are `Str` values, and each interpolated value is
 paired with the literal segment that follows it.
 
@@ -124,7 +124,7 @@ We can verify this by putting the following into `roc repl`:
 ```
 » "caf\u(e9)" == "café"
 
-Bool.true : Bool
+True
 ```
 
 As it turns out, `"cafe\u(301)"` is another way to represent the same word. The Unicode code point 0x301 represents a ["combining acute accent"](https://unicodeplus.com/U+0301)—which essentially means that it will add an accent mark to whatever came before it. In this case, since `"cafe\u(301)"` has an `e` before the `"\u(301)"`, that `e` ends up with an accent mark on it and becomes `é`.
@@ -134,7 +134,7 @@ Although these two strings get rendered identically to one another, they are dif
 ```
 » "caf\u(e9)" == "cafe\u(301)"
 
-Bool.false : Bool
+False
 ```
 
 This can be a source of bugs! One way to prevent this problem is to perform string normalization.
@@ -162,7 +162,7 @@ The way Roc organizes the `Str` module and supporting packages is designed to he
 * If you are implementing a Unicode library like [roc-lang/unicode](https://github.com/roc-lang/unicode), working in terms of code points will be unavoidable. Aside from basic readability considerations like `\u(...)` in string literals, if you have the option to avoid working in terms of code points, it is almost always correct to avoid them.
 * If it seems like a good idea to split a string into "characters" (graphemes), you should definitely stop and reconsider whether this is really the best design. Almost always, doing this is some combination of more error-prone or slower (usually both) than doing something else that does not require taking graphemes into consideration.
 
-For this reason (among others), grapheme functions live in [roc-lang/unicode](https://github.com/roc-lang/unicode) rather than in [`Str`](../Str). They are more niche than they seem, so they should not be reached for all the time! Another reason is that 
+For this reason (among others), grapheme functions live in [roc-lang/unicode](https://github.com/roc-lang/unicode) rather than in [`Str`](../Str). They are more niche than they seem, so they should not be reached for all the time!
 
 
 ## Low-Level

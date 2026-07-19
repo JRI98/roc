@@ -12,4 +12,4 @@ platform "glue-try-box-model"
     targets: {}
 
 init_for_host : {} -> Try(Box(Model), I32)
-init_for_host = |{}| Ok(Box.box(program.init({})))
+init_for_host = |{}| Ok(Box.box((program.init)({})))

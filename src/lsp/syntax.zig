@@ -1194,7 +1194,7 @@ pub const SyntaxChecker = struct {
         return null;
     }
 
-    /// Resolve documentation for a lookup expression (local, external, or dot access).
+    /// Resolve documentation for a local lookup, external lookup, or attached method dispatch.
     fn resolveDocForLookup(self: *SyntaxChecker, env: *BuildEnv, module_env: *ModuleEnv, expr_idx: CIR.Expr.Idx) Allocator.Error!?[]const u8 {
         const source = module_env.common.source;
         const store = &module_env.store;
@@ -1228,30 +1228,6 @@ pub const SyntaxChecker = struct {
 
                     if (findExternalModuleEnv(env, module_name)) |external_env| {
                         return try findDocInModule(self.allocator, external_env, function_name);
-                    }
-                }
-            },
-            .e_field_access => |dot| {
-                // Method call - resolve receiver type to find the providing module
-                const field_name = module_env.getSource(dot.field_name_region);
-                const receiver_type_var = ModuleEnv.varFrom(dot.receiver);
-                if (resolveMethodOwnerForLookup(module_env, receiver_type_var)) |method_owner| {
-                    // Prefer local method docs first (e.g. static-dispatch methods
-                    // defined in the current module), then fall back to external
-                    // module lookup for builtin/qualified providers.
-                    if (try findMethodDocForOwnerAndName(self.allocator, module_env, method_owner.owner, field_name)) |local_doc| {
-                        return local_doc;
-                    }
-
-                    const type_name = module_env.getIdentText(method_owner.type_ident);
-                    if (findExternalModuleEnvForMethodOwner(env, method_owner, type_name)) |external_env| {
-                        const qualified_name = try std.fmt.allocPrint(
-                            self.allocator,
-                            "{s}.{s}",
-                            .{ type_name, field_name },
-                        );
-                        defer self.allocator.free(qualified_name);
-                        return try findDocInModule(self.allocator, external_env, qualified_name);
                     }
                 }
             },
@@ -1675,35 +1651,6 @@ pub const SyntaxChecker = struct {
                     self.logDebug(.build, "[DEF] e_lookup_external: could not extract module name from '{s}'", .{region_text});
                     return null;
                 },
-                .e_field_access => |dot| {
-                    // Static dispatch - cursor is on method name
-                    // Get the type of the receiver to find which module provides the method
-                    const receiver_type_var = ModuleEnv.varFrom(dot.receiver);
-                    var type_writer = module_env.initTypeWriter() catch |err| {
-                        self.logDebug(.build, "[DEF] initTypeWriter failed: {s}", .{@errorName(err)});
-                        oom.* = err;
-                        return null;
-                    };
-                    defer type_writer.deinit();
-
-                    type_writer.write(receiver_type_var, .one_line) catch |err| switch (err) {
-                        error.OutOfMemory => {
-                            oom.* = error.OutOfMemory;
-                            return null;
-                        },
-                        error.WriteFailed => {
-                            self.logDebug(.build, "[DEF] type_writer.write failed: {s}", .{@errorName(err)});
-                            return null;
-                        },
-                    };
-                    const type_str = type_writer.get();
-
-                    const base_type = extractBaseTypeName(type_str);
-
-                    self.logDebug(.build, "[DEF] e_dot_access type_str='{s}', base_type='{s}'", .{ type_str, base_type });
-
-                    return self.findModuleByName(base_type, oom);
-                },
                 .e_dispatch_call => |method_call| {
                     // Attached method call - navigate to the provider module for the receiver type
                     // Get the type of the receiver to find which module provides the method
@@ -1730,7 +1677,7 @@ pub const SyntaxChecker = struct {
                     // Extract the base type name (e.g., "Str" from complex type)
                     const base_type = extractBaseTypeName(type_str);
 
-                    self.logDebug(.build, "[DEF] e_field_access type_str='{s}', base_type='{s}'", .{ type_str, base_type });
+                    self.logDebug(.build, "[DEF] e_dispatch_call type_str='{s}', base_type='{s}'", .{ type_str, base_type });
 
                     // Find the module for this type
                     // TODO: Also navigate to the specific method definition within the module
@@ -2619,12 +2566,12 @@ pub const SyntaxChecker = struct {
                     if (added) {} else {}
                 }
             },
-            .after_value_dot => |record_access| {
-                self.logDebug(.completion, "completion: after_record_dot for '{s}' at offset {d}", .{ record_access.access_chain, record_access.member_start });
+            .after_value_dot => |value_dot| {
+                self.logDebug(.completion, "completion: after_value_dot for '{s}' at offset {d}", .{ value_dot.access_chain, value_dot.receiver_segment_start });
                 if (module_env_opt) |module_env| {
                     var chain_resolved = false;
                     var chain_oom: ?Allocator.Error = null;
-                    if (resolveAccessChainTypeVar(self, &builder, module_env, module_lookup_env, env, record_access.access_chain, record_access.chain_start, &chain_oom)) |resolved| {
+                    if (resolveAccessChainTypeVar(self, &builder, module_env, module_lookup_env, env, value_dot.access_chain, value_dot.chain_start, &chain_oom)) |resolved| {
                         chain_resolved = true;
                         try builder.addFieldsFromTypeVar(resolved.module_env, resolved.type_var);
                         try builder.addTupleIndexCompletions(resolved.module_env, resolved.type_var);
@@ -2636,32 +2583,31 @@ pub const SyntaxChecker = struct {
                     // type-based traversal fails, try namespace-style member
                     // completion from qualified definition names.
                     var namespace_resolved = false;
-                    if (!chain_resolved and record_access.access_chain.len > 0 and std.ascii.isUpper(record_access.access_chain[0])) {
-                        namespace_resolved = try builder.addNamespaceMemberCompletions(module_env, record_access.access_chain);
+                    if (!chain_resolved and value_dot.access_chain.len > 0 and std.ascii.isUpper(value_dot.access_chain[0])) {
+                        namespace_resolved = try builder.addNamespaceMemberCompletions(module_env, value_dot.access_chain);
                     }
 
                     if (!chain_resolved and !namespace_resolved) {
-                        const variable_name = lastChainSegment(record_access.access_chain);
-                        const variable_start = record_access.member_start;
+                        const variable_name = lastChainSegment(value_dot.access_chain);
+                        const variable_start = value_dot.receiver_segment_start;
 
-                        // Try the precise CIR-based lookup first: findDotReceiverTypeVar
-                        // specifically looks for e_field_access nodes and returns the
-                        // receiver's type, which is semantically correct for dot
-                        // completions. Fall back to findExprEndingAt for cases where
-                        // the CIR lacks a dot access node (e.g., incomplete code).
+                        // A prior complete snapshot may have a field-access node at
+                        // this position. Its receiver type remains useful for this
+                        // incomplete value-dot prefix; it does not select field or
+                        // method semantics. Otherwise, query the preceding expression.
                         var resolved_type_var: ?types.Var = null;
-                        if (cir_queries.findDotReceiverTypeVar(module_env, cursor_offset)) |type_var| {
+                        if (cir_queries.findFieldAccessReceiverTypeVar(module_env, cursor_offset)) |type_var| {
                             resolved_type_var = type_var;
                         }
-                        if (resolved_type_var == null and record_access.dot_offset > 0) {
-                            if (cir_queries.findExprEndingAt(module_env, record_access.dot_offset)) |type_at| {
+                        if (resolved_type_var == null and value_dot.dot_offset > 0) {
+                            if (cir_queries.findExprEndingAt(module_env, value_dot.dot_offset)) |type_at| {
                                 resolved_type_var = type_at.type_var;
                             }
                         }
                         // When using snapshot, cursor positions don't correspond to snapshot CIR
                         // So we must look up by name instead of analyzing the dot expression
                         if (used_snapshot or resolved_type_var == null) {
-                            self.logDebug(.completion, "completion: using name-based lookup (snapshot={}, or findDotReceiverTypeVar failed)", .{used_snapshot});
+                            self.logDebug(.completion, "completion: using name-based lookup (snapshot={}, or receiver-type lookup failed)", .{used_snapshot});
                             try builder.addRecordFieldCompletions(module_env, variable_name, variable_start);
                             self.logDebug(.completion, "completion: after addRecordFieldCompletions, items={d}", .{items.items.len});
                             try builder.addMethodCompletions(module_env, variable_name, variable_start);
@@ -2674,18 +2620,18 @@ pub const SyntaxChecker = struct {
                         }
                     }
                 } else {
-                    self.logDebug(.completion, "completion: NO module_env for record/method completions", .{});
+                    self.logDebug(.completion, "completion: NO module_env for value-dot completions", .{});
                 }
             },
             .after_receiver_dot => |info| {
                 // Use CIR to resolve receiver types for chained calls (e.g., value.func().).
                 // This avoids brittle text parsing and keeps completion tied to the AST.
                 if (module_env_opt) |module_env| {
-                    // Prefer findDotReceiverTypeVar (semantic dot-access lookup)
-                    // and fall back to findExprEndingAt (position-based) when the
-                    // CIR doesn't have a dot access node for this position.
+                    // A prior complete snapshot may have a field access at this
+                    // position. Use only its receiver type for the unfinished
+                    // prefix; field and method candidates remain independent.
                     var resolved_type_var: ?types.Var = null;
-                    if (cir_queries.findDotReceiverTypeVar(module_env, cursor_offset)) |type_var| {
+                    if (cir_queries.findFieldAccessReceiverTypeVar(module_env, cursor_offset)) |type_var| {
                         resolved_type_var = type_var;
                     }
                     if (resolved_type_var == null and info.dot_offset > 0) {

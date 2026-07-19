@@ -1,6 +1,6 @@
 # META
 ~~~ini
-description=Module dot malformed (should error)
+description=Mod dot malformed (should error)
 type=expr
 ~~~
 # SOURCE
@@ -8,7 +8,7 @@ type=expr
 I.5
 ~~~
 # EXPECTED
-INVALID TUPLE ACCESS - module_dot_tuple.md:1:1:1:4
+INVALID TUPLE ACCESS - mod_dot_tuple.md:1:1:1:4
 # PROBLEMS
 
 ┌──────────────────────┐
@@ -17,7 +17,7 @@ INVALID TUPLE ACCESS - module_dot_tuple.md:1:1:1:4
  │                                                                            │
  │  I.5                                                                       │
  │  ‾‾‾                                                                       │
- └─────────────────────────────────────────────────── module_dot_tuple.md:1:1 ┘
+ └─────────────────────────────────────────────────── mod_dot_tuple.md:1:1 ┘
 
 
 # TOKENS

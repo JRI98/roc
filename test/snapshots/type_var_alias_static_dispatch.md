@@ -116,14 +116,14 @@ EndOfFile,
 # PARSE
 ~~~clojure
 (file
-	(type-module)
+	(type-mod)
 	(statements
 		(s-type-anno (name "call_default")
 			(ty-fn
 				(ty-record)
 				(ty-var (raw "thing")))
 			(where
-				(method (module-of "thing") (name "default")
+				(method (mod-of "thing") (name "default")
 					(args)
 					(ty-var (raw "thing")))))
 		(s-decl
@@ -145,7 +145,7 @@ EndOfFile,
 				(ty-var (raw "b"))
 				(ty-var (raw "a")))
 			(where
-				(method (module-of "a") (name "from_b")
+				(method (mod-of "a") (name "from_b")
 					(args
 						(ty-var (raw "b")))
 					(ty-var (raw "a")))))
@@ -169,11 +169,11 @@ EndOfFile,
 				(ty-var (raw "val"))
 				(ty-var (raw "val")))
 			(where
-				(method (module-of "val") (name "transform")
+				(method (mod-of "val") (name "transform")
 					(args
 						(ty-var (raw "val")))
 					(ty-var (raw "val")))
-				(method (module-of "val") (name "validate")
+				(method (mod-of "val") (name "validate")
 					(args
 						(ty-var (raw "val")))
 					(ty (name "Bool")))))
@@ -205,11 +205,11 @@ EndOfFile,
 				(ty-var (raw "x"))
 				(ty-var (raw "x")))
 			(where
-				(method (module-of "x") (name "second")
+				(method (mod-of "x") (name "second")
 					(args
 						(ty-var (raw "x")))
 					(ty-var (raw "x")))
-				(method (module-of "x") (name "first")
+				(method (mod-of "x") (name "first")
 					(args)
 					(ty-var (raw "x")))))
 		(s-decl
@@ -238,11 +238,11 @@ EndOfFile,
 					(ty-var (raw "a"))
 					(ty-var (raw "b"))))
 			(where
-				(method (module-of "a") (name "convert")
+				(method (mod-of "a") (name "convert")
 					(args
 						(ty-var (raw "a")))
 					(ty-var (raw "a")))
-				(method (module-of "b") (name "convert")
+				(method (mod-of "b") (name "convert")
 					(args
 						(ty-var (raw "b")))
 					(ty-var (raw "b")))))
@@ -275,7 +275,7 @@ EndOfFile,
 				(ty (name "Str"))
 				(ty-var (raw "t")))
 			(where
-				(method (module-of "t") (name "create")
+				(method (mod-of "t") (name "create")
 					(args
 						(ty (name "Str"))
 						(ty (name "U64")))
@@ -301,7 +301,7 @@ EndOfFile,
 				(ty (name "Str"))
 				(ty-var (raw "thing")))
 			(where
-				(method (module-of "thing") (name "from_str")
+				(method (mod-of "thing") (name "from_str")
 					(args
 						(ty (name "Str")))
 					(ty-var (raw "thing")))))

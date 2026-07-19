@@ -69,7 +69,7 @@ EndOfFile,
 # PARSE
 ~~~clojure
 (file
-	(type-module)
+	(type-mod)
 	(statements
 		(s-type-anno (name "make_map")
 			(ty-fn
@@ -80,11 +80,11 @@ EndOfFile,
 					(ty (name "I64"))
 					(ty (name "I64"))))
 			(where
-				(method (module-of "a") (name "decode")
+				(method (mod-of "a") (name "decode")
 					(args
 						(ty (name "I64")))
 					(ty-var (raw "a")))
-				(method (module-of "b") (name "encode")
+				(method (mod-of "b") (name "encode")
 					(args
 						(ty-var (raw "b")))
 					(ty (name "I64")))))

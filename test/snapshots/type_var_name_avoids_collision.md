@@ -1,6 +1,6 @@
 # META
 ~~~ini
-description=Type variable names avoid collision with existing identifiers in module
+description=Type variable names avoid collision with existing identifiers in mod
 type=file
 ~~~
 # SOURCE

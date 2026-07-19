@@ -260,8 +260,6 @@ fn structuralJsonSource(
     errdefer source.deinit(allocator);
 
     try source.appendSlice(allocator,
-        \\module [main]
-        \\
         \\Shape : {
         \\
     );
@@ -277,7 +275,7 @@ fn structuralJsonSource(
     try source.appendSlice(allocator, "}\n\n");
     switch (operation) {
         .parse => try source.appendSlice(allocator,
-            \\main : Str -> Try(Shape, Json.ParseErr)
+            \\main : Str -> Try(Shape, [InvalidJson(Str), MissingRequiredField(Str)])
             \\main = |json| Json.parse(json)
             \\
         ),
@@ -813,8 +811,6 @@ test "issue 10153 nested loops do not multiply SpecConstr callable functions" {
     // nested loop may add its own worker family, but must not duplicate the
     // already-specialized callable graph produced by the generic Json wrapper.
     const single_loop_source =
-        \\module [main]
-        \\
         \\outer : List(U8) -> List(U8)
         \\outer = |xs| {
         \\    var $out = []
@@ -845,8 +841,6 @@ test "issue 10153 nested loops do not multiply SpecConstr callable functions" {
         \\}
     ;
     const nested_loop_source =
-        \\module [main]
-        \\
         \\outer : List(U8) -> List(U8)
         \\outer = |xs| {
         \\    var $out = []
@@ -1443,8 +1437,6 @@ test "issue 10121 structural JSON helper sharing survives LIR lowering" {
 test "issue 10121 shared JSON helpers preserve optional nested round trips" {
     const allocator = std.testing.allocator;
     const source =
-        \\module [main]
-        \\
         \\Shape : {
         \\    first : Try({ bar : Str, count : U64 }, [Missing]),
         \\    second : Try({ bar : Str, count : U64 }, [Missing]),
@@ -1460,7 +1452,7 @@ test "issue 10121 shared JSON helpers preserve optional nested round trips" {
         \\        third: Ok({ bar: "three", count: 3 }),
         \\    }
         \\    encoded = Json.to_str(original)
-        \\    parsed : Try(Shape, Json.ParseErr)
+        \\    parsed : Try(Shape, [InvalidJson(Str), MissingRequiredField(Str)])
         \\    parsed = Json.parse(encoded)
         \\
         \\    match parsed {
@@ -1491,8 +1483,6 @@ test "issue 10121 shared JSON helpers preserve optional nested round trips" {
 test "issue 9802 same-type map2 specialization counters are bounded" {
     const allocator = std.testing.allocator;
     const source =
-        \\module [main]
-        \\
         \\Boxed(a) := [Boxed(a)]
         \\
         \\const : a -> Boxed(a)
@@ -1545,8 +1535,6 @@ test "issue 9802 same-type map2 specialization counters are bounded" {
 test "issue 9802 growing-structural map2 specialization counters are bounded" {
     const allocator = std.testing.allocator;
     const source =
-        \\module [main]
-        \\
         \\Boxed(a) := [Boxed(a)]
         \\
         \\const : a -> Boxed(a)
@@ -1597,15 +1585,13 @@ test "issue 9802 growing-structural map2 specialization counters are bounded" {
 test "imported and local generic specialization counters reuse closed types" {
     const allocator = std.testing.allocator;
     const util_module =
-        \\module [identity]
-        \\
-        \\identity : a -> a
-        \\identity = |value| value
+        \\Util := [].{
+        \\    identity : a -> a
+        \\    identity = |value| value
+        \\}
     ;
     const source =
-        \\module [main]
-        \\
-        \\import Util exposing [identity]
+        \\import Util
         \\
         \\Boxed(a) := [Boxed(a)]
         \\
@@ -1616,8 +1602,8 @@ test "imported and local generic specialization counters reuse closed types" {
         \\main = {
         \\    value = Boxed(1)
         \\    {
-        \\        imported_a: identity(value),
-        \\        imported_b: identity(value),
+        \\        imported_a: Util.identity(value),
+        \\        imported_b: Util.identity(value),
         \\        local_a: local_identity(value),
         \\        local_b: local_identity(value),
         \\    }
@@ -1637,8 +1623,6 @@ test "imported and local generic specialization counters reuse closed types" {
 test "alias-heavy generic specialization count does not exceed backing types" {
     const allocator = std.testing.allocator;
     const backing_source =
-        \\module [main]
-        \\
         \\id : a -> a
         \\id = |value| value
         \\
@@ -1662,8 +1646,6 @@ test "alias-heavy generic specialization count does not exceed backing types" {
         \\}
     ;
     const alias_source =
-        \\module [main]
-        \\
         \\Alias0 : U64
         \\Alias1 : Alias0
         \\Alias2 : Alias1
@@ -1703,8 +1685,6 @@ test "alias-heavy generic specialization count does not exceed backing types" {
 test "disabling monotype specialization cache does not change monotype output" {
     const allocator = std.testing.allocator;
     const source =
-        \\module [main]
-        \\
         \\identity : a -> a
         \\identity = |value| value
         \\
@@ -1728,8 +1708,6 @@ test "disabling monotype specialization cache does not change monotype output" {
 test "monotype specialization cache read reuses loaded hits and lowers fresh misses" {
     const allocator = std.testing.allocator;
     const mixed_source =
-        \\module [main]
-        \\
         \\identity : a -> a
         \\identity = |value| value
         \\
@@ -1779,8 +1757,6 @@ test "monotype specialization cache read reuses loaded hits and lowers fresh mis
 test "nested function specializations keep equal types at different sites distinct" {
     const allocator = std.testing.allocator;
     const source =
-        \\module [main]
-        \\
         \\first : U64 -> U64
         \\first = |n| {
         \\    id = |x| x
@@ -1820,8 +1796,6 @@ test "nested function specializations keep equal types at different sites distin
 test "one nested function site specializes at multiple closed function types" {
     const allocator = std.testing.allocator;
     const source =
-        \\module [main]
-        \\
         \\choose : a -> a
         \\choose = |value| {
         \\    id = |x| x
@@ -1854,8 +1828,6 @@ test "one nested function site specializes at multiple closed function types" {
 test "differently ordered source record rows produce normalized monotype rows" {
     const allocator = std.testing.allocator;
     const source =
-        \\module [main]
-        \\
         \\choose : Bool -> { a : U64, b : U64 }
         \\choose = |flag| if flag { b: 2, a: 1 } else { a: 3, b: 4 }
         \\
@@ -3159,8 +3131,6 @@ fn expectEscapingIterChainAllocatesNothing(source: []const u8) TestError!void {
 
 test "iter alloc static: iterator returned from a function is zero-alloc" {
     try expectEscapingIterChainAllocatesNothing(
-        \\module [main]
-        \\
         \\consume : Iter(U64) -> U64
         \\consume = |it| {
         \\    var $sum = 0.U64
@@ -3180,8 +3150,6 @@ test "iter alloc static: iterator returned from a function is zero-alloc" {
 
 test "iter alloc static: iterator passed to a non-inlined function is zero-alloc" {
     try expectEscapingIterChainAllocatesNothing(
-        \\module [main]
-        \\
         \\consume : Iter(U64) -> U64
         \\consume = |it| {
         \\    var $sum = 0.U64
@@ -3198,8 +3166,6 @@ test "iter alloc static: iterator passed to a non-inlined function is zero-alloc
 
 test "iter alloc static: branch-chosen iterator is zero-alloc" {
     try expectEscapingIterChainAllocatesNothing(
-        \\module [main]
-        \\
         \\consume : Iter(U64) -> U64
         \\consume = |it| {
         \\    var $sum = 0.U64
@@ -3224,8 +3190,6 @@ test "iter alloc static: branch-chosen iterator is zero-alloc" {
 
 test "iter alloc static: same adapter with different capture layouts is zero-alloc" {
     try expectEscapingIterChainAllocatesNothing(
-        \\module [main]
-        \\
         \\Config : { big : U64, small : U64 }
         \\
         \\consume : Iter(U64) -> U64
@@ -3257,8 +3221,6 @@ test "iter alloc static: same adapter with different capture layouts is zero-all
 test "iter alloc static: runtime-count map wrapping terminates at dynamic boundary" {
     const allocator = std.testing.allocator;
     const source =
-        \\module [main]
-        \\
         \\consume : Iter(U64) -> U64
         \\consume = |it| {
         \\    var $sum = 0.U64
@@ -3300,8 +3262,6 @@ test "iter alloc static: runtime-count map wrapping terminates at dynamic bounda
 test "iter alloc static: recursive map wrapping terminates at dynamic boundary" {
     const allocator = std.testing.allocator;
     const source =
-        \\module [main]
-        \\
         \\consume : Iter(U64) -> U64
         \\consume = |it| {
         \\    var $sum = 0.U64
@@ -3349,8 +3309,6 @@ test "iter alloc static: recursive map wrapping terminates at dynamic boundary" 
 fn deepStaticChainSource(comptime map_count: usize) []const u8 {
     comptime {
         var source: []const u8 =
-            \\module [main]
-            \\
             \\main : U64 -> U64
             \\main = |n| {
             \\    i0 = 0.U64..<n
@@ -3392,8 +3350,6 @@ test "iter alloc static: static chain past the depth cap uses forced dynamic rep
 test "iter alloc static: base list fold is zero-alloc" {
     const allocator = std.testing.allocator;
     const source =
-        \\module [main]
-        \\
         \\main : I64
         \\main = {
         \\    xs = [1.I64, 2, 3, 4, 5]
@@ -3510,8 +3466,6 @@ fn expectRangeMapCollectUsesDirectListLoop(source: []const u8, expected_append_u
 test "user iter method is not recognized as builtin list cursor" {
     const allocator = std.testing.allocator;
     var lowered_source = try lowerModule(allocator,
-        \\module [main]
-        \\
         \\Bag := [Bag].{
         \\    iter : Bag -> Iter(I64)
         \\    iter = |_| Iter.single(1.I64)
@@ -3536,8 +3490,6 @@ test "user iter method is not recognized as builtin list cursor" {
 test "destination baseline: boxed record update reboxes a list and string payload" {
     const allocator = std.testing.allocator;
     var lowered_source = try lowerModule(allocator,
-        \\module [main]
-        \\
         \\Plant : {
         \\    x : I32,
         \\    label : Str,
@@ -3585,8 +3537,6 @@ test "destination baseline: boxed record update reboxes a list and string payloa
 test "destination phase 3: direct boxed update wrapper calls a return-slot variant" {
     const allocator = std.testing.allocator;
     var lowered_source = try lowerModule(allocator,
-        \\module [main]
-        \\
         \\Model : {
         \\    tick : U64,
         \\    label : Str,
@@ -3622,8 +3572,6 @@ test "destination phase 3: direct boxed update wrapper calls a return-slot varia
 test "destination phase 3: effectful boxed update wrapper prepares box update" {
     const allocator = std.testing.allocator;
     var lowered_source = try lowerModule(allocator,
-        \\module [main]
-        \\
         \\Model : {
         \\    tick : U64,
         \\    label : Str,
@@ -3648,8 +3596,6 @@ test "destination phase 3: effectful boxed update wrapper prepares box update" {
 test "destination baseline: boxed lambda is packed then boxed" {
     const allocator = std.testing.allocator;
     var lowered_source = try lowerModule(allocator,
-        \\module [main]
-        \\
         \\Formatter : U64 -> Str
         \\
         \\make : Str -> Box(Formatter)
@@ -3669,8 +3615,6 @@ test "destination baseline: boxed lambda is packed then boxed" {
 test "destination baseline: large record return feeds a record update" {
     const allocator = std.testing.allocator;
     var lowered_source = try lowerModule(allocator,
-        \\module [main]
-        \\
         \\Big : {
         \\    label : Str,
         \\    items : List(U64),
@@ -3713,8 +3657,6 @@ test "destination baseline: large record return feeds a record update" {
 // Ported pending iterator redesign: the materialize-inline plan decision this test asserts is not part of the current inline plan.
 // test "call value wrapper is optimized-inline eligible but not materialize-inline eligible" {
 //     try expectInlinePlanDecisions(
-//         \\module [main]
-//         \\
 //         \\callee : U64 -> U64
 //         \\callee = |x| x + 1
 //         \\
@@ -3729,8 +3671,6 @@ test "destination baseline: large record return feeds a record update" {
 // Ported pending iterator redesign: the materialize-inline plan decision this test asserts is not part of the current inline plan.
 // test "simple direct low-level wrapper is materialize-inline eligible" {
 //     try expectInlinePlanDecisions(
-//         \\module [main]
-//         \\
 //         \\callee : U64 -> U64
 //         \\callee = |x| x + 1
 //         \\
@@ -3746,8 +3686,6 @@ test "destination baseline: large record return feeds a record update" {
 
 test "plant iter pipeline collect uses direct range map list loop" {
     try expectRangeMapCollectUsesDirectListLoop(
-        \\module [main]
-        \\
         \\Plant : { seed : I64 }
         \\
         \\random_plant : I64 -> Plant
@@ -3767,8 +3705,6 @@ test "plant iter pipeline collect uses direct range map list loop" {
 
 test "direct range map collect uses direct list loop" {
     try expectRangeMapCollectUsesDirectListLoop(
-        \\module [main]
-        \\
         \\Plant : { seed : I64 }
         \\
         \\random_plant : I64 -> Plant
@@ -3789,8 +3725,6 @@ test "non-inlined call list argument keeps let-bound leaves available" {
     // boundary materializes inside nested inlining.
     const allocator = std.testing.allocator;
     var optimized = try lowerModule(allocator,
-        \\module [main]
-        \\
         \\len_rec : List(U64), U64 -> U64
         \\len_rec = |bytes, acc| {
         \\    match bytes {
@@ -3837,8 +3771,6 @@ test "multi-use match binding emits branch bodies once" {
     // referenced; otherwise every use duplicates every branch body.
     const allocator = std.testing.allocator;
     var optimized = try lowerModule(allocator,
-        \\module [main]
-        \\
         \\route : U64 -> U64
         \\route = |x| {
         \\    if x > 3 {
@@ -3876,8 +3808,6 @@ test "boundary field access projects private leaf branch" {
     // sparse receiver whole.
     const allocator = std.testing.allocator;
     var optimized = try lowerModule(allocator,
-        \\module [main]
-        \\
         \\countdown : U64 -> U64
         \\countdown = |x| {
         \\    if x > 3 {
@@ -3924,8 +3854,6 @@ test "local iterator append loop demands step captures across states" {
     // without a capture its body demands.
     const allocator = std.testing.allocator;
     var optimized = try lowerModule(allocator,
-        \\module [main]
-        \\
         \\Point : { x : I64 }
         \\
         \\points : () -> Iter(Point)
@@ -3949,16 +3877,14 @@ test "local iterator append loop demands step captures across states" {
 test "imported iterator producer keeps finite step callables" {
     const allocator = std.testing.allocator;
     const producer_module =
-        \\module [points]
+        \\Points := [].{
+        \\    Point : { x : I64 }
         \\
-        \\Point : { x : I64 }
-        \\
-        \\points : () -> Iter(Point)
-        \\points = || [{ x: 1.I64 }, { x: 2 }].iter().append({ x: 3 })
+        \\    points : () -> Iter(Point)
+        \\    points = || [{ x: 1.I64 }, { x: 2 }].iter().append({ x: 3 })
+        \\}
     ;
     const source =
-        \\module [main]
-        \\
         \\import Points
         \\
         \\main : I64
@@ -3983,8 +3909,6 @@ test "imported iterator producer keeps finite step callables" {
 test "static list iter append loop eliminates public iter adapters" {
     const allocator = std.testing.allocator;
     const iter_source =
-        \\module [main]
-        \\
         \\Point : { x : I64, y : I64 }
         \\
         \\sum_points : U64 -> I64
@@ -4016,8 +3940,6 @@ test "static list iter append loop eliminates public iter adapters" {
         \\main = sum_points(2)
     ;
     const list_source =
-        \\module [main]
-        \\
         \\Point : { x : I64, y : I64 }
         \\
         \\sum_points : U64 -> I64
@@ -4064,8 +3986,6 @@ test "static list iter append loop eliminates public iter adapters" {
 // test "post-check lowering mode constructs optimized context only in optimized mode" {
 //     const allocator = std.testing.allocator;
 //     const source =
-//         \\module [main]
-//         \\
 //         \\main : U64
 //         \\main = 0
 //     ;
@@ -4083,8 +4003,6 @@ test "static list iter append loop eliminates public iter adapters" {
 // test "checking finalization lowering constructs no optimized context" {
 //     const allocator = std.testing.allocator;
 //     const source =
-//         \\module [main]
-//         \\
 //         \\main : U64
 //         \\main = 0
 //     ;
@@ -4100,8 +4018,6 @@ test "static list iter append loop eliminates public iter adapters" {
 test "post-check lowering mode gates public iter adapter elimination" {
     const allocator = std.testing.allocator;
     const source =
-        \\module [main]
-        \\
         \\sum_points : U64 -> U64
         \\sum_points = |extra| {
         \\    base_points = [1, 2, 3].iter()
@@ -4137,8 +4053,6 @@ test "post-check lowering mode gates public iter adapter elimination" {
 // test "state loop lowers to ordinary lir joins" {
 //     const allocator = std.testing.allocator;
 //     const source =
-//         \\module [main]
-//         \\
 //         \\main : U64
 //         \\main = 0
 //     ;
@@ -4222,8 +4136,6 @@ test "post-check lowering mode gates public iter adapter elimination" {
 test "dynamic static list iter append loop splits nested callable captures" {
     const allocator = std.testing.allocator;
     const source =
-        \\module [main]
-        \\
         \\Point : { x : I64, y : I64 }
         \\
         \\main : U64 -> I64
@@ -4258,8 +4170,6 @@ test "dynamic static list iter append loop splits nested callable captures" {
 
 test "static record list iter append loop avoids direct-list append allocation" {
     const record_iter_source =
-        \\module [main]
-        \\
         \\Point : { x : I64, y : I64 }
         \\
         \\main : Bool -> I64
@@ -4283,8 +4193,6 @@ test "static record list iter append loop avoids direct-list append allocation" 
         \\}
     ;
     const record_list_source =
-        \\module [main]
-        \\
         \\Point : { x : I64, y : I64 }
         \\
         \\main : Bool -> I64
@@ -4313,8 +4221,6 @@ test "static record list iter append loop avoids direct-list append allocation" 
 
 test "static primitive list iter append loop avoids direct-list append allocation" {
     const primitive_iter_source =
-        \\module [main]
-        \\
         \\main : Bool -> I64
         \\main = |use_extra| {
         \\    base_points = [11.I64].iter()
@@ -4334,8 +4240,6 @@ test "static primitive list iter append loop avoids direct-list append allocatio
         \\}
     ;
     const primitive_list_source =
-        \\module [main]
-        \\
         \\main : Bool -> I64
         \\main = |use_extra| {
         \\    base_points = [11.I64]
@@ -4361,8 +4265,6 @@ test "static primitive list iter append loop avoids direct-list append allocatio
 test "stream from iterator collect keeps finite step callables" {
     const allocator = std.testing.allocator;
     const source =
-        \\module [main]
-        \\
         \\main : () => List(I64)
         \\main = || {
         \\    stream =
@@ -4384,8 +4286,6 @@ test "stream from iterator collect keeps finite step callables" {
 
 test "optimized infinite custom iterator consumes finite prefix" {
     const source =
-        \\module [main]
-        \\
         \\main : U64
         \\main = {
         \\    adv : ((U64, U64) -> Try((U64, (U64, U64)), [NoMore]))
@@ -4408,8 +4308,6 @@ test "optimized infinite custom iterator consumes finite prefix" {
 test "spec constr list filter-map loop does not produce unbound ARC locals" {
     const allocator = std.testing.allocator;
     const source =
-        \\module [main]
-        \\
         \\main : List(I32)
         \\main = {
         \\    var $out = []
@@ -4426,8 +4324,6 @@ test "spec constr list filter-map loop does not produce unbound ARC locals" {
 
 test "spec constr preserves known-match expect failure order" {
     try expectOptimizedHostEvents(
-        \\module [main]
-        \\
         \\State : { n : I64 }
         \\Step : [One({ item : I64 })]
         \\
@@ -4458,8 +4354,6 @@ test "spec constr preserves known-match expect failure order" {
 
 test "spec constr preserves known-match crash order" {
     try expectOptimizedHostEvents(
-        \\module [main]
-        \\
         \\State : { n : I64 }
         \\Step : [One({ item : I64 })]
         \\
@@ -4490,8 +4384,6 @@ test "spec constr preserves known-match crash order" {
 test "spec constr specializes primitive-start record state carried by while loop" {
     const allocator = std.testing.allocator;
     const source =
-        \\module [main]
-        \\
         \\State : { n : I64, acc : I64 }
         \\
         \\sum_from : I64 -> I64
@@ -4525,8 +4417,6 @@ test "spec constr specializes primitive-start record state carried by while loop
 test "spec constr does not require single-field record wrapper for local loop splitting" {
     const allocator = std.testing.allocator;
     const wrapped_source =
-        \\module [main]
-        \\
         \\Start : { n : I64 }
         \\State : { n : I64, acc : I64 }
         \\
@@ -4545,8 +4435,6 @@ test "spec constr does not require single-field record wrapper for local loop sp
         \\main = sum_from({ n: 4 })
     ;
     const primitive_source =
-        \\module [main]
-        \\
         \\State : { n : I64, acc : I64 }
         \\
         \\sum_from : I64 -> I64
@@ -4576,8 +4464,6 @@ test "spec constr does not require single-field record wrapper for local loop sp
 test "spec constr splits loop record state with opaque callable field" {
     const allocator = std.testing.allocator;
     const source =
-        \\module [main]
-        \\
         \\State : { n : I64, f : I64 -> I64 }
         \\
         \\inc : I64 -> I64
@@ -4614,8 +4500,6 @@ test "spec constr splits loop record state with opaque callable field" {
 test "spec constr splits loop record state with direct callable captures" {
     const allocator = std.testing.allocator;
     const source =
-        \\module [main]
-        \\
         \\State : { n : I64, f : I64 -> I64 }
         \\
         \\sum_from : I64, I64, I64 -> I64
@@ -4651,8 +4535,6 @@ test "spec constr splits loop record state with direct callable captures" {
 test "spec constr splits loop record state with returned callable captures" {
     const allocator = std.testing.allocator;
     const source =
-        \\module [main]
-        \\
         \\State : { n : I64, f : I64 -> I64 }
         \\
         \\make_affine = |scale, offset| |n| n * scale + offset
@@ -4689,8 +4571,6 @@ test "spec constr splits loop record state with returned callable captures" {
 test "spec constr splits loop record state with annotated returned callable captures" {
     const allocator = std.testing.allocator;
     const source =
-        \\module [main]
-        \\
         \\State : { n : I64, f : I64 -> I64 }
         \\
         \\make_affine : I64, I64 -> (I64 -> I64)
@@ -4728,8 +4608,6 @@ test "spec constr splits loop record state with annotated returned callable capt
 test "spec constr exposes direct call record result for field access" {
     const allocator = std.testing.allocator;
     const source =
-        \\module [main]
-        \\
         \\Start : { n : I64 }
         \\State : { n : I64, acc : I64 }
         \\
@@ -4759,8 +4637,6 @@ test "spec constr exposes direct call record result for field access" {
 test "spec constr exposes block-wrapped direct call record result for field access" {
     const allocator = std.testing.allocator;
     const source =
-        \\module [main]
-        \\
         \\State : { n : I64, acc : I64 }
         \\
         \\make_state : I64 -> State
@@ -4786,8 +4662,6 @@ test "spec constr exposes block-wrapped direct call record result for field acce
 test "spec constr exposes demanded direct call argument facts" {
     const allocator = std.testing.allocator;
     const source =
-        \\module [main]
-        \\
         \\State : { n : I64, acc : I64 }
         \\
         \\make_state : I64 -> State
@@ -4814,8 +4688,6 @@ test "spec constr exposes demanded direct call argument facts" {
 test "spec constr specializes if-joined record state carried by while loop" {
     const allocator = std.testing.allocator;
     const source =
-        \\module [main]
-        \\
         \\Start : { n : I64 }
         \\State : { n : I64, acc : I64 }
         \\
@@ -4857,8 +4729,6 @@ test "spec constr specializes if-joined record state carried by while loop" {
 test "spec constr specializes match-joined record state carried by while loop" {
     const allocator = std.testing.allocator;
     const source =
-        \\module [main]
-        \\
         \\Start : { n : I64 }
         \\State : { n : I64, acc : I64 }
         \\
@@ -4966,8 +4836,6 @@ test "iterdiff: bounded list map collect agrees across inline modes" {
     // scalar. The `dbg` of the collected list is the structural (allocation-
     // independent) value assertion; `dbg` of the scalar pins the fold result.
     try expectSameObservationsAcrossInlineModes(
-        \\module [main]
-        \\
         \\main : I64
         \\main = {
         \\    doubled : List(I64)
@@ -4992,8 +4860,6 @@ test "iterdiff: bounded list map collect agrees across inline modes" {
 // `[1.I64, 2, 3].iter().keep_if(|n| n > 1).collect()` returns `[2, 3]`.
 test "iterdiff: bounded list map keep_if collect agrees across inline modes" {
     try expectSameObservationsAcrossInlineModes(
-        \\module [main]
-        \\
         \\main : I64
         \\main = {
         \\    doubled : List(I64)
@@ -5013,8 +4879,6 @@ test "iterdiff: bounded list map keep_if collect agrees across inline modes" {
 
 test "iterdiff: if-chosen iterator chains consumed by one loop agree across inline modes" {
     try expectSameObservationsAcrossInlineModes(
-        \\module [main]
-        \\
         \\main : I64
         \\main = {
         \\    threshold = 4.I64
@@ -5046,8 +4910,6 @@ test "iterdiff: branch-chosen append search with early return agrees across inli
     // order, with the early return short-circuiting). Both lowerings must return
     // the same value for every `(selector, target)` probe.
     try expectSameObservationsAcrossInlineModes(
-        \\module [main]
-        \\
         \\Point : { x : I64, y : I64 }
         \\
         \\find : U64, I64 -> I64
@@ -5094,8 +4956,6 @@ test "iterdiff: set materialized mid-pipeline then iterated agrees across inline
     // iterating over the materialized result. Both lowerings must observe the
     // same deduplicated element sequence and the same collected output.
     try expectSameObservationsAcrossInlineModes(
-        \\module [main]
-        \\
         \\main : I64
         \\main = {
         \\    deduped : Set(I64)
@@ -5122,8 +4982,6 @@ test "iterdiff: coarse custom is_eq set dedup keeps same representative across i
     // representative (identical ordered `tag` trace), never a different one the
     // quotient happens to call equal.
     try expectSameObservationsAcrossInlineModes(
-        \\module [main]
-        \\
         \\Bucket := { key : I64, tag : I64 }.{
         \\    is_eq : Bucket, Bucket -> Bool
         \\    is_eq = |a, b| a.key == b.key
@@ -5158,8 +5016,6 @@ test "iterdiff: stream per-element effects agree across inline modes" {
     // reproduce it exactly. The effectful `map!` step `dbg`s each element as it
     // is pulled, so the ordered trace pins effect order across inline modes.
     try expectSameObservationsAcrossInlineModes(
-        \\module [main]
-        \\
         \\main : () => List(I64)
         \\main = || {
         \\    stream =
@@ -5192,8 +5048,6 @@ test "iterdiff: stream per-element effects agree across inline modes" {
 // 1 gate (both modes disagree). See Phase 1 report for the minimized repro.
 test "iterdiff: infinite custom iterator bounded prefix agrees across inline modes" {
     try expectSameObservationsAcrossInlineModes(
-        \\module [main]
-        \\
         \\main : U64
         \\main = {
         \\    adv : ((U64, U64) -> Try((U64, (U64, U64)), [NoMore]))
@@ -5236,8 +5090,6 @@ test "iterdiff: infinite custom iterator bounded prefix agrees across inline mod
 test "iterdiff: tier-one map collect matches hand-written loop shape" {
     const allocator = std.testing.allocator;
     const iter_source =
-        \\module [main]
-        \\
         \\main : List(I64)
         \\main =
         \\    [1.I64, 2, 3, 4, 5, 6]
@@ -5246,8 +5098,6 @@ test "iterdiff: tier-one map collect matches hand-written loop shape" {
         \\        .collect()
     ;
     const loop_source =
-        \\module [main]
-        \\
         \\main : List(I64)
         \\main = {
         \\    var $out = []
@@ -5298,8 +5148,6 @@ test "iterdiff: tier-one map collect matches hand-written loop shape" {
 test "iter alloc static: list append append for-loop has no boxed iterator state" {
     const allocator = std.testing.allocator;
     const source =
-        \\module [main]
-        \\
         \\main : U64 -> Str
         \\main = |_seed| {
         \\    base_points = [
@@ -5327,8 +5175,6 @@ test "iter alloc static: list append append for-loop has no boxed iterator state
 test "iter alloc static: list append append fold has no boxed iterator state" {
     const allocator = std.testing.allocator;
     const source =
-        \\module [main]
-        \\
         \\main : U64 -> Str
         \\main = |_seed| {
         \\    base_points = [
@@ -5367,8 +5213,6 @@ test "iterdiff: list aliased into an append and a loop stays unmutated across in
     // `dbg x`, the final `dbg base`, and `dbg grown` diverge between modes if the
     // shared list is ever mutated in place.
     try expectSameObservationsAcrossInlineModes(
-        \\module [main]
-        \\
         \\main : I64
         \\main = {
         \\    base : List(I64)
@@ -5394,8 +5238,6 @@ test "iterdiff: loop-carried list appended inside its own loop stays unmutated a
     // whole loop, so each append must copy it; an in-place mutation of the
     // carried source would change later iterations and the final `dbg base`.
     try expectSameObservationsAcrossInlineModes(
-        \\module [main]
-        \\
         \\main : U64
         \\main = {
         \\    base : List(I64)
@@ -5525,8 +5367,6 @@ fn bareListIterCollectLoopIsScalar(shape: ProcShape) bool {
 test "bare list iter collect carries scalar list state in the loop" {
     const allocator = std.testing.allocator;
     const source =
-        \\module [main]
-        \\
         \\main : () -> List(I64)
         \\main = || [1.I64, 2, 3].iter().collect()
     ;
@@ -5548,8 +5388,6 @@ test "bare list iter collect carries scalar list state in the loop" {
 }
 
 const dispatch_boundary_source =
-    \\module [main]
-    \\
     \\Thing := [Val(Str)].{
     \\    to_str : Thing -> Str
     \\    to_str = |Thing.Val(s)| s
@@ -5622,8 +5460,6 @@ test "dispatch evidence boundary validator reports a site-evidence key outside t
     // A where-constrained helper instantiated at a concrete type gives the
     // instantiation site a site-evidence entry to corrupt.
     const source =
-        \\module [main]
-        \\
         \\Thing := [Val(Str)].{
         \\    to_str : Thing -> Str
         \\    to_str = |Thing.Val(s)| s
@@ -5659,8 +5495,6 @@ test "compiler-generated dispatch classes lower via checked evidence" {
     // throughout, and the evaluated output asserts every class resolved to
     // the RIGHT target, not merely some lowerable one.
     const source =
-        \\module [main]
-        \\
         \\Speed := [Mph(U64)].{
         \\    is_eq : Speed, Speed -> Bool
         \\    is_eq = |Speed.Mph(a), Speed.Mph(b)| a == b
@@ -5677,7 +5511,7 @@ test "compiler-generated dispatch classes lower via checked evidence" {
         \\    lhs = { speed: Speed.Mph($sum), label: "total" }
         \\    rhs = { speed: Speed.Mph(6), label: "total" }
         \\    other = { speed: Speed.Mph(7), label: "total" }
-        \\    parsed : Try({ names : Set(Str) }, Json.ParseErr)
+        \\    parsed : Try({ names : Set(Str) }, [InvalidJson(Str), MissingRequiredField(Str)])
         \\    parsed = Json.parse("{ \"names\": [\"a\", \"b\"] }")
         \\    parsed_count = match parsed {
         \\        Ok(rec) => rec.names.len()

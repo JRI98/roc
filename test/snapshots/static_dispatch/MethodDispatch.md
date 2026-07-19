@@ -80,7 +80,7 @@ EndOfFile,
 # PARSE
 ~~~clojure
 (file
-	(type-module)
+	(type-mod)
 	(statements
 		(s-type-decl
 			(header (name "Container")
@@ -126,7 +126,7 @@ EndOfFile,
 				(ty-var (raw "a"))
 				(ty (name "Str")))
 			(where
-				(method (module-of "a") (name "get_value")
+				(method (mod-of "a") (name "get_value")
 					(args
 						(ty-var (raw "a")))
 					(ty (name "Str")))))
@@ -147,7 +147,7 @@ EndOfFile,
 					(ty (name "Str")))
 				(ty-var (raw "a")))
 			(where
-				(method (module-of "a") (name "transform")
+				(method (mod-of "a") (name "transform")
 					(args
 						(ty-var (raw "a"))
 						(ty-fn

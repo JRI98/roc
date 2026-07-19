@@ -1046,7 +1046,7 @@ pub const StaticDispatchConstraint = struct {
         /// the source operator was `!=` rather than `==`.
         desugared_binop: struct { negated: bool },
         desugared_unaryop, // From uniary operator desugaring (e.g., !)
-        method_call, // From .method() syntax
+        method_call, // From `.method()` syntax
         /// From a where clause in a type annotation. `body_required` is true when
         /// the originating scheme's body provably forces this method: during the
         /// scheme's own check a body dispatch of this method matched and unified

@@ -12,4 +12,4 @@ platform "glue-unresolved-by-value"
     targets: {}
 
 init_for_host : {} -> { value : Model, tag : I32 }
-init_for_host = |{}| { value: program.init({}), tag: 0 }
+init_for_host = |{}| { value: (program.init)({}), tag: 0 }

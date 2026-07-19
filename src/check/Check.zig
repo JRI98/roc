@@ -10864,6 +10864,17 @@ const Expected = struct {
         };
     }
 
+    fn withMaterializedAnnotation(self: Expected, expected_type: ExpectedType) Expected {
+        return .{
+            .annotation = null,
+            .expected_type = expected_type,
+            .branch_result = self.branch_result,
+            .return_result = self.return_result,
+            .comptime_condition_warnings = self.comptime_condition_warnings,
+            .hoist_position = self.hoist_position,
+        };
+    }
+
     fn withBranchResult(self: Expected, branch_result: Var) Expected {
         return .{
             .annotation = self.annotation,
@@ -11887,17 +11898,19 @@ fn checkExpr(self: *Self, expr_idx: CIR.Expr.Idx, env: *Env, expected: Expected)
 
     try self.setVarRank(expr_var_raw, env);
 
-    // Generate the expr var and the annotation type vars
+    // Generate the expr var and the expected type vars.
     //
-    // If we have an annotation, then we create a fresh one, so if we hit an
-    // error we don't poison the variable
-    const expr_var: Var, const mb_anno_vars: ?AnnoVars = blk: {
+    // If the current expression has an annotation, materialize it once here and
+    // pass children the resulting expected var. Children must not regenerate the
+    // same annotation, because that creates distinct rigid vars with the same
+    // source names.
+    const expr_var: Var, const mb_anno_vars: ?AnnoVars, const nested_expected: Expected = blk: {
         if (expr == .e_closure) {
             // Closures delegate to their inner lambda's checkExpr, which handles
             // annotation and generalization. Forward expected so the annotation
             // type is created at the lambda's rank.
             // (The e_closure-wraps-e_lambda invariant is asserted by isFunctionDef.)
-            break :blk .{ expr_var_raw, null };
+            break :blk .{ expr_var_raw, null, expected };
         }
 
         if (expected.annotation) |annotation_idx| {
@@ -11921,6 +11934,10 @@ fn checkExpr(self: *Self, expr_idx: CIR.Expr.Idx, env: *Env, expected: Expected)
                     .anno_var_backup = anno_var_backup,
                     .context = .type_annotation,
                 },
+                expected.withMaterializedAnnotation(.{
+                    .var_ = anno_var,
+                    .context = .type_annotation,
+                }),
             };
         } else if (expected.expected_type) |expected_type| {
             const expected_var_backup = try self.instantiateVarOrphan(
@@ -11937,17 +11954,18 @@ fn checkExpr(self: *Self, expr_idx: CIR.Expr.Idx, env: *Env, expected: Expected)
                     .anno_var_backup = expected_var_backup,
                     .context = expected_type.context,
                 },
+                expected,
             };
         } else {
-            break :blk .{ expr_var_raw, null };
+            break :blk .{ expr_var_raw, null, expected };
         }
     };
 
     var does_fx = false; // Does this expression potentially perform any side effects?
-    const child_expected = expected.forStatement();
+    const child_expected = nested_expected.forStatement();
     self.checking_binding_rhs_pattern = binding_rhs_pattern;
     errdefer self.checking_binding_rhs_pattern = null;
-    var hoist_frame = try self.beginHoistFrame(expr_idx, is_binding_rhs, expected.hoist_position);
+    var hoist_frame = try self.beginHoistFrame(expr_idx, is_binding_rhs, nested_expected.hoist_position);
     self.checking_binding_rhs_pattern = null;
     defer hoist_frame.deinit();
 
@@ -12548,14 +12566,14 @@ fn checkExpr(self: *Self, expr_idx: CIR.Expr.Idx, env: *Env, expected: Expected)
             defer self.endHoistLexicalScope(hoist_scope);
 
             // Check all statements in the block
-            const stmt_result = try self.checkBlockStatements(block.stmts, env, expr_region, expected.forStatement());
+            const stmt_result = try self.checkBlockStatements(block.stmts, env, expr_region, nested_expected.forStatement());
             does_fx = stmt_result.does_fx or does_fx;
 
             // Check the final expression
             const final_expr_does_fx = if (stmt_result.blocks_later_hoists)
-                try self.checkExpr(block.final_expr, env, expected.suppressHoistSelection())
+                try self.checkExpr(block.final_expr, env, nested_expected.suppressHoistSelection())
             else
-                try self.checkExpr(block.final_expr, env, expected);
+                try self.checkExpr(block.final_expr, env, nested_expected);
             does_fx = final_expr_does_fx or does_fx;
 
             // If the block diverges (has a return/crash), use a flex var for the block's type
@@ -12703,7 +12721,7 @@ fn checkExpr(self: *Self, expr_idx: CIR.Expr.Idx, env: *Env, expected: Expected)
                 if (body_is_delayed_dependency) self.delayed_dependency_depth -= 1;
             }
 
-            const lambda_body_expected = Expected.none().withHoistPosition(expected.hoist_position);
+            const lambda_body_expected = Expected.none().withHoistPosition(nested_expected.hoist_position);
             try self.pushReturnConstraintFrame(expr_idx);
             var return_constraints_processed = false;
             defer if (!return_constraints_processed) self.discardReturnConstraintFrame(expr_idx);
@@ -12798,7 +12816,7 @@ fn checkExpr(self: *Self, expr_idx: CIR.Expr.Idx, env: *Env, expected: Expected)
             if (suppress_group_member_generalize) {
                 self.suppress_generalize_expr = closure.lambda_idx;
             }
-            does_fx = try self.checkExpr(closure.lambda_idx, env, expected) or does_fx;
+            does_fx = try self.checkExpr(closure.lambda_idx, env, nested_expected) or does_fx;
             const lambda_var = ModuleEnv.varFrom(closure.lambda_idx);
 
             _ = try self.unify(expr_var, lambda_var, env);
@@ -13082,19 +13100,19 @@ fn checkExpr(self: *Self, expr_idx: CIR.Expr.Idx, env: *Env, expected: Expected)
             }
         },
         .e_if => |if_expr| {
-            does_fx = try self.checkIfElseExpr(expr_idx, expr_region, env, if_expr, expected) or does_fx;
+            does_fx = try self.checkIfElseExpr(expr_idx, expr_region, env, if_expr, nested_expected) or does_fx;
         },
         .e_match => |match| {
-            does_fx = try self.checkMatchExpr(expr_idx, env, match, expected) or does_fx;
+            does_fx = try self.checkMatchExpr(expr_idx, env, match, nested_expected) or does_fx;
         },
         .e_binop => |binop| {
-            does_fx = try self.checkBinopExpr(expr_idx, expr_region, env, binop, expected) or does_fx;
+            does_fx = try self.checkBinopExpr(expr_idx, expr_region, env, binop, nested_expected) or does_fx;
         },
         .e_unary_minus => |unary| {
-            does_fx = try self.checkUnaryMinusExpr(expr_idx, expr_region, env, unary, expected) or does_fx;
+            does_fx = try self.checkUnaryMinusExpr(expr_idx, expr_region, env, unary, nested_expected) or does_fx;
         },
         .e_unary_not => |unary| {
-            does_fx = try self.checkUnaryNotExpr(expr_idx, expr_region, env, unary, expected) or does_fx;
+            does_fx = try self.checkUnaryNotExpr(expr_idx, expr_region, env, unary, nested_expected) or does_fx;
         },
         .e_field_access => |field_access| {
             does_fx = try self.checkExpr(field_access.receiver, env, child_expected) or does_fx;
@@ -13400,7 +13418,7 @@ fn checkExpr(self: *Self, expr_idx: CIR.Expr.Idx, env: *Env, expected: Expected)
                 for_expr.body,
                 env,
                 expr_region,
-                expected.forStatement(),
+                nested_expected.forStatement(),
             ) or does_fx;
 
             // Like cor, loop bodies are ordinary expressions whose final value is
@@ -13434,7 +13452,7 @@ fn checkExpr(self: *Self, expr_idx: CIR.Expr.Idx, env: *Env, expected: Expected)
         },
         .e_return => |ret| {
             self.markCurrentHoistObservableEffect();
-            const return_expected = expected.forReturnValue();
+            const return_expected = nested_expected.forReturnValue();
             does_fx = try self.checkExpr(ret.expr, env, return_expected) or does_fx;
             const ret_var = ModuleEnv.varFrom(ret.expr);
             const return_ctx: problem.Context = switch (ret.context) {
@@ -21980,10 +21998,6 @@ fn parseSpecDeclForNumKind(num_kind: CIR.NumKind) BuiltinParseSpecDecl {
     };
 }
 
-fn missingRecordFieldMethodName(self: *Self) Allocator.Error!Ident.Idx {
-    return try @constCast(self.cir).insertIdent(base.Ident.for_text("missing_record_field"));
-}
-
 fn invalidValueMethodName(self: *Self) Allocator.Error!Ident.Idx {
     return try @constCast(self.cir).insertIdent(base.Ident.for_text("invalid_value"));
 }
@@ -22374,29 +22388,63 @@ fn validateEncodeKeyMethod(
     return if (result.isOk()) .ok else .reported_error;
 }
 
-fn validateMissingRecordFieldMethod(
+fn constrainDerivedParserRequiredFieldError(
     self: *Self,
-    encoding_var: Var,
-    state_var: Var,
     err_var: Var,
-    constraint: StaticDispatchConstraint,
     env: *Env,
     region: Region,
 ) Allocator.Error!DerivedParseValidation {
-    const method_name = try self.missingRecordFieldMethodName();
-    const method = try self.parseFormatMethodVarForEncoding(encoding_var, method_name, env, region) orelse {
-        return try self.reportDerivedParseMissingMethod(encoding_var, method_name, constraint, env);
-    };
     const str_var = try self.freshStr(env, region);
-    const expected_fn = try self.freshFromContent(try self.types.mkFuncUnbound(&.{ encoding_var, str_var, state_var }, err_var), env, region);
-    const result = try self.unifyInContext(method.var_, expected_fn, env, .{
-        .method_type = .{
-            .constraint_var = encoding_var,
-            .dispatcher_name = method.dispatcher_name,
-            .method_name = method_name,
-        },
-    });
+    const tag_name = try @constCast(self.cir).insertIdent(base.Ident.for_text("MissingRequiredField"));
+    const tag = try self.types.mkTag(tag_name, &.{str_var});
+    const ext_var = try self.fresh(env, region);
+    const required_err_var = try self.freshFromContent(try self.types.mkTagUnion(&.{tag}, ext_var), env, region);
+    const result = try self.unify(err_var, required_err_var, env);
     return if (result.isOk()) .ok else .reported_error;
+}
+
+fn constrainDerivedParserErrorRowIncludes(
+    self: *Self,
+    parent_err_var: Var,
+    child_err_var: Var,
+    env: *Env,
+    region: Region,
+) Allocator.Error!DerivedParseValidation {
+    const resolved = self.types.resolveVar(child_err_var);
+    return switch (resolved.desc.content) {
+        .structure => |structure| switch (structure) {
+            .empty_tag_union => .ok,
+            .tag_union => |tag_union| blk: {
+                const tags = self.types.getTagsSlice(tag_union.tags);
+                const copied_tags = try self.gpa.alloc(types_mod.Tag, tags.len);
+                defer self.gpa.free(copied_tags);
+                for (copied_tags, tags.items(.name), tags.items(.args)) |*copied, name, args| {
+                    copied.* = .{ .name = name, .args = args };
+                }
+
+                for (copied_tags) |child_tag| {
+                    const payload_vars = try self.gpa.dupe(Var, self.types.sliceVars(child_tag.args));
+                    defer self.gpa.free(payload_vars);
+                    const required_tag = try self.types.mkTag(child_tag.name, payload_vars);
+                    const parent_ext = try self.fresh(env, region);
+                    const required_parent = try self.freshFromContent(try self.types.mkTagUnion(&.{required_tag}, parent_ext), env, region);
+                    const result = try self.unify(parent_err_var, required_parent, env);
+                    if (!result.isOk()) break :blk .reported_error;
+                }
+
+                break :blk try self.constrainDerivedParserErrorRowIncludes(parent_err_var, tag_union.ext, env, region);
+            },
+            else => .unsupported,
+        },
+        .alias => |alias| try self.constrainDerivedParserErrorRowIncludes(parent_err_var, self.types.getAliasBackingVar(alias), env, region),
+        .flex => blk: {
+            const empty = try self.freshFromContent(.{ .structure = .empty_tag_union }, env, region);
+            const result = try self.unify(resolved.var_, empty, env);
+            break :blk if (result.isOk()) .ok else .reported_error;
+        },
+        .rigid => .unsupported,
+        .err => .ok,
+    };
 }
 
 fn validateInvalidValueMethod(
@@ -22556,7 +22604,7 @@ fn validateDerivedParseRecord(
         .unsupported, .reported_error => |result| return result,
     }
     if (try self.recordParseNeedsRequiredFieldError(fields_range)) {
-        switch (try self.validateMissingRecordFieldMethod(encoding_var, state_var, err_var, constraint, env, region)) {
+        switch (try self.constrainDerivedParserRequiredFieldError(err_var, env, region)) {
             .ok => {},
             .unsupported, .reported_error => |result| return result,
         }
@@ -22787,7 +22835,8 @@ fn validateDerivedParseNominal(
         break :blk try self.instantiateVar(copied_var, env, .{ .explicit = region });
     };
 
-    const expected_ret = try self.freshParseResultTryVar(nominal_var, state_var, err_var, env, region);
+    const child_err_var = try self.fresh(env, region);
+    const expected_ret = try self.freshParseResultTryVar(nominal_var, state_var, child_err_var, env, region);
     const expected_runtime_fn = try self.freshFromContent(try self.types.mkFuncUnbound(&.{state_var}, expected_ret), env, region);
     const expected_fn = try self.freshFromContent(try self.types.mkFuncUnbound(&.{encoding_var}, expected_runtime_fn), env, region);
     const result = try self.unifyInContext(method_var, expected_fn, env, .{
@@ -22797,7 +22846,8 @@ fn validateDerivedParseNominal(
             .method_name = constraint.fn_name,
         },
     });
-    return if (result.isOk()) .ok else .reported_error;
+    if (!result.isOk()) return .reported_error;
+    return try self.constrainDerivedParserErrorRowIncludes(err_var, child_err_var, env, region);
 }
 
 fn validateDerivedEncodeVar(

@@ -1,13 +1,15 @@
-ParserMissingRequiredMethod :: [].{}
+ParserMissingRequiredFieldError :: [].{}
 
 Format := [Default].{
 	rename_field : Format, Str -> Str
 	rename_field = |_, name| name
 
-	parse_str : Format, State -> Try({ value : Str, rest : State }, [MissingRequired])
-	parse_str = |_| Err(MissingRequired)
+	parse_str : Format, State -> Try({ value : Str, rest : State }, [FormatError])
+	parse_str = |_, _| Err(FormatError)
 
-	parse_record_field : Format, Encoding.FieldName.FieldNames(_shape), State -> Try(
+	parse_record_field : Format,
+	Encoding.FieldName.FieldNames(_shape),
+	State -> Try(
 		[
 			Field({ field : Encoding.FieldName(_shape), rest : State }),
 			TryField({ name : Str, rest : State }),
@@ -15,19 +17,19 @@ Format := [Default].{
 			Continue({ rest : State }),
 			Done({ rest : State }),
 		],
-		[MissingRequired],
+		[FormatError],
 	)
 	parse_record_field = |_, _, state| Ok(Done({ rest: state }))
 
-	skip_record_field : Format, State -> Try(State, [MissingRequired])
+	skip_record_field : Format, State -> Try(State, [FormatError])
 	skip_record_field = |_, state| Ok(state)
 }
 
 State := [Done]
 
-parse : State -> Try(a, [MissingRequired])
+parse : State -> Try(a, [FormatError])
 	where [
-		a.parser_for : Format -> (State -> Try({ value : a, rest : State }, [MissingRequired])),
+		a.parser_for : Format -> (State -> Try({ value : a, rest : State }, [FormatError])),
 	]
 parse = |input| {
 	Shape : a
@@ -36,5 +38,5 @@ parse = |input| {
 	Ok(parsed.value)
 }
 
-main : Try({ foo : Str }, [MissingRequired])
+main : Try({ name : Str }, [FormatError])
 main = parse(Done)

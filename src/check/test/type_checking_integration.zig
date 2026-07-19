@@ -2798,6 +2798,17 @@ test "check type - crash" {
     );
 }
 
+test "check type - issue 10244 - crash body satisfies annotated function type" {
+    // Repro for https://github.com/roc-lang/roc/issues/10244
+    const source =
+        \\fun : a -> a
+        \\fun = {
+        \\  crash "NYI"
+        \\}
+    ;
+    try checkTypesModule(source, .{ .pass = .{ .def = "fun" } }, "a -> a");
+}
+
 test "check type - if with all crash branches makes following code unreachable" {
     const source =
         \\choose : Bool -> Str

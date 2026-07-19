@@ -203,7 +203,7 @@ UNEXPECTED STATEMENT - fuzz_crash_028.md:40:9:40:10
 UNEXPECTED STATEMENT - fuzz_crash_028.md:41:1:41:2
 UNEXPECTED STATEMENT - fuzz_crash_028.md:48:1:48:5
 EXPECTED RECORD ACCESSOR - fuzz_crash_028.md:103:2:103:5
-MODULE NOT FOUND - fuzz_crash_028.md:6:1:8:4
+MOD NOT FOUND - fuzz_crash_028.md:6:1:8:4
 UNDECLARED TYPE - fuzz_crash_028.md:29:2:29:5
 UNDECLARED TYPE - fuzz_crash_028.md:30:2:30:5
 UNDECLARED TYPE - fuzz_crash_028.md:32:19:32:21
@@ -299,14 +299,14 @@ Numbers cannot have leading zeros.
 
 
 ┌───────────────────┐
-│ INCOMPLETE IMPORT ├─ I was parsing an import, and the module path is ───────┐
+│ INCOMPLETE IMPORT ├─ I was parsing an import, and the mod path is ───────┐
 └┬──────────────────┘  incomplete.                                            │
  │                                                                            │
  │  import p                                                                 │
  │  ‾‾‾‾‾‾                                                                    │
  └──────────────────────────────────────────────────── fuzz_crash_028.md:10:1 ┘
 
-    Imports must name a module, optionally with a qualifier and exposing list.
+    Imports must name a mod, optionally with a qualifier and exposing list.
 
     For example:
         import Json.Decode exposing [decode]
@@ -373,7 +373,7 @@ Numbers cannot have leading zeros.
 
     I found `Map` here.
     Names that start with uppercase letters are used for tags, type names, and
-    module names in Roc.
+    mod names in Roc.
 
 
 ┌──────────────────────┐
@@ -627,7 +627,7 @@ Numbers cannot have leading zeros.
 
     I found `MapML` here.
     Names that start with uppercase letters are used for tags, type names, and
-    module names in Roc.
+    mod names in Roc.
 
 
 ┌──────────────────────┐
@@ -899,7 +899,7 @@ Numbers cannot have leading zeros.
 
     I found `Foo` here.
     Names that start with uppercase letters are used for tags, type names, and
-    module names in Roc.
+    mod names in Roc.
 
 
 ┌──────────────────────┐
@@ -1087,7 +1087,7 @@ Numbers cannot have leading zeros.
 
 
 ┌──────────────────┐
-│ MODULE NOT FOUND ├─ The module `Stdot` was not found in this Roc project. ──┐
+│ MOD NOT FOUND ├─ The mod `Stdot` was not found in this Roc project. ──┐
 └┬─────────────────┘                                                          │
  │                                                                            │
  │  import Stdot                                                              │
@@ -1647,15 +1647,15 @@ Numbers cannot have leading zeros.
 
 
 ┌─────────────────────────┐
-│ EXPOSED BUT NOT DEFINED ├─ The module header says that `main!` is ──────────┐
+│ EXPOSED BUT NOT DEFINED ├─ The mod header says that `main!` is ──────────┐
 └┬────────────────────────┘  exposed, but it is not defined anywhere in       │
- │                           this module.                                     │
+ │                           this mod.                                     │
  │                                                                            │
  │  app [main!] { pf: platform "c" }                                          │
  │       ‾‾‾‾‾                                                                │
  └───────────────────────────────────────────────────── fuzz_crash_028.md:2:6 ┘
 
-    You can fix this by either defining `main!` in this module, or by removing
+    You can fix this by either defining `main!` in this mod, or by removing
     it from the list of exposed values.
 
 
@@ -1670,7 +1670,7 @@ Numbers cannot have leading zeros.
  │                                                                            │
  └──────────────────────────────────────────────────── fuzz_crash_028.md:28:1 ┘
 
-    Add a value body here, or put hosted functions in a platform type module so
+    Add a value body here, or put hosted functions in a platform type mod so
     they are published through the host boundary.
 
 
@@ -1682,7 +1682,7 @@ Numbers cannot have leading zeros.
  │  ‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾                                                      │
  └──────────────────────────────────────────────────── fuzz_crash_028.md:47:1 ┘
 
-    Add a value body here, or put hosted functions in a platform type module so
+    Add a value body here, or put hosted functions in a platform type mod so
     they are published through the host boundary.
 
 
@@ -1816,7 +1816,7 @@ Numbers cannot have leading zeros.
  │  ‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾                                         │
  └──────────────────────────────────────────────────── fuzz_crash_028.md:95:1 ┘
 
-    Add a value body here, or put hosted functions in a platform type module so
+    Add a value body here, or put hosted functions in a platform type mod so
     they are published through the host boundary.
 
 
@@ -1884,7 +1884,7 @@ Numbers cannot have leading zeros.
  │  ‾‾‾‾‾‾                                                                    │
  └─────────────────────────────────────────────────── fuzz_crash_028.md:141:1 ┘
 
-    Add a value body here, or put hosted functions in a platform type module so
+    Add a value body here, or put hosted functions in a platform type mod so
     they are published through the host boundary.
 
 
@@ -1896,7 +1896,7 @@ Numbers cannot have leading zeros.
  │  ‾‾‾‾‾‾‾‾‾‾‾‾                                                              │
  └─────────────────────────────────────────────────── fuzz_crash_028.md:144:1 ┘
 
-    Add a value body here, or put hosted functions in a platform type module so
+    Add a value body here, or put hosted functions in a platform type mod so
     they are published through the host boundary.
 
 
@@ -3283,11 +3283,11 @@ expect {
 		(e-anno-only)
 		(annotation
 			(ty-malformed)))
-	(s-import (module "pf.Stdout")
+	(s-import (mod "pf.Stdout")
 		(exposes
 			(exposed (name "line!") (wildcard false))
 			(exposed (name "e!") (wildcard false))))
-	(s-import (module "Stdot")
+	(s-import (mod "Stdot")
 		(exposes))
 	(s-alias-decl
 		(ty-header (name "Some")

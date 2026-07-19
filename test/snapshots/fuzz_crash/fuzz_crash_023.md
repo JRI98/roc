@@ -5,7 +5,7 @@ type=file
 ~~~
 # SOURCE
 ~~~roc
-# This is a module comment!
+# This is a mod comment!
 app [main!] { pf: platform "../basic-cli/platform.roc" }
 
 import pf.Stdout exposing [line!, write!]
@@ -219,8 +219,8 @@ EXPECTED RECORD FIELD - fuzz_crash_023.md:178:37:178:38
 UNEXPECTED EXPRESSION SYNTAX - fuzz_crash_023.md:178:45:178:46
 EXPECTED FUNCTION ARROW - fuzz_crash_023.md:178:52:178:54
 NOT IMPLEMENTED - fuzz_crash_023.md:6:1:12:4
-MODULE NOT FOUND - fuzz_crash_023.md:16:1:16:27
-MODULE NOT FOUND - fuzz_crash_023.md:17:1:20:20
+MOD NOT FOUND - fuzz_crash_023.md:16:1:16:27
+MOD NOT FOUND - fuzz_crash_023.md:17:1:20:20
 UNDECLARED TYPE - fuzz_crash_023.md:36:8:36:11
 UNDECLARED TYPE - fuzz_crash_023.md:36:13:36:16
 UNDECLARED TYPE - fuzz_crash_023.md:39:2:39:5
@@ -355,12 +355,12 @@ MISSING METHOD - fuzz_crash_023.md:189:26:189:66
 
     I found `Ok` here.
     Names that start with uppercase letters are used for tags, type names, and
-    module names in Roc.
+    mod names in Roc.
 
 
 ┌─────────────────┐
 │ NOT IMPLEMENTED ├─ This feature is not yet implemented: malformed import ───┐
-└┬────────────────┘  module name contains invalid control characters.         │
+└┬────────────────┘  mod name contains invalid control characters.         │
  │                                                                            │
  │  import # Comment after import keyword                                     │
  │      pf # Comment after qualifier                                          │
@@ -377,7 +377,7 @@ MISSING METHOD - fuzz_crash_023.md:189:26:189:66
 
 
 ┌──────────────────┐
-│ MODULE NOT FOUND ├─ The module `BadName` was not found in this Roc ─────────┐
+│ MOD NOT FOUND ├─ The mod `BadName` was not found in this Roc ─────────┐
 └┬─────────────────┘  project.                                                │
  │                                                                            │
  │  import BadName as GoodName                                                │
@@ -387,7 +387,7 @@ MISSING METHOD - fuzz_crash_023.md:189:26:189:66
 
 
 ┌──────────────────┐
-│ MODULE NOT FOUND ├─ The module `BadNameMultiline` was not found in this ────┐
+│ MOD NOT FOUND ├─ The mod `BadNameMultiline` was not found in this ────┐
 └┬─────────────────┘  Roc project.                                            │
  │                                                                            │
  │  import                                                                    │
@@ -526,7 +526,7 @@ MISSING METHOD - fuzz_crash_023.md:189:26:189:66
 │ UNUSED VARIABLE ├─ Variable `rest` is defined here and then never used. ────┐
 └┬────────────────┘                                                           │
  │                                                                            │
- │  # This is a module comment!                                               │
+ │  # This is a mod comment!                                                  │
  │  ‾                                                                         │
  └───────────────────────────────────────────────────── fuzz_crash_023.md:1:1 ┘
 
@@ -550,7 +550,7 @@ MISSING METHOD - fuzz_crash_023.md:189:26:189:66
 │ UNUSED VARIABLE ├─ Variable `rest` is defined here and then never used. ────┐
 └┬────────────────┘                                                           │
  │                                                                            │
- │  # This is a module comment!                                               │
+ │  # This is a mod comment!                                                  │
  │  ‾                                                                         │
  └───────────────────────────────────────────────────── fuzz_crash_023.md:1:1 ┘
 
@@ -574,7 +574,7 @@ MISSING METHOD - fuzz_crash_023.md:189:26:189:66
 │ UNUSED VARIABLE ├─ Variable `rest` is defined here and then never used. ────┐
 └┬────────────────┘                                                           │
  │                                                                            │
- │  # This is a module comment!                                               │
+ │  # This is a mod comment!                                                  │
  │  ‾                                                                         │
  └───────────────────────────────────────────────────── fuzz_crash_023.md:1:1 ┘
 
@@ -1083,7 +1083,7 @@ MISSING METHOD - fuzz_crash_023.md:189:26:189:66
  │                                               ‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾     │
  └────────────────────────────────────────────────── fuzz_crash_023.md:178:47 ┘
 
-    Add a value body here, or put hosted functions in a platform type module so
+    Add a value body here, or put hosted functions in a platform type mod so
     they are published through the host boundary.
 
 
@@ -1132,7 +1132,7 @@ MISSING METHOD - fuzz_crash_023.md:189:26:189:66
  │                                               ‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾     │
  └────────────────────────────────────────────────── fuzz_crash_023.md:178:47 ┘
 
-    Add a value body here, or put hosted functions in a platform type module so
+    Add a value body here, or put hosted functions in a platform type mod so
     they are published through the host boundary.
 
 
@@ -1144,7 +1144,7 @@ MISSING METHOD - fuzz_crash_023.md:189:26:189:66
  │  ‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾                                                  │
  └─────────────────────────────────────────────────── fuzz_crash_023.md:201:1 ┘
 
-    Add a value body here, or put hosted functions in a platform type module so
+    Add a value body here, or put hosted functions in a platform type mod so
     they are published through the host boundary.
 
 
@@ -1896,7 +1896,7 @@ EndOfFile,
 ~~~
 # FORMATTED
 ~~~roc
-# This is a module comment!
+# This is a mod comment!
 app [main!] { pf: platform "../basic-cli/platform.roc" }
 
 import pf.Stdout exposing [line!, write!]
@@ -2776,22 +2776,22 @@ expect {
 		(e-anno-only)
 		(annotation
 			(ty-malformed)))
-	(s-import (module "pf.Stdout")
+	(s-import (mod "pf.Stdout")
 		(exposes
 			(exposed (name "line!") (wildcard false))
 			(exposed (name "write!") (wildcard false))))
-	(s-import (module "#malformed_import_0")
+	(s-import (mod "#malformed_import_0")
 		(exposes
 			(exposed (name "line!") (wildcard false))
 			(exposed (name "write!") (wildcard false))))
-	(s-import (module "pkg.Something")
+	(s-import (mod "pkg.Something")
 		(exposes
 			(exposed (name "func") (alias "function") (wildcard false))
 			(exposed (name "Type") (alias "ValueCategory") (wildcard false))
 			(exposed (name "Custom") (wildcard true))))
-	(s-import (module "BadName")
+	(s-import (mod "BadName")
 		(exposes))
-	(s-import (module "BadNameMultiline")
+	(s-import (mod "BadNameMultiline")
 		(exposes))
 	(s-alias-decl
 		(ty-header (name "Map")

@@ -17,7 +17,7 @@ main! = |_args| {
 }
 ```
 
-This application is built on a platform called [roc-platform-template-zig](https://github.com/lukewilliamboswell/roc-platform-template-zig), a starter platform written in Zig and Roc. See [Application Modules](modules.md#application-modules) for the details of the `app` header, and [Platform Modules](modules.md#platform-modules) for how a platform declares the interface an application builds against.
+This application is built on a platform called [roc-platform-template-zig](https://github.com/lukewilliamboswell/roc-platform-template-zig), a starter platform written in Zig and Roc. See [Application Modules](modules#application-modules) for the details of the `app` header, and [Platform Modules](modules#platform-modules) for how a platform declares the interface an application builds against.
 
 ## Domain-specific functionality
 
@@ -78,12 +78,12 @@ To understand how platforms can tailor automatic memory management to their part
 
 Each platform consists of two parts:
 
-- **The Roc API** is the part that application authors see. For example, `Stdout.line!` is part of the Roc API of roc-platform-template-zig. It is defined by the platform's [platform module](modules.md#platform-modules) and the [type modules](modules.md#type-modules) it exposes.
+- **The Roc API** is the part that application authors see. For example, `Stdout.line!` is part of the Roc API of roc-platform-template-zig. It is defined by the platform's [platform module](modules#platform-modules) and the [type modules](modules#type-modules) it exposes.
 - **The host** is the under-the-hood implementation written in a language other than Roc. For example, the host for roc-platform-template-zig is written in Zig. It has a Zig function which implements the behavior of the `Stdout.line!` operation, and all the other I/O operations it supports.
 
 This design means application authors do not necessarily need to know (or care) about the non-Roc language being used to implement the platform's host. That can be a behind-the-scenes implementation detail that only the platform's authors are concerned with. Application authors interact only with the public-facing Roc API.
 
-The platform module's [`provides`](modules.md#provides) section is what maps Roc function identifiers to the symbol names Roc links against in the host.
+The platform module's [`provides`](modules#provides) section is what maps the symbol names Roc links against in the host to the Roc functions exposed under those symbols.
 
 ### Memory management
 

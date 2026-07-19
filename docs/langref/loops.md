@@ -21,7 +21,7 @@ A loop body only includes statements; it does not have a final expression. The l
 ### Iterating over types that have `iter`
 
 `for` can also be used on types that have an
-[`iter`](static-dispatch.md#iteration) method, as long as that method returns an
+[`iter`](static-dispatch#iteration) method, as long as that method returns an
 [`Iter`](../Iter). The loop then calls `next` on the returned iterator.
 For example, [`List`](../List) has `List.iter`, so you can do a `for`
 loop over a list:
@@ -34,7 +34,7 @@ for n in [1, 2, 3, 4] {
 }
 ```
 
-At runtime, this `[1, 2, 3, 4]` code snippet is exactly as efficient as the earlier `1..<5` one. In one case, `1..<5` will be evaluated to an `Iter` at compile time, and in the other, `[1, 2, 3, 4].iter()` will be evaluated at compile time to an identical `Iter`. By the time either program actually runs, they will have the same memory contents and will be executing the same instructions.
+This `[1, 2, 3, 4]` code snippet works the same way as the earlier `1..<5` one. In one case, `1..<5` evaluates to an `Iter` of the numbers 1 through 4, and in the other, `[1, 2, 3, 4].iter()` evaluates to an `Iter` of those same numbers. Either way, the loop proceeds by repeatedly calling `next` on that `Iter`.
 
 ### Pattern matching in `for`
 
@@ -66,6 +66,8 @@ for Ok(amount_to_add) in items {
 ```
 
 If you can't write an exhaustive pattern-match, you can name the entire iterator item and then use [`match`](pattern-matching#match) on it inside the loop body.
+
+(Note: the dedicated exhaustiveness error is not implemented yet for `for` patterns, even though it is for [assignments](statements#assignment). Currently, a non-exhaustive tag pattern like this one is reported as a type mismatch instead, and non-exhaustive patterns that the type checker can't rule out—such as a number literal pattern—are not caught at compile time and crash at runtime.)
 
 ## `while` Loops
 
@@ -111,7 +113,7 @@ for i in [1, 2, 3] {
 }
 ```
 
-Loops typically use [variable reassignment](./statements.md#reassignment) or for calling [effectful functions](./functions.md#effectful-functions).
+Loops are typically used for [variable reassignment](statements#reassignment) or for calling [effectful functions](functions#effectful-functions).
 
 ## Infinite Loops
 
