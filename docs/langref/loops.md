@@ -113,7 +113,7 @@ for i in [1, 2, 3] {
 }
 ```
 
-Loops typically use [variable reassignment](statements#reassignment) or for calling [effectful functions](functions#effectful-functions).
+Loops are typically used for [variable reassignment](statements#reassignment) or for calling [effectful functions](functions#effectful-functions).
 
 ## Infinite Loops
 

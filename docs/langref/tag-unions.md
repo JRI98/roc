@@ -25,7 +25,7 @@ _Structural_ tag unions are both structural and extensible.
 
 In contrast, [_nominal_ tag unions](#nominal-tag-unions) are neither structural nor extensible.
 
-### Extending Structural Tag Unions 
+### Extending Structural Tag Unions
 
 Structural tag unions can be extended by having a conditional branch introduce a new tag:
 
@@ -62,7 +62,7 @@ You can use these type parameters in type aliases:
 Letters(others) : [A, B, ..others]
 ```
 
-If you match on a [catch-all underscore pattern](pattern-matching#catch-all-patterns-_), 
+If you match on a [catch-all underscore pattern](pattern-matching#catch-all-patterns-_),
 you can accept a tag union containing _at least_ some tags, but also arbitrary others:
 
 ```roc
@@ -115,17 +115,17 @@ extended_color = if some_condition {
 
 This is rarely useful to application authors, but it is useful to platform authors.
 Platform authors can't send extensible types across the host boundary (as otherwise
-the host couldn't reliably know which tags map to which integer discriminants), 
-so this is a way to (for example) make a structural tag union for errors, and then 
+the host couldn't reliably know which tags map to which integer discriminants),
+so this is a way to (for example) make a structural tag union for errors, and then
 mark it as closed so that it can be sent across the host boundary.
 
 ### Limitations
 
-Structural tag unions are not allowed to be recursive. To make a recursive tag union, 
+Structural tag unions are not allowed to be recursive. To make a recursive tag union,
 use a [nominal tag union](#nominal-tag-unions) instead. (This used to be supported,
 but [was removed because of its nonobvious downsides](https://github.com/roc-lang/rfcs/pull/1).)
 
-Platform authors should note the previous section on [closed tag unions](#closed-tag-unions), 
+Platform authors should note the previous section on [closed tag unions](#closed-tag-unions),
 which explains why only closed tag unions can be sent across the host boundary.
 
 ## Nominal Tag Unions

@@ -149,7 +149,7 @@ the _type_, because the `url` _module_ is commonly lowercase in Rust.
 
 Rust does not share Elm's strong cultural norm of organizing a module around a particular type.
 This does happen, such as in the standard library's [`string` module](https://doc.rust-lang.org/stable/std/string/index.html)
-module being organized around the [`String` type](https://doc.rust-lang.org/stable/std/string/struct.String.html),
+being organized around the [`String` type](https://doc.rust-lang.org/stable/std/string/struct.String.html),
 but you also see examples like the [`ffi` module](https://doc.rust-lang.org/stable/std/ffi/index.html) which
 exposes the types [`CStr`](https://doc.rust-lang.org/stable/std/ffi/struct.CStr.html),
 [`CString`](https://doc.rust-lang.org/stable/std/ffi/struct.CString.html),

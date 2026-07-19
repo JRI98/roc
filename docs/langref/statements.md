@@ -11,7 +11,7 @@ An _assignment statement_ gives a name to a [value](expressions#values) inside t
 answer = 42
 ```
 
-The name an assignment gives must be a valid Roc [identifier](naming#identifiers).
+The name an assignment gives must be a valid Roc [lowercase name](naming#lowercase-names).
 
 ### [Pattern matching in assignments](#assignment-patterns) {#assignment-patterns}
 

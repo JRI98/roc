@@ -60,7 +60,7 @@ if 2.Dec > 1.Dec {
 }
 ```
 
-This almost never comes up in practice, unless you're playing around putting numbers into the REPL. In those situations, `Dec` can be a nice default because it both supports fractions and can give precise answers when doing quick calculations in the repl.
+This almost never comes up in practice, unless you're playing around putting numbers into the REPL. In those situations, `Dec` can be a nice default because it both supports fractions and can give precise answers when doing quick calculations in the REPL.
 
 ## Builtin Number Types
 

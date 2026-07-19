@@ -136,7 +136,7 @@ following are not known at compile time:
 - Values provided by the platform
 
 If a [`crash`](statements#crash) is encountered during compile-time evaluation,
-it will be reported at compile time just like any other compilation errors (such as
+it will be reported at compile time just like any other compilation error (such as
 syntax errors, naming errors, and type mismatches).
 
 Note that functions are values! If you define a top-level function by calling other
