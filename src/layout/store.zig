@@ -851,10 +851,10 @@ pub const Store = struct {
                         return;
                     }
 
-                    const canonical_node_id: u32 = @intCast(visited.count());
-                    try visited.put(node_id, canonical_node_id);
+                    const visit_id: u32 = @intCast(visited.count());
+                    try visited.put(node_id, visit_id);
                     try key.append(allocator, 2);
-                    try appendValue(key, allocator, canonical_node_id);
+                    try appendValue(key, allocator, visit_id);
                     try appendNodeKey(graph, allocator, key, visited, node_id);
                 },
             }
@@ -1058,6 +1058,7 @@ pub const Store = struct {
         defer working.deinit(self.allocator);
         var pending_recursive = std.StringHashMap(GraphRef).init(self.allocator);
         defer pending_recursive.deinit();
+        var first_working_node: ?GraphNodeId = null;
 
         for (graph.nodes.items, 0..) |_, i| {
             if (analysis.keys[i]) |key| {
@@ -1071,7 +1072,9 @@ pub const Store = struct {
                 }
             }
 
-            const local: GraphRef = .{ .local = try working.reserveNode(self.allocator) };
+            const node_id = try working.reserveNode(self.allocator);
+            if (first_working_node == null) first_working_node = node_id;
+            const local: GraphRef = .{ .local = node_id };
             mapping[i] = local;
             if (analysis.keys[i]) |key| try pending_recursive.put(key, local);
         }
@@ -1136,7 +1139,7 @@ pub const Store = struct {
             const translated_root = translateGraphRef(mapping, root);
             const working_root: GraphRef = switch (translated_root) {
                 .local => translated_root,
-                .canonical => .{ .local = @enumFromInt(0) },
+                .canonical => .{ .local = first_working_node.? },
             };
             working_commit = try self.commitGraphUncached(&working, working_root);
         }

@@ -535,6 +535,11 @@ pub const io_spec_tests = [_]TestSpec{
         .description = "Cross-module recursive nominal types with pattern matching",
     },
     .{
+        .roc_file = "test/fx/issue_10203/main.roc",
+        .io_spec = "1>done",
+        .description = "Regression test: boxed function values in cross-module recursive nominals lower to LIR",
+    },
+    .{
         .roc_file = "test/fx/transitive_import_nominal_equality/main.roc",
         .io_spec = "1>True",
         .description = "Regression test: transitive imports preserve nominal method owner environments for equality",
