@@ -1,15 +1,11 @@
-ParserOptionalAbsentTagName :: [].{}
+ParserRequiredFieldError :: [].{}
 
 Format := [Default].{
 	rename_field : Format, Str -> Str
 	rename_field = |_, name| name
 
 	parse_str : Format, State -> Try({ value : Str, rest : State }, [FormatError, ..])
-	parse_str = |_, state|
-		match state {
-			Present(value) => Ok({ value, rest: Done })
-			Done => Err(FormatError)
-		}
+	parse_str = |_, _state| Err(FormatError)
 
 	parse_record_field : Format,
 	Encoding.FieldName.FieldNames(_shape),
@@ -23,17 +19,13 @@ Format := [Default].{
 		],
 		[FormatError, ..],
 	)
-	parse_record_field = |_, _, state|
-		match state {
-			Present(_) => Ok(TryField({ name: "foo", rest: state }))
-			Done => Ok(Done({ rest: state }))
-		}
+	parse_record_field = |_, _, state| Ok(Done({ rest: state }))
 
 	skip_record_field : Format, State -> Try(State, [FormatError, ..])
-	skip_record_field = |_, _| Ok(Done)
+	skip_record_field = |_, state| Ok(state)
 }
 
-State := [Present(Str), Done]
+State := [Done]
 
 parse : State -> Try(a, [FormatError, ..errs])
 	where [
@@ -47,8 +39,8 @@ parse = |input| {
 }
 
 expect {
-	result : Try({ foo : Try(Str, [Missing]) }, [FormatError])
-	result = parse(State.Done)
+	result : Try({ name : Str }, [FormatError, MissingRequiredField(Str)])
+	result = parse(Done)
 
-	result == Ok({ foo: Err(Missing) })
+	result == Err(MissingRequiredField("name"))
 }

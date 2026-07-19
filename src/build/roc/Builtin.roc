@@ -40,62 +40,61 @@ Builtin :: [].{
 		JsonEncodeState :: { output : List(U8), container_commas : List(Bool) }
 
 		Json :: {}.{
-			ParseErr : [MissingRequiredField(Str), InvalidJson(Str)]
-			parse_str : JsonEncoding, JsonState -> Try({ value : Str, rest : JsonState }, Json.ParseErr)
+			parse_str : JsonEncoding, JsonState -> Try({ value : Str, rest : JsonState }, [InvalidJson(Str)])
 			parse_str = |encoding, state| JsonEncoding.parse_str(encoding, state)
 
-			parse_bool : JsonEncoding, JsonState -> Try({ value : Bool, rest : JsonState }, Json.ParseErr)
+			parse_bool : JsonEncoding, JsonState -> Try({ value : Bool, rest : JsonState }, [InvalidJson(Str)])
 			parse_bool = |encoding, state| JsonEncoding.parse_bool(encoding, state)
 
-			parse_u8 : JsonEncoding, JsonState -> Try({ value : U8, rest : JsonState }, Json.ParseErr)
+			parse_u8 : JsonEncoding, JsonState -> Try({ value : U8, rest : JsonState }, [InvalidJson(Str)])
 			parse_u8 = |encoding, state| JsonEncoding.parse_u8(encoding, state)
 
-			parse_i8 : JsonEncoding, JsonState -> Try({ value : I8, rest : JsonState }, Json.ParseErr)
+			parse_i8 : JsonEncoding, JsonState -> Try({ value : I8, rest : JsonState }, [InvalidJson(Str)])
 			parse_i8 = |encoding, state| JsonEncoding.parse_i8(encoding, state)
 
-			parse_u16 : JsonEncoding, JsonState -> Try({ value : U16, rest : JsonState }, Json.ParseErr)
+			parse_u16 : JsonEncoding, JsonState -> Try({ value : U16, rest : JsonState }, [InvalidJson(Str)])
 			parse_u16 = |encoding, state| JsonEncoding.parse_u16(encoding, state)
 
-			parse_i16 : JsonEncoding, JsonState -> Try({ value : I16, rest : JsonState }, Json.ParseErr)
+			parse_i16 : JsonEncoding, JsonState -> Try({ value : I16, rest : JsonState }, [InvalidJson(Str)])
 			parse_i16 = |encoding, state| JsonEncoding.parse_i16(encoding, state)
 
-			parse_u32 : JsonEncoding, JsonState -> Try({ value : U32, rest : JsonState }, Json.ParseErr)
+			parse_u32 : JsonEncoding, JsonState -> Try({ value : U32, rest : JsonState }, [InvalidJson(Str)])
 			parse_u32 = |encoding, state| JsonEncoding.parse_u32(encoding, state)
 
-			parse_i32 : JsonEncoding, JsonState -> Try({ value : I32, rest : JsonState }, Json.ParseErr)
+			parse_i32 : JsonEncoding, JsonState -> Try({ value : I32, rest : JsonState }, [InvalidJson(Str)])
 			parse_i32 = |encoding, state| JsonEncoding.parse_i32(encoding, state)
 
-			parse_u64 : JsonEncoding, JsonState -> Try({ value : U64, rest : JsonState }, Json.ParseErr)
+			parse_u64 : JsonEncoding, JsonState -> Try({ value : U64, rest : JsonState }, [InvalidJson(Str)])
 			parse_u64 = |encoding, state| JsonEncoding.parse_u64(encoding, state)
 
-			parse_i64 : JsonEncoding, JsonState -> Try({ value : I64, rest : JsonState }, Json.ParseErr)
+			parse_i64 : JsonEncoding, JsonState -> Try({ value : I64, rest : JsonState }, [InvalidJson(Str)])
 			parse_i64 = |encoding, state| JsonEncoding.parse_i64(encoding, state)
 
-			parse_u128 : JsonEncoding, JsonState -> Try({ value : U128, rest : JsonState }, Json.ParseErr)
+			parse_u128 : JsonEncoding, JsonState -> Try({ value : U128, rest : JsonState }, [InvalidJson(Str)])
 			parse_u128 = |encoding, state| JsonEncoding.parse_u128(encoding, state)
 
-			parse_i128 : JsonEncoding, JsonState -> Try({ value : I128, rest : JsonState }, Json.ParseErr)
+			parse_i128 : JsonEncoding, JsonState -> Try({ value : I128, rest : JsonState }, [InvalidJson(Str)])
 			parse_i128 = |encoding, state| JsonEncoding.parse_i128(encoding, state)
 
-			parse_dec : JsonEncoding, JsonState -> Try({ value : Dec, rest : JsonState }, Json.ParseErr)
+			parse_dec : JsonEncoding, JsonState -> Try({ value : Dec, rest : JsonState }, [InvalidJson(Str)])
 			parse_dec = |encoding, state| JsonEncoding.parse_dec(encoding, state)
 
-			parse_f32 : JsonEncoding, JsonState -> Try({ value : F32, rest : JsonState }, Json.ParseErr)
+			parse_f32 : JsonEncoding, JsonState -> Try({ value : F32, rest : JsonState }, [InvalidJson(Str)])
 			parse_f32 = |encoding, state| JsonEncoding.parse_f32(encoding, state)
 
-			parse_f64 : JsonEncoding, JsonState -> Try({ value : F64, rest : JsonState }, Json.ParseErr)
+			parse_f64 : JsonEncoding, JsonState -> Try({ value : F64, rest : JsonState }, [InvalidJson(Str)])
 			parse_f64 = |encoding, state| JsonEncoding.parse_f64(encoding, state)
 
-			parse_null : JsonEncoding, JsonState -> Try(JsonState, Json.ParseErr)
+			parse_null : JsonEncoding, JsonState -> Try(JsonState, [InvalidJson(Str)])
 			parse_null = |encoding, state| JsonEncoding.parse_null(encoding, state)
 
-			parse_array_start : JsonEncoding, JsonState -> Try(JsonState, Json.ParseErr)
+			parse_array_start : JsonEncoding, JsonState -> Try(JsonState, [InvalidJson(Str)])
 			parse_array_start = |encoding, state| JsonEncoding.parse_array_start(encoding, state)
 
-			parse_array_next : JsonEncoding, JsonState -> Try([Element(JsonState), Done(JsonState)], Json.ParseErr)
+			parse_array_next : JsonEncoding, JsonState -> Try([Element(JsonState), Done(JsonState)], [InvalidJson(Str)])
 			parse_array_next = |encoding, state| JsonEncoding.parse_array_next(encoding, state)
 
-			parse_array_after_element : JsonEncoding, JsonState -> Try([Continue(JsonState), Done(JsonState)], Json.ParseErr)
+			parse_array_after_element : JsonEncoding, JsonState -> Try([Continue(JsonState), Done(JsonState)], [InvalidJson(Str)])
 			parse_array_after_element = |encoding, state| JsonEncoding.parse_array_after_element(encoding, state)
 
 			encode_str : JsonEncoding, Str, JsonEncodeState -> Try(JsonEncodeState, _never_fails)
@@ -187,9 +186,9 @@ Builtin :: [].{
 				Ok(Str.from_utf8_lossy(encoded.output))
 			}
 
-			parse : Str -> Try(a, Json.ParseErr)
+			parse : Str -> Try(a, [InvalidJson(Str), ..errs])
 				where [
-					a.parser_for : JsonEncoding -> (JsonState -> Try({ value : a, rest : JsonState }, Json.ParseErr)),
+					a.parser_for : JsonEncoding -> (JsonState -> Try({ value : a, rest : JsonState }, [InvalidJson(Str), ..errs])),
 				]
 			parse = |json| {
 				Shape : a
@@ -206,9 +205,9 @@ Builtin :: [].{
 					}
 			}
 
-			parse_trailing_commas : Str -> Try(a, Json.ParseErr)
+			parse_trailing_commas : Str -> Try(a, [InvalidJson(Str), ..errs])
 				where [
-					a.parser_for : JsonEncoding -> (JsonState -> Try({ value : a, rest : JsonState }, Json.ParseErr)),
+					a.parser_for : JsonEncoding -> (JsonState -> Try({ value : a, rest : JsonState }, [InvalidJson(Str), ..errs])),
 				]
 			parse_trailing_commas = |json| {
 				Shape : a
@@ -225,9 +224,9 @@ Builtin :: [].{
 					}
 			}
 
-			parser_camel : () -> (Str -> Try(a, Json.ParseErr))
+			parser_camel : () -> (Str -> Try(a, [InvalidJson(Str), ..errs]))
 				where [
-					a.parser_for : JsonEncoding -> (JsonState -> Try({ value : a, rest : JsonState }, Json.ParseErr)),
+					a.parser_for : JsonEncoding -> (JsonState -> Try({ value : a, rest : JsonState }, [InvalidJson(Str), ..errs])),
 				]
 			parser_camel = || {
 				Shape : a
@@ -247,10 +246,10 @@ Builtin :: [].{
 				}
 			}
 
-			invalid_json : Json.ParseErr
+			invalid_json : [InvalidJson(Str), ..]
 			invalid_json = InvalidJson("Invalid JSON")
 
-			parse_json_bool : Str -> Try({ value : Bool, rest : JsonState }, Json.ParseErr)
+			parse_json_bool : Str -> Try({ value : Bool, rest : JsonState }, [InvalidJson(Str), ..])
 			parse_json_bool = |raw| {
 				trimmed = json_trim_start(raw)
 				parts = Json.split_json_scalar_tail(trimmed)?
@@ -264,7 +263,7 @@ Builtin :: [].{
 				}
 			}
 
-			parse_json_null : Str -> Try(JsonState, Json.ParseErr)
+			parse_json_null : Str -> Try(JsonState, [InvalidJson(Str), ..])
 			parse_json_null = |raw| {
 				trimmed = json_trim_start(raw)
 				parts = Json.split_json_scalar_tail(trimmed)?
@@ -276,7 +275,7 @@ Builtin :: [].{
 				}
 			}
 
-			parse_array_start_from_json : Str -> Try(JsonState, Json.ParseErr)
+			parse_array_start_from_json : Str -> Try(JsonState, [InvalidJson(Str), ..])
 			parse_array_start_from_json = |raw| {
 				trimmed = json_trim_start(raw)
 
@@ -287,7 +286,7 @@ Builtin :: [].{
 				}
 			}
 
-			parse_array_next_from_json : Str -> Try([Element(JsonState), Done(JsonState)], Json.ParseErr)
+			parse_array_next_from_json : Str -> Try([Element(JsonState), Done(JsonState)], [InvalidJson(Str), ..])
 			parse_array_next_from_json = |raw| {
 				trimmed = json_trim_start(raw)
 
@@ -298,7 +297,7 @@ Builtin :: [].{
 				}
 			}
 
-			parse_array_after_element_from_json : JsonEncoding, Str -> Try([Continue(JsonState), Done(JsonState)], Json.ParseErr)
+			parse_array_after_element_from_json : JsonEncoding, Str -> Try([Continue(JsonState), Done(JsonState)], [InvalidJson(Str), ..])
 			parse_array_after_element_from_json = |encoding, raw| {
 				trimmed = json_trim_start(raw)
 
@@ -321,7 +320,7 @@ Builtin :: [].{
 				}
 			}
 
-			parse_json_unsigned_int : Str, (Str -> Try(a, [BadNumStr])) -> Try({ value : a, rest : JsonState }, Json.ParseErr)
+			parse_json_unsigned_int : Str, (Str -> Try(a, [BadNumStr])) -> Try({ value : a, rest : JsonState }, [InvalidJson(Str), ..])
 			parse_json_unsigned_int = |raw, parse_num| {
 				trimmed = json_trim_start(raw)
 				parts = Json.split_json_scalar_tail(trimmed)?
@@ -336,7 +335,7 @@ Builtin :: [].{
 				}
 			}
 
-			parse_json_signed_int : Str, (Str -> Try(a, [BadNumStr])) -> Try({ value : a, rest : JsonState }, Json.ParseErr)
+			parse_json_signed_int : Str, (Str -> Try(a, [BadNumStr])) -> Try({ value : a, rest : JsonState }, [InvalidJson(Str), ..])
 			parse_json_signed_int = |raw, parse_num| {
 				trimmed = json_trim_start(raw)
 				parts = Json.split_json_scalar_tail(trimmed)?
@@ -351,7 +350,7 @@ Builtin :: [].{
 				}
 			}
 
-			parse_json_number : Str, (Str -> Try(a, [BadNumStr])) -> Try({ value : a, rest : JsonState }, Json.ParseErr)
+			parse_json_number : Str, (Str -> Try(a, [BadNumStr])) -> Try({ value : a, rest : JsonState }, [InvalidJson(Str), ..])
 			parse_json_number = |raw, parse_num| {
 				trimmed = json_trim_start(raw)
 				parts = Json.split_json_scalar_tail(trimmed)?
@@ -486,7 +485,7 @@ Builtin :: [].{
 				}
 			}
 
-			parse_json_key_unsigned_int : Str, (Str -> Try(a, [BadNumStr])) -> Try(a, Json.ParseErr)
+			parse_json_key_unsigned_int : Str, (Str -> Try(a, [BadNumStr])) -> Try(a, [InvalidJson(Str), ..])
 			parse_json_key_unsigned_int = |key, parse_num|
 				if Json.is_json_unsigned_int_literal(key) {
 					match parse_num(key) {
@@ -497,7 +496,7 @@ Builtin :: [].{
 					Err(Json.invalid_json)
 				}
 
-			parse_json_key_signed_int : Str, (Str -> Try(a, [BadNumStr])) -> Try(a, Json.ParseErr)
+			parse_json_key_signed_int : Str, (Str -> Try(a, [BadNumStr])) -> Try(a, [InvalidJson(Str), ..])
 			parse_json_key_signed_int = |key, parse_num|
 				if Json.is_json_signed_int_literal(key) {
 					match parse_num(key) {
@@ -508,7 +507,7 @@ Builtin :: [].{
 					Err(Json.invalid_json)
 				}
 
-			parse_json_key_number : Str, (Str -> Try(a, [BadNumStr])) -> Try(a, Json.ParseErr)
+			parse_json_key_number : Str, (Str -> Try(a, [BadNumStr])) -> Try(a, [InvalidJson(Str), ..])
 			parse_json_key_number = |key, parse_num|
 				if Json.is_json_number(key) {
 					match parse_num(key) {
@@ -706,7 +705,7 @@ Builtin :: [].{
 					Continue({ rest : JsonState }),
 					Done({ rest : JsonState }),
 				],
-				Json.ParseErr,
+				[InvalidJson(Str), ..],
 			)
 			parse_record_field_from_object = |encoding, raw| {
 				remaining = json_trim_start(raw)
@@ -809,7 +808,7 @@ Builtin :: [].{
 				}
 			}
 
-			skip_json_value : JsonEncoding, JsonState -> Try(JsonState, Json.ParseErr)
+			skip_json_value : JsonEncoding, JsonState -> Try(JsonState, [InvalidJson(Str), ..])
 			skip_json_value = |encoding, state|
 				match state {
 					Input(raw) => {
@@ -833,7 +832,7 @@ Builtin :: [].{
 					}
 				}
 
-			skip_json_object : JsonEncoding, Str -> Try(JsonState, Json.ParseErr)
+			skip_json_object : JsonEncoding, Str -> Try(JsonState, [InvalidJson(Str), ..])
 			skip_json_object = |encoding, raw| {
 				remaining = json_trim_start(raw)
 
@@ -890,7 +889,7 @@ Builtin :: [].{
 				}
 			}
 
-			skip_json_array : JsonEncoding, Str -> Try(JsonState, Json.ParseErr)
+			skip_json_array : JsonEncoding, Str -> Try(JsonState, [InvalidJson(Str), ..])
 			skip_json_array = |encoding, raw| {
 				remaining = json_trim_start(raw)
 
@@ -935,7 +934,7 @@ Builtin :: [].{
 				}
 			}
 
-			parse_tag_union_from_json : Str, JsonEncoding, ParseTagUnionSpec(a) -> Try({ value : a, rest : JsonState }, Json.ParseErr)
+			parse_tag_union_from_json : Str, JsonEncoding, ParseTagUnionSpec(a) -> Try({ value : a, rest : JsonState }, [InvalidJson(Str), ..])
 			parse_tag_union_from_json = |raw, encoding, spec| {
 				remaining = json_trim_start(raw)
 
@@ -1008,18 +1007,18 @@ Builtin :: [].{
 				}
 			}
 
-			start_string_tag_payloads : JsonState, U64 -> Try(JsonState, Json.ParseErr)
+			start_string_tag_payloads : JsonState, U64 -> Try(JsonState, [InvalidJson(Str), ..])
 			start_string_tag_payloads = |state, count|
 				if count == 0 Ok(state) else Err(Json.invalid_json)
 
-			next_string_tag_payload : JsonState, U64, U64 -> Try(JsonState, Json.ParseErr)
+			next_string_tag_payload : JsonState, U64, U64 -> Try(JsonState, [InvalidJson(Str), ..])
 			next_string_tag_payload = |_, _, _| Err(Json.invalid_json)
 
-			finish_string_tag_payloads : JsonState, U64 -> Try(JsonState, Json.ParseErr)
+			finish_string_tag_payloads : JsonState, U64 -> Try(JsonState, [InvalidJson(Str), ..])
 			finish_string_tag_payloads = |state, count|
 				if count == 0 Ok(state) else Err(Json.invalid_json)
 
-			start_object_tag_payloads : JsonEncoding, JsonState, U64 -> Try(JsonState, Json.ParseErr)
+			start_object_tag_payloads : JsonEncoding, JsonState, U64 -> Try(JsonState, [InvalidJson(Str), ..])
 			start_object_tag_payloads = |encoding, state, count|
 				if count == 0 {
 					match state {
@@ -1038,7 +1037,7 @@ Builtin :: [].{
 					}
 				}
 
-			next_object_tag_payload : JsonEncoding, JsonState, U64, U64 -> Try(JsonState, Json.ParseErr)
+			next_object_tag_payload : JsonEncoding, JsonState, U64, U64 -> Try(JsonState, [InvalidJson(Str), ..])
 			next_object_tag_payload = |encoding, state, _, count|
 				if count <= 1 {
 					Err(Json.invalid_json)
@@ -1053,7 +1052,7 @@ Builtin :: [].{
 					}
 				}
 
-			finish_object_tag_payloads : JsonEncoding, JsonState, U64 -> Try(JsonState, Json.ParseErr)
+			finish_object_tag_payloads : JsonEncoding, JsonState, U64 -> Try(JsonState, [InvalidJson(Str), ..])
 			finish_object_tag_payloads = |encoding, state, count|
 				if count <= 1 {
 					Ok(state)
@@ -1064,7 +1063,7 @@ Builtin :: [].{
 					}
 				}
 
-			finish_tag_payload : JsonEncoding, a, Str -> Try({ value : a, rest : JsonState }, Json.ParseErr)
+			finish_tag_payload : JsonEncoding, a, Str -> Try({ value : a, rest : JsonState }, [InvalidJson(Str), ..])
 			finish_tag_payload = |encoding, value, raw| {
 				remaining = json_trim_start(raw)
 
@@ -1089,7 +1088,7 @@ Builtin :: [].{
 				Err(Json.invalid_json)
 			}
 
-			consume_empty_json_object : Str -> Try({ after : Str }, Json.ParseErr)
+			consume_empty_json_object : Str -> Try({ after : Str }, [InvalidJson(Str), ..])
 			consume_empty_json_object = |raw| {
 				remaining = json_trim_start(raw)
 
@@ -1311,7 +1310,7 @@ Builtin :: [].{
 			## \uXXXX (with surrogate pairs combined into one code point). Unknown escapes, incomplete
 			## escapes, and unpaired surrogates are invalid JSON. Strings without escapes return
 			## zero-copy slices.
-			split_json_string_tail : Str -> Try({ value : Str, after : Str }, Json.ParseErr)
+			split_json_string_tail : Str -> Try({ value : Str, after : Str }, [InvalidJson(Str), ..])
 			split_json_string_tail = |tail| {
 				{ body, after } = scan_json_string_tail(tail)?
 				value = match body {
@@ -1324,7 +1323,7 @@ Builtin :: [].{
 			## Split a JSON scalar (number, boolean, or null) from the text after it.
 			## The scalar ends at the first `,`, `}`, `]`, or JSON whitespace; `after`
 			## keeps that delimiter. Both results are zero-copy slices.
-			split_json_scalar_tail : Str -> Try({ value : Str, after : Str }, Json.ParseErr)
+			split_json_scalar_tail : Str -> Try({ value : Str, after : Str }, [InvalidJson(Str), ..])
 			split_json_scalar_tail = |raw| {
 				bytes = Str.to_utf8(raw)
 
@@ -1376,7 +1375,7 @@ Builtin :: [].{
 					TrailingCommas => True
 				}
 
-			parse_str : JsonEncoding, JsonState -> Try({ value : Str, rest : JsonState }, Json.ParseErr)
+			parse_str : JsonEncoding, JsonState -> Try({ value : Str, rest : JsonState }, [InvalidJson(Str), ..])
 			parse_str = |_, state|
 				match state {
 					Input(raw) => {
@@ -1391,109 +1390,109 @@ Builtin :: [].{
 					}
 				}
 
-			parse_bool : JsonEncoding, JsonState -> Try({ value : Bool, rest : JsonState }, Json.ParseErr)
+			parse_bool : JsonEncoding, JsonState -> Try({ value : Bool, rest : JsonState }, [InvalidJson(Str), ..])
 			parse_bool = |_, state|
 				match state {
 					Input(raw) => Json.parse_json_bool(raw)
 				}
 
-			parse_u8 : JsonEncoding, JsonState -> Try({ value : U8, rest : JsonState }, Json.ParseErr)
+			parse_u8 : JsonEncoding, JsonState -> Try({ value : U8, rest : JsonState }, [InvalidJson(Str), ..])
 			parse_u8 = |_, state|
 				match state {
 					Input(raw) => Json.parse_json_unsigned_int(raw, u8_from_str)
 				}
 
-			parse_i8 : JsonEncoding, JsonState -> Try({ value : I8, rest : JsonState }, Json.ParseErr)
+			parse_i8 : JsonEncoding, JsonState -> Try({ value : I8, rest : JsonState }, [InvalidJson(Str), ..])
 			parse_i8 = |_, state|
 				match state {
 					Input(raw) => Json.parse_json_signed_int(raw, i8_from_str)
 				}
 
-			parse_u16 : JsonEncoding, JsonState -> Try({ value : U16, rest : JsonState }, Json.ParseErr)
+			parse_u16 : JsonEncoding, JsonState -> Try({ value : U16, rest : JsonState }, [InvalidJson(Str), ..])
 			parse_u16 = |_, state|
 				match state {
 					Input(raw) => Json.parse_json_unsigned_int(raw, u16_from_str)
 				}
 
-			parse_i16 : JsonEncoding, JsonState -> Try({ value : I16, rest : JsonState }, Json.ParseErr)
+			parse_i16 : JsonEncoding, JsonState -> Try({ value : I16, rest : JsonState }, [InvalidJson(Str), ..])
 			parse_i16 = |_, state|
 				match state {
 					Input(raw) => Json.parse_json_signed_int(raw, i16_from_str)
 				}
 
-			parse_u32 : JsonEncoding, JsonState -> Try({ value : U32, rest : JsonState }, Json.ParseErr)
+			parse_u32 : JsonEncoding, JsonState -> Try({ value : U32, rest : JsonState }, [InvalidJson(Str), ..])
 			parse_u32 = |_, state|
 				match state {
 					Input(raw) => Json.parse_json_unsigned_int(raw, u32_from_str)
 				}
 
-			parse_i32 : JsonEncoding, JsonState -> Try({ value : I32, rest : JsonState }, Json.ParseErr)
+			parse_i32 : JsonEncoding, JsonState -> Try({ value : I32, rest : JsonState }, [InvalidJson(Str), ..])
 			parse_i32 = |_, state|
 				match state {
 					Input(raw) => Json.parse_json_signed_int(raw, i32_from_str)
 				}
 
-			parse_u64 : JsonEncoding, JsonState -> Try({ value : U64, rest : JsonState }, Json.ParseErr)
+			parse_u64 : JsonEncoding, JsonState -> Try({ value : U64, rest : JsonState }, [InvalidJson(Str), ..])
 			parse_u64 = |_, state|
 				match state {
 					Input(raw) => Json.parse_json_unsigned_int(raw, u64_from_str)
 				}
 
-			parse_i64 : JsonEncoding, JsonState -> Try({ value : I64, rest : JsonState }, Json.ParseErr)
+			parse_i64 : JsonEncoding, JsonState -> Try({ value : I64, rest : JsonState }, [InvalidJson(Str), ..])
 			parse_i64 = |_, state|
 				match state {
 					Input(raw) => Json.parse_json_signed_int(raw, i64_from_str)
 				}
 
-			parse_u128 : JsonEncoding, JsonState -> Try({ value : U128, rest : JsonState }, Json.ParseErr)
+			parse_u128 : JsonEncoding, JsonState -> Try({ value : U128, rest : JsonState }, [InvalidJson(Str), ..])
 			parse_u128 = |_, state|
 				match state {
 					Input(raw) => Json.parse_json_unsigned_int(raw, u128_from_str)
 				}
 
-			parse_i128 : JsonEncoding, JsonState -> Try({ value : I128, rest : JsonState }, Json.ParseErr)
+			parse_i128 : JsonEncoding, JsonState -> Try({ value : I128, rest : JsonState }, [InvalidJson(Str), ..])
 			parse_i128 = |_, state|
 				match state {
 					Input(raw) => Json.parse_json_signed_int(raw, i128_from_str)
 				}
 
-			parse_dec : JsonEncoding, JsonState -> Try({ value : Dec, rest : JsonState }, Json.ParseErr)
+			parse_dec : JsonEncoding, JsonState -> Try({ value : Dec, rest : JsonState }, [InvalidJson(Str), ..])
 			parse_dec = |_, state|
 				match state {
 					Input(raw) => Json.parse_json_number(raw, Json.dec_from_json_number)
 				}
 
-			parse_f32 : JsonEncoding, JsonState -> Try({ value : F32, rest : JsonState }, Json.ParseErr)
+			parse_f32 : JsonEncoding, JsonState -> Try({ value : F32, rest : JsonState }, [InvalidJson(Str), ..])
 			parse_f32 = |_, state|
 				match state {
 					Input(raw) => Json.parse_json_number(raw, f32_from_str)
 				}
 
-			parse_f64 : JsonEncoding, JsonState -> Try({ value : F64, rest : JsonState }, Json.ParseErr)
+			parse_f64 : JsonEncoding, JsonState -> Try({ value : F64, rest : JsonState }, [InvalidJson(Str), ..])
 			parse_f64 = |_, state|
 				match state {
 					Input(raw) => Json.parse_json_number(raw, f64_from_str)
 				}
 
-			parse_null : JsonEncoding, JsonState -> Try(JsonState, Json.ParseErr)
+			parse_null : JsonEncoding, JsonState -> Try(JsonState, [InvalidJson(Str), ..])
 			parse_null = |_, state|
 				match state {
 					Input(raw) => Json.parse_json_null(raw)
 				}
 
-			parse_array_start : JsonEncoding, JsonState -> Try(JsonState, Json.ParseErr)
+			parse_array_start : JsonEncoding, JsonState -> Try(JsonState, [InvalidJson(Str), ..])
 			parse_array_start = |_, state|
 				match state {
 					Input(raw) => Json.parse_array_start_from_json(raw)
 				}
 
-			parse_array_next : JsonEncoding, JsonState -> Try([Element(JsonState), Done(JsonState)], Json.ParseErr)
+			parse_array_next : JsonEncoding, JsonState -> Try([Element(JsonState), Done(JsonState)], [InvalidJson(Str), ..])
 			parse_array_next = |_, state|
 				match state {
 					Input(raw) => Json.parse_array_next_from_json(raw)
 				}
 
-			parse_array_after_element : JsonEncoding, JsonState -> Try([Continue(JsonState), Done(JsonState)], Json.ParseErr)
+			parse_array_after_element : JsonEncoding, JsonState -> Try([Continue(JsonState), Done(JsonState)], [InvalidJson(Str), ..])
 			parse_array_after_element = |encoding, state|
 				match state {
 					Input(raw) => Json.parse_array_after_element_from_json(encoding, raw)
@@ -1509,14 +1508,14 @@ Builtin :: [].{
 					Continue({ rest : JsonState }),
 					Done({ rest : JsonState }),
 				],
-				Json.ParseErr,
+				[InvalidJson(Str), ..],
 			)
 			parse_record_field = |encoding, _, state|
 				match state {
 					Input(raw) => Json.parse_record_field_from_object(encoding, raw)
 				}
 
-			parse_object_next : JsonEncoding, JsonState -> Try([Entry({ key : Str, rest : JsonState }), Done({ rest : JsonState })], Json.ParseErr)
+			parse_object_next : JsonEncoding, JsonState -> Try([Entry({ key : Str, rest : JsonState }), Done({ rest : JsonState })], [InvalidJson(Str), ..])
 			parse_object_next = |encoding, state|
 				match state {
 					Input(raw) =>
@@ -1530,16 +1529,13 @@ Builtin :: [].{
 						}
 					}
 
-			skip_record_field : JsonEncoding, JsonState -> Try(JsonState, Json.ParseErr)
+			skip_record_field : JsonEncoding, JsonState -> Try(JsonState, [InvalidJson(Str), ..])
 			skip_record_field = |encoding, state| Json.skip_json_value(encoding, state)
 
-			missing_record_field : JsonEncoding, Str, JsonState -> Json.ParseErr
-			missing_record_field = |_, field, _| MissingRequiredField(field)
-
-			invalid_value : JsonEncoding, JsonState -> Json.ParseErr
+			invalid_value : JsonEncoding, JsonState -> [InvalidJson(Str), ..]
 			invalid_value = |_, _| Json.invalid_json
 
-			parse_tag_union : JsonEncoding, ParseTagUnionSpec(a), JsonState -> Try({ value : a, rest : JsonState }, Json.ParseErr)
+			parse_tag_union : JsonEncoding, ParseTagUnionSpec(a), JsonState -> Try({ value : a, rest : JsonState }, [InvalidJson(Str), ..])
 			parse_tag_union = |encoding, spec, state|
 				match state {
 					Input(value) => Json.parse_tag_union_from_json(value, encoding, spec)
@@ -1680,10 +1676,10 @@ Builtin :: [].{
 					},
 				)
 
-			parse_key_str : JsonEncoding, Str -> Try(Str, Json.ParseErr)
+			parse_key_str : JsonEncoding, Str -> Try(Str, [InvalidJson(Str), ..])
 			parse_key_str = |_, key| Ok(key)
 
-			parse_key_bool : JsonEncoding, Str -> Try(Bool, Json.ParseErr)
+			parse_key_bool : JsonEncoding, Str -> Try(Bool, [InvalidJson(Str), ..])
 			parse_key_bool = |_, key|
 				if Str.is_eq(key, "true") {
 					Ok(True)
@@ -1693,43 +1689,43 @@ Builtin :: [].{
 					Err(Json.invalid_json)
 				}
 
-			parse_key_u8 : JsonEncoding, Str -> Try(U8, Json.ParseErr)
+			parse_key_u8 : JsonEncoding, Str -> Try(U8, [InvalidJson(Str), ..])
 			parse_key_u8 = |_, key| Json.parse_json_key_unsigned_int(key, u8_from_str)
 
-			parse_key_i8 : JsonEncoding, Str -> Try(I8, Json.ParseErr)
+			parse_key_i8 : JsonEncoding, Str -> Try(I8, [InvalidJson(Str), ..])
 			parse_key_i8 = |_, key| Json.parse_json_key_signed_int(key, i8_from_str)
 
-			parse_key_u16 : JsonEncoding, Str -> Try(U16, Json.ParseErr)
+			parse_key_u16 : JsonEncoding, Str -> Try(U16, [InvalidJson(Str), ..])
 			parse_key_u16 = |_, key| Json.parse_json_key_unsigned_int(key, u16_from_str)
 
-			parse_key_i16 : JsonEncoding, Str -> Try(I16, Json.ParseErr)
+			parse_key_i16 : JsonEncoding, Str -> Try(I16, [InvalidJson(Str), ..])
 			parse_key_i16 = |_, key| Json.parse_json_key_signed_int(key, i16_from_str)
 
-			parse_key_u32 : JsonEncoding, Str -> Try(U32, Json.ParseErr)
+			parse_key_u32 : JsonEncoding, Str -> Try(U32, [InvalidJson(Str), ..])
 			parse_key_u32 = |_, key| Json.parse_json_key_unsigned_int(key, u32_from_str)
 
-			parse_key_i32 : JsonEncoding, Str -> Try(I32, Json.ParseErr)
+			parse_key_i32 : JsonEncoding, Str -> Try(I32, [InvalidJson(Str), ..])
 			parse_key_i32 = |_, key| Json.parse_json_key_signed_int(key, i32_from_str)
 
-			parse_key_u64 : JsonEncoding, Str -> Try(U64, Json.ParseErr)
+			parse_key_u64 : JsonEncoding, Str -> Try(U64, [InvalidJson(Str), ..])
 			parse_key_u64 = |_, key| Json.parse_json_key_unsigned_int(key, u64_from_str)
 
-			parse_key_i64 : JsonEncoding, Str -> Try(I64, Json.ParseErr)
+			parse_key_i64 : JsonEncoding, Str -> Try(I64, [InvalidJson(Str), ..])
 			parse_key_i64 = |_, key| Json.parse_json_key_signed_int(key, i64_from_str)
 
-			parse_key_u128 : JsonEncoding, Str -> Try(U128, Json.ParseErr)
+			parse_key_u128 : JsonEncoding, Str -> Try(U128, [InvalidJson(Str), ..])
 			parse_key_u128 = |_, key| Json.parse_json_key_unsigned_int(key, u128_from_str)
 
-			parse_key_i128 : JsonEncoding, Str -> Try(I128, Json.ParseErr)
+			parse_key_i128 : JsonEncoding, Str -> Try(I128, [InvalidJson(Str), ..])
 			parse_key_i128 = |_, key| Json.parse_json_key_signed_int(key, i128_from_str)
 
-			parse_key_dec : JsonEncoding, Str -> Try(Dec, Json.ParseErr)
+			parse_key_dec : JsonEncoding, Str -> Try(Dec, [InvalidJson(Str), ..])
 			parse_key_dec = |_, key| Json.parse_json_key_number(key, Json.dec_from_json_number)
 
-			parse_key_f32 : JsonEncoding, Str -> Try(F32, Json.ParseErr)
+			parse_key_f32 : JsonEncoding, Str -> Try(F32, [InvalidJson(Str), ..])
 			parse_key_f32 = |_, key| Json.parse_json_key_number(key, f32_from_str)
 
-			parse_key_f64 : JsonEncoding, Str -> Try(F64, Json.ParseErr)
+			parse_key_f64 : JsonEncoding, Str -> Try(F64, [InvalidJson(Str), ..])
 			parse_key_f64 = |_, key| Json.parse_json_key_number(key, f64_from_str)
 
 			encode_key_str : JsonEncoding, Str -> Try(Str, _never_fails)
@@ -1808,19 +1804,19 @@ Builtin :: [].{
 			rename_field : HttpHeaderEncoding, Str -> Str
 			rename_field = |_, name| HttpHeader.underscores_to_dashes(name)
 
-			parse_str : HttpHeaderEncoding, HttpHeaderState -> Try({ value : Str, rest : HttpHeaderState }, HttpHeader)
+			parse_str : HttpHeaderEncoding, HttpHeaderState -> Try({ value : Str, rest : HttpHeaderState }, [BadHeader, ..])
 			parse_str = |_, state| {
 				value_parts = HttpHeader.take_header_value(state.raw)?
 				Ok({ value: value_parts.value, rest: HttpHeaderState.{ raw: value_parts.after } })
 			}
 
-			parse_u64 : HttpHeaderEncoding, HttpHeaderState -> Try({ value : U64, rest : HttpHeaderState }, HttpHeader)
+			parse_u64 : HttpHeaderEncoding, HttpHeaderState -> Try({ value : U64, rest : HttpHeaderState }, [BadHeader, ..])
 			parse_u64 = |_, state| {
 				value_parts = HttpHeader.take_header_value(state.raw)?
 
 				match u64_from_str(value_parts.value) {
 					Ok(value) => Ok({ value, rest: HttpHeaderState.{ raw: value_parts.after } })
-					Err(_) => Err(HttpHeader.BadHeader)
+					Err(_) => Err(BadHeader)
 				}
 			}
 
@@ -1834,30 +1830,26 @@ Builtin :: [].{
 					Continue({ rest : HttpHeaderState }),
 					Done({ rest : HttpHeaderState }),
 				],
-				HttpHeader,
+				[BadHeader, ..],
 			)
 			parse_record_field = |_, fields, state|
 				HttpHeader.parse_record_field_from_headers(fields, state.raw)
 
-			skip_record_field : HttpHeaderEncoding, HttpHeaderState -> Try(HttpHeaderState, HttpHeader)
+			skip_record_field : HttpHeaderEncoding, HttpHeaderState -> Try(HttpHeaderState, [BadHeader, ..])
 			skip_record_field = |_, state| {
 				parts = HttpHeader.take_header_value(state.raw)?
 				Ok(HttpHeaderState.{ raw: parts.after })
 			}
 
-			missing_record_field : HttpHeaderEncoding, Str, HttpHeaderState -> HttpHeader
-			missing_record_field = |_, _, _| HttpHeader.MissingRequired
 		}
 
-		HttpHeader := [MissingRequired, BadHeader].{
-			parser_for : () -> (Str -> Try(output, HttpHeader))
+		HttpHeader :: {}.{
+			parser_for : () -> (Str -> Try(output, [BadHeader, ..errs]))
 				where [
-					output.parser_for : HttpHeaderEncoding -> (HttpHeaderState -> Try({ value : output, rest : HttpHeaderState }, HttpHeader)),
+					output.parser_for : HttpHeaderEncoding -> (HttpHeaderState -> Try({ value : output, rest : HttpHeaderState }, [BadHeader, ..errs])),
 				]
 			parser_for = || {
 				Output : output
-
-				parse_output : HttpHeaderState -> Try({ value : output, rest : HttpHeaderState }, HttpHeader)
 				parse_output = Output.parser_for(HttpHeaderEncoding.Caseless)
 
 				|raw| {
@@ -1866,9 +1858,9 @@ Builtin :: [].{
 				}
 			}
 
-			parse : Str -> Try(output, HttpHeader)
+			parse : Str -> Try(output, [BadHeader, ..errs])
 				where [
-					output.parser_for : HttpHeaderEncoding -> (HttpHeaderState -> Try({ value : output, rest : HttpHeaderState }, HttpHeader)),
+					output.parser_for : HttpHeaderEncoding -> (HttpHeaderState -> Try({ value : output, rest : HttpHeaderState }, [BadHeader, ..errs])),
 				]
 			parse = |raw| {
 				Output : output
@@ -1879,10 +1871,10 @@ Builtin :: [].{
 				Ok(parsed.value)
 			}
 
-			parse_str : HttpHeaderEncoding, HttpHeaderState -> Try({ value : Str, rest : HttpHeaderState }, HttpHeader)
+			parse_str : HttpHeaderEncoding, HttpHeaderState -> Try({ value : Str, rest : HttpHeaderState }, [BadHeader, ..])
 			parse_str = |encoding, state| HttpHeaderEncoding.parse_str(encoding, state)
 
-			parse_u64 : HttpHeaderEncoding, HttpHeaderState -> Try({ value : U64, rest : HttpHeaderState }, HttpHeader)
+			parse_u64 : HttpHeaderEncoding, HttpHeaderState -> Try({ value : U64, rest : HttpHeaderState }, [BadHeader, ..])
 			parse_u64 = |encoding, state| HttpHeaderEncoding.parse_u64(encoding, state)
 
 			parse_record_field_from_headers : FieldName.FieldNames(_shape),
@@ -1894,7 +1886,7 @@ Builtin :: [].{
 					Continue({ rest : HttpHeaderState }),
 					Done({ rest : HttpHeaderState }),
 				],
-				HttpHeader,
+				[BadHeader, ..],
 			)
 			parse_record_field_from_headers = |fields, headers|
 				if Str.is_empty(headers) {
@@ -1914,7 +1906,7 @@ Builtin :: [].{
 								line_len = Str.count_utf8_bytes(line_parts.before)
 
 								if name_len >= line_len {
-									Err(HttpHeader.BadHeader)
+									Err(BadHeader)
 								} else {
 									if name_len < FieldName.FieldNames.shortest_name(fields) {
 										Ok(Continue({ rest: HttpHeaderState.{ raw: line_parts.after } }))
@@ -1933,12 +1925,12 @@ Builtin :: [].{
 								}
 							}
 
-							Err(NotFound) => Err(HttpHeader.BadHeader)
+							Err(NotFound) => Err(BadHeader)
 						}
 					}
 				}
 
-			take_header_value : Str -> Try({ value : Str, after : Str }, HttpHeader)
+			take_header_value : Str -> Try({ value : Str, after : Str }, [BadHeader, ..])
 			take_header_value = |raw|
 				match Str.find_first(raw, "\r\n") {
 					Ok({ before, after }) => Ok({ value: Str.trim(before), after })
@@ -17313,7 +17305,7 @@ ScannedJsonString : { after : Str, body : [NoEscapes(Str), HasEscapes(Str)] }
 
 ## Scan a JSON string body to its closing (unescaped) quote, validating escapes
 ## along the way.
-scan_json_string_tail : Str -> Try(ScannedJsonString, Json.ParseErr)
+scan_json_string_tail : Str -> Try(ScannedJsonString, [InvalidJson(Str), ..])
 scan_json_string_tail = |tail| {
 	bytes = Str.to_utf8(tail)
 	len = List.len(bytes)
@@ -17370,7 +17362,7 @@ scan_json_string_tail = |tail| {
 ## Find the end of a JSON string, for skipped values whose content is discarded.
 ## Escapes are still validated (invalid escapes in skipped fields remain invalid
 ## JSON), but the body is never decoded. Returns the text after the closing quote.
-skip_json_string_tail : Str -> Try(Str, Json.ParseErr)
+skip_json_string_tail : Str -> Try(Str, [InvalidJson(Str), ..])
 skip_json_string_tail = |tail| {
 	{ after, .. } = scan_json_string_tail(tail)?
 	Ok(after)
@@ -17378,7 +17370,7 @@ skip_json_string_tail = |tail| {
 
 ## Decode a JSON string body: walk it, mapping each escape sequence to its code point and
 ## copying everything else.
-decode_json_string_body : Str -> Try(Str, Json.ParseErr)
+decode_json_string_body : Str -> Try(Str, [InvalidJson(Str), ..])
 decode_json_string_body = |raw| {
 	bytes = Str.to_utf8(raw)
 	len = List.len(bytes)
@@ -17413,7 +17405,7 @@ decode_json_string_body = |raw| {
 ## Parse one JSON escape sequence. `rest` is expected to hold the bytes after a backslash.
 ## Every JSON escape denotes exactly one code point (surrogate pairs combine into one), so
 ## this returns that code point plus the number of bytes consumed from `rest`.
-parse_json_escape_sequence : List(U8) -> Try({ code_point : U64, consumed : U64 }, Json.ParseErr)
+parse_json_escape_sequence : List(U8) -> Try({ code_point : U64, consumed : U64 }, [InvalidJson(Str), ..])
 parse_json_escape_sequence = |rest| match rest {
 	['"', ..] => Ok({ code_point: '"', consumed: 1 })
 	['\\', ..] => Ok({ code_point: '\\', consumed: 1 })
@@ -17456,7 +17448,7 @@ parse_json_escape_sequence = |rest| match rest {
 }
 
 ## Combine 4 hex-digit bytes (as in \uXXXX) into their numeric value.
-decode_json_hex4 : U8, U8, U8, U8 -> Try(U64, Json.ParseErr)
+decode_json_hex4 : U8, U8, U8, U8 -> Try(U64, [InvalidJson(Str), ..])
 decode_json_hex4 = |b0, b1, b2, b3| {
 	d0 = decode_json_hex_digit(b0)?
 	d1 = decode_json_hex_digit(b1)?
@@ -17465,7 +17457,7 @@ decode_json_hex4 = |b0, b1, b2, b3| {
 	Ok(((d0 * 16 + d1) * 16 + d2) * 16 + d3)
 }
 
-decode_json_hex_digit : U8 -> Try(U64, Json.ParseErr)
+decode_json_hex_digit : U8 -> Try(U64, [InvalidJson(Str), ..])
 decode_json_hex_digit = |byte|
 	hex_digit_value(byte).map_ok(|value| value.to_u64()).map_err(|_| Json.invalid_json)
 

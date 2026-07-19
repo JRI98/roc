@@ -13651,8 +13651,6 @@ const BodyContext = struct {
         } } });
         const done_body = try self.lowerParseRecordDoneEvent(
             shape_ty,
-            encoding_expr,
-            encoding_ty,
             state_ty,
             ret_ty,
             record_slots,
@@ -13969,8 +13967,6 @@ const BodyContext = struct {
     fn lowerParseRecordDoneEvent(
         self: *BodyContext,
         shape_ty: Type.TypeId,
-        encoding_expr: DraftExprId,
-        encoding_ty: Type.TypeId,
         state_ty: Type.TypeId,
         ret_ty: Type.TypeId,
         record_slots: ParseRecordSlots,
@@ -13986,8 +13982,6 @@ const BodyContext = struct {
             shape_ty,
             record_try_ty,
             rest_expr,
-            encoding_expr,
-            encoding_ty,
             state_ty,
             renamed_field_locals,
         );
@@ -15347,19 +15341,28 @@ const BodyContext = struct {
         state_ty: Type.TypeId,
         ret_ty: Type.TypeId,
     ) Allocator.Error!DraftExprId {
-        const runtime_fn_ty = try self.builder.program.types.add(.{ .func = .{
-            .args = try self.builder.program.types.addSpan(&.{state_ty}),
-            .ret = ret_ty,
-        } });
-        const callable_mono_ty = try self.methodTargetMonoTypeFromArgs(lookup, &.{encoding_ty}, runtime_fn_ty);
+        const callable_mono_ty = try self.methodTargetMonoTypeFromArgAtIndexIsolated(lookup, 0, encoding_ty);
         const parse_fn = self.builder.functionShape(callable_mono_ty, "custom parser target was not a function");
         const parse_arg_tys = self.builder.program.types.span(parse_fn.args);
         if (parse_arg_tys.len != 1) Common.invariant("custom parser target had an unexpected arity");
         if (!self.sameType(GuardedList.at(parse_arg_tys, 0), encoding_ty)) Common.invariant("custom parser encoding type differed from input encoding type");
-        if (!self.sameType(parse_fn.ret, runtime_fn_ty)) Common.invariant("custom parser runtime function type differed from expected type");
+        const runtime_fn_ty = parse_fn.ret;
+        const runtime_fn = self.builder.functionShape(runtime_fn_ty, "custom parser runtime target was not a function");
+        const runtime_arg_tys = self.builder.program.types.span(runtime_fn.args);
+        if (runtime_arg_tys.len != 1 or !self.sameType(GuardedList.at(runtime_arg_tys, 0), state_ty)) {
+            Common.invariant("custom parser runtime argument differed from parser state type");
+        }
+        const source_ret_ty = runtime_fn.ret;
 
-        const ret_info = self.tryInfo(ret_ty);
-        const parse_ok_fields = switch (self.builder.shapeContent(ret_info.ok_ty)) {
+        const source_ret_info = self.tryInfo(source_ret_ty);
+        const target_ret_info = self.tryInfo(ret_ty);
+        if (!self.sameType(source_ret_info.ok_ty, target_ret_info.ok_ty)) {
+            Common.invariant("custom parser result Ok type differed from derived parser result Ok type");
+        }
+        if (!self.builder.errorRowIsIncludedIn(source_ret_info.err_ty, target_ret_info.err_ty)) {
+            Common.invariant("custom parser error row was not included in derived parser error row");
+        }
+        const parse_ok_fields = switch (self.builder.shapeContent(source_ret_info.ok_ty)) {
             .record => |span| self.builder.program.types.fieldSpan(span),
             else => Common.invariant("custom parser result Ok type was not a parse result record"),
         };
@@ -15381,13 +15384,118 @@ const BodyContext = struct {
                 .args = try self.addExprSpan(&[_]DraftExprId{encoding_expr}),
             } },
         });
-        return try self.addExpr(.{
-            .ty = ret_ty,
+        const source_result = try self.addExpr(.{
+            .ty = source_ret_ty,
             .data = .{ .call_value = .{
                 .callee = parser_expr,
                 .args = try self.addExprSpan(&[_]DraftExprId{state_expr}),
             } },
         });
+        return try self.injectTryErrorRow(source_result, source_ret_ty, ret_ty);
+    }
+
+    fn injectTryErrorRow(
+        self: *BodyContext,
+        source_expr: DraftExprId,
+        source_try_ty: Type.TypeId,
+        target_try_ty: Type.TypeId,
+    ) Allocator.Error!DraftExprId {
+        if (self.sameType(source_try_ty, target_try_ty)) return source_expr;
+
+        const source_info = self.tryInfo(source_try_ty);
+        const target_info = self.tryInfo(target_try_ty);
+        if (!self.sameType(source_info.ok_ty, target_info.ok_ty)) {
+            Common.invariant("parser Try error-row injection changed the Ok type");
+        }
+        if (!self.builder.errorRowIsIncludedIn(source_info.err_ty, target_info.err_ty)) {
+            Common.invariant("parser Try error-row injection source was not included in target");
+        }
+
+        const ok_local = try self.addLocal(self.builder.symbols.fresh(), source_info.ok_ty);
+        const ok_payload_pat = try self.bindPat(ok_local, source_info.ok_ty);
+        const ok_backing_pat = try self.addPat(.{ .ty = source_info.backing_ty, .data = .{ .tag = .{
+            .name = source_info.ok_tag.name,
+            .payloads = try self.addPatSpan(&[_]DraftPatId{ok_payload_pat}),
+        } } });
+        const ok_pat = try self.addPat(.{ .ty = source_try_ty, .data = .{ .nominal = ok_backing_pat } });
+        const ok_body = try self.tryOk(target_try_ty, try self.localExpr(ok_local, source_info.ok_ty));
+
+        const source_err_tags = self.builder.tagUnionTags(source_info.err_ty);
+        const branch_count: usize = if (source_err_tags.len == 0) 1 else 2;
+        const branches = try self.allocator.alloc(DraftBranch, branch_count);
+        defer self.allocator.free(branches);
+        branches[0] = .{ .pat = ok_pat, .body = ok_body };
+
+        if (source_err_tags.len != 0) {
+            const err_local = try self.addLocal(self.builder.symbols.fresh(), source_info.err_ty);
+            const err_payload_pat = try self.bindPat(err_local, source_info.err_ty);
+            const err_backing_pat = try self.addPat(.{ .ty = source_info.backing_ty, .data = .{ .tag = .{
+                .name = source_info.err_tag.name,
+                .payloads = try self.addPatSpan(&[_]DraftPatId{err_payload_pat}),
+            } } });
+            const err_pat = try self.addPat(.{ .ty = source_try_ty, .data = .{ .nominal = err_backing_pat } });
+            const err_value = try self.localExpr(err_local, source_info.err_ty);
+            const injected_err = try self.injectErrorRow(err_value, source_info.err_ty, target_info.err_ty);
+            branches[1] = .{ .pat = err_pat, .body = try self.tryErr(target_try_ty, injected_err) };
+        }
+
+        return try self.addExpr(.{ .ty = target_try_ty, .data = .{ .match_ = .{
+            .scrutinee = source_expr,
+            .branches = try self.addBranchSpan(branches),
+        } } });
+    }
+
+    fn injectErrorRow(
+        self: *BodyContext,
+        source_expr: DraftExprId,
+        source_err_ty: Type.TypeId,
+        target_err_ty: Type.TypeId,
+    ) Allocator.Error!DraftExprId {
+        if (self.sameType(source_err_ty, target_err_ty)) return source_expr;
+
+        const source_tags = self.builder.tagUnionTags(source_err_ty);
+        if (source_tags.len == 0) Common.invariant("cannot inject an empty parser error row into a different row");
+        const branches = try self.allocator.alloc(DraftBranch, source_tags.len);
+        defer self.allocator.free(branches);
+
+        for (0..source_tags.len) |tag_index| {
+            const source_tag = GuardedList.at(source_tags, tag_index);
+            const target_tag = self.builder.tagByName(target_err_ty, source_tag.name);
+            const source_payload_tys = self.builder.program.types.span(source_tag.payloads);
+            const target_payload_tys = self.builder.program.types.span(target_tag.payloads);
+            if (source_payload_tys.len != target_payload_tys.len) {
+                Common.invariant("parser error-row injection changed tag payload arity");
+            }
+
+            const payload_pats = try self.allocator.alloc(DraftPatId, source_payload_tys.len);
+            defer self.allocator.free(payload_pats);
+            const payload_exprs = try self.allocator.alloc(DraftExprId, source_payload_tys.len);
+            defer self.allocator.free(payload_exprs);
+            for (0..source_payload_tys.len) |payload_index| {
+                const source_payload_ty = GuardedList.at(source_payload_tys, payload_index);
+                const target_payload_ty = GuardedList.at(target_payload_tys, payload_index);
+                if (!self.sameType(source_payload_ty, target_payload_ty)) {
+                    Common.invariant("parser error-row injection changed tag payload type");
+                }
+                const local = try self.addLocal(self.builder.symbols.fresh(), source_payload_ty);
+                payload_pats[payload_index] = try self.bindPat(local, source_payload_ty);
+                payload_exprs[payload_index] = try self.localExpr(local, source_payload_ty);
+            }
+
+            const pat = try self.addPat(.{ .ty = source_err_ty, .data = .{ .tag = .{
+                .name = source_tag.name,
+                .payloads = try self.addPatSpan(payload_pats),
+            } } });
+            branches[tag_index] = .{
+                .pat = pat,
+                .body = try self.tagUnionValue(target_err_ty, target_tag, payload_exprs),
+            };
+        }
+
+        return try self.addExpr(.{ .ty = target_err_ty, .data = .{ .match_ = .{
+            .scrutinee = source_expr,
+            .branches = try self.addBranchSpan(branches),
+        } } });
     }
 
     fn parseResultOkType(
@@ -15616,8 +15724,6 @@ const BodyContext = struct {
         record_ty: Type.TypeId,
         ret_ty: Type.TypeId,
         rest_value: DraftExprId,
-        encoding_expr: DraftExprId,
-        encoding_ty: Type.TypeId,
         state_ty: Type.TypeId,
         renamed_field_locals: []const DraftLocalId,
     ) Allocator.Error!DraftExprId {
@@ -15660,10 +15766,6 @@ const BodyContext = struct {
                     record_slots.payload_tys[index],
                     field,
                     field_try_ty,
-                    rest_local,
-                    encoding_expr,
-                    encoding_ty,
-                    state_ty,
                     renamed_field_locals[index],
                 );
             }
@@ -19361,7 +19463,7 @@ const BodyContext = struct {
                 // Equality and hash share the binary structural lowering,
                 // which distinguishes their result modes internally.
                 .equality, .hash => try self.lowerStructuralEquality(plan, callable_mono_ty, plan_ret_ty, self, pre_lowered),
-                .parser => try self.lowerStructuralParser(plan, callable_mono_ty, plan_ret_ty, self, pre_lowered),
+                .parser => try self.lowerStructuralParser(plan, callable_mono_ty, plan_ret_ty, &call_ctx, self, pre_lowered),
                 .encoder => try self.lowerStructuralEncoderFor(plan, callable_mono_ty, plan_ret_ty, self, pre_lowered),
                 .map => |map_plan| try self.lowerStructuralMap("map", plan, map_plan, callable_mono_ty, plan_ret_ty, self, pre_lowered),
                 .map_effectful => |map_plan| try self.lowerStructuralMap("map!", plan, map_plan, callable_mono_ty, plan_ret_ty, self, pre_lowered),
@@ -20812,11 +20914,128 @@ const BodyContext = struct {
         return try self.wrapLet(input_local, input_ty, operands.first, bind_transform, ret_ty);
     }
 
+    fn structuralParserCallableTypeWithRequiredFieldError(
+        self: *BodyContext,
+        callable_ty: Type.TypeId,
+        shape_ty: Type.TypeId,
+    ) Allocator.Error!Type.TypeId {
+        var visited = std.AutoHashMap(Type.TypeId, void).init(self.allocator);
+        defer visited.deinit();
+        if (!try self.parserShapeNeedsRequiredFieldError(shape_ty, &visited)) return callable_ty;
+
+        const callable_fn = self.builder.functionShape(callable_ty, "structural parser callable was not a function");
+        const runtime_fn = self.builder.functionShape(callable_fn.ret, "structural parser callable did not return a function");
+        const parse_try = self.tryInfo(runtime_fn.ret);
+        const composed_err_ty = try self.errorRowWithMissingRequiredField(parse_try.err_ty);
+        if (self.sameType(parse_try.err_ty, composed_err_ty)) return callable_ty;
+
+        const composed_parse_try = try self.tryTypeLike(runtime_fn.ret, parse_try.ok_ty, composed_err_ty);
+        const composed_runtime_fn = try self.builder.program.types.add(.{ .func = .{
+            .args = runtime_fn.args,
+            .ret = composed_parse_try,
+        } });
+        return try self.builder.program.types.add(.{ .func = .{
+            .args = callable_fn.args,
+            .ret = composed_runtime_fn,
+        } });
+    }
+
+    fn errorRowWithMissingRequiredField(
+        self: *BodyContext,
+        err_ty: Type.TypeId,
+    ) Allocator.Error!Type.TypeId {
+        const tags = self.builder.tagUnionTags(err_ty);
+        for (0..tags.len) |index| {
+            const tag = GuardedList.at(tags, index);
+            if (!Ident.textEql(self.builder.program.names.tagLabelText(tag.name), "MissingRequiredField")) continue;
+            const payloads = self.builder.program.types.span(tag.payloads);
+            const str_ty = try self.builder.primitiveType(.str);
+            if (payloads.len != 1 or !self.sameType(GuardedList.at(payloads, 0), str_ty)) {
+                Common.invariant("MissingRequiredField in parser error row did not carry one Str payload");
+            }
+            return err_ty;
+        }
+
+        const composed_tags = try self.allocator.alloc(Type.Tag, tags.len + 1);
+        defer self.allocator.free(composed_tags);
+        for (0..tags.len) |index| composed_tags[index] = GuardedList.at(tags, index);
+        const tag_name = try self.builder.program.names.internTagLabel("MissingRequiredField");
+        composed_tags[tags.len] = .{
+            .name = tag_name,
+            .checked_name = tag_name,
+            .payloads = try self.builder.program.types.addSpan(&[_]Type.TypeId{try self.builder.primitiveType(.str)}),
+        };
+        return try self.builder.program.types.add(.{
+            .tag_union = try self.builder.program.types.addTagVariants(&self.builder.program.names, composed_tags),
+        });
+    }
+
+    fn parserShapeNeedsRequiredFieldError(
+        self: *BodyContext,
+        ty: Type.TypeId,
+        visited: *std.AutoHashMap(Type.TypeId, void),
+    ) Allocator.Error!bool {
+        if (visited.contains(ty)) return false;
+        try visited.put(ty, {});
+
+        if (self.jsonParseScalarMethodName(ty) != null) return false;
+        if (self.missingTryInfo(ty)) |info| {
+            return try self.parserShapeNeedsRequiredFieldError(info.ok_ty, visited);
+        }
+        if (self.tryJsonInfo(ty)) |info| {
+            return try self.parserShapeNeedsRequiredFieldError(info.ok_payload_ty, visited);
+        }
+        if (self.customParserLookupReadOnly(ty) != null) return false;
+        if (self.setPayloadType(ty)) |payload_ty| {
+            return try self.parserShapeNeedsRequiredFieldError(payload_ty, visited);
+        }
+        if (self.dictEntryShape(ty)) |dict| {
+            return try self.parserShapeNeedsRequiredFieldError(dict.value_ty, visited);
+        }
+
+        return switch (self.builder.shapeContent(ty)) {
+            .list => |payload_ty| try self.parserShapeNeedsRequiredFieldError(payload_ty, visited),
+            .box => |payload_ty| try self.parserShapeNeedsRequiredFieldError(payload_ty, visited),
+            .tuple => |span| blk: {
+                const elems = self.builder.program.types.span(span);
+                for (0..GuardedList.borrowLen(elems)) |index| {
+                    if (try self.parserShapeNeedsRequiredFieldError(GuardedList.at(elems, index), visited)) break :blk true;
+                }
+                break :blk false;
+            },
+            .record => |span| blk: {
+                const fields = self.builder.program.types.fieldSpan(span);
+                for (0..GuardedList.borrowLen(fields)) |index| {
+                    const field = GuardedList.at(fields, index);
+                    if (self.missingTryInfo(field.ty)) |optional| {
+                        if (try self.parserShapeNeedsRequiredFieldError(optional.ok_ty, visited)) break :blk true;
+                    } else {
+                        break :blk true;
+                    }
+                }
+                break :blk false;
+            },
+            .tag_union => |span| blk: {
+                const tags = self.builder.program.types.tagSpan(span);
+                for (0..GuardedList.borrowLen(tags)) |tag_index| {
+                    const payloads = self.builder.program.types.span(GuardedList.at(tags, tag_index).payloads);
+                    for (0..GuardedList.borrowLen(payloads)) |payload_index| {
+                        if (try self.parserShapeNeedsRequiredFieldError(GuardedList.at(payloads, payload_index), visited)) break :blk true;
+                    }
+                }
+                break :blk false;
+            },
+            .zst => false,
+            else => false,
+        };
+    }
+
     fn lowerStructuralParser(
         self: *BodyContext,
         plan: static_dispatch.StaticDispatchCallPlan,
-        callable_mono_ty: Type.TypeId,
-        ret_ty: Type.TypeId,
+        initial_callable_mono_ty: Type.TypeId,
+        initial_ret_ty: Type.TypeId,
+        call_ctx: *BodyContext,
         arg_ctx: *BodyContext,
         pre_lowered: ?PreLoweredOperand,
     ) Allocator.Error!DraftExprId {
@@ -20825,6 +21044,17 @@ const BodyContext = struct {
             else => Common.invariant("non-parser_for dispatch plan reached structural parse lowering"),
         };
         if (!parser.structural_allowed) Common.invariant("structural parser dispatch plan did not permit structural parser lowering");
+
+        const shape_ty = try self.sealCheckedType(plan.dispatcher_ty);
+        const composed_callable_ty = try self.structuralParserCallableTypeWithRequiredFieldError(initial_callable_mono_ty, shape_ty);
+        if (!self.sameType(initial_callable_mono_ty, composed_callable_ty)) {
+            try call_ctx.constrainTypeToMono(plan.callable_ty, composed_callable_ty);
+        }
+        const callable_mono_ty = try call_ctx.activeTypeFromNode(try call_ctx.instNode(plan.callable_ty));
+        const ret_ty = self.builder.functionShape(callable_mono_ty, "checked structural parser target had a non-function type").ret;
+        if (!self.sameType(initial_ret_ty, ret_ty)) {
+            Common.invariant("structural parser composed return type did not refill the dispatch return type");
+        }
 
         const fn_data = self.builder.functionShape(callable_mono_ty, "checked structural parser target had a non-function type");
         const arg_tys = try GuardedList.dupe(self.allocator, Type.TypeId, self.builder.program.types.span(fn_data.args));
@@ -20838,7 +21068,6 @@ const BodyContext = struct {
         defer self.allocator.free(runtime_arg_tys);
         if (runtime_arg_tys.len != 1) Common.invariant("structural parser runtime function must have one state argument");
 
-        const shape_ty = try self.sealCheckedType(plan.dispatcher_ty);
         const top_level_json_try = self.tryJsonInfo(shape_ty);
         if (self.jsonParseScalarMethodName(shape_ty) == null and top_level_json_try == null) {
             if (self.setPayloadType(shape_ty)) |elem_ty| {
@@ -23042,10 +23271,6 @@ const BodyContext = struct {
         payload_ty: Type.TypeId,
         field: Type.Field,
         field_try_ty: Type.TypeId,
-        rest_local: DraftLocalId,
-        encoding_expr: DraftExprId,
-        encoding_ty: Type.TypeId,
-        state_ty: Type.TypeId,
         renamed_field_local: DraftLocalId,
     ) Allocator.Error!DraftExprId {
         const field_ty = field.ty;
@@ -23059,10 +23284,7 @@ const BodyContext = struct {
             Common.invariant("generated record parse payload type differed from parsed field type");
         }
         const present_body = try self.tryOk(field_try_ty, try self.localExpr(payload_local, payload_ty));
-
-        const absent_body = if (self.typeHasBuiltinOwner(field_ty, .str)) blk: {
-            break :blk try self.tryErr(field_try_ty, try self.missingRecordFieldError(encoding_expr, renamed_field_expr, rest_local, encoding_ty, state_ty, field_try_info.err_ty));
-        } else try self.tryErr(field_try_ty, try self.missingRecordFieldError(encoding_expr, renamed_field_expr, rest_local, encoding_ty, state_ty, field_try_info.err_ty));
+        const absent_body = try self.tryErr(field_try_ty, try self.missingRequiredFieldError(renamed_field_expr, field_try_info.err_ty));
 
         return try self.addExpr(.{ .ty = field_try_ty, .data = .{ .if_initialized_payload = .{
             .cond = is_present_expr,
@@ -23074,37 +23296,25 @@ const BodyContext = struct {
         } } });
     }
 
-    fn missingRecordFieldError(
+    fn missingRequiredFieldError(
         self: *BodyContext,
-        encoding_expr: DraftExprId,
         field_name_expr: DraftExprId,
-        rest_local: DraftLocalId,
-        encoding_ty: Type.TypeId,
-        state_ty: Type.TypeId,
         err_ty: Type.TypeId,
     ) Allocator.Error!DraftExprId {
         const str_ty = try self.builder.primitiveType(.str);
-        const lookup = try self.methodLookupForTypeName(encoding_ty, "missing_record_field");
-        const callable_mono_ty = try self.methodTargetMonoTypeFromArgs(lookup, &.{ encoding_ty, str_ty, state_ty }, err_ty);
-        const missing_fn = self.builder.functionShape(callable_mono_ty, "missing_record_field target method was not a function");
-        const arg_tys = self.builder.program.types.span(missing_fn.args);
-        if (arg_tys.len != 3) Common.invariant("missing_record_field target method had an unexpected arity");
-        if (!self.sameType(GuardedList.at(arg_tys, 0), encoding_ty)) Common.invariant("missing_record_field encoding type differed from record encoding type");
-        if (!self.sameType(GuardedList.at(arg_tys, 1), str_ty)) Common.invariant("missing_record_field name type differed from Str");
-        if (!self.sameType(GuardedList.at(arg_tys, 2), state_ty)) Common.invariant("missing_record_field state type differed from record rest state type");
-        if (!self.sameType(missing_fn.ret, err_ty)) Common.invariant("missing_record_field return type differed from parse error type");
-
-        const args = [_]DraftExprId{
-            encoding_expr,
-            field_name_expr,
-            try self.localExpr(rest_local, state_ty),
-        };
+        if (!self.sameType(try self.exprType(field_name_expr), str_ty)) {
+            Common.invariant("generated missing required field name was not Str");
+        }
+        const missing_tag = self.monoTagByText(err_ty, "MissingRequiredField");
+        const payload_tys = self.builder.program.types.span(missing_tag.payloads);
+        if (payload_tys.len != 1 or !self.sameType(GuardedList.at(payload_tys, 0), str_ty)) {
+            Common.invariant("MissingRequiredField in parser error row did not carry one Str payload");
+        }
         return try self.addExpr(.{
             .ty = err_ty,
-            .data = .{ .call_proc = .{
-                .callee = draftProcCalleeFromAst(Ast.procCalleeForSlot(try self.methodTargetCalleeWithMono(lookup, callable_mono_ty, .synthesize))),
-                .args = try self.addExprSpan(&args),
-                .is_cold = true,
+            .data = .{ .tag = .{
+                .name = missing_tag.name,
+                .payloads = try self.addExprSpan(&[_]DraftExprId{field_name_expr}),
             } },
         });
     }

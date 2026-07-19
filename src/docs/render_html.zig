@@ -2636,7 +2636,7 @@ test "writeTypeLink strips the module prefix for same-module builtin refs" {
     const gpa = testing.allocator;
 
     // A promoted builtin module ("Encoding") uses bare ids (`JsonState`,
-    // `Json.ParseErr`), but the compiler can report a same-module reference
+    // `HttpHeaderState`), but the compiler can report a same-module reference
     // module-qualified (`Encoding.JsonState`). The link must drop the redundant
     // `Encoding.` so the fragment matches the id on the page — otherwise it
     // points at `#Encoding.JsonState`, which doesn't exist. A regular module
@@ -2701,7 +2701,7 @@ test "writeTypeLink strips the module prefix for same-module builtin refs" {
     // type is top-level or nested under a sub-namespace.
     try ctx.enterModule(gpa, &modules[0]);
     try expect(gpa, &ctx, "Encoding", "Encoding.JsonState", "#JsonState");
-    try expect(gpa, &ctx, "Encoding", "Encoding.Json.ParseErr", "#Json.ParseErr");
+    try expect(gpa, &ctx, "Encoding", "Encoding.HttpHeaderState", "#HttpHeaderState");
     try expect(gpa, &ctx, "Encoding", "JsonState", "#JsonState");
     ctx.leaveModule();
 

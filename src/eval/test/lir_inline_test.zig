@@ -275,7 +275,7 @@ fn structuralJsonSource(
     try source.appendSlice(allocator, "}\n\n");
     switch (operation) {
         .parse => try source.appendSlice(allocator,
-            \\main : Str -> Try(Shape, Json.ParseErr)
+            \\main : Str -> Try(Shape, [InvalidJson(Str), MissingRequiredField(Str)])
             \\main = |json| Json.parse(json)
             \\
         ),
@@ -1452,7 +1452,7 @@ test "issue 10121 shared JSON helpers preserve optional nested round trips" {
         \\        third: Ok({ bar: "three", count: 3 }),
         \\    }
         \\    encoded = Json.to_str(original)
-        \\    parsed : Try(Shape, Json.ParseErr)
+        \\    parsed : Try(Shape, [InvalidJson(Str), MissingRequiredField(Str)])
         \\    parsed = Json.parse(encoded)
         \\
         \\    match parsed {
@@ -5511,7 +5511,7 @@ test "compiler-generated dispatch classes lower via checked evidence" {
         \\    lhs = { speed: Speed.Mph($sum), label: "total" }
         \\    rhs = { speed: Speed.Mph(6), label: "total" }
         \\    other = { speed: Speed.Mph(7), label: "total" }
-        \\    parsed : Try({ names : Set(Str) }, Json.ParseErr)
+        \\    parsed : Try({ names : Set(Str) }, [InvalidJson(Str), MissingRequiredField(Str)])
         \\    parsed = Json.parse("{ \"names\": [\"a\", \"b\"] }")
         \\    parsed_count = match parsed {
         \\        Ok(rec) => rec.names.len()

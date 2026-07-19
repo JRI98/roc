@@ -21998,10 +21998,6 @@ fn parseSpecDeclForNumKind(num_kind: CIR.NumKind) BuiltinParseSpecDecl {
     };
 }
 
-fn missingRecordFieldMethodName(self: *Self) Allocator.Error!Ident.Idx {
-    return try @constCast(self.cir).insertIdent(base.Ident.for_text("missing_record_field"));
-}
-
 fn invalidValueMethodName(self: *Self) Allocator.Error!Ident.Idx {
     return try @constCast(self.cir).insertIdent(base.Ident.for_text("invalid_value"));
 }
@@ -22392,29 +22388,63 @@ fn validateEncodeKeyMethod(
     return if (result.isOk()) .ok else .reported_error;
 }
 
-fn validateMissingRecordFieldMethod(
+fn constrainDerivedParserRequiredFieldError(
     self: *Self,
-    encoding_var: Var,
-    state_var: Var,
     err_var: Var,
-    constraint: StaticDispatchConstraint,
     env: *Env,
     region: Region,
 ) Allocator.Error!DerivedParseValidation {
-    const method_name = try self.missingRecordFieldMethodName();
-    const method = try self.parseFormatMethodVarForEncoding(encoding_var, method_name, env, region) orelse {
-        return try self.reportDerivedParseMissingMethod(encoding_var, method_name, constraint, env);
-    };
     const str_var = try self.freshStr(env, region);
-    const expected_fn = try self.freshFromContent(try self.types.mkFuncUnbound(&.{ encoding_var, str_var, state_var }, err_var), env, region);
-    const result = try self.unifyInContext(method.var_, expected_fn, env, .{
-        .method_type = .{
-            .constraint_var = encoding_var,
-            .dispatcher_name = method.dispatcher_name,
-            .method_name = method_name,
-        },
-    });
+    const tag_name = try @constCast(self.cir).insertIdent(base.Ident.for_text("MissingRequiredField"));
+    const tag = try self.types.mkTag(tag_name, &.{str_var});
+    const ext_var = try self.fresh(env, region);
+    const required_err_var = try self.freshFromContent(try self.types.mkTagUnion(&.{tag}, ext_var), env, region);
+    const result = try self.unify(err_var, required_err_var, env);
     return if (result.isOk()) .ok else .reported_error;
+}
+
+fn constrainDerivedParserErrorRowIncludes(
+    self: *Self,
+    parent_err_var: Var,
+    child_err_var: Var,
+    env: *Env,
+    region: Region,
+) Allocator.Error!DerivedParseValidation {
+    const resolved = self.types.resolveVar(child_err_var);
+    return switch (resolved.desc.content) {
+        .structure => |structure| switch (structure) {
+            .empty_tag_union => .ok,
+            .tag_union => |tag_union| blk: {
+                const tags = self.types.getTagsSlice(tag_union.tags);
+                const copied_tags = try self.gpa.alloc(types_mod.Tag, tags.len);
+                defer self.gpa.free(copied_tags);
+                for (copied_tags, tags.items(.name), tags.items(.args)) |*copied, name, args| {
+                    copied.* = .{ .name = name, .args = args };
+                }
+
+                for (copied_tags) |child_tag| {
+                    const payload_vars = try self.gpa.dupe(Var, self.types.sliceVars(child_tag.args));
+                    defer self.gpa.free(payload_vars);
+                    const required_tag = try self.types.mkTag(child_tag.name, payload_vars);
+                    const parent_ext = try self.fresh(env, region);
+                    const required_parent = try self.freshFromContent(try self.types.mkTagUnion(&.{required_tag}, parent_ext), env, region);
+                    const result = try self.unify(parent_err_var, required_parent, env);
+                    if (!result.isOk()) break :blk .reported_error;
+                }
+
+                break :blk try self.constrainDerivedParserErrorRowIncludes(parent_err_var, tag_union.ext, env, region);
+            },
+            else => .unsupported,
+        },
+        .alias => |alias| try self.constrainDerivedParserErrorRowIncludes(parent_err_var, self.types.getAliasBackingVar(alias), env, region),
+        .flex => blk: {
+            const empty = try self.freshFromContent(.{ .structure = .empty_tag_union }, env, region);
+            const result = try self.unify(resolved.var_, empty, env);
+            break :blk if (result.isOk()) .ok else .reported_error;
+        },
+        .rigid => .unsupported,
+        .err => .ok,
+    };
 }
 
 fn validateInvalidValueMethod(
@@ -22574,7 +22604,7 @@ fn validateDerivedParseRecord(
         .unsupported, .reported_error => |result| return result,
     }
     if (try self.recordParseNeedsRequiredFieldError(fields_range)) {
-        switch (try self.validateMissingRecordFieldMethod(encoding_var, state_var, err_var, constraint, env, region)) {
+        switch (try self.constrainDerivedParserRequiredFieldError(err_var, env, region)) {
             .ok => {},
             .unsupported, .reported_error => |result| return result,
         }
@@ -22805,7 +22835,8 @@ fn validateDerivedParseNominal(
         break :blk try self.instantiateVar(copied_var, env, .{ .explicit = region });
     };
 
-    const expected_ret = try self.freshParseResultTryVar(nominal_var, state_var, err_var, env, region);
+    const child_err_var = try self.fresh(env, region);
+    const expected_ret = try self.freshParseResultTryVar(nominal_var, state_var, child_err_var, env, region);
     const expected_runtime_fn = try self.freshFromContent(try self.types.mkFuncUnbound(&.{state_var}, expected_ret), env, region);
     const expected_fn = try self.freshFromContent(try self.types.mkFuncUnbound(&.{encoding_var}, expected_runtime_fn), env, region);
     const result = try self.unifyInContext(method_var, expected_fn, env, .{
@@ -22815,7 +22846,8 @@ fn validateDerivedParseNominal(
             .method_name = constraint.fn_name,
         },
     });
-    return if (result.isOk()) .ok else .reported_error;
+    if (!result.isOk()) return .reported_error;
+    return try self.constrainDerivedParserErrorRowIncludes(err_var, child_err_var, env, region);
 }
 
 fn validateDerivedEncodeVar(

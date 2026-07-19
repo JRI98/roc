@@ -20,13 +20,13 @@ source = "{\"f00\":\"p0\",\"f01\":\"p1\",\"f02\":\"p2\",\"f03\":\"p3\",\"f04\":\
 
 round_trips : Str -> Bool
 round_trips = |json| {
-	first_result : Try(Shape, Json.ParseErr)
+	first_result : Try(Shape, [InvalidJson(Str)])
 	first_result = Json.parse(json)
 
 	match first_result {
 		Ok(first) => {
 			encoded1 = Json.to_str(first)
-			second_result : Try(Shape, Json.ParseErr)
+			second_result : Try(Shape, [InvalidJson(Str)])
 			second_result = Json.parse(encoded1)
 
 			match second_result {

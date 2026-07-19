@@ -2122,6 +2122,55 @@ error), and the issue #9798 regression test in
 src/check/test/type_checking_integration.zig (a non-hosted `?` into an open
 annotated row is a type error even when the visible errors are included).
 
+### Derived Parser Required-Field Error Composition
+
+A compiler-derived structural record parser, rather than its input-format
+implementation, owns the failure produced when a required field is absent.
+When a parsed record contains at least one field whose type is not the
+recognized optional-field shape `Try(_, [Missing, ..])`, the checker requires
+the parser's shared error row to contain `MissingRequiredField(Str)`. It does so
+by unifying that row with an open row containing the tag. Records whose fields
+are all optional do not add this error, and non-record shapes do not add it.
+Nested derived shapes contribute the error whenever any reachable derived
+record has a required field.
+
+A custom nominal parser nested inside a derived shape keeps its own minimal
+error row. During checking, `constrainDerivedParserErrorRowIncludes` closes an
+unconstrained extension on the instantiated custom-parser method and requires
+every resulting child error tag to occur with the same payload types in the
+parent parser row. A rigid open extension is rejected because the compiler
+cannot prove which additional errors it may produce. Monotype lowering calls
+the custom parser at that checked child row and explicitly injects each child
+error tag into the parent row. This lets a custom JSON scalar parser retain
+only `InvalidJson(Str)` when it is nested in a record whose generated parser
+also needs `MissingRequiredField(Str)`.
+
+Input formats contribute only errors that arise from reading their syntax and
+values. They do not implement a missing-required-field callback. Monotype
+specialization repeats the declared shape rule when a parser constraint was
+generalized before its concrete dispatcher was known: it constrains the
+instantiated callable's open error extension to include
+`MissingRequiredField(Str)` before materializing the callable monotype. This is
+required even when an enclosing generic function consumes and maps every parse
+error, because the generated parser runtime still constructs the missing-field
+branch. Lowering then consumes that solved error row and directly constructs
+`MissingRequiredField(field_name)` when generated record-finalization observes
+an absent required field; absence of that tag from the checked monotype is an
+invariant violation, not a condition lowering may recover from.
+
+Both sides are pinned by tests: accepted —
+test/cli/ParserRequiredFieldError.roc (a non-JSON derived parser reports the
+generic error with the missing field name), and
+test/cli/JsonParseErrorComposition.roc (JSON scalar parsing has only
+`InvalidJson(Str)`, while a required-record parser composes in
+`MissingRequiredField(Str)`),
+test/cli/JsonParseGenericWrapperErrors.roc (a generalized wrapper may consume
+the parser errors without losing the concrete record's required-field error),
+and test/cli/ParserCustomNominalField.roc (a custom nominal parser's narrower
+error row injects into its containing record row); rejected —
+test/cli/ParserMissingRequiredFieldError.roc (a required-record parser cannot
+use a closed format error row that omits `MissingRequiredField(Str)`).
+
 ### Rewrite Inventory
 
 Every solver-mutating rewrite in checking, classified. A change that adds a
@@ -2158,6 +2207,14 @@ Other solved-graph mutations:
   ignorable payload vars for tags the expression provably never constructs
   close to the empty tag union, so matches on constructed values are
   exhaustive without wildcard arms.
+- `constrainDerivedParserRequiredFieldError` — policy: Derived Parser
+  Required-Field Error Composition (above). A structural probe of derived
+  record fields gates ordinary unification of the parser's shared error row
+  with `[MissingRequiredField(Str), ..]`.
+- `constrainDerivedParserErrorRowIncludes` — policy: Derived Parser
+  Required-Field Error Composition (above). A custom parser method's
+  instantiated error extension is closed, then its concrete tags gate ordinary
+  unification constraints requiring the parent parser row to include them.
 - Literal defaulting (`commitLiteralDefault`, `commitLiteralGroupDefault`)
   — policy: literal defaulting as declared in Static Dispatch At The
   Checked Boundary (the `LITERAL DEFAULTED` warning) and the numeric
