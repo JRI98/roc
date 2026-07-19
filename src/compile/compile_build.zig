@@ -809,7 +809,7 @@ pub const BuildEnv = struct {
         // Resolve the full dependency graph (downloads plus version solving),
         // then materialize the resolved packages and their shorthands.
         if (header_info.kind == .app or header_info.kind == .default_app or header_info.kind == .package or header_info.kind == .platform) {
-            try self.resolveAndMaterialize(key_pkg);
+            try self.resolveAndMaterialize(key_pkg, header_info.resolver_root);
         }
     }
 
@@ -1402,9 +1402,7 @@ pub const BuildEnv = struct {
     const HeaderInfo = struct {
         kind: PackageKind,
         source_file_state: ?watch_inputs.State,
-        platform_alias: ?[]u8 = null,
-        platform_path: ?[]u8 = null,
-        shorthands: std.StringHashMapUnmanaged([]const u8) = .{},
+        resolver_root: package_resolution.FetchedPackage,
         /// Platform-exposed modules (e.g., Stdout, Stderr) that apps can import
         exposes: std.ArrayListUnmanaged([]const u8) = .empty,
         /// Platform provides entries (roc_ident -> ffi_symbol mapping)
@@ -1414,14 +1412,7 @@ pub const BuildEnv = struct {
 
         fn deinit(self: *HeaderInfo, gpa: Allocator) void {
             if (self.targets_config) |tc| tc.deinit(gpa);
-            if (self.platform_alias) |a| freeSlice(gpa, a);
-            if (self.platform_path) |p| freeSlice(gpa, p);
-            var it = self.shorthands.iterator();
-            while (it.next()) |e| {
-                freeConstSlice(gpa, e.key_ptr.*);
-                freeConstSlice(gpa, e.value_ptr.*);
-            }
-            self.shorthands.deinit(gpa);
+            self.resolver_root.deinit(gpa);
             for (self.exposes.items) |e| {
                 freeConstSlice(gpa, e);
             }
@@ -1446,27 +1437,6 @@ pub const BuildEnv = struct {
         self.clearPackageExposes(pkg);
         pkg.exposes = header_info.exposes;
         header_info.exposes = .empty;
-    }
-
-    fn putHeaderShorthand(
-        self: *BuildEnv,
-        info: *HeaderInfo,
-        key: []const u8,
-        path: []const u8,
-    ) BuildError!void {
-        var path_transferred = false;
-        errdefer if (!path_transferred) freeConstSlice(self.gpa, path);
-
-        if (info.shorthands.fetchRemove(key)) |entry| {
-            self.gpa.free(entry.key);
-            self.gpa.free(entry.value);
-        }
-
-        const key_owned = try self.gpa.dupe(u8, key);
-        errdefer self.gpa.free(key_owned);
-
-        try info.shorthands.put(self.gpa, key_owned, path);
-        path_transferred = true;
     }
 
     fn parseHeaderDeps(self: *BuildEnv, file_path: []const u8) BuildError!HeaderInfo {
@@ -1537,133 +1507,26 @@ pub const BuildEnv = struct {
         const file = ast.store.getFile();
         const header = ast.store.getHeader(file.header);
 
-        var info = HeaderInfo{ .kind = .package, .source_file_state = source_read.file_state };
+        const resolver_root = package_resolution.scanParsedHeader(self.gpa, file_abs, src, ast, header) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.HeaderParseFailed => return error.ExpectedString,
+        };
+        var info = HeaderInfo{
+            .kind = .package,
+            .source_file_state = source_read.file_state,
+            .resolver_root = resolver_root,
+        };
         errdefer info.deinit(self.gpa);
 
         switch (header) {
-            .app => |a| {
+            .app => {
                 info.kind = .app;
-
-                // Platform field
-                const pf = ast.store.getRecordField(a.platform_idx);
-                const alias = ast.resolve(pf.name);
-                const value_expr = pf.value orelse return error.ExpectedPlatformString;
-                const plat_rel = try self.stringFromExpr(ast, value_expr);
-                defer self.gpa.free(plat_rel);
-
-                // URL specs are resolved (downloaded and version-solved) by
-                // package resolution; keep them verbatim here.
-                const plat_path = if (base.url.isSafeUrl(plat_rel)) blk: {
-                    break :blk try self.gpa.dupe(u8, plat_rel);
-                } else blk: {
-                    const header_dir = std.fs.path.dirname(file_abs) orelse ".";
-                    const abs_path = try PathUtils.makeAbsolute(self.gpa, header_dir, plat_rel);
-                    // Add the platform directory to workspace roots so that
-                    // imports within the platform can be resolved, even when
-                    // it lives outside the app directory (e.g. ../platform).
-                    if (std.fs.path.dirname(abs_path)) |plat_dir| {
-                        try self.addWorkspaceRoot(plat_dir);
-                    }
-                    break :blk abs_path;
-                };
-
-                info.platform_path = @constCast(plat_path);
-                info.platform_alias = try self.gpa.dupe(u8, alias);
-
-                // Packages map
-                const coll = ast.store.getCollection(a.packages);
-                const fields = ast.store.recordFieldSlice(.{ .span = coll.span });
-                for (fields) |idx| {
-                    const rf = ast.store.getRecordField(idx);
-                    const k = ast.resolve(rf.name);
-                    if (rf.value == null) {
-                        // If no value is provided for an app field, skip it
-                        continue;
-                    }
-                    const relp = try self.stringFromExpr(ast, rf.value.?);
-                    defer self.gpa.free(relp);
-
-                    // URL specs are resolved by package resolution; keep them
-                    // verbatim here.
-                    const v = if (base.url.isSafeUrl(relp)) blk: {
-                        break :blk try self.gpa.dupe(u8, relp);
-                    } else blk: {
-                        const header_dir2 = std.fs.path.dirname(file_abs) orelse ".";
-                        const abs_path = try PathUtils.makeAbsolute(self.gpa, header_dir2, relp);
-                        errdefer self.gpa.free(abs_path);
-                        if (std.fs.path.dirname(abs_path)) |pkg_dir| {
-                            try self.addWorkspaceRoot(pkg_dir);
-                        }
-                        break :blk abs_path;
-                    };
-
-                    try self.putHeaderShorthand(&info, k, v);
-                }
             },
-            .package => |p| {
+            .package => {
                 info.kind = .package;
-                const coll = ast.store.getCollection(p.packages);
-                const fields = ast.store.recordFieldSlice(.{ .span = coll.span });
-                for (fields) |idx| {
-                    const rf = ast.store.getRecordField(idx);
-                    const k = ast.resolve(rf.name);
-                    if (rf.value == null) {
-                        // If no value is provided for a package field, skip it
-                        continue;
-                    }
-                    const relp = try self.stringFromExpr(ast, rf.value.?);
-                    defer self.gpa.free(relp);
-
-                    // URL specs are resolved by package resolution; keep them
-                    // verbatim here.
-                    const v = if (base.url.isSafeUrl(relp)) blk: {
-                        break :blk try self.gpa.dupe(u8, relp);
-                    } else blk: {
-                        const header_dir2 = std.fs.path.dirname(file_abs) orelse ".";
-                        const abs_path = try PathUtils.makeAbsolute(self.gpa, header_dir2, relp);
-                        // Enforce: package header deps must be within workspace roots
-                        if (!PathUtils.isWithinRoot(abs_path, self.workspace_roots.items)) {
-                            self.gpa.free(abs_path);
-                            return error.PathOutsideWorkspace;
-                        }
-                        break :blk abs_path;
-                    };
-
-                    try self.putHeaderShorthand(&info, k, v);
-                }
             },
             .platform => |p| {
                 info.kind = .platform;
-                const coll = ast.store.getCollection(p.packages);
-                const fields = ast.store.recordFieldSlice(.{ .span = coll.span });
-                for (fields) |idx| {
-                    const rf = ast.store.getRecordField(idx);
-                    const k = ast.resolve(rf.name);
-                    if (rf.value == null) {
-                        // If no value is provided for a platform field, skip it
-                        continue;
-                    }
-                    const relp = try self.stringFromExpr(ast, rf.value.?);
-                    defer self.gpa.free(relp);
-
-                    // URL specs are resolved by package resolution; keep them
-                    // verbatim here.
-                    const v = if (base.url.isSafeUrl(relp)) blk: {
-                        break :blk try self.gpa.dupe(u8, relp);
-                    } else blk: {
-                        const header_dir2 = std.fs.path.dirname(file_abs) orelse ".";
-                        const abs_path = try PathUtils.makeAbsolute(self.gpa, header_dir2, relp);
-                        // Enforce: platform header deps must be within workspace roots
-                        if (!PathUtils.isWithinRoot(abs_path, self.workspace_roots.items)) {
-                            self.gpa.free(abs_path);
-                            return error.PathOutsideWorkspace;
-                        }
-                        break :blk abs_path;
-                    };
-
-                    try self.putHeaderShorthand(&info, k, v);
-                }
-
                 // Extract platform-exposed modules (e.g., Stdout, Stderr)
                 // These are modules that apps can import from the platform
                 const exposes_coll = ast.store.getCollection(p.exposes);
@@ -1715,37 +1578,6 @@ pub const BuildEnv = struct {
         }
 
         return info;
-    }
-
-    fn stringFromExpr(self: *BuildEnv, ast: *parse.AST, expr_idx: parse.AST.Expr.Idx) BuildError![]const u8 {
-        const e = ast.store.getExpr(expr_idx);
-        return switch (e) {
-            .string => |s| blk: {
-                var buf = std.ArrayList(u8).empty;
-                errdefer buf.deinit(self.gpa);
-
-                // Use exprSlice to properly iterate through string parts
-                for (ast.store.exprSlice(s.parts)) |part_idx| {
-                    const part = ast.store.getExpr(part_idx);
-                    if (part == .string_part) {
-                        const tok = part.string_part.token;
-                        const slice = ast.resolve(tok);
-                        try buf.appendSlice(self.gpa, slice);
-                    }
-                }
-
-                const result = try buf.toOwnedSlice(self.gpa);
-
-                // Check for null bytes in the string, which are invalid in file paths
-                if (std.mem.findScalar(u8, result, 0) != null) {
-                    self.gpa.free(result);
-                    return error.InvalidNullByteInPath;
-                }
-
-                break :blk result;
-            },
-            else => error.ExpectedString,
-        };
     }
 
     fn makeAbsolute(self: *BuildEnv, path: []const u8) Allocator.Error![]u8 {
@@ -2025,9 +1857,11 @@ pub const BuildEnv = struct {
     /// package (named by its unique identity - full URL or absolute path),
     /// wire every package's shorthand aliases to the packages its specs
     /// resolved to, and transfer platform metadata.
-    fn resolveAndMaterialize(self: *BuildEnv, root_pkg_name: []const u8) BuildError!void {
-        const root_abs = self.discovered_root_abs orelse return error.Internal;
-
+    fn resolveAndMaterialize(
+        self: *BuildEnv,
+        root_pkg_name: []const u8,
+        scanned_root: package_resolution.FetchedPackage,
+    ) BuildError!void {
         // Without a cache directory, resolution still works for graphs with
         // no URL dependencies; URL specs report a download failure.
         if (self.package_cache_dir == null) {
@@ -2045,7 +1879,7 @@ pub const BuildEnv = struct {
         var resolver = package_resolution.Resolver.init(self.gpa, ctx_fetcher.fetcher(), self.resolution_config);
         defer resolver.deinit();
 
-        var resolved = resolver.resolve(root_abs) catch |err| switch (err) {
+        var resolved = resolver.resolveScannedRoot(scanned_root) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
             error.ResolutionFailed => {
                 for (resolver.diagnostics.items) |diagnostic| {

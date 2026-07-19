@@ -98,6 +98,16 @@ pub const FetchedPackage = struct {
     /// packages, which are not downloaded and not size-limited).
     content_bytes: u64,
     deps: []const ScannedDep,
+
+    pub fn deinit(self: *FetchedPackage, allocator: Allocator) void {
+        for (self.deps) |dep| {
+            allocator.free(dep.alias);
+            allocator.free(dep.spec);
+        }
+        allocator.free(self.deps);
+        allocator.free(self.root_file);
+        allocator.free(self.root_dir);
+    }
 };
 
 /// Errors a fetcher can produce for a single package.
@@ -390,6 +400,22 @@ pub const Resolver = struct {
                 return error.ResolutionFailed;
             },
         };
+        return self.resolveLoadedRoot(root_path, root_node);
+    }
+
+    /// Resolve using a root header the caller already scanned. The package is
+    /// copied into the resolver's arena so the returned graph owns everything
+    /// it needs independently of the caller.
+    pub fn resolveScannedRoot(self: *Resolver, scanned_root: FetchedPackage) error{ OutOfMemory, ResolutionFailed }!Resolved {
+        const root_node = try copyFetchedPackage(self.arena(), scanned_root);
+        return self.resolveLoadedRoot(root_node.root_file, root_node);
+    }
+
+    fn resolveLoadedRoot(
+        self: *Resolver,
+        root_path: []const u8,
+        root_node: FetchedPackage,
+    ) error{ OutOfMemory, ResolutionFailed }!Resolved {
         try self.local_nodes.put(self.arena(), root_path, root_node);
 
         var chosen: std.StringHashMapUnmanaged(GroupChoice) = .{};
@@ -1280,21 +1306,39 @@ pub fn scanHeaderSource(
         }
     }
 
+    return scanParsedHeader(allocator, root_file_abs, src, ast, header);
+}
+
+/// Extract dependency-resolution input from an already parsed Roc header.
+/// This lets callers that need other header metadata hand the exact same parse
+/// to the resolver instead of reading and parsing the root file a second time.
+pub fn scanParsedHeader(
+    allocator: Allocator,
+    root_file_abs: []const u8,
+    src: []const u8,
+    ast: *parse.AST,
+    header: parse.AST.Header,
+) error{ OutOfMemory, HeaderParseFailed }!FetchedPackage {
     var deps = std.ArrayListUnmanaged(ScannedDep).empty;
+    errdefer {
+        for (deps.items) |dep| {
+            allocator.free(dep.alias);
+            allocator.free(dep.spec);
+        }
+        deps.deinit(allocator);
+    }
 
     const root_file = try allocator.dupe(u8, root_file_abs);
+    errdefer allocator.free(root_file);
     const root_dir = try allocator.dupe(u8, std.fs.path.dirname(root_file_abs) orelse ".");
+    errdefer allocator.free(root_dir);
 
     const kind: HeaderKind = switch (header) {
         .app => |a| blk: {
             const platform_field = ast.store.getRecordField(a.platform_idx);
             if (platform_field.value) |value_expr| {
                 const spec = (try stringFromExpr(allocator, ast, value_expr)) orelse return error.HeaderParseFailed;
-                try deps.append(allocator, .{
-                    .alias = try allocator.dupe(u8, ast.resolve(platform_field.name)),
-                    .spec = spec,
-                    .is_platform = true,
-                });
+                try appendScannedDep(allocator, &deps, ast.resolve(platform_field.name), spec, true);
             } else {
                 return error.HeaderParseFailed;
             }
@@ -1312,7 +1356,7 @@ pub fn scanHeaderSource(
             break :blk .platform;
         },
         .module, .hosted, .type_module, .default_app => .module,
-        .malformed => unreachable,
+        .malformed => return error.HeaderParseFailed,
     };
 
     return .{
@@ -1321,7 +1365,7 @@ pub fn scanHeaderSource(
         .root_dir = root_dir,
         .root_source_hash = sha256Bytes(src),
         .content_bytes = 0,
-        .deps = deps.items,
+        .deps = try deps.toOwnedSlice(allocator),
     };
 }
 
@@ -1358,12 +1402,25 @@ fn appendPackagesCollection(
         const field = ast.store.getRecordField(idx);
         const value_expr = field.value orelse continue;
         const spec = (try stringFromExpr(allocator, ast, value_expr)) orelse return error.HeaderParseFailed;
-        try deps.append(allocator, .{
-            .alias = try allocator.dupe(u8, ast.resolve(field.name)),
-            .spec = spec,
-            .is_platform = false,
-        });
+        try appendScannedDep(allocator, deps, ast.resolve(field.name), spec, false);
     }
+}
+
+fn appendScannedDep(
+    allocator: Allocator,
+    deps: *std.ArrayListUnmanaged(ScannedDep),
+    alias: []const u8,
+    owned_spec: []const u8,
+    is_platform: bool,
+) Allocator.Error!void {
+    errdefer allocator.free(owned_spec);
+    const owned_alias = try allocator.dupe(u8, alias);
+    errdefer allocator.free(owned_alias);
+    try deps.append(allocator, .{
+        .alias = owned_alias,
+        .spec = owned_spec,
+        .is_platform = is_platform,
+    });
 }
 
 fn stringFromExpr(allocator: Allocator, ast: *parse.AST, expr_idx: parse.AST.Expr.Idx) Allocator.Error!?[]const u8 {
@@ -1371,6 +1428,7 @@ fn stringFromExpr(allocator: Allocator, ast: *parse.AST, expr_idx: parse.AST.Exp
     switch (expr) {
         .string => |s| {
             var buf = std.ArrayListUnmanaged(u8).empty;
+            errdefer buf.deinit(allocator);
             for (ast.store.exprSlice(s.parts)) |part_idx| {
                 const part = ast.store.getExpr(part_idx);
                 if (part == .string_part) {
@@ -1378,8 +1436,11 @@ fn stringFromExpr(allocator: Allocator, ast: *parse.AST, expr_idx: parse.AST.Exp
                 }
             }
             // Null bytes are invalid in both file paths and URLs.
-            if (std.mem.findScalar(u8, buf.items, 0) != null) return null;
-            return buf.items;
+            if (std.mem.findScalar(u8, buf.items, 0) != null) {
+                buf.deinit(allocator);
+                return null;
+            }
+            return try buf.toOwnedSlice(allocator);
         },
         else => return null,
     }
