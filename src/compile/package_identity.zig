@@ -163,7 +163,7 @@ test "packageIdentityFor canonicalizes local paths" {
     defer tmp.cleanup();
 
     try tmp.dir.createDir(std.testing.io, "pkg", .default_dir);
-    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "pkg/main.roc", .data = "module []\n" });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "pkg/main.roc", .data = "" });
 
     const tmp_root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", allocator);
     defer allocator.free(tmp_root);
@@ -208,7 +208,7 @@ test "packageIdentityFor canonicalizes symlinked local paths" {
     defer tmp.cleanup();
 
     try tmp.dir.createDir(std.testing.io, "real", .default_dir);
-    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "real/main.roc", .data = "module []\n" });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "real/main.roc", .data = "" });
     tmp.dir.symLink(std.testing.io, "real", "link", .{ .is_directory = true }) catch return error.SkipZigTest;
 
     const tmp_root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", allocator);

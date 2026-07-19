@@ -112,7 +112,7 @@ NO CHANGE
 				(p-assign (ident "print_msg!")))
 			(e-string
 				(e-literal (string "Hello, world!")))))
-	(s-import (module "pf.Stdout")
+	(s-import (mod "pf.Stdout")
 		(exposes)))
 ~~~
 # TYPES

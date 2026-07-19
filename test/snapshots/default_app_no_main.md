@@ -1,6 +1,6 @@
 # META
 ~~~ini
-description=Error - type module with no main! or matching type
+description=Error - type mod with no main! or matching type
 type=file
 ~~~
 # SOURCE
@@ -19,7 +19,7 @@ EndOfFile,
 # PARSE
 ~~~clojure
 (file
-	(type-module)
+	(type-mod)
 	(statements
 		(s-decl
 			(p-ident (raw "helper"))

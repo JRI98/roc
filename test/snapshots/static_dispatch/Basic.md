@@ -50,7 +50,7 @@ EndOfFile,
 # PARSE
 ~~~clojure
 (file
-	(type-module)
+	(type-mod)
 	(statements
 		(s-type-decl
 			(header (name "Basic")
@@ -90,7 +90,7 @@ EndOfFile,
 				(ty-var (raw "a"))
 				(ty-var (raw "b")))
 			(where
-				(method (module-of "a") (name "to_str")
+				(method (mod-of "a") (name "to_str")
 					(args
 						(ty-var (raw "a")))
 					(ty-var (raw "b")))))
@@ -108,7 +108,7 @@ EndOfFile,
 				(ty-var (raw "a"))
 				(ty-var (raw "b")))
 			(where
-				(method (module-of "a") (name "to_str2")
+				(method (mod-of "a") (name "to_str2")
 					(args
 						(ty-var (raw "a")))
 					(ty-var (raw "b")))))

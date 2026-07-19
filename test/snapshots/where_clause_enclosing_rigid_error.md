@@ -43,7 +43,7 @@ EndOfFile,
 # PARSE
 ~~~clojure
 (file
-	(type-module)
+	(type-mod)
 	(statements
 		(s-type-anno (name "outer")
 			(ty-fn
@@ -61,7 +61,7 @@ EndOfFile,
 								(ty-var (raw "a"))
 								(ty (name "Str")))
 							(where
-								(method (module-of "a") (name "show")
+								(method (mod-of "a") (name "show")
 									(args
 										(ty-var (raw "a")))
 									(ty (name "Str")))))

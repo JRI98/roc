@@ -205,7 +205,7 @@ EndOfFile,
 # PARSE
 ~~~clojure
 (file
-	(type-module)
+	(type-mod)
 	(statements
 		(s-type-decl
 			(header (name "Container")
@@ -389,7 +389,7 @@ EndOfFile,
 				(ty-var (raw "c"))
 				(ty-var (raw "d")))
 			(where
-				(method (module-of "a") (name "map")
+				(method (mod-of "a") (name "map")
 					(args
 						(ty-var (raw "a"))
 						(ty-fn

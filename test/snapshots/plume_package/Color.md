@@ -1,6 +1,6 @@
 # META
 ~~~ini
-description=Color module from package
+description=Color mod from package
 type=package
 ~~~
 # SOURCE
@@ -304,7 +304,7 @@ EndOfFile,
 # PARSE
 ~~~clojure
 (file
-	(type-module)
+	(type-mod)
 	(statements
 		(s-type-decl
 			(header (name "Color")

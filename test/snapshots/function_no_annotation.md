@@ -143,7 +143,7 @@ NO CHANGE
 			(e-lookup-local
 				(p-assign (ident "process!")))
 			(e-num (value "42"))))
-	(s-import (module "pf.Stdout")
+	(s-import (mod "pf.Stdout")
 		(exposes)))
 ~~~
 # TYPES

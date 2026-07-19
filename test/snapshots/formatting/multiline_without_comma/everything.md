@@ -326,7 +326,7 @@ NON EXHAUSTIVE MATCH - everything.md:90:2:113:3
  │                                                                            │
  └──────────────────────────────────────────────────────── everything.md:58:1 ┘
 
-    Add a value body here, or put hosted functions in a platform type module so
+    Add a value body here, or put hosted functions in a platform type mod so
     they are published through the host boundary.
 
 
@@ -483,7 +483,7 @@ EndOfFile,
 # PARSE
 ~~~clojure
 (file
-	(type-module)
+	(type-mod)
 	(statements
 		(s-import (raw "I1")
 			(exposing
@@ -540,8 +540,8 @@ EndOfFile,
 				(ty-var (raw "e"))
 				(ty-var (raw "e")))
 			(where
-				(alias (module-of "e") (name "A"))
-				(alias (module-of "e") (name "B"))))
+				(alias (mod-of "e") (name "A"))
+				(alias (mod-of "e") (name "B"))))
 		(s-decl
 			(p-ident (raw "h"))
 			(e-lambda
@@ -763,11 +763,11 @@ h = |x, y| {
 								(value
 									(e-lookup-local
 										(p-assign (ident "a")))))))))))
-	(s-import (module "I1")
+	(s-import (mod "I1")
 		(exposes
 			(exposed (name "I11") (wildcard false))
 			(exposed (name "I12") (wildcard false))))
-	(s-import (module "I2")
+	(s-import (mod "I2")
 		(exposes
 			(exposed (name "I21") (alias "Ias1") (wildcard false))
 			(exposed (name "I22") (alias "Ias2") (wildcard false))))

@@ -780,27 +780,27 @@ const import_crash_module =
 ;
 
 const import_unused_expect_module =
-    \\module [safe]
-    \\
     \\hidden_bad : I64
     \\hidden_bad = {
     \\    expect False
     \\    0.I64
     \\}
     \\
-    \\safe = 42
+    \\Util := [].{
+    \\    safe = 42
+    \\}
 ;
 
 const import_unused_crash_module =
-    \\module [safe]
-    \\
     \\hidden_bad : I64
     \\hidden_bad = {
     \\    crash "imported unused top-level constant crash"
     \\    0.I64
     \\}
     \\
-    \\safe = 42
+    \\Util := [].{
+    \\    safe = 42
+    \\}
 ;
 
 const crash_other_defs =

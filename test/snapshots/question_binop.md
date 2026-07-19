@@ -40,7 +40,7 @@ EndOfFile,
 # PARSE
 ~~~clojure
 (file
-	(type-module)
+	(type-mod)
 	(statements
 		(s-type-anno (name "question_with_err_tag")
 			(ty-fn

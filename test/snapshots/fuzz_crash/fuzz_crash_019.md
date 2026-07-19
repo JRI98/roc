@@ -136,9 +136,9 @@ MISSING MATCH ARROW - fuzz_crash_019.md:62:5:62:5
 MISSING MATCH ARROW - fuzz_crash_019.md:63:7:63:7
 MISSING MATCH ARROW - fuzz_crash_019.md:66:12:66:12
 EXPECTED RECORD ACCESSOR - fuzz_crash_019.md:83:2:83:5
-MODULE NOT FOUND - fuzz_crash_019.md:6:1:8:6
-MODULE NOT FOUND - fuzz_crash_019.md:10:1:10:19
-MODULE NOT FOUND - fuzz_crash_019.md:11:1:12:4
+MOD NOT FOUND - fuzz_crash_019.md:6:1:8:6
+MOD NOT FOUND - fuzz_crash_019.md:10:1:10:19
+MOD NOT FOUND - fuzz_crash_019.md:11:1:12:4
 UNDECLARED TYPE - fuzz_crash_019.md:13:13:13:16
 UNDECLARED TYPE VARIABLE - fuzz_crash_019.md:13:19:13:21
 UNDECLARED TYPE VARIABLE - fuzz_crash_019.md:19:4:19:6
@@ -340,7 +340,7 @@ MISSING METHOD - fuzz_crash_019.md:105:55:105:72
 
 
 ┌──────────────────┐
-│ MODULE NOT FOUND ├─ The module `Stdot` was not found in this Roc project. ──┐
+│ MOD NOT FOUND ├─ The mod `Stdot` was not found in this Roc project. ──┐
 └┬─────────────────┘                                                          │
  │                                                                            │
  │  import Stdot                                                              │
@@ -352,7 +352,7 @@ MISSING METHOD - fuzz_crash_019.md:105:55:105:72
 
 
 ┌──────────────────┐
-│ MODULE NOT FOUND ├─ The module `Bae` was not found in this Roc project. ────┐
+│ MOD NOT FOUND ├─ The mod `Bae` was not found in this Roc project. ────┐
 └┬─────────────────┘                                                          │
  │                                                                            │
  │  import Bae as Gooe                                                        │
@@ -362,7 +362,7 @@ MISSING METHOD - fuzz_crash_019.md:105:55:105:72
 
 
 ┌──────────────────┐
-│ MODULE NOT FOUND ├─ The module `Ba` was not found in this Roc project. ─────┐
+│ MOD NOT FOUND ├─ The mod `Ba` was not found in this Roc project. ─────┐
 └┬─────────────────┘                                                          │
  │                                                                            │
  │  import                                                                    │
@@ -925,15 +925,15 @@ MISSING METHOD - fuzz_crash_019.md:105:55:105:72
 
 
 ┌─────────────────────────┐
-│ EXPOSED BUT NOT DEFINED ├─ The module header says that `main!` is ──────────┐
+│ EXPOSED BUT NOT DEFINED ├─ The mod header says that `main!` is ──────────┐
 └┬────────────────────────┘  exposed, but it is not defined anywhere in       │
- │                           this module.                                     │
+ │                           this mod.                                     │
  │                                                                            │
  │  app [main!] { pf: platform "c" }                                          │
  │       ‾‾‾‾‾                                                                │
  └───────────────────────────────────────────────────── fuzz_crash_019.md:2:6 ┘
 
-    You can fix this by either defining `main!` in this module, or by removing
+    You can fix this by either defining `main!` in this mod, or by removing
     it from the list of exposed values.
 
 
@@ -957,7 +957,7 @@ MISSING METHOD - fuzz_crash_019.md:105:55:105:72
  │                                                                            │
  └──────────────────────────────────────────────────── fuzz_crash_019.md:22:1 ┘
 
-    Add a value body here, or put hosted functions in a platform type module so
+    Add a value body here, or put hosted functions in a platform type mod so
     they are published through the host boundary.
 
 
@@ -969,7 +969,7 @@ MISSING METHOD - fuzz_crash_019.md:105:55:105:72
  │  ‾‾‾‾‾‾‾‾                                                                  │
  └──────────────────────────────────────────────────── fuzz_crash_019.md:37:1 ┘
 
-    Add a value body here, or put hosted functions in a platform type module so
+    Add a value body here, or put hosted functions in a platform type mod so
     they are published through the host boundary.
 
 
@@ -1047,7 +1047,7 @@ MISSING METHOD - fuzz_crash_019.md:105:55:105:72
  │  ‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾                                                     │
  └──────────────────────────────────────────────────── fuzz_crash_019.md:74:1 ┘
 
-    Add a value body here, or put hosted functions in a platform type module so
+    Add a value body here, or put hosted functions in a platform type mod so
     they are published through the host boundary.
 
 
@@ -1059,7 +1059,7 @@ MISSING METHOD - fuzz_crash_019.md:105:55:105:72
  │  ‾‾‾‾‾‾                                                                    │
  └─────────────────────────────────────────────────── fuzz_crash_019.md:113:1 ┘
 
-    Add a value body here, or put hosted functions in a platform type module so
+    Add a value body here, or put hosted functions in a platform type mod so
     they are published through the host boundary.
 
 
@@ -1161,7 +1161,7 @@ MISSING METHOD - fuzz_crash_019.md:105:55:105:72
  │  ‾‾‾‾‾‾‾‾‾‾‾‾                                                              │
  └─────────────────────────────────────────────────── fuzz_crash_019.md:116:1 ┘
 
-    Add a value body here, or put hosted functions in a platform type module so
+    Add a value body here, or put hosted functions in a platform type mod so
     they are published through the host boundary.
 
 
@@ -2320,15 +2320,15 @@ expect {
 		(e-anno-only)
 		(annotation
 			(ty-malformed)))
-	(s-import (module "pf.Stdout")
+	(s-import (mod "pf.Stdout")
 		(exposes
 			(exposed (name "line!") (wildcard false))))
-	(s-import (module "Stdot")
+	(s-import (mod "Stdot")
 		(exposes
 			(exposed (name "Cust") (wildcard false))))
-	(s-import (module "Bae")
+	(s-import (mod "Bae")
 		(exposes))
-	(s-import (module "Ba")
+	(s-import (mod "Ba")
 		(exposes))
 	(s-alias-decl
 		(ty-header (name "Map")

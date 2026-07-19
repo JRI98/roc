@@ -54,7 +54,7 @@ EndOfFile,
 # PARSE
 ~~~clojure
 (file
-	(type-module)
+	(type-mod)
 	(statements
 		(s-type-anno (name "slice")
 			(ty-fn

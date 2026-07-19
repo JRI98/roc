@@ -1,6 +1,6 @@
 # META
 ~~~ini
-description=A module that exposes a binding aliasing a polymorphic function
+description=A mod that exposes a binding aliasing a polymorphic function
 type=file
 ~~~
 # SOURCE
@@ -28,7 +28,7 @@ EndOfFile,
 # PARSE
 ~~~clojure
 (file
-	(type-module)
+	(type-mod)
 	(statements
 		(s-type-decl
 			(header (name "FooBar")

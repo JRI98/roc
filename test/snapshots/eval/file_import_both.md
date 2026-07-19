@@ -26,7 +26,7 @@ EndOfFile,
 # PARSE
 ~~~clojure
 (file
-	(type-module)
+	(type-mod)
 	(statements
 		(s-file-import
 			(path "test/snapshots/eval/file_import_test_data.txt")
