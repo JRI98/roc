@@ -5762,7 +5762,7 @@ fn assertGranularTestStepsAreIsolated(b: *std.Build) void {
         collectTestRuns(b, &tls.step, &visited, &found, &found_len);
 
         if (found_len > 1) {
-            std.log.warn(
+            std.debug.panic(
                 "build.zig: step \"{s}\" runs at least {d} test binaries ({s}, {s}, ...). " ++
                     "A granular run-test-zig-* step must run exactly one; wire the suite " ++
                     "through TestSuiteRegistry.register rather than handing the summary's " ++
