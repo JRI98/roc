@@ -24,6 +24,7 @@ gpa: Allocator,
 nodes: Node.List,
 regions: Region.List,
 int128_values: collections.SafeList(i128), // Typed storage for large numeric literals
+literal_dispatch_plans: collections.SafeList(LiteralDispatchPlan), // Checked literal dispatch metadata owned by literal nodes
 span2_data: collections.SafeList(Span2), // Typed storage for (start, len) span pairs
 span_with_node_data: collections.SafeList(SpanWithNode), // Typed storage for (start, len, node) triples
 method_call_data: collections.SafeList(MethodCallData), // Typed storage for method args plus method-token source region
@@ -55,6 +56,25 @@ pub const SpanWithNode = extern struct {
     start: u32,
     len: u32,
     node: u32,
+};
+
+/// Checked dispatch metadata owned by one literal expression or pattern node.
+/// The owning node stores this record's dense index, so replacing the node
+/// atomically retires the plan instead of leaving raw-node side metadata live.
+pub const LiteralDispatchPlan = extern struct {
+    node_idx: u32,
+    target_var: u32,
+    fn_var: u32,
+    kind: u32,
+
+    pub const Kind = enum(u32) {
+        numeral,
+        quote,
+    };
+
+    pub fn dispatchKind(self: LiteralDispatchPlan) Kind {
+        return @enumFromInt(self.kind);
+    }
 };
 
 /// Method-call side data.
@@ -290,6 +310,8 @@ pub fn initCapacity(gpa: Allocator, capacity: usize) Allocator.Error!NodeStore {
     errdefer regions.deinit(gpa);
     var int128_values = try collections.SafeList(i128).initCapacity(gpa, capacity / 8);
     errdefer int128_values.deinit(gpa);
+    var literal_dispatch_plans = try collections.SafeList(LiteralDispatchPlan).initCapacity(gpa, capacity / 8);
+    errdefer literal_dispatch_plans.deinit(gpa);
     var span2_data = try collections.SafeList(Span2).initCapacity(gpa, capacity / 4);
     errdefer span2_data.deinit(gpa);
     var span_with_node_data = try collections.SafeList(SpanWithNode).initCapacity(gpa, capacity / 4);
@@ -330,6 +352,7 @@ pub fn initCapacity(gpa: Allocator, capacity: usize) Allocator.Error!NodeStore {
         .nodes = nodes,
         .regions = regions,
         .int128_values = int128_values,
+        .literal_dispatch_plans = literal_dispatch_plans,
         .span2_data = span2_data,
         .span_with_node_data = span_with_node_data,
         .method_call_data = method_call_data,
@@ -357,6 +380,7 @@ pub fn clone(self: *const NodeStore, gpa: Allocator) Allocator.Error!NodeStore {
         .nodes = try self.nodes.clone(gpa),
         .regions = try self.regions.clone(gpa),
         .int128_values = try self.int128_values.clone(gpa),
+        .literal_dispatch_plans = try self.literal_dispatch_plans.clone(gpa),
         .span2_data = try self.span2_data.clone(gpa),
         .span_with_node_data = try self.span_with_node_data.clone(gpa),
         .method_call_data = try self.method_call_data.clone(gpa),
@@ -384,6 +408,7 @@ pub fn deinit(store: *NodeStore) void {
     store.nodes.deinit(store.gpa);
     store.regions.deinit(store.gpa);
     store.int128_values.deinit(store.gpa);
+    store.literal_dispatch_plans.deinit(store.gpa);
     store.span2_data.deinit(store.gpa);
     store.span_with_node_data.deinit(store.gpa);
     store.method_call_data.deinit(store.gpa);
@@ -411,6 +436,7 @@ pub fn relocate(store: *NodeStore, offset: isize) void {
     store.nodes.relocate(offset);
     store.regions.relocate(offset);
     store.int128_values.relocate(offset);
+    store.literal_dispatch_plans.relocate(offset);
     store.span2_data.relocate(offset);
     store.span_with_node_data.relocate(offset);
     store.method_call_data.relocate(offset);
@@ -478,6 +504,204 @@ comptime {
 pub fn getRegionAt(store: *const NodeStore, node_idx: Node.Idx) Region {
     const idx: Region.Idx = @enumFromInt(@intFromEnum(node_idx));
     return store.regions.get(idx).*;
+}
+
+fn literalDispatchKindForTag(tag: Node.Tag) ?LiteralDispatchPlan.Kind {
+    return switch (tag) {
+        .expr_num,
+        .expr_frac_f32,
+        .expr_frac_f64,
+        .expr_dec,
+        .expr_dec_small,
+        .expr_num_from_numeral,
+        .expr_typed_int,
+        .expr_typed_frac,
+        .expr_typed_num_from_numeral,
+        .pattern_num_literal,
+        .pattern_small_dec_literal,
+        .pattern_dec_literal,
+        .pattern_num_from_numeral_literal,
+        => .numeral,
+        .expr_string,
+        .pattern_str_literal,
+        => .quote,
+        else => null,
+    };
+}
+
+fn literalDispatchPlanPlusOne(node: Node) u32 {
+    const payload = node.getPayload();
+    return switch (node.tag) {
+        .expr_num => payload.expr_num.literal_dispatch_plan_plus_one,
+        .expr_frac_f32 => payload.expr_frac_f32.literal_dispatch_plan_plus_one,
+        .expr_frac_f64 => payload.expr_frac_f64.literal_dispatch_plan_plus_one,
+        .expr_dec => payload.expr_dec.literal_dispatch_plan_plus_one,
+        .expr_dec_small => payload.expr_dec_small.literal_dispatch_plan_plus_one,
+        .expr_num_from_numeral => payload.expr_num_from_numeral.literal_dispatch_plan_plus_one,
+        .expr_typed_int => payload.expr_typed_int.literal_dispatch_plan_plus_one,
+        .expr_typed_frac => payload.expr_typed_frac.literal_dispatch_plan_plus_one,
+        .expr_typed_num_from_numeral => payload.expr_typed_num_from_numeral.literal_dispatch_plan_plus_one,
+        .expr_string => payload.expr_string.literal_dispatch_plan_plus_one,
+        .pattern_num_literal => payload.pattern_num_literal.literal_dispatch_plan_plus_one,
+        .pattern_small_dec_literal => payload.pattern_small_dec_literal.literal_dispatch_plan_plus_one,
+        .pattern_dec_literal => payload.pattern_dec_literal.literal_dispatch_plan_plus_one,
+        .pattern_num_from_numeral_literal => payload.pattern_num_from_numeral_literal.literal_dispatch_plan_plus_one,
+        .pattern_str_literal => payload.pattern_str_literal.literal_dispatch_plan_plus_one,
+        else => 0,
+    };
+}
+
+fn setLiteralDispatchPlanPlusOne(store: *NodeStore, node_idx: Node.Idx, plan_plus_one: u32) void {
+    var node = store.nodes.get(node_idx);
+    const payload = node.getPayload();
+    switch (node.tag) {
+        .expr_num => {
+            var data = payload.expr_num;
+            data.literal_dispatch_plan_plus_one = plan_plus_one;
+            node.setPayload(.{ .expr_num = data });
+        },
+        .expr_frac_f32 => {
+            var data = payload.expr_frac_f32;
+            data.literal_dispatch_plan_plus_one = plan_plus_one;
+            node.setPayload(.{ .expr_frac_f32 = data });
+        },
+        .expr_frac_f64 => {
+            var data = payload.expr_frac_f64;
+            data.literal_dispatch_plan_plus_one = plan_plus_one;
+            node.setPayload(.{ .expr_frac_f64 = data });
+        },
+        .expr_dec => {
+            var data = payload.expr_dec;
+            data.literal_dispatch_plan_plus_one = plan_plus_one;
+            node.setPayload(.{ .expr_dec = data });
+        },
+        .expr_dec_small => {
+            var data = payload.expr_dec_small;
+            data.literal_dispatch_plan_plus_one = plan_plus_one;
+            node.setPayload(.{ .expr_dec_small = data });
+        },
+        .expr_num_from_numeral => {
+            var data = payload.expr_num_from_numeral;
+            data.literal_dispatch_plan_plus_one = plan_plus_one;
+            node.setPayload(.{ .expr_num_from_numeral = data });
+        },
+        .expr_typed_int => {
+            var data = payload.expr_typed_int;
+            data.literal_dispatch_plan_plus_one = plan_plus_one;
+            node.setPayload(.{ .expr_typed_int = data });
+        },
+        .expr_typed_frac => {
+            var data = payload.expr_typed_frac;
+            data.literal_dispatch_plan_plus_one = plan_plus_one;
+            node.setPayload(.{ .expr_typed_frac = data });
+        },
+        .expr_typed_num_from_numeral => {
+            var data = payload.expr_typed_num_from_numeral;
+            data.literal_dispatch_plan_plus_one = plan_plus_one;
+            node.setPayload(.{ .expr_typed_num_from_numeral = data });
+        },
+        .expr_string => {
+            var data = payload.expr_string;
+            data.literal_dispatch_plan_plus_one = plan_plus_one;
+            node.setPayload(.{ .expr_string = data });
+        },
+        .pattern_num_literal => {
+            var data = payload.pattern_num_literal;
+            data.literal_dispatch_plan_plus_one = plan_plus_one;
+            node.setPayload(.{ .pattern_num_literal = data });
+        },
+        .pattern_small_dec_literal => {
+            var data = payload.pattern_small_dec_literal;
+            data.literal_dispatch_plan_plus_one = plan_plus_one;
+            node.setPayload(.{ .pattern_small_dec_literal = data });
+        },
+        .pattern_dec_literal => {
+            var data = payload.pattern_dec_literal;
+            data.literal_dispatch_plan_plus_one = plan_plus_one;
+            node.setPayload(.{ .pattern_dec_literal = data });
+        },
+        .pattern_num_from_numeral_literal => {
+            var data = payload.pattern_num_from_numeral_literal;
+            data.literal_dispatch_plan_plus_one = plan_plus_one;
+            node.setPayload(.{ .pattern_num_from_numeral_literal = data });
+        },
+        .pattern_str_literal => {
+            var data = payload.pattern_str_literal;
+            data.literal_dispatch_plan_plus_one = plan_plus_one;
+            node.setPayload(.{ .pattern_str_literal = data });
+        },
+        else => std.debug.panic("literal dispatch plan attached to non-literal node {s}", .{@tagName(node.tag)}),
+    }
+    store.nodes.set(node_idx, node);
+}
+
+/// Attach or update the checked dispatch evidence owned by a literal node.
+pub fn recordLiteralDispatchPlan(
+    store: *NodeStore,
+    node_idx: Node.Idx,
+    kind: LiteralDispatchPlan.Kind,
+    target_var: types.Var,
+    fn_var: types.Var,
+) Allocator.Error!void {
+    const node = store.nodes.get(node_idx);
+    std.debug.assert(literalDispatchKindForTag(node.tag) == kind);
+
+    const plan = LiteralDispatchPlan{
+        .node_idx = @intFromEnum(node_idx),
+        .target_var = @intFromEnum(target_var),
+        .fn_var = @intFromEnum(fn_var),
+        .kind = @intFromEnum(kind),
+    };
+    const plan_plus_one = literalDispatchPlanPlusOne(node);
+    if (plan_plus_one != 0) {
+        store.literal_dispatch_plans.set(@enumFromInt(plan_plus_one - 1), plan);
+        return;
+    }
+
+    const plan_idx = try store.literal_dispatch_plans.append(store.gpa, plan);
+    setLiteralDispatchPlanPlusOne(store, node_idx, @intFromEnum(plan_idx) + 1);
+}
+
+/// Return the checked dispatch evidence owned by a literal node, if any.
+pub fn literalDispatchPlanForNode(store: *const NodeStore, node_idx: Node.Idx) ?LiteralDispatchPlan {
+    const node = store.nodes.get(node_idx);
+    const plan_plus_one = literalDispatchPlanPlusOne(node);
+    if (plan_plus_one == 0) return null;
+    const plan = store.literal_dispatch_plans.get(@enumFromInt(plan_plus_one - 1)).*;
+    std.debug.assert(plan.node_idx == @intFromEnum(node_idx));
+    std.debug.assert(plan.dispatchKind() == literalDispatchKindForTag(node.tag).?);
+    return plan;
+}
+
+/// The dense set of live literal dispatch plans. Every record is owned by the
+/// node named in `node_idx`; node replacement removes its record immediately.
+pub fn literalDispatchPlans(store: *const NodeStore) []const LiteralDispatchPlan {
+    if (@import("builtin").mode == .Debug) {
+        for (store.literal_dispatch_plans.items.items, 0..) |plan, plan_index| {
+            const owner = store.nodes.get(@enumFromInt(plan.node_idx));
+            std.debug.assert(literalDispatchPlanPlusOne(owner) == @as(u32, @intCast(plan_index + 1)));
+            std.debug.assert(literalDispatchKindForTag(owner.tag).? == plan.dispatchKind());
+        }
+    }
+    return store.literal_dispatch_plans.items.items;
+}
+
+fn detachLiteralDispatchPlan(store: *NodeStore, node_idx: Node.Idx) void {
+    const node = store.nodes.get(node_idx);
+    const plan_plus_one = literalDispatchPlanPlusOne(node);
+    if (plan_plus_one == 0) return;
+
+    const plan_index: usize = plan_plus_one - 1;
+    const plans = &store.literal_dispatch_plans.items;
+    std.debug.assert(plans.items[plan_index].node_idx == @intFromEnum(node_idx));
+    const last_index = plans.items.len - 1;
+    setLiteralDispatchPlanPlusOne(store, node_idx, 0);
+    if (plan_index != last_index) {
+        const moved = plans.items[last_index];
+        plans.items[plan_index] = moved;
+        setLiteralDispatchPlanPlusOne(store, @enumFromInt(moved.node_idx), @intCast(plan_index + 1));
+    }
+    _ = plans.pop();
 }
 
 /// Helper function to get a region by pattern index
@@ -1547,6 +1771,7 @@ pub fn replaceExprWithRuntimeError(
     diagnostic_idx: CIR.Diagnostic.Idx,
 ) void {
     const node_idx: Node.Idx = @enumFromInt(@intFromEnum(expr_idx));
+    store.detachLiteralDispatchPlan(node_idx);
     var node = Node.init(.malformed);
     node.setPayload(.{ .diag_single_value = .{
         .value = @intFromEnum(diagnostic_idx),
@@ -2120,11 +2345,7 @@ pub fn setStatementNode(store: *NodeStore, stmt_idx: CIR.Statement.Idx, statemen
 
 /// Replaces an existing expression node with a runtime error expression.
 pub fn setExprRuntimeError(store: *NodeStore, expr_idx: CIR.Expr.Idx, diagnostic_idx: CIR.Diagnostic.Idx) void {
-    var node = Node.init(.malformed);
-    node.setPayload(.{ .diag_single_value = .{
-        .value = @intFromEnum(diagnostic_idx),
-    } });
-    store.nodes.set(@enumFromInt(@intFromEnum(expr_idx)), node);
+    store.replaceExprWithRuntimeError(expr_idx, diagnostic_idx);
 }
 
 /// Creates a statement node, but does not append to the store.
@@ -5184,6 +5405,7 @@ pub fn matchBranchPatternSpanFrom(store: *NodeStore, start: u32) Allocator.Error
 pub const Serialized = extern struct {
     gpa: [2]u64, // Reserve enough space for 2 64-bit pointers (16 bytes total)
     int128_values: collections.SafeList(i128).Serialized, // Must be first data field for 16-byte alignment
+    literal_dispatch_plans: collections.SafeList(LiteralDispatchPlan).Serialized,
     nodes: Node.List.Serialized,
     regions: Region.List.Serialized,
     span2_data: collections.SafeList(Span2).Serialized,
@@ -5213,6 +5435,7 @@ pub const Serialized = extern struct {
     ) Allocator.Error!void {
         // Serialize int128_values FIRST to ensure 16-byte alignment (i128 requires it)
         try self.int128_values.serialize(&store.int128_values, allocator, writer);
+        try self.literal_dispatch_plans.serialize(&store.literal_dispatch_plans, allocator, writer);
         // Serialize nodes
         try self.nodes.serialize(&store.nodes, allocator, writer);
         // Serialize regions
@@ -5261,6 +5484,7 @@ pub const Serialized = extern struct {
             .nodes = self.nodes.deserializeInto(base_addr),
             .regions = self.regions.deserializeInto(base_addr),
             .int128_values = self.int128_values.deserializeInto(base_addr),
+            .literal_dispatch_plans = self.literal_dispatch_plans.deserializeInto(base_addr),
             .span2_data = self.span2_data.deserializeInto(base_addr),
             .span_with_node_data = self.span_with_node_data.deserializeInto(base_addr),
             .method_call_data = self.method_call_data.deserializeInto(base_addr),
@@ -5290,6 +5514,7 @@ pub const Serialized = extern struct {
             // Regions needs to be mutable (grown during type checking)
             .regions = try self.regions.deserializeWithCopy(base_addr, gpa),
             .int128_values = self.int128_values.deserializeInto(base_addr),
+            .literal_dispatch_plans = self.literal_dispatch_plans.deserializeInto(base_addr),
             .span2_data = self.span2_data.deserializeInto(base_addr),
             .span_with_node_data = self.span_with_node_data.deserializeInto(base_addr),
             .method_call_data = self.method_call_data.deserializeInto(base_addr),
@@ -5374,6 +5599,7 @@ test "NodeStore basic CompactWriter roundtrip" {
         },
     });
     const node1_idx = try original.nodes.append(gpa, node1);
+    try original.recordLiteralDispatchPlan(node1_idx, .numeral, @enumFromInt(7), @enumFromInt(9));
 
     // Add a region
     const region = Region{
@@ -5419,12 +5645,59 @@ test "NodeStore basic CompactWriter roundtrip" {
     try testing.expectEqual(@as(usize, 1), deserialized.int128_values.len());
     const retrieved_value = deserialized.int128_values.items.items[0];
     try testing.expectEqual(@as(i128, 42), retrieved_value);
+    const literal_plan = deserialized.literalDispatchPlanForNode(node1_idx).?;
+    try testing.expectEqual(LiteralDispatchPlan.Kind.numeral, literal_plan.dispatchKind());
+    try testing.expectEqual(@as(u32, 7), literal_plan.target_var);
+    try testing.expectEqual(@as(u32, 9), literal_plan.fn_var);
 
     // Verify regions
     try testing.expectEqual(@as(usize, 1), deserialized.regions.len());
     const retrieved_region = deserialized.regions.get(region1_idx);
     try testing.expectEqual(region.start.offset, retrieved_region.start.offset);
     try testing.expectEqual(region.end.offset, retrieved_region.end.offset);
+}
+
+test "literal dispatch plans are retired with their owning nodes" {
+    const testing = std.testing;
+    const gpa = testing.allocator;
+
+    var store = try NodeStore.init(gpa);
+    defer store.deinit();
+
+    const quote_expr = try store.addExpr(
+        CIR.Expr.initStr(.{ .span = .{ .start = 0, .len = 0 } }),
+        Region.zero(),
+    );
+    const numeral_expr = try store.addExpr(.{ .e_num = .{
+        .value = .{ .bytes = @bitCast(@as(i128, 0)), .kind = .i128 },
+        .kind = .num_unbound,
+    } }, Region.zero());
+
+    try store.recordLiteralDispatchPlan(
+        @enumFromInt(@intFromEnum(quote_expr)),
+        .quote,
+        @enumFromInt(1),
+        @enumFromInt(2),
+    );
+    try store.recordLiteralDispatchPlan(
+        @enumFromInt(@intFromEnum(numeral_expr)),
+        .numeral,
+        @enumFromInt(3),
+        @enumFromInt(4),
+    );
+    try testing.expectEqual(@as(usize, 2), store.literalDispatchPlans().len);
+
+    store.replaceExprWithRuntimeError(quote_expr, @enumFromInt(0));
+    try testing.expect(store.literalDispatchPlanForNode(@enumFromInt(@intFromEnum(quote_expr))) == null);
+    try testing.expectEqual(@as(usize, 1), store.literalDispatchPlans().len);
+
+    const numeral_plan = store.literalDispatchPlanForNode(@enumFromInt(@intFromEnum(numeral_expr))).?;
+    try testing.expectEqual(LiteralDispatchPlan.Kind.numeral, numeral_plan.dispatchKind());
+    try testing.expectEqual(@as(u32, 3), numeral_plan.target_var);
+    try testing.expectEqual(@as(u32, 4), numeral_plan.fn_var);
+
+    store.replaceExprWithRuntimeError(numeral_expr, @enumFromInt(0));
+    try testing.expectEqual(@as(usize, 0), store.literalDispatchPlans().len);
 }
 
 test "NodeStore multiple nodes CompactWriter roundtrip" {

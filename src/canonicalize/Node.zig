@@ -540,6 +540,7 @@ pub const Payload = extern union {
         denom_power: u32,
         has_suffix: bool,
         _padding: [3]u8 = .{ 0, 0, 0 },
+        literal_dispatch_plan_plus_one: u32 = 0,
     };
 
     pub const ExprTuple = extern struct {
@@ -619,7 +620,8 @@ pub const Payload = extern union {
     pub const ExprFracF32 = extern struct {
         value: u32,
         has_suffix: bool,
-        _padding: [7]u8 = .{ 0, 0, 0, 0, 0, 0, 0 },
+        _padding: [3]u8 = .{ 0, 0, 0 },
+        literal_dispatch_plan_plus_one: u32 = 0,
     };
 
     pub const ExprFracF64 = extern struct {
@@ -627,6 +629,7 @@ pub const Payload = extern union {
         value_hi: u32,
         has_suffix: bool,
         _padding: [3]u8 = .{ 0, 0, 0 },
+        literal_dispatch_plan_plus_one: u32 = 0,
     };
 
     /// expr_num: numeric literal with kind and value in int128_values
@@ -634,23 +637,26 @@ pub const Payload = extern union {
         kind: u32,
         val_kind: u32,
         int128_idx: u32,
+        literal_dispatch_plan_plus_one: u32 = 0,
     };
 
     /// expr_dec: decimal literal with value in int128_values
     pub const ExprDec = extern struct {
         int128_idx: u32,
         has_suffix: bool,
-        _padding: [7]u8 = .{ 0, 0, 0, 0, 0, 0, 0 },
+        _padding: [3]u8 = .{ 0, 0, 0 },
+        literal_dispatch_plan_plus_one: u32 = 0,
     };
 
     pub const ExprNumFromNumeral = extern struct {
-        _padding: [12]u8 = .{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 },
+        literal_dispatch_plan_plus_one: u32 = 0,
+        _padding: [8]u8 = .{ 0, 0, 0, 0, 0, 0, 0, 0 },
     };
 
     pub const ExprString = extern struct {
         segments_start: u32,
         segments_len: u32,
-        _padding: [4]u8 = .{ 0, 0, 0, 0 },
+        literal_dispatch_plan_plus_one: u32 = 0,
     };
 
     pub const ExprFieldAccess = extern struct {
@@ -750,6 +756,7 @@ pub const Payload = extern union {
         type_name: u32,
         val_kind: u32,
         int128_idx: u32,
+        literal_dispatch_plan_plus_one: u32 = 0,
     };
 
     /// expr_typed_frac: typed fraction with type name and value in int128_values
@@ -757,11 +764,13 @@ pub const Payload = extern union {
         type_name: u32,
         val_kind: u32,
         int128_idx: u32,
+        literal_dispatch_plan_plus_one: u32 = 0,
     };
 
     pub const ExprTypedNumFromNumeral = extern struct {
         type_name: u32,
-        _padding: [8]u8 = .{ 0, 0, 0, 0, 0, 0, 0, 0 },
+        literal_dispatch_plan_plus_one: u32 = 0,
+        _padding: [4]u8 = .{ 0, 0, 0, 0 },
     };
 
     /// expr_string_segment: string segment reference
@@ -857,6 +866,7 @@ pub const Payload = extern union {
         kind: u32,
         value_kind: u32,
         int128_idx: u32,
+        literal_dispatch_plan_plus_one: u32 = 0,
     };
 
     pub const PatternNominal = extern struct {
@@ -876,22 +886,26 @@ pub const Payload = extern union {
         denominator_power: u32,
         has_suffix: bool,
         _padding: [3]u8 = .{ 0, 0, 0 },
+        literal_dispatch_plan_plus_one: u32 = 0,
     };
 
     /// pattern_dec_literal: decimal pattern with value in int128_values
     pub const PatternDecLiteral = extern struct {
         int128_idx: u32,
         has_suffix: bool,
-        _padding: [7]u8 = .{ 0, 0, 0, 0, 0, 0, 0 },
+        _padding: [3]u8 = .{ 0, 0, 0 },
+        literal_dispatch_plan_plus_one: u32 = 0,
     };
 
     pub const PatternStrLiteral = extern struct {
         literal: u32,
-        _padding: [8]u8 = .{ 0, 0, 0, 0, 0, 0, 0, 0 },
+        literal_dispatch_plan_plus_one: u32 = 0,
+        _padding: [4]u8 = .{ 0, 0, 0, 0 },
     };
 
     pub const PatternNumFromNumeralLiteral = extern struct {
-        _padding: [12]u8 = .{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 },
+        literal_dispatch_plan_plus_one: u32 = 0,
+        _padding: [8]u8 = .{ 0, 0, 0, 0, 0, 0, 0, 0 },
     };
 
     pub const PatternStrInterpolation = extern struct {

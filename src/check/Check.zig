@@ -23660,7 +23660,8 @@ fn quoteLiteralRegionForDispatcher(self: *Self, constraint: StaticDispatchConstr
     const kind = constraint.origin.literalKind() orelse return null;
     if (kind != .quote) return null;
     const resolved_dispatcher = self.types.resolveVar(dispatcher_var).var_;
-    for (self.cir.quote_dispatch_plans.items.items) |plan| {
+    for (self.cir.store.literalDispatchPlans()) |plan| {
+        if (plan.dispatchKind() != .quote) continue;
         const target: Var = @enumFromInt(plan.target_var);
         if (self.types.resolveVar(target).var_ != resolved_dispatcher) continue;
         return self.cir.store.getNodeRegion(@enumFromInt(plan.node_idx));

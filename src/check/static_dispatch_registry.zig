@@ -1258,7 +1258,8 @@ pub const StaticDispatchPlanTable = struct {
         }
 
         const module_env = module.moduleEnvConst();
-        for (module_env.numeral_dispatch_plans.items.items) |numeral_plan| {
+        for (module_env.store.literalDispatchPlans()) |numeral_plan| {
+            if (numeral_plan.dispatchKind() != .numeral) continue;
             const node: CIR.Node.Idx = @enumFromInt(numeral_plan.node_idx);
             const expr_idx: CIR.Expr.Idx = @enumFromInt(numeral_plan.node_idx);
             const checked_expr = checked_bodies.exprIdForSource(expr_idx) orelse
@@ -1324,7 +1325,8 @@ pub const StaticDispatchPlanTable = struct {
             try numeral_by_node.put(allocator, node, plan_id);
         }
 
-        for (module_env.quote_dispatch_plans.items.items) |quote_plan| {
+        for (module_env.store.literalDispatchPlans()) |quote_plan| {
+            if (quote_plan.dispatchKind() != .quote) continue;
             const node: CIR.Node.Idx = @enumFromInt(quote_plan.node_idx);
             const expr_idx: CIR.Expr.Idx = @enumFromInt(quote_plan.node_idx);
             const checked_expr = checked_bodies.exprIdForSource(expr_idx) orelse

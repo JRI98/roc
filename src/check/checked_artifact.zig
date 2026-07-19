@@ -6227,15 +6227,7 @@ fn appendStaticDispatchTypeRoots(
         _ = try appendCheckedTypeRoot(allocator, module, names, imports, store, active, @enumFromInt(plan.next_fn_var));
     }
 
-    for (module.moduleEnvConst().numeral_dispatch_plans.items.items) |plan| {
-        const is_expr = source_nodes.hasExpr(@enumFromInt(plan.node_idx));
-        const is_pattern = source_nodes.hasPattern(@enumFromInt(plan.node_idx));
-        if (!is_expr and !is_pattern) continue;
-        _ = try appendCheckedTypeRoot(allocator, module, names, imports, store, active, @enumFromInt(plan.target_var));
-        _ = try appendCheckedTypeRoot(allocator, module, names, imports, store, active, @enumFromInt(plan.fn_var));
-    }
-
-    for (module.moduleEnvConst().quote_dispatch_plans.items.items) |plan| {
+    for (module.moduleEnvConst().store.literalDispatchPlans()) |plan| {
         const is_expr = source_nodes.hasExpr(@enumFromInt(plan.node_idx));
         const is_pattern = source_nodes.hasPattern(@enumFromInt(plan.node_idx));
         if (!is_expr and !is_pattern) continue;
@@ -18220,7 +18212,8 @@ pub const CompileTimeRootTable = struct {
             });
         }
 
-        for (module_env.numeral_dispatch_plans.items.items) |numeral_plan| {
+        for (module_env.store.literalDispatchPlans()) |numeral_plan| {
+            if (numeral_plan.dispatchKind() != .numeral) continue;
             const expr_idx: CIR.Expr.Idx = @enumFromInt(numeral_plan.node_idx);
             const checked_expr = checked_bodies.exprIdForSource(expr_idx) orelse
                 checked_bodies.numeralConversionExprAtRawNode(numeral_plan.node_idx) orelse
@@ -18249,7 +18242,8 @@ pub const CompileTimeRootTable = struct {
             });
         }
 
-        for (module_env.quote_dispatch_plans.items.items) |quote_plan| {
+        for (module_env.store.literalDispatchPlans()) |quote_plan| {
+            if (quote_plan.dispatchKind() != .quote) continue;
             const expr_idx: CIR.Expr.Idx = @enumFromInt(quote_plan.node_idx);
             const checked_expr = checked_bodies.exprIdForSource(expr_idx) orelse
                 checked_bodies.numeralConversionExprAtRawNode(quote_plan.node_idx) orelse
