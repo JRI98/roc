@@ -15,13 +15,15 @@
 //! so the symbol names are only ever spelled by `shim_symbols`.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const builtins = @import("builtins");
 const build_options = @import("build_options");
 
 const RocOps = builtins.host_abi.RocOps;
 const shim_symbols = builtins.shim_symbols;
 
-const trace_refcount = build_options.trace_refcount;
+// Freestanding hosts (the wasm test host) have no stderr to trace to.
+const trace_refcount = build_options.trace_refcount and builtin.os.tag != .freestanding;
 
 /// Bytes reserved before the user data for the stored total size. The prefix
 /// is at least `alignment` bytes so the user data keeps its alignment, and at

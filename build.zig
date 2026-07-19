@@ -1997,6 +1997,7 @@ fn buildAndCopyWasmHostObject(
     configureBackend(obj, target);
     obj.root_module.addImport("builtins", roc_modules.builtins);
     obj.root_module.addImport("build_options", roc_modules.build_options);
+    obj.root_module.addImport("host_alloc", roc_modules.host_alloc);
     // Per-function/data sections so wasm final-link DCE can strip unused host code.
     obj.link_function_sections = true;
     obj.link_data_sections = true;
