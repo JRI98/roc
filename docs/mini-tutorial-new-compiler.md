@@ -416,7 +416,7 @@ animals = ["bird", "crab", "lizard"]
 
 You can get the length of the list by calling `List.len(animals)`, or as a shortcut, you can just call `animals.len()`.
 
-Both of them do the same thing. When you call `.len()`, Roc's type inference knows that the type of `animials` is `List`,
+Both of them do the same thing. When you call `.len()`, Roc's type inference knows that the type of `animals` is `List`,
 so it translates that `animals.len()` call into `List.len(animals)` at compile time. `.len()` is known as a _method_ because
 it's a function that is associated with a particular type (in this case, `List`).
 
