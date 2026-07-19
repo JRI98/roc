@@ -24,6 +24,26 @@ pub fn calculateUnderlineLength(start_column: u32, end_column: u32) u32 {
     return 1;
 }
 
+/// Whether an underline region draws a caret row under the source line
+/// numbered `line_num`: only single-line regions on exactly that line do.
+pub fn underlineAppliesToLine(start_line: u32, end_line: u32, line_num: u32) bool {
+    return start_line == line_num and start_line == end_line;
+}
+
+/// Write the padding that precedes an underline span on a caret row, advancing
+/// from `col_position` (1-based; 1 means nothing has been written on this row
+/// yet) up to `start_column`. The row's first gap mirrors the source line's own
+/// characters via `printLeadingWhitespace` — preserving tabs so the carets land
+/// under a tabbed line — while gaps between spans are plain spaces.
+pub fn printUnderlineGap(writer: anytype, line: []const u8, col_position: u32, start_column: u32) error{WriteFailed}!void {
+    if (start_column <= col_position) return;
+    if (col_position == 1) {
+        try printLeadingWhitespace(writer, line, start_column);
+    } else {
+        try printSpaces(writer, start_column - col_position);
+    }
+}
+
 /// The number of terminal columns a single Unicode codepoint occupies:
 /// 0 for combining marks / zero-width characters, 2 for East Asian Wide and
 /// Fullwidth characters (and most emoji), 1 otherwise.

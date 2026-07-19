@@ -370,13 +370,13 @@ fn lastTitleSegment(title: []const u8) []const u8 {
     return std.mem.trim(u8, title, " \t\r\n");
 }
 
-/// Dupe `s` with ASCII letters uppercased. The EXPECTED section shouts titles
-/// in ALL CAPS, matching the box renderer, even though titles are authored in
-/// title case.
-fn asciiUpperDupe(allocator: std.mem.Allocator, s: []const u8) Allocator.Error![]u8 {
-    const out = try allocator.dupe(u8, s);
-    for (out) |*c| c.* = std.ascii.toUpper(c.*);
-    return out;
+/// Dupe `s` shouted to ALL CAPS via the box renderer's own `writeShouted`, so
+/// the EXPECTED section's titles can never drift from the rendered PROBLEMS.
+fn shoutedDupe(allocator: std.mem.Allocator, s: []const u8) Allocator.Error![]u8 {
+    var shouted = std.Io.Writer.Allocating.init(allocator);
+    errdefer shouted.deinit();
+    reporting.writeShouted(&shouted.writer, s) catch return error.OutOfMemory;
+    return try shouted.toOwnedSlice();
 }
 
 const RegionLoc = struct { file: []const u8, sl: u32, sc: u32, el: u32, ec: u32 };
@@ -428,7 +428,7 @@ fn renderReportsToExpectedContent(allocator: std.mem.Allocator, reports: *const 
     for (reports.items) |*report| {
         const loc = reportRegionLoc(report);
         try entries.append(.{
-            .problem_type = try asciiUpperDupe(allocator, lastTitleSegment(report.title)),
+            .problem_type = try shoutedDupe(allocator, lastTitleSegment(report.title)),
             .file = try allocator.dupe(u8, loc.file),
             .start_line = loc.sl,
             .start_col = loc.sc,
