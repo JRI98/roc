@@ -4688,34 +4688,24 @@ pub fn build(b: *std.Build) void {
             );
         }
 
-        if (run_args.len != 0) {
-            module_test.run_step.addArgs(run_args);
-        }
-        if (std.mem.eql(u8, module_test.test_step.name, "base")) {
-            module_test.run_step.step.dependOn(&install_stack_overflow_test_helper.step);
-        }
-
-        // Create individual test step for this module
         const test_exe_name = module_test.test_step.name;
-        const run_module_test_step = b.step(
-            b.fmt("run-test-zig-module-{s}", .{test_exe_name}),
-            b.fmt("Run {s} Zig module tests", .{test_exe_name}),
-        );
 
-        // Create run step that accepts command line args (including --test-filter)
-        const individual_run = b.addRunArtifact(module_test.test_step);
-        if (run_args.len != 0) {
-            individual_run.addArgs(run_args);
-        }
-        if (std.mem.eql(u8, module_test.test_step.name, "base")) {
-            individual_run.step.dependOn(&install_stack_overflow_test_helper.step);
-        }
-        run_module_test_step.dependOn(&individual_run.step);
+        // The `base` module's tests exec a helper binary, so it must be
+        // installed first. Hoisted into an explicitly typed local because
+        // peer-type resolution on an inline conditional slice literal inside a
+        // struct literal field is fragile.
+        const module_deps: []const *Step = if (std.mem.eql(u8, test_exe_name, "base"))
+            &.{&install_stack_overflow_test_helper.step}
+        else
+            &.{};
 
-        b.default_step.dependOn(&module_test.test_step.step);
-        build_test_zig_step.dependOn(&module_test.test_step.step);
-        if (enumerate_tests_for_wiring_check) run_test_wiring.addArtifactArg(module_test.test_step);
-        tests_summary.addRun(&module_test.run_step.step);
+        test_suites.register(.{
+            .step_suffix = b.fmt("module-{s}", .{test_exe_name}),
+            .description = b.fmt("Run {s} Zig module tests", .{test_exe_name}),
+            .compile = module_test.test_step,
+            .deps = module_deps,
+            .default_step = true,
+        });
     }
 
     const lsp_integration_test_harness_module = createTestHarnessModule(b, roc_modules);
@@ -5571,32 +5561,19 @@ pub fn build(b: *std.Build) void {
                 .filters = test_filters,
             });
 
-            const run_http_header_decoder_platform_test = b.addRunArtifact(http_header_decoder_platform_test);
-            run_http_header_decoder_platform_test.setEnvironmentVariable("ROC_HTTP_HEADER_DECODER_PREBUILT_EXE", http_app_installed_path);
-            if (run_args.len != 0) {
-                run_http_header_decoder_platform_test.addArgs(run_args);
-            }
-            build_test_zig_step.dependOn(&http_header_decoder_platform_test.step);
-            if (enumerate_tests_for_wiring_check) run_test_wiring.addArtifactArg(http_header_decoder_platform_test);
-            run_http_header_decoder_platform_test.step.dependOn(final_http_host_step);
-            run_http_header_decoder_platform_test.step.dependOn(&install_http_app.step);
-            run_http_header_decoder_platform_test.step.dependOn(build_roc_step);
-
-            const run_http_header_decoder_platform_test_for_summary = b.addRunArtifact(http_header_decoder_platform_test);
-            run_http_header_decoder_platform_test_for_summary.setEnvironmentVariable("ROC_HTTP_HEADER_DECODER_PREBUILT_EXE", http_app_installed_path);
-            if (run_args.len != 0) {
-                run_http_header_decoder_platform_test_for_summary.addArgs(run_args);
-            }
-            run_http_header_decoder_platform_test_for_summary.step.dependOn(final_http_host_step);
-            run_http_header_decoder_platform_test_for_summary.step.dependOn(&install_http_app.step);
-            run_http_header_decoder_platform_test_for_summary.step.dependOn(build_roc_step);
-            tests_summary.addRun(&run_http_header_decoder_platform_test_for_summary.step);
-
-            const run_http_header_decoder_platform_zig_test_step = b.step(
-                "run-test-zig-http-header-decoder-platform",
-                "Run HTTP header Decoder platform Zig test",
-            );
-            run_http_header_decoder_platform_zig_test_step.dependOn(&run_http_header_decoder_platform_test.step);
+            test_suites.register(.{
+                .step_suffix = "http-header-decoder-platform",
+                .description = "Run HTTP header Decoder platform Zig test",
+                .compile = http_header_decoder_platform_test,
+                .deps = &.{
+                    final_http_host_step,
+                    &install_http_app.step,
+                    build_roc_step,
+                },
+                .env = &.{
+                    .{ .key = "ROC_HTTP_HEADER_DECODER_PREBUILT_EXE", .value = http_app_installed_path },
+                },
+            });
 
             const json_decoder_host_lib = createTestPlatformHostLib(
                 b,
@@ -5689,40 +5666,23 @@ pub fn build(b: *std.Build) void {
                 .filters = test_filters,
             });
 
-            const run_json_decoder_platform_test = b.addRunArtifact(json_decoder_platform_test);
-            run_json_decoder_platform_test.setEnvironmentVariable("ROC_JSON_DECODER_PREBUILT_EXE", json_app_installed_path);
-            run_json_decoder_platform_test.setEnvironmentVariable("ROC_JSON_DECODER_CAMEL_PREBUILT_EXE", json_camel_app_installed_path);
-            run_json_decoder_platform_test.setEnvironmentVariable("ROC_JSON_DECODER_CAMEL_DIRECT_PREBUILT_EXE", json_camel_direct_app_installed_path);
-            if (run_args.len != 0) {
-                run_json_decoder_platform_test.addArgs(run_args);
-            }
-            build_test_zig_step.dependOn(&json_decoder_platform_test.step);
-            if (enumerate_tests_for_wiring_check) run_test_wiring.addArtifactArg(json_decoder_platform_test);
-            run_json_decoder_platform_test.step.dependOn(final_json_host_step);
-            run_json_decoder_platform_test.step.dependOn(&install_json_app.step);
-            run_json_decoder_platform_test.step.dependOn(&install_json_camel_app.step);
-            run_json_decoder_platform_test.step.dependOn(&install_json_camel_direct_app.step);
-            run_json_decoder_platform_test.step.dependOn(build_roc_step);
-
-            const run_json_decoder_platform_test_for_summary = b.addRunArtifact(json_decoder_platform_test);
-            run_json_decoder_platform_test_for_summary.setEnvironmentVariable("ROC_JSON_DECODER_PREBUILT_EXE", json_app_installed_path);
-            run_json_decoder_platform_test_for_summary.setEnvironmentVariable("ROC_JSON_DECODER_CAMEL_PREBUILT_EXE", json_camel_app_installed_path);
-            run_json_decoder_platform_test_for_summary.setEnvironmentVariable("ROC_JSON_DECODER_CAMEL_DIRECT_PREBUILT_EXE", json_camel_direct_app_installed_path);
-            if (run_args.len != 0) {
-                run_json_decoder_platform_test_for_summary.addArgs(run_args);
-            }
-            run_json_decoder_platform_test_for_summary.step.dependOn(final_json_host_step);
-            run_json_decoder_platform_test_for_summary.step.dependOn(&install_json_app.step);
-            run_json_decoder_platform_test_for_summary.step.dependOn(&install_json_camel_app.step);
-            run_json_decoder_platform_test_for_summary.step.dependOn(&install_json_camel_direct_app.step);
-            run_json_decoder_platform_test_for_summary.step.dependOn(build_roc_step);
-            tests_summary.addRun(&run_json_decoder_platform_test_for_summary.step);
-
-            const run_json_decoder_platform_zig_test_step = b.step(
-                "run-test-zig-json-decoder-platform",
-                "Run JSON Decoder platform Zig test",
-            );
-            run_json_decoder_platform_zig_test_step.dependOn(&run_json_decoder_platform_test.step);
+            test_suites.register(.{
+                .step_suffix = "json-decoder-platform",
+                .description = "Run JSON Decoder platform Zig test",
+                .compile = json_decoder_platform_test,
+                .deps = &.{
+                    final_json_host_step,
+                    &install_json_app.step,
+                    &install_json_camel_app.step,
+                    &install_json_camel_direct_app.step,
+                    build_roc_step,
+                },
+                .env = &.{
+                    .{ .key = "ROC_JSON_DECODER_PREBUILT_EXE", .value = json_app_installed_path },
+                    .{ .key = "ROC_JSON_DECODER_CAMEL_PREBUILT_EXE", .value = json_camel_app_installed_path },
+                    .{ .key = "ROC_JSON_DECODER_CAMEL_DIRECT_PREBUILT_EXE", .value = json_camel_direct_app_installed_path },
+                },
+            });
         }
     }
 

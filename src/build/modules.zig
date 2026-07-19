@@ -268,10 +268,17 @@ fn targetMatchesHost(target: ResolvedTarget) bool {
         target.result.abi == builtin.target.abi;
 }
 
-/// Represents a test module with its compilation and execution steps.
+/// Represents a test module's compilation step.
+///
+/// Deliberately does not carry a pre-made `Step.Run`. Every run of these
+/// binaries is created by `TestSuiteRegistry` in build.zig, which builds one
+/// run for the tests summary and a separate one for the public
+/// `run-test-zig-module-*` step. A ready-made run stored here is exactly the
+/// convenient thing to hand to `TestsSummaryStep.addRun` *and* to a public
+/// step -- which is how eleven other suites ended up sharing one run and, on
+/// Windows, dragging the whole serialization chain behind them.
 pub const ModuleTest = struct {
     test_step: *Step.Compile,
-    run_step: *Step.Run,
 };
 
 /// Bundles the per-module test steps with accounting for forced passes (aggregators +
@@ -801,11 +808,8 @@ pub const RocModules = struct {
                 }
             }
 
-            const run_step = b.addRunArtifact(test_step);
-
             tests[i] = .{
                 .test_step = test_step,
-                .run_step = run_step,
             };
         }
 
