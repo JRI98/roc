@@ -916,6 +916,7 @@ generate_rust_file_header =
 	\\#![allow(dead_code)]
 	\\#![allow(improper_ctypes)]
 	\\#![allow(improper_ctypes_definitions)]
+	\\#![allow(unexpected_cfgs)]
 	\\
 	\\
 
