@@ -13,7 +13,7 @@ const ReachTask = union(enum) {
     stmt: lir.LIR.CFStmtId,
 };
 
-fn procReachesListSet(store: *const lir.LirStore, start: lir.LIR.LirProcSpecId) !bool {
+fn procReachesListSet(store: *const lir.LirStore, start: lir.LIR.LirProcSpecId) std.mem.Allocator.Error!bool {
     const allocator = std.testing.allocator;
     const seen_procs = try allocator.alloc(bool, store.procSpecCount());
     defer allocator.free(seen_procs);
@@ -123,7 +123,7 @@ fn retainReachesListSetCall(
     store: *const lir.LirStore,
     start: lir.LIR.CFStmtId,
     retained: lir.LIR.LocalId,
-) !bool {
+) std.mem.Allocator.Error!bool {
     var current = start;
     var remaining = store.cfStmtCount() + 1;
     while (remaining > 0) : (remaining -= 1) {

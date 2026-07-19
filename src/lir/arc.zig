@@ -64,9 +64,10 @@ pub fn insert(store: *LirStore, layouts: *const layout_mod.Store, options: Inser
 
     // Liveness-table bit layout: [0, localCount) raw locals with
     // read-before-rebind semantics, then one bit per multi-member borrow
-    // group (group-use semantics: any member read, no kills), then one bit
-    // per borrowed call-result local (value-use semantics: RC statements are
-    // not uses, string-match captures kill on the match edge).
+    // group (any member reads it; definitions end the previous resource and
+    // explicit source reads transfer liveness to the new resource), then one
+    // bit per borrowed call-result local (value-use semantics: RC statements
+    // are not uses, string-match captures kill on the match edge).
     const no_liveness_bit = std.math.maxInt(u32);
     var group_bit_index = try store.allocator.alloc(u32, store.localCount());
     defer store.allocator.free(group_bit_index);
@@ -4131,6 +4132,7 @@ const Inserter = struct {
             }
             if (node.def) |local| {
                 scratch.unset(@intFromEnum(local));
+                if (self.groupBitOf(local)) |bit| scratch.unset(bit);
                 if (self.valueUseBitOf(local)) |bit| scratch.unset(bit);
             }
             scratch.setUnion(node.reads);
