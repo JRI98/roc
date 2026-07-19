@@ -1697,7 +1697,7 @@ Literal-origin dispatch evidence has the same lifetime as the checked literal
 expression or pattern that owns it. If diagnostic recovery replaces that node,
 its evidence is retired atomically and cannot be output as a dispatch plan.
 An append-only raw-node table that can outlive its owning literal violates the
-checked-boundary invariant even if publication could identify and skip the
+checked-boundary invariant even if the output step could identify and skip the
 stale entry.
 
 Source dispatch, type dispatch, method equality, and iterator `for` plans all
