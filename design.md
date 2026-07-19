@@ -2012,12 +2012,21 @@ mode. SpecConstr improves optimized loop and call shape so later lowering and
 LLVM see scalar state and direct operations.
 
 SpecConstr preserves shared control explicitly. When a rewrite would move one
-continuation under multiple `match` or `if` arms, it introduces one typed lifted
-join point and replaces each arm result with a jump that supplies the result as
-an argument. It must never copy the continuation into the arms. This makes the
-amount of stored continuation code independent of branch count and nesting;
-later specialization may inspect the jump arguments without destroying that
-sharing.
+continuation under multiple `match` or `if` arms, it introduces typed lifted
+join points and replaces each arm result with a jump. It must never copy
+continuation code into more than one arm, which keeps the amount of stored
+continuation code independent of branch count and nesting. Within that rule the
+rewrite preserves the arms' statically known value structure: it declines
+entirely when an arm's result is opaque (an ordinary let binding keeps
+downstream tail-call and loop-shape recognition intact); a continuation that
+immediately matches the bound value gets one join per continuation branch, and
+only the small dispatching match is copied into the arms, where it folds
+against each arm's known constructor into a direct jump; a join's parameters
+are the decomposed leaves of the values its jump sites supply whenever those
+values agree on one structure skeleton, so specialization inside the shared
+body still sees the shape; and a join with exactly one jump site is not shared
+control at all — its body is cloned directly at that site against the site's
+full symbolic values.
 
 #### Constant Storage
 

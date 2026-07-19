@@ -50,7 +50,7 @@ pub const Constants = struct {
     /// 24: CommonIdents carries the range_exclusive/range_inclusive method idents.
     /// 25: Canonical node storage records where-clause rigid ownership.
     /// 26: ModuleEnv scheme instantiation evidence was renamed to scheme-use evidence.
-    pub const CACHE_VERSION = 27;
+    pub const CACHE_VERSION = 28;
 };
 
 /// Configuration for the Roc cache system.
