@@ -82,8 +82,9 @@ pub fn tokenTagToSemanticType(tag: Token.Tag) ?u32 {
 }
 
 /// Classifies a token using the syntax encoded by its neighboring token tags.
-/// A dotted lowercase name followed immediately by `(` is a method name;
-/// otherwise, a dotted lowercase name is a record field name.
+/// A dotted lowercase name followed immediately by `(` cannot be record field
+/// access. The parser separately distinguishes an attached method call from an
+/// uppercase-qualified lookup; both use the LSP `function` token category.
 fn tokenSemanticTypeAt(tags: []const Token.Tag, token_index: usize) ?u32 {
     const tag = tags[token_index];
 
