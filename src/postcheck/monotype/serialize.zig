@@ -29,7 +29,8 @@ pub const MAGIC: [8]u8 = .{ 'R', 'O', 'C', 'S', 'P', 'E', 'C', 0 };
 /// Version 6: specialization identities include the checked method lookup
 /// scope whose generated dispatch targets are embedded in the body.
 /// Version 7: expression tags include post-lift join-point control forms.
-pub const FORMAT_VERSION: u32 = 7;
+/// Version 8: cached type digests are alias-transparent.
+pub const FORMAT_VERSION: u32 = 8;
 
 const SECTION_COUNT = 40;
 /// Required byte alignment for every section payload. This covers all typed
