@@ -43,9 +43,7 @@ extern fn roc_default_start_main() callconv(.c) i32;
 
 /// The C runtime owns the process entrypoint: it initializes the Roc runtime,
 /// runs the Roc entrypoint, and folds failed inline expects into the status.
-export fn main(argc: c_int, argv: [*][*:0]u8) callconv(.c) c_int {
-    _ = argc;
-    _ = argv;
+export fn main() callconv(.c) c_int {
     roc_default_runtime_init();
     const status = roc_default_start_main();
     if (status == 0 and inline_expect_failed) return 1;
