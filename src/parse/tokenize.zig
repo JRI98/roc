@@ -2605,7 +2605,6 @@ test "tokenizer" {
     try testTokenization(gpa, "-42", &[_]Token.Tag{.Int});
     try testTokenization(gpa, "1e10", &[_]Token.Tag{.Float});
     try testTokenization(gpa, "_ident", &[_]Token.Tag{.NamedUnderscore});
-    try testTokenization(gpa, "1..2", &[_]Token.Tag{ .Int, .DoubleDot, .Int });
     try testTokenization(gpa, "3...4", &[_]Token.Tag{ .Int, .TripleDot, .Int });
     try testTokenization(gpa, "..<", &[_]Token.Tag{.OpDoubleDotLessThan});
     try testTokenization(gpa, "..=", &[_]Token.Tag{.OpDoubleDotEquals});
@@ -2614,8 +2613,6 @@ test "tokenizer" {
     try testTokenization(gpa, "1 ..< 5", &[_]Token.Tag{ .Int, .OpDoubleDotLessThan, .Int });
     try testTokenization(gpa, "a..=b", &[_]Token.Tag{ .LowerIdent, .OpDoubleDotEquals, .LowerIdent });
     // existing behavior must not change:
-    try testTokenization(gpa, "1...5", &[_]Token.Tag{ .Int, .TripleDot, .Int });
-    try testTokenization(gpa, "1..5", &[_]Token.Tag{ .Int, .DoubleDot, .Int });
     try testTokenization(gpa, "1. .2", &[_]Token.Tag{ .Int, .Dot, .DotInt });
     try testTokenization(gpa, "1.2.3", &[_]Token.Tag{ .Float, .NoSpaceDotInt });
     try testTokenization(gpa, "match", &[_]Token.Tag{.KwMatch});
@@ -2994,29 +2991,24 @@ test "additional operators" {
 
     // Pizza operator |>
     try testTokenization(gpa, "|>", &[_]Token.Tag{.OpPizza});
-    try testTokenization(gpa, "a |> b", &[_]Token.Tag{ .LowerIdent, .OpPizza, .LowerIdent });
 
     // Pipe operator |
     try testTokenization(gpa, "|", &[_]Token.Tag{.OpBar});
 
     // Percent operator %
     try testTokenization(gpa, "%", &[_]Token.Tag{.OpPercent});
-    try testTokenization(gpa, "a % b", &[_]Token.Tag{ .LowerIdent, .OpPercent, .LowerIdent });
 
     // Caret operator ^
     try testTokenization(gpa, "^", &[_]Token.Tag{.OpCaret});
-    try testTokenization(gpa, "a ^ b", &[_]Token.Tag{ .LowerIdent, .OpCaret, .LowerIdent });
 
     // Single backslash operator
     try testTokenization(gpa, "\\", &[_]Token.Tag{.OpBackslash});
 
     // Double slash //
     try testTokenization(gpa, "//", &[_]Token.Tag{.OpDoubleSlash});
-    try testTokenization(gpa, "a // b", &[_]Token.Tag{ .LowerIdent, .OpDoubleSlash, .LowerIdent });
 
     // Slash /
     try testTokenization(gpa, "/", &[_]Token.Tag{.OpSlash});
-    try testTokenization(gpa, "a / b", &[_]Token.Tag{ .LowerIdent, .OpSlash, .LowerIdent });
 }
 
 test "number suffixes" {

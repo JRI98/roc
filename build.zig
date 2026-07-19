@@ -1601,118 +1601,173 @@ const CoverageSummaryStep = struct {
     };
 };
 
-fn checkFxPlatformTestCoverage(step: *Step) !void {
-    const b = step.owner;
-    std.debug.print("---- checking fx platform test coverage ----\n", .{});
+const TestAssetCoverageDir = struct {
+    dir: []const u8,
+    spec_files: []const []const u8,
+};
 
-    const allocator = b.allocator;
-
-    // Get all .roc files in test/fx (excluding subdirectories)
-    const io = b.graph.io;
-    var fx_dir = try std.Io.Dir.cwd().openDir(io, "test/fx", .{ .iterate = true });
-    defer fx_dir.close(io);
-
-    var roc_files = std.ArrayList([]const u8).empty;
-    defer {
-        for (roc_files.items) |file| {
-            allocator.free(file);
-        }
-        roc_files.deinit(allocator);
-    }
-
-    var dir_iter = fx_dir.iterate();
-    while (try dir_iter.next(io)) |entry| {
-        if (entry.kind == .file and std.mem.endsWith(u8, entry.name, ".roc")) {
-            const file_name = try allocator.dupe(u8, entry.name);
-            try roc_files.append(allocator, file_name);
-        }
-    }
-
-    // Sort the list for consistent output
-    std.mem.sort([]const u8, roc_files.items, {}, struct {
-        fn lessThan(_: void, lhs: []const u8, rhs: []const u8) bool {
-            return std.mem.order(u8, lhs, rhs) == .lt;
-        }
-    }.lessThan);
-
-    // Find all references to test/fx/*.roc files in test source files
-    var tested_files = std.StringHashMap(void).init(allocator);
-    defer {
-        var key_iter = tested_files.keyIterator();
-        while (key_iter.next()) |key| {
-            allocator.free(key.*);
-        }
-        tested_files.deinit();
-    }
-
-    // Scan both the test file and the shared specs file
-    const test_files_to_scan = [_][]const u8{
+// Every top-level app .roc file in these directories must be named by at least
+// one of its spec sources; otherwise it is dead test data no runner executes.
+// Module and platform .roc files are dependencies of apps, so only files whose
+// first non-comment line is an `app` header are required to be covered.
+const test_asset_coverage_dirs = [_]TestAssetCoverageDir{
+    .{ .dir = "test/fx", .spec_files = &.{
         "src/cli/test/fx_platform_test.zig",
         "src/cli/test/fx_test_specs.zig",
-    };
+        "src/cli/test/parallel_cli_runner.zig",
+    } },
+    .{ .dir = "test/fx-open", .spec_files = &.{
+        "src/cli/test/platform_config.zig",
+        "src/cli/test/parallel_cli_runner.zig",
+    } },
+    .{ .dir = "test/cli", .spec_files = &.{
+        "src/cli/test/parallel_cli_runner.zig",
+        "src/compile/test/embedding_smoke.zig",
+    } },
+    .{ .dir = "test/str", .spec_files = &.{
+        "src/cli/test/platform_config.zig",
+        "src/cli/test/test_runner.zig",
+        "src/cli/test/parallel_cli_runner.zig",
+        "src/compile/coordinator.zig",
+    } },
+    .{ .dir = "test/echo", .spec_files = &.{
+        "src/cli/test/parallel_cli_runner.zig",
+        "src/eval/test/builtin_doc_tests.zig",
+    } },
+};
 
-    for (test_files_to_scan) |test_file_path| {
-        const test_file_contents = std.Io.Dir.cwd().readFileAlloc(io, test_file_path, allocator, .limited(1024 * 1024)) catch |err| {
-            std.debug.print("Warning: Could not read {s}: {}\n", .{ test_file_path, err });
-            continue;
-        };
-        defer allocator.free(test_file_contents);
-
-        var line_iter = std.mem.splitScalar(u8, test_file_contents, '\n');
-        while (line_iter.next()) |line| {
-            // Look for patterns like "test/fx/filename.roc"
-            var search_start: usize = 0;
-            while (std.mem.findPos(u8, line, search_start, "test/fx/")) |idx| {
-                const rest_of_line = line[idx..];
-                // Find the end of the filename
-                if (std.mem.find(u8, rest_of_line, ".roc")) |roc_pos| {
-                    const full_path = rest_of_line[0 .. roc_pos + 4]; // Include ".roc"
-                    // Extract just the filename (after "test/fx/")
-                    const filename = full_path["test/fx/".len..];
-                    // Only count files in test/fx (not subdirectories like test/fx/subdir/)
-                    if (std.mem.find(u8, filename, "/") == null) {
-                        // Dupe the filename since the source buffer will be freed
-                        const duped_filename = try allocator.dupe(u8, filename);
-                        try tested_files.put(duped_filename, {});
-                    }
-                }
-                search_start = idx + 1;
-            }
-        }
+fn isRocAppFile(contents: []const u8) bool {
+    var line_iter = std.mem.splitScalar(u8, contents, '\n');
+    while (line_iter.next()) |raw_line| {
+        const line = std.mem.trim(u8, raw_line, " \t\r");
+        if (line.len == 0) continue;
+        if (line[0] == '#') continue;
+        return std.mem.startsWith(u8, line, "app");
     }
-
-    // Find missing tests
-    var missing_tests = std.ArrayList([]const u8).empty;
-    defer missing_tests.deinit(allocator);
-
-    for (roc_files.items) |roc_file| {
-        if (!tested_files.contains(roc_file)) {
-            try missing_tests.append(allocator, roc_file);
-        }
-    }
-
-    // Report results
-    if (missing_tests.items.len > 0) {
-        std.debug.print("\nERROR: The following .roc files in test/fx/ do not have tests:\n", .{});
-        for (missing_tests.items) |missing_file| {
-            std.debug.print("  - {s}\n", .{missing_file});
-        }
-        std.debug.print("\nPlease add tests in fx_platform_test.zig or fx_test_specs.zig, or remove these files from test/fx/.\n", .{});
-        return step.fail("{d} .roc file(s) in test/fx/ are missing tests", .{missing_tests.items.len});
-    }
-
-    std.debug.print("All {d} .roc files in test/fx/ have tests.\n", .{roc_files.items.len});
+    return false;
 }
 
-const CheckFxStep = struct {
+fn checkTestAssetCoverage(step: *Step) !void {
+    const b = step.owner;
+    std.debug.print("---- checking test asset coverage ----\n", .{});
+
+    const allocator = b.allocator;
+    const io = b.graph.io;
+
+    var total_missing: usize = 0;
+    var total_checked: usize = 0;
+
+    for (test_asset_coverage_dirs) |cfg| {
+        var asset_dir = try std.Io.Dir.cwd().openDir(io, cfg.dir, .{ .iterate = true });
+        defer asset_dir.close(io);
+
+        var app_files = std.ArrayList([]const u8).empty;
+        defer {
+            for (app_files.items) |file| {
+                allocator.free(file);
+            }
+            app_files.deinit(allocator);
+        }
+
+        var dir_iter = asset_dir.iterate();
+        while (try dir_iter.next(io)) |entry| {
+            if (entry.kind != .file or !std.mem.endsWith(u8, entry.name, ".roc")) continue;
+            const contents = try asset_dir.readFileAlloc(io, entry.name, allocator, .limited(1024 * 1024));
+            defer allocator.free(contents);
+            if (!isRocAppFile(contents)) continue;
+            try app_files.append(allocator, try allocator.dupe(u8, entry.name));
+        }
+
+        std.mem.sort([]const u8, app_files.items, {}, struct {
+            fn lessThan(_: void, lhs: []const u8, rhs: []const u8) bool {
+                return std.mem.order(u8, lhs, rhs) == .lt;
+            }
+        }.lessThan);
+
+        var tested_files = std.StringHashMap(void).init(allocator);
+        defer {
+            var key_iter = tested_files.keyIterator();
+            while (key_iter.next()) |key| {
+                allocator.free(key.*);
+            }
+            tested_files.deinit();
+        }
+
+        const dir_prefix = try std.fmt.allocPrint(allocator, "{s}/", .{cfg.dir});
+        defer allocator.free(dir_prefix);
+
+        for (cfg.spec_files) |spec_file_path| {
+            const spec_contents = std.Io.Dir.cwd().readFileAlloc(io, spec_file_path, allocator, .limited(4 * 1024 * 1024)) catch |err| {
+                return step.fail("could not read spec source {s}: {}", .{ spec_file_path, err });
+            };
+            defer allocator.free(spec_contents);
+
+            var line_iter = std.mem.splitScalar(u8, spec_contents, '\n');
+            while (line_iter.next()) |full_line| {
+                // A mention inside a `//` comment is not a live spec entry.
+                const line = if (std.mem.find(u8, full_line, "//")) |comment_idx|
+                    full_line[0..comment_idx]
+                else
+                    full_line;
+
+                var search_start: usize = 0;
+                while (std.mem.findPos(u8, line, search_start, dir_prefix)) |idx| {
+                    const rest_of_line = line[idx..];
+                    if (std.mem.find(u8, rest_of_line, ".roc")) |roc_pos| {
+                        const full_path = rest_of_line[0 .. roc_pos + 4];
+                        const filename = full_path[dir_prefix.len..];
+                        // Only count top-level files, not subdirectory paths.
+                        if (std.mem.find(u8, filename, "/") == null) {
+                            const duped_filename = try allocator.dupe(u8, filename);
+                            if (tested_files.contains(duped_filename)) {
+                                allocator.free(duped_filename);
+                            } else {
+                                try tested_files.put(duped_filename, {});
+                            }
+                        }
+                    }
+                    search_start = idx + 1;
+                }
+            }
+        }
+
+        var missing_count: usize = 0;
+        for (app_files.items) |app_file| {
+            total_checked += 1;
+            if (!tested_files.contains(app_file)) {
+                if (missing_count == 0) {
+                    std.debug.print("\nERROR: app .roc files in {s}/ with no spec entry:\n", .{cfg.dir});
+                }
+                std.debug.print("  - {s}/{s}\n", .{ cfg.dir, app_file });
+                missing_count += 1;
+            }
+        }
+        if (missing_count > 0) {
+            std.debug.print("Add a spec entry in one of:\n", .{});
+            for (cfg.spec_files) |spec_file_path| {
+                std.debug.print("  {s}\n", .{spec_file_path});
+            }
+            std.debug.print("or delete the unused file(s).\n", .{});
+        }
+        total_missing += missing_count;
+    }
+
+    if (total_missing > 0) {
+        return step.fail("{d} app .roc file(s) have no spec entry", .{total_missing});
+    }
+
+    std.debug.print("All {d} app .roc files across {d} asset directories are covered.\n", .{ total_checked, test_asset_coverage_dirs.len });
+}
+
+const CheckTestAssetCoverageStep = struct {
     step: Step,
 
-    fn create(b: *std.Build) *CheckFxStep {
-        const self = b.allocator.create(CheckFxStep) catch @panic("OOM");
+    fn create(b: *std.Build) *CheckTestAssetCoverageStep {
+        const self = b.allocator.create(CheckTestAssetCoverageStep) catch @panic("OOM");
         self.* = .{
             .step = Step.init(.{
                 .id = Step.Id.custom,
-                .name = "checkfx-inner",
+                .name = "check-test-asset-coverage-inner",
                 .owner = b,
                 .makeFn = make,
             }),
@@ -1722,7 +1777,7 @@ const CheckFxStep = struct {
 
     fn make(step: *Step, options: Step.MakeOptions) !void {
         _ = options;
-        try checkFxPlatformTestCoverage(step);
+        try checkTestAssetCoverage(step);
     }
 };
 
@@ -2382,7 +2437,7 @@ pub fn build(b: *std.Build) void {
     const run_check_zig_lints_step = b.step("run-check-zig-lints", "Run Zig lints");
     const run_check_tidy_step = b.step("run-check-tidy", "Run code tidiness checks");
     const run_check_git_lints_step = b.step("run-check-git-lints", "Run Git-backed code checks");
-    const run_check_fx_platform_test_coverage_step = b.step("run-check-fx-platform-test-coverage", "Check that every .roc file in test/fx has a corresponding test");
+    const run_check_test_asset_coverage_step = b.step("run-check-test-asset-coverage", "Check that every app .roc file in spec-driven test asset dirs has a spec entry");
     const run_check_type_checker_patterns_step = b.step("run-check-type-checker-patterns", "Check forbidden type-checker patterns");
     const run_check_enum_from_int_zero_step = b.step("run-check-enum-from-int-zero", "Check forbidden @enumFromInt(0) usage");
     const run_check_unused_suppression_step = b.step("run-check-unused-suppression", "Check unused-variable suppression patterns");
@@ -2752,6 +2807,15 @@ pub fn build(b: *std.Build) void {
     run_test_wiring.step.dependOn(&install_test_wiring.step);
     run_check_test_wiring_step.dependOn(&run_test_wiring.step);
 
+    // The wiring check's semantic phase runs every Zig test binary with
+    // --listen=- to enumerate the tests each one actually contains (metadata
+    // only; no tests execute), then requires every named test decl in src/ to
+    // appear in some binary. The binary paths are appended as args at each
+    // b.addTest site below. They are only passed when the host can execute
+    // the configured target and no --test-filter trimmed the test set;
+    // otherwise the checker falls back to its import-level check alone.
+    const enumerate_tests_for_wiring_check = target_is_native and test_filters.len == 0;
+
     const run_minici = b.addRunArtifact(minici_exe);
     run_minici.addArg(b.graph.zig_exe);
     for (b.search_prefixes.items) |search_prefix| {
@@ -2870,7 +2934,7 @@ pub fn build(b: *std.Build) void {
     llvm_codegen_module.addImport("roc_target", roc_modules.roc_target);
     llvm_codegen_module.addImport("vendor_llvm_ir", roc_modules.vendor_llvm_ir);
 
-    const roc_exe = addMainExe(b, roc_modules, target, optimize, strip, omit_frame_pointer, use_system_llvm, user_llvm_path, flag_enable_tracy, zstd, compiled_builtins_module, write_compiled_builtins, llvm_codegen_module, flag_enable_tracy, true, valgrind_support) orelse return;
+    const roc_exe = addMainExe(b, roc_modules, target, optimize, strip, omit_frame_pointer, use_system_llvm, user_llvm_path, flag_enable_tracy, zstd, compiled_builtins_module, write_compiled_builtins, llvm_codegen_module, flag_enable_tracy, true, if (enumerate_tests_for_wiring_check) run_test_wiring else null, valgrind_support) orelse return;
     roc_modules.addAll(roc_exe);
     _ = install_and_run(b, no_bin, roc_exe, build_roc_step, run_roc_step, run_args);
 
@@ -2910,6 +2974,7 @@ pub fn build(b: *std.Build) void {
             llvm_codegen_module,
             null, // No tracy
             false,
+            null, // No machine-code shim test, so nothing to enumerate
             valgrind_support,
         );
         if (release_exe) |exe| {
@@ -4323,8 +4388,8 @@ pub fn build(b: *std.Build) void {
     }
 
     // Check fx platform test coverage convenience step
-    const checkfx_inner = CheckFxStep.create(b);
-    run_check_fx_platform_test_coverage_step.dependOn(&checkfx_inner.step);
+    const check_test_asset_coverage_inner = CheckTestAssetCoverageStep.create(b);
+    run_check_test_asset_coverage_step.dependOn(&check_test_asset_coverage_inner.step);
 
     const stack_overflow_test_helper_exe = b.addExecutable(.{
         .name = "stack_overflow_test_helper",
@@ -4407,7 +4472,7 @@ pub fn build(b: *std.Build) void {
 
     for (module_tests_result.tests) |module_test| {
         // Add compiled builtins to tests that canonicalize ordinary modules.
-        if (std.mem.eql(u8, module_test.test_step.name, "can") or std.mem.eql(u8, module_test.test_step.name, "check") or std.mem.eql(u8, module_test.test_step.name, "eval") or std.mem.eql(u8, module_test.test_step.name, "compile") or std.mem.eql(u8, module_test.test_step.name, "lsp_unit") or std.mem.eql(u8, module_test.test_step.name, "lsp_integration")) {
+        if (std.mem.eql(u8, module_test.test_step.name, "can") or std.mem.eql(u8, module_test.test_step.name, "check") or std.mem.eql(u8, module_test.test_step.name, "eval") or std.mem.eql(u8, module_test.test_step.name, "compile") or std.mem.eql(u8, module_test.test_step.name, "lsp") or std.mem.eql(u8, module_test.test_step.name, "lsp_unit") or std.mem.eql(u8, module_test.test_step.name, "lsp_integration")) {
             module_test.test_step.root_module.addImport("compiled_builtins", compiled_builtins_module);
             module_test.test_step.step.dependOn(&write_compiled_builtins.step);
         }
@@ -4506,6 +4571,7 @@ pub fn build(b: *std.Build) void {
 
         b.default_step.dependOn(&module_test.test_step.step);
         build_test_zig_step.dependOn(&module_test.test_step.step);
+        if (enumerate_tests_for_wiring_check) run_test_wiring.addArtifactArg(module_test.test_step);
         tests_summary.addRun(&module_test.run_step.step);
     }
 
@@ -4547,6 +4613,118 @@ pub fn build(b: *std.Build) void {
     build_test_zig_step.dependOn(&lsp_integration_runner_exe.step);
     run_test_zig_step.dependOn(&run_lsp_integration.step);
 
+    // Build-helper unit tests: test_harness.zig and stack_probe.zig are only
+    // consumed as module imports by executables, so they need their own test root.
+    const build_helpers_test = b.addTest(.{
+        .name = "build_helpers",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/build/helpers_test_root.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+            .imports = &.{
+                .{ .name = "collections", .module = roc_modules.collections },
+                .{ .name = "build_options", .module = roc_modules.build_options },
+            },
+        }),
+        .filters = test_filters,
+    });
+    build_test_zig_step.dependOn(&build_helpers_test.step);
+    if (enumerate_tests_for_wiring_check) run_test_wiring.addArtifactArg(build_helpers_test);
+    const run_build_helpers_test = b.addRunArtifact(build_helpers_test);
+    if (run_args.len != 0) {
+        run_build_helpers_test.addArgs(run_args);
+    }
+    tests_summary.addRun(&run_build_helpers_test.step);
+    const run_build_helpers_step = b.step(
+        "run-test-zig-build-helpers",
+        "Run build-helper Zig unit tests",
+    );
+    run_build_helpers_step.dependOn(&run_build_helpers_test.step);
+
+    // CLI runner unit tests: parallel_cli_runner.zig is an executable root, so
+    // its test decls are only collected by this dedicated test compile.
+    const cli_runner_unit_test = b.addTest(.{
+        .name = "cli_runner_unit",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/cli/test/parallel_cli_runner.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+            .imports = &.{
+                .{ .name = "test_harness", .module = createTestHarnessModule(b, roc_modules) },
+                .{ .name = "collections", .module = roc_modules.collections },
+                .{ .name = "backend", .module = roc_modules.backend },
+                .{ .name = "bytebox", .module = bytebox.module("bytebox") },
+                .{ .name = "build_options", .module = roc_modules.build_options },
+            },
+        }),
+        .filters = test_filters,
+    });
+    build_test_zig_step.dependOn(&cli_runner_unit_test.step);
+    if (enumerate_tests_for_wiring_check) run_test_wiring.addArtifactArg(cli_runner_unit_test);
+    const run_cli_runner_unit_test = b.addRunArtifact(cli_runner_unit_test);
+    if (run_args.len != 0) {
+        run_cli_runner_unit_test.addArgs(run_args);
+    }
+    tests_summary.addRun(&run_cli_runner_unit_test.step);
+    const run_cli_runner_unit_step = b.step(
+        "run-test-zig-cli-runner-unit",
+        "Run CLI runner Zig unit tests",
+    );
+    run_cli_runner_unit_step.dependOn(&run_cli_runner_unit_test.step);
+
+    // LLVM backend aggregator test: src/backend/llvm/mod.zig is not the root of
+    // the llvm_codegen module, so its refAllDecls compile coverage needs its own
+    // test compile.
+    const backend_llvm_test = b.addTest(.{
+        .name = "backend_llvm",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/backend/llvm/mod.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+            .imports = &.{
+                .{ .name = "layout", .module = roc_modules.layout },
+                .{ .name = "lir", .module = roc_modules.lir },
+                .{ .name = "ctx", .module = roc_modules.ctx },
+                .{ .name = "builtins", .module = roc_modules.builtins },
+                .{ .name = "build_options", .module = roc_modules.build_options },
+                .{ .name = "roc_target", .module = roc_modules.roc_target },
+                .{ .name = "vendor_llvm_ir", .module = roc_modules.vendor_llvm_ir },
+            },
+        }),
+        .filters = test_filters,
+    });
+    try addLlvmSupportToStep(
+        b,
+        backend_llvm_test,
+        target,
+        use_system_llvm,
+        user_llvm_path,
+        roc_modules,
+        llvm_codegen_module,
+        llvm_embedded_module,
+        zstd,
+    );
+    if (backend_llvm_test.root_module.resolved_target.?.result.os.tag != .windows or
+        backend_llvm_test.root_module.resolved_target.?.result.abi != .msvc)
+    {
+        backend_llvm_test.root_module.link_libcpp = true;
+    }
+    build_test_zig_step.dependOn(&backend_llvm_test.step);
+    if (enumerate_tests_for_wiring_check) run_test_wiring.addArtifactArg(backend_llvm_test);
+    const run_backend_llvm_test = b.addRunArtifact(backend_llvm_test);
+    if (run_args.len != 0) {
+        run_backend_llvm_test.addArgs(run_args);
+    }
+    tests_summary.addRun(&run_backend_llvm_test.step);
+    const run_backend_llvm_step = b.step(
+        "run-test-zig-backend-llvm",
+        "Run LLVM backend aggregator Zig tests",
+    );
+    run_backend_llvm_step.dependOn(&run_backend_llvm_test.step);
+
     // Add snapshot tool test
     const enable_snapshot_tests = b.option(bool, "snapshot-tests", "Enable snapshot tests") orelse true;
     if (enable_snapshot_tests) {
@@ -4582,6 +4760,7 @@ pub fn build(b: *std.Build) void {
 
         add_tracy(b, roc_modules.build_options, snapshot_test, target, true, flag_enable_tracy);
         build_test_zig_step.dependOn(&snapshot_test.step);
+        if (enumerate_tests_for_wiring_check) run_test_wiring.addArtifactArg(snapshot_test);
 
         const run_snapshot_test = b.addRunArtifact(snapshot_test);
         if (snapshot_exe_install) |install| {
@@ -4636,6 +4815,7 @@ pub fn build(b: *std.Build) void {
         }
         add_tracy(b, roc_modules.build_options, builtin_doc_test, target, true, flag_enable_tracy);
         build_test_zig_step.dependOn(&builtin_doc_test.step);
+        if (enumerate_tests_for_wiring_check) run_test_wiring.addArtifactArg(builtin_doc_test);
 
         const run_builtin_doc_test = b.addRunArtifact(builtin_doc_test);
         if (run_args.len != 0) {
@@ -4682,6 +4862,7 @@ pub fn build(b: *std.Build) void {
     }
     add_tracy(b, roc_modules.build_options, lir_inline_test, target, true, flag_enable_tracy);
     build_test_zig_step.dependOn(&lir_inline_test.step);
+    if (enumerate_tests_for_wiring_check) run_test_wiring.addArtifactArg(lir_inline_test);
 
     const run_lir_inline_test = b.addRunArtifact(lir_inline_test);
     if (run_args.len != 0) {
@@ -4727,6 +4908,7 @@ pub fn build(b: *std.Build) void {
     }
     add_tracy(b, roc_modules.build_options, trmc_lir_test, target, true, flag_enable_tracy);
     build_test_zig_step.dependOn(&trmc_lir_test.step);
+    if (enumerate_tests_for_wiring_check) run_test_wiring.addArtifactArg(trmc_lir_test);
 
     const run_trmc_lir_test = b.addRunArtifact(trmc_lir_test);
     if (run_args.len != 0) {
@@ -4777,6 +4959,7 @@ pub fn build(b: *std.Build) void {
         cli_test.root_module.addImport("compiled_builtins", compiled_builtins_module);
         cli_test.step.dependOn(&write_compiled_builtins.step);
         build_test_zig_step.dependOn(&cli_test.step);
+        if (enumerate_tests_for_wiring_check) run_test_wiring.addArtifactArg(cli_test);
 
         const run_cli_test = b.addRunArtifact(cli_test);
         if (run_args.len != 0) {
@@ -4811,6 +4994,7 @@ pub fn build(b: *std.Build) void {
         linkWatchPlatformLibs(watch_test, target);
 
         build_test_zig_step.dependOn(&watch_test.step);
+        if (enumerate_tests_for_wiring_check) run_test_wiring.addArtifactArg(watch_test);
 
         const run_watch_test = b.addRunArtifact(watch_test);
         if (run_args.len != 0) {
@@ -4838,6 +5022,7 @@ pub fn build(b: *std.Build) void {
             .filters = test_filters,
         });
         build_test_zig_step.dependOn(&minici_test.step);
+        if (enumerate_tests_for_wiring_check) run_test_wiring.addArtifactArg(minici_test);
 
         const run_minici_test = b.addRunArtifact(minici_test);
         if (run_args.len != 0) {
@@ -5237,6 +5422,7 @@ pub fn build(b: *std.Build) void {
             run_fx_platform_test.addArgs(run_args);
         }
         build_test_zig_step.dependOn(&fx_platform_test.step);
+        if (enumerate_tests_for_wiring_check) run_test_wiring.addArtifactArg(fx_platform_test);
         // Ensure host library is copied AND fixed before running the test
         run_fx_platform_test.step.dependOn(final_fx_host_step);
         run_fx_platform_test.step.dependOn(final_static_data_platform_step);
@@ -5333,6 +5519,7 @@ pub fn build(b: *std.Build) void {
                 run_http_header_decoder_platform_test.addArgs(run_args);
             }
             build_test_zig_step.dependOn(&http_header_decoder_platform_test.step);
+            if (enumerate_tests_for_wiring_check) run_test_wiring.addArtifactArg(http_header_decoder_platform_test);
             run_http_header_decoder_platform_test.step.dependOn(final_http_host_step);
             run_http_header_decoder_platform_test.step.dependOn(&install_http_app.step);
             run_http_header_decoder_platform_test.step.dependOn(build_roc_step);
@@ -5452,6 +5639,7 @@ pub fn build(b: *std.Build) void {
                 run_json_decoder_platform_test.addArgs(run_args);
             }
             build_test_zig_step.dependOn(&json_decoder_platform_test.step);
+            if (enumerate_tests_for_wiring_check) run_test_wiring.addArtifactArg(json_decoder_platform_test);
             run_json_decoder_platform_test.step.dependOn(final_json_host_step);
             run_json_decoder_platform_test.step.dependOn(&install_json_app.step);
             run_json_decoder_platform_test.step.dependOn(&install_json_camel_app.step);
@@ -5728,6 +5916,9 @@ fn addMainExe(
     llvm_codegen_module: *std.Build.Module,
     flag_enable_tracy: ?[]const u8,
     add_machine_code_shim_test: bool,
+    /// When set, the machine-code shim test binary is registered with the
+    /// test-wiring checker's semantic enumeration.
+    test_wiring_run: ?*Step.Run,
     valgrind_support: ?bool,
 ) ?*Step.Compile {
     const exe = b.addExecutable(.{
@@ -5967,6 +6158,7 @@ fn addMainExe(
         machine_code_shim_test.root_module.addObject(machine_code_shim_test_host);
         machine_code_shim_test.bundle_compiler_rt = true;
         add_tracy(b, roc_modules.build_options, machine_code_shim_test, b.graph.host, false, flag_enable_tracy);
+        if (test_wiring_run) |wiring_run| wiring_run.addArtifactArg(machine_code_shim_test);
 
         const run_machine_code_shim_test = b.addRunArtifact(machine_code_shim_test);
         const run_machine_code_shim_test_step = b.step(

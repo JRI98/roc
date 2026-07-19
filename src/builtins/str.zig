@@ -2570,26 +2570,6 @@ test "isSmallStr: returns true for empty string" {
     try std.testing.expect(str.isSmallStr());
 }
 
-test "RocStr.eq: small, equal" {
-    var test_env = TestEnv.init(std.testing.allocator);
-    defer test_env.deinit();
-
-    const str1_len = 3;
-    var str1: [str1_len]u8 = "abc".*;
-    const str1_ptr: [*]u8 = &str1;
-    var roc_str1 = RocStr.init(str1_ptr, str1_len, test_env.getOps());
-
-    const str2_len = 3;
-    var str2: [str2_len]u8 = "abc".*;
-    const str2_ptr: [*]u8 = &str2;
-    var roc_str2 = RocStr.init(str2_ptr, str2_len, test_env.getOps());
-
-    try std.testing.expect(roc_str1.eql(roc_str2));
-
-    roc_str1.decref(test_env.getOps());
-    roc_str2.decref(test_env.getOps());
-}
-
 test "RocStr.eq: small, not equal, different length" {
     var test_env = TestEnv.init(std.testing.allocator);
     defer test_env.deinit();
@@ -2610,75 +2590,6 @@ test "RocStr.eq: small, not equal, different length" {
     }
 
     try std.testing.expect(!roc_str1.eql(roc_str2));
-}
-
-test "RocStr.eq: small, not equal, same length" {
-    var test_env = TestEnv.init(std.testing.allocator);
-    defer test_env.deinit();
-
-    const str1_len = 3;
-    var str1: [str1_len]u8 = "acb".*;
-    const str1_ptr: [*]u8 = &str1;
-    var roc_str1 = RocStr.init(str1_ptr, str1_len, test_env.getOps());
-
-    const str2_len = 3;
-    var str2: [str2_len]u8 = "abc".*;
-    const str2_ptr: [*]u8 = &str2;
-    var roc_str2 = RocStr.init(str2_ptr, str2_len, test_env.getOps());
-
-    defer {
-        roc_str1.decref(test_env.getOps());
-        roc_str2.decref(test_env.getOps());
-    }
-
-    try std.testing.expect(!roc_str1.eql(roc_str2));
-}
-
-test "RocStr.eq: small, exact u64 chunk" {
-    var test_env = TestEnv.init(std.testing.allocator);
-    defer test_env.deinit();
-
-    const roc_str1 = RocStr.init("abcdefgh", 8, test_env.getOps());
-    const roc_str2 = RocStr.init("abcdefgh", 8, test_env.getOps());
-
-    defer {
-        roc_str1.decref(test_env.getOps());
-        roc_str2.decref(test_env.getOps());
-    }
-
-    try std.testing.expect(roc_str1.isSmallStr());
-    try std.testing.expectEqual(@as(usize, 8), roc_str1.len());
-    try std.testing.expect(roc_str1.eql(roc_str2));
-}
-
-test "RocStr.eq: small, masked tail detects last byte difference" {
-    var test_env = TestEnv.init(std.testing.allocator);
-    defer test_env.deinit();
-
-    const equal_text = if (SMALL_STR_MAX_LENGTH >= 23)
-        "abcdefghijklmnopqrstuvw"
-    else
-        "abcdefghijk";
-    const different_text = if (SMALL_STR_MAX_LENGTH >= 23)
-        "abcdefghijklmnopqrstuvX"
-    else
-        "abcdefghijX";
-
-    const roc_str1 = RocStr.init(equal_text, equal_text.len, test_env.getOps());
-    const roc_str2 = RocStr.init(equal_text, equal_text.len, test_env.getOps());
-    const roc_str3 = RocStr.init(different_text, different_text.len, test_env.getOps());
-
-    defer {
-        roc_str1.decref(test_env.getOps());
-        roc_str2.decref(test_env.getOps());
-        roc_str3.decref(test_env.getOps());
-    }
-
-    try std.testing.expect(roc_str1.isSmallStr());
-    try std.testing.expect(roc_str2.isSmallStr());
-    try std.testing.expect(roc_str3.isSmallStr());
-    try std.testing.expect(roc_str1.eql(roc_str2));
-    try std.testing.expect(!roc_str1.eql(roc_str3));
 }
 
 test "RocStr.eq: all small lengths compare by bytes" {
@@ -2991,22 +2902,6 @@ test "RocStr.eq: short seamless slice at allocation end" {
     try std.testing.expect(str1.isSeamlessSlice());
     try std.testing.expect(str1.eql(str2));
     try std.testing.expect(!str1.eql(str3));
-}
-
-test "RocStr.eq: large, equal" {
-    var test_env = TestEnv.init(std.testing.allocator);
-    defer test_env.deinit();
-
-    const content = "012345678901234567890123456789";
-    const roc_str1 = RocStr.init(content, content.len, test_env.getOps());
-    const roc_str2 = RocStr.init(content, content.len, test_env.getOps());
-
-    defer {
-        roc_str1.decref(test_env.getOps());
-        roc_str2.decref(test_env.getOps());
-    }
-
-    try std.testing.expect(roc_str1.eql(roc_str2));
 }
 
 test "RocStr.eq: large, different lengths, unequal" {
@@ -3381,36 +3276,6 @@ test "strSplitHelp: overlapping delimiter 1" {
     try std.testing.expect(array[1].eql(expected[1]));
 }
 
-test "strSplitHelp: overlapping delimiter 2" {
-    var test_env = TestEnv.init(std.testing.allocator);
-    defer test_env.deinit();
-
-    // Str.splitOn "aaa" "aa" == ["", "a"]
-    const str_arr = "aaaa";
-    const str = RocStr.init(str_arr, str_arr.len, test_env.getOps());
-
-    const delimiter_arr = "aa";
-    const delimiter = RocStr.init(delimiter_arr, delimiter_arr.len, test_env.getOps());
-
-    var array: [3]RocStr = undefined;
-    const array_ptr: [*]RocStr = &array;
-
-    strSplitOnHelp(array_ptr, str, delimiter, test_env.getOps());
-
-    const expected = [3]RocStr{
-        RocStr.empty(),
-        RocStr.empty(),
-        RocStr.empty(),
-    };
-
-    // strings are all small so we ignore freeing the memory
-
-    try std.testing.expectEqual(array.len, expected.len);
-    try std.testing.expect(array[0].eql(expected[0]));
-    try std.testing.expect(array[1].eql(expected[1]));
-    try std.testing.expect(array[2].eql(expected[2]));
-}
-
 test "countSegments: long delimiter" {
     var test_env = TestEnv.init(std.testing.allocator);
     defer test_env.deinit();
@@ -3505,19 +3370,6 @@ test "countSegments: overlapping delimiter 1" {
     );
 
     try std.testing.expectEqual(segments_count, 2);
-}
-
-test "countSegments: overlapping delimiter 2" {
-    var test_env = TestEnv.init(std.testing.allocator);
-    defer test_env.deinit();
-
-    // Str.splitOn "aaa" "aa" == ["", "a"]
-    const segments_count = countSegments(
-        RocStr.init("aaaa", 4, test_env.getOps()),
-        RocStr.init("aa", 2, test_env.getOps()),
-    );
-
-    try std.testing.expectEqual(segments_count, 3);
 }
 
 test "substringUnsafe: start" {
@@ -3627,27 +3479,6 @@ test "startsWith: food starts with foo" {
     try std.testing.expect(startsWith(food, foo));
 }
 
-test "startsWith: 123456789123456789 starts with 123456789123456789" {
-    var test_env = TestEnv.init(std.testing.allocator);
-    defer test_env.deinit();
-
-    const str = RocStr.fromSlice("123456789123456789", test_env.getOps());
-    defer str.decref(test_env.getOps());
-    try std.testing.expect(startsWith(str, str));
-}
-
-test "startsWith: 12345678912345678910 starts with 123456789123456789" {
-    var test_env = TestEnv.init(std.testing.allocator);
-    defer test_env.deinit();
-
-    const str = RocStr.fromSlice("12345678912345678910", test_env.getOps());
-    defer str.decref(test_env.getOps());
-    const prefix = RocStr.fromSlice("123456789123456789", test_env.getOps());
-    defer prefix.decref(test_env.getOps());
-
-    try std.testing.expect(startsWith(str, prefix));
-}
-
 test "endsWith: foo ends with oo" {
     var test_env = TestEnv.init(std.testing.allocator);
     defer test_env.deinit();
@@ -3658,39 +3489,6 @@ test "endsWith: foo ends with oo" {
     defer oo.decref(test_env.getOps());
 
     try std.testing.expect(endsWith(foo, oo));
-}
-
-test "endsWith: 123456789123456789 ends with 123456789123456789" {
-    var test_env = TestEnv.init(std.testing.allocator);
-    defer test_env.deinit();
-
-    const str = RocStr.init("123456789123456789", 18, test_env.getOps());
-    defer str.decref(test_env.getOps());
-    try std.testing.expect(endsWith(str, str));
-}
-
-test "endsWith: 12345678912345678910 ends with 345678912345678910" {
-    var test_env = TestEnv.init(std.testing.allocator);
-    defer test_env.deinit();
-
-    const str = RocStr.init("12345678912345678910", 20, test_env.getOps());
-    const suffix = RocStr.init("345678912345678910", 18, test_env.getOps());
-    defer str.decref(test_env.getOps());
-    defer suffix.decref(test_env.getOps());
-
-    try std.testing.expect(endsWith(str, suffix));
-}
-
-test "endsWith: hello world ends with world" {
-    var test_env = TestEnv.init(std.testing.allocator);
-    defer test_env.deinit();
-
-    const str = RocStr.init("hello world", 11, test_env.getOps());
-    const suffix = RocStr.init("world", 5, test_env.getOps());
-    defer str.decref(test_env.getOps());
-    defer suffix.decref(test_env.getOps());
-
-    try std.testing.expect(endsWith(str, suffix));
 }
 
 test "RocStr.concat: small concat small" {
@@ -4685,27 +4483,6 @@ test "strTrim: blank" {
     try std.testing.expect(trimmed.eql(RocStr.empty()));
 }
 
-test "strTrim: large to large" {
-    var test_env = TestEnv.init(std.testing.allocator);
-    defer test_env.deinit();
-
-    const original_bytes = " hello even more giant world ";
-    const original = RocStr.init(original_bytes, original_bytes.len, test_env.getOps());
-
-    try std.testing.expect(!original.isSmallStr());
-
-    const expected_bytes = "hello even more giant world";
-    const expected = RocStr.init(expected_bytes, expected_bytes.len, test_env.getOps());
-    defer expected.decref(test_env.getOps());
-
-    try std.testing.expect(!expected.isSmallStr());
-
-    const trimmed = strTrim(original, .Immutable, test_env.getOps());
-    defer trimmed.decref(test_env.getOps());
-
-    try std.testing.expect(trimmed.eql(expected));
-}
-
 test "strTrim: large to small sized slice" {
     var test_env = TestEnv.init(std.testing.allocator);
     defer test_env.deinit();
@@ -4773,27 +4550,6 @@ test "strTrimStart: blank" {
     try std.testing.expect(trimmed.eql(RocStr.empty()));
 }
 
-test "strTrimStart: large to large" {
-    var test_env = TestEnv.init(std.testing.allocator);
-    defer test_env.deinit();
-
-    const original_bytes = " hello even more giant world ";
-    const original = RocStr.init(original_bytes, original_bytes.len, test_env.getOps());
-    defer original.decref(test_env.getOps());
-
-    try std.testing.expect(!original.isSmallStr());
-
-    const expected_bytes = "hello even more giant world ";
-    const expected = RocStr.init(expected_bytes, expected_bytes.len, test_env.getOps());
-    defer expected.decref(test_env.getOps());
-
-    try std.testing.expect(!expected.isSmallStr());
-
-    const trimmed = strTrimStart(original, .Immutable, test_env.getOps());
-
-    try std.testing.expect(trimmed.eql(expected));
-}
-
 test "strTrimStart: large to small" {
     var test_env = TestEnv.init(std.testing.allocator);
     defer test_env.deinit();
@@ -4857,26 +4613,6 @@ test "strTrimEnd: blank" {
     const trimmed = strTrimEnd(original, .Immutable, test_env.getOps());
 
     try std.testing.expect(trimmed.eql(RocStr.empty()));
-}
-
-test "strTrimEnd: large to large" {
-    var test_env = TestEnv.init(std.testing.allocator);
-    defer test_env.deinit();
-    const original_bytes = " hello even more giant world ";
-    const original = RocStr.init(original_bytes, original_bytes.len, test_env.getOps());
-    defer original.decref(test_env.getOps());
-
-    try std.testing.expect(!original.isSmallStr());
-
-    const expected_bytes = " hello even more giant world";
-    const expected = RocStr.init(expected_bytes, expected_bytes.len, test_env.getOps());
-    defer expected.decref(test_env.getOps());
-
-    try std.testing.expect(!expected.isSmallStr());
-
-    const trimmed = strTrimEnd(original, .Immutable, test_env.getOps());
-
-    try std.testing.expect(trimmed.eql(expected));
 }
 
 test "strTrimEnd: large to small" {

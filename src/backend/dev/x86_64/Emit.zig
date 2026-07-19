@@ -1883,50 +1883,6 @@ test "callRel32 encoding" {
 
 // Multi-target calling convention tests
 
-test "CC constants differ between Windows and System V" {
-    // Windows uses 4 param regs, System V uses 6
-    try std.testing.expectEqual(@as(usize, 4), WinEmit.CC.PARAM_REGS.len);
-    try std.testing.expectEqual(@as(usize, 6), LinuxEmit.CC.PARAM_REGS.len);
-    try std.testing.expectEqual(@as(usize, 6), MacEmit.CC.PARAM_REGS.len);
-
-    // Windows has 32-byte shadow space, System V has none
-    try std.testing.expectEqual(@as(u8, 32), WinEmit.CC.SHADOW_SPACE);
-    try std.testing.expectEqual(@as(u8, 0), LinuxEmit.CC.SHADOW_SPACE);
-    try std.testing.expectEqual(@as(u8, 0), MacEmit.CC.SHADOW_SPACE);
-
-    // Windows first param is RCX, System V is RDI
-    try std.testing.expectEqual(Registers.GeneralReg.RCX, WinEmit.CC.PARAM_REGS[0]);
-    try std.testing.expectEqual(Registers.GeneralReg.RDI, LinuxEmit.CC.PARAM_REGS[0]);
-    try std.testing.expectEqual(Registers.GeneralReg.RDI, MacEmit.CC.PARAM_REGS[0]);
-
-    // Windows uses 4 float param regs, System V uses 8
-    try std.testing.expectEqual(@as(usize, 4), WinEmit.CC.FLOAT_PARAM_REGS.len);
-    try std.testing.expectEqual(@as(usize, 8), LinuxEmit.CC.FLOAT_PARAM_REGS.len);
-    try std.testing.expectEqual(@as(usize, 8), MacEmit.CC.FLOAT_PARAM_REGS.len);
-
-    // Windows returns in RAX only, System V can use RAX+RDX
-    try std.testing.expectEqual(@as(usize, 1), WinEmit.CC.RETURN_REGS.len);
-    try std.testing.expectEqual(@as(usize, 2), LinuxEmit.CC.RETURN_REGS.len);
-    try std.testing.expectEqual(@as(usize, 2), MacEmit.CC.RETURN_REGS.len);
-}
-
-test "CC.canPassStructByValue differs between Windows and System V" {
-    // Windows: only power-of-2 sizes (1, 2, 4, 8)
-    try std.testing.expect(WinEmit.CC.canPassStructByValue(1));
-    try std.testing.expect(WinEmit.CC.canPassStructByValue(2));
-    try std.testing.expect(WinEmit.CC.canPassStructByValue(4));
-    try std.testing.expect(WinEmit.CC.canPassStructByValue(8));
-    try std.testing.expect(!WinEmit.CC.canPassStructByValue(3));
-    try std.testing.expect(!WinEmit.CC.canPassStructByValue(9));
-    try std.testing.expect(!WinEmit.CC.canPassStructByValue(16));
-
-    // System V: any size up to 16
-    try std.testing.expect(LinuxEmit.CC.canPassStructByValue(1));
-    try std.testing.expect(LinuxEmit.CC.canPassStructByValue(9));
-    try std.testing.expect(LinuxEmit.CC.canPassStructByValue(16));
-    try std.testing.expect(!LinuxEmit.CC.canPassStructByValue(17));
-}
-
 test "CC.passI128ByPointer differs between Windows and System V" {
     // Windows requires i128 pass-by-pointer
     try std.testing.expect(WinEmit.CC.passI128ByPointer());

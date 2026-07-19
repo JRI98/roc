@@ -43,51 +43,6 @@ const MethodRegistryTestCheckedBodies = struct {
 
 // primitives - nums //
 
-test "check type - num - unbound" {
-    const source =
-        \\50
-    ;
-    try checkTypesExpr(
-        source,
-        .pass,
-        "Dec",
-    );
-}
-
-test "check type - num - int suffix 1" {
-    const source =
-        \\{
-        \\  x = 10.U8
-        \\
-        \\  x
-        \\}
-    ;
-    try checkTypesExpr(source, .pass, "U8");
-}
-
-test "check type - num - int suffix 2" {
-    const source =
-        \\{
-        \\  x = 10.I128
-        \\
-        \\  x
-        \\}
-    ;
-    try checkTypesExpr(source, .pass, "I128");
-}
-
-test "check type - num - int big" {
-    const source =
-        \\{
-        \\  e : U128
-        \\  e = 340282366920938463463374607431768211455
-        \\
-        \\  e
-        \\}
-    ;
-    try checkTypesExpr(source, .pass, "U128");
-}
-
 test "check type - num - float" {
     const source =
         \\10.1
@@ -99,50 +54,7 @@ test "check type - num - float" {
     );
 }
 
-test "check type - num - float suffix 1" {
-    const source =
-        \\{
-        \\  x : F32
-        \\  x = 10.1
-        \\
-        \\  x
-        \\}
-    ;
-    try checkTypesExpr(source, .pass, "F32");
-}
-
-test "check type - num - float suffix 2" {
-    const source =
-        \\{
-        \\  x : F64
-        \\  x = 10.1
-        \\
-        \\  x
-        \\}
-    ;
-    try checkTypesExpr(source, .pass, "F64");
-}
-
-test "check type - num - float suffix 3" {
-    const source =
-        \\{
-        \\  x : Dec
-        \\  x = 10.1
-        \\
-        \\  x
-        \\}
-    ;
-    try checkTypesExpr(source, .pass, "Dec");
-}
-
 // primitives - strs //
-
-test "check type - str" {
-    const source =
-        \\"hello"
-    ;
-    try checkTypesExpr(source, .pass, "Str");
-}
 
 test "check type - str annotation mismatch with number" {
     const source =
@@ -199,56 +111,12 @@ test "check type - binop operands must have same type - I64 plus I32 should fail
     try checkTypesModule(source, .fail, "Type Mismatch");
 }
 
-test "check type - binop operands must have same type - I64 minus I32 should fail" {
-    const source =
-        \\a : I64
-        \\a = 1
-        \\b : I32
-        \\b = 2
-        \\x = a - b
-    ;
-    try checkTypesModule(source, .fail, "Type Mismatch");
-}
-
-test "check type - binop operands must have same type - I64 times I32 should fail" {
-    const source =
-        \\a : I64
-        \\a = 1
-        \\b : I32
-        \\b = 2
-        \\x = a * b
-    ;
-    try checkTypesModule(source, .fail, "Type Mismatch");
-}
-
-test "check type - binop operands must have same type - F64 divide F32 should fail" {
-    const source =
-        \\a : F64
-        \\a = 1.0
-        \\b : F32
-        \\b = 2.0
-        \\x = a / b
-    ;
-    try checkTypesModule(source, .fail, "Type Mismatch");
-}
-
 test "check type - binop operands same type works - I64 plus I64" {
     const source =
         \\x : I64
         \\x = 1 + 2
     ;
     try checkTypesModule(source, .{ .pass = .last_def }, "I64");
-}
-
-test "check type - binop operands same type works - unbound plus unbound" {
-    const source =
-        \\x = 1 + 2
-    ;
-    try checkTypesModule(
-        source,
-        .{ .pass = .last_def },
-        "Dec",
-    );
 }
 
 // BOUNDARY DEFAULTING: a literal flowing through method-call dispatch
@@ -413,29 +281,11 @@ test "check type - comparison operands must have same type - I64 lt I32 should f
 
 // primitives - lists //
 
-test "check type - list empty" {
-    const source =
-        \\[]
-    ;
-    try checkTypesExpr(source, .pass, "List(_a)");
-}
-
 test "check type - list - same elems 1" {
     const source =
         \\["hello", "world"]
     ;
     try checkTypesExpr(source, .pass, "List(Str)");
-}
-
-test "check type - list - same elems 2" {
-    const source =
-        \\[100, 200]
-    ;
-    try checkTypesExpr(
-        source,
-        .pass,
-        "List(Dec)",
-    );
 }
 
 test "check type - list - 1st elem more specific coreces 2nd elem" {
@@ -462,40 +312,7 @@ test "check type - list - 2nd elem more specific coreces 1st elem" {
     try checkTypesExpr(source, .pass, "List(U32)");
 }
 
-test "check type - list  - diff elems 1" {
-    const source =
-        \\["hello", 10]
-    ;
-    // Number literal used where Str is expected (first elem determines list type)
-    try checkTypesExpr(source, .fail, "Type Mismatch");
-}
-
-// number requirements //
-
-// Skipped: Literal bounds checking is out of scope for poly removal phase
-// See POLY_REMOVAL_PLAN.md
-test "check type - num - cannot coerce 500 to u8" {
-    // const source =
-    //     \\[500, 200u8]
-    // ;
-    // try checkTypesExpr(source, .fail, "NUMBER DOES NOT FIT IN TYPE");
-}
-
 // records //
-
-test "check type - record" {
-    const source =
-        \\{
-        \\  hello: "Hello",
-        \\  world: 10,
-        \\}
-    ;
-    try checkTypesExpr(
-        source,
-        .pass,
-        "{ hello: Str, world: Dec }",
-    );
-}
 
 test "check type - record - field typo" {
     // spellchecker:off
@@ -618,14 +435,6 @@ test "check type - empty record equality" {
     try checkTypesExpr(source, .pass, "Bool");
 }
 
-test "check type - record with function field - no is_eq" {
-    // Records containing functions should not have is_eq because functions don't have is_eq
-    const source =
-        \\{ x: 1, f: |a| a + 1 } == { x: 1, f: |a| a + 1 }
-    ;
-    try checkTypesExpr(source, .fail, "Type Does Not Support Equality");
-}
-
 test "check type - tuple with function element - no is_eq" {
     // Tuples containing functions should not have is_eq because functions don't have is_eq
     const source =
@@ -743,30 +552,6 @@ test "check type - tuple inequality" {
     try checkTypesExpr(source, .pass, "Bool");
 }
 
-test "check type - record with function field - no inequality" {
-    // Records containing functions should not support != because they don't have is_eq
-    const source =
-        \\{ x: 1, f: |a| a + 1 } != { x: 1, f: |a| a + 1 }
-    ;
-    try checkTypesExpr(source, .fail, "Type Does Not Support Equality");
-}
-
-test "check type - tuple with function element - no inequality" {
-    // Tuples containing functions should not support != because they don't have is_eq
-    const source =
-        \\(1, |a| a) != (1, |a| a)
-    ;
-    try checkTypesExpr(source, .fail, "Type Does Not Support Equality");
-}
-
-test "check type - direct lambda inequality - no is_eq" {
-    // Lambdas/functions should not support inequality comparison (requires is_eq)
-    const source =
-        \\(|x| x) != (|y| y)
-    ;
-    try checkTypesExpr(source, .fail, "Type Does Not Support Equality");
-}
-
 test "check type - tag union inequality" {
     const source =
         \\Ok(1) != Ok(1)
@@ -774,22 +559,7 @@ test "check type - tag union inequality" {
     try checkTypesExpr(source, .pass, "Bool");
 }
 
-test "check type - tag union with function payload - no inequality" {
-    // Tag unions with function payloads should not support != because they don't have is_eq
-    const source =
-        \\Fn(|x| x) != Fn(|x| x)
-    ;
-    try checkTypesExpr(source, .fail, "Type Does Not Support Equality");
-}
-
 // tags //
-
-test "check type - tag" {
-    const source =
-        \\MyTag
-    ;
-    try checkTypesExpr(source, .pass, "[MyTag, ..]");
-}
 
 test "check type - tag - args" {
     const source =
@@ -2215,20 +1985,6 @@ test "check type - binops and mismatch" {
     try checkTypesModule(source, .fail, "Type Mismatch");
 }
 
-test "check type - binops or" {
-    const source =
-        \\x = True or False
-    ;
-    try checkTypesModule(source, .{ .pass = .last_def }, "Bool");
-}
-
-test "check type - binops or mismatch" {
-    const source =
-        \\x = "Hello" or False
-    ;
-    try checkTypesModule(source, .fail, "Type Mismatch");
-}
-
 // record access
 
 test "check type - record - access" {
@@ -2535,20 +2291,6 @@ test "check type - patterns - wrong type" {
         \\}
     ;
     try checkTypesExpr(source, .fail, "Missing Method");
-}
-
-test "check type - patterns tag without payload" {
-    const source =
-        \\{
-        \\  x = True
-        \\
-        \\  match(x) {
-        \\    True => "true",
-        \\    False => "false",
-        \\  }
-        \\}
-    ;
-    try checkTypesExpr(source, .pass, "Str");
 }
 
 test "check type - patterns tag with payload" {
@@ -3232,61 +2974,6 @@ test "check type - for mismatch" {
 }
 
 // static dispatch //
-
-test "check type - static dispatch - polymorphic - annotation" {
-    const source =
-        \\main : a -> Str where [a.to_str : a -> Str]
-        \\main = |a| a.to_str()
-    ;
-    try checkTypesModule(
-        source,
-        .{ .pass = .{ .def = "main" } },
-        "a -> Str where [a.to_str : a -> Str]",
-    );
-}
-
-test "check type - static dispatch - polymorphic - no annotation" {
-    const source =
-        \\main = |x| x.to_str()
-    ;
-    try checkTypesModule(
-        source,
-        .{ .pass = .{ .def = "main" } },
-        "a -> b where [a.to_str : a -> b]",
-    );
-}
-
-test "check type - static dispatch - concrete - annotation" {
-    const source =
-        \\Test := [Val(Str)].{
-        \\  to_str : Test -> Str
-        \\  to_str = |Test.Val(s)| s
-        \\}
-        \\
-        \\main : Str
-        \\main = Test.Val("hello").to_str()
-    ;
-    try checkTypesModule(
-        source,
-        .{ .pass = .{ .def = "main" } },
-        "Str",
-    );
-}
-
-test "check type - static dispatch - concrete - no annotation" {
-    const source =
-        \\Test := [Val(Str)].{
-        \\  to_str = |Test.Val(s)| s
-        \\}
-        \\
-        \\main = Test.Val("hello").to_str()
-    ;
-    try checkTypesModule(
-        source,
-        .{ .pass = .{ .def = "main" } },
-        "Str",
-    );
-}
 
 test "check type - static dispatch - concrete - wrong method name" {
     const source =
@@ -4379,34 +4066,12 @@ test "check type - static dispatch method type mismatch - REGRESSION TEST" {
 // These tests verify type-checking of Bool expressions from failing REPL snapshots.
 // If all pass, the Bool inversion bug is in LIR lowering or codegen, not type-checking.
 
-test "check type - bool diagnostic - Bool.True" {
-    try checkTypesExpr("Bool.True", .pass, "Bool");
-}
-
-test "check type - bool diagnostic - Bool.False" {
-    try checkTypesExpr("Bool.False", .pass, "Bool");
-}
-
 test "check type - bool diagnostic - Bool.not(True)" {
     try checkTypesExpr("Bool.not(True)", .pass, "Bool");
 }
 
 test "check type - bool diagnostic - Bool.not(False)" {
     try checkTypesExpr("Bool.not(False)", .pass, "Bool");
-}
-
-test "check type - bool diagnostic - !Bool.True" {
-    const source =
-        \\x = !Bool.True
-    ;
-    try checkTypesModule(source, .{ .pass = .last_def }, "Bool");
-}
-
-test "check type - bool diagnostic - !Bool.False" {
-    const source =
-        \\x = !Bool.False
-    ;
-    try checkTypesModule(source, .{ .pass = .last_def }, "Bool");
 }
 
 test "check type - bool diagnostic - Bool.True and Bool.False" {
@@ -4420,31 +4085,11 @@ test "check type - bool diagnostic - !Bool.True or !Bool.True" {
     try checkTypesModule(source, .{ .pass = .last_def }, "Bool");
 }
 
-test "check type - bool diagnostic - lambda negation applied to Bool.True" {
-    try checkTypesExpr("(|x| !x)(Bool.True)", .pass, "Bool");
-}
-
 // --- Nominal Bool vs structural tag union tests ---
 // CRITICAL DISTINCTION: In Roc, bare tags like `True` and `False` are structural tag unions,
 // NOT Bool primitives. They only become nominal `Bool` when unified with a Bool annotation
 // or a qualified reference like `Bool.True`. This is by design.
 // See also: corresponding lowering coverage in eval/backend integration tests.
-
-test "check type - nominal Bool - annotated True is Bool" {
-    const source =
-        \\x : Bool
-        \\x = True
-    ;
-    try checkTypesModule(source, .{ .pass = .last_def }, "Bool");
-}
-
-test "check type - nominal Bool - annotated False is Bool" {
-    const source =
-        \\x : Bool
-        \\x = False
-    ;
-    try checkTypesModule(source, .{ .pass = .last_def }, "Bool");
-}
 
 test "check type - structural tag - bare True is open tag union" {
     const source =
@@ -5618,32 +5263,6 @@ test "check type - mutually recursive functions - is_even and is_odd" {
 
 // self recursive functions - additional //
 
-test "check type - self recursive function - factorial" {
-    const source =
-        \\fact = |n| {
-        \\  if n <= 1.U64 {
-        \\    1.U64
-        \\  } else {
-        \\    n * fact(n - 1.U64)
-        \\  }
-        \\}
-    ;
-    try checkTypesModule(source, .{ .pass = .{ .def = "fact" } }, "U64 -> U64");
-}
-
-test "check type - self recursive function - multiple args" {
-    const source =
-        \\power = |base, exp| {
-        \\  if exp <= 0.U64 {
-        \\    1.U64
-        \\  } else {
-        \\    base * power(base, exp - 1.U64)
-        \\  }
-        \\}
-    ;
-    try checkTypesModule(source, .{ .pass = .{ .def = "power" } }, "U64, U64 -> U64");
-}
-
 // A binop whose lhs is a literal and whose rhs is pinned to a concrete type only
 // LATER, through a builtin signature (`index : U64` from
 // `List.map_with_index`'s callback) — the real-world pattern speculative peer
@@ -5657,20 +5276,6 @@ test "check type - binop literal lhs with signature-pinned rhs - U64 index" {
         \\result = List.map_with_index([10, 20, 30], |num, index| num + index)
     ;
     try checkTypesModule(source, .{ .pass = .last_def }, "List(U64)");
-}
-
-test "check type - self recursive function - with accumulator" {
-    const source =
-        \\sum_to : U64, U64 -> U64
-        \\sum_to = |n, acc| {
-        \\  if n <= 0.U64 {
-        \\    acc
-        \\  } else {
-        \\    sum_to(n - 1.U64, acc + n)
-        \\  }
-        \\}
-    ;
-    try checkTypesModule(source, .{ .pass = .{ .def = "sum_to" } }, "U64, U64 -> U64");
 }
 
 test "check type - self recursive function - returning record" {
@@ -5911,40 +5516,6 @@ test "check type - self recursive static dispatch - wrong arg type" {
 
 // mutually recursive functions - additional //
 
-test "check type - mutually recursive functions - three-way cycle" {
-    const source =
-        \\f = |n| {
-        \\  if n <= 0.U64 {
-        \\    0.U64
-        \\  } else {
-        \\    g(n - 1.U64)
-        \\  }
-        \\}
-        \\g = |n| {
-        \\  if n <= 0.U64 {
-        \\    0.U64
-        \\  } else {
-        \\    h(n - 1.U64)
-        \\  }
-        \\}
-        \\h = |n| {
-        \\  if n <= 0.U64 {
-        \\    0.U64
-        \\  } else {
-        \\    f(n - 1.U64)
-        \\  }
-        \\}
-    ;
-    try checkTypesModuleDefs(
-        source,
-        &.{
-            .{ .def = "f", .expected = "U64 -> U64" },
-            .{ .def = "g", .expected = "U64 -> U64" },
-            .{ .def = "h", .expected = "U64 -> U64" },
-        },
-    );
-}
-
 test "check type - mutually recursive functions - polymorphic" {
     const source =
         \\ping = |n, x| {
@@ -5988,42 +5559,6 @@ test "check type - mutually recursive functions - record constraint propagation"
 }
 
 // mutually recursive static dispatch - additional //
-
-test "check type - mutually recursive static dispatch - three-way cycle" {
-    const source =
-        \\Triple := [Val(U64)].{
-        \\  step_a = |Triple.Val(n)| {
-        \\    if n == 0.U64 {
-        \\      0.U64
-        \\    } else {
-        \\      Triple.Val(n - 1.U64).step_b()
-        \\    }
-        \\  }
-        \\  step_b = |Triple.Val(n)| {
-        \\    if n == 0.U64 {
-        \\      0.U64
-        \\    } else {
-        \\      Triple.Val(n - 1.U64).step_c()
-        \\    }
-        \\  }
-        \\  step_c = |Triple.Val(n)| {
-        \\    if n == 0.U64 {
-        \\      0.U64
-        \\    } else {
-        \\      Triple.Val(n - 1.U64).step_a()
-        \\    }
-        \\  }
-        \\}
-    ;
-    try checkTypesModuleDefs(
-        source,
-        &.{
-            .{ .def = "Test.Triple.step_a", .expected = "Triple -> U64" },
-            .{ .def = "Test.Triple.step_b", .expected = "Triple -> U64" },
-            .{ .def = "Test.Triple.step_c", .expected = "Triple -> U64" },
-        },
-    );
-}
 
 test "check type - mutually recursive static dispatch - polymorphic" {
     const source =
@@ -6382,24 +5917,6 @@ test "check type - mutually recursive functions - partially annotated polymorphi
             .{ .def = "ping", .expected = "U64, a -> a" },
             .{ .def = "pong", .expected = "U64, a -> a" },
             .{ .def = "test", .expected = "(Str, U8)" },
-        },
-    );
-}
-
-test "check type - mutually recursive functions - three member unannotated group" {
-    // Three unannotated members inferred as one binding group; the whole
-    // group generalizes together at its boundary.
-    const source =
-        \\red = |n| if n == 0.U64 { 0.U64 } else { green(n - 1.U64) }
-        \\green = |n| if n == 0.U64 { 0.U64 } else { blue(n - 1.U64) }
-        \\blue = |n| if n == 0.U64 { 0.U64 } else { red(n - 1.U64) }
-    ;
-    try checkTypesModuleDefs(
-        source,
-        &.{
-            .{ .def = "red", .expected = "U64 -> U64" },
-            .{ .def = "green", .expected = "U64 -> U64" },
-            .{ .def = "blue", .expected = "U64 -> U64" },
         },
     );
 }

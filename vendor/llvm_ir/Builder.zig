@@ -9828,7 +9828,7 @@ pub fn dump(b: *Builder, io: Io) void {
 }
 
 /// Prints the LLVM IR to a file at the given path.
-pub fn printToFilePath(b: *Builder, io: Io, dir: Io.Dir, path: []const u8) Allocator.Error!void {
+pub fn printToFilePath(b: *Builder, io: Io, dir: Io.Dir, path: []const u8) !void {
     var buffer: [4000]u8 = undefined;
     const file = try dir.createFile(io, path, .{});
     defer file.close(io);
@@ -9836,7 +9836,7 @@ pub fn printToFilePath(b: *Builder, io: Io, dir: Io.Dir, path: []const u8) Alloc
 }
 
 /// Prints the LLVM IR to a file handle.
-pub fn printToFile(b: *Builder, io: Io, file: Io.File, buffer: []u8) Allocator.Error!void {
+pub fn printToFile(b: *Builder, io: Io, file: Io.File, buffer: []u8) !void {
     var fw = file.writer(io, buffer);
     try print(b, &fw.interface);
     try fw.interface.flush();

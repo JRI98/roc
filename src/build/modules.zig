@@ -707,6 +707,7 @@ pub const RocModules = struct {
             .can,
             .check,
             .ctx,
+            .eval,
             .layout,
             .values,
             .ipc,
@@ -715,9 +716,11 @@ pub const RocModules = struct {
             .bundle,
             .unbundle,
             .base58,
+            .lsp,
             .lsp_unit,
             .backend,
             .lir_core,
+            .roc_target,
             .postcheck,
             .lir,
             .symbol,
@@ -755,6 +758,12 @@ pub const RocModules = struct {
                 }),
                 .filters = filter_injection.filters,
             });
+
+            // The eval module's host-call trampoline is implemented in assembly;
+            // the test compile has its own root module, so it needs the file too.
+            if (module_type == .eval) {
+                test_step.root_module.addAssemblyFile(b.path("src/eval/host_trampoline.S"));
+            }
 
             // Watch module needs Core Foundation and FSEvents on macOS (only when not cross-compiling)
             // These frameworks provide the FSEvents API for proper event-driven file system monitoring on macOS.

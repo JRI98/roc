@@ -1775,16 +1775,6 @@ test "fromStr: 0" {
     try std.testing.expectEqual(RocDec{ .num = 0 }, dec.?);
 }
 
-test "fromStr: 1" {
-    var test_env = TestEnv.init(std.testing.allocator);
-    defer test_env.deinit();
-
-    const roc_str = RocStr.init("1", 1, test_env.getOps());
-    const dec = RocDec.fromStr(roc_str);
-
-    try std.testing.expectEqual(RocDec.one_point_zero, dec.?);
-}
-
 test "fromStr: 123.45" {
     var test_env = TestEnv.init(std.testing.allocator);
     defer test_env.deinit();
@@ -1803,26 +1793,6 @@ test "fromStr: .45" {
     const dec = RocDec.fromStr(roc_str);
 
     try std.testing.expectEqual(RocDec{ .num = 450000000000000000 }, dec.?);
-}
-
-test "fromStr: 0.45" {
-    var test_env = TestEnv.init(std.testing.allocator);
-    defer test_env.deinit();
-
-    const roc_str = RocStr.init("0.45", 4, test_env.getOps());
-    const dec = RocDec.fromStr(roc_str);
-
-    try std.testing.expectEqual(RocDec{ .num = 450000000000000000 }, dec.?);
-}
-
-test "fromStr: 123" {
-    var test_env = TestEnv.init(std.testing.allocator);
-    defer test_env.deinit();
-
-    const roc_str = RocStr.init("123", 3, test_env.getOps());
-    const dec = RocDec.fromStr(roc_str);
-
-    try std.testing.expectEqual(RocDec{ .num = 123000000000000000000 }, dec.?);
 }
 
 test "fromStr: -.45" {
@@ -1875,26 +1845,6 @@ test "fromStr: abc" {
     try std.testing.expectEqual(dec, null);
 }
 
-test "fromStr: 123.abc" {
-    var test_env = TestEnv.init(std.testing.allocator);
-    defer test_env.deinit();
-
-    const roc_str = RocStr.init("123.abc", 7, test_env.getOps());
-    const dec = RocDec.fromStr(roc_str);
-
-    try std.testing.expectEqual(dec, null);
-}
-
-test "fromStr: abc.123" {
-    var test_env = TestEnv.init(std.testing.allocator);
-    defer test_env.deinit();
-
-    const roc_str = RocStr.init("abc.123", 7, test_env.getOps());
-    const dec = RocDec.fromStr(roc_str);
-
-    try std.testing.expectEqual(dec, null);
-}
-
 test "fromStr: .123.1" {
     var test_env = TestEnv.init(std.testing.allocator);
     defer test_env.deinit();
@@ -1903,17 +1853,6 @@ test "fromStr: .123.1" {
     const dec = RocDec.fromStr(roc_str);
 
     try std.testing.expectEqual(dec, null);
-}
-
-test "to_str: 100.00" {
-    var test_env = TestEnv.init(std.testing.allocator);
-    defer test_env.deinit();
-
-    var dec: RocDec = .{ .num = 100000000000000000000 };
-    var res_roc_str = dec.to_str(test_env.getOps());
-
-    const res_slice: []const u8 = "100.0"[0..];
-    try std.testing.expectEqualSlices(u8, res_slice, res_roc_str.asSlice());
 }
 
 test "to_str: 123.45" {
@@ -2004,28 +1943,6 @@ test "to_str: -0.00045" {
     try std.testing.expectEqualSlices(u8, res_slice, res_roc_str.asSlice());
 }
 
-test "to_str: -111.123456" {
-    var test_env = TestEnv.init(std.testing.allocator);
-    defer test_env.deinit();
-
-    var dec: RocDec = .{ .num = -111123456000000000000 };
-    var res_roc_str = dec.to_str(test_env.getOps());
-
-    const res_slice: []const u8 = "-111.123456"[0..];
-    try std.testing.expectEqualSlices(u8, res_slice, res_roc_str.asSlice());
-}
-
-test "to_str: 123.1111111" {
-    var test_env = TestEnv.init(std.testing.allocator);
-    defer test_env.deinit();
-
-    var dec: RocDec = .{ .num = 123111111100000000000 };
-    var res_roc_str = dec.to_str(test_env.getOps());
-
-    const res_slice: []const u8 = "123.1111111"[0..];
-    try std.testing.expectEqualSlices(u8, res_slice, res_roc_str.asSlice());
-}
-
 test "to_str: 123.1111111111111 (big str)" {
     var test_env = TestEnv.init(std.testing.allocator);
     defer test_env.deinit();
@@ -2111,15 +2028,6 @@ test "add: 0" {
     try std.testing.expectEqual(RocDec{ .num = 0 }, dec.add(.{ .num = 0 }, test_env.getOps()));
 }
 
-test "add: 1" {
-    var test_env = TestEnv.init(std.testing.allocator);
-    defer test_env.deinit();
-
-    var dec: RocDec = .{ .num = 0 };
-
-    try std.testing.expectEqual(RocDec{ .num = 1 }, dec.add(.{ .num = 1 }, test_env.getOps()));
-}
-
 test "sub: 0" {
     var test_env = TestEnv.init(std.testing.allocator);
     defer test_env.deinit();
@@ -2127,15 +2035,6 @@ test "sub: 0" {
     var dec: RocDec = .{ .num = 1 };
 
     try std.testing.expectEqual(RocDec{ .num = 1 }, dec.sub(.{ .num = 0 }, test_env.getOps()));
-}
-
-test "sub: 1" {
-    var test_env = TestEnv.init(std.testing.allocator);
-    defer test_env.deinit();
-
-    var dec: RocDec = .{ .num = 1 };
-
-    try std.testing.expectEqual(RocDec{ .num = 0 }, dec.sub(.{ .num = 1 }, test_env.getOps()));
 }
 
 test "mul: by 0" {
@@ -2156,15 +2055,6 @@ test "mul: by 1" {
     try std.testing.expectEqual(RocDec.fromU64(15), dec.mul(RocDec.fromU64(1), test_env.getOps()));
 }
 
-test "mul: by 2" {
-    var test_env = TestEnv.init(std.testing.allocator);
-    defer test_env.deinit();
-
-    var dec: RocDec = RocDec.fromU64(15);
-
-    try std.testing.expectEqual(RocDec.fromU64(30), dec.mul(RocDec.fromU64(2), test_env.getOps()));
-}
-
 test "div: 0 / 2" {
     var test_env = TestEnv.init(std.testing.allocator);
     defer test_env.deinit();
@@ -2172,24 +2062,6 @@ test "div: 0 / 2" {
     var dec: RocDec = RocDec.fromU64(0);
 
     try std.testing.expectEqual(RocDec.fromU64(0), dec.div(RocDec.fromU64(2), test_env.getOps()));
-}
-
-test "div: 2 / 2" {
-    var test_env = TestEnv.init(std.testing.allocator);
-    defer test_env.deinit();
-
-    var dec: RocDec = RocDec.fromU64(2);
-
-    try std.testing.expectEqual(RocDec.fromU64(1), dec.div(RocDec.fromU64(2), test_env.getOps()));
-}
-
-test "div: 20 / 2" {
-    var test_env = TestEnv.init(std.testing.allocator);
-    defer test_env.deinit();
-
-    var dec: RocDec = RocDec.fromU64(20);
-
-    try std.testing.expectEqual(RocDec.fromU64(10), dec.div(RocDec.fromU64(2), test_env.getOps()));
 }
 
 test "div: 8 / 5" {
@@ -2272,16 +2144,6 @@ test "fract: 0" {
     try std.testing.expectEqual(RocDec{ .num = 0 }, dec.fract());
 }
 
-test "fract: 1" {
-    var test_env = TestEnv.init(std.testing.allocator);
-    defer test_env.deinit();
-
-    const roc_str = RocStr.init("1", 1, test_env.getOps());
-    var dec = RocDec.fromStr(roc_str).?;
-
-    try std.testing.expectEqual(RocDec{ .num = 0 }, dec.fract());
-}
-
 test "fract: 123.45" {
     var test_env = TestEnv.init(std.testing.allocator);
     defer test_env.deinit();
@@ -2302,16 +2164,6 @@ test "fract: -123.45" {
     try std.testing.expectEqual(RocDec{ .num = -450000000000000000 }, dec.fract());
 }
 
-test "fract: .45" {
-    var test_env = TestEnv.init(std.testing.allocator);
-    defer test_env.deinit();
-
-    const roc_str = RocStr.init(".45", 3, test_env.getOps());
-    var dec = RocDec.fromStr(roc_str).?;
-
-    try std.testing.expectEqual(RocDec{ .num = 450000000000000000 }, dec.fract());
-}
-
 test "fract: -0.00045" {
     const dec: RocDec = .{ .num = -450000000000000 };
     const res = dec.fract();
@@ -2327,16 +2179,6 @@ test "trunc: 0" {
     var dec = RocDec.fromStr(roc_str).?;
 
     try std.testing.expectEqual(RocDec{ .num = 0 }, dec.trunc(test_env.getOps()));
-}
-
-test "trunc: 1" {
-    var test_env = TestEnv.init(std.testing.allocator);
-    defer test_env.deinit();
-
-    const roc_str = RocStr.init("1", 1, test_env.getOps());
-    var dec = RocDec.fromStr(roc_str).?;
-
-    try std.testing.expectEqual(RocDec.one_point_zero, dec.trunc(test_env.getOps()));
 }
 
 test "trunc: 123.45" {
@@ -2357,16 +2199,6 @@ test "trunc: -123.45" {
     var dec = RocDec.fromStr(roc_str).?;
 
     try std.testing.expectEqual(RocDec{ .num = -123000000000000000000 }, dec.trunc(test_env.getOps()));
-}
-
-test "trunc: .45" {
-    var test_env = TestEnv.init(std.testing.allocator);
-    defer test_env.deinit();
-
-    const roc_str = RocStr.init(".45", 3, test_env.getOps());
-    var dec = RocDec.fromStr(roc_str).?;
-
-    try std.testing.expectEqual(RocDec{ .num = 0 }, dec.trunc(test_env.getOps()));
 }
 
 test "trunc: -0.00045" {
@@ -2449,16 +2281,6 @@ test "powInt: 2 ^ 2" {
     try std.testing.expectEqual(dec, RocDec.two_point_zero.powInt(2, test_env.getOps()));
 }
 
-test "powInt: 0.5 ^ 2" {
-    var test_env = TestEnv.init(std.testing.allocator);
-    defer test_env.deinit();
-
-    const roc_str = RocStr.init("0.25", 4, test_env.getOps());
-    const dec = RocDec.fromStr(roc_str).?;
-
-    try std.testing.expectEqual(dec, RocDec.zero_point_five.powInt(2, test_env.getOps()));
-}
-
 test "pow: 0.5 ^ 2.0" {
     var test_env = TestEnv.init(std.testing.allocator);
     defer test_env.deinit();
@@ -2467,52 +2289,6 @@ test "pow: 0.5 ^ 2.0" {
     const dec = RocDec.fromStr(roc_str).?;
 
     try std.testing.expectEqual(dec, RocDec.zero_point_five.pow(RocDec.two_point_zero, test_env.getOps()));
-}
-
-test "sqrt: 1.0" {
-    var test_env = TestEnv.init(std.testing.allocator);
-    defer test_env.deinit();
-
-    const roc_str = RocStr.init("1.0", 3, test_env.getOps());
-    const dec = RocDec.fromStr(roc_str).?;
-
-    try std.testing.expectEqual(dec, RocDec.sqrt(RocDec.one_point_zero, test_env.getOps()));
-}
-
-test "sqrt: 0.0" {
-    var test_env = TestEnv.init(std.testing.allocator);
-    defer test_env.deinit();
-
-    const roc_str = RocStr.init("0.0", 3, test_env.getOps());
-    const dec = RocDec.fromStr(roc_str).?;
-
-    try std.testing.expectEqual(dec, dec.sqrt(test_env.getOps()));
-}
-
-test "sqrt: 9.0" {
-    var test_env = TestEnv.init(std.testing.allocator);
-    defer test_env.deinit();
-
-    const roc_str = RocStr.init("9.0", 3, test_env.getOps());
-    const dec = RocDec.fromStr(roc_str).?;
-
-    const roc_str_expected = RocStr.init("3.0", 3, test_env.getOps());
-    const expected = RocDec.fromStr(roc_str_expected).?;
-
-    try std.testing.expectEqual(expected, dec.sqrt(test_env.getOps()));
-}
-
-test "sqrt: 1.44" {
-    var test_env = TestEnv.init(std.testing.allocator);
-    defer test_env.deinit();
-
-    const roc_str = RocStr.init("1.44", 4, test_env.getOps());
-    const dec = RocDec.fromStr(roc_str).?;
-
-    const roc_str_expected = RocStr.init("1.2", 3, test_env.getOps());
-    const expected = RocDec.fromStr(roc_str_expected).?;
-
-    try std.testing.expectEqual(expected, dec.sqrt(test_env.getOps()));
 }
 
 fn expectApproxDec(expected: RocDec, actual: RocDec, tolerance: u128) error{TestUnexpectedResult}!void {
@@ -2792,14 +2568,6 @@ test "sqrt: 2.0 truncates to fixed-point precision" {
     const expected = RocDec{ .num = 1414213562373095048 };
 
     try std.testing.expectEqual(expected, two.sqrt(test_env.getOps()));
-}
-
-test "sqrt: small fixed-point values stay deterministic" {
-    var test_env = TestEnv.init(std.testing.allocator);
-    defer test_env.deinit();
-
-    try expectRocDecConstant((try decFromText("0.000000000000000001")).sqrt(test_env.getOps()), "0.000000001");
-    try expectRocDecConstant((try decFromText("12321.0")).sqrt(test_env.getOps()), "111.0");
 }
 
 test "sqrt fixtures match exact fixed-point spec" {

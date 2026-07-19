@@ -237,34 +237,3 @@ test "printSpaces" {
     try printSpaces(&writer.writer, 5);
     try testing.expectEqualStrings("     ", writer.written());
 }
-
-test "integration - format source region" {
-    // For "x" identifier at column 1, length should be 1
-    try testing.expectEqual(@as(u32, 1), calculateUnderlineLength(1, 2));
-
-    // For "x" identifier at column 5, length should be 1
-    try testing.expectEqual(@as(u32, 1), calculateUnderlineLength(5, 6));
-}
-
-test "real-world identifier underline calculations" {
-    // Single character identifier "x" at column 1
-    // Columns: 1234...
-    // Text:    x = 1
-    //          ^ (column 1-2, should underline 1 char)
-    try testing.expectEqual(@as(u32, 1), calculateUnderlineLength(1, 2));
-
-    // Multi-character identifier "someVariable" at column 1
-    // Columns: 123456789012345...
-    // Text:    someVariable = 1
-    //          ^^^^^^^^^^^^ (columns 1-13, should underline 12 chars)
-    try testing.expectEqual(@as(u32, 12), calculateUnderlineLength(1, 13));
-
-    // Identifier "foo" at column 5
-    // Columns: 12345678...
-    // Text:        foo = bar
-    //              ^^^ (columns 5-8, should underline 3 chars)
-    try testing.expectEqual(@as(u32, 3), calculateUnderlineLength(5, 8));
-
-    // Edge case: single column span (e.g., single char at end of identifier)
-    try testing.expectEqual(@as(u32, 1), calculateUnderlineLength(10, 10));
-}

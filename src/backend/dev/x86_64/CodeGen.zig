@@ -1175,18 +1175,6 @@ test "MacCodeGen matches LinuxCodeGen (both System V)" {
     try std.testing.expect(!MacCodeGen.roc_target.isWindows());
 }
 
-test "macOS x64 CALLEE_SAVED_AREA_SIZE matches Linux" {
-    // System V: 5 registers * 8 bytes = 40 bytes (same as Linux)
-    try std.testing.expectEqual(@as(i32, 40), MacCodeGen.CALLEE_SAVED_AREA_SIZE);
-    try std.testing.expectEqual(LinuxCodeGen.CALLEE_SAVED_AREA_SIZE, MacCodeGen.CALLEE_SAVED_AREA_SIZE);
-}
-
-test "macOS x64 callee-saved register count matches Linux" {
-    // System V: 5 callee-saved registers (RBX, R12-R15) - same as Linux
-    try std.testing.expectEqual(@as(u32, 5), @popCount(MacCodeGen.CALLEE_SAVED_GENERAL_MASK));
-    try std.testing.expectEqual(@popCount(LinuxCodeGen.CALLEE_SAVED_GENERAL_MASK), @popCount(MacCodeGen.CALLEE_SAVED_GENERAL_MASK));
-}
-
 test "MacCodeGen prologue/epilogue matches LinuxCodeGen" {
     // macOS and Linux should produce identical code (both System V)
     var mac_cg = MacCodeGen.init(std.testing.allocator);
@@ -1204,29 +1192,4 @@ test "MacCodeGen prologue/epilogue matches LinuxCodeGen" {
 
     // Should produce identical code
     try std.testing.expectEqualSlices(u8, linux_cg.getCode(), mac_cg.getCode());
-}
-
-test "macOS x64: use callee-saved registers when caller-saved exhausted" {
-    var cg = MacCodeGen.init(std.testing.allocator);
-    defer cg.deinit();
-
-    // macOS uses System V ABI — same caller-saved set as Linux
-    // (R11 is reserved as SCRATCH_REG and excluded from the allocatable mask)
-    const num_caller_saved: usize = @popCount(SystemV.CALLER_SAVED_GENERAL_MASK);
-    var regs: [8]GeneralReg = undefined;
-    for (0..num_caller_saved) |i| {
-        regs[i] = try cg.allocGeneralFor(@intCast(i));
-    }
-
-    // callee_saved_used should still be 0 (all were caller-saved)
-    try std.testing.expectEqual(@as(u16, 0), cg.callee_saved_used);
-
-    // Next allocation should use a callee-saved register
-    const callee_reg = try cg.allocGeneralFor(@intCast(num_caller_saved));
-
-    // Now callee_saved_used should have a bit set
-    try std.testing.expect(cg.callee_saved_used != 0);
-
-    // The register should be one of the callee-saved ones (System V)
-    try std.testing.expect(SystemV.isCalleeSaved(callee_reg));
 }

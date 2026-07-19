@@ -76,14 +76,14 @@ pub const build_platform_main_source =
 ;
 
 /// Build-only default platform for targets that use a C runtime entrypoint.
-/// The user-facing main! signature stays the same; the synthetic main returns
-/// the C process status code.
+/// The C runtime object owns `main`; it calls this exported Roc entrypoint and
+/// folds failed inline expects into the process status code.
 pub const build_c_platform_main_source =
     \\platform ""
     \\    requires {} { main! : List(Str) => Try(_, [Exit(I8), ..]) }
     \\    exposes [Echo]
     \\    packages {}
-    \\    provides { "main": main_for_host! }
+    \\    provides { "roc_default_start_main": main_for_host! }
     \\    hosted { "roc_default_echo_line": Echo.line! }
     \\    targets: {
     \\        inputs_dir: "targets/",

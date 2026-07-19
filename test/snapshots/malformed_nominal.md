@@ -1,7 +1,7 @@
 # META
 ~~~ini
-description=Basic example to develop the snapshot methodology
-type=file:002.roc
+description=Malformed nominal declaration name recovers with unexpected-statement diagnostics
+type=file:malformed_nominal.roc
 ~~~
 # SOURCE
 ~~~roc
@@ -12,10 +12,10 @@ foo = "one"
 bar = "two"
 ~~~
 # EXPECTED
-UNEXPECTED STATEMENT - 002.md:1:1:1:3
-UNEXPECTED STATEMENT - 002.md:1:4:1:6
-UNEXPECTED STATEMENT - 002.md:1:7:1:8
-UNEXPECTED STATEMENT - 002.md:1:8:1:9
+UNEXPECTED STATEMENT - malformed_nominal.md:1:1:1:3
+UNEXPECTED STATEMENT - malformed_nominal.md:1:4:1:6
+UNEXPECTED STATEMENT - malformed_nominal.md:1:7:1:8
+UNEXPECTED STATEMENT - malformed_nominal.md:1:8:1:9
 # PROBLEMS
 
 ┌──────────────────────┐
@@ -24,7 +24,7 @@ UNEXPECTED STATEMENT - 002.md:1:8:1:9
  │                                                                            │
  │  @2 := {}                                                                  │
  │  ‾‾                                                                        │
- └──────────────────────────────────────────────────────────────── 002.md:1:1 ┘
+ └────────────────────────────────────────────────── malformed_nominal.md:1:1 ┘
 
     Statements can be declarations, type annotations, imports, expectations,
     returns, crashes, loops, or expression statements inside a block.
@@ -41,7 +41,7 @@ UNEXPECTED STATEMENT - 002.md:1:8:1:9
  │                                                                            │
  │  @2 := {}                                                                  │
  │     ‾‾                                                                     │
- └──────────────────────────────────────────────────────────────── 002.md:1:4 ┘
+ └────────────────────────────────────────────────── malformed_nominal.md:1:4 ┘
 
     Statements can be declarations, type annotations, imports, expectations,
     returns, crashes, loops, or expression statements inside a block.
@@ -58,7 +58,7 @@ UNEXPECTED STATEMENT - 002.md:1:8:1:9
  │                                                                            │
  │  @2 := {}                                                                  │
  │        ‾                                                                   │
- └──────────────────────────────────────────────────────────────── 002.md:1:7 ┘
+ └────────────────────────────────────────────────── malformed_nominal.md:1:7 ┘
 
     Statements can be declarations, type annotations, imports, expectations,
     returns, crashes, loops, or expression statements inside a block.
@@ -75,7 +75,7 @@ UNEXPECTED STATEMENT - 002.md:1:8:1:9
  │                                                                            │
  │  @2 := {}                                                                  │
  │         ‾                                                                  │
- └──────────────────────────────────────────────────────────────── 002.md:1:8 ┘
+ └────────────────────────────────────────────────── malformed_nominal.md:1:8 ┘
 
     Statements can be declarations, type annotations, imports, expectations,
     returns, crashes, loops, or expression statements inside a block.

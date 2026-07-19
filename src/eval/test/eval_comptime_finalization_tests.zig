@@ -59,11 +59,6 @@ const expect_success =
     \\main = 42
 ;
 
-const expect_failure =
-    \\expect missing_expect_condition
-    \\main = 42
-;
-
 const inline_expect_failure =
     \\bad = {
     \\    expect False
@@ -195,16 +190,29 @@ const associated_deep_multiple =
     \\main = Outer.a + Outer.Middle.b + Outer.Middle.Inner.c
 ;
 
-const problem_type_mismatch =
-    \\main = missing_numeric_bound_value
+const u8_out_of_range =
+    \\main : U8
+    \\main = 256
+;
+
+const i8_below_min =
+    \\main : I8
+    \\main = -129
+;
+
+const u64_negative =
+    \\main : U64
+    \\main = -1
 ;
 
 const div_zero =
-    \\main = missing_division_by_zero_value
+    \\main : I64
+    \\main = 1 // 0
 ;
 
 const mod_zero =
-    \\main = missing_modulo_by_zero_value
+    \\main : I64
+    \\main = 1 % 0
 ;
 
 const int_list_nil =
@@ -829,12 +837,9 @@ pub const tests = [_]TestCase{
     .{ .name = "comptime eval - cross-module crash is detected", .source_kind = .module, .imports = &.{.{ .name = "Util", .source = import_crash_module }}, .source = "import Util\nmain = Util.safe", .expected = .{ .inspect_str = "42.0" } },
     .{ .name = "comptime eval - imported constant can be accessed from headerless module", .source_kind = .module, .imports = &.{.{ .name = "Util", .source = "Util := [].{\n    hidden = 1\n    shown = 2\n}\n" }}, .source = "import Util\nmain = Util.hidden", .expected = .{ .inspect_str = "1.0" } },
     .{ .name = "comptime eval - expect success does not report", .source_kind = .module, .source = expect_success, .expected = .{ .inspect_str = "42.0" } },
-    .{ .name = "comptime eval - expect failure is reported but does not halt within def", .source_kind = .module, .source = expect_failure, .expected = .{ .problem = {} } },
-    .{ .name = "comptime eval - multiple expect failures are reported", .source_kind = .module, .source = expect_failure, .expected = .{ .problem = {} } },
     .{ .name = "comptime eval - inline expect failure in constant is reported", .source_kind = .module, .source = inline_expect_failure, .expected = .{ .problem = {} } },
     .{ .name = "comptime eval - multiple inline expect failures in constant are reported", .source_kind = .module, .source = multiple_inline_expect_failures, .expected = .{ .problem = {} } },
     .{ .name = "comptime eval - crash does not halt other defs", .source_kind = .module, .source = crash_other_defs, .expected = .{ .inspect_str = "42.0" } },
-    .{ .name = "comptime eval - expect failure does not halt evaluation", .source_kind = .module, .source = expect_failure, .expected = .{ .problem = {} } },
     .{ .name = "comptime eval - dbg does not halt evaluation", .source_kind = .module, .source = dbg_does_not_halt, .expected = .{ .inspect_str = "42.0" } },
     .{ .name = "comptime eval - unused top-level dbg still evaluates", .source_kind = .module, .source = unused_top_level_dbg_does_not_halt, .expected = .{ .inspect_str = "42.0" } },
     .{ .name = "comptime eval - unused top-level constant expect failure is reported", .source_kind = .module, .source = unused_top_level_expect_failure, .expected = .{ .problem = {} } },
@@ -842,7 +847,6 @@ pub const tests = [_]TestCase{
     .{ .name = "comptime eval - imported unused top-level expect failure is reported", .source_kind = .module, .imports = &.{.{ .name = "Util", .source = import_unused_expect_module }}, .source = "import Util\nmain = Util.safe", .expected = .{ .problem = {} } },
     .{ .name = "comptime eval - imported unused top-level crash is reported", .source_kind = .module, .imports = &.{.{ .name = "Util", .source = import_unused_crash_module }}, .source = "import Util\nmain = Util.safe", .expected = .{ .problem = {} } },
     .{ .name = "comptime eval - crash in first def does not halt other defs", .source_kind = .module, .source = crash_first_other_defs, .expected = .{ .inspect_str = "42.0" } },
-    .{ .name = "comptime eval - crash halts within single def", .source = crash_now, .expected = .{ .crash = {} } },
     .{ .name = "comptime eval - constant folding multiplication", .source_kind = .module, .source = folded_multiply, .expected = .{ .inspect_str = "42.0" } },
     .{ .name = "comptime eval - constant folding preserves literal", .source_kind = .module, .source = folded_literal, .expected = .{ .inspect_str = "42.0" } },
     .{ .name = "comptime eval - constant folding multiple defs", .source_kind = .module, .source = folded_multiple, .expected = .{ .inspect_str = "42.0" } },
@@ -854,41 +858,19 @@ pub const tests = [_]TestCase{
     .{ .name = "comptime eval - multiple associated items with dependencies", .source_kind = .module, .source = associated_multiple, .expected = .{ .inspect_str = "7.0" } },
     .{ .name = "comptime eval - deeply nested associated items (5+ levels)", .source_kind = .module, .source = associated_deep, .expected = .{ .inspect_str = "123.0" } },
     .{ .name = "comptime eval - deeply nested with multiple items at each level", .source_kind = .module, .source = associated_deep_multiple, .expected = .{ .inspect_str = "60.0" } },
-    .{ .name = "comptime eval - U8: 256 does not fit", .source_kind = .module, .source = problem_type_mismatch, .expected = .{ .problem = {} } },
-    .{ .name = "comptime eval - U8: negative does not fit", .source_kind = .module, .source = problem_type_mismatch, .expected = .{ .problem = {} } },
-    .{ .name = "comptime eval - I8: -129 does not fit", .source_kind = .module, .source = problem_type_mismatch, .expected = .{ .problem = {} } },
+    .{ .name = "comptime eval - U8: 256 does not fit", .source_kind = .module, .source = u8_out_of_range, .expected = .{ .problem = {} } },
+    .{ .name = "comptime eval - I8: -129 does not fit", .source_kind = .module, .source = i8_below_min, .expected = .{ .problem = {} } },
+    .{ .name = "comptime eval - U64: negative literal does not fit", .source_kind = .module, .source = u64_negative, .expected = .{ .problem = {} } },
     .{ .name = "comptime eval - U8 valid max value", .source_kind = .module, .source = "main : U8\nmain = 255", .expected = .{ .inspect_str = "255" } },
-    .{ .name = "comptime eval - U8 too large with descriptive error", .source_kind = .module, .source = problem_type_mismatch, .expected = .{ .problem = {} } },
-    .{ .name = "comptime eval - U8 negative with descriptive error", .source_kind = .module, .source = problem_type_mismatch, .expected = .{ .problem = {} } },
-    .{ .name = "comptime eval - U8 fractional with descriptive error", .source_kind = .module, .source = problem_type_mismatch, .expected = .{ .problem = {} } },
     .{ .name = "comptime eval - I8 valid range", .source_kind = .module, .source = "main : I8\nmain = -128", .expected = .{ .inspect_str = "-128" } },
-    .{ .name = "comptime eval - I8 too small with descriptive error", .source_kind = .module, .source = problem_type_mismatch, .expected = .{ .problem = {} } },
-    .{ .name = "comptime eval - I8 too large with descriptive error", .source_kind = .module, .source = problem_type_mismatch, .expected = .{ .problem = {} } },
-    .{ .name = "comptime eval - I8 fractional with descriptive error", .source_kind = .module, .source = problem_type_mismatch, .expected = .{ .problem = {} } },
     .{ .name = "comptime eval - U16 valid max value", .source_kind = .module, .source = "main : U16\nmain = 65535", .expected = .{ .inspect_str = "65535" } },
-    .{ .name = "comptime eval - U16 too large with descriptive error", .source_kind = .module, .source = problem_type_mismatch, .expected = .{ .problem = {} } },
-    .{ .name = "comptime eval - U16 negative with descriptive error", .source_kind = .module, .source = problem_type_mismatch, .expected = .{ .problem = {} } },
     .{ .name = "comptime eval - I16 valid range", .source_kind = .module, .source = "main : I16\nmain = -32768", .expected = .{ .inspect_str = "-32768" } },
-    .{ .name = "comptime eval - I16 too small with descriptive error", .source_kind = .module, .source = problem_type_mismatch, .expected = .{ .problem = {} } },
-    .{ .name = "comptime eval - I16 too large with descriptive error", .source_kind = .module, .source = problem_type_mismatch, .expected = .{ .problem = {} } },
     .{ .name = "comptime eval - U32 valid max value", .source_kind = .module, .source = "main : U32\nmain = 4294967295", .expected = .{ .inspect_str = "4294967295" } },
-    .{ .name = "comptime eval - U32 too large with descriptive error", .source_kind = .module, .source = problem_type_mismatch, .expected = .{ .problem = {} } },
-    .{ .name = "comptime eval - U32 negative with descriptive error", .source_kind = .module, .source = problem_type_mismatch, .expected = .{ .problem = {} } },
     .{ .name = "comptime eval - I32 valid range", .source_kind = .module, .source = "main : I32\nmain = -2147483648", .expected = .{ .inspect_str = "-2147483648" } },
-    .{ .name = "comptime eval - I32 too small with descriptive error", .source_kind = .module, .source = problem_type_mismatch, .expected = .{ .problem = {} } },
-    .{ .name = "comptime eval - I32 too large with descriptive error", .source_kind = .module, .source = problem_type_mismatch, .expected = .{ .problem = {} } },
     .{ .name = "comptime eval - U64 valid max value", .source_kind = .module, .source = "main : U64\nmain = 18446744073709551615", .expected = .{ .inspect_str = "18446744073709551615" } },
-    .{ .name = "comptime eval - U64 too large with descriptive error", .source_kind = .module, .source = problem_type_mismatch, .expected = .{ .problem = {} } },
-    .{ .name = "comptime eval - U64 negative with descriptive error", .source_kind = .module, .source = problem_type_mismatch, .expected = .{ .problem = {} } },
     .{ .name = "comptime eval - I64 valid range", .source_kind = .module, .source = "main : I64\nmain = -9223372036854775808", .expected = .{ .inspect_str = "-9223372036854775808" } },
-    .{ .name = "comptime eval - I64 too small with descriptive error", .source_kind = .module, .source = problem_type_mismatch, .expected = .{ .problem = {} } },
-    .{ .name = "comptime eval - I64 too large with descriptive error", .source_kind = .module, .source = problem_type_mismatch, .expected = .{ .problem = {} } },
-    .{ .name = "comptime eval - I64 fractional with descriptive error", .source_kind = .module, .source = problem_type_mismatch, .expected = .{ .problem = {} } },
     .{ .name = "comptime eval - U128 valid max value", .source_kind = .module, .source = "main : U128\nmain = 340282366920938463463374607431768211455", .expected = .{ .inspect_str = "340282366920938463463374607431768211455" } },
-    .{ .name = "comptime eval - U128 negative does not fit", .source_kind = .module, .source = problem_type_mismatch, .expected = .{ .problem = {} } },
-    .{ .name = "comptime eval - U128 fractional with descriptive error", .source_kind = .module, .source = problem_type_mismatch, .expected = .{ .problem = {} } },
     .{ .name = "comptime eval - I128 valid range", .source_kind = .module, .source = "main : I128\nmain = -170141183460469231731687303715884105728", .expected = .{ .inspect_str = "-170141183460469231731687303715884105728" } },
-    .{ .name = "comptime eval - I128 fractional with descriptive error", .source_kind = .module, .source = problem_type_mismatch, .expected = .{ .problem = {} } },
     .{ .name = "comptime eval - F32 valid", .source_kind = .module, .source = "main : F32\nmain = 1.5", .expected = .{ .inspect_str = "1.5" } },
     .{ .name = "comptime eval - F64 valid", .source_kind = .module, .source = "main : F64\nmain = 1.5", .expected = .{ .inspect_str = "1.5" } },
     .{ .name = "comptime eval - Dec valid", .source_kind = .module, .source = "main : Dec\nmain = 1.5", .expected = .{ .inspect_str = "1.5" } },
@@ -896,7 +878,6 @@ pub const tests = [_]TestCase{
     .{ .name = "comptime eval - F64 negative valid", .source_kind = .module, .source = "main : F64\nmain = -1.5", .expected = .{ .inspect_str = "-1.5" } },
     .{ .name = "comptime eval - to_str on unbound number literal", .source_kind = .module, .source = "main = I64.to_str(42)", .expected = .{ .inspect_str = "\"42\"" } },
     .{ .name = "comptime eval - division by zero produces error", .source_kind = .module, .source = div_zero, .expected = .{ .problem = {} } },
-    .{ .name = "comptime eval - division by zero in expression", .source_kind = .module, .source = div_zero, .expected = .{ .problem = {} } },
     .{ .name = "comptime eval - modulo by zero produces error", .source_kind = .module, .source = mod_zero, .expected = .{ .problem = {} } },
     .{ .name = "comptime eval - division by zero does not crash subsequent defs (issue 9001)", .source_kind = .module, .source = "good = 42\nmain = good", .expected = .{ .inspect_str = "42.0" } },
     .{ .name = "comptime eval - recursive nominal: simple IntList Nil", .source_kind = .module, .source = int_list_nil, .expected = .{ .inspect_str = "Nil" } },
@@ -960,15 +941,11 @@ pub const tests = [_]TestCase{
     .{ .name = "comptime eval - issue 8901: pattern matching on nominal type", .source_kind = .module, .source = nominal_match, .expected = .{ .inspect_str = "1.0" } },
     .{ .name = "issue 8930: wrapped tag union in wrapped record should not crash", .source_kind = .module, .source = wrapped_record, .expected = .{ .inspect_str = "CombinedValue({ combination_method: Add })" } },
     .{ .name = "issue 8944: wrapper function for List.get with match", .source_kind = .module, .source = list_get_wrapper, .expected = .{ .inspect_str = "Ok(\"c\")" } },
-    .{ .name = "issue 8979: while (True) {} should crash instead of hanging", .source = crash_now, .expected = .{ .crash = {} } },
-    .{ .name = "issue 8979: while (True) with body but no exit should crash", .source = crash_now, .expected = .{ .crash = {} } },
-    .{ .name = "issue 8979: while with expression evaluating to True and no exit should crash", .source = crash_now, .expected = .{ .crash = {} } },
     .{ .name = "issue 8979: while (True) with break should not crash", .source_kind = .module, .source = while_true_break, .expected = .{ .inspect_str = "True" } },
     .{ .name = "issue 8979: while (True) with conditional break should not crash", .source_kind = .module, .source = while_conditional_break, .expected = .{ .inspect_str = "5.0" } },
     .{ .name = "issue 8979: while with mutable condition should not crash", .source_kind = .module, .source = while_mutable_condition, .expected = .{ .inspect_str = "42.0" } },
     .{ .name = "issue 8979: while with comparison involving mutable var should not crash", .source_kind = .module, .source = while_mutable_comparison, .expected = .{ .inspect_str = "5.0" } },
     .{ .name = "issue 8979: while (False) should not crash", .source_kind = .module, .source = while_false, .expected = .{ .inspect_str = "42.0" } },
-    .{ .name = "issue 8979: nested while - inner break does not save outer loop", .source = crash_now, .expected = .{ .crash = {} } },
     .{ .name = "tag union matching with payload inside function - single module", .source_kind = .module, .source = tag_payload_single, .expected = .{ .inspect_str = "42" } },
     .{ .name = "comptime exhaustiveness - match succeeds empirically", .source_kind = .module, .source = comptime_exhaustive_match_ok, .expected = .{ .inspect_str = "\"blah\"" } },
     .{ .name = "comptime exhaustiveness - Email.parse destructure succeeds empirically", .source_kind = .module, .source = comptime_exhaustive_destructure_email, .expected = .{ .inspect_str = "\"alice@example.com\"" } },

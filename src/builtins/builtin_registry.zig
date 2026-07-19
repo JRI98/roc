@@ -127,6 +127,8 @@ pub const BuiltinFn = enum {
     int_try_unsigned,
     dec_to_int_try_unsafe,
     f64_to_int_try_unsafe,
+    f32_to_int_wrap,
+    f64_to_int_wrap,
     dec_to_f32_try_unsafe,
     f64_to_f32_try_unsafe,
     i128_to_dec_try_unsafe,

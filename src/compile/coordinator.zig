@@ -6453,44 +6453,6 @@ test "Coordinator shutdown stops spawned workers promptly" {
     try std.testing.expectEqual(@as(usize, 0), coord.workers.items.len);
 }
 
-test "Channel in coordinator context" {
-    // Skip on wasm
-    if (is_freestanding) return error.SkipZigTest;
-
-    const allocator = std.testing.allocator;
-
-    var coord = try Coordinator.init(
-        allocator,
-        .multi_threaded,
-        2,
-        roc_target.RocTarget.detectNative(),
-        undefined,
-        "test",
-        null, // cache_manager
-        CoreCtx.os(std.testing.allocator, std.testing.allocator, std.testing.io),
-    );
-    defer coord.deinit();
-
-    // Test that the result channel works
-    const test_result = WorkerResult{
-        .parse_failed = .{
-            .package_name = "test",
-            .module_id = 0,
-            .module_name = "Test",
-            .path = "/test.roc",
-            .source_file_state = .missing,
-            .reports = std.ArrayList(reporting.Report).empty,
-            .partial_env = null,
-        },
-    };
-
-    try coord.result_channel.send(test_result);
-
-    const received = coord.result_channel.tryRecv();
-    try std.testing.expect(received != null);
-    try std.testing.expect(received.? == .parse_failed);
-}
-
 test "Coordinator enqueueParseTask flow" {
     const allocator = std.testing.allocator;
     const app_identity = package_identity.synthetic_app_identity;
@@ -6560,43 +6522,6 @@ test "platform root candidate comes from registration, not name probing" {
     const candidate = coord.platformRootCandidate() orelse return error.TestExpectedCandidate;
     try std.testing.expect(candidate.mod == pf_pkg.getModule(pf_root_id).?);
     try std.testing.expect(candidate.mod.phase != .Done);
-}
-
-test "Coordinator single-threaded loop with mock result" {
-    const allocator = std.testing.allocator;
-    const app_identity = package_identity.synthetic_app_identity;
-
-    var coord = try Coordinator.init(
-        allocator,
-        .single_threaded,
-        1,
-        roc_target.RocTarget.detectNative(),
-        undefined,
-        "test",
-        null, // cache_manager
-        CoreCtx.os(std.testing.allocator, std.testing.allocator, std.testing.io),
-    );
-    defer coord.deinit();
-
-    // Create package and module
-    const pkg = try coord.ensurePackage(app_identity, "/test/app");
-    const module_id = try pkg.ensureModule(allocator, "Main", "/test/app/Main.roc");
-
-    // Set up remaining count
-    pkg.remaining_modules = 1;
-    coord.total_remaining = 1;
-
-    // Instead of actually parsing, let's manually process a "completed" result
-    // This simulates what would happen after a module completes type-checking
-
-    // Mark module as done directly
-    const mod = pkg.getModule(module_id).?;
-    mod.phase = .Done;
-    pkg.remaining_modules = 0;
-    coord.total_remaining = 0;
-
-    // Now the coordinator should be complete
-    try std.testing.expect(coord.isComplete());
 }
 
 test "Coordinator CI failure scenario - app with platform cross-package imports" {

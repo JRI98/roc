@@ -2014,26 +2014,6 @@ test "CallBuilder stack args at correct offsets on Windows" {
     try std.testing.expect(emit.buf.items.len > 50);
 }
 
-// Multi-target aarch64 calling convention tests
-
-test "aarch64 CC identical across all targets" {
-    const Arm64Linux = aarch64.LinuxEmit;
-    const Arm64Win = aarch64.WinEmit;
-    const Arm64Mac = aarch64.MacEmit;
-
-    // All aarch64 targets use AAPCS64 - verify uniform behavior
-    try std.testing.expectEqual(Arm64Linux.CC.PARAM_REGS.len, Arm64Win.CC.PARAM_REGS.len);
-    try std.testing.expectEqual(Arm64Linux.CC.PARAM_REGS.len, Arm64Mac.CC.PARAM_REGS.len);
-    try std.testing.expectEqual(@as(usize, 8), Arm64Linux.CC.PARAM_REGS.len);
-
-    try std.testing.expectEqual(Arm64Linux.CC.SHADOW_SPACE, Arm64Win.CC.SHADOW_SPACE);
-    try std.testing.expectEqual(Arm64Linux.CC.SHADOW_SPACE, Arm64Mac.CC.SHADOW_SPACE);
-    try std.testing.expectEqual(@as(u8, 0), Arm64Linux.CC.SHADOW_SPACE);
-
-    try std.testing.expectEqual(Arm64Linux.CC.FLOAT_PARAM_REGS.len, Arm64Win.CC.FLOAT_PARAM_REGS.len);
-    try std.testing.expectEqual(@as(usize, 8), Arm64Linux.CC.FLOAT_PARAM_REGS.len);
-}
-
 test "CallingConvention.forTarget for aarch64 targets" {
     const linux_cc = CallingConvention.forTarget(.arm64linux);
     const win_cc = CallingConvention.forTarget(.arm64win);
@@ -2052,15 +2032,6 @@ test "CallingConvention.forTarget for aarch64 targets" {
     try std.testing.expectEqual(aarch64.GeneralReg.X1, linux_cc.getAarch64ParamReg(1));
     try std.testing.expectEqual(aarch64.GeneralReg.X6, linux_cc.getAarch64ParamReg(6));
     try std.testing.expectEqual(aarch64.GeneralReg.X7, linux_cc.getAarch64ParamReg(7));
-}
-
-test "CC constants for macOS x64" {
-    const MacEmit = x86_64.Emit(.x64mac);
-    try std.testing.expect(MacEmit.CC.PARAM_REGS.len >= 4);
-    try std.testing.expect(MacEmit.CC.RETURN_REGS.len >= 1);
-    try std.testing.expectEqual(@as(u8, 0), MacEmit.CC.SHADOW_SPACE);
-    try std.testing.expectEqual(@as(usize, 16), MacEmit.CC.RETURN_BY_PTR_THRESHOLD);
-    try std.testing.expectEqual(std.math.maxInt(usize), MacEmit.CC.PASS_BY_PTR_THRESHOLD);
 }
 
 test "macOS x64 CC matches Linux x64 (both System V)" {

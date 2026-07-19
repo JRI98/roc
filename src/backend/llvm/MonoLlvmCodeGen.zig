@@ -3344,13 +3344,19 @@ pub const MonoLlvmCodeGen = struct {
         const shift_bits = builder.intValue(.i8, self.intBits(target_layout)) catch return error.OutOfMemory;
         const rhs_u8 = try self.coerceScalar(rhs, .i8, false);
         const too_large = wip.icmp(.uge, rhs_u8, shift_bits, "") catch return error.OutOfMemory;
-        const zero_amount = builder.zeroInitValue(result_ty) catch return error.OutOfMemory;
         const amount = try self.coerceScalar(rhs_u8, result_ty, false);
+        if (op == .num_shift_right_by and target_layout.isSigned()) {
+            // Arithmetic right shift keeps filling with sign bits, so any
+            // amount >= the bit width behaves like shifting by bits - 1.
+            const max_amount = builder.intValue(result_ty, self.intBits(target_layout) - 1) catch return error.OutOfMemory;
+            const safe_amount = wip.select(.normal, too_large, max_amount, amount, "") catch return error.OutOfMemory;
+            return wip.bin(.ashr, lhs, safe_amount, "") catch return error.OutOfMemory;
+        }
+        const zero_amount = builder.zeroInitValue(result_ty) catch return error.OutOfMemory;
         const safe_amount = wip.select(.normal, too_large, zero_amount, amount, "") catch return error.OutOfMemory;
         const tag: LlvmBuilder.Function.Instruction.Tag = switch (op) {
             .num_shift_left_by => .shl,
-            .num_shift_right_by => if (target_layout.isSigned()) .ashr else .lshr,
-            .num_shift_right_zf_by => .lshr,
+            .num_shift_right_by, .num_shift_right_zf_by => .lshr,
             else => unreachable,
         };
         const shifted = wip.bin(tag, lhs, safe_amount, "") catch return error.OutOfMemory;
@@ -3595,6 +3601,10 @@ pub const MonoLlvmCodeGen = struct {
                 try self.emitFloatDecIntTryUnsafeConversion(target, GuardedList.at(args, 0), info);
                 return;
             }
+            if (floatToIntTruncInfo(op)) |info| {
+                try self.emitFloatToIntTruncConversion(target, GuardedList.at(args, 0), info);
+                return;
+            }
         }
         if (std.mem.find(u8, name, "_to_") != null and args.len >= 1 and
             std.mem.find(u8, name, "_try") == null and
@@ -3653,6 +3663,61 @@ pub const MonoLlvmCodeGen = struct {
             .dec_to_u128_try_unsafe => .{ .src_kind = .dec, .target_bits = 128, .target_signed = false },
             else => null,
         };
+    }
+
+    const FloatToIntTruncInfo = struct {
+        src_is_f32: bool,
+        target_bits: u8,
+        target_signed: bool,
+    };
+
+    fn floatToIntTruncInfo(op: lir.LowLevel) ?FloatToIntTruncInfo {
+        return switch (op) {
+            .f32_to_i8_trunc => .{ .src_is_f32 = true, .target_bits = 8, .target_signed = true },
+            .f32_to_i16_trunc => .{ .src_is_f32 = true, .target_bits = 16, .target_signed = true },
+            .f32_to_i32_trunc => .{ .src_is_f32 = true, .target_bits = 32, .target_signed = true },
+            .f32_to_i64_trunc => .{ .src_is_f32 = true, .target_bits = 64, .target_signed = true },
+            .f32_to_i128_trunc => .{ .src_is_f32 = true, .target_bits = 128, .target_signed = true },
+            .f32_to_u8_trunc => .{ .src_is_f32 = true, .target_bits = 8, .target_signed = false },
+            .f32_to_u16_trunc => .{ .src_is_f32 = true, .target_bits = 16, .target_signed = false },
+            .f32_to_u32_trunc => .{ .src_is_f32 = true, .target_bits = 32, .target_signed = false },
+            .f32_to_u64_trunc => .{ .src_is_f32 = true, .target_bits = 64, .target_signed = false },
+            .f32_to_u128_trunc => .{ .src_is_f32 = true, .target_bits = 128, .target_signed = false },
+            .f64_to_i8_trunc => .{ .src_is_f32 = false, .target_bits = 8, .target_signed = true },
+            .f64_to_i16_trunc => .{ .src_is_f32 = false, .target_bits = 16, .target_signed = true },
+            .f64_to_i32_trunc => .{ .src_is_f32 = false, .target_bits = 32, .target_signed = true },
+            .f64_to_i64_trunc => .{ .src_is_f32 = false, .target_bits = 64, .target_signed = true },
+            .f64_to_i128_trunc => .{ .src_is_f32 = false, .target_bits = 128, .target_signed = true },
+            .f64_to_u8_trunc => .{ .src_is_f32 = false, .target_bits = 8, .target_signed = false },
+            .f64_to_u16_trunc => .{ .src_is_f32 = false, .target_bits = 16, .target_signed = false },
+            .f64_to_u32_trunc => .{ .src_is_f32 = false, .target_bits = 32, .target_signed = false },
+            .f64_to_u64_trunc => .{ .src_is_f32 = false, .target_bits = 64, .target_signed = false },
+            .f64_to_u128_trunc => .{ .src_is_f32 = false, .target_bits = 128, .target_signed = false },
+            else => null,
+        };
+    }
+
+    /// Wrapping float→int conversion: the builtin wrapper implements Roc's
+    /// wrap semantics (NaN and the infinities produce 0, widths of at most
+    /// 64 bits wrap modulo 2^bits, and 128-bit targets produce 0 when the
+    /// truncated value is out of range), writing the result bytes directly
+    /// into the target slot.
+    fn emitFloatToIntTruncConversion(self: *MonoLlvmCodeGen, target: LocalId, arg: LocalId, info: FloatToIntTruncInfo) Error!void {
+        const builder = self.builder orelse return error.CompilationFailed;
+        const value = try self.loadScalar(self.slot(arg).ptr, self.localLayout(arg));
+        const name = if (info.src_is_f32) builtinSymbol(.f32_to_int_wrap) else builtinSymbol(.f64_to_int_wrap);
+        const float_ty: LlvmBuilder.Type = if (info.src_is_f32) .float else .double;
+        try self.callBuiltinVoid(
+            name,
+            &.{ try self.ptrType(), float_ty, .i32, .i32, .i32 },
+            &.{
+                self.slot(target).ptr,
+                value,
+                builder.intValue(.i32, info.target_bits) catch return error.OutOfMemory,
+                builder.intValue(.i32, @intFromBool(info.target_signed)) catch return error.OutOfMemory,
+                builder.intValue(.i32, @as(u32, info.target_bits) / 8) catch return error.OutOfMemory,
+            },
+        );
     }
 
     fn tryUnsafeOffsets(self: *MonoLlvmCodeGen, ret_layout: layout.Idx) Error!TryUnsafeOffsets {

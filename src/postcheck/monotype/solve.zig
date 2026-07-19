@@ -2451,10 +2451,6 @@ fn testCheckedTypeId(comptime value: u32) checked.CheckedTypeId {
     return @enumFromInt(value);
 }
 
-test "monotype solve declarations are referenced" {
-    std.testing.refAllDecls(@This());
-}
-
 test "completed monotype program view does not expose instantiation graph nodes" {
     @setEvalBranchQuota(10_000);
     comptime assertNoNodeId(Ast.ProgramView, "Ast.ProgramView");

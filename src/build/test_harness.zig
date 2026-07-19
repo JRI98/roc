@@ -252,8 +252,12 @@ pub fn milliTimestamp() i64 {
     return @as(i64, ts.sec) * 1000 + @divTrunc(@as(i64, ts.nsec), 1_000_000);
 }
 
-/// pipe: returns [2]fd_t or error.
-pub fn pipe() error{PipeFailed}![2]posix.fd_t {
+/// pipe: returns [2]fd_t or error. Only defined where fork-based pools
+/// exist: mingw declares but does not implement pipe, so it must never be
+/// referenced on Windows (refAllDecls included).
+pub const pipe = if (has_fork) pipePosix else {};
+
+fn pipePosix() error{PipeFailed}![2]posix.fd_t {
     var fds: [2]posix.fd_t = undefined;
     const rc = std.c.pipe(&fds);
     if (rc != 0) return error.PipeFailed;
@@ -266,14 +270,21 @@ pub fn closeFd(fd: posix.fd_t) void {
 }
 
 /// Mark a file descriptor as close-on-exec so subprocesses do not inherit it.
-pub fn setCloseOnExec(fd: posix.fd_t) void {
+/// Only defined where fork-based pools exist: fcntl's F constants are absent
+/// on Windows, so the body must never be analyzed there (refAllDecls included).
+pub const setCloseOnExec = if (has_fork) setCloseOnExecPosix else {};
+
+fn setCloseOnExecPosix(fd: posix.fd_t) void {
     const flags = std.c.fcntl(fd, std.c.F.GETFD);
     if (flags == -1) return;
     _ = std.c.fcntl(fd, std.c.F.SETFD, flags | std.c.FD_CLOEXEC);
 }
 
-/// fork: wrapper around std.c.fork that returns pid_t or error.
-pub fn fork() error{ForkFailed}!posix.pid_t {
+/// fork: wrapper around std.c.fork that returns pid_t or error. Only defined
+/// where fork exists; see setCloseOnExec.
+pub const fork = if (has_fork) forkPosix else {};
+
+fn forkPosix() error{ForkFailed}!posix.pid_t {
     const pid = std.c.fork();
     if (pid < 0) return error.ForkFailed;
     return pid;
@@ -281,8 +292,12 @@ pub fn fork() error{ForkFailed}!posix.pid_t {
 
 /// Holds the process id and exit status from waitpid.
 pub const WaitResult = struct { pid: posix.pid_t, status: u32 };
-/// Waits for a child process and returns its pid and raw status.
-pub fn waitpid(pid: posix.pid_t, flags: c_int) WaitResult {
+
+/// Waits for a child process and returns its pid and raw status. Only defined
+/// where fork-based pools exist; see pipe.
+pub const waitpid = if (has_fork) waitpidPosix else {};
+
+fn waitpidPosix(pid: posix.pid_t, flags: c_int) WaitResult {
     var status: c_int = 0;
     const result = std.c.waitpid(pid, &status, flags);
     return .{ .pid = result, .status = @bitCast(status) };

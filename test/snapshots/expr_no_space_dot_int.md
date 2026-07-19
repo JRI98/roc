@@ -1,6 +1,6 @@
 # META
 ~~~ini
-description=
+description=dot-int tuple index access on a plain identifier
 type=snippet
 ~~~
 # SOURCE

@@ -4755,6 +4755,14 @@ const ArcTest = struct {
         } });
     }
 
+    fn assignDiscriminant(self: *ArcTest, target: LIR.LocalId, source: LIR.LocalId, next: LIR.CFStmtId) Allocator.Error!LIR.CFStmtId {
+        return try self.store.addCFStmt(.{ .assign_ref = .{
+            .target = target,
+            .op = .{ .discriminant = .{ .source = source } },
+            .next = next,
+        } });
+    }
+
     fn assignTagPayload(self: *ArcTest, target: LIR.LocalId, source: LIR.LocalId, next: LIR.CFStmtId) Allocator.Error!LIR.CFStmtId {
         return try self.store.addCFStmt(.{ .assign_ref = .{
             .target = target,
@@ -4863,6 +4871,40 @@ const ArcTest = struct {
 
     fn run(self: *ArcTest) Allocator.Error!void {
         try insert(&self.store, &self.layouts, .{});
+    }
+
+    /// Follows linear `next` links from `start` and returns the first
+    /// switch_stmt payload encountered.
+    fn walkToSwitch(self: *const ArcTest, start: LIR.CFStmtId) @FieldType(LIR.CFStmt, "switch_stmt") {
+        var cursor = start;
+        var remaining: usize = self.store.cfStmtCount() + 1;
+        while (remaining > 0) : (remaining -= 1) {
+            switch (self.store.getCFStmt(cursor)) {
+                .switch_stmt => |s| return s,
+                .incref => |rc| cursor = rc.next,
+                .decref => |rc| cursor = rc.next,
+                .decref_if_initialized => |rc| cursor = rc.next,
+                .free => |rc| cursor = rc.next,
+                .assign_ref => |assign| cursor = assign.next,
+                .assign_literal => |assign| cursor = assign.next,
+                .init_uninitialized => |uninit| cursor = uninit.next,
+                .assign_call => |assign| cursor = assign.next,
+                .assign_call_erased => |assign| cursor = assign.next,
+                .assign_packed_erased_fn => |assign| cursor = assign.next,
+                .assign_low_level => |assign| cursor = assign.next,
+                .assign_list => |assign| cursor = assign.next,
+                .assign_struct => |assign| cursor = assign.next,
+                .assign_tag => |assign| cursor = assign.next,
+                .store_struct => |assign| cursor = assign.next,
+                .store_tag => |assign| cursor = assign.next,
+                .set_local => |assign| cursor = assign.next,
+                .debug => |debug_stmt| cursor = debug_stmt.next,
+                .expect => |expect_stmt| cursor = expect_stmt.next,
+                .comptime_branch_taken => |marker| cursor = marker.next,
+                else => arcInvariant("ARC test fixture expected a switch_stmt on the linear path"),
+            }
+        }
+        arcInvariant("ARC test fixture cycled while walking to a switch_stmt");
     }
 
     fn procBody(self: *const ArcTest) LIR.CFStmtId {
@@ -5352,18 +5394,6 @@ test "RC proc body: returning refcounted param does not tail-decref it" {
     try f.expectRc(param, 0, 0, 0);
 }
 
-test "RC proc body: returning list param does not tail-decref it" {
-    var f = try ArcTest.init(testing.allocator);
-    defer f.deinit();
-    const param = try f.local(f.list_str);
-    const ret = try f.ret(param);
-    _ = try f.addProc(&.{param}, ret, f.list_str);
-    try f.run();
-    // The parameter solves borrowed and the return borrows it: no RC
-    // statements at all.
-    try f.expectRc(param, 0, 0, 0);
-}
-
 test "RC shared neutral proc body is rewritten separately for each proc" {
     var f = try ArcTest.init(testing.allocator);
     defer f.deinit();
@@ -5444,18 +5474,6 @@ test "RC shadowed list decl only cleans latest generation at block tail" {
     try scenario.fixture.expectRc(scenario.new_value, 0, 0, 0);
 }
 
-test "RC mutation: reassigning refcounted var emits decref before mutation" {
-    var scenario = try setupMutation(false);
-    defer scenario.fixture.deinit();
-    try scenario.fixture.expectRc(scenario.old_value, 0, 2, 0);
-}
-
-test "RC mutation: final use of reassignable refcounted var emits tail decref" {
-    var scenario = try setupMutation(true);
-    defer scenario.fixture.deinit();
-    try testing.expect(scenario.fixture.countRc(scenario.target, .decref) >= 1);
-}
-
 test "RC match guard: symbol used only in guard gets proper RC ops" {
     var f = try ArcTest.init(testing.allocator);
     defer f.deinit();
@@ -5484,10 +5502,36 @@ test "RC match guard+body: symbol used in both guard and body gets proper RC ops
     try f.expectRc(value, 1, 0, 0);
 }
 
-test "RC if_then_else: symbol used in both branches — no extra incref" {
-    var scenario = try setupSwitchUse(true, true, false, false);
-    defer scenario.fixture.deinit();
-    try scenario.fixture.expectRc(scenario.value, 0, 0, 0);
+test "RC if_then_else: then-only value is decref'd inside the else branch" {
+    var f = try ArcTest.init(testing.allocator);
+    defer f.deinit();
+    const cond = try f.local(.bool);
+    const value = try f.local(.str);
+    const then_result = try f.local(.i64);
+    const else_result = try f.local(.i64);
+    const result = try f.local(.i64);
+
+    // if cond { result = call(value) } else { result = 0 }; return result
+    const ret = try f.ret(result);
+    const then_set = try f.setLocal(result, then_result, .initialize_join_result, ret);
+    const then_body = try f.assignCall(then_result, &.{value}, then_set);
+    const else_set = try f.setLocal(result, else_result, .initialize_join_result, ret);
+    const else_body = try f.assignI64(else_result, 0, else_set);
+    const if_stmt = try f.switchStmt(cond, then_body, else_body, ret);
+    const body = try f.assignStr(value, "then-only", if_stmt);
+    _ = try f.addProc(&.{cond}, body, .i64);
+    try f.run();
+
+    // The then branch consumes the value's unit in the call, so the binding
+    // needs no incref; the else branch owns the single release.
+    try f.expectRc(value, 0, 1, 0);
+    const if_after = f.walkToSwitch(f.procBody());
+    try f.expectReachableRcBefore(if_after.default_branch, .decref, value, .ret);
+    const then_after = GuardedList.at(f.store.getCFSwitchBranches(if_after.branches), 0).body;
+    try testing.expectError(
+        error.ExpectedRcBeforeStop,
+        f.expectReachableRcBefore(then_after, .decref, value, .ret),
+    );
 }
 
 test "RC if_then_else: condition preserves live list owner for branch body" {
@@ -5605,10 +5649,41 @@ test "RC tag-pattern match tail-cleans outer scrutinee binding with refcounted p
     try f.expectRc(tag_value, 0, 1, 0);
 }
 
-test "RC discriminant_switch: symbol used in switch branches gets per-branch RC" {
-    var scenario = try setupSwitchUse(true, false, false, false);
-    defer scenario.fixture.deinit();
-    try scenario.fixture.expectRc(scenario.value, 0, 1, 0);
+test "RC discriminant_switch: scrutinee is released on both payload and no-payload paths" {
+    var f = try ArcTest.init(testing.allocator);
+    defer f.deinit();
+    const payload = try f.local(.str);
+    const tag_value = try f.local(f.tag_str);
+    const disc = try f.local(.u8);
+    const extracted = try f.local(.str);
+    const branch_result = try f.local(.i64);
+    const result = try f.local(.i64);
+
+    // match tag_value { Tag1(extracted) => call(extracted), _ => 0 }
+    const ret = try f.ret(result);
+    const branch_set = try f.setLocal(result, branch_result, .initialize_join_result, ret);
+    const branch_call = try f.assignCall(branch_result, &.{extracted}, branch_set);
+    const branch_body = try f.assignTagPayload(extracted, tag_value, branch_call);
+    const default_body = try f.assignI64(result, 0, ret);
+    const switch_stmt = try f.switchStmt(disc, branch_body, default_body, ret);
+    const disc_read = try f.assignDiscriminant(disc, tag_value, switch_stmt);
+    const tag_assign = try f.assignTag(tag_value, 1, payload, disc_read);
+    const body = try f.assignStr(payload, "payload", tag_assign);
+    _ = try f.addProc(&.{}, body, .i64);
+    try f.run();
+
+    // The payload's unit moves into the tag. Each switch path owns one
+    // release of the scrutinee: the payload branch after extraction, the
+    // no-payload path immediately.
+    try f.expectRc(payload, 0, 0, 0);
+    try testing.expectEqual(@as(usize, 0), f.countRc(tag_value, .incref));
+    try testing.expectEqual(@as(usize, 2), f.countRc(tag_value, .decref));
+    const switch_after = f.walkToSwitch(f.procBody());
+    const branch_after = GuardedList.at(f.store.getCFSwitchBranches(switch_after.branches), 0).body;
+    try f.expectReachableRcBefore(branch_after, .decref, tag_value, .ret);
+    try f.expectReachableRcBefore(switch_after.default_branch, .decref, tag_value, .ret);
+    // Extraction retains the payload view it hands out.
+    try testing.expect(f.countRc(extracted, .incref) >= 1);
 }
 
 test "RC discriminant_switch: body-bound symbols don't get per-branch RC ops" {
@@ -5659,10 +5734,39 @@ test "RC early_return emits correct number of decrefs for multi-use symbol" {
     try f.expectRc(value, 2, 0, 0);
 }
 
-test "RC early_return inside branch accounts for branch-level increfs" {
-    var scenario = try setupSwitchUse(true, false, true, false);
-    defer scenario.fixture.deinit();
-    try scenario.fixture.expectRc(scenario.value, 1, 1, 0);
+test "RC early_return inside branch retains for branch uses and leaves cleanup to the fallthrough" {
+    var f = try ArcTest.init(testing.allocator);
+    defer f.deinit();
+    const cond = try f.local(.i64);
+    const value = try f.local(.str);
+    const branch_result = try f.local(.i64);
+    const other = try f.local(.str);
+
+    // if cond == 1 { _ = call(value, value); return value }
+    // other = "other"; return other
+    const early_ret = try f.ret(value);
+    const branch_body = try f.assignCall(branch_result, &.{ value, value }, early_ret);
+    const cont_ret = try f.ret(other);
+    const continuation = try f.assignStr(other, "other", cont_ret);
+    const switch_stmt = try f.switchStmt(cond, branch_body, continuation, continuation);
+    const cond_assign = try f.assignI64(cond, 1, switch_stmt);
+    const body = try f.assignStr(value, "early", cond_assign);
+    _ = try f.addProc(&.{}, body, .str);
+    try f.run();
+
+    // The early-returning branch consumes the value three times (two call
+    // args plus the return), paying two retains; its own path never releases.
+    // The fallthrough path never uses the value and owns the single release.
+    try f.expectRc(value, 2, 1, 0);
+    try f.expectRc(other, 0, 0, 0);
+    const switch_after = f.walkToSwitch(f.procBody());
+    const branch_after = GuardedList.at(f.store.getCFSwitchBranches(switch_after.branches), 0).body;
+    try f.expectReachableRcBefore(branch_after, .incref, value, .ret);
+    try testing.expectError(
+        error.ExpectedRcBeforeStop,
+        f.expectReachableRcBefore(branch_after, .decref, value, .ret),
+    );
+    try f.expectReachableRcBefore(switch_after.default_branch, .decref, value, .ret);
 }
 
 test "RC early_return nested in call arguments gets cleanup decrefs" {

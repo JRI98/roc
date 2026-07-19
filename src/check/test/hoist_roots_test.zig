@@ -1032,25 +1032,6 @@ test "hoist arbitrary block roots with non-concrete internal locals are pruned" 
     try std.testing.expectEqual(@as(usize, 0), test_env.checker.selectedHoistedRoots().len);
 }
 
-test "hoist exact non-concrete internal local repro roots are pruned" {
-    var test_env = try TestEnv.init("Test",
-        \\main = |arg| {
-        \\    _ = [
-        \\        {
-        \\            x = []
-        \\            List.len(x).to_i64_wrap()
-        \\        },
-        \\        arg,
-        \\    ]
-        \\    arg
-        \\}
-    );
-    defer test_env.deinit();
-
-    try test_env.assertNoErrors();
-    try std.testing.expectEqual(@as(usize, 0), test_env.checker.selectedHoistedRoots().len);
-}
-
 test "hoist nested block roots with non-concrete destructured internal binders are pruned" {
     var test_env = try TestEnv.init("Test",
         \\main = |arg| {

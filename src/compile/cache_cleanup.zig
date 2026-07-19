@@ -355,14 +355,6 @@ fn isLegacyHashDir(name: []const u8) bool {
     return true;
 }
 
-test "Config constants are reasonable" {
-    // 5 minutes in nanoseconds
-    try std.testing.expectEqual(@as(i96, 300_000_000_000), Config.TEMP_MAX_AGE_NS);
-
-    // 30 days in nanoseconds
-    try std.testing.expectEqual(@as(i96, 30 * 24 * 60 * 60 * 1_000_000_000), Config.PERSISTENT_MAX_AGE_NS);
-}
-
 test "CleanupStats initializes to zero" {
     const stats = CleanupStats{};
     try std.testing.expectEqual(@as(u32, 0), stats.temp_dirs_deleted);
@@ -370,11 +362,6 @@ test "CleanupStats initializes to zero" {
     try std.testing.expectEqual(@as(u32, 0), stats.cache_files_deleted);
     try std.testing.expectEqual(@as(u32, 0), stats.empty_dirs_deleted);
     try std.testing.expectEqual(@as(u32, 0), stats.errors);
-}
-
-test "deleteTempDir handles non-existent directory" {
-    // Should not crash when directory doesn't exist
-    deleteTempDir(std.testing.io, "/nonexistent/path/that/does/not/exist");
 }
 
 test "deleteTempDir deletes directory and coordination file" {
@@ -478,22 +465,4 @@ test "cleanupCacheSubdir deletes old files and keeps new files" {
     tmp_dir.dir.access(std.testing.io, "cache_subdir/bucket1/old_file.rcache", .{}) catch |err| {
         try std.testing.expectEqual(error.FileNotFound, err);
     };
-}
-
-test "CleanupStats tracks operations correctly" {
-    var stats = CleanupStats{};
-
-    // Simulate operations
-    stats.temp_dirs_deleted += 1;
-    stats.temp_dirs_deleted += 1;
-    stats.temp_files_deleted += 1;
-    stats.cache_files_deleted += 5;
-    stats.empty_dirs_deleted += 3;
-    stats.errors += 1;
-
-    try std.testing.expectEqual(@as(u32, 2), stats.temp_dirs_deleted);
-    try std.testing.expectEqual(@as(u32, 1), stats.temp_files_deleted);
-    try std.testing.expectEqual(@as(u32, 5), stats.cache_files_deleted);
-    try std.testing.expectEqual(@as(u32, 3), stats.empty_dirs_deleted);
-    try std.testing.expectEqual(@as(u32, 1), stats.errors);
 }

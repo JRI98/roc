@@ -917,6 +917,7 @@ test "const store writer pointer memoization is scoped to one root" {
         .interface_capabilities = .{},
         .compile_time_roots = .{},
         .top_level_values = .{},
+        .hoisted_constants = .{},
         .const_templates = .{},
         .const_store = const_store.ConstStore.init(testing.allocator),
     };
@@ -972,8 +973,8 @@ test "const store writer pointer memoization is scoped to one root" {
 
     const first_value = artifact.const_store.get(first.const_node);
     const second_value = artifact.const_store.get(second.const_node);
-    try testing.expectEqual(.str, first_value);
-    try testing.expectEqual(.str, second_value);
+    try testing.expect(first_value == .str);
+    try testing.expect(second_value == .str);
     try testing.expectEqualStrings(first_bytes, artifact.const_store.strBytes(first_value.str));
     try testing.expectEqualStrings(second_bytes, artifact.const_store.strBytes(second_value.str));
 }

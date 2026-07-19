@@ -8327,32 +8327,32 @@ fn emptyLiftedProgramForTest(allocator: Allocator) Ast.Program {
         allocator,
         names.NameStore.init(allocator),
         Type.Store.init(allocator),
-        .empty,
-        .empty,
-        .empty,
-        .empty,
-        .empty,
-        .empty,
-        .empty,
-        .empty,
-        .empty,
-        .empty,
-        .empty,
-        .empty,
-        .empty,
-        .empty,
-        .empty,
-        .empty,
-        .empty,
+        .empty, // imported_fns
+        .empty, // exprs
+        .empty, // pats
+        .empty, // stmts
+        .empty, // locals
+        .empty, // expr_ids
+        .empty, // pat_ids
+        .empty, // typed_locals
+        .empty, // stmt_ids
+        .empty, // field_exprs
+        .empty, // fn_def_captures
+        .empty, // record_destructs
+        .empty, // str_pattern_steps
+        .empty, // branches
+        .empty, // if_branches
+        .empty, // string_literals
         Mono.ProcDebugNameMap.init(allocator),
-        .empty,
-        .empty,
-        .empty,
-        .empty,
-        .empty,
-        .empty,
-        .empty,
-        0,
+        .empty, // source_files
+        .empty, // expr_locs
+        .empty, // expr_regions
+        .empty, // stmt_locs
+        .empty, // stmt_regions
+        .empty, // local_names
+        .empty, // static_data_values
+        .empty, // comptime_sites
+        0, // next_symbol
     );
 }
 
@@ -8600,17 +8600,23 @@ test "known match fold aborts on undecidable branches and trips the invariant wh
     const excluded_branches = try program.addBranchSpan(&.{
         .{ .pat = bar_pat, .body = body },
     });
-    const pid = try std.posix.fork();
+    const pid = std.c.fork();
+    try std.testing.expect(pid >= 0);
     if (pid == 0) {
-        const devnull = std.posix.open("/dev/null", .{ .ACCMODE = .WRONLY }, 0) catch std.posix.exit(2);
-        std.posix.dup2(devnull, std.posix.STDERR_FILENO) catch std.posix.exit(2);
-        _ = cloner.simplifyKnownMatchValue(foo_value, excluded_branches) catch std.posix.exit(2);
+        const dev_null = std.c.open("/dev/null", .{ .ACCMODE = .WRONLY });
+        if (dev_null >= 0) {
+            _ = std.c.dup2(dev_null, 2);
+            _ = std.c.close(dev_null);
+        }
+        _ = cloner.simplifyKnownMatchValue(foo_value, excluded_branches) catch std.c._exit(2);
         // Reaching this line means the invariant did not fire.
-        std.posix.exit(0);
+        std.c._exit(0);
     }
-    const result = std.posix.waitpid(pid, 0);
-    const failed = std.posix.W.IFSIGNALED(result.status) or
-        (std.posix.W.IFEXITED(result.status) and std.posix.W.EXITSTATUS(result.status) != 0);
+    var status: c_int = 0;
+    _ = std.c.waitpid(pid, &status, 0);
+    const raw_status: u32 = @bitCast(status);
+    const failed = std.posix.W.IFSIGNALED(raw_status) or
+        (std.posix.W.IFEXITED(raw_status) and std.posix.W.EXITSTATUS(raw_status) != 0);
     try std.testing.expect(failed);
 }
 

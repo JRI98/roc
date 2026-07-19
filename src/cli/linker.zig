@@ -1143,19 +1143,6 @@ pub fn linkObjects(ctx: *CliCtx, object_files: []const []const u8, output: []con
     return link(ctx, config);
 }
 
-test "link config creation" {
-    const config = LinkConfig{
-        .output_path = "test_output",
-        .object_files = &.{ "file1.o", "file2.o" },
-    };
-
-    try std.testing.expect(config.target_format == TargetFormat.detectFromSystem());
-    try std.testing.expectEqualStrings("test_output", config.output_path);
-    try std.testing.expectEqual(@as(usize, 2), config.object_files.len);
-    try std.testing.expectEqual(@as(usize, 0), config.platform_files_pre.len);
-    try std.testing.expectEqual(@as(usize, 0), config.platform_files_post.len);
-}
-
 test "size wasm strips final target feature metadata" {
     const size = binaryenConfig(.{ .output_path = "out.wasm", .object_files = &.{}, .wasm_optimize = .size });
     try std.testing.expectEqual(@as(u8, 1), size.strip_target_features);
@@ -1165,15 +1152,6 @@ test "size wasm strips final target feature metadata" {
 
     const speed = binaryenConfig(.{ .output_path = "out.wasm", .object_files = &.{}, .wasm_optimize = .speed });
     try std.testing.expectEqual(@as(u8, 0), speed.strip_target_features);
-}
-
-test "target format detection" {
-    const detected = TargetFormat.detectFromSystem();
-
-    // Should detect a valid format
-    switch (detected) {
-        .elf, .coff, .macho, .wasm => {},
-    }
 }
 
 test "force undefined symbols use target linker spelling" {

@@ -1167,6 +1167,7 @@ pub fn publishProgramKeepingReportedComptimeProblems(
         .published_roots_only,
         null,
         .report_comptime_problems,
+        null,
     );
 }
 

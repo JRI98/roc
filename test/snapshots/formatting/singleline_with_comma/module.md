@@ -5,16 +5,33 @@ type=snippet
 ~~~
 # SOURCE
 ~~~roc
+module [a, b,]
+
 a = 'a'
 
 b = 'a'
 ~~~
 # EXPECTED
-NIL
+MODULE HEADER DEPRECATED - module.md:1:1:1:15
 # PROBLEMS
-NIL
+
+┌──────────────────────────┐
+│ MODULE HEADER DEPRECATED ├─ The `module` header is deprecated. ─────────────┐
+└┬─────────────────────────┘                                                  │
+ │                                                                            │
+ │  module [a, b,]                                                            │
+ │  ‾‾‾‾‾‾‾‾‾‾‾‾‾‾                                                            │
+ └───────────────────────────────────────────────────────────── module.md:1:1 ┘
+
+    Type modules (headerless files with a top-level type matching the filename)
+    are now the preferred way to define modules.
+
+    Remove the `module` header and ensure your file defines a type that matches
+    the filename.
+
 # TOKENS
 ~~~zig
+KwModule,OpenSquare,LowerIdent,Comma,LowerIdent,Comma,CloseSquare,
 LowerIdent,OpAssign,SingleQuote,
 LowerIdent,OpAssign,SingleQuote,
 EndOfFile,
@@ -22,7 +39,12 @@ EndOfFile,
 # PARSE
 ~~~clojure
 (file
-	(type-module)
+	(module
+		(exposes
+			(exposed-lower-ident
+				(text "a"))
+			(exposed-lower-ident
+				(text "b"))))
 	(statements
 		(s-decl
 			(p-ident (raw "a"))
@@ -33,7 +55,14 @@ EndOfFile,
 ~~~
 # FORMATTED
 ~~~roc
-NO CHANGE
+module [
+	a,
+	b,
+]
+
+a = 'a'
+
+b = 'a'
 ~~~
 # CANONICALIZE
 ~~~clojure

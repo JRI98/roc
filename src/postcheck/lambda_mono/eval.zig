@@ -175,7 +175,8 @@ pub const Evaluator = struct {
             .return_value = .unit,
             .break_value = .unit,
             .continue_values = &.{},
-            .jump_target = @enumFromInt(0),
+            // Written by every jump before the error.Jumped unwind that reads it.
+            .jump_target = undefined,
             .jump_values = &.{},
             .depth = 0,
             .roc_ops = null,

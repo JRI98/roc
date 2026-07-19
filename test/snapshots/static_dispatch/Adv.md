@@ -1,6 +1,6 @@
 # META
 ~~~ini
-description=
+description=Static dispatch through chained and nested method calls
 type=file
 ~~~
 # SOURCE

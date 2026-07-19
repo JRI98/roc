@@ -33,9 +33,27 @@ const AllocationHeader = extern struct {
     len: usize,
 };
 
+/// Set when an inline `expect` fails. A failed inline expect reports and lets
+/// the program continue; the process exit turns an otherwise-successful status
+/// into 1, matching the interpreter's default-app behavior.
+var inline_expect_failed: bool = false;
+
+/// The Roc entrypoint the synthetic default platform exports.
+extern fn roc_default_start_main() callconv(.c) i32;
+
+/// The C runtime owns the process entrypoint: it initializes the Roc runtime,
+/// runs the Roc entrypoint, and folds failed inline expects into the status.
+export fn main() callconv(.c) c_int {
+    roc_default_runtime_init();
+    const status = roc_default_start_main();
+    if (status == 0 and inline_expect_failed) return 1;
+    return status;
+}
+
 export fn roc_default_runtime_init() callconv(.c) void {}
 
 export fn roc_default_exit(code: u8) callconv(.c) noreturn {
+    if (code == 0 and inline_expect_failed) c.exit(1);
     c.exit(code);
 }
 
@@ -47,15 +65,16 @@ export fn roc_default_echo_line(str: RocStr) callconv(.c) void {
 }
 
 export fn roc_dbg(bytes: [*]const u8, len: usize) callconv(.c) void {
+    writeAll(2, "[dbg] ");
     writeAll(2, bytes[0..len]);
     writeAll(2, "\n");
 }
 
-export fn roc_expect_failed(bytes: [*]const u8, len: usize) callconv(.c) noreturn {
-    writeAll(2, "Roc expect failed: ");
+export fn roc_expect_failed(bytes: [*]const u8, len: usize) callconv(.c) void {
+    inline_expect_failed = true;
+    writeAll(2, "Expect failed: ");
     writeAll(2, bytes[0..len]);
     writeAll(2, "\n");
-    c.exit(1);
 }
 
 export fn roc_crashed(bytes: [*]const u8, len: usize) callconv(.c) noreturn {

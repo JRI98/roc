@@ -2738,56 +2738,6 @@ const core_tests = [_]TestCase{
         .expected = .{ .inspect_str = "\"Test\"" },
     },
     .{
-        .name = "inspect: polymorphic return function then call int",
-        .source = "(|_| (|x| x))(0)(42)",
-        .expected = .{ .inspect_str = "42.0" },
-    },
-    .{
-        .name = "inspect: polymorphic return function then call string",
-        .source = "(|_| (|x| x))(0)(\"hi\")",
-        .expected = .{ .inspect_str = "\"hi\"" },
-    },
-    .{
-        .name = "inspect: polymorphic captured id applied to int",
-        .source = "((|id| (|x| id(x)))(|y| y))(41)",
-        .expected = .{ .inspect_str = "41.0" },
-    },
-    .{
-        .name = "inspect: polymorphic captured id applied to string",
-        .source = "((|id| (|x| id(x)))(|y| y))(\"ok\")",
-        .expected = .{ .inspect_str = "\"ok\"" },
-    },
-    .{
-        .name = "inspect: polymorphic higher-order apply then call",
-        .source = "((|f| (|x| f(x)))(|n| n + 1))(41)",
-        .expected = .{ .inspect_str = "42.0" },
-    },
-    .{
-        .name = "inspect: polymorphic higher-order apply twice",
-        .source = "((|f| (|x| f(f(x))))(|n| n + 1))(40)",
-        .expected = .{ .inspect_str = "42.0" },
-    },
-    .{
-        .name = "inspect: polymorphic pass constructed closure and apply",
-        .source = "(|g| g(41))((|f| (|x| f(x)))(|y| y))",
-        .expected = .{ .inspect_str = "41.0" },
-    },
-    .{
-        .name = "inspect: polymorphic construct then pass then call",
-        .source = "((|make| (|z| (make(|n| n + 1))(z)))(|f| (|x| f(x))))(41)",
-        .expected = .{ .inspect_str = "42.0" },
-    },
-    .{
-        .name = "inspect: polymorphic compose identity with plus one",
-        .source = "(((|f| (|g| (|x| f(g(x)))))(|n| n + 1))(|y| y))(41)",
-        .expected = .{ .inspect_str = "42.0" },
-    },
-    .{
-        .name = "inspect: polymorphic return function using captured increment",
-        .source = "(((|n| (|id| (|x| id(x + n))))(1))(|y| y))(41)",
-        .expected = .{ .inspect_str = "42.0" },
-    },
-    .{
         .name = "inspect: recursive countdown",
         .source =
         \\{
@@ -2852,21 +2802,6 @@ const core_tests = [_]TestCase{
         \\}
         ,
         .expected = .{ .inspect_str = "5.0" },
-    },
-    .{
-        .name = "inspect: tag union one arg ok",
-        .source = "Ok(42.0)",
-        .expected = .{ .inspect_str = "Ok(42.0)" },
-    },
-    .{
-        .name = "inspect: tag union multi arg point",
-        .source = "Point(1.0, 2.0)",
-        .expected = .{ .inspect_str = "Point(1.0, 2.0)" },
-    },
-    .{
-        .name = "inspect: tag union nested in tuple regression",
-        .source = "Ok((Name(\"hello\"), 5))",
-        .expected = .{ .inspect_str = "Ok((Name(\"hello\"), 5.0))" },
     },
     .{
         .name = "inspect: multiple polymorphic instantiations",

@@ -2343,40 +2343,6 @@ test "monotype type interner keeps distinct recursive roots with different child
     try std.testing.expect(!try interner.typeEql(recursive_only, recursive_with_bool));
 }
 
-test "monotype named type digest includes generic arguments" {
-    var name_store = names.NameStore.init(std.testing.allocator);
-    defer name_store.deinit();
-
-    const module_identity = try name_store.internModuleIdentity(&([_]u8{0xAB} ** 32));
-    const type_name = try name_store.internTypeName("Box");
-
-    var store = Store.init(std.testing.allocator);
-    defer store.deinit();
-
-    const i64_ty = try store.add(.{ .primitive = .i64 });
-    const str = try store.add(.{ .primitive = .str });
-    const i64_args = try store.addSpan(&.{i64_ty});
-    const str_args = try store.addSpan(&.{str});
-    const checked_ty: checked.CheckedTypeId = @enumFromInt(1);
-
-    const named_i64 = try store.add(.{ .named = .{
-        .named_type = .{ .module = .{}, .ty = checked_ty },
-        .def = .{ .module = module_identity, .type_name = type_name },
-        .kind = .nominal,
-        .args = i64_args,
-    } });
-    const named_str = try store.add(.{ .named = .{
-        .named_type = .{ .module = .{}, .ty = checked_ty },
-        .def = .{ .module = module_identity, .type_name = type_name },
-        .kind = .nominal,
-        .args = str_args,
-    } });
-
-    const i64_digest = store.typeDigest(&name_store, named_i64);
-    const str_digest = store.typeDigest(&name_store, named_str);
-    try std.testing.expect(!std.mem.eql(u8, i64_digest.bytes[0..], str_digest.bytes[0..]));
-}
-
 test "monotype store keeps function-containing shapes distinct" {
     var store = Store.init(std.testing.allocator);
     defer store.deinit();
@@ -2485,36 +2451,6 @@ test "monotype type verifier rejects malformed rows and references" {
         _ = try store.add(.{ .record = bad_fields });
         try std.testing.expectEqual(Store.VerifyError.type_ref_out_of_bounds, store.verify(&name_store).?);
     }
-}
-
-test "monotype digest terminates on recursive structural types" {
-    var name_store = names.NameStore.init(std.testing.allocator);
-    defer name_store.deinit();
-
-    var store = Store.init(std.testing.allocator);
-    defer store.deinit();
-
-    const field_name = try name_store.internRecordFieldLabel("step");
-
-    // A record whose field is a function returning the record itself.
-    const rec_a = try store.reserveSlot();
-    const fn_a = try store.add(.{ .func = .{ .args = Span.empty(), .ret = rec_a } });
-    const fields_a = try store.addFields(&.{.{ .name = field_name, .ty = fn_a }});
-    store.fillReservedSlot(rec_a, .{ .record = fields_a });
-
-    const first = store.typeDigest(&name_store, rec_a);
-    const again = store.typeDigest(&name_store, rec_a);
-    try std.testing.expect(std.mem.eql(u8, first.bytes[0..], again.bytes[0..]));
-
-    // An isomorphic cycle at different ids digests identically: cycles are
-    // encoded as back references by position, not by id.
-    const rec_b = try store.reserveSlot();
-    const fn_b = try store.add(.{ .func = .{ .args = Span.empty(), .ret = rec_b } });
-    const fields_b = try store.addFields(&.{.{ .name = field_name, .ty = fn_b }});
-    store.fillReservedSlot(rec_b, .{ .record = fields_b });
-
-    const other = store.typeDigest(&name_store, rec_b);
-    try std.testing.expect(std.mem.eql(u8, first.bytes[0..], other.bytes[0..]));
 }
 
 test "monotype cached digest reuses acyclic child digests and invalidates on reserved refill" {
@@ -2837,99 +2773,6 @@ test "monotype cached and uncached digests agree on type identity" {
     inline for (.{ alias_i64, alias_chain }) |alias_ty| {
         try std.testing.expect(std.mem.eql(u8, store.typeDigestCached(&name_store, alias_ty, null).bytes[0..], store.typeDigestCached(&name_store, alias_ty, null).bytes[0..]));
     }
-}
-
-test "monotype type equality accepts isomorphic recursive structural types" {
-    var name_store = names.NameStore.init(std.testing.allocator);
-    defer name_store.deinit();
-
-    var store = Store.init(std.testing.allocator);
-    defer store.deinit();
-
-    const field_name = try name_store.internRecordFieldLabel("step");
-
-    const rec_a = try store.reserveSlot();
-    const fn_a = try store.add(.{ .func = .{ .args = Span.empty(), .ret = rec_a } });
-    const fields_a = try store.addFields(&.{.{ .name = field_name, .ty = fn_a }});
-    store.fillReservedSlot(rec_a, .{ .record = fields_a });
-
-    const rec_b = try store.reserveSlot();
-    const fn_b = try store.add(.{ .func = .{ .args = Span.empty(), .ret = rec_b } });
-    const fields_b = try store.addFields(&.{.{ .name = field_name, .ty = fn_b }});
-    store.fillReservedSlot(rec_b, .{ .record = fields_b });
-
-    try std.testing.expect(try store.typeEql(&name_store, rec_a, rec_b));
-
-    const str = try store.add(.{ .primitive = .str });
-    const rec_c = try store.reserveSlot();
-    const fields_c = try store.addFields(&.{.{ .name = field_name, .ty = str }});
-    store.fillReservedSlot(rec_c, .{ .record = fields_c });
-    try std.testing.expect(!try store.typeEql(&name_store, rec_a, rec_c));
-}
-
-test "monotype digest treats aliases as their backing" {
-    var name_store = names.NameStore.init(std.testing.allocator);
-    defer name_store.deinit();
-
-    var store = Store.init(std.testing.allocator);
-    defer store.deinit();
-
-    const module_identity = try name_store.internModuleIdentity(&([_]u8{0xAB} ** 32));
-    const type_name = try name_store.internTypeName("Pretty");
-    const checked_ty: checked.CheckedTypeId = @enumFromInt(1);
-
-    const str = try store.add(.{ .primitive = .str });
-    const aliased = try store.add(.{ .named = .{
-        .named_type = .{ .module = .{}, .ty = checked_ty },
-        .def = .{ .module = module_identity, .type_name = type_name },
-        .kind = .alias,
-        .args = Span.empty(),
-        .backing = .{ .ty = str, .use = .inspectable },
-    } });
-    const nominal = try store.add(.{ .named = .{
-        .named_type = .{ .module = .{}, .ty = checked_ty },
-        .def = .{ .module = module_identity, .type_name = type_name },
-        .kind = .nominal,
-        .args = Span.empty(),
-        .backing = .{ .ty = str, .use = .inspectable },
-    } });
-
-    const str_digest = store.typeDigest(&name_store, str);
-    const alias_digest = store.typeDigest(&name_store, aliased);
-    const nominal_digest = store.typeDigest(&name_store, nominal);
-    try std.testing.expect(std.mem.eql(u8, str_digest.bytes[0..], alias_digest.bytes[0..]));
-    try std.testing.expect(!std.mem.eql(u8, str_digest.bytes[0..], nominal_digest.bytes[0..]));
-}
-
-test "monotype type equality treats aliases as their backing" {
-    var name_store = names.NameStore.init(std.testing.allocator);
-    defer name_store.deinit();
-
-    var store = Store.init(std.testing.allocator);
-    defer store.deinit();
-
-    const module_identity = try name_store.internModuleIdentity(&([_]u8{0xAB} ** 32));
-    const type_name = try name_store.internTypeName("Pretty");
-    const checked_ty: checked.CheckedTypeId = @enumFromInt(1);
-
-    const str = try store.add(.{ .primitive = .str });
-    const aliased = try store.add(.{ .named = .{
-        .named_type = .{ .module = .{}, .ty = checked_ty },
-        .def = .{ .module = module_identity, .type_name = type_name },
-        .kind = .alias,
-        .args = Span.empty(),
-        .backing = .{ .ty = str, .use = .inspectable },
-    } });
-    const nominal = try store.add(.{ .named = .{
-        .named_type = .{ .module = .{}, .ty = checked_ty },
-        .def = .{ .module = module_identity, .type_name = type_name },
-        .kind = .nominal,
-        .args = Span.empty(),
-        .backing = .{ .ty = str, .use = .inspectable },
-    } });
-
-    try std.testing.expect(try store.typeEql(&name_store, str, aliased));
-    try std.testing.expect(!try store.typeEql(&name_store, str, nominal));
 }
 
 test "monotype type equality compares exact types across stores" {

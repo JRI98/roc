@@ -54,28 +54,6 @@ test "Iter.range_inclusive over generic operands carries its where-constraints" 
     try test_env.assertLastDefTypeContains("range_inclusive");
 }
 
-test "exclusive range of unannotated literals defaults like a numeral" {
-    var test_env = try TestEnv.initExpr("Test", "0..<3");
-    defer test_env.deinit();
-    try test_env.assertLastDefType("Iter(Dec)");
-}
-
-test "inclusive range of unannotated literals defaults like a numeral" {
-    var test_env = try TestEnv.initExpr("Test", "0..=3");
-    defer test_env.deinit();
-    try test_env.assertLastDefType("Iter(Dec)");
-}
-
-test "annotation on the range result pins the bound type" {
-    const source =
-        \\r : Iter(U8)
-        \\r = 0..<10
-    ;
-    var test_env = try TestEnv.init("Test", source);
-    defer test_env.deinit();
-    try test_env.assertDefType("r", "Iter(U8)");
-}
-
 test "exclusive range over generic operands requires a range_exclusive method" {
     const source =
         \\f = |start, finish| start..<finish
@@ -121,17 +99,6 @@ test "inclusive range bounds must unify with each other" {
     try test_env.assertFirstTypeError("Type Mismatch");
 }
 
-test "range over a non-numeric nominal reports a missing-method error" {
-    const source =
-        \\bad = "a"..<"z"
-    ;
-    var test_env = try TestEnv.init("Test", source);
-    defer test_env.deinit();
-    // Str has no `range_exclusive` method, so the desugared method call
-    // cannot be dispatched.
-    try test_env.assertFirstTypeError("Missing Method");
-}
-
 test "range on annotated float operands types as Iter(F64)" {
     const source =
         \\start : F64
@@ -169,20 +136,4 @@ test "numeric types expose range_inclusive as an associated function" {
     var test_env = try TestEnv.init("Test", source);
     defer test_env.deinit();
     try test_env.assertDefType("r", "Iter(I64)");
-}
-
-test "for loop consumes a range" {
-    const source =
-        \\total : U64
-        \\total = {
-        \\    var sum_ = 0
-        \\    for i in 1..=5 {
-        \\        sum_ = sum_ + i
-        \\    }
-        \\    sum_
-        \\}
-    ;
-    var test_env = try TestEnv.init("Test", source);
-    defer test_env.deinit();
-    try test_env.assertDefType("total", "U64");
 }

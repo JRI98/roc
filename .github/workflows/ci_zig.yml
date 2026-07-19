@@ -82,9 +82,9 @@ jobs:
         run: |
           zig build run-check-test-wiring
 
-      - name: Check fx platform test coverage
+      - name: Check test asset coverage
         run: |
-          zig build run-check-fx-platform-test-coverage
+          zig build run-check-test-asset-coverage
 
       - name: Check type checker patterns
         run: zig build run-check-type-checker-patterns
@@ -136,7 +136,7 @@ jobs:
         run: |
           set -euo pipefail
 
-          for target in tokenize parse canonicalize typecheck; do
+          for target in tokenize parse canonicalize typecheck build; do
             export ROC_FUZZ_TARGET="$target"
             export ROC_FUZZ_INPUT="/tmp/roc-${target}-fuzz-input"
 
@@ -363,6 +363,15 @@ jobs:
         run: |
           zig build run-test-cli
 
+      - name: Run machine-code shim tests
+        run: zig build run-test-zig-machine-code-shim
+
+      - name: Run host-effects eval tests
+        run: zig build run-test-eval-host-effects
+
+      - name: Run WASM static library tests
+        run: zig build run-test-wasm-static-lib
+
       - name: roc executable minimal check (Unix)
         if: runner.os != 'Windows'
         run: |
@@ -447,6 +456,10 @@ jobs:
 
           echo "=== Files found ==="
           cat kcov-output/parser/parse_unit_coverage/coverage.json | jq -r '.files[].file' | head -10
+
+      - name: Eval Code Coverage
+        if: matrix.os == 'ubuntu-24.04-arm'
+        run: zig build run-coverage-eval
 
   zig-valgrind:
     needs: check-once

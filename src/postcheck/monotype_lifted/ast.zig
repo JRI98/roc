@@ -778,6 +778,18 @@ pub const Program = struct {
         return self.string_literals.unsafeRawItemsForView()[@intFromEnum(id)];
     }
 
+    pub fn addStringLiteral(self: *Program, text: []const u8) std.mem.Allocator.Error!StringLiteralId {
+        const id: StringLiteralId = @enumFromInt(@as(u32, @intCast(self.string_literals.len())));
+        const owned = try self.allocator.dupe(u8, text);
+        errdefer self.allocator.free(owned);
+        try self.string_literals.append(self.allocator, .{
+            .backing = owned,
+            .offset = 0,
+            .len = @intCast(text.len),
+        });
+        return id;
+    }
+
     pub fn importedFnCount(self: *const Program) usize {
         return self.imported_fns.len();
     }

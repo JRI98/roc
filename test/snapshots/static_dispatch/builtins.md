@@ -1,6 +1,6 @@
 # META
 ~~~ini
-description=
+description=Static dispatch to builtin-provided methods
 type=file
 ~~~
 # SOURCE

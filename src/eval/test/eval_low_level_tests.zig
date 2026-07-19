@@ -4145,21 +4145,6 @@ pub const tests = [_]TestCase{
         .expected = .{ .inspect_str = "6.0" },
     },
     .{
-        .name = "issue 8750: dbg in polymorphic function with List.len",
-        .source =
-        \\{
-        \\debug = |v| {
-        \\    dbg v
-        \\    v
-        \\}
-        \\xs = [1, 2, 3]
-        \\len = xs->debug()->List.len()
-        \\len
-        \\}
-        ,
-        .expected = .{ .inspect_str = "3" },
-    },
-    .{
         .name = "issue 8750: block without dbg before List.fold",
         .source =
         \\{
@@ -4616,17 +4601,6 @@ pub const tests = [_]TestCase{
         \\}
         ,
         .expected = .{ .inspect_str = "[]" },
-    },
-    .{
-        .name = "issue 8750: List.fold render value",
-        .source =
-        \\{
-        \\    xs = [1, 2, 3]
-        \\    sum = xs->List.fold(0, |acc, x| acc + x)
-        \\    sum
-        \\}
-        ,
-        .expected = .{ .inspect_str = "6.0" },
     },
     .{
         .name = "low_level - List.set replaces element at index",

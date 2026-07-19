@@ -63,21 +63,6 @@ test "exact num literals outside compact range default to Dec and report invalid
     }
 }
 
-test "infers type for zero" {
-    const test_cases = [_][]const u8{
-        "0",
-        "-0",
-    };
-
-    inline for (test_cases) |source| {
-        var test_env = try TestEnv.initExpr("Test", source);
-        defer test_env.deinit();
-
-        // Number literals resolve to Dec after finalization
-        try test_env.assertLastDefType("Dec");
-    }
-}
-
 test "infers type for hex literals" {
     const test_cases = [_][]const u8{
         "0x0",

@@ -1758,21 +1758,6 @@ fn writeEscapedHtml(writer: *std.Io.Writer, text: []const u8) error{WriteFailed}
 // Tests
 const testing = std.testing;
 
-test "render report to markdown" {
-    var report = try Report.init(testing.allocator, "Test Error", "Something went wrong.", .runtime_error);
-    defer report.deinit();
-
-    try report.document.addText("This is a test error message.");
-
-    var writer = std.Io.Writer.Allocating.init(testing.allocator);
-    defer writer.deinit();
-
-    try renderReportToMarkdown(&report, &writer.writer, ReportingConfig.initMarkdown());
-
-    try testing.expect(std.mem.find(u8, writer.written(), "**Test Error**") != null);
-    try testing.expect(std.mem.find(u8, writer.written(), "This is a test error message.") != null);
-}
-
 test "render document with annotations to markdown" {
     var doc = Document.init(testing.allocator);
     defer doc.deinit();

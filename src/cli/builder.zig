@@ -344,7 +344,7 @@ pub fn initializeLLVM() void {
 }
 
 /// Compile LLVM bitcode file to object file
-pub fn compileBitcodeToObject(gpa: Allocator, std_io: std.Io, config: CompileConfig) Allocator.Error!bool {
+pub fn compileBitcodeToObject(gpa: Allocator, std_io: std.Io, config: CompileConfig) (Allocator.Error || error{LLVMNotAvailable})!bool {
     if (comptime !llvm_available) {
         try renderLLVMNotAvailableError(gpa);
         return error.LLVMNotAvailable;

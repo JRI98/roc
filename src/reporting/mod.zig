@@ -42,4 +42,5 @@ test {
     const std = @import("std");
     std.testing.refAllDecls(@import("test.zig"));
     std.testing.refAllDecls(@import("parity_test.zig"));
+    std.testing.refAllDecls(@import("common_misspellings.zig"));
 }

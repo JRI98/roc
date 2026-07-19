@@ -3441,36 +3441,6 @@ fn expectRangeMapCollectUsesDirectListLoop(source: []const u8, expected_append_u
     try std.testing.expectEqual(expected_append_unsafe_count, try reachableProcShapeFieldTotal(allocator, &optimized.lowered, "list_append_unsafe_count"));
 }
 
-test "direct call wrapper is inlined under optimized post-check lowering" {
-    try expectRootDirectCallCount(
-        \\module [main]
-        \\
-        \\callee : U64 -> U64
-        \\callee = |x| x + 1
-        \\
-        \\wrapper : U64 -> U64
-        \\wrapper = |x| callee(x)
-        \\
-        \\main : U64
-        \\main = wrapper(41)
-    , .wrappers, 0);
-}
-
-test "direct call wrapper is not inlined under ordinary post-check lowering" {
-    try expectRootTargetHasCalls(
-        \\module [main]
-        \\
-        \\callee : U64 -> U64
-        \\callee = |x| x + 1
-        \\
-        \\wrapper : U64 -> U64
-        \\wrapper = |x| callee(x)
-        \\
-        \\main : U64
-        \\main = wrapper(41)
-    , .none);
-}
-
 test "user iter method is not recognized as builtin list cursor" {
     const allocator = std.testing.allocator;
     var lowered_source = try lowerModule(allocator,

@@ -641,25 +641,6 @@ test "shared memory allocator rewinds mapped header to a used-size boundary" {
     try testing.expectError(error.InvalidSharedMemory, rewindMappedHeader(shm.base_ptr, shm.total_size, @sizeOf(Header) - 1));
 }
 
-test "shared memory allocator cross-process" {
-    const testing = std.testing;
-    const io = testing.io;
-
-    // Skip on CI or if not supported
-
-    // Parent: Create and write data
-    {
-        const page_size = try getSystemPageSize();
-        var shm = try SharedMemoryAllocator.create(io, 1024 * 1024, page_size);
-        defer shm.deinit(testing.allocator);
-
-        const data = try shm.allocator().alloc(u32, 10);
-        for (data, 0..) |*item, i| {
-            item.* = @intCast(i * 2);
-        }
-    }
-}
-
 test "fromFd maps pages that can be marked executable" {
     const page_size = try getSystemPageSize();
     var owner = try SharedMemoryAllocator.createExecutable(std.testing.io, page_size * 2, page_size);

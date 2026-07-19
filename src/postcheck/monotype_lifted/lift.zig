@@ -2448,6 +2448,7 @@ test "checkCaptureInvariants accepts a well-formed capture and catches a corrupt
         .empty, // stmt_locs
         .empty, // stmt_regions
         .empty, // local_names
+        .empty, // static_data_values
         .empty, // comptime_sites
         0, // next_symbol
     );

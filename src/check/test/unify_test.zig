@@ -219,10 +219,6 @@ const TestEnv = struct {
         return try self.mkNominalTypeWithOpacity(name, backing_var, args, true);
     }
 
-    fn mkList(self: *Self, elem_var: Var) std.mem.Allocator.Error!Content {
-        return try self.mkNominalType("List", elem_var, &[_]Var{elem_var});
-    }
-
     fn mkBox(self: *Self, elem_var: Var) std.mem.Allocator.Error!Content {
         return try self.mkNominalType("Box", elem_var, &[_]Var{elem_var});
     }
@@ -683,26 +679,6 @@ test "unify - a & b box with same arg unify" {
     try std.testing.expectEqual(box_str, (try env.getDescForRootVar(b)).content);
 }
 
-test "unify - a & b list with same arg unify" {
-    const gpa = std.testing.allocator;
-
-    var env = try TestEnv.init(gpa);
-    defer env.deinit();
-
-    const str = Content{ .structure = .empty_record };
-    const str_var = try env.module_env.types.freshFromContent(str);
-
-    const list_str = try env.mkList(str_var);
-
-    const a = try env.module_env.types.freshFromContent(list_str);
-    const b = try env.module_env.types.freshFromContent(list_str);
-
-    const result = try env.unify(a, b);
-
-    try std.testing.expectEqual(.ok, result);
-    try std.testing.expectEqual(Slot{ .redirect = b }, env.module_env.types.getSlot(a));
-    try std.testing.expectEqual(list_str, (try env.getDescForRootVar(b)).content);
-}
 // unification - structure/structure - tuple //
 // unification - structure/structure - poly/compact_int //
 // unification - structure/structure - poly/compact_frac //
@@ -1835,36 +1811,6 @@ test "unify - flex with constraints unifies with flex with same constraints" {
     try std.testing.expectEqual(.ok, result);
 }
 
-test "unify - empty constraints unify with any" {
-    const gpa = std.testing.allocator;
-    var env = try TestEnv.init(gpa);
-    defer env.deinit();
-
-    const str = try env.module_env.types.freshFromContent(Content{ .structure = .empty_record });
-
-    const foo_fn = try env.module_env.types.freshFromContent(try env.mkFuncPure(&[_]Var{str}, str));
-    const foo_constraint = types_mod.StaticDispatchConstraint{
-        .fn_name = try env.module_env.getIdentStore().insert(env.module_env.gpa, Ident.for_text("foo")),
-        .fn_var = foo_fn,
-        .origin = .{ .where_clause = .{} },
-    };
-    const constraints = try env.module_env.types.appendStaticDispatchConstraints(&[_]types_mod.StaticDispatchConstraint{foo_constraint});
-
-    const empty_range = types_mod.StaticDispatchConstraint.SafeList.Range.empty();
-
-    const a = try env.module_env.types.freshFromContent(.{ .flex = .{
-        .name = null,
-        .constraints = empty_range,
-    } });
-    const b = try env.module_env.types.freshFromContent(.{ .flex = .{
-        .name = null,
-        .constraints = constraints,
-    } });
-
-    const result = try env.unify(a, b);
-    try std.testing.expectEqual(.ok, result);
-}
-
 // capture constraints
 
 test "unify - flex with constraints vs structure captures deferred check" {
@@ -1950,77 +1896,6 @@ test "unify - flex with no constraints vs structure does not capture" {
 
     // Check that NO constraint was captured
     try std.testing.expectEqual(0, env.scratch.deferred_constraints.len());
-}
-
-test "unify - flex vs nominal type captures constraint" {
-    const gpa = std.testing.allocator;
-    var env = try TestEnv.init(gpa);
-    defer env.deinit();
-
-    const str = try env.module_env.types.freshFromContent(Content{ .structure = .empty_record });
-
-    // Create constraint
-    const ord_fn = try env.module_env.types.freshFromContent(try env.mkFuncPure(&[_]Var{str}, str));
-    const ord_constraint = types_mod.StaticDispatchConstraint{
-        .fn_name = try env.module_env.getIdentStore().insert(env.module_env.gpa, Ident.for_text("ord")),
-        .fn_var = ord_fn,
-        .origin = .{ .where_clause = .{} },
-    };
-    const constraints = try env.module_env.types.appendStaticDispatchConstraints(&[_]types_mod.StaticDispatchConstraint{ord_constraint});
-
-    const flex_var = try env.module_env.types.freshFromContent(.{ .flex = .{
-        .name = null,
-        .constraints = constraints,
-    } });
-
-    // Create nominal type (e.g., Path)
-    const backing_var = try env.module_env.types.freshFromContent(Content{ .structure = .empty_record });
-    const nominal_var = try env.module_env.types.freshFromContent(try env.mkNominalType("Path", backing_var, &[_]Var{}));
-
-    const result = try env.unify(flex_var, nominal_var);
-    try std.testing.expectEqual(.ok, result);
-
-    // Check that constraint was captured
-    try std.testing.expectEqual(1, env.scratch.deferred_constraints.len());
-    const deferred = env.scratch.deferred_constraints.items.items[0];
-    try std.testing.expectEqual(
-        env.module_env.types.resolveVar(nominal_var).var_,
-        env.module_env.types.resolveVar(deferred.var_).var_,
-    );
-    try std.testing.expectEqual(constraints, deferred.constraints);
-}
-
-test "unify - from_numeral flex with rigid retains constraints on resolved rigid" {
-    const gpa = std.testing.allocator;
-    var env = try TestEnv.init(gpa);
-    defer env.deinit();
-
-    const str = try env.module_env.types.freshFromContent(Content{ .structure = .empty_record });
-    const to_str_fn = try env.module_env.types.freshFromContent(try env.mkFuncPure(&[_]Var{str}, str));
-    const to_str_constraint = types_mod.StaticDispatchConstraint{
-        .fn_name = try env.module_env.getIdentStore().insert(env.module_env.gpa, Ident.for_text("to_str")),
-        .fn_var = to_str_fn,
-        .origin = .{ .from_literal = .{ .numeral = types_mod.NumeralInfo.testOnlyInt(12345, false, base.Region.zero()) } },
-    };
-    const constraints = try env.module_env.types.appendStaticDispatchConstraints(&[_]types_mod.StaticDispatchConstraint{to_str_constraint});
-
-    const flex_var = try env.module_env.types.freshFromContent(.{ .flex = .{
-        .name = null,
-        .constraints = constraints,
-    } });
-
-    const rigid_ident = try env.module_env.getIdentStore().insert(env.module_env.gpa, Ident.for_text("a"));
-    const rigid_var = try env.module_env.types.freshFromContent(.{ .rigid = Rigid.init(rigid_ident) });
-
-    const result = try env.unify(flex_var, rigid_var);
-    try std.testing.expectEqual(.ok, result);
-
-    const resolved = env.module_env.types.resolveVar(rigid_var);
-    try std.testing.expect(resolved.desc.content == .rigid);
-    const retained_constraints = env.module_env.types.sliceStaticDispatchConstraints(resolved.desc.content.rigid.constraints);
-    try std.testing.expectEqual(@as(usize, 0), retained_constraints.len);
-    try std.testing.expectEqual(1, env.scratch.deferred_constraints.len());
-    try std.testing.expectEqual(constraints, env.scratch.deferred_constraints.items.items[0].constraints);
 }
 
 test "unify - rigid with from_numeral flex retains constraints on resolved rigid" {

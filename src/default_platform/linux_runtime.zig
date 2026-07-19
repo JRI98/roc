@@ -52,21 +52,26 @@ comptime {
     @export(&defaultTrunc, .{ .name = "trunc", .linkage = .weak });
 }
 
+/// Set when an inline `expect` fails. A failed inline expect reports and lets
+/// the program continue; `roc_default_exit` turns an otherwise-successful exit
+/// into status 1, matching the interpreter's default-app behavior.
+var inline_expect_failed: bool = false;
+
 export fn roc_default_runtime_init() callconv(.c) void {
     installSignalHandlers();
 }
 
 export fn roc_dbg(bytes: [*]const u8, len: usize) callconv(.c) void {
+    writeLiteral(stderr_fd, "[dbg] ");
     writeAll(stderr_fd, bytes[0..len]);
     writeLiteral(stderr_fd, "\n");
 }
 
-export fn roc_expect_failed(bytes: [*]const u8, len: usize) callconv(.c) noreturn {
-    writeLiteral(stderr_fd, "Roc expect failed: ");
+export fn roc_expect_failed(bytes: [*]const u8, len: usize) callconv(.c) void {
+    inline_expect_failed = true;
+    writeLiteral(stderr_fd, "Expect failed: ");
     writeAll(stderr_fd, bytes[0..len]);
     writeLiteral(stderr_fd, "\n");
-    printBacktrace(@returnAddress(), @frameAddress());
-    exitFailure();
 }
 
 export fn roc_crashed(bytes: [*]const u8, len: usize) callconv(.c) noreturn {
@@ -85,6 +90,7 @@ export fn roc_default_echo_line(str: RocStr) callconv(.c) void {
 }
 
 export fn roc_default_exit(code: u8) callconv(.c) noreturn {
+    if (code == 0 and inline_expect_failed) linux.exit_group(1);
     linux.exit_group(code);
 }
 

@@ -5,96 +5,39 @@ type=snippet
 ~~~
 # SOURCE
 ~~~roc
+module [
 	a,
 	b
 ]
 
 a = 'a'
+
 b = 'a'
 ~~~
 # EXPECTED
-UNEXPECTED STATEMENT - module.md:1:2:1:3
-UNEXPECTED STATEMENT - module.md:1:3:1:4
-UNEXPECTED STATEMENT - module.md:2:2:2:3
-UNEXPECTED STATEMENT - module.md:3:1:3:2
+MODULE HEADER DEPRECATED - module.md:1:1:4:2
 # PROBLEMS
 
-┌──────────────────────┐
-│ UNEXPECTED STATEMENT ├─ I was parsing a statement, and this token cannot ───┐
-└┬─────────────────────┘  start a statement here.                             │
+┌──────────────────────────┐
+│ MODULE HEADER DEPRECATED ├─ The `module` header is deprecated. ─────────────┐
+└┬─────────────────────────┘                                                  │
  │                                                                            │
- │  a,                                                                        │
- │  ‾                                                                         │
- └───────────────────────────────────────────────────────────── module.md:1:2 ┘
-
-    Statements can be declarations, type annotations, imports, expectations,
-    returns, crashes, loops, or expression statements inside a block.
-
-    For example:
-        answer = 42
-
-    I found `a` here.
-    Names that start with lowercase letters are value names or record field
-    names, depending on the surrounding syntax.
-
-
-┌──────────────────────┐
-│ UNEXPECTED STATEMENT ├─ I was parsing a statement, and this token cannot ───┐
-└┬─────────────────────┘  start a statement here.                             │
- │                                                                            │
- │  a,                                                                        │
- │   ‾                                                                        │
- └───────────────────────────────────────────────────────────── module.md:1:3 ┘
-
-    Statements can be declarations, type annotations, imports, expectations,
-    returns, crashes, loops, or expression statements inside a block.
-
-    For example:
-        answer = 42
-
-    I found `,` here.
-    A comma separates items, but there must be a valid item on both sides of it.
-
-
-┌──────────────────────┐
-│ UNEXPECTED STATEMENT ├─ I was parsing a statement, and this token cannot ───┐
-└┬─────────────────────┘  start a statement here.                             │
- │                                                                            │
- │  b                                                                         │
- │  ‾                                                                         │
- └───────────────────────────────────────────────────────────── module.md:2:2 ┘
-
-    Statements can be declarations, type annotations, imports, expectations,
-    returns, crashes, loops, or expression statements inside a block.
-
-    For example:
-        answer = 42
-
-    I found `b` here.
-    Names that start with lowercase letters are value names or record field
-    names, depending on the surrounding syntax.
-
-
-┌──────────────────────┐
-│ UNEXPECTED STATEMENT ├─ I was parsing a statement, and this token cannot ───┐
-└┬─────────────────────┘  start a statement here.                             │
- │                                                                            │
+ │  module [                                                                  │
+ │      a,                                                                    │
+ │      b                                                                     │
  │  ]                                                                         │
- │  ‾                                                                         │
- └───────────────────────────────────────────────────────────── module.md:3:1 ┘
+ │                                                                            │
+ └───────────────────────────────────────────────────────────── module.md:1:1 ┘
 
-    Statements can be declarations, type annotations, imports, expectations,
-    returns, crashes, loops, or expression statements inside a block.
+    Type modules (headerless files with a top-level type matching the filename)
+    are now the preferred way to define modules.
 
-    For example:
-        answer = 42
-
-    I found `]` here.
-    This closes the current construct, so the parser was looking for the
-    missing item before it.
+    Remove the `module` header and ensure your file defines a type that matches
+    the filename.
 
 # TOKENS
 ~~~zig
+KwModule,OpenSquare,
 LowerIdent,Comma,
 LowerIdent,
 CloseSquare,
@@ -105,12 +48,13 @@ EndOfFile,
 # PARSE
 ~~~clojure
 (file
-	(type-module)
+	(module
+		(exposes
+			(exposed-lower-ident
+				(text "a"))
+			(exposed-lower-ident
+				(text "b"))))
 	(statements
-		(s-malformed (tag "statement_unexpected_token"))
-		(s-malformed (tag "statement_unexpected_token"))
-		(s-malformed (tag "statement_unexpected_token"))
-		(s-malformed (tag "statement_unexpected_token"))
 		(s-decl
 			(p-ident (raw "a"))
 			(e-single-quote (raw "'a'")))
@@ -120,9 +64,7 @@ EndOfFile,
 ~~~
 # FORMATTED
 ~~~roc
-
-
-
+module [a, b]
 
 a = 'a'
 

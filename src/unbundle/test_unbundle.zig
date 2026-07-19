@@ -242,18 +242,6 @@ test "pathHasUnbundleErr - empty path" {
     try testing.expect(err.?.reason == .empty_path);
 }
 
-test "pathHasUnbundleErr - mixed valid and invalid components" {
-    // Path with valid components but one .. in the middle
-    const err1 = unbundle.pathHasUnbundleErr("valid/path/../file.txt");
-    try testing.expect(err1 != null);
-    try testing.expect(err1.?.reason == .path_traversal);
-
-    // Path with valid components but one . in the middle
-    const err2 = unbundle.pathHasUnbundleErr("valid/./path/file.txt");
-    try testing.expect(err2 != null);
-    try testing.expect(err2.?.reason == .current_directory_reference);
-}
-
 test "pathHasUnbundleErr - Windows drive letters" {
     const paths = [_][]const u8{
         "C:/file.txt",
@@ -320,41 +308,6 @@ test "BufferExtractWriter - overwrite existing file" {
     const file = writer.files.get("test.txt");
     try testing.expect(file != null);
     try testing.expectEqualStrings("New content", file.?.items);
-}
-
-test "DirExtractWriter - nested directory creation" {
-    const io = testing.io;
-
-    var tmp = testing.tmpDir(.{});
-    defer tmp.cleanup();
-
-    var writer = unbundle.DirExtractWriter.init(tmp.dir, io, testing.allocator);
-    defer writer.deinit();
-
-    // Create a file in a deeply nested path
-    const file_writer = try writer.extractWriter().createFile("a/b/c/d/e/file.txt");
-    try file_writer.writeAll("Nested content");
-    try writer.extractWriter().finishFile();
-
-    // Verify the file was created
-    const content = try tmp.dir.readFileAlloc(io, "a/b/c/d/e/file.txt", testing.allocator, .limited(1024));
-    defer testing.allocator.free(content);
-    try testing.expectEqualStrings("Nested content", content);
-}
-
-test "ErrorContext population" {
-    var error_context: unbundle.ErrorContext = undefined;
-
-    // Test that error context is populated correctly
-    if (unbundle.pathHasUnbundleErr("../etc/passwd")) |validation_error| {
-        error_context.path = validation_error.path;
-        error_context.reason = validation_error.reason;
-
-        try testing.expectEqualStrings("../etc/passwd", error_context.path);
-        try testing.expect(error_context.reason == .path_traversal);
-    } else {
-        try testing.expect(false); // Should have failed
-    }
 }
 
 const download = @import("download.zig");

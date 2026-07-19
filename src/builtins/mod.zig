@@ -22,6 +22,7 @@ test "builtins tests" {
     std.testing.refAllDecls(@import("builtin_registry.zig"));
     std.testing.refAllDecls(@import("crypto.zig"));
     std.testing.refAllDecls(@import("dec.zig"));
+    std.testing.refAllDecls(@import("dev_wrappers.zig"));
     std.testing.refAllDecls(@import("erased_callable.zig"));
     std.testing.refAllDecls(@import("float_math/tan.zig"));
     std.testing.refAllDecls(@import("hash.zig"));

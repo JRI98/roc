@@ -114,7 +114,9 @@ comptime {
         std.testing.refAllDecls(platform_validation);
         std.testing.refAllDecls(cli_context);
         std.testing.refAllDecls(cli_problem);
-        std.testing.refAllDecls(@import("embedded_lld").stack_probe);
+        std.testing.refAllDecls(@import("builder.zig"));
+        std.testing.refAllDecls(@import("host_symbols.zig"));
+        std.testing.refAllDecls(@import("test/platform_config.zig"));
         std.testing.refAllDecls(@import("ReplLine.zig"));
         std.testing.refAllDecls(@import("ReplSession.zig"));
     }

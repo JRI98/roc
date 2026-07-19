@@ -1,6 +1,6 @@
 # META
 ~~~ini
-description=
+description=Static dispatch methods on a polymorphic container nominal type
 type=file
 ~~~
 # SOURCE

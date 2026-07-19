@@ -144,6 +144,7 @@ test "base tests" {
     std.testing.refAllDecls(@import("SExprTree.zig"));
     std.testing.refAllDecls(@import("SerialStringInterner.zig"));
     std.testing.refAllDecls(@import("SmallStringInterner.zig"));
+    std.testing.refAllDecls(@import("elf_self_relocate.zig"));
     std.testing.refAllDecls(@import("source_utils.zig"));
     std.testing.refAllDecls(@import("stack_overflow.zig"));
     std.testing.refAllDecls(@import("StringLiteral.zig"));

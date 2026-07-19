@@ -1,6 +1,6 @@
 # META
 ~~~ini
-description=Color module from package
+description=Polymorphic container package with annotated and unannotated static dispatch methods
 type=package
 ~~~
 # SOURCE
@@ -720,7 +720,7 @@ main = {
 ~~~clojure
 (can-ir
 	(d-let
-		(p-assign (ident "Container.map"))
+		(p-assign (ident "ContainerPackage.Container.map"))
 		(e-lambda
 			(args
 				(p-assign (ident "container"))
@@ -761,7 +761,7 @@ main = {
 				(ty-apply (name "Container") (local)
 					(ty-rigid-var-lookup (ty-rigid-var (name "b")))))))
 	(d-let
-		(p-assign (ident "Container.get_or"))
+		(p-assign (ident "ContainerPackage.Container.get_or"))
 		(e-lambda
 			(args
 				(p-assign (ident "container"))
@@ -790,7 +790,7 @@ main = {
 									(e-lookup-local
 										(p-assign (ident "default")))))))))))
 	(d-let
-		(p-assign (ident "Container.flat_map"))
+		(p-assign (ident "ContainerPackage.Container.flat_map"))
 		(e-lambda
 			(args
 				(p-assign (ident "container"))

@@ -1,6 +1,6 @@
 # META
 ~~~ini
-description=
+description=if expression without an else branch produces a parse error
 type=snippet
 ~~~
 # SOURCE

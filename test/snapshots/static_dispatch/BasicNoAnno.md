@@ -1,6 +1,6 @@
 # META
 ~~~ini
-description=
+description=Static dispatch on a nominal type without a method annotation
 type=file
 ~~~
 # SOURCE

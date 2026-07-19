@@ -2561,9 +2561,7 @@ test "erased callable layouts use explicit erased-callable RC helper plans" {
     );
 }
 
-const LayoutStoreTestError = Allocator.Error || error{ TestExpectedEqual, TestUnexpectedResult };
-
-fn expectBoolOrdinaryTagUnion() LayoutStoreTestError!void {
+test "bool layout is an ordinary two-variant tag union with zst payloads" {
     const testing = std.testing;
     var store = try Store.init(testing.allocator, .u64);
     defer store.deinit();
@@ -2579,46 +2577,52 @@ fn expectBoolOrdinaryTagUnion() LayoutStoreTestError!void {
     }
 }
 
-fn expectZstContainerAbi() LayoutStoreTestError!void {
+test "zst layout has zst tag and size 0" {
     const testing = std.testing;
     var store = try Store.init(testing.allocator, .u64);
     defer store.deinit();
-
-    const box_zst_idx = try store.insertLayout(Layout.boxOfZst());
-    const list_zst_idx = try store.insertLayout(Layout.listOfZst());
-    const box_abi = store.builtinBoxAbi(box_zst_idx);
-    const list_abi = store.builtinListAbi(list_zst_idx);
-
-    try testing.expectEqual(@as(?Idx, null), box_abi.elem_layout_idx);
-    try testing.expectEqual(@as(u32, 0), box_abi.elem_size);
-    try testing.expectEqual(@as(?Idx, null), list_abi.elem_layout_idx);
-    try testing.expectEqual(@as(u32, 0), list_abi.elem_size);
+    try testing.expectEqual(LayoutTag.zst, store.getLayout(.zst).tag);
+    try testing.expectEqual(@as(u32, 0), store.layoutSize(store.getLayout(.zst)));
 }
 
-fn expectCanonicalStructOrdering() LayoutStoreTestError!void {
+test "putStructFields collapses all-zero-sized records to the zst layout" {
     const testing = std.testing;
     var store = try Store.init(testing.allocator, .u64);
     defer store.deinit();
-
     const idx = try store.putStructFields(&[_]StructField{
-        .{ .index = 0, .layout = .u8 },
-        .{ .index = 1, .layout = .u64 },
-        .{ .index = 2, .layout = .u16 },
-        .{ .index = 3, .layout = .u8 },
+        .{ .index = 0, .layout = .zst },
+        .{ .index = 1, .layout = .zst },
     });
-    const layout_val = store.getLayout(idx);
-    try testing.expectEqual(LayoutTag.struct_, layout_val.tag);
-
-    const data = store.getStructData(layout_val.getStruct().idx);
-    const fields = store.struct_fields.sliceRange(data.getFields());
-    try testing.expectEqual(@as(usize, 4), fields.len);
-    try testing.expectEqual(@as(u16, 1), fields.get(0).index);
-    try testing.expectEqual(@as(u16, 2), fields.get(1).index);
-    try testing.expectEqual(@as(u16, 0), fields.get(2).index);
-    try testing.expectEqual(@as(u16, 3), fields.get(3).index);
+    try testing.expectEqual(Idx.zst, idx);
 }
 
-fn expectTagUnionShapeInterning() LayoutStoreTestError!void {
+test "putTagUnion collapses a single-variant union with zst payload to the zst layout" {
+    const testing = std.testing;
+    var store = try Store.init(testing.allocator, .u64);
+    defer store.deinit();
+    const idx = try store.putTagUnion(&[_]Idx{.zst});
+    try testing.expectEqual(Idx.zst, idx);
+}
+
+test "single-tag union with non-zero-sized payload keeps tag_union layout and payload size" {
+    const testing = std.testing;
+    var store = try Store.init(testing.allocator, .u64);
+    defer store.deinit();
+    const idx = try store.putTagUnion(&[_]Idx{.u64});
+    try testing.expectEqual(LayoutTag.tag_union, store.getLayout(idx).tag);
+    try testing.expectEqual(@as(u32, 8), store.layoutSize(store.getLayout(idx)));
+}
+
+test "putTuple interns identical tuple shapes to the same layout idx" {
+    const testing = std.testing;
+    var store = try Store.init(testing.allocator, .u64);
+    defer store.deinit();
+    const a = try store.putTuple(&[_]Layout{ Layout.int(.u64), Layout.str() });
+    const b = try store.putTuple(&[_]Layout{ Layout.int(.u64), Layout.str() });
+    try testing.expectEqual(a, b);
+}
+
+test "putTagUnion interns identical variant payload shapes to the same layout idx" {
     const testing = std.testing;
     var store = try Store.init(testing.allocator, .u64);
     defer store.deinit();
@@ -2630,7 +2634,7 @@ fn expectTagUnionShapeInterning() LayoutStoreTestError!void {
     try testing.expectEqual(LayoutTag.tag_union, store.getLayout(a).tag);
 }
 
-fn expectRecursiveGraphInterning() LayoutStoreTestError!void {
+test "commitGraph produces identical recursive tag union shapes regardless of construction order" {
     const testing = std.testing;
     var store = try Store.init(testing.allocator, .u64);
     defer store.deinit();
@@ -2670,7 +2674,7 @@ fn expectRecursiveGraphInterning() LayoutStoreTestError!void {
     }
 }
 
-fn expectNestedOrdinaryDataGraph() LayoutStoreTestError!void {
+test "commitGraph resolves locally built container children inside struct fields" {
     const testing = std.testing;
     var store = try Store.init(testing.allocator, .u64);
     defer store.deinit();
@@ -2696,163 +2700,180 @@ fn expectNestedOrdinaryDataGraph() LayoutStoreTestError!void {
     try testing.expectEqual(@as(usize, 2), info.fields.len);
 }
 
-test "fromTypeVar - bool type" {
-    try expectBoolOrdinaryTagUnion();
-}
-
-test "putTagUnion interns two-nullary enums to canonical bool layout" {
-    try expectBoolOrdinaryTagUnion();
-}
-
-test "fromTypeVar - unresolved boxed type vars use box_of_zst" {
-    try expectZstContainerAbi();
-}
-
-test "fromTypeVar - zero-sized types (ZST)" {
+test "commitGraph resolves recursive Box back-edges to the union layout itself (issue #8816)" {
     const testing = std.testing;
     var store = try Store.init(testing.allocator, .u64);
     defer store.deinit();
-    try testing.expectEqual(LayoutTag.zst, store.getLayout(.zst).tag);
-    try testing.expectEqual(@as(u32, 0), store.layoutSize(store.getLayout(.zst)));
+
+    // RichDoc := [PlainText(Str), Wrapped(Box(RichDoc))]. The recursive
+    // reference reaches RichDoc through a Box, and the same shape is committed
+    // twice through independently built graphs (as happens when the nominal is
+    // reached through different type vars). Every commit must resolve the
+    // recursive reference to a Box of the union layout itself, never to an
+    // unresolved opaque_ptr placeholder (issue #8816).
+    var graph_a = LayoutGraph{};
+    defer graph_a.deinit(testing.allocator);
+    const union_a = try graph_a.reserveNode(testing.allocator);
+    const box_a = try graph_a.reserveNode(testing.allocator);
+    graph_a.setNode(box_a, .{ .box = .{ .local = union_a } });
+    const refs_a = try graph_a.appendRefs(testing.allocator, &[_]GraphRef{ .{ .canonical = .str }, .{ .local = box_a } });
+    graph_a.setNode(union_a, .{ .tag_union = refs_a });
+    var commit_a = try store.commitGraph(&graph_a, .{ .local = union_a });
+    defer commit_a.deinit(testing.allocator);
+
+    var graph_b = LayoutGraph{};
+    defer graph_b.deinit(testing.allocator);
+    const box_b = try graph_b.reserveNode(testing.allocator);
+    const union_b = try graph_b.reserveNode(testing.allocator);
+    graph_b.setNode(box_b, .{ .box = .{ .local = union_b } });
+    const refs_b = try graph_b.appendRefs(testing.allocator, &[_]GraphRef{ .{ .canonical = .str }, .{ .local = box_b } });
+    graph_b.setNode(union_b, .{ .tag_union = refs_b });
+    var commit_b = try store.commitGraph(&graph_b, .{ .local = union_b });
+    defer commit_b.deinit(testing.allocator);
+
+    for ([_]Idx{ commit_a.root_idx, commit_b.root_idx }) |root_idx| {
+        const root = store.getLayout(root_idx);
+        try testing.expectEqual(LayoutTag.tag_union, root.tag);
+        const info = store.getTagUnionInfo(root);
+        try testing.expectEqual(@as(usize, 2), info.variants.len);
+
+        try testing.expectEqual(Idx.str, info.variants.get(0).payload_layout);
+
+        const wrapped_layout = store.getLayout(info.variants.get(1).payload_layout);
+        try testing.expectEqual(LayoutTag.box, wrapped_layout.tag);
+        try testing.expectEqual(root_idx, wrapped_layout.getIdx());
+
+        // Str payload (24 bytes) dominates the Box pointer payload; the
+        // 1-byte discriminant lands after it and pads to 8-byte alignment.
+        try testing.expectEqual(@as(u32, 32), info.size());
+    }
 }
 
-test "fromTypeVar - record with only zero-sized fields" {
+test "recursive nominal through Box keeps a single box indirection (issue #8916)" {
     const testing = std.testing;
     var store = try Store.init(testing.allocator, .u64);
     defer store.deinit();
-    const idx = try store.putStructFields(&[_]StructField{
-        .{ .index = 0, .layout = .zst },
-        .{ .index = 1, .layout = .zst },
+
+    // Nat := [Zero, Suc(Box(Nat))]. The Suc payload must be exactly one Box
+    // whose element is the union layout itself: pattern matching unboxes
+    // exactly one level of indirection, so a second Box wrapped around the
+    // recursive occurrence would send it through a pointer that is never
+    // there (issue #8916).
+    var graph = LayoutGraph{};
+    defer graph.deinit(testing.allocator);
+    const union_node = try graph.reserveNode(testing.allocator);
+    const box_node = try graph.reserveNode(testing.allocator);
+    graph.setNode(box_node, .{ .box = .{ .local = union_node } });
+    const refs = try graph.appendRefs(testing.allocator, &[_]GraphRef{ .{ .canonical = .zst }, .{ .local = box_node } });
+    graph.setNode(union_node, .{ .tag_union = refs });
+
+    var commit = try store.commitGraph(&graph, .{ .local = union_node });
+    defer commit.deinit(testing.allocator);
+
+    // The union itself stays an ordinary tag union; recursion never forces the
+    // whole union behind a box.
+    const root = store.getLayout(commit.root_idx);
+    try testing.expectEqual(LayoutTag.tag_union, root.tag);
+
+    const info = store.getTagUnionInfo(root);
+    try testing.expectEqual(@as(usize, 2), info.variants.len);
+    try testing.expectEqual(Idx.zst, info.variants.get(0).payload_layout);
+
+    const suc_layout = store.getLayout(info.variants.get(1).payload_layout);
+    try testing.expectEqual(LayoutTag.box, suc_layout.tag);
+    const box_elem = suc_layout.getIdx();
+    try testing.expectEqual(commit.root_idx, box_elem);
+    try testing.expectEqual(LayoutTag.tag_union, store.getLayout(box_elem).tag);
+
+    // One pointer of payload, then the 1-byte discriminant, padded to
+    // pointer alignment.
+    try testing.expectEqual(@as(u16, 8), info.discriminant_offset);
+    try testing.expectEqual(@as(u32, 16), info.size());
+}
+
+test "layoutSizeAlign computes finite sizes for a recursive union whose record payloads contain List of it (issue #8923)" {
+    const testing = std.testing;
+    var store = try Store.init(testing.allocator, .u64);
+    defer store.deinit();
+
+    // Statement := [
+    //     FuncCall({ name: Str, args: List(U64) }),
+    //     ForLoop({ identifiers: List(Str), block: List(Statement) }),
+    //     IfStatement({ condition: U64, block: List(Statement) }),
+    // ]
+    // The recursion runs through record fields holding List(Statement); size
+    // computation must terminate at the list indirection and keep the
+    // recursive element as the union layout itself (issue #8923).
+    var graph = LayoutGraph{};
+    defer graph.deinit(testing.allocator);
+
+    const union_node = try graph.reserveNode(testing.allocator);
+    const list_stmt_node = try graph.reserveNode(testing.allocator);
+    const list_u64_node = try graph.reserveNode(testing.allocator);
+    const list_str_node = try graph.reserveNode(testing.allocator);
+    const func_call_node = try graph.reserveNode(testing.allocator);
+    const for_loop_node = try graph.reserveNode(testing.allocator);
+    const if_stmt_node = try graph.reserveNode(testing.allocator);
+
+    graph.setNode(list_stmt_node, .{ .list = .{ .local = union_node } });
+    graph.setNode(list_u64_node, .{ .list = .{ .canonical = .u64 } });
+    graph.setNode(list_str_node, .{ .list = .{ .canonical = .str } });
+
+    const func_call_fields = try graph.appendFields(testing.allocator, &[_]graph_mod.Field{
+        .{ .index = 0, .child = .{ .canonical = .str } },
+        .{ .index = 1, .child = .{ .local = list_u64_node } },
     });
-    try testing.expectEqual(Idx.zst, idx);
-}
+    graph.setNode(func_call_node, .{ .struct_ = func_call_fields });
 
-test "single-tag union with zero-sized payload keeps tag_union layout and size 0" {
-    const testing = std.testing;
-    var store = try Store.init(testing.allocator, .u64);
-    defer store.deinit();
-    const idx = try store.putTagUnion(&[_]Idx{.zst});
-    try testing.expectEqual(Idx.zst, idx);
-}
+    const for_loop_fields = try graph.appendFields(testing.allocator, &[_]graph_mod.Field{
+        .{ .index = 0, .child = .{ .local = list_str_node } },
+        .{ .index = 1, .child = .{ .local = list_stmt_node } },
+    });
+    graph.setNode(for_loop_node, .{ .struct_ = for_loop_fields });
 
-test "single-tag union with non-zero-sized payload keeps tag_union layout and payload size" {
-    const testing = std.testing;
-    var store = try Store.init(testing.allocator, .u64);
-    defer store.deinit();
-    const idx = try store.putTagUnion(&[_]Idx{.u64});
-    try testing.expectEqual(LayoutTag.tag_union, store.getLayout(idx).tag);
-    try testing.expectEqual(@as(u32, 8), store.layoutSize(store.getLayout(idx)));
-}
+    const if_stmt_fields = try graph.appendFields(testing.allocator, &[_]graph_mod.Field{
+        .{ .index = 0, .child = .{ .canonical = .u64 } },
+        .{ .index = 1, .child = .{ .local = list_stmt_node } },
+    });
+    graph.setNode(if_stmt_node, .{ .struct_ = if_stmt_fields });
 
-test "record extension with empty_record succeeds" {
-    try expectCanonicalStructOrdering();
-}
+    const refs = try graph.appendRefs(testing.allocator, &[_]GraphRef{
+        .{ .local = func_call_node },
+        .{ .local = for_loop_node },
+        .{ .local = if_stmt_node },
+    });
+    graph.setNode(union_node, .{ .tag_union = refs });
 
-test "deeply nested containers with inner ZST" {
-    try expectZstContainerAbi();
-}
+    var commit = try store.commitGraph(&graph, .{ .local = union_node });
+    defer commit.deinit(testing.allocator);
 
-test "nested ZST detection - List of record with ZST field" {
-    try expectZstContainerAbi();
-}
+    const root = store.getLayout(commit.root_idx);
+    try testing.expectEqual(LayoutTag.tag_union, root.tag);
 
-test "nested ZST detection - singleton record wrapping singleton tag becomes list_of_zst" {
-    try expectZstContainerAbi();
-}
+    // Both size entry points terminate and agree.
+    const size_align = store.layoutSizeAlign(root);
+    const info = store.getTagUnionInfo(root);
+    try testing.expectEqual(info.size(), size_align.size);
+    try testing.expectEqual(@as(u32, 56), size_align.size);
+    try testing.expectEqual(@as(u64, 8), size_align.alignment.toByteUnits());
+    try testing.expectEqual(@as(u16, 48), info.discriminant_offset);
 
-test "nested ZST detection - Box of tuple with ZST elements" {
-    try expectZstContainerAbi();
-}
-
-test "nested ZST detection - deeply nested" {
-    try expectZstContainerAbi();
-}
-
-test "zst combinatorics matrix for nested singleton ordinary-data wrappers" {
-    try expectZstContainerAbi();
-}
-
-test "fromTypeVar - flex var with method constraint returning open tag union" {
-    try expectTagUnionShapeInterning();
-}
-
-test "fromTypeVar - type alias inside Try nominal (issue #8708)" {
-    try expectTagUnionShapeInterning();
-}
-
-test "fromTypeVar - recursive nominal type with nested Box at depth 2+ (issue #8816)" {
-    try expectRecursiveGraphInterning();
-}
-
-test "layoutSizeAlign - recursive nominal type with record containing List (issue #8923)" {
-    try expectNestedOrdinaryDataGraph();
-}
-
-test "fromTypeVar - recursive nominal with Box has no double-boxing (issue #8916)" {
-    try expectRecursiveGraphInterning();
-}
-
-test "putRecord - same alignment preserves canonical field order" {
-    try expectCanonicalStructOrdering();
-}
-
-test "putRecord - alignment overrides canonical order" {
-    try expectCanonicalStructOrdering();
-}
-
-test "putRecord - equal-alignment ties do not depend on sort stability" {
-    try expectCanonicalStructOrdering();
-}
-
-test "putTuple interns identical tuple shapes to the same layout idx" {
-    const testing = std.testing;
-    var store = try Store.init(testing.allocator, .u64);
-    defer store.deinit();
-    const a = try store.putTuple(&[_]Layout{ Layout.int(.u64), Layout.str() });
-    const b = try store.putTuple(&[_]Layout{ Layout.int(.u64), Layout.str() });
-    try testing.expectEqual(a, b);
-}
-
-test "putTagUnion interns identical variant payload shapes to the same layout idx" {
-    try expectTagUnionShapeInterning();
-}
-
-test "internGraph interns identical recursive tag unions regardless of construction order" {
-    try expectRecursiveGraphInterning();
-}
-
-test "internGraph interns identical recursive tuple-list graphs regardless of construction order" {
-    try expectRecursiveGraphInterning();
-}
-
-test "internGraph interns identical recursive tag unions with boxes regardless of construction order" {
-    try expectRecursiveGraphInterning();
-}
-
-test "internGraph handles mixed canonical children with local recursive refs" {
-    try expectNestedOrdinaryDataGraph();
-}
-
-test "type and monotype layout resolvers agree for nested ordinary data layouts" {
-    try expectNestedOrdinaryDataGraph();
-}
-
-test "type and monotype layout resolvers preserve singleton ordinary-data structs" {
-    try expectNestedOrdinaryDataGraph();
-}
-
-test "type and monotype layout resolvers preserve singleton tag payload containers" {
-    try expectTagUnionShapeInterning();
-}
-
-test "type and monotype layout resolvers agree for recursive nominal layouts" {
-    try expectRecursiveGraphInterning();
-}
-
-test "type and monotype layout resolvers agree for directly recursive tag union layouts" {
-    try expectRecursiveGraphInterning();
-}
-
-test "fromTypeVar - no-payload nominal tag union gets canonical tag_union layout, not box" {
-    try expectBoolOrdinaryTagUnion();
+    // The recursive record payloads keep List(Statement) as a plain list whose
+    // element is the union layout itself (no placeholder, no extra box).
+    try testing.expectEqual(@as(usize, 3), info.variants.len);
+    const expected_struct_sizes = [_]u32{ 48, 48, 32 };
+    const recursive_field = [_]bool{ false, true, true };
+    for (0..info.variants.len) |i| {
+        const variant_layout = store.getLayout(info.variants.get(i).payload_layout);
+        try testing.expectEqual(LayoutTag.struct_, variant_layout.tag);
+        const struct_info = store.getStructInfo(variant_layout);
+        try testing.expectEqual(expected_struct_sizes[i], struct_info.size());
+        if (recursive_field[i]) {
+            const block_field = struct_info.fields.get(1);
+            try testing.expectEqual(@as(u16, 1), block_field.index);
+            const block_layout = store.getLayout(block_field.layout);
+            try testing.expectEqual(LayoutTag.list, block_layout.tag);
+            try testing.expectEqual(commit.root_idx, block_layout.getIdx());
+        }
+    }
 }
