@@ -3396,6 +3396,7 @@ fn registerNestedTypeDecl(
     parent_name: Ident.Idx,
     relative_name_idx: ?Ident.Idx,
     type_name: Ident.Idx,
+    owner_is_module_visible: bool,
     nested_type_decl: std.meta.fieldInfo(AST.Statement, .type_decl).type,
 ) std.mem.Allocator.Error!?NestedTypeDeclRegistration {
     const nested_header = self.parse_ir.store.getTypeHeader(nested_type_decl.header) catch return null;
@@ -3415,8 +3416,10 @@ fn registerNestedTypeDecl(
         self.env.getIdent(nested_type_ident),
     );
 
-    const node_idx_u32: u32 = @intFromEnum(nested_type_decl_idx);
-    try self.env.setExposedTypeNodeIndexById(nested_qualified_idx, node_idx_u32);
+    if (owner_is_module_visible) {
+        const node_idx_u32: u32 = @intFromEnum(nested_type_decl_idx);
+        try self.env.setExposedTypeNodeIndexById(nested_qualified_idx, node_idx_u32);
+    }
 
     const current_scope_idx = self.scopes.items.len - 1;
     try self.introduceAssociatedTypeAliasInScope(current_scope_idx, nested_type_ident, nested_type_decl_idx);
@@ -3427,9 +3430,7 @@ fn registerNestedTypeDecl(
     );
     try self.introduceAssociatedTypeAliasInScope(current_scope_idx, user_qualified_ident_idx, nested_type_decl_idx);
 
-    const parser_path = self.parserTypePathForAstStatement(ast_stmt_idx);
-    const root_scope = if (parser_path) |path| self.typePathRootScope(path) else null;
-    if (root_scope == self.moduleParserScopeIdx()) {
+    if (owner_is_module_visible) {
         // Also publish the user-facing qualified name (e.g. `Test.MyBool`)
         // at the module scope so references from outside the associated
         // block — like `x = Test.MyBool.method(...)` at top level —
@@ -3609,7 +3610,14 @@ fn canonicalizeAssociatedItems(
                 // Fill this declaration at its source-order position so later
                 // stages see declaration roots in the same order as the source
                 // walk.
-                const nested_registration = (try self.registerNestedTypeDecl(stmt_idx, parent_name, relative_name_idx, type_name, nested_type_decl)) orelse continue;
+                const nested_registration = (try self.registerNestedTypeDecl(
+                    stmt_idx,
+                    parent_name,
+                    relative_name_idx,
+                    type_name,
+                    owner_is_module_visible,
+                    nested_type_decl,
+                )) orelse continue;
                 const nested_type_decl_idx = nested_registration.stmt_idx;
 
                 const nested_qualified_idx = try self.insertQualifiedIdent(
