@@ -241,6 +241,9 @@ pub const BuildEnv = struct {
     /// otherwise populated from the environment on first resolution.
     package_cache_dir: ?[]const u8 = null,
 
+    /// Optional root for materialized compiler-owned platform sources.
+    compiler_owned_source_dir: ?[]const u8 = null,
+
     // Builtin modules (Bool, Try, Str) shared across all packages (heap-allocated to prevent moves)
     builtin_modules: *BuiltinModules,
     owns_builtin_modules: bool,
@@ -342,6 +345,7 @@ pub const BuildEnv = struct {
         }
 
         if (self.package_cache_dir) |dir| self.gpa.free(@constCast(dir));
+        if (self.compiler_owned_source_dir) |dir| self.gpa.free(@constCast(dir));
 
         // Deinit and free owned builtin modules. Borrowed builtins outlive this
         // BuildEnv and are released by their owner.
@@ -519,6 +523,13 @@ pub const BuildEnv = struct {
 
     pub fn setRootSourceDirOverride(self: *BuildEnv, source_dir: []const u8) void {
         self.root_source_dir_override = source_dir;
+    }
+
+    pub fn setCompilerOwnedSourceDir(self: *BuildEnv, source_dir: []const u8) Allocator.Error!void {
+        if (self.compiler_owned_source_dir) |old| {
+            self.gpa.free(@constCast(old));
+        }
+        self.compiler_owned_source_dir = try self.gpa.dupe(u8, source_dir);
     }
 
     pub fn setSyntheticRootSourceMapping(
@@ -1883,6 +1894,7 @@ pub const BuildEnv = struct {
             .fs = self.filesystem,
             .gpa = self.gpa,
             .cache_packages_dir = self.package_cache_dir,
+            .compiler_owned_source_dir = self.compiler_owned_source_dir,
         };
         var resolver = package_resolution.Resolver.init(self.gpa, ctx_fetcher.fetcher(), self.resolution_config);
         defer resolver.deinit();

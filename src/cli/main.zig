@@ -13078,8 +13078,9 @@ fn rocGlue(ctx: *CliCtx, args: cli_args.GlueArgs) glue.GlueError!void {
         .no_cache = args.no_cache,
         .opt = switch (args.opt) {
             .dev => .dev,
-            .interpreter => .interpreter,
-            .size, .speed => unreachable,
+            .size => .size,
+            .speed => .speed,
+            .interpreter => unreachable,
         },
     }, temp_dir, ctx.io.std_io);
 }

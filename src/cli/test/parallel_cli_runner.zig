@@ -13,7 +13,7 @@
 //!   --timeout <ms>       Per-test timeout in ms (default: 120000, 240000 with glue)
 //!   --include-llvm       Include size and speed LLVM backend jobs
 //!   --glue-roc <path>    Roc binary to use for glue generation (default: <roc_binary>)
-//!   --glue-opt <opt>     Glue execution mode; supported value: interpreter
+//!   --glue-opt <opt>     Glue execution mode: default, dev, size, or speed
 //!   --verbose            Print PASS results and timing details
 
 const std = @import("std");
@@ -142,19 +142,25 @@ const llvm_test_opts = [_]OptMode{ .size, .speed };
 
 const GlueExecutionMode = enum(u8) {
     default,
-    interpreter,
+    dev,
+    size,
+    speed,
 
     fn cliName(self: GlueExecutionMode) []const u8 {
         return switch (self) {
             .default => "default",
-            .interpreter => "interpreter",
+            .dev => "dev",
+            .size => "size",
+            .speed => "speed",
         };
     }
 
     fn optArg(self: GlueExecutionMode) ?[]const u8 {
         return switch (self) {
             .default => null,
-            .interpreter => "--opt=interpreter",
+            .dev => "--opt=dev",
+            .size => "--opt=size",
+            .speed => "--opt=speed",
         };
     }
 };
@@ -405,7 +411,7 @@ const CustomCase = enum {
     build_issue_9435_hosted_nominal_return,
     bundle_complex_package,
     glue_debug,
-    glue_debug_interpreter,
+    glue_debug_dev,
     glue_c_header,
     glue_c_header_compiles,
     glue_zig,
@@ -743,7 +749,7 @@ const echo_cases = [_]CliCase{
 
 const glue_cases = [_]CliCase{
     .{ .id = 0, .suite = .glue, .name = "glue command with DebugGlue succeeds", .body = .{ .custom = .glue_debug } },
-    .{ .id = 0, .suite = .glue, .name = "glue command with DebugGlue succeeds with --opt=interpreter", .body = .{ .custom = .glue_debug_interpreter } },
+    .{ .id = 0, .suite = .glue, .name = "glue command with DebugGlue succeeds with --opt=dev", .body = .{ .custom = .glue_debug_dev } },
     .{ .id = 0, .suite = .glue, .name = "glue command with CGlue generates expected C header", .body = .{ .custom = .glue_c_header } },
     .{ .id = 0, .suite = .glue, .name = "glue command generated C header compiles with zig cc", .body = .{ .custom = .glue_c_header_compiles } },
     .{ .id = 0, .suite = .glue, .name = "glue regression: ZigGlue succeeds on fx platform", .body = .{ .custom = .glue_zig } },
@@ -2197,7 +2203,7 @@ fn runCustomCase(
         .build_issue_9435_hosted_nominal_return => customBuildIssue9435(io, allocator, &env, &timer, timeout_ms),
         .bundle_complex_package => customBundleComplexPackage(io, allocator, &env, &timer, timeout_ms),
         .glue_debug => customGlueDebug(io, allocator, &env, &timer, timeout_ms),
-        .glue_debug_interpreter => customGlueDebugInterpreter(io, allocator, &env, &timer, timeout_ms),
+        .glue_debug_dev => customGlueDebugDev(io, allocator, &env, &timer, timeout_ms),
         .glue_c_header => customGlueCHeader(io, allocator, &env, &timer, timeout_ms),
         .glue_c_header_compiles => customGlueCHeaderCompiles(io, allocator, &env, &timer, timeout_ms),
         .glue_zig => customGlueZig(io, allocator, &env, &timer, timeout_ms),
@@ -7050,11 +7056,11 @@ fn customGlueDebug(io: std.Io, allocator: Allocator, env: *const CaseEnv, timer:
     return null;
 }
 
-fn customGlueDebugInterpreter(io: std.Io, allocator: Allocator, env: *const CaseEnv, timer: *harness.Timer, timeout_ms: u64) ?TestResult {
+fn customGlueDebugDev(io: std.Io, allocator: Allocator, env: *const CaseEnv, timer: *harness.Timer, timeout_ms: u64) ?TestResult {
     const output_dir = createWorkSubdir(io, allocator, env, "glue-out") catch |err|
         return customInfraFailure(allocator, timer, "failed to create glue output dir: {}", .{err});
     if (runRocAndCheck(io, allocator, env, timer, timeout_ms, .{
-        .args = &.{ "glue", "--opt=interpreter", "src/glue/src/DebugGlue.roc", output_dir, "test/fx/platform/main.roc" },
+        .args = &.{ "glue", "--opt=dev", "src/glue/src/DebugGlue.roc", output_dir, "test/fx/platform/main.roc" },
         .contains = &.{.{ .stream = .stderr, .text = "name: \"main!\"" }},
         .not_contains = &.{
             .{ .stream = .stderr, .text = "PANIC" },
@@ -8211,7 +8217,7 @@ fn printUsage() void {
         \\  --timeout <ms>       Per-test timeout in ms (default: 120000, 240000 with glue)
         \\  --include-llvm       Include size and speed LLVM backend jobs
         \\  --glue-roc <path>    Roc binary to use for glue generation (default: <roc_binary>)
-        \\  --glue-opt <opt>     Glue execution mode; supported value: interpreter
+        \\  --glue-opt <opt>     Glue execution mode: default, dev, size, or speed
         \\  --verbose            Show PASS results with timing
         \\
     , .{});
@@ -8232,7 +8238,10 @@ fn parseSuiteName(value: []const u8) ?Suite {
 }
 
 fn parseGlueExecutionMode(value: []const u8) ?GlueExecutionMode {
-    if (std.mem.eql(u8, value, "interpreter")) return .interpreter;
+    if (std.mem.eql(u8, value, "default")) return .default;
+    if (std.mem.eql(u8, value, "dev")) return .dev;
+    if (std.mem.eql(u8, value, "size")) return .size;
+    if (std.mem.eql(u8, value, "speed")) return .speed;
     return null;
 }
 

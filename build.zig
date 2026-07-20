@@ -2480,7 +2480,7 @@ pub fn build(b: *std.Build) void {
     const run_snapshot_tool_step = b.step("run-snapshot-tool", "Run the snapshot tool to update snapshot files");
     const echo_wasm_step = b.step("build-echo-wasm", "Build the echo platform to zig-out/lib/echo.wasm");
     const echo_wasm_archive_step = b.step("build-echo-wasm-archive", "Build echo.wasm and zstd-compress it to zig-out/lib/echo.wasm.zst");
-    const build_glue_release_step = b.step("build-glue-release", "Build release-ready glue package and specs");
+    const build_glue_release_step = b.step("build-glue-release", "Build release-ready glue specs");
 
     const build_test_hosts_step = b.step("build-test-hosts", "Build test platform host libraries");
     const build_release_step = b.step("build-release", "Build optimized release binary for distribution");
@@ -2522,7 +2522,7 @@ pub fn build(b: *std.Build) void {
     const test_progress_interval_ms = b.option(u64, "test-progress-interval-ms", "Print non-TTY parallel test progress every N milliseconds; 0 disables it") orelse 0;
     const eval_no_fork = b.option(bool, "eval-no-fork", "Run eval tests in-process instead of through fork isolation") orelse false;
     const eval_time_worker = b.option(bool, "eval-time-worker", "Print eval worker startup timing instrumentation") orelse false;
-    const glue_release_tag = b.option([]const u8, "glue-release-tag", "Nightly release tag used in generated glue package URLs");
+    const glue_release_tag = b.option([]const u8, "glue-release-tag", "Nightly release tag used in generated glue release metadata");
     const enable_valgrind = b.option(bool, "valgrind", "Emit Valgrind client request support") orelse false;
     if (enable_valgrind and (builtin.target.os.tag != .linux or target.result.os.tag != .linux)) {
         std.log.err("-Dvalgrind=true requires a Linux build host and Linux target", .{});
@@ -3133,7 +3133,6 @@ pub fn build(b: *std.Build) void {
             .{ .name = "embedded_lld", .module = roc_modules.embedded_lld },
         },
     });
-
     const builtins64_target = b.resolveTargetQuery(.{ .cpu_arch = .wasm64, .os_tag = .freestanding, .abi = .none });
     const builtins64_bc_obj = b.addObject(.{
         .name = "roc_builtins64_bc",
@@ -3403,7 +3402,7 @@ pub fn build(b: *std.Build) void {
         exe.root_module.addImport("llvm_embedded", llvm_embedded_module);
     }
 
-    roc_modules.eval.addAnonymousImport("llvm_compile", .{
+    const llvm_compile_module = b.createModule(.{
         .root_source_file = b.path("src/llvm_compile/mod.zig"),
         .imports = &.{
             .{ .name = "collections", .module = roc_modules.collections },
@@ -3419,6 +3418,8 @@ pub fn build(b: *std.Build) void {
             .{ .name = "embedded_lld", .module = roc_modules.embedded_lld },
         },
     });
+    roc_modules.eval.addImport("llvm_compile", llvm_compile_module);
+    roc_modules.glue.addImport("llvm_compile", llvm_compile_module);
 
     // Add snapshot tool
     const snapshot_exe = b.addExecutable(.{
@@ -3807,15 +3808,8 @@ pub fn build(b: *std.Build) void {
         configureBackend(glue_release_exe, target);
         glue_release_exe.root_module.addImport("build_options", roc_modules.build_options);
 
-        const glue_package_cmd = b.addRunArtifact(roc_exe);
-        glue_package_cmd.setCwd(b.path("src/glue/platform"));
-        glue_package_cmd.addArgs(&.{ "bundle", "--output-dir" });
-        const glue_package_dir = glue_package_cmd.addOutputDirectoryArg("glue-package");
-        glue_package_cmd.addArg("main.roc");
-
         const glue_release_cmd = b.addRunArtifact(glue_release_exe);
         glue_release_cmd.addArg(glue_release_tag orelse "nightly-local");
-        glue_release_cmd.addDirectoryArg(glue_package_dir);
         const glue_release_dir = glue_release_cmd.addOutputDirectoryArg("glue-release");
 
         const glue_release_install = b.addInstallDirectory(.{
@@ -4547,6 +4541,7 @@ pub fn build(b: *std.Build) void {
             compile_build_module.addImport("unbundle", roc_modules.unbundle);
             compile_build_module.addImport("roc_target", roc_modules.roc_target);
             compile_build_module.addImport("compiled_builtins", compiled_builtins_module);
+            compile_build_module.addImport("compiler_platform_sources", roc_modules.compiler_platform_sources);
             module_test.test_step.root_module.addImport("compile_build", compile_build_module);
             try addLlvmSupportToStep(
                 b,

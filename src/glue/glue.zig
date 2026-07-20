@@ -24,6 +24,7 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
+const build_options = @import("build_options");
 const Allocator = std.mem.Allocator;
 const base = @import("base");
 const parse = @import("parse");
@@ -35,6 +36,7 @@ const roc_target = @import("roc_target");
 const layout = @import("layout");
 const lir = @import("lir");
 const GuardedList = lir.LirStore.GuardedList;
+const llvm_compile = @import("llvm_compile");
 
 const ModuleEnv = can.ModuleEnv;
 const BuildEnv = compile.BuildEnv;
@@ -54,7 +56,8 @@ const eval_mod = @import("eval");
 /// Backend used to execute the glue spec.
 pub const GlueOpt = enum {
     dev,
-    interpreter,
+    size,
+    speed,
 };
 
 /// Arguments for glue code generation.
@@ -77,6 +80,8 @@ pub const GlueError = error{
     BuildEnvInit,
     CompilationFailed,
     DevBackendUnavailable,
+    GlueDylibUnavailable,
+    GlueDylibStampMismatch,
     ModuleRetrieval,
     OutOfMemory,
     WriteFailed,
@@ -98,7 +103,9 @@ pub fn rocGlue(gpa: Allocator, stderr: *std.Io.Writer, stdout: *std.Io.Writer, a
             error.TempDirCreation => stderr.print("Error: Could not create temp directory\n", .{}),
             error.BuildEnvInit => stderr.print("Error: Failed to initialize build environment\n", .{}),
             error.CompilationFailed => stderr.print("Error: Compilation failed\n", .{}),
-            error.DevBackendUnavailable => stderr.print("Error: The dev backend is not available for this host. Use `roc glue --opt=interpreter ...`.\n", .{}),
+            error.DevBackendUnavailable => stderr.print("Error: The dev backend is not available for this host.\n", .{}),
+            error.GlueDylibUnavailable => stderr.print("Error: Could not load compiled glue dylib.\n", .{}),
+            error.GlueDylibStampMismatch => stderr.print("Error: Compiled glue dylib cache entry did not match this compiler.\n", .{}),
             error.ModuleRetrieval => stderr.print("Error: Failed to get compiled modules\n", .{}),
             error.OutOfMemory => stderr.print("Error: Out of memory\n", .{}),
             error.WriteFailed => stderr.print("Error: Write failed\n", .{}),
@@ -107,7 +114,7 @@ pub fn rocGlue(gpa: Allocator, stderr: *std.Io.Writer, stdout: *std.Io.Writer, a
     };
 }
 
-fn rocGlueInner(gpa: Allocator, stderr: *std.Io.Writer, stdout: *std.Io.Writer, args: GlueArgs, _: []const u8, std_io: std.Io) GlueError!void {
+fn rocGlueInner(gpa: Allocator, stderr: *std.Io.Writer, stdout: *std.Io.Writer, args: GlueArgs, temp_dir: []const u8, std_io: std.Io) GlueError!void {
 
     // 0. Validate glue spec file exists
     std.Io.Dir.cwd().access(std_io, args.glue_spec, .{}) catch {
@@ -370,8 +377,20 @@ fn rocGlueInner(gpa: Allocator, stderr: *std.Io.Writer, stdout: *std.Io.Writer, 
     if (result_buf.len > 0) @memset(result_buf, 0);
 
     switch (args.opt) {
-        .dev => try runGlueSpecDev(gpa, stderr, &lowered, glue_proc, arg_layouts, &types_list, result_buf.ptr, &runtime_env),
-        .interpreter => try runGlueSpecInterpreter(gpa, stderr, &lowered, glue_proc, arg_layouts, &types_list, result_buf.ptr, runtime_env.get_ops()),
+        .dev, .size, .speed => try runGlueSpecDylib(
+            gpa,
+            stderr,
+            &lowered,
+            glue_proc,
+            arg_layouts,
+            &types_list,
+            result_buf.ptr,
+            &runtime_env,
+            root_artifact.key,
+            args,
+            temp_dir,
+            std_io,
+        ),
     }
     try writeHostEvents(stderr, &runtime_env);
 
@@ -441,6 +460,291 @@ fn runGlueSpecInterpreter(
     }) catch |err| {
         stderr.print("Error running glue spec: {}\n", .{err}) catch {};
         return error.CompilationFailed;
+    };
+}
+
+const glue_plugin_stamp_magic = [8]u8{ 'R', 'O', 'C', 'P', 'L', 'G', '1', 0 };
+const glue_plugin_abi_version: u32 = 1;
+
+const GluePluginKind = enum(u32) {
+    glue = 1,
+};
+
+const GluePluginStampV1 = extern struct {
+    magic: [8]u8,
+    size: u32,
+    kind: u32,
+    abi_version: u32,
+    reserved: u32 = 0,
+    target_hash: [32]u8,
+    compiler_hash: [32]u8,
+    glue_platform_hash: [32]u8,
+    artifact_input_hash: [32]u8,
+};
+
+const BuiltGlueDylib = struct {
+    path: [:0]const u8,
+    delete_after_use: bool,
+
+    fn deinit(self: BuiltGlueDylib, allocator: Allocator, std_io: std.Io) void {
+        if (self.delete_after_use) {
+            std.Io.Dir.deleteFileAbsolute(std_io, std.mem.sliceTo(self.path, 0)) catch {};
+        }
+        allocator.free(self.path);
+    }
+};
+
+fn runGlueSpecDylib(
+    gpa: Allocator,
+    stderr: *std.Io.Writer,
+    lowered: *lir.CheckedPipeline.LoweredProgram,
+    glue_proc: lir.LirProcSpecId,
+    arg_layouts: []const layout.Idx,
+    types_list: *RocList,
+    result_ptr: [*]u8,
+    runtime_env: *eval_mod.RuntimeHostEnv,
+    root_artifact_key: CheckedArtifact.CheckedModuleArtifactKey,
+    args: GlueArgs,
+    temp_dir: []const u8,
+    std_io: std.Io,
+) GlueError!void {
+    _ = temp_dir;
+    if (builtin.target.os.tag == .freestanding) return error.GlueDylibUnavailable;
+
+    const stamp = gluePluginStamp(root_artifact_key);
+    const dylib = try getOrBuildGlueDylib(gpa, lowered, glue_proc, arg_layouts, root_artifact_key, stamp, args, std_io);
+    defer dylib.deinit(gpa, std_io);
+
+    var lib = eval_mod.DynLib.open(gpa, dylib.path) catch |err| {
+        stderr.print("Error loading compiled glue dylib {s}: {s}\n", .{ dylib.path, @errorName(err) }) catch {};
+        return error.GlueDylibUnavailable;
+    };
+    defer lib.close();
+
+    try verifyGluePluginStamp(&lib, &stamp);
+
+    const GlueEntryFn = *const fn (*builtins.host_abi.RocOps, [*]u8, ?*anyopaque) callconv(.c) void;
+    const entry = lib.lookup(GlueEntryFn, builtins.shim_symbols.roc_make_glue) orelse return error.GlueDylibUnavailable;
+
+    runtime_env.resetObservation();
+    if (builtin.target.cpu.arch == .aarch64 and builtin.target.os.tag == .linux) {
+        runtime_env.setLongjmpOnCrash(false);
+    }
+    var crash_boundary = runtime_env.enterCrashBoundary();
+    defer crash_boundary.deinit();
+
+    const sj = crash_boundary.set();
+    if (sj == 0) {
+        entry(
+            @ptrCast(runtime_env.get_ops()),
+            @ptrCast(result_ptr),
+            @ptrCast(types_list),
+        );
+    }
+
+    switch (runtime_env.crashState()) {
+        .did_not_crash => {},
+        .crashed => |message| {
+            stderr.print("Error running glue spec: crashed with message: {s}\n", .{message}) catch {};
+            return error.CompilationFailed;
+        },
+    }
+}
+
+fn getOrBuildGlueDylib(
+    gpa: Allocator,
+    lowered: *lir.CheckedPipeline.LoweredProgram,
+    glue_proc: lir.LirProcSpecId,
+    arg_layouts: []const layout.Idx,
+    root_artifact_key: CheckedArtifact.CheckedModuleArtifactKey,
+    stamp: GluePluginStampV1,
+    args: GlueArgs,
+    std_io: std.Io,
+) GlueError!BuiltGlueDylib {
+    if (args.no_cache) {
+        const path = try buildGlueDylib(gpa, lowered, glue_proc, arg_layouts, stamp, args.opt, std_io);
+        return .{ .path = path, .delete_after_use = true };
+    }
+
+    const cache_path = glueDylibCachePath(gpa, root_artifact_key, stamp, args.opt, std_io) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return error.BuildEnvInit,
+    };
+    errdefer gpa.free(cache_path);
+
+    if (std.Io.Dir.cwd().access(std_io, std.mem.sliceTo(cache_path, 0), .{})) {
+        return .{ .path = cache_path, .delete_after_use = false };
+    } else |_| {}
+
+    const cache_dir = std.fs.path.dirname(std.mem.sliceTo(cache_path, 0)) orelse return error.BuildEnvInit;
+    std.Io.Dir.cwd().createDirPath(std_io, cache_dir) catch return error.BuildEnvInit;
+
+    const temp_path = try buildGlueDylib(gpa, lowered, glue_proc, arg_layouts, stamp, args.opt, std_io);
+    defer {
+        std.Io.Dir.deleteFileAbsolute(std_io, std.mem.sliceTo(temp_path, 0)) catch {};
+        gpa.free(temp_path);
+    }
+
+    std.Io.Dir.cwd().copyFile(
+        std.mem.sliceTo(temp_path, 0),
+        std.Io.Dir.cwd(),
+        std.mem.sliceTo(cache_path, 0),
+        std_io,
+        .{},
+    ) catch return error.CompilationFailed;
+
+    return .{ .path = cache_path, .delete_after_use = false };
+}
+
+fn buildGlueDylib(
+    gpa: Allocator,
+    lowered: *lir.CheckedPipeline.LoweredProgram,
+    glue_proc: lir.LirProcSpecId,
+    arg_layouts: []const layout.Idx,
+    stamp: GluePluginStampV1,
+    opt: GlueOpt,
+    std_io: std.Io,
+) GlueError![:0]const u8 {
+    var codegen = llvm_compile.MonoLlvmCodeGen.init(gpa, &lowered.lir_result.store);
+    codegen.layout_store = &lowered.lir_result.layouts;
+    codegen.plugin_stamp_bytes = std.mem.asBytes(&stamp);
+    codegen.emit_debug_info = opt == .dev;
+    defer codegen.deinit();
+
+    const proc = lowered.lir_result.store.getProcSpec(glue_proc);
+    const entrypoints = [_]llvm_compile.MonoLlvmCodeGen.Entrypoint{.{
+        .symbol_name = builtins.shim_symbols.roc_make_glue,
+        .proc = glue_proc,
+        .arg_layouts = arg_layouts,
+        .ret_layout = proc.ret_layout,
+        .abi = .plugin,
+    }};
+    var bitcode = codegen.generateEntrypointModule("roc_glue_plugin", entrypoints[0..]) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return error.CompilationFailed,
+    };
+    defer bitcode.deinit();
+
+    return llvm_compile.compileToSharedLibrary(gpa, std_io, bitcode.bitcode, glueLlvmCompileOptions(opt)) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return error.CompilationFailed,
+    };
+}
+
+fn verifyGluePluginStamp(lib: *eval_mod.DynLib, expected: *const GluePluginStampV1) GlueError!void {
+    const StampFn = *const fn () callconv(.c) *const GluePluginStampV1;
+    const stamp_fn = lib.lookup(StampFn, "roc_plugin_stamp_v1") orelse return error.GlueDylibStampMismatch;
+    const actual = stamp_fn();
+    if (!std.mem.eql(u8, std.mem.asBytes(actual), std.mem.asBytes(expected))) {
+        return error.GlueDylibStampMismatch;
+    }
+}
+
+fn glueLlvmCompileOptions(opt: GlueOpt) llvm_compile.CompileOptions {
+    return .{
+        .function_sections = false,
+        .use_module_target_triple = true,
+        .optimization = switch (opt) {
+            .dev => .O0,
+            .size => .Oz,
+            .speed => .O3,
+        },
+        .debug = opt == .dev,
+        .target_ptr_width_bits = targetPtrWidthBits(base.target.TargetUsize.native),
+    };
+}
+
+fn targetPtrWidthBits(target_usize: base.target.TargetUsize) u8 {
+    return @intCast(target_usize.size() * 8);
+}
+
+fn glueDylibCachePath(
+    allocator: Allocator,
+    root_artifact_key: CheckedArtifact.CheckedModuleArtifactKey,
+    stamp: GluePluginStampV1,
+    opt: GlueOpt,
+    std_io: std.Io,
+) (Allocator.Error || error{NoHomeDirectory})![:0]u8 {
+    const roc_ctx = compile.CoreCtx.default(allocator, allocator, std_io);
+    const config = compile.CacheConfig{ .roc_ctx = roc_ctx };
+    const version_dir = try config.getVersionCacheDir(allocator);
+    defer allocator.free(version_dir);
+
+    const digest = glueDylibOutputHash(root_artifact_key, stamp);
+    const digest_hex = std.fmt.bytesToHex(digest, .lower);
+    const filename = try std.fmt.allocPrint(allocator, "{s}{s}", .{ digest_hex[0..], sharedLibraryExtension() });
+    defer allocator.free(filename);
+
+    return std.fs.path.joinZ(allocator, &.{
+        version_dir,
+        "glue-dylib",
+        RocTarget.detectNative().toName(),
+        @tagName(opt),
+        filename,
+    });
+}
+
+fn glueDylibOutputHash(root_artifact_key: CheckedArtifact.CheckedModuleArtifactKey, stamp: GluePluginStampV1) [32]u8 {
+    var hasher = std.crypto.hash.Blake3.init(.{});
+    hashTaggedBytes(&hasher, "purpose", "roc-glue-dylib-output-v1");
+    hashTaggedBytes(&hasher, "root-artifact-key", &root_artifact_key.bytes);
+    hashTaggedBytes(&hasher, "stamp", std.mem.asBytes(&stamp));
+    var digest: [32]u8 = undefined;
+    hasher.final(&digest);
+    return digest;
+}
+
+fn gluePluginStamp(root_artifact_key: CheckedArtifact.CheckedModuleArtifactKey) GluePluginStampV1 {
+    return .{
+        .magic = glue_plugin_stamp_magic,
+        .size = @sizeOf(GluePluginStampV1),
+        .kind = @intFromEnum(GluePluginKind.glue),
+        .abi_version = glue_plugin_abi_version,
+        .target_hash = hashTarget(),
+        .compiler_hash = hashCompiler(),
+        .glue_platform_hash = compile.compiler_platforms.sourceHash(.glue),
+        .artifact_input_hash = root_artifact_key.bytes,
+    };
+}
+
+fn hashTarget() [32]u8 {
+    var hasher = std.crypto.hash.Blake3.init(.{});
+    hashTaggedBytes(&hasher, "roc-target", RocTarget.detectNative().toName());
+    hashTaggedBytes(&hasher, "cpu-arch", @tagName(builtin.target.cpu.arch));
+    hashTaggedBytes(&hasher, "os", @tagName(builtin.target.os.tag));
+    hashTaggedBytes(&hasher, "abi", @tagName(builtin.target.abi));
+    hashTaggedBytes(&hasher, "endian", @tagName(builtin.target.cpu.arch.endian()));
+    var ptr_width: [1]u8 = .{@sizeOf(usize) * 8};
+    hashTaggedBytes(&hasher, "ptr-width", &ptr_width);
+    var digest: [32]u8 = undefined;
+    hasher.final(&digest);
+    return digest;
+}
+
+fn hashCompiler() [32]u8 {
+    var hasher = std.crypto.hash.Blake3.init(.{});
+    hashTaggedBytes(&hasher, "compiler-version", build_options.compiler_version);
+    hashTaggedBytes(&hasher, "compiler-artifact-hash", &build_options.compiler_artifact_hash);
+    var digest: [32]u8 = undefined;
+    hasher.final(&digest);
+    return digest;
+}
+
+fn hashTaggedBytes(hasher: *std.crypto.hash.Blake3, tag: []const u8, bytes: []const u8) void {
+    hasher.update(tag);
+    hasher.update(&[_]u8{0});
+    var len_buf: [8]u8 = undefined;
+    std.mem.writeInt(u64, &len_buf, @intCast(bytes.len), .little);
+    hasher.update(&len_buf);
+    hasher.update(bytes);
+    hasher.update(&[_]u8{0});
+}
+
+fn sharedLibraryExtension() []const u8 {
+    return switch (builtin.os.tag) {
+        .windows => ".dll",
+        .macos => ".dylib",
+        else => ".so",
     };
 }
 

@@ -872,7 +872,7 @@ fn parseGlue(args: []const []const u8) CliArgs {
             \\  [ROC_FILE]   The platform .roc file to analyze [default: main.roc]
             \\
             \\Options:
-            \\  --opt=<level>  Run the glue spec with dev or interpreter [default: dev]
+            \\  --opt=<level>  Compile and run the glue spec with dev, size, or speed [default: dev]
             \\  --no-cache     Disable compilation caching
             \\  -h, --help     Print help
             \\
@@ -883,11 +883,11 @@ fn parseGlue(args: []const []const u8) CliArgs {
             if (getFlagValue(arg)) |value| {
                 if (OptLevel.from_str(value)) |level| {
                     switch (level) {
-                        .dev, .interpreter => opt = level,
-                        .speed, .size => return CliArgs{ .problem = ArgProblem{ .invalid_flag_value = .{ .flag = "--opt", .value = value, .valid_options = "dev,interpreter" } } },
+                        .dev, .size, .speed => opt = level,
+                        .interpreter => return CliArgs{ .problem = ArgProblem{ .invalid_flag_value = .{ .flag = "--opt", .value = value, .valid_options = "dev,size,speed" } } },
                     }
                 } else {
-                    return CliArgs{ .problem = ArgProblem{ .invalid_flag_value = .{ .flag = "--opt", .value = value, .valid_options = "dev,interpreter" } } };
+                    return CliArgs{ .problem = ArgProblem{ .invalid_flag_value = .{ .flag = "--opt", .value = value, .valid_options = "dev,size,speed" } } };
                 }
             } else {
                 return CliArgs{ .problem = ArgProblem{ .missing_flag_value = .{ .flag = "--opt" } } };
@@ -920,7 +920,7 @@ fn parseGlue(args: []const []const u8) CliArgs {
         \\  [ROC_FILE]   The platform .roc file to analyze [default: main.roc]
         \\
         \\Options:
-        \\  --opt=<level>  Run the glue spec with dev or interpreter [default: dev]
+        \\  --opt=<level>  Compile and run the glue spec with dev, size, or speed [default: dev]
         \\  -h, --help     Print help
         \\
         };
@@ -941,7 +941,7 @@ fn parseGlue(args: []const []const u8) CliArgs {
         \\  [ROC_FILE]   The platform .roc file to analyze [default: main.roc]
         \\
         \\Options:
-        \\  --opt=<level>  Run the glue spec with dev or interpreter [default: dev]
+        \\  --opt=<level>  Compile and run the glue spec with dev, size, or speed [default: dev]
         \\  -h, --help     Print help
         \\
         };
@@ -1864,18 +1864,18 @@ test "roc glue" {
         try testing.expectEqualStrings("platform/main.roc", result.glue.platform_path);
     }
     {
-        const result = try parse(gpa, testing.io, &[_][]const u8{ "glue", "--opt=interpreter", "Glue.roc", "glue-out" });
+        const result = try parse(gpa, testing.io, &[_][]const u8{ "glue", "--opt=size", "Glue.roc", "glue-out" });
         defer result.deinit(gpa);
         try testing.expectEqualStrings("Glue.roc", result.glue.glue_spec);
         try testing.expectEqualStrings("glue-out", result.glue.output_dir);
-        try testing.expectEqual(OptLevel.interpreter, result.glue.opt);
+        try testing.expectEqual(OptLevel.size, result.glue.opt);
     }
     {
-        const result = try parse(gpa, testing.io, &[_][]const u8{ "glue", "--opt=size", "Glue.roc", "glue-out" });
+        const result = try parse(gpa, testing.io, &[_][]const u8{ "glue", "--opt=interpreter", "Glue.roc", "glue-out" });
         defer result.deinit(gpa);
         try testing.expectEqualStrings("--opt", result.problem.invalid_flag_value.flag);
-        try testing.expectEqualStrings("size", result.problem.invalid_flag_value.value);
-        try testing.expectEqualStrings("dev,interpreter", result.problem.invalid_flag_value.valid_options);
+        try testing.expectEqualStrings("interpreter", result.problem.invalid_flag_value.value);
+        try testing.expectEqualStrings("dev,size,speed", result.problem.invalid_flag_value.valid_options);
     }
     {
         const result = try parse(gpa, testing.io, &[_][]const u8{ "glue", "-h" });
