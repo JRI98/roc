@@ -109,6 +109,7 @@ pub const OutputStream = enum {
     stderr,
 };
 
+/// If output should use colors
 pub const ColorMode = enum {
     auto,
     always,
@@ -238,9 +239,8 @@ pub const CliCtx = struct {
         return CoreCtx.default(self.gpa, self.arena, self.io.std_io);
     }
 
-    /// Build a colored-terminal reporting config sized to the real terminal
-    /// width (falling back to the default for narrow/unknown terminals).
-    pub fn terminalReportConfig(self: *const Self) ReportingConfig {
+    /// Build the terminal-layout defaults before applying color policy.
+    fn baseReportConfig(self: *const Self) ReportingConfig {
         var config = ReportingConfig.initColorTerminal();
         if (self.coreCtx().terminalWidth()) |cols| {
             if (cols >= 40) config.max_line_width = cols;
@@ -284,7 +284,7 @@ pub const CliCtx = struct {
         const supports_ansi = self.streamSupportsAnsi(stream);
         const use_color = policy.usesColor(supports_ansi);
 
-        var config = self.terminalReportConfig();
+        var config = self.baseReportConfig();
         config.is_tty = supports_ansi;
         config.color_preference = if (!use_color)
             .never
