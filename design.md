@@ -2107,6 +2107,16 @@ body still sees the shape; and a join with exactly one jump site is not shared
 control at all — its body is cloned directly at that site against the site's
 full symbolic values.
 
+Every SpecConstr clone is hygienic. A retained pattern, loop parameter, join
+parameter, try-sequence local, or other runtime binder receives a fresh lifted
+local identity in each emitted copy, and every occurrence in that binder's
+lexical scope is rewritten to the fresh identity. A binder whose uses were
+fully replaced by a known value still receives a fresh identity in the emitted
+pattern, but that unused output identity does not replace the known-value
+substitution. Cloning never relies on later lowering to reconstruct lexical
+scope from reused local ids: distinct emitted binders are distinct explicit
+identities before Lambda Solved or LIR lowering consumes them.
+
 #### Constant Storage
 
 Compile-time finalization is separate from iterator representation and

@@ -5570,3 +5570,28 @@ test "compiler-generated dispatch classes lower via checked evidence" {
     defer allocator.free(output);
     try std.testing.expectEqualStrings("True", output);
 }
+
+// Repro for https://github.com/roc-lang/roc/issues/10253: the recursive call
+// must carry the current position, 1, into the next iteration's `prev_len`.
+test "issue 10253 optimized tail recursion preserves the previous scalar argument" {
+    try expectOptimizedDbgEvents(
+        \\go : U64, List(U64), U64, Bool -> U64
+        \\go = |pos, heads, prev_len, _pending| {
+        \\    heads2 = heads.set(0, 7) ?? []
+        \\    cur = if pos != 0 { pos } else { 0 }
+        \\    if prev_len != 0 {
+        \\        prev_len
+        \\    } else {
+        \\        go(pos + 1, heads2, cur, Bool.False)
+        \\    }
+        \\}
+        \\
+        \\main : U64 -> {}
+        \\main = |zero| {
+        \\    dbg go(zero + 1, [], 0, Bool.False)
+        \\    {}
+        \\}
+    ,
+        &.{"1"},
+    );
+}

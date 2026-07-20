@@ -4381,7 +4381,10 @@ const Cloner = struct {
             .local => |local| .{ .local = local },
             .unit => .unit,
             .uninitialized => .uninitialized,
-            .uninitialized_payload => |payload| .{ .uninitialized_payload = payload },
+            .uninitialized_payload => |payload| .{ .uninitialized_payload = .{
+                .condition = self.cloneLocalRef(payload.condition),
+                .mask = payload.mask,
+            } },
             .int_lit => |value| .{ .int_lit = value },
             .frac_f32_lit => |value| .{ .frac_f32_lit = value },
             .frac_f64_lit => |value| .{ .frac_f64_lit = value },
@@ -4451,7 +4454,7 @@ const Cloner = struct {
             .if_initialized_payload => |payload_switch| .{ .if_initialized_payload = .{
                 .cond = try self.cloneExpr(payload_switch.cond),
                 .cond_mask = payload_switch.cond_mask,
-                .payload = payload_switch.payload,
+                .payload = self.cloneLocalRef(payload_switch.payload),
                 .uninitialized_is_cold = payload_switch.uninitialized_is_cold,
                 .initialized = try self.cloneExpr(payload_switch.initialized),
                 .uninitialized = try self.cloneExpr(payload_switch.uninitialized),
@@ -4459,12 +4462,13 @@ const Cloner = struct {
             .try_sequence => |sequence| blk: {
                 const try_expr = try self.cloneExpr(sequence.try_expr);
                 const shadow_start = self.changes.items.len;
-                try self.shadowLocal(sequence.ok_local);
+                const ok_ty = self.pass.program.getLocal(sequence.ok_local).ty;
+                const ok_local = try self.cloneBinder(sequence.ok_local, ok_ty, .bind_runtime);
                 const ok_body = try self.cloneExpr(sequence.ok_body);
                 self.restore(shadow_start);
                 break :blk .{ .try_sequence = .{
                     .try_expr = try_expr,
-                    .ok_local = sequence.ok_local,
+                    .ok_local = ok_local,
                     .err_is_cold = sequence.err_is_cold,
                     .ok_body = ok_body,
                 } };
@@ -4472,15 +4476,17 @@ const Cloner = struct {
             .try_record_sequence => |sequence| blk: {
                 const try_expr = try self.cloneExpr(sequence.try_expr);
                 const shadow_start = self.changes.items.len;
-                try self.shadowLocal(sequence.value_local);
-                try self.shadowLocal(sequence.rest_local);
+                const value_ty = self.pass.program.getLocal(sequence.value_local).ty;
+                const value_local = try self.cloneBinder(sequence.value_local, value_ty, .bind_runtime);
+                const rest_ty = self.pass.program.getLocal(sequence.rest_local).ty;
+                const rest_local = try self.cloneBinder(sequence.rest_local, rest_ty, .bind_runtime);
                 const ok_body = try self.cloneExpr(sequence.ok_body);
                 self.restore(shadow_start);
                 break :blk .{ .try_record_sequence = .{
                     .try_expr = try_expr,
-                    .value_local = sequence.value_local,
+                    .value_local = value_local,
                     .value_field = sequence.value_field,
-                    .rest_local = sequence.rest_local,
+                    .rest_local = rest_local,
                     .rest_field = sequence.rest_field,
                     .err_is_cold = sequence.err_is_cold,
                     .ok_body = ok_body,
@@ -4604,11 +4610,11 @@ const Cloner = struct {
                 self.pending.shrinkRetainingCapacity(pending_before);
             }
         }
-        try self.shadowPatLocals(let_.bind);
+        const bind = try self.clonePat(let_.bind, .bind_runtime);
         const rest = try self.cloneExpr(let_.rest);
         self.restore(change_start);
         return .{ .expr = try self.addExpr(.{ .ty = self.pass.program.getExpr(let_.rest).ty, .data = .{ .let_ = .{
-            .bind = try self.clonePat(let_.bind),
+            .bind = bind,
             .value = value_expr,
             .rest = rest,
             .comptime_site = let_.comptime_site,
@@ -4660,26 +4666,29 @@ const Cloner = struct {
         const value_expr = try self.materialize(value);
         const change_start = self.changes.items.len;
         const bound = try self.bindPatToReusableValue(let_.bind, value);
+        var bind: Ast.PatId = undefined;
         const rest = if (bound == .match) blk: {
             const cloned = try self.cloneExpr(let_.rest);
             self.restore(change_start);
+            bind = try self.clonePat(let_.bind, .output_only);
             break :blk cloned;
         } else if (try self.bindPatToSingleUseRestValue(let_.bind, value, let_.rest)) blk: {
             const cloned = try self.cloneExpr(let_.rest);
             self.restore(change_start);
+            bind = try self.clonePat(let_.bind, .output_only);
             break :blk cloned;
         } else blk: {
             self.restore(change_start);
             if (self.caseExprFromValue(value)) |case_expr| {
                 if (try self.cloneLetOfCase(let_, case_expr)) |data| return data;
             }
-            try self.shadowPatLocals(let_.bind);
+            bind = try self.clonePat(let_.bind, .bind_runtime);
             const rest = try self.cloneExpr(let_.rest);
             self.restore(change_start);
             break :blk rest;
         };
         return .{ .let_ = .{
-            .bind = try self.clonePat(let_.bind),
+            .bind = bind,
             .value = value_expr,
             .rest = rest,
             .comptime_site = let_.comptime_site,
@@ -4853,11 +4862,11 @@ const Cloner = struct {
 
         const change_start = self.changes.items.len;
         const pending_start = self.pending.items.len;
-        try self.shadowPatLocals(let_.bind);
+        const bind = try self.clonePat(let_.bind, .bind_runtime);
         const rest = try self.flushPendingSince(pending_start, try self.cloneExpr(let_.rest));
         self.restore(change_start);
         const continuation = try self.addExpr(.{ .ty = rest_ty, .data = .{ .let_ = .{
-            .bind = try self.clonePat(let_.bind),
+            .bind = bind,
             .value = param_expr,
             .rest = rest,
             .comptime_site = let_.comptime_site,
@@ -5215,11 +5224,11 @@ const Cloner = struct {
                 self.restore(change_start);
                 const value_expr = try self.materialize(site.values[0]);
                 const pat_change_start = self.changes.items.len;
-                try self.shadowPatLocals(binding.pat);
+                const bind = try self.clonePat(binding.pat, .bind_runtime);
                 const rest = try self.cloneExpr(join.body);
                 self.restore(pat_change_start);
                 break :body try self.addExpr(.{ .ty = rest_ty, .data = .{ .let_ = .{
-                    .bind = try self.clonePat(binding.pat),
+                    .bind = bind,
                     .value = value_expr,
                     .rest = rest,
                     .comptime_site = binding.comptime_site,
@@ -5295,11 +5304,11 @@ const Cloner = struct {
                 }
                 const param_expr = try self.addExpr(.{ .ty = param_ty, .data = .{ .local = param_local } });
                 const pat_change_start = self.changes.items.len;
-                try self.shadowPatLocals(binding.pat);
+                const bind = try self.clonePat(binding.pat, .bind_runtime);
                 const rest = try self.cloneExpr(join.body);
                 self.restore(pat_change_start);
                 break :body try self.addExpr(.{ .ty = rest_ty, .data = .{ .let_ = .{
-                    .bind = try self.clonePat(binding.pat),
+                    .bind = bind,
                     .value = param_expr,
                     .rest = rest,
                     .comptime_site = binding.comptime_site,
@@ -5557,12 +5566,19 @@ const Cloner = struct {
         for (params, 0..) |param, index| whole_shapes[index] = .{ .any = param.ty };
 
         const initial_span = try self.valuesToExprSpan(values);
-        for (params) |param| try self.shadowLocal(param.local);
+        const whole_params = try self.pass.allocator.alloc(Ast.TypedLocal, params.len);
+        defer self.pass.allocator.free(whole_params);
+        for (params, 0..) |param, index| {
+            whole_params[index] = .{
+                .local = try self.cloneBinder(param.local, param.ty, .bind_runtime),
+                .ty = param.ty,
+            };
+        }
         try self.loop_stack.append(self.pass.allocator, .{ .values = whole_shapes, .any_demoted = false });
         const body = try self.cloneExpr(loop.body);
         if (self.loop_stack.pop() == null) Common.invariant("loop stack underflow after whole-state body clone");
         return .{ .expr = try self.addExpr(.{ .ty = ty, .data = .{ .loop_ = .{
-            .params = loop.params,
+            .params = try self.pass.program.addTypedLocalSpan(whole_params),
             .initial_values = initial_span,
             .body = body,
         } } }) };
@@ -7285,10 +7301,10 @@ const Cloner = struct {
         }
     }
 
-    /// Record an identity substitution for a local bound by a retained
-    /// source pattern: the pattern's body resolves the local to the
-    /// pattern's own runtime binding, never to an outer substitution that
-    /// bound the same local id in another clone of this code.
+    /// Record an identity substitution for a local bound by an already-emitted
+    /// pattern. This is used when a rewrite reuses that exact pattern node;
+    /// source patterns cloned into new code go through `clonePat`, which gives
+    /// every emitted binder a fresh local instead.
     fn shadowLocal(self: *Cloner, local: Ast.LocalId) Common.LowerError!void {
         const ty = self.pass.program.getLocal(local).ty;
         try self.putSubst(local, .{ .expr = try self.addExpr(.{ .ty = ty, .data = .{ .local = local } }) });
@@ -7340,40 +7356,75 @@ const Cloner = struct {
         }
     }
 
-    fn clonePat(self: *Cloner, pat_id: Ast.PatId) Allocator.Error!Ast.PatId {
+    const BinderCloneMode = enum {
+        /// The surrounding clone has already replaced every use of this
+        /// binding with a known value. The emitted pattern still needs its own
+        /// fresh identity, but must not overwrite that value substitution.
+        output_only,
+        /// The cloned body retains references to the runtime binding. Map the
+        /// source local to the fresh output local for the binding's scope.
+        bind_runtime,
+    };
+
+    fn cloneBinder(self: *Cloner, source: Ast.LocalId, ty: Type.TypeId, mode: BinderCloneMode) Common.LowerError!Ast.LocalId {
+        const fresh = try self.pass.program.addLocal(self.pass.symbols.fresh(), ty);
+        if (mode == .bind_runtime) {
+            const local_expr = try self.addExpr(.{ .ty = ty, .data = .{ .local = fresh } });
+            try self.putSubst(source, .{ .expr = local_expr });
+        }
+        return fresh;
+    }
+
+    /// Rewrite a local reference stored directly in an expression node rather
+    /// than in a child `.local` expression. These fields require a runtime
+    /// local, so a structured substitution is an invalid cloned IR state.
+    fn cloneLocalRef(self: *Cloner, source: Ast.LocalId) Ast.LocalId {
+        const value = self.subst.get(source) orelse blk: {
+            const identity = self.binderIdentityOf(source) orelse return source;
+            break :blk self.binder_subst.get(identity) orelse return source;
+        };
+        const expr = switch (value) {
+            .expr => |expr| expr,
+            else => Common.invariant("SpecConstr local-id field referenced a non-local substituted value"),
+        };
+        return localExpr(self.pass.program, expr) orelse
+            Common.invariant("SpecConstr local-id field referenced a non-local expression");
+    }
+
+    fn clonePat(self: *Cloner, pat_id: Ast.PatId, mode: BinderCloneMode) Common.LowerError!Ast.PatId {
         const pat = self.pass.program.getPat(pat_id);
         const data: Ast.PatData = switch (pat.data) {
-            .bind => |local| .{ .bind = local },
+            .bind => |local| .{ .bind = try self.cloneBinder(local, pat.ty, mode) },
             .wildcard => .wildcard,
             .as => |as| .{ .as = .{
-                .pattern = try self.clonePat(as.pattern),
-                .local = as.local,
+                .pattern = try self.clonePat(as.pattern, mode),
+                .local = try self.cloneBinder(as.local, pat.ty, mode),
             } },
-            .record => |fields| .{ .record = try self.cloneRecordDestructSpan(fields) },
-            .tuple => |items| .{ .tuple = try self.clonePatSpan(items) },
+            .record => |fields| .{ .record = try self.cloneRecordDestructSpan(fields, mode) },
+            .tuple => |items| .{ .tuple = try self.clonePatSpan(items, mode) },
             .list => |list| .{ .list = .{
-                .patterns = try self.clonePatSpan(list.patterns),
+                .patterns = try self.clonePatSpan(list.patterns, mode),
                 .rest = if (list.rest) |rest| .{
                     .index = rest.index,
-                    .pattern = if (rest.pattern) |rest_pattern| try self.clonePat(rest_pattern) else null,
+                    .pattern = if (rest.pattern) |rest_pattern| try self.clonePat(rest_pattern, mode) else null,
                 } else null,
             } },
             .tag => |tag| .{ .tag = .{
                 .name = tag.name,
-                .payloads = try self.clonePatSpan(tag.payloads),
+                .payloads = try self.clonePatSpan(tag.payloads, mode),
             } },
-            .nominal => |backing| .{ .nominal = try self.clonePat(backing) },
+            .nominal => |backing| .{ .nominal = try self.clonePat(backing, mode) },
             .int_lit => |value| .{ .int_lit = value },
             .dec_lit => |value| .{ .dec_lit = value },
             .frac_f32_lit => |value| .{ .frac_f32_lit = value },
             .frac_f64_lit => |value| .{ .frac_f64_lit = value },
             .str_lit => |value| .{ .str_lit = value },
-            .str_pattern => |str| .{ .str_pattern = try self.cloneStrPattern(str) },
+            .str_pattern => |str| .{ .str_pattern = try self.cloneStrPattern(str, mode) },
         };
         return try self.pass.program.addPat(.{ .ty = pat.ty, .data = data });
     }
 
-    fn cloneStrPattern(self: *Cloner, str: Ast.StrPattern) Allocator.Error!Ast.StrPattern {
+    fn cloneStrPattern(self: *Cloner, str: Ast.StrPattern, mode: BinderCloneMode) Common.LowerError!Ast.StrPattern {
         const input_steps = self.pass.program.strPatternStepSpan(str.steps);
         const output_steps = try self.pass.allocator.alloc(Ast.StrPatternStep, input_steps.len);
         defer self.pass.allocator.free(output_steps);
@@ -7382,7 +7433,7 @@ const Cloner = struct {
             const input_step = GuardedList.at(input_steps, index);
             const output_step = &output_steps[index];
             output_step.* = .{
-                .capture = if (input_step.capture) |capture| try self.clonePat(capture) else null,
+                .capture = if (input_step.capture) |capture| try self.clonePat(capture, mode) else null,
                 .delimiter = input_step.delimiter,
             };
         }
@@ -7412,15 +7463,18 @@ const Cloner = struct {
         const stmt = self.pass.program.getStmt(stmt_id);
         return try self.addStmt(switch (stmt) {
             .uninitialized => |pat| blk: {
-                try self.shadowPatLocals(pat);
-                break :blk .{ .uninitialized = try self.clonePat(pat) };
+                break :blk .{ .uninitialized = try self.clonePat(pat, .bind_runtime) };
             },
             .let_ => |let_| blk: {
+                const recursive_pat = if (let_.recursive)
+                    try self.clonePat(let_.pat, .bind_runtime)
+                else
+                    null;
                 const value = try self.cloneExprValue(let_.value);
                 const value_expr = try self.materialize(value);
                 if (try self.bindPatToReusableValue(let_.pat, value) == .match) {
                     break :blk .{ .let_ = .{
-                        .pat = try self.clonePat(let_.pat),
+                        .pat = recursive_pat orelse try self.clonePat(let_.pat, .output_only),
                         .value = value_expr,
                         .recursive = let_.recursive,
                         .comptime_site = let_.comptime_site,
@@ -7441,9 +7495,8 @@ const Cloner = struct {
                     self.restore(change_before);
                     self.pending.shrinkRetainingCapacity(pending_before);
                 }
-                try self.shadowPatLocals(let_.pat);
                 break :blk .{ .let_ = .{
-                    .pat = try self.clonePat(let_.pat),
+                    .pat = recursive_pat orelse try self.clonePat(let_.pat, .bind_runtime),
                     .value = value_expr,
                     .recursive = let_.recursive,
                     .comptime_site = let_.comptime_site,
@@ -7485,13 +7538,13 @@ const Cloner = struct {
         return try self.pass.program.addCaptureOperandSpan(operands);
     }
 
-    fn clonePatSpan(self: *Cloner, span: Ast.Span(Ast.PatId)) Allocator.Error!Ast.Span(Ast.PatId) {
+    fn clonePatSpan(self: *Cloner, span: Ast.Span(Ast.PatId), mode: BinderCloneMode) Common.LowerError!Ast.Span(Ast.PatId) {
         const source = try GuardedList.dupe(self.pass.allocator, Ast.PatId, self.pass.program.patSpan(span));
         defer self.pass.allocator.free(source);
 
         const values = try self.pass.allocator.alloc(Ast.PatId, source.len);
         defer self.pass.allocator.free(values);
-        for (source, 0..) |pat, index| values[index] = try self.clonePat(pat);
+        for (source, 0..) |pat, index| values[index] = try self.clonePat(pat, mode);
         return try self.pass.program.addPatSpan(values);
     }
 
@@ -7510,7 +7563,7 @@ const Cloner = struct {
         return try self.pass.program.addFieldExprSpan(values);
     }
 
-    fn cloneRecordDestructSpan(self: *Cloner, span: Ast.Span(Ast.RecordDestruct)) Allocator.Error!Ast.Span(Ast.RecordDestruct) {
+    fn cloneRecordDestructSpan(self: *Cloner, span: Ast.Span(Ast.RecordDestruct), mode: BinderCloneMode) Common.LowerError!Ast.Span(Ast.RecordDestruct) {
         const source = try GuardedList.dupe(self.pass.allocator, Ast.RecordDestruct, self.pass.program.recordDestructSpan(span));
         defer self.pass.allocator.free(source);
 
@@ -7519,7 +7572,7 @@ const Cloner = struct {
         for (source, 0..) |field, index| {
             values[index] = .{
                 .name = field.name,
-                .pattern = try self.clonePat(field.pattern),
+                .pattern = try self.clonePat(field.pattern, mode),
             };
         }
         return try self.pass.program.addRecordDestructSpan(values);
@@ -7533,9 +7586,9 @@ const Cloner = struct {
         defer self.pass.allocator.free(values);
         for (source, 0..) |branch, index| {
             const change_start = self.changes.items.len;
-            try self.shadowPatLocals(branch.pat);
+            const pat = try self.clonePat(branch.pat, .bind_runtime);
             values[index] = .{
-                .pat = try self.clonePat(branch.pat),
+                .pat = pat,
                 .guard = if (branch.guard) |guard| try self.cloneExpr(guard) else null,
                 .body = try self.cloneExpr(branch.body),
             };
@@ -9269,6 +9322,64 @@ test "static match verdicts separate definite no-match from statically undecidab
     const nominal_value = Value{ .nominal = .{ .ty = union_ty, .backing = &backing } };
     try std.testing.expectEqual(MatchVerdict.match, try cloner.bindPatToValue(nominal_pat, nominal_value));
     try std.testing.expectEqual(MatchVerdict.unknown, try cloner.bindPatToValue(nominal_pat, opaque_value));
+}
+
+test "SpecConstr pattern clones bind fresh local identities" {
+    const allocator = std.testing.allocator;
+    var program = emptyLiftedProgramForTest(allocator);
+    defer program.deinit();
+
+    var pass = try Pass.init(allocator, &program);
+    defer pass.deinit();
+    var cloner = Cloner.initForRewrite(&pass);
+    defer cloner.deinit();
+
+    const u8_ty = try program.types.add(.{ .primitive = .u8 });
+    const source_local = try program.addLocal(@enumFromInt(1), u8_ty);
+    const source_pat = try program.addPat(.{ .ty = u8_ty, .data = .{ .bind = source_local } });
+    const source_ref = try program.addExpr(.{ .ty = u8_ty, .data = .{ .local = source_local } });
+    const source_payload_ref = try program.addExpr(.{ .ty = u8_ty, .data = .{ .uninitialized_payload = .{ .condition = source_local } } });
+
+    const first_change = cloner.changes.items.len;
+    const first_pat = try cloner.clonePat(source_pat, .bind_runtime);
+    const first_local = switch (program.getPat(first_pat).data) {
+        .bind => |local| local,
+        else => return error.TestUnexpectedResult,
+    };
+    const first_ref = try cloner.cloneExpr(source_ref);
+    try std.testing.expectEqual(first_local, program.getExpr(first_ref).data.local);
+    const first_payload_ref = try cloner.cloneExpr(source_payload_ref);
+    try std.testing.expectEqual(first_local, program.getExpr(first_payload_ref).data.uninitialized_payload.condition);
+    cloner.restore(first_change);
+
+    const second_change = cloner.changes.items.len;
+    const second_pat = try cloner.clonePat(source_pat, .bind_runtime);
+    const second_local = switch (program.getPat(second_pat).data) {
+        .bind => |local| local,
+        else => return error.TestUnexpectedResult,
+    };
+    const second_ref = try cloner.cloneExpr(source_ref);
+    try std.testing.expectEqual(second_local, program.getExpr(second_ref).data.local);
+    cloner.restore(second_change);
+
+    try std.testing.expect(source_local != first_local);
+    try std.testing.expect(source_local != second_local);
+    try std.testing.expect(first_local != second_local);
+
+    const known_local = try program.addLocal(@enumFromInt(2), u8_ty);
+    const known_ref = try program.addExpr(.{ .ty = u8_ty, .data = .{ .local = known_local } });
+    const known_change = cloner.changes.items.len;
+    try cloner.putSubst(source_local, .{ .expr = known_ref });
+    const output_pat = try cloner.clonePat(source_pat, .output_only);
+    const output_local = switch (program.getPat(output_pat).data) {
+        .bind => |local| local,
+        else => return error.TestUnexpectedResult,
+    };
+    const substituted_ref = try cloner.cloneExpr(source_ref);
+    try std.testing.expectEqual(known_local, program.getExpr(substituted_ref).data.local);
+    try std.testing.expect(output_local != source_local);
+    try std.testing.expect(output_local != known_local);
+    cloner.restore(known_change);
 }
 
 test "known match fold aborts on undecidable branches and trips the invariant when every branch is excluded" {
