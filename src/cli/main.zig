@@ -5083,24 +5083,6 @@ const CoordinatorReportCounts = struct {
     warnings: usize,
 };
 
-const SummaryStream = enum {
-    stdout,
-    stderr,
-};
-
-fn summaryUsesColor(ctx: *CliCtx, stream: SummaryStream) Allocator.Error!bool {
-    if (comptime builtin.target.cpu.arch == .wasm32 or builtin.target.os.tag == .freestanding) return false;
-    if (try envVarNonEmpty(ctx.gpa, "NO_COLOR")) return false;
-    if (try envVarNonEmpty(ctx.gpa, "FORCE_COLOR")) return true;
-    if (try envVarEquals(ctx.gpa, "TERM", "dumb")) return false;
-
-    const file = switch (stream) {
-        .stdout => std.Io.File.stdout(),
-        .stderr => std.Io.File.stderr(),
-    };
-    return file.supportsAnsiEscapeCodes(ctx.io.std_io) catch false;
-}
-
 fn writeDiagnosticCounts(writer: *std.Io.Writer, error_count: anytype, warning_count: anytype, use_color: bool) std.Io.Writer.Error!void {
     const error_suffix = if (error_count == 1) "" else "s";
     const warning_suffix = if (warning_count == 1) "" else "s";
@@ -5202,6 +5184,7 @@ fn successfulLoweredProgram(result: *LoweredCoordinatorResult, label: []const u8
 /// during the drain.
 fn renderDrainedBuildEnvReports(ctx: *CliCtx, build_env: *BuildEnv, display_path: []const u8) Allocator.Error!CoordinatorReportCounts {
     var counts = CoordinatorReportCounts{ .errors = 0, .warnings = 0 };
+    const report_config = ctx.reportConfig(.stderr);
 
     const drained = try build_env.drainReports();
     defer build_env.freeDrainedReports(drained);
@@ -5214,7 +5197,7 @@ fn renderDrainedBuildEnvReports(ctx: *CliCtx, build_env: *BuildEnv, display_path
                 .warning => counts.warnings += 1,
             }
             if (!builtin.is_test) {
-                reporting.renderReportToTerminal(report, ctx.io.stderr(), ColorPalette.ANSI, ctx.terminalReportConfig()) catch {};
+                reporting.renderReportToTerminal(report, ctx.io.stderr(), ColorPalette.ANSI, report_config) catch {};
             }
         }
     }
@@ -5223,7 +5206,7 @@ fn renderDrainedBuildEnvReports(ctx: *CliCtx, build_env: *BuildEnv, display_path
         const stderr = ctx.io.stderr();
         stderr.writeAll("\n") catch {};
         stderr.writeAll("Found ") catch {};
-        writeDiagnosticCounts(stderr, counts.errors, counts.warnings, try summaryUsesColor(ctx, .stderr)) catch {};
+        writeDiagnosticCounts(stderr, counts.errors, counts.warnings, report_config.shouldUseColors()) catch {};
         stderr.print(" for {s}.\n", .{display_path}) catch {};
     }
 
@@ -8774,7 +8757,7 @@ fn rocBuildLlvm(ctx: *CliCtx, args: cli_args.BuildArgs) CliMainError!void {
     reporter.end();
 
     const targets_config = build_env.getPlatformTargetsConfig() orelse {
-        try renderProblem(ctx.gpa, ctx.io.stderr(), .{
+        try renderProblem(ctx, .{
             .no_platform_found = .{ .app_path = args.path },
         });
         return error.NoPlatformSource;
@@ -8850,7 +8833,7 @@ fn rocBuildLlvm(ctx: *CliCtx, args: cli_args.BuildArgs) CliMainError!void {
     }
     total_warning_count += try optimizedDbgWarningsForBuild(ctx, &build_env, args.opt);
     const resolved_targets_config = build_env.getPlatformTargetsConfig() orelse {
-        try renderProblem(ctx.gpa, ctx.io.stderr(), .{
+        try renderProblem(ctx, .{
             .no_platform_found = .{ .app_path = args.path },
         });
         return error.NoPlatformSource;
@@ -9094,7 +9077,7 @@ fn rocBuildNative(ctx: *CliCtx, args: cli_args.BuildArgs) CliMainError!void {
     reporter.end();
 
     const targets_config = build_env.getPlatformTargetsConfig() orelse {
-        try renderProblem(ctx.gpa, ctx.io.stderr(), .{
+        try renderProblem(ctx, .{
             .no_platform_found = .{ .app_path = args.path },
         });
         return error.NoPlatformSource;
@@ -9162,7 +9145,7 @@ fn rocBuildNative(ctx: *CliCtx, args: cli_args.BuildArgs) CliMainError!void {
     }
     total_warning_count += try optimizedDbgWarningsForBuild(ctx, &build_env, args.opt);
     const resolved_targets_config = build_env.getPlatformTargetsConfig() orelse {
-        try renderProblem(ctx.gpa, ctx.io.stderr(), .{
+        try renderProblem(ctx, .{
             .no_platform_found = .{ .app_path = args.path },
         });
         return error.NoPlatformSource;
@@ -9424,7 +9407,7 @@ fn rocBuildEmbedded(ctx: *CliCtx, args: cli_args.BuildArgs) CliMainError!void {
     reporter.end();
 
     const targets_config = build_env.getPlatformTargetsConfig() orelse {
-        try renderProblem(ctx.gpa, ctx.io.stderr(), .{
+        try renderProblem(ctx, .{
             .no_platform_found = .{ .app_path = args.path },
         });
         return error.NoPlatformSource;
@@ -9480,7 +9463,7 @@ fn rocBuildEmbedded(ctx: *CliCtx, args: cli_args.BuildArgs) CliMainError!void {
     }
     total_warning_count += try optimizedDbgWarningsForBuild(ctx, &build_env, args.opt);
     const resolved_targets_config = build_env.getPlatformTargetsConfig() orelse {
-        try renderProblem(ctx.gpa, ctx.io.stderr(), .{
+        try renderProblem(ctx, .{
             .no_platform_found = .{ .app_path = args.path },
         });
         return error.NoPlatformSource;
@@ -12520,7 +12503,7 @@ fn rocTest(ctx: *CliCtx, args_in: cli_args.TestArgs, arg0: []const u8) RocTestEr
     const modules = try build_env.getCompiledModules(ctx.gpa);
     defer ctx.gpa.free(modules);
 
-    const report_config = try testReportingConfig(ctx);
+    const report_config = testReportingConfig(ctx);
 
     var module_results = std.ArrayList(CliModuleTestResult).empty;
     defer {
@@ -12656,30 +12639,30 @@ fn rocTest(ctx: *CliCtx, args_in: cli_args.TestArgs, arg0: []const u8) RocTestEr
     const total_tests = total.passed + total.failed + total.compiler_errors;
     try stdout.writeAll(stdout_body.written());
     try stderr.writeAll(stderr_body.written());
-    try stderr.print("Ran {} tests{s} in {d:.1}ms:\n    " ++ ansi_term.green ++ "{}" ++ ansi_term.reset ++ " passed\n    " ++ ansi_term.red ++ "{}" ++ ansi_term.reset ++ " failed\n    " ++ ansi_term.yellow ++ "{}" ++ ansi_term.reset ++ " compiler errors\n", .{ total_tests, cached_suffix, elapsed_ms, total.passed, total.failed, total.compiler_errors });
+    const green = if (report_config.shouldUseColors()) ansi_term.green else "";
+    const red = if (report_config.shouldUseColors()) ansi_term.red else "";
+    const yellow = if (report_config.shouldUseColors()) ansi_term.yellow else "";
+    const reset = if (report_config.shouldUseColors()) ansi_term.reset else "";
+    try stderr.print("Ran {} tests{s} in {d:.1}ms:\n    {s}{}{s} passed\n    {s}{}{s} failed\n    {s}{}{s} compiler errors\n", .{
+        total_tests,
+        cached_suffix,
+        elapsed_ms,
+        green,
+        total.passed,
+        reset,
+        red,
+        total.failed,
+        reset,
+        yellow,
+        total.compiler_errors,
+        reset,
+    });
 
     return error.TestsFailed;
 }
 
-fn testReportingConfig(ctx: *CliCtx) Allocator.Error!reporting.ReportingConfig {
-    var config = ctx.terminalReportConfig();
-    config.is_tty = std.Io.File.stderr().isTty(ctx.io.std_io) catch false;
-    // terminalReportConfig() forces color_preference=.always, which makes
-    // shouldUseColors() ignore is_tty entirely. Fall back to .auto so color
-    // follows the real TTY status: redirected output (pipes/files) stays
-    // uncolored while an attached terminal still gets color. The env vars
-    // below override this either way.
-    config.color_preference = .auto;
-
-    if (try envVarNonEmpty(ctx.gpa, "NO_COLOR")) {
-        config.color_preference = .never;
-    } else if (try envVarEquals(ctx.gpa, "ROC_HIGH_CONTRAST", "1")) {
-        config.color_preference = .high_contrast;
-    } else if (try envVarNonEmpty(ctx.gpa, "FORCE_COLOR")) {
-        config.color_preference = .always;
-    }
-
-    return config;
+fn testReportingConfig(ctx: *CliCtx) reporting.ReportingConfig {
+    return ctx.reportConfig(.stderr);
 }
 
 fn renderCliTestTranscriptEvents(
@@ -13545,10 +13528,9 @@ fn rocRepl(ctx: *CliCtx, repl_args: cli_args.ReplArgs) CliMainError!void {
     const stdin_is_tty = stdin.isTty(ctx.io.std_io) catch false;
     const stdout_is_tty = std.Io.File.stdout().isTty(ctx.io.std_io) catch false;
     const mode: ReplMode = if (stdin_is_tty and stdout_is_tty) .interactive else .batch;
-    const report_config = try replReportingConfig(ctx, repl_args, mode);
+    const report_config = replReportingConfig(ctx, repl_args, mode);
 
-    const no_color_env = try envVarNonEmpty(ctx.gpa, "NO_COLOR");
-    const use_color = mode == .interactive and !repl_args.no_color and !no_color_env;
+    const use_color = mode == .interactive and !repl_args.no_color and ctx.usesColor(.stdout);
 
     // The line editor handles Ctrl-C itself (press twice in a row to quit).
     // Ignore SIGINT at the process level so a Ctrl-C while the terminal is
@@ -13671,39 +13653,13 @@ fn processReplInput(
     return false;
 }
 
-fn replReportingConfig(ctx: *CliCtx, repl_args: cli_args.ReplArgs, mode: ReplMode) Allocator.Error!reporting.ReportingConfig {
-    const stderr_is_tty = std.Io.File.stderr().isTty(ctx.io.std_io) catch false;
-    const no_color_env = try envVarNonEmpty(ctx.gpa, "NO_COLOR");
-    const force_color = try envVarNonEmpty(ctx.gpa, "FORCE_COLOR");
-    const high_contrast = try envVarEquals(ctx.gpa, "ROC_HIGH_CONTRAST", "1");
-    const color_disabled = repl_args.no_color or no_color_env;
-    const should_color = !color_disabled and (force_color or (mode == .interactive and stderr_is_tty));
-
-    // Always render the box layout; when color is disabled, keep the
-    // color_terminal target but force the no-color palette so the REPL shows the
-    // same plain box as non-TTY output (rather than the old markdown layout).
-    var config = if (should_color)
-        if (high_contrast) reporting.ReportingConfig.initHighContrast() else ctx.terminalReportConfig()
-    else blk: {
-        var plain = ctx.terminalReportConfig();
-        plain.color_preference = .never;
-        break :blk plain;
-    };
-
-    config.is_tty = stderr_is_tty;
+fn replReportingConfig(ctx: *CliCtx, repl_args: cli_args.ReplArgs, mode: ReplMode) reporting.ReportingConfig {
+    const policy = ctx.colorPolicy();
+    var config = ctx.reportConfig(.stderr);
+    if (repl_args.no_color or (mode == .batch and policy.mode != .always)) {
+        config.color_preference = .never;
+    }
     return config;
-}
-
-fn envVarNonEmpty(allocator: Allocator, name: []const u8) Allocator.Error!bool {
-    const value = try getEnvVar(allocator, name) orelse return false;
-    defer allocator.free(value);
-    return value.len > 0;
-}
-
-fn envVarEquals(allocator: Allocator, name: []const u8, expected: []const u8) Allocator.Error!bool {
-    const value = try getEnvVar(allocator, name) orelse return false;
-    defer allocator.free(value);
-    return std.mem.eql(u8, value, expected);
 }
 
 const glue = @import("glue");
@@ -13869,13 +13825,10 @@ fn printBuildSuccess(
     cache_percent: u32,
 ) std.Io.Writer.Error!void {
     const stdout = ctx.io.stdout();
-    const is_tty = if (builtin.target.cpu.arch == .wasm32)
-        false
-    else
-        std.Io.File.stdout().isTty(ctx.io.std_io) catch false;
-    const green = if (is_tty) ansi_term.green else "";
-    const yellow = if (is_tty) ansi_term.yellow else "";
-    const reset = if (is_tty) ansi_term.reset else "";
+    const use_color = ctx.usesColor(.stdout);
+    const green = if (use_color) ansi_term.green else "";
+    const yellow = if (use_color) ansi_term.yellow else "";
+    const reset = if (use_color) ansi_term.reset else "";
     const warning_color = if (warning_count == 0) green else yellow;
     const warnings_word = if (warning_count == 1) "warning" else "warnings";
 
@@ -14442,10 +14395,11 @@ fn finishRocCheck(
     check_result: *CheckResult,
 ) RocCheckError!void {
     const elapsed = @as(u64, @intCast(std.Io.Timestamp.now(ctx.io.std_io, .real).nanoseconds - timer_start_ns));
+    const stderr_report_config = ctx.reportConfig(.stderr);
 
     for (check_result.reports) |module| {
         for (module.reports) |*report| {
-            try reporting.renderReportToTerminal(report, stderr, ColorPalette.ANSI, ctx.terminalReportConfig());
+            try reporting.renderReportToTerminal(report, stderr, ColorPalette.ANSI, stderr_report_config);
         }
     }
 
@@ -14454,7 +14408,7 @@ fn finishRocCheck(
     if (check_result.error_count > 0 or check_result.warning_count > 0) {
         stderr.writeAll("\n") catch {};
         stderr.writeAll("Found ") catch {};
-        writeDiagnosticCounts(stderr, check_result.error_count, check_result.warning_count, try summaryUsesColor(ctx, .stderr)) catch {};
+        writeDiagnosticCounts(stderr, check_result.error_count, check_result.warning_count, stderr_report_config.shouldUseColors()) catch {};
         stderr.writeAll(" in ") catch {};
         formatElapsedTimeMs(stderr, elapsed) catch {};
         stderr.print(" for {s}.\n", .{args.path}) catch {};
@@ -14471,7 +14425,7 @@ fn finishRocCheck(
             exitOnWarnings(ctx, check_result.warning_count);
         }
     } else {
-        writeNoErrors(stdout, try summaryUsesColor(ctx, .stdout)) catch {};
+        writeNoErrors(stdout, ctx.usesColor(.stdout)) catch {};
         stdout.writeAll(" found in ") catch {};
         formatElapsedTimeMs(stdout, elapsed) catch {};
         stdout.print(" for {s}\n", .{args.path}) catch {};
@@ -15122,6 +15076,7 @@ fn bumpCheckSide(
     side: []const u8,
 ) CliMainError!CheckResultWithBuildEnv {
     const stderr = ctx.io.stderr();
+    const report_config = ctx.reportConfig(.stderr);
     var result = checkFileWithBuildEnvPreserved(
         ctx,
         path,
@@ -15143,7 +15098,7 @@ fn bumpCheckSide(
 
     for (result.check_result.reports) |module| {
         for (module.reports) |*report| {
-            reporting.renderReportToTerminal(report, stderr, ColorPalette.ANSI, ctx.terminalReportConfig()) catch {};
+            reporting.renderReportToTerminal(report, stderr, ColorPalette.ANSI, report_config) catch {};
         }
     }
     if (result.check_result.error_count > 0) {
@@ -15361,6 +15316,7 @@ fn rocDocs(ctx: *CliCtx, args_in: cli_args.DocsArgs) CliMainError!void {
 
     const stdout = ctx.io.stdout();
     const stderr = ctx.io.stderr();
+    const report_config = ctx.reportConfig(.stderr);
 
     const timer_start_ns = std.Io.Timestamp.now(ctx.io.std_io, .real).nanoseconds;
 
@@ -15400,7 +15356,7 @@ fn rocDocs(ctx: *CliCtx, args_in: cli_args.DocsArgs) CliMainError!void {
         for (module.reports) |*report| {
 
             // Render the diagnostic report to stderr
-            reporting.renderReportToTerminal(report, stderr, ColorPalette.ANSI, ctx.terminalReportConfig()) catch |render_err| {
+            reporting.renderReportToTerminal(report, stderr, ColorPalette.ANSI, report_config) catch |render_err| {
                 stderr.print("Error rendering diagnostic report: {}", .{render_err}) catch {};
                 // Fallback to just printing the title
                 stderr.print("  {s}", .{report.title}) catch {};
