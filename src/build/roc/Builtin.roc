@@ -3783,6 +3783,36 @@ Builtin :: [].{
 					},
 			)
 
+		## Like [List.map], but the transform can fail. Runs a `Try`-returning
+		## function on each element and collects the `Ok` values. Stops at the first
+		## `Err` and returns it, so the result is either all the transformed values
+		## or the first failure.
+		## ```roc
+		## expect [1.I64, 2, 3].map_try(|n| if n < 3 { Ok(n) } else { Err(TooBig) }) == Err(TooBig)
+		## ```
+		map_try : List(a), (a -> Try(b, err)) -> Try(List(b), err)
+		map_try = |list, transform| {
+			var $out = List.with_capacity(list.len())
+			for elem in list {
+				$out = list_append_unsafe($out, transform(elem)?)
+			}
+			Ok($out)
+		}
+
+		## Like [List.map_try], but the transform is effectful. It runs on each
+		## element until one returns `Err`, then stops.
+		## ```roc
+		## rows.map_try!(|row| SQL.insert!("INSERT INTO t VALUES (?)", [row]))
+		## ```
+		map_try! : List(a), (a => Try(b, err)) => Try(List(b), err)
+		map_try! = |list, transform!| {
+			var $out = List.with_capacity(list.len())
+			for elem in list {
+				$out = list_append_unsafe($out, transform!(elem)?)
+			}
+			Ok($out)
+		}
+
 		## Build a value using each element in the list.
 		##
 		## Starting with a given `state` value, this folds through each element in the
