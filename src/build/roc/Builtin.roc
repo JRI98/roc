@@ -3813,6 +3813,39 @@ Builtin :: [].{
 			Ok($out)
 		}
 
+		## Like [List.keep_if], but the predicate can fail. Runs a `Try`-returning
+		## predicate on each element, keeping the ones it maps to `Ok(Bool.True)`.
+		## Stops at the first `Err` and returns it.
+		## ```roc
+		## expect [1.I64, 2, 3].keep_if_try(|n| Ok(n > 1)) == Ok([2, 3])
+		## ```
+		keep_if_try : List(a), (a -> Try(Bool, err)) -> Try(List(a), err)
+		keep_if_try = |list, predicate| {
+			var $out = []
+			for elem in list {
+				if predicate(elem)? {
+					$out = List.concat($out, [elem])
+				}
+			}
+			Ok($out)
+		}
+
+		## Like [List.keep_if_try], but the predicate is effectful. It runs on each
+		## element until one returns `Err`, then stops.
+		## ```roc
+		## users.keep_if_try!(|user| SQL.query_bool!("SELECT is_active FROM users WHERE id = ?", [user.id]))
+		## ```
+		keep_if_try! : List(a), (a => Try(Bool, err)) => Try(List(a), err)
+		keep_if_try! = |list, predicate!| {
+			var $out = []
+			for elem in list {
+				if predicate!(elem)? {
+					$out = List.concat($out, [elem])
+				}
+			}
+			Ok($out)
+		}
+
 		## Build a value using each element in the list.
 		##
 		## Starting with a given `state` value, this folds through each element in the
