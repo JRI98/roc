@@ -4544,7 +4544,8 @@ Builtin :: [].{
 		## If the result is `Err`, runs a recovery function on the value it holds. That
 		## function returns a new result, so recovering can itself fail — with a
 		## different error type if you like. If the result is `Ok`, this has no effect.
-		## Use [Try.map_err] when the recovery cannot fail.
+		## Use [Try.map_err] when you only want to transform the error without
+		## recovering from it.
 		## ```roc
 		## expect {
 		## 	err : Try(I64, Str)
