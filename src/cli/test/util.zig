@@ -87,7 +87,11 @@ pub const ResultCheckError = error{
 };
 
 fn reserveUniqueTestDir(io: std.Io, allocator: std.mem.Allocator, namespace: []const u8) TestDirError![]u8 {
-    const cache_parent_rel = try std.fs.path.join(allocator, &.{ ".zig-cache", "roc-test", namespace });
+    // These directories are disposable test scratch, not reusable Zig cache.
+    // Keep them out of `.zig-cache` so CI cache actions do not try to save
+    // per-test Roc caches, local Zig caches, temp files, or preserved failure
+    // work dirs.
+    const cache_parent_rel = try std.fs.path.join(allocator, &.{ "zig-out", "roc-test", namespace });
     defer allocator.free(cache_parent_rel);
 
     try std.Io.Dir.cwd().createDirPath(io, cache_parent_rel);
