@@ -518,6 +518,8 @@ pub fn LirCodeGen(comptime target: RocTarget) type {
 
         /// Readonly data symbols for non-SSO strings in object-file output.
         static_strings: []const StaticStringData.Entry,
+        /// Resolved readonly values used only by in-process native execution.
+        native_static_data: []const usize,
         /// Owned names for generated internal static-data relocation targets.
         static_data_symbol_names: std.ArrayList([]u8),
 
@@ -906,6 +908,7 @@ pub fn LirCodeGen(comptime target: RocTarget) type {
                 .store = store,
                 .layout_store = layout_store_opt,
                 .static_strings = static_strings,
+                .native_static_data = &.{},
                 .static_data_symbol_names = .empty,
                 .local_locations = std.AutoHashMap(u32, ValueLocation).init(allocator),
                 .join_points = std.AutoHashMap(u32, usize).init(allocator),
@@ -938,6 +941,10 @@ pub fn LirCodeGen(comptime target: RocTarget) type {
 
         pub fn setComptimeHooks(self: *Self, hooks: ?ComptimeHooks) void {
             self.comptime_hooks = hooks;
+        }
+
+        pub fn setNativeStaticData(self: *Self, addresses: []const usize) void {
+            self.native_static_data = addresses;
         }
 
         /// Clean up resources
@@ -5464,13 +5471,31 @@ pub fn LirCodeGen(comptime target: RocTarget) type {
             const slot = self.codegen.allocStackSlot(size);
             const src_reg = try self.allocTempGeneral();
             defer self.codegen.freeGeneral(src_reg);
-            try self.emitStaticDataAddress(src_reg, id);
+            switch (self.generation_mode) {
+                .native_execution => {
+                    const address = self.nativeStaticDataAddress(id);
+                    try self.codegen.emitLoadImm(src_reg, @bitCast(@as(u64, address)));
+                },
+                .shim_execution, .object_file => try self.emitStaticDataAddress(src_reg, id),
+            }
 
             const temp_reg = try self.allocTempGeneral();
             defer self.codegen.freeGeneral(temp_reg);
             try self.copyChunked(temp_reg, src_reg, 0, frame_ptr, slot, size);
 
             return self.stackLocationForLayout(runtime_layout, slot);
+        }
+
+        fn nativeStaticDataAddress(self: *const Self, id: lir.LIR.StaticDataId) usize {
+            const index: usize = @intFromEnum(id);
+            if (index < self.native_static_data.len) return self.native_static_data[index];
+            if (builtin.mode == .Debug) {
+                std.debug.panic(
+                    "Dev/codegen invariant violated: static data value {d} has no native address",
+                    .{@intFromEnum(id)},
+                );
+            }
+            unreachable;
         }
 
         /// Generate code for a local lookup.

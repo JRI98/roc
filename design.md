@@ -428,6 +428,29 @@ shared. Records that contain static lists should point at shared static list
 bytes; equivalent named and inline constants should produce equivalent static
 data.
 
+When checking finalization lowers a root that refers to an already-stored,
+representation-stable `ConstStore` value, it must preserve that sharing by
+emitting an explicit LIR static-data value. It must not recursively rebuild that
+value as runtime list, record, tuple, tag, box, string, or callable construction.
+Callable-containing const graphs are not representation-stable at this boundary:
+post-check specialization may replace callable identities and capture graphs, so
+they remain explicit reconstructions. Eligibility is computed by a memoized walk
+over explicit `ConstStore` edges, never inferred from runtime bytes or layout
+coincidence.
+
+Object emission, native compile-time execution, and interpreter compile-time
+execution consume the same target-layout static-data materializer. In-process
+evaluators own a relocated immutable data image and index its root addresses
+directly by compact `StaticDataId`; callable relocations carry explicit
+capture-offset metadata so the interpreter does not reconstruct ABI meaning from
+bytes or symbols. A static-data candidate is identified by its stored const node
+and concrete Monotype type; a checked type id alone cannot identify its
+representation across distinct specialization contexts. Direct LIR lowering
+deduplicates those candidates only when their concrete destination const plan and
+runtime layout also match. This preserves distinct specialized and narrowed
+representations of the same stored value while allowing each one to be emitted
+directly in the representation its consumer requires.
+
 Compile-time evaluation is allowed to fail with user diagnostics only during
 checking. After checking, stored constant data is ordinary checked output. A
 target static-data builder may decide which reachable evaluated values have a
