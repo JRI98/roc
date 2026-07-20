@@ -1752,11 +1752,7 @@ pub const InstGraph = struct {
         const ty = existing orelse return try self.monoFor(node);
         const root = self.find(node);
         const previous_root = self.monoViewNode(ty) orelse return try self.monoFor(root);
-        try self.mono_nodes.put(ty, root);
-        try self.registerMonoView(root, ty);
-        if (previous_root != root) {
-            try self.queueDirty(root);
-        }
+        if (previous_root != root) return try self.monoFor(root);
         return ty;
     }
 
@@ -2577,6 +2573,31 @@ test "record field node carries contextual row evidence into receiver" {
     try std.testing.expectEqual(@as(usize, 2), sealed_tags.len);
     try std.testing.expectEqual(emit_failed, GuardedList.at(sealed_tags, 0).name);
     try std.testing.expectEqual(exit, GuardedList.at(sealed_tags, 1).name);
+}
+
+test "monotype reuse keeps views of different roots distinct" {
+    const gpa = std.testing.allocator;
+
+    var type_store = Type.Store.init(gpa);
+    defer type_store.deinit();
+
+    var name_store = names.NameStore.init(gpa);
+    defer name_store.deinit();
+
+    var unsolved_monos = std.AutoHashMap(Type.TypeId, void).init(gpa);
+    defer unsolved_monos.deinit();
+
+    const graph = try InstGraph.create(gpa, &type_store, &name_store, &unsolved_monos);
+    defer graph.destroy();
+
+    const old_root = try graph.newNode(.{ .primitive = .u64 });
+    const new_root = try graph.newNode(.{ .primitive = .str });
+    const old_view = try graph.monoFor(old_root);
+    const new_view = try graph.monoForWithReuse(new_root, old_view);
+
+    try std.testing.expect(old_view != new_view);
+    try std.testing.expectEqual(Type.Content{ .primitive = .u64 }, type_store.get(old_view));
+    try std.testing.expectEqual(Type.Content{ .primitive = .str }, type_store.get(new_view));
 }
 
 test "alias unification does not make the alias its own backing" {
