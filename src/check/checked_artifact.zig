@@ -6197,6 +6197,15 @@ fn appendStaticDispatchTypeRoots(
                     imports,
                     store,
                     active,
+                    interpolation.dispatcher_var orelse checkedArtifactInvariant("checked interpolation expression had no static dispatch dispatcher type", .{}),
+                );
+                _ = try appendCheckedTypeRoot(
+                    allocator,
+                    module,
+                    names,
+                    imports,
+                    store,
+                    active,
                     interpolation.constraint_fn_var orelse checkedArtifactInvariant("checked interpolation expression had no static dispatch constraint type", .{}),
                 );
                 _ = try appendCheckedTypeRoot(
@@ -22752,6 +22761,9 @@ pub const DispatchEvidenceFailure = struct {
         template_plan_refs_out_of_bounds,
         template_evidence_params_out_of_bounds,
         evidence_param_path_out_of_bounds,
+        evidence_param_path_invalid_kind,
+        evidence_param_path_invalid_shape,
+        evidence_param_path_diverges_from_checked_type,
     };
 
     kind: Kind,
@@ -23137,7 +23149,7 @@ pub const CheckedModuleArtifact = struct {
     /// Manual discriminant for `SERIALIZED_VERSION_HASH`: bump to force a cache /
     /// baked-blob invalidation for a layout change the structural fingerprint below
     /// cannot observe (e.g. a semantic change to how a field is interpreted).
-    const serialized_layout_version: u32 = 24;
+    const serialized_layout_version: u32 = 25;
 
     /// Comptime fingerprint of `Serialized`'s layout, mirroring
     /// `cache_module.MODULE_ENV_VERSION_HASH`. It is appended to the baked builtin
@@ -23375,6 +23387,181 @@ pub const CheckedModuleArtifact = struct {
         return null;
     }
 
+    fn evidencePathGrammarFailure(path: []const static_dispatch.EvidencePathStep) ?DispatchEvidenceFailure.Kind {
+        var path_index: usize = 0;
+        while (path_index < path.len) {
+            const path_step = path[path_index];
+            const kind = path_step.kindOrNull() orelse return .evidence_param_path_invalid_kind;
+            path_index += 1;
+            switch (kind) {
+                .fn_ret, .alias_backing, .nominal_backing => {
+                    if (path_step.data != 0) return .evidence_param_path_invalid_shape;
+                },
+                .tag_payload_tag => {
+                    if (path_index >= path.len) return .evidence_param_path_invalid_shape;
+                    const payload_kind = path[path_index].kindOrNull() orelse return .evidence_param_path_invalid_kind;
+                    if (payload_kind != .tag_payload_index) return .evidence_param_path_invalid_shape;
+                    path_index += 1;
+                },
+                .tag_payload_index => return .evidence_param_path_invalid_shape,
+                .fn_arg, .alias_arg, .nominal_arg, .tuple_elem, .record_field => {},
+            }
+        }
+        return null;
+    }
+
+    fn checkedPayloadOrNull(view: CheckedTypeStoreView, ty: CheckedTypeId) ?CheckedTypePayload {
+        if (@intFromEnum(ty) >= view.payloadCount()) return null;
+        return view.payload(ty);
+    }
+
+    /// Resolve one logical record-field selection over the published checked
+    /// row. Aliases and row extensions are transparent producer topology; a
+    /// nominal is not, matching the durable path and Monotype consumer.
+    fn checkedEvidenceRecordFieldChild(
+        view: CheckedTypeStoreView,
+        names: *const canonical.CanonicalNameStore,
+        root: CheckedTypeId,
+        label: canonical.RecordFieldLabelId,
+    ) ?CheckedTypeId {
+        var current = root;
+        var remaining = view.payloadCount() + 1;
+        while (remaining > 0) : (remaining -= 1) {
+            switch (checkedPayloadOrNull(view, current) orelse return null) {
+                .alias => |alias| current = alias.backing,
+                .record => |record| {
+                    for (record.fields) |field| {
+                        if (names.recordFieldLabelTextEql(field.name, label)) return field.ty;
+                    }
+                    current = record.ext;
+                },
+                .record_unbound => |fields| {
+                    for (fields) |field| {
+                        if (names.recordFieldLabelTextEql(field.name, label)) return field.ty;
+                    }
+                    return null;
+                },
+                else => return null,
+            }
+        }
+        return null;
+    }
+
+    /// Resolve one logical tag-payload selection over the published checked
+    /// row, with the same alias/extension normalization as record fields.
+    fn checkedEvidenceTagPayloadChild(
+        view: CheckedTypeStoreView,
+        names: *const canonical.CanonicalNameStore,
+        root: CheckedTypeId,
+        label: canonical.TagLabelId,
+        payload_index: u32,
+    ) ?CheckedTypeId {
+        var current = root;
+        var remaining = view.payloadCount() + 1;
+        while (remaining > 0) : (remaining -= 1) {
+            switch (checkedPayloadOrNull(view, current) orelse return null) {
+                .alias => |alias| current = alias.backing,
+                .tag_union => |tag_union| {
+                    for (tag_union.tags) |tag| {
+                        if (!names.tagLabelTextEql(tag.name, label)) continue;
+                        const payloads = tag.argsSlice(view);
+                        if (payload_index >= payloads.len) return null;
+                        return payloads[payload_index];
+                    }
+                    current = tag_union.ext;
+                },
+                else => return null,
+            }
+        }
+        return null;
+    }
+
+    /// Verify that a normalized path selects a real component of the
+    /// template's published checked callable. This mirrors Monotype's path
+    /// vocabulary while resolving row labels across complete logical rows.
+    fn checkedEvidencePathResolves(
+        self: *const CheckedModuleArtifact,
+        start_ty: CheckedTypeId,
+        path: []const static_dispatch.EvidencePathStep,
+    ) bool {
+        const view = self.checked_types.view();
+        var ty = start_ty;
+        var path_index: usize = 0;
+        while (path_index < path.len) {
+            const path_step = path[path_index];
+            const kind = path_step.kindOrNull() orelse return false;
+            path_index += 1;
+            const payload = checkedPayloadOrNull(view, ty) orelse return false;
+            switch (kind) {
+                .fn_arg => switch (payload) {
+                    .function => |func| {
+                        if (path_step.data >= func.args.len) return false;
+                        ty = func.args[path_step.data];
+                    },
+                    else => return false,
+                },
+                .fn_ret => switch (payload) {
+                    .function => |func| ty = func.ret,
+                    else => return false,
+                },
+                .alias_arg => switch (payload) {
+                    .alias => |alias| {
+                        if (path_step.data >= alias.args.len) return false;
+                        ty = alias.args[path_step.data];
+                    },
+                    else => return false,
+                },
+                .alias_backing => switch (payload) {
+                    .alias => |alias| ty = alias.backing,
+                    else => return false,
+                },
+                .nominal_arg => switch (payload) {
+                    .nominal => |nominal| {
+                        if (path_step.data >= nominal.args.len) return false;
+                        ty = nominal.args[path_step.data];
+                    },
+                    else => return false,
+                },
+                .nominal_backing => switch (payload) {
+                    .nominal => |nominal| ty = view.nominalBackingTemplateForPayload(nominal) orelse return false,
+                    else => return false,
+                },
+                .tuple_elem => switch (payload) {
+                    .tuple => |elems| {
+                        if (path_step.data >= elems.len) return false;
+                        ty = elems[path_step.data];
+                    },
+                    else => return false,
+                },
+                .record_field => {
+                    if (path_step.data >= self.canonical_names.recordFieldLabelCount()) return false;
+                    ty = checkedEvidenceRecordFieldChild(
+                        view,
+                        &self.canonical_names,
+                        ty,
+                        @enumFromInt(path_step.data),
+                    ) orelse return false;
+                },
+                .tag_payload_tag => {
+                    if (path_index >= path.len) return false;
+                    const payload_step = path[path_index];
+                    if (payload_step.kindOrNull() != .tag_payload_index) return false;
+                    path_index += 1;
+                    if (path_step.data >= self.canonical_names.tagLabelCount()) return false;
+                    ty = checkedEvidenceTagPayloadChild(
+                        view,
+                        &self.canonical_names,
+                        ty,
+                        @enumFromInt(path_step.data),
+                        payload_step.data,
+                    ) orelse return false;
+                },
+                .tag_payload_index => return false,
+            }
+        }
+        return true;
+    }
+
     /// Public `validateDispatchEvidence` function.
     ///
     /// Dispatch-evidence totality at the check/postcheck boundary: every
@@ -23480,6 +23667,24 @@ pub const CheckedModuleArtifact = struct {
         for (templates.evidence_params_pool, 0..) |param, i| {
             if (@as(u64, param.path.start) + param.path.len > templates.evidence_param_paths.len) {
                 return .{ .kind = .evidence_param_path_out_of_bounds, .index = @intCast(i), .method = param.method };
+            }
+            const path = templates.evidenceParamPath(param);
+            if (evidencePathGrammarFailure(path)) |kind| {
+                return .{ .kind = kind, .index = @intCast(i), .method = param.method };
+            }
+        }
+        for (templates.templates) |template| {
+            const params = templates.evidenceParams(&template);
+            for (params, 0..) |param, param_offset| {
+                const path = templates.evidenceParamPath(param);
+                if (path.len == 0) continue;
+                if (!self.checkedEvidencePathResolves(template.checked_fn_root, path)) {
+                    return .{
+                        .kind = .evidence_param_path_diverges_from_checked_type,
+                        .index = template.evidence_params.start + @as(u32, @intCast(param_offset)),
+                        .method = param.method,
+                    };
+                }
             }
         }
 
@@ -27750,8 +27955,8 @@ test "SERIALIZED_VERSION_HASH golden value" {
     // change, bump `serialized_layout_version` and replace the golden bytes below with
     // the ones this assertion prints.
     const golden: [32]u8 = .{
-        0x6A, 0x38, 0x1B, 0x6C, 0x78, 0x7F, 0x16, 0xA6, 0x0E, 0x22, 0x6A, 0xEE, 0x36, 0xF1, 0x13, 0x36,
-        0x78, 0x77, 0x71, 0xD2, 0x9D, 0x19, 0xB6, 0x80, 0x73, 0x8D, 0xE3, 0x5D, 0x02, 0x71, 0xC0, 0xFB,
+        0x84, 0x42, 0x29, 0x9E, 0x9F, 0xCB, 0x4F, 0x12, 0x90, 0x16, 0xFF, 0xCD, 0xD2, 0x5B, 0xE9, 0x3D,
+        0xEC, 0x53, 0x60, 0x36, 0xD8, 0x87, 0xA6, 0xC8, 0xDA, 0x78, 0x1E, 0x70, 0x40, 0x96, 0x4F, 0x03,
     };
     try std.testing.expectEqualSlices(u8, &golden, &CheckedModuleArtifact.SERIALIZED_VERSION_HASH);
 }
