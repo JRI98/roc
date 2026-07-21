@@ -2832,6 +2832,10 @@ pub const MonoLlvmCodeGen = struct {
             .num_bitwise_xor,
             => try self.emitNumericBinary(target, op, arg_locals),
             .num_bitwise_not => try self.emitNumericBitwiseNot(target, GuardedList.at(arg_locals, 0)),
+            .num_count_one_bits,
+            .num_count_leading_zero_bits,
+            .num_count_trailing_zero_bits,
+            => try self.emitNumericBitCount(target, op, GuardedList.at(arg_locals, 0)),
             .num_negate, .num_negate_checked => try self.emitNumericNegate(target, op, GuardedList.at(arg_locals, 0)),
             .num_abs, .num_abs_checked => try self.emitNumericAbs(target, op, GuardedList.at(arg_locals, 0)),
             .num_abs_diff => try self.emitNumericAbsDiff(target, arg_locals),
@@ -3491,6 +3495,49 @@ pub const MonoLlvmCodeGen = struct {
         const target_layout = self.localLayout(target);
         const value = try self.loadScalar(self.slot(arg).ptr, self.localLayout(arg));
         const result = wip.not(value, "") catch return error.OutOfMemory;
+        try self.storeScalar(self.slot(target).ptr, target_layout, result);
+    }
+
+    /// Lower a bit-counting op (`count_one_bits`/`count_leading_zero_bits`/
+    /// `count_trailing_zero_bits`) to the corresponding LLVM intrinsic on the
+    /// operand's integer type (i8..i128; LLVM legalizes i128 itself). The
+    /// ctlz/cttz `is_zero_poison` flag is FALSE so a zero operand yields the
+    /// bit width, matching the spec. The intrinsic result has the operand's
+    /// width; `storeScalar` truncates it to the declared U8 return.
+    fn emitNumericBitCount(self: *MonoLlvmCodeGen, target: LocalId, op: lir.LowLevel, arg: LocalId) Error!void {
+        const builder = self.builder orelse return error.CompilationFailed;
+        const wip = self.wip orelse return error.CompilationFailed;
+        const target_layout = self.localLayout(target);
+        const value = try self.loadScalar(self.slot(arg).ptr, self.localLayout(arg));
+        const value_ty = value.typeOfWip(wip);
+        const zero_is_not_poison = builder.intValue(.i1, 0) catch return error.OutOfMemory;
+        const result = switch (op) {
+            .num_count_one_bits => wip.callIntrinsic(
+                .normal,
+                .none,
+                .ctpop,
+                &.{value_ty},
+                &.{value},
+                "",
+            ) catch return error.OutOfMemory,
+            .num_count_leading_zero_bits => wip.callIntrinsic(
+                .normal,
+                .none,
+                .ctlz,
+                &.{value_ty},
+                &.{ value, zero_is_not_poison },
+                "",
+            ) catch return error.OutOfMemory,
+            .num_count_trailing_zero_bits => wip.callIntrinsic(
+                .normal,
+                .none,
+                .cttz,
+                &.{value_ty},
+                &.{ value, zero_is_not_poison },
+                "",
+            ) catch return error.OutOfMemory,
+            else => unreachable,
+        };
         try self.storeScalar(self.slot(target).ptr, target_layout, result);
     }
 

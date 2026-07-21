@@ -5523,6 +5523,11 @@ pub const Interpreter = struct {
             .num_bitwise_xor => self.numBitwiseOp(args[0], args[1], ll.ret_layout, arg_layout, .xor),
             .num_bitwise_not => self.numBitwiseOp(args[0], args[0], ll.ret_layout, arg_layout, .not),
 
+            // ── Bit counting (result is always U8) ──
+            .num_count_one_bits => self.numBitCountOp(args[0], ll.ret_layout, arg_layout, .count_ones),
+            .num_count_leading_zero_bits => self.numBitCountOp(args[0], ll.ret_layout, arg_layout, .count_leading_zeros),
+            .num_count_trailing_zero_bits => self.numBitCountOp(args[0], ll.ret_layout, arg_layout, .count_trailing_zeros),
+
             // ── Comparison ──
             .num_is_eq => self.numCmpOp(args[0], args[1], arg_layout, .eq),
             .num_is_lt => self.numCmpOp(args[0], args[1], arg_layout, .lt),
@@ -6097,6 +6102,7 @@ pub const Interpreter = struct {
     const CmpOp = enum { eq, lt, lte, gt, gte };
     const ShiftOp = enum { shl, shr, shr_zf };
     const BitwiseOp = enum { @"and", @"or", xor, not };
+    const BitCountOp = enum { count_ones, count_leading_zeros, count_trailing_zeros };
     const NumericOperandKind = union(enum) {
         unsigned_int: u16,
         signed_int: u16,
@@ -6437,6 +6443,33 @@ pub const Interpreter = struct {
                 .{@intFromEnum(arg_layout)},
             ),
         }
+        return val;
+    }
+
+    /// Count one/leading-zero/trailing-zero bits of an integer operand. The
+    /// result is always a U8, independent of the operand width. Zig's
+    /// `@clz`/`@ctz` return the bit width for a zero input, matching the spec
+    /// (leading/trailing-zero of 0 == the operand's bit width).
+    fn numBitCountOp(self: *LirInterpreter, a: Value, ret_layout: layout_mod.Idx, arg_layout: layout_mod.Idx, op: BitCountOp) Error!Value {
+        const val = try self.alloc(ret_layout);
+        const count: u8 = switch (try self.numericOperandKind(arg_layout)) {
+            // Bit counting reads the two's-complement bit pattern, so the
+            // operand's signedness does not affect the result; read each width
+            // as its unsigned counterpart.
+            .unsigned_int, .signed_int => |bits| switch (bits) {
+                8 => bitCount(u8, a.read(u8), op),
+                16 => bitCount(u16, a.read(u16), op),
+                32 => bitCount(u32, a.read(u32), op),
+                64 => bitCount(u64, a.read(u64), op),
+                128 => bitCount(u128, a.read(u128), op),
+                else => return self.invariantFailedError("LIR/interpreter invariant violated: unsupported integer bit-count width {d}", .{bits}),
+            },
+            .float, .dec => return self.invariantFailedError(
+                "LIR/interpreter invariant violated: bit count used non-integer layout {d}",
+                .{@intFromEnum(arg_layout)},
+            ),
+        };
+        val.write(u8, count);
         return val;
     }
 
@@ -7259,6 +7292,14 @@ pub const Interpreter = struct {
             .@"or" => av | bv,
             .xor => av ^ bv,
             .not => ~av,
+        };
+    }
+
+    fn bitCount(comptime T: type, av: T, op: BitCountOp) u8 {
+        return switch (op) {
+            .count_ones => @popCount(av),
+            .count_leading_zeros => @clz(av),
+            .count_trailing_zeros => @ctz(av),
         };
     }
 

@@ -169,6 +169,12 @@ pub const LowLevel = enum(u16) {
     num_bitwise_xor,
     num_bitwise_not,
 
+    // Bit-counting operations (integer types only). Each takes an integer
+    // operand and returns a U8, regardless of the operand's width.
+    num_count_one_bits,
+    num_count_leading_zero_bits,
+    num_count_trailing_zero_bits,
+
     // Numeric parsing operations
     u8_from_str,
     i8_from_str,
@@ -864,6 +870,9 @@ pub const LowLevel = enum(u16) {
             .num_bitwise_or,
             .num_bitwise_xor,
             .num_bitwise_not,
+            .num_count_one_bits,
+            .num_count_leading_zero_bits,
+            .num_count_trailing_zero_bits,
             .u8_from_str,
             .i8_from_str,
             .u16_from_str,

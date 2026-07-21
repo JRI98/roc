@@ -4937,4 +4937,1264 @@ pub const tests = [_]TestCase{
         ,
         .expected = .{ .inspect_str = "\"rat\"" },
     },
+    .{
+        .name = "low_level - U8.count_one_bits zero",
+        .source =
+        \\{
+        \\a : U8
+        \\a = 0
+        \\x = a.count_one_bits()
+        \\x
+        \\}
+        ,
+        .expected = .{ .inspect_str = "0" },
+    },
+    .{
+        .name = "low_level - U8.count_leading_zero_bits zero",
+        .source =
+        \\{
+        \\a : U8
+        \\a = 0
+        \\x = a.count_leading_zero_bits()
+        \\x
+        \\}
+        ,
+        .expected = .{ .inspect_str = "8" },
+    },
+    .{
+        .name = "low_level - U8.count_trailing_zero_bits zero",
+        .source =
+        \\{
+        \\a : U8
+        \\a = 0
+        \\x = a.count_trailing_zero_bits()
+        \\x
+        \\}
+        ,
+        .expected = .{ .inspect_str = "8" },
+    },
+    .{
+        .name = "low_level - U8.count_one_bits all_ones",
+        .source =
+        \\{
+        \\a : U8
+        \\a = 255
+        \\x = a.count_one_bits()
+        \\x
+        \\}
+        ,
+        .expected = .{ .inspect_str = "8" },
+    },
+    .{
+        .name = "low_level - U8.count_leading_zero_bits all_ones",
+        .source =
+        \\{
+        \\a : U8
+        \\a = 255
+        \\x = a.count_leading_zero_bits()
+        \\x
+        \\}
+        ,
+        .expected = .{ .inspect_str = "0" },
+    },
+    .{
+        .name = "low_level - U8.count_trailing_zero_bits all_ones",
+        .source =
+        \\{
+        \\a : U8
+        \\a = 255
+        \\x = a.count_trailing_zero_bits()
+        \\x
+        \\}
+        ,
+        .expected = .{ .inspect_str = "0" },
+    },
+    .{
+        .name = "low_level - U8.count_one_bits one",
+        .source =
+        \\{
+        \\a : U8
+        \\a = 1
+        \\x = a.count_one_bits()
+        \\x
+        \\}
+        ,
+        .expected = .{ .inspect_str = "1" },
+    },
+    .{
+        .name = "low_level - U8.count_leading_zero_bits one",
+        .source =
+        \\{
+        \\a : U8
+        \\a = 1
+        \\x = a.count_leading_zero_bits()
+        \\x
+        \\}
+        ,
+        .expected = .{ .inspect_str = "7" },
+    },
+    .{
+        .name = "low_level - U8.count_trailing_zero_bits one",
+        .source =
+        \\{
+        \\a : U8
+        \\a = 1
+        \\x = a.count_trailing_zero_bits()
+        \\x
+        \\}
+        ,
+        .expected = .{ .inspect_str = "0" },
+    },
+    .{
+        .name = "low_level - U8.count_one_bits top_bit",
+        .source =
+        \\{
+        \\a : U8
+        \\a = 128
+        \\x = a.count_one_bits()
+        \\x
+        \\}
+        ,
+        .expected = .{ .inspect_str = "1" },
+    },
+    .{
+        .name = "low_level - U8.count_leading_zero_bits top_bit",
+        .source =
+        \\{
+        \\a : U8
+        \\a = 128
+        \\x = a.count_leading_zero_bits()
+        \\x
+        \\}
+        ,
+        .expected = .{ .inspect_str = "0" },
+    },
+    .{
+        .name = "low_level - U8.count_trailing_zero_bits top_bit",
+        .source =
+        \\{
+        \\a : U8
+        \\a = 128
+        \\x = a.count_trailing_zero_bits()
+        \\x
+        \\}
+        ,
+        .expected = .{ .inspect_str = "7" },
+    },
+    .{
+        .name = "low_level - U8.count_one_bits mixed",
+        .source =
+        \\{
+        \\a : U8
+        \\a = 44
+        \\x = a.count_one_bits()
+        \\x
+        \\}
+        ,
+        .expected = .{ .inspect_str = "3" },
+    },
+    .{
+        .name = "low_level - U8.count_leading_zero_bits mixed",
+        .source =
+        \\{
+        \\a : U8
+        \\a = 44
+        \\x = a.count_leading_zero_bits()
+        \\x
+        \\}
+        ,
+        .expected = .{ .inspect_str = "2" },
+    },
+    .{
+        .name = "low_level - U8.count_trailing_zero_bits mixed",
+        .source =
+        \\{
+        \\a : U8
+        \\a = 44
+        \\x = a.count_trailing_zero_bits()
+        \\x
+        \\}
+        ,
+        .expected = .{ .inspect_str = "2" },
+    },
+    .{
+        .name = "low_level - U16.count_one_bits zero",
+        .source =
+        \\{
+        \\a : U16
+        \\a = 0
+        \\x = a.count_one_bits()
+        \\x
+        \\}
+        ,
+        .expected = .{ .inspect_str = "0" },
+    },
+    .{
+        .name = "low_level - U16.count_leading_zero_bits zero",
+        .source =
+        \\{
+        \\a : U16
+        \\a = 0
+        \\x = a.count_leading_zero_bits()
+        \\x
+        \\}
+        ,
+        .expected = .{ .inspect_str = "16" },
+    },
+    .{
+        .name = "low_level - U16.count_trailing_zero_bits zero",
+        .source =
+        \\{
+        \\a : U16
+        \\a = 0
+        \\x = a.count_trailing_zero_bits()
+        \\x
+        \\}
+        ,
+        .expected = .{ .inspect_str = "16" },
+    },
+    .{
+        .name = "low_level - U16.count_one_bits all_ones",
+        .source =
+        \\{
+        \\a : U16
+        \\a = 65535
+        \\x = a.count_one_bits()
+        \\x
+        \\}
+        ,
+        .expected = .{ .inspect_str = "16" },
+    },
+    .{
+        .name = "low_level - U16.count_leading_zero_bits all_ones",
+        .source =
+        \\{
+        \\a : U16
+        \\a = 65535
+        \\x = a.count_leading_zero_bits()
+        \\x
+        \\}
+        ,
+        .expected = .{ .inspect_str = "0" },
+    },
+    .{
+        .name = "low_level - U16.count_trailing_zero_bits all_ones",
+        .source =
+        \\{
+        \\a : U16
+        \\a = 65535
+        \\x = a.count_trailing_zero_bits()
+        \\x
+        \\}
+        ,
+        .expected = .{ .inspect_str = "0" },
+    },
+    .{
+        .name = "low_level - U16.count_one_bits one",
+        .source =
+        \\{
+        \\a : U16
+        \\a = 1
+        \\x = a.count_one_bits()
+        \\x
+        \\}
+        ,
+        .expected = .{ .inspect_str = "1" },
+    },
+    .{
+        .name = "low_level - U16.count_leading_zero_bits one",
+        .source =
+        \\{
+        \\a : U16
+        \\a = 1
+        \\x = a.count_leading_zero_bits()
+        \\x
+        \\}
+        ,
+        .expected = .{ .inspect_str = "15" },
+    },
+    .{
+        .name = "low_level - U16.count_trailing_zero_bits one",
+        .source =
+        \\{
+        \\a : U16
+        \\a = 1
+        \\x = a.count_trailing_zero_bits()
+        \\x
+        \\}
+        ,
+        .expected = .{ .inspect_str = "0" },
+    },
+    .{
+        .name = "low_level - U16.count_one_bits top_bit",
+        .source =
+        \\{
+        \\a : U16
+        \\a = 32768
+        \\x = a.count_one_bits()
+        \\x
+        \\}
+        ,
+        .expected = .{ .inspect_str = "1" },
+    },
+    .{
+        .name = "low_level - U16.count_leading_zero_bits top_bit",
+        .source =
+        \\{
+        \\a : U16
+        \\a = 32768
+        \\x = a.count_leading_zero_bits()
+        \\x
+        \\}
+        ,
+        .expected = .{ .inspect_str = "0" },
+    },
+    .{
+        .name = "low_level - U16.count_trailing_zero_bits top_bit",
+        .source =
+        \\{
+        \\a : U16
+        \\a = 32768
+        \\x = a.count_trailing_zero_bits()
+        \\x
+        \\}
+        ,
+        .expected = .{ .inspect_str = "15" },
+    },
+    .{
+        .name = "low_level - U16.count_one_bits mixed",
+        .source =
+        \\{
+        \\a : U16
+        \\a = 3840
+        \\x = a.count_one_bits()
+        \\x
+        \\}
+        ,
+        .expected = .{ .inspect_str = "4" },
+    },
+    .{
+        .name = "low_level - U16.count_leading_zero_bits mixed",
+        .source =
+        \\{
+        \\a : U16
+        \\a = 3840
+        \\x = a.count_leading_zero_bits()
+        \\x
+        \\}
+        ,
+        .expected = .{ .inspect_str = "4" },
+    },
+    .{
+        .name = "low_level - U16.count_trailing_zero_bits mixed",
+        .source =
+        \\{
+        \\a : U16
+        \\a = 3840
+        \\x = a.count_trailing_zero_bits()
+        \\x
+        \\}
+        ,
+        .expected = .{ .inspect_str = "8" },
+    },
+    .{
+        .name = "low_level - U32.count_one_bits zero",
+        .source =
+        \\{
+        \\a : U32
+        \\a = 0
+        \\x = a.count_one_bits()
+        \\x
+        \\}
+        ,
+        .expected = .{ .inspect_str = "0" },
+    },
+    .{
+        .name = "low_level - U32.count_leading_zero_bits zero",
+        .source =
+        \\{
+        \\a : U32
+        \\a = 0
+        \\x = a.count_leading_zero_bits()
+        \\x
+        \\}
+        ,
+        .expected = .{ .inspect_str = "32" },
+    },
+    .{
+        .name = "low_level - U32.count_trailing_zero_bits zero",
+        .source =
+        \\{
+        \\a : U32
+        \\a = 0
+        \\x = a.count_trailing_zero_bits()
+        \\x
+        \\}
+        ,
+        .expected = .{ .inspect_str = "32" },
+    },
+    .{
+        .name = "low_level - U32.count_one_bits one",
+        .source =
+        \\{
+        \\a : U32
+        \\a = 1
+        \\x = a.count_one_bits()
+        \\x
+        \\}
+        ,
+        .expected = .{ .inspect_str = "1" },
+    },
+    .{
+        .name = "low_level - U32.count_leading_zero_bits one",
+        .source =
+        \\{
+        \\a : U32
+        \\a = 1
+        \\x = a.count_leading_zero_bits()
+        \\x
+        \\}
+        ,
+        .expected = .{ .inspect_str = "31" },
+    },
+    .{
+        .name = "low_level - U32.count_trailing_zero_bits one",
+        .source =
+        \\{
+        \\a : U32
+        \\a = 1
+        \\x = a.count_trailing_zero_bits()
+        \\x
+        \\}
+        ,
+        .expected = .{ .inspect_str = "0" },
+    },
+    .{
+        .name = "low_level - U32.count_one_bits top_bit",
+        .source =
+        \\{
+        \\a : U32
+        \\a = 2147483648
+        \\x = a.count_one_bits()
+        \\x
+        \\}
+        ,
+        .expected = .{ .inspect_str = "1" },
+    },
+    .{
+        .name = "low_level - U32.count_leading_zero_bits top_bit",
+        .source =
+        \\{
+        \\a : U32
+        \\a = 2147483648
+        \\x = a.count_leading_zero_bits()
+        \\x
+        \\}
+        ,
+        .expected = .{ .inspect_str = "0" },
+    },
+    .{
+        .name = "low_level - U32.count_trailing_zero_bits top_bit",
+        .source =
+        \\{
+        \\a : U32
+        \\a = 2147483648
+        \\x = a.count_trailing_zero_bits()
+        \\x
+        \\}
+        ,
+        .expected = .{ .inspect_str = "31" },
+    },
+    .{
+        .name = "low_level - U32.count_one_bits mixed",
+        .source =
+        \\{
+        \\a : U32
+        \\a = 255
+        \\x = a.count_one_bits()
+        \\x
+        \\}
+        ,
+        .expected = .{ .inspect_str = "8" },
+    },
+    .{
+        .name = "low_level - U32.count_leading_zero_bits mixed",
+        .source =
+        \\{
+        \\a : U32
+        \\a = 255
+        \\x = a.count_leading_zero_bits()
+        \\x
+        \\}
+        ,
+        .expected = .{ .inspect_str = "24" },
+    },
+    .{
+        .name = "low_level - U32.count_trailing_zero_bits mixed",
+        .source =
+        \\{
+        \\a : U32
+        \\a = 255
+        \\x = a.count_trailing_zero_bits()
+        \\x
+        \\}
+        ,
+        .expected = .{ .inspect_str = "0" },
+    },
+    .{
+        .name = "low_level - U64.count_one_bits zero",
+        .source =
+        \\{
+        \\a : U64
+        \\a = 0
+        \\x = a.count_one_bits()
+        \\x
+        \\}
+        ,
+        .expected = .{ .inspect_str = "0" },
+    },
+    .{
+        .name = "low_level - U64.count_leading_zero_bits zero",
+        .source =
+        \\{
+        \\a : U64
+        \\a = 0
+        \\x = a.count_leading_zero_bits()
+        \\x
+        \\}
+        ,
+        .expected = .{ .inspect_str = "64" },
+    },
+    .{
+        .name = "low_level - U64.count_trailing_zero_bits zero",
+        .source =
+        \\{
+        \\a : U64
+        \\a = 0
+        \\x = a.count_trailing_zero_bits()
+        \\x
+        \\}
+        ,
+        .expected = .{ .inspect_str = "64" },
+    },
+    .{
+        .name = "low_level - U64.count_one_bits all_ones",
+        .source =
+        \\{
+        \\a : U64
+        \\a = 18446744073709551615
+        \\x = a.count_one_bits()
+        \\x
+        \\}
+        ,
+        .expected = .{ .inspect_str = "64" },
+    },
+    .{
+        .name = "low_level - U64.count_leading_zero_bits all_ones",
+        .source =
+        \\{
+        \\a : U64
+        \\a = 18446744073709551615
+        \\x = a.count_leading_zero_bits()
+        \\x
+        \\}
+        ,
+        .expected = .{ .inspect_str = "0" },
+    },
+    .{
+        .name = "low_level - U64.count_trailing_zero_bits all_ones",
+        .source =
+        \\{
+        \\a : U64
+        \\a = 18446744073709551615
+        \\x = a.count_trailing_zero_bits()
+        \\x
+        \\}
+        ,
+        .expected = .{ .inspect_str = "0" },
+    },
+    .{
+        .name = "low_level - U64.count_one_bits one",
+        .source =
+        \\{
+        \\a : U64
+        \\a = 1
+        \\x = a.count_one_bits()
+        \\x
+        \\}
+        ,
+        .expected = .{ .inspect_str = "1" },
+    },
+    .{
+        .name = "low_level - U64.count_leading_zero_bits one",
+        .source =
+        \\{
+        \\a : U64
+        \\a = 1
+        \\x = a.count_leading_zero_bits()
+        \\x
+        \\}
+        ,
+        .expected = .{ .inspect_str = "63" },
+    },
+    .{
+        .name = "low_level - U64.count_trailing_zero_bits one",
+        .source =
+        \\{
+        \\a : U64
+        \\a = 1
+        \\x = a.count_trailing_zero_bits()
+        \\x
+        \\}
+        ,
+        .expected = .{ .inspect_str = "0" },
+    },
+    .{
+        .name = "low_level - U64.count_one_bits top_bit",
+        .source =
+        \\{
+        \\a : U64
+        \\a = 9223372036854775808
+        \\x = a.count_one_bits()
+        \\x
+        \\}
+        ,
+        .expected = .{ .inspect_str = "1" },
+    },
+    .{
+        .name = "low_level - U64.count_leading_zero_bits top_bit",
+        .source =
+        \\{
+        \\a : U64
+        \\a = 9223372036854775808
+        \\x = a.count_leading_zero_bits()
+        \\x
+        \\}
+        ,
+        .expected = .{ .inspect_str = "0" },
+    },
+    .{
+        .name = "low_level - U64.count_trailing_zero_bits top_bit",
+        .source =
+        \\{
+        \\a : U64
+        \\a = 9223372036854775808
+        \\x = a.count_trailing_zero_bits()
+        \\x
+        \\}
+        ,
+        .expected = .{ .inspect_str = "63" },
+    },
+    .{
+        .name = "low_level - I8.count_one_bits zero",
+        .source =
+        \\{
+        \\a : I8
+        \\a = 0
+        \\x = a.count_one_bits()
+        \\x
+        \\}
+        ,
+        .expected = .{ .inspect_str = "0" },
+    },
+    .{
+        .name = "low_level - I8.count_leading_zero_bits zero",
+        .source =
+        \\{
+        \\a : I8
+        \\a = 0
+        \\x = a.count_leading_zero_bits()
+        \\x
+        \\}
+        ,
+        .expected = .{ .inspect_str = "8" },
+    },
+    .{
+        .name = "low_level - I8.count_trailing_zero_bits zero",
+        .source =
+        \\{
+        \\a : I8
+        \\a = 0
+        \\x = a.count_trailing_zero_bits()
+        \\x
+        \\}
+        ,
+        .expected = .{ .inspect_str = "8" },
+    },
+    .{
+        .name = "low_level - I8.count_one_bits neg_one",
+        .source =
+        \\{
+        \\a : I8
+        \\a = -1
+        \\x = a.count_one_bits()
+        \\x
+        \\}
+        ,
+        .expected = .{ .inspect_str = "8" },
+    },
+    .{
+        .name = "low_level - I8.count_leading_zero_bits neg_one",
+        .source =
+        \\{
+        \\a : I8
+        \\a = -1
+        \\x = a.count_leading_zero_bits()
+        \\x
+        \\}
+        ,
+        .expected = .{ .inspect_str = "0" },
+    },
+    .{
+        .name = "low_level - I8.count_trailing_zero_bits neg_one",
+        .source =
+        \\{
+        \\a : I8
+        \\a = -1
+        \\x = a.count_trailing_zero_bits()
+        \\x
+        \\}
+        ,
+        .expected = .{ .inspect_str = "0" },
+    },
+    .{
+        .name = "low_level - I8.count_one_bits min",
+        .source =
+        \\{
+        \\a : I8
+        \\a = -128
+        \\x = a.count_one_bits()
+        \\x
+        \\}
+        ,
+        .expected = .{ .inspect_str = "1" },
+    },
+    .{
+        .name = "low_level - I8.count_leading_zero_bits min",
+        .source =
+        \\{
+        \\a : I8
+        \\a = -128
+        \\x = a.count_leading_zero_bits()
+        \\x
+        \\}
+        ,
+        .expected = .{ .inspect_str = "0" },
+    },
+    .{
+        .name = "low_level - I8.count_trailing_zero_bits min",
+        .source =
+        \\{
+        \\a : I8
+        \\a = -128
+        \\x = a.count_trailing_zero_bits()
+        \\x
+        \\}
+        ,
+        .expected = .{ .inspect_str = "7" },
+    },
+    .{
+        .name = "low_level - I8.count_one_bits one",
+        .source =
+        \\{
+        \\a : I8
+        \\a = 1
+        \\x = a.count_one_bits()
+        \\x
+        \\}
+        ,
+        .expected = .{ .inspect_str = "1" },
+    },
+    .{
+        .name = "low_level - I8.count_leading_zero_bits one",
+        .source =
+        \\{
+        \\a : I8
+        \\a = 1
+        \\x = a.count_leading_zero_bits()
+        \\x
+        \\}
+        ,
+        .expected = .{ .inspect_str = "7" },
+    },
+    .{
+        .name = "low_level - I8.count_trailing_zero_bits one",
+        .source =
+        \\{
+        \\a : I8
+        \\a = 1
+        \\x = a.count_trailing_zero_bits()
+        \\x
+        \\}
+        ,
+        .expected = .{ .inspect_str = "0" },
+    },
+    .{
+        .name = "low_level - I8.count_one_bits mixed_neg",
+        .source =
+        \\{
+        \\a : I8
+        \\a = -8
+        \\x = a.count_one_bits()
+        \\x
+        \\}
+        ,
+        .expected = .{ .inspect_str = "5" },
+    },
+    .{
+        .name = "low_level - I8.count_leading_zero_bits mixed_neg",
+        .source =
+        \\{
+        \\a : I8
+        \\a = -8
+        \\x = a.count_leading_zero_bits()
+        \\x
+        \\}
+        ,
+        .expected = .{ .inspect_str = "0" },
+    },
+    .{
+        .name = "low_level - I8.count_trailing_zero_bits mixed_neg",
+        .source =
+        \\{
+        \\a : I8
+        \\a = -8
+        \\x = a.count_trailing_zero_bits()
+        \\x
+        \\}
+        ,
+        .expected = .{ .inspect_str = "3" },
+    },
+    .{
+        .name = "low_level - I64.count_one_bits zero",
+        .source =
+        \\{
+        \\a : I64
+        \\a = 0
+        \\x = a.count_one_bits()
+        \\x
+        \\}
+        ,
+        .expected = .{ .inspect_str = "0" },
+    },
+    .{
+        .name = "low_level - I64.count_leading_zero_bits zero",
+        .source =
+        \\{
+        \\a : I64
+        \\a = 0
+        \\x = a.count_leading_zero_bits()
+        \\x
+        \\}
+        ,
+        .expected = .{ .inspect_str = "64" },
+    },
+    .{
+        .name = "low_level - I64.count_trailing_zero_bits zero",
+        .source =
+        \\{
+        \\a : I64
+        \\a = 0
+        \\x = a.count_trailing_zero_bits()
+        \\x
+        \\}
+        ,
+        .expected = .{ .inspect_str = "64" },
+    },
+    .{
+        .name = "low_level - I64.count_one_bits neg_one",
+        .source =
+        \\{
+        \\a : I64
+        \\a = -1
+        \\x = a.count_one_bits()
+        \\x
+        \\}
+        ,
+        .expected = .{ .inspect_str = "64" },
+    },
+    .{
+        .name = "low_level - I64.count_leading_zero_bits neg_one",
+        .source =
+        \\{
+        \\a : I64
+        \\a = -1
+        \\x = a.count_leading_zero_bits()
+        \\x
+        \\}
+        ,
+        .expected = .{ .inspect_str = "0" },
+    },
+    .{
+        .name = "low_level - I64.count_trailing_zero_bits neg_one",
+        .source =
+        \\{
+        \\a : I64
+        \\a = -1
+        \\x = a.count_trailing_zero_bits()
+        \\x
+        \\}
+        ,
+        .expected = .{ .inspect_str = "0" },
+    },
+    .{
+        .name = "low_level - I64.count_one_bits mixed_neg",
+        .source =
+        \\{
+        \\a : I64
+        \\a = -2
+        \\x = a.count_one_bits()
+        \\x
+        \\}
+        ,
+        .expected = .{ .inspect_str = "63" },
+    },
+    .{
+        .name = "low_level - I64.count_leading_zero_bits mixed_neg",
+        .source =
+        \\{
+        \\a : I64
+        \\a = -2
+        \\x = a.count_leading_zero_bits()
+        \\x
+        \\}
+        ,
+        .expected = .{ .inspect_str = "0" },
+    },
+    .{
+        .name = "low_level - I64.count_trailing_zero_bits mixed_neg",
+        .source =
+        \\{
+        \\a : I64
+        \\a = -2
+        \\x = a.count_trailing_zero_bits()
+        \\x
+        \\}
+        ,
+        .expected = .{ .inspect_str = "1" },
+    },
+    .{
+        .name = "low_level - U128.count_one_bits zero",
+        .source =
+        \\{
+        \\a : U128
+        \\a = 0
+        \\x = a.count_one_bits()
+        \\x
+        \\}
+        ,
+        .expected = .{ .inspect_str = "0" },
+    },
+    .{
+        .name = "low_level - U128.count_leading_zero_bits zero",
+        .source =
+        \\{
+        \\a : U128
+        \\a = 0
+        \\x = a.count_leading_zero_bits()
+        \\x
+        \\}
+        ,
+        .expected = .{ .inspect_str = "128" },
+    },
+    .{
+        .name = "low_level - U128.count_trailing_zero_bits zero",
+        .source =
+        \\{
+        \\a : U128
+        \\a = 0
+        \\x = a.count_trailing_zero_bits()
+        \\x
+        \\}
+        ,
+        .expected = .{ .inspect_str = "128" },
+    },
+    .{
+        .name = "low_level - U128.count_one_bits all_ones",
+        .source =
+        \\{
+        \\a : U128
+        \\a = 340282366920938463463374607431768211455
+        \\x = a.count_one_bits()
+        \\x
+        \\}
+        ,
+        .expected = .{ .inspect_str = "128" },
+    },
+    .{
+        .name = "low_level - U128.count_leading_zero_bits all_ones",
+        .source =
+        \\{
+        \\a : U128
+        \\a = 340282366920938463463374607431768211455
+        \\x = a.count_leading_zero_bits()
+        \\x
+        \\}
+        ,
+        .expected = .{ .inspect_str = "0" },
+    },
+    .{
+        .name = "low_level - U128.count_trailing_zero_bits all_ones",
+        .source =
+        \\{
+        \\a : U128
+        \\a = 340282366920938463463374607431768211455
+        \\x = a.count_trailing_zero_bits()
+        \\x
+        \\}
+        ,
+        .expected = .{ .inspect_str = "0" },
+    },
+    .{
+        .name = "low_level - U128.count_one_bits one",
+        .source =
+        \\{
+        \\a : U128
+        \\a = 1
+        \\x = a.count_one_bits()
+        \\x
+        \\}
+        ,
+        .expected = .{ .inspect_str = "1" },
+    },
+    .{
+        .name = "low_level - U128.count_leading_zero_bits one",
+        .source =
+        \\{
+        \\a : U128
+        \\a = 1
+        \\x = a.count_leading_zero_bits()
+        \\x
+        \\}
+        ,
+        .expected = .{ .inspect_str = "127" },
+    },
+    .{
+        .name = "low_level - U128.count_trailing_zero_bits one",
+        .source =
+        \\{
+        \\a : U128
+        \\a = 1
+        \\x = a.count_trailing_zero_bits()
+        \\x
+        \\}
+        ,
+        .expected = .{ .inspect_str = "0" },
+    },
+    .{
+        .name = "low_level - U128.count_one_bits top_bit",
+        .source =
+        \\{
+        \\a : U128
+        \\a = 170141183460469231731687303715884105728
+        \\x = a.count_one_bits()
+        \\x
+        \\}
+        ,
+        .expected = .{ .inspect_str = "1" },
+    },
+    .{
+        .name = "low_level - U128.count_leading_zero_bits top_bit",
+        .source =
+        \\{
+        \\a : U128
+        \\a = 170141183460469231731687303715884105728
+        \\x = a.count_leading_zero_bits()
+        \\x
+        \\}
+        ,
+        .expected = .{ .inspect_str = "0" },
+    },
+    .{
+        .name = "low_level - U128.count_trailing_zero_bits top_bit",
+        .source =
+        \\{
+        \\a : U128
+        \\a = 170141183460469231731687303715884105728
+        \\x = a.count_trailing_zero_bits()
+        \\x
+        \\}
+        ,
+        .expected = .{ .inspect_str = "127" },
+    },
+    .{
+        .name = "low_level - U128.count_one_bits low_half_only",
+        .source =
+        \\{
+        \\a : U128
+        \\a = 255
+        \\x = a.count_one_bits()
+        \\x
+        \\}
+        ,
+        .expected = .{ .inspect_str = "8" },
+    },
+    .{
+        .name = "low_level - U128.count_leading_zero_bits low_half_only",
+        .source =
+        \\{
+        \\a : U128
+        \\a = 255
+        \\x = a.count_leading_zero_bits()
+        \\x
+        \\}
+        ,
+        .expected = .{ .inspect_str = "120" },
+    },
+    .{
+        .name = "low_level - U128.count_trailing_zero_bits low_half_only",
+        .source =
+        \\{
+        \\a : U128
+        \\a = 255
+        \\x = a.count_trailing_zero_bits()
+        \\x
+        \\}
+        ,
+        .expected = .{ .inspect_str = "0" },
+    },
+    .{
+        .name = "low_level - U128.count_one_bits spans_halves",
+        .source =
+        \\{
+        \\a : U128
+        \\a = 18446744073709551617
+        \\x = a.count_one_bits()
+        \\x
+        \\}
+        ,
+        .expected = .{ .inspect_str = "2" },
+    },
+    .{
+        .name = "low_level - U128.count_leading_zero_bits spans_halves",
+        .source =
+        \\{
+        \\a : U128
+        \\a = 18446744073709551617
+        \\x = a.count_leading_zero_bits()
+        \\x
+        \\}
+        ,
+        .expected = .{ .inspect_str = "63" },
+    },
+    .{
+        .name = "low_level - U128.count_trailing_zero_bits spans_halves",
+        .source =
+        \\{
+        \\a : U128
+        \\a = 18446744073709551617
+        \\x = a.count_trailing_zero_bits()
+        \\x
+        \\}
+        ,
+        .expected = .{ .inspect_str = "0" },
+    },
+    .{
+        .name = "low_level - I128.count_one_bits zero",
+        .source =
+        \\{
+        \\a : I128
+        \\a = 0
+        \\x = a.count_one_bits()
+        \\x
+        \\}
+        ,
+        .expected = .{ .inspect_str = "0" },
+    },
+    .{
+        .name = "low_level - I128.count_leading_zero_bits zero",
+        .source =
+        \\{
+        \\a : I128
+        \\a = 0
+        \\x = a.count_leading_zero_bits()
+        \\x
+        \\}
+        ,
+        .expected = .{ .inspect_str = "128" },
+    },
+    .{
+        .name = "low_level - I128.count_trailing_zero_bits zero",
+        .source =
+        \\{
+        \\a : I128
+        \\a = 0
+        \\x = a.count_trailing_zero_bits()
+        \\x
+        \\}
+        ,
+        .expected = .{ .inspect_str = "128" },
+    },
+    .{
+        .name = "low_level - I128.count_one_bits neg_one",
+        .source =
+        \\{
+        \\a : I128
+        \\a = -1
+        \\x = a.count_one_bits()
+        \\x
+        \\}
+        ,
+        .expected = .{ .inspect_str = "128" },
+    },
+    .{
+        .name = "low_level - I128.count_leading_zero_bits neg_one",
+        .source =
+        \\{
+        \\a : I128
+        \\a = -1
+        \\x = a.count_leading_zero_bits()
+        \\x
+        \\}
+        ,
+        .expected = .{ .inspect_str = "0" },
+    },
+    .{
+        .name = "low_level - I128.count_trailing_zero_bits neg_one",
+        .source =
+        \\{
+        \\a : I128
+        \\a = -1
+        \\x = a.count_trailing_zero_bits()
+        \\x
+        \\}
+        ,
+        .expected = .{ .inspect_str = "0" },
+    },
+    .{
+        .name = "low_level - I128.count_one_bits low_half_only",
+        .source =
+        \\{
+        \\a : I128
+        \\a = 256
+        \\x = a.count_one_bits()
+        \\x
+        \\}
+        ,
+        .expected = .{ .inspect_str = "1" },
+    },
+    .{
+        .name = "low_level - I128.count_leading_zero_bits low_half_only",
+        .source =
+        \\{
+        \\a : I128
+        \\a = 256
+        \\x = a.count_leading_zero_bits()
+        \\x
+        \\}
+        ,
+        .expected = .{ .inspect_str = "119" },
+    },
+    .{
+        .name = "low_level - I128.count_trailing_zero_bits low_half_only",
+        .source =
+        \\{
+        \\a : I128
+        \\a = 256
+        \\x = a.count_trailing_zero_bits()
+        \\x
+        \\}
+        ,
+        .expected = .{ .inspect_str = "8" },
+    },
 };
