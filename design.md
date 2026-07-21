@@ -5840,7 +5840,7 @@ representation on all three ISAs, and it composes with the bitwise ops and
   halves, `narrow_to_u8x16_saturated`/`_wrap` for (two-input) narrowing,
   `to_u32x4_bits` / `to_u128_bits` / `from_u128_bits` for free
   reinterpretation of the same 128 bits.
-- Shifts are `shift_left_by` / `shift_right_by` / `shift_right_zf_by` with
+- Shifts are `shl_wrap` / `shr_wrap` / `shr_zf_wrap` with
   a scalar `U8` count applied uniformly to every lane, matching the scalar
   methods bit-for-bit per lane (see meaning below).
 - Every type carries the standard citizenship methods: `default` (zero
@@ -5864,12 +5864,10 @@ These are the cases where ISAs disagree natively and the spec must choose.
 The choices below are implemented by the reference implementations and are
 the contract every backend must match:
 
-- **Shifts** with count ≥ lane width: `shift_left_by` and
-  `shift_right_zf_by` produce 0; `shift_right_by` on signed lanes produces
-  the sign fill (0 or all-ones); on unsigned lanes it equals
-  `shift_right_zf_by`. This matches the scalar reference meaning (the
-  LLVM backend and both interpreters; the dev and wasm backends currently
-  diverge on the scalar versions — a pre-existing bug).
+- **Shifts** take the count modulo the lane width: `shl_wrap`, `shr_wrap`,
+  and `shr_zf_wrap` shift every lane by `count % lane_bits`, so a count equal
+  to the lane width leaves every lane unchanged and larger counts wrap around.
+  This matches the scalar `shl_wrap` family.
 - **`table_lookup`** (`pshufb` / `tbl` / `i8x16.swizzle`): any index ≥ 16
   yields 0. (wasm/NEON meaning; on x86 `pshufb` needs a one-instruction
   fixup because it wraps indices 16–127.)

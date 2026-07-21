@@ -16297,30 +16297,34 @@ Builtin :: [].{
 			all_lanes_set : U8x16 -> Bool
 			all_lanes_set = |vector| U8x16.to_bitmask(vector) == 65535
 
-			## Shift every lane's bits left by the same count. Counts of 8 or
-			## more produce 0 in every lane, matching [U8.shift_left_by].
+			## Shift every lane's bits left by the same count. The count is
+			## taken modulo 8: shifting by 8 leaves every lane unchanged and
+			## shifting by 9 shifts by 1, matching [U8.shl_wrap].
 			##
 			## x86-64 has no 8-bit lane shift, so this lowers to a 16-bit
-			## `psllw` + `pand` mask; AArch64 NEON `shl`; wasm `i8x16.shl`
-			## (wasm masks the count, so the at-or-past-width case needs a
-			## fixup there).
-			shift_left_by : U8x16, U8 -> U8x16
-			shift_left_by = |vector, count| U8x16.from_u128_bits(simd128_shift_left(vector.to_u128_bits(), 8, count))
+			## `psllw` + `pand` mask, with the count masked to the lane width
+			## first; AArch64 NEON `shl` takes the pre-masked count; wasm
+			## `i8x16.shl` masks the count natively.
+			shl_wrap : U8x16, U8 -> U8x16
+			shl_wrap = |vector, count| U8x16.from_u128_bits(simd128_shift_left(vector.to_u128_bits(), 8, count))
 
 			## Shift every lane's bits right by the same count, filling with
-			## zeros. For unsigned lanes this behaves the same as
-			## [U8x16.shift_right_zf_by].
-			shift_right_by : U8x16, U8 -> U8x16
-			shift_right_by = |vector, count| U8x16.shift_right_zf_by(vector, count)
+			## zeros. The count is taken modulo 8. For unsigned lanes this
+			## behaves the same as [U8x16.shr_zf_wrap].
+			shr_wrap : U8x16, U8 -> U8x16
+			shr_wrap = |vector, count| U8x16.shr_zf_wrap(vector, count)
 
 			## Shift every lane's bits right by the same count, filling the
-			## vacated high bits with zeros. Counts of 8 or more produce 0 in
-			## every lane, matching [U8.shift_right_zf_by].
+			## vacated high bits with zeros. The count is taken modulo 8:
+			## shifting by 8 leaves every lane unchanged and shifting by 9
+			## shifts by 1, matching [U8.shr_zf_wrap].
 			##
-			## Lowers to `psrlw` + `pand` on x86-64 (no 8-bit lane shift),
-			## `ushr` on AArch64 NEON, and `i8x16.shr_u` on wasm.
-			shift_right_zf_by : U8x16, U8 -> U8x16
-			shift_right_zf_by = |vector, count| U8x16.from_u128_bits(simd128_shift_right_zf(vector.to_u128_bits(), 8, count))
+			## Lowers to `psrlw` + `pand` on x86-64 (no 8-bit lane shift), with
+			## the count masked to the lane width first; `ushr` on AArch64 NEON
+			## takes the pre-masked count; `i8x16.shr_u` on wasm masks the count
+			## natively.
+			shr_zf_wrap : U8x16, U8 -> U8x16
+			shr_zf_wrap = |vector, count| U8x16.from_u128_bits(simd128_shift_right_zf(vector.to_u128_bits(), 8, count))
 
 			## The value of the lane at the given index. Crashes if the index
 			## is 16 or greater. (Lane indices are expected to be compile-time
@@ -16965,37 +16969,43 @@ Builtin :: [].{
 			all_lanes_set : I8x16 -> Bool
 			all_lanes_set = |vector| I8x16.to_bitmask(vector) == 65535
 
-			## Shift every lane's bits left by the same count. Counts of 8 or
-			## more produce 0 in every lane, matching [I8.shift_left_by].
+			## Shift every lane's bits left by the same count. The count is
+			## taken modulo 8: shifting by 8 leaves every lane unchanged and
+			## shifting by 9 shifts by 1, matching [I8.shl_wrap].
 			##
 			## x86-64 has no 8-bit lane shift, so this lowers to a 16-bit
-			## `psllw` + `pand` mask; AArch64 NEON `shl`; wasm `i8x16.shl`
-			## (wasm masks the count, so the at-or-past-width case needs a
-			## fixup there).
-			shift_left_by : I8x16, U8 -> I8x16
-			shift_left_by = |vector, count| I8x16.from_u128_bits(simd128_shift_left(vector.to_u128_bits(), 8, count))
+			## `psllw` + `pand` mask, with the count masked to the lane width
+			## first; AArch64 NEON `shl` takes the pre-masked count; wasm
+			## `i8x16.shl` masks the count natively.
+			shl_wrap : I8x16, U8 -> I8x16
+			shl_wrap = |vector, count| I8x16.from_u128_bits(simd128_shift_left(vector.to_u128_bits(), 8, count))
 
 			## Shift every lane's bits right by the same count, filling the
-			## vacated high bits with zeros. Counts of 8 or more produce 0 in
-			## every lane, matching [I8.shift_right_zf_by].
+			## vacated high bits with zeros. The count is taken modulo 8:
+			## shifting by 8 leaves every lane unchanged and shifting by 9
+			## shifts by 1, matching [I8.shr_zf_wrap].
 			##
-			## Lowers to `psrlw` + `pand` on x86-64 (no 8-bit lane shift),
-			## `ushr` on AArch64 NEON, and `i8x16.shr_u` on wasm.
-			shift_right_zf_by : I8x16, U8 -> I8x16
-			shift_right_zf_by = |vector, count| I8x16.from_u128_bits(simd128_shift_right_zf(vector.to_u128_bits(), 8, count))
+			## Lowers to `psrlw` + `pand` on x86-64 (no 8-bit lane shift), with
+			## the count masked to the lane width first; `ushr` on AArch64 NEON
+			## takes the pre-masked count; `i8x16.shr_u` on wasm masks the count
+			## natively.
+			shr_zf_wrap : I8x16, U8 -> I8x16
+			shr_zf_wrap = |vector, count| I8x16.from_u128_bits(simd128_shift_right_zf(vector.to_u128_bits(), 8, count))
 
 			## Shift every lane's bits right by the same count, replicating the
-			## sign bit into the vacated high bits. Counts of 8 or more produce
-			## the sign fill (0 for non-negative lanes, all-ones for negative),
-			## matching [I8.shift_right_by].
+			## sign bit into the vacated high bits. The count is taken modulo 8:
+			## shifting by 8 leaves every lane unchanged and shifting by 9
+			## shifts by 1, matching [I8.shr_wrap].
 			##
 			## Lowers to `psraw` + a mask sequence on x86-64 (no 8-bit lane
-			## shift), `sshr` on AArch64 NEON, and `i8x16.shr_s` on wasm.
+			## shift), with the count masked to the lane width first; `sshr` on
+			## AArch64 NEON takes the pre-masked count; `i8x16.shr_s` on wasm
+			## masks the count natively.
 			## ```roc
-			## expect I8x16.splat(-8).shift_right_by(1).get_lane(0) == -4
+			## expect I8x16.splat(-8).shr_wrap(1).get_lane(0) == -4
 			## ```
-			shift_right_by : I8x16, U8 -> I8x16
-			shift_right_by = |vector, count| I8x16.from_u128_bits(simd128_shift_right_arith(vector.to_u128_bits(), 8, count))
+			shr_wrap : I8x16, U8 -> I8x16
+			shr_wrap = |vector, count| I8x16.from_u128_bits(simd128_shift_right_arith(vector.to_u128_bits(), 8, count))
 
 			## The value of the lane at the given index. Crashes if the index
 			## is 16 or greater. (Lane indices are expected to be compile-time
@@ -17536,29 +17546,32 @@ Builtin :: [].{
 			all_lanes_set : U16x8 -> Bool
 			all_lanes_set = |vector| U16x8.to_bitmask(vector) == 255
 
-			## Shift every lane's bits left by the same count. Counts of 16 or
-			## more produce 0 in every lane, matching [U16.shift_left_by].
+			## Shift every lane's bits left by the same count. The count is
+			## taken modulo 16: shifting by 16 leaves every lane unchanged and
+			## shifting by 17 shifts by 1, matching [U16.shl_wrap].
 			##
-			## Lowers to `psllw` on x86-64, `shl` on AArch64 NEON, and
-			## `i16x8.shl` on wasm (wasm masks the count, so the at-or-past-width
-			## case needs a fixup there).
-			shift_left_by : U16x8, U8 -> U16x8
-			shift_left_by = |vector, count| U16x8.from_u128_bits(simd128_shift_left(vector.to_u128_bits(), 16, count))
+			## Lowers to `psllw` on x86-64 with the count masked to the lane
+			## width first, `shl` on AArch64 NEON taking the pre-masked count,
+			## and `i16x8.shl` on wasm, which masks the count natively.
+			shl_wrap : U16x8, U8 -> U16x8
+			shl_wrap = |vector, count| U16x8.from_u128_bits(simd128_shift_left(vector.to_u128_bits(), 16, count))
 
 			## Shift every lane's bits right by the same count, filling with
-			## zeros. For unsigned lanes this behaves the same as
-			## [U16x8.shift_right_zf_by].
-			shift_right_by : U16x8, U8 -> U16x8
-			shift_right_by = |vector, count| U16x8.shift_right_zf_by(vector, count)
+			## zeros. The count is taken modulo 16. For unsigned lanes this
+			## behaves the same as [U16x8.shr_zf_wrap].
+			shr_wrap : U16x8, U8 -> U16x8
+			shr_wrap = |vector, count| U16x8.shr_zf_wrap(vector, count)
 
 			## Shift every lane's bits right by the same count, filling the
-			## vacated high bits with zeros. Counts of 16 or more produce 0 in
-			## every lane, matching [U16.shift_right_zf_by].
+			## vacated high bits with zeros. The count is taken modulo 16:
+			## shifting by 16 leaves every lane unchanged and shifting by 17
+			## shifts by 1, matching [U16.shr_zf_wrap].
 			##
-			## Lowers to `psrlw` on x86-64, `ushr` on AArch64 NEON, and
-			## `i16x8.shr_u` on wasm.
-			shift_right_zf_by : U16x8, U8 -> U16x8
-			shift_right_zf_by = |vector, count| U16x8.from_u128_bits(simd128_shift_right_zf(vector.to_u128_bits(), 16, count))
+			## Lowers to `psrlw` on x86-64 with the count masked to the lane
+			## width first, `ushr` on AArch64 NEON taking the pre-masked count,
+			## and `i16x8.shr_u` on wasm, which masks the count natively.
+			shr_zf_wrap : U16x8, U8 -> U16x8
+			shr_zf_wrap = |vector, count| U16x8.from_u128_bits(simd128_shift_right_zf(vector.to_u128_bits(), 16, count))
 
 			## The value of the lane at the given index. Crashes if the index
 			## is 8 or greater. (Lane indices are expected to be compile-time
@@ -18180,32 +18193,37 @@ Builtin :: [].{
 			all_lanes_set : I16x8 -> Bool
 			all_lanes_set = |vector| I16x8.to_bitmask(vector) == 255
 
-			## Shift every lane's bits left by the same count. Counts of 16 or
-			## more produce 0 in every lane, matching [I16.shift_left_by].
+			## Shift every lane's bits left by the same count. The count is
+			## taken modulo 16: shifting by 16 leaves every lane unchanged and
+			## shifting by 17 shifts by 1, matching [I16.shl_wrap].
 			##
-			## Lowers to `psllw` on x86-64, `shl` on AArch64 NEON, and
-			## `i16x8.shl` on wasm (wasm masks the count, so the at-or-past-width
-			## case needs a fixup there).
-			shift_left_by : I16x8, U8 -> I16x8
-			shift_left_by = |vector, count| I16x8.from_u128_bits(simd128_shift_left(vector.to_u128_bits(), 16, count))
+			## Lowers to `psllw` on x86-64 with the count masked to the lane
+			## width first, `shl` on AArch64 NEON taking the pre-masked count,
+			## and `i16x8.shl` on wasm, which masks the count natively.
+			shl_wrap : I16x8, U8 -> I16x8
+			shl_wrap = |vector, count| I16x8.from_u128_bits(simd128_shift_left(vector.to_u128_bits(), 16, count))
 
 			## Shift every lane's bits right by the same count, preserving the
-			## sign ("arithmetic shift"). Counts of 16 or more fill every lane
-			## with its sign bit (0 or all-ones), matching [I16.shift_right_by].
+			## sign ("arithmetic shift"). The count is taken modulo 16: shifting
+			## by 16 leaves every lane unchanged and shifting by 17 shifts by 1,
+			## matching [I16.shr_wrap].
 			##
-			## Lowers to `psraw` on x86-64, `sshr` on AArch64 NEON, and
-			## `i16x8.shr_s` on wasm.
-			shift_right_by : I16x8, U8 -> I16x8
-			shift_right_by = |vector, count| I16x8.from_u128_bits(simd128_shift_right_arith(vector.to_u128_bits(), 16, count))
+			## Lowers to `psraw` on x86-64 with the count masked to the lane
+			## width first, `sshr` on AArch64 NEON taking the pre-masked count,
+			## and `i16x8.shr_s` on wasm, which masks the count natively.
+			shr_wrap : I16x8, U8 -> I16x8
+			shr_wrap = |vector, count| I16x8.from_u128_bits(simd128_shift_right_arith(vector.to_u128_bits(), 16, count))
 
 			## Shift every lane's bits right by the same count, filling the
-			## vacated high bits with zeros ("zero-fill"). Counts of 16 or more
-			## produce 0 in every lane, matching [I16.shift_right_zf_by].
+			## vacated high bits with zeros ("zero-fill"). The count is taken
+			## modulo 16: shifting by 16 leaves every lane unchanged and shifting
+			## by 17 shifts by 1, matching [I16.shr_zf_wrap].
 			##
-			## Lowers to `psrlw` on x86-64, `ushr` on AArch64 NEON, and
-			## `i16x8.shr_u` on wasm.
-			shift_right_zf_by : I16x8, U8 -> I16x8
-			shift_right_zf_by = |vector, count| I16x8.from_u128_bits(simd128_shift_right_zf(vector.to_u128_bits(), 16, count))
+			## Lowers to `psrlw` on x86-64 with the count masked to the lane
+			## width first, `ushr` on AArch64 NEON taking the pre-masked count,
+			## and `i16x8.shr_u` on wasm, which masks the count natively.
+			shr_zf_wrap : I16x8, U8 -> I16x8
+			shr_zf_wrap = |vector, count| I16x8.from_u128_bits(simd128_shift_right_zf(vector.to_u128_bits(), 16, count))
 
 			## Shift every lane right by the same count, rounding to nearest
 			## (round half up): each lane becomes
@@ -18802,29 +18820,32 @@ Builtin :: [].{
 			all_lanes_set : U32x4 -> Bool
 			all_lanes_set = |vector| U32x4.to_bitmask(vector) == 15
 
-			## Shift every lane's bits left by the same count. Counts of 32 or
-			## more produce 0 in every lane, matching [U32.shift_left_by].
+			## Shift every lane's bits left by the same count. The count is
+			## taken modulo 32: shifting by 32 leaves every lane unchanged and
+			## shifting by 33 shifts by 1, matching [U32.shl_wrap].
 			##
-			## Lowers to `pslld` on x86-64, `shl` on AArch64 NEON, and
-			## `i32x4.shl` on wasm (wasm masks the count, so the at-or-past-width
-			## case needs a fixup there).
-			shift_left_by : U32x4, U8 -> U32x4
-			shift_left_by = |vector, count| U32x4.from_u128_bits(simd128_shift_left(vector.to_u128_bits(), 32, count))
+			## Lowers to `pslld` on x86-64 with the count masked to the lane
+			## width first, `shl` on AArch64 NEON taking the pre-masked count,
+			## and `i32x4.shl` on wasm, which masks the count natively.
+			shl_wrap : U32x4, U8 -> U32x4
+			shl_wrap = |vector, count| U32x4.from_u128_bits(simd128_shift_left(vector.to_u128_bits(), 32, count))
 
 			## Shift every lane's bits right by the same count, filling with
-			## zeros. For unsigned lanes this behaves the same as
-			## [U32x4.shift_right_zf_by].
-			shift_right_by : U32x4, U8 -> U32x4
-			shift_right_by = |vector, count| U32x4.shift_right_zf_by(vector, count)
+			## zeros. The count is taken modulo 32. For unsigned lanes this
+			## behaves the same as [U32x4.shr_zf_wrap].
+			shr_wrap : U32x4, U8 -> U32x4
+			shr_wrap = |vector, count| U32x4.shr_zf_wrap(vector, count)
 
 			## Shift every lane's bits right by the same count, filling the
-			## vacated high bits with zeros. Counts of 32 or more produce 0 in
-			## every lane, matching [U32.shift_right_zf_by].
+			## vacated high bits with zeros. The count is taken modulo 32:
+			## shifting by 32 leaves every lane unchanged and shifting by 33
+			## shifts by 1, matching [U32.shr_zf_wrap].
 			##
-			## Lowers to `psrld` on x86-64, `ushr` on AArch64 NEON, and
-			## `i32x4.shr_u` on wasm.
-			shift_right_zf_by : U32x4, U8 -> U32x4
-			shift_right_zf_by = |vector, count| U32x4.from_u128_bits(simd128_shift_right_zf(vector.to_u128_bits(), 32, count))
+			## Lowers to `psrld` on x86-64 with the count masked to the lane
+			## width first, `ushr` on AArch64 NEON taking the pre-masked count,
+			## and `i32x4.shr_u` on wasm, which masks the count natively.
+			shr_zf_wrap : U32x4, U8 -> U32x4
+			shr_zf_wrap = |vector, count| U32x4.from_u128_bits(simd128_shift_right_zf(vector.to_u128_bits(), 32, count))
 
 			## The value of the lane at the given index. Crashes if the index
 			## is 4 or greater. (Lane indices are expected to be compile-time
@@ -19346,33 +19367,37 @@ Builtin :: [].{
 			all_lanes_set : I32x4 -> Bool
 			all_lanes_set = |vector| I32x4.to_bitmask(vector) == 15
 
-			## Shift every lane's bits left by the same count. Counts of 32 or
-			## more produce 0 in every lane, matching [I32.shift_left_by].
+			## Shift every lane's bits left by the same count. The count is
+			## taken modulo 32: shifting by 32 leaves every lane unchanged and
+			## shifting by 33 shifts by 1, matching [I32.shl_wrap].
 			##
-			## Lowers to `pslld` on x86-64, `shl` on AArch64 NEON, and
-			## `i32x4.shl` on wasm (wasm masks the count, so the at-or-past-width
-			## case needs a fixup there).
-			shift_left_by : I32x4, U8 -> I32x4
-			shift_left_by = |vector, count| I32x4.from_u128_bits(simd128_shift_left(vector.to_u128_bits(), 32, count))
+			## Lowers to `pslld` on x86-64 with the count masked to the lane
+			## width first, `shl` on AArch64 NEON taking the pre-masked count,
+			## and `i32x4.shl` on wasm, which masks the count natively.
+			shl_wrap : I32x4, U8 -> I32x4
+			shl_wrap = |vector, count| I32x4.from_u128_bits(simd128_shift_left(vector.to_u128_bits(), 32, count))
 
 			## Shift every lane's bits right by the same count, replicating the
-			## sign bit into the vacated high bits (arithmetic shift). Counts of
-			## 32 or more produce the sign fill (0 or all-ones) in every lane,
-			## matching [I32.shift_right_by].
+			## sign bit into the vacated high bits (arithmetic shift). The count
+			## is taken modulo 32: shifting by 32 leaves every lane unchanged and
+			## shifting by 33 shifts by 1, matching [I32.shr_wrap].
 			##
-			## Lowers to `psrad` on x86-64, `sshr` on AArch64 NEON, and
-			## `i32x4.shr_s` on wasm.
-			shift_right_by : I32x4, U8 -> I32x4
-			shift_right_by = |vector, count| I32x4.from_u128_bits(simd128_shift_right_arith(vector.to_u128_bits(), 32, count))
+			## Lowers to `psrad` on x86-64 with the count masked to the lane
+			## width first, `sshr` on AArch64 NEON taking the pre-masked count,
+			## and `i32x4.shr_s` on wasm, which masks the count natively.
+			shr_wrap : I32x4, U8 -> I32x4
+			shr_wrap = |vector, count| I32x4.from_u128_bits(simd128_shift_right_arith(vector.to_u128_bits(), 32, count))
 
 			## Shift every lane's bits right by the same count, filling the
-			## vacated high bits with zeros. Counts of 32 or more produce 0 in
-			## every lane, matching [I32.shift_right_zf_by].
+			## vacated high bits with zeros. The count is taken modulo 32:
+			## shifting by 32 leaves every lane unchanged and shifting by 33
+			## shifts by 1, matching [I32.shr_zf_wrap].
 			##
-			## Lowers to `psrld` on x86-64, `ushr` on AArch64 NEON, and
-			## `i32x4.shr_u` on wasm.
-			shift_right_zf_by : I32x4, U8 -> I32x4
-			shift_right_zf_by = |vector, count| I32x4.from_u128_bits(simd128_shift_right_zf(vector.to_u128_bits(), 32, count))
+			## Lowers to `psrld` on x86-64 with the count masked to the lane
+			## width first, `ushr` on AArch64 NEON taking the pre-masked count,
+			## and `i32x4.shr_u` on wasm, which masks the count natively.
+			shr_zf_wrap : I32x4, U8 -> I32x4
+			shr_zf_wrap = |vector, count| I32x4.from_u128_bits(simd128_shift_right_zf(vector.to_u128_bits(), 32, count))
 
 			## Arithmetic right shift that rounds to nearest by adding a
 			## half-ULP bias first: each lane becomes
@@ -19810,29 +19835,32 @@ Builtin :: [].{
 			all_lanes_set : U64x2 -> Bool
 			all_lanes_set = |vector| U64x2.to_bitmask(vector) == 3
 
-			## Shift every lane's bits left by the same count. Counts of 64 or
-			## more produce 0 in every lane, matching [U64.shift_left_by].
+			## Shift every lane's bits left by the same count. The count is
+			## taken modulo 64: shifting by 64 leaves every lane unchanged and
+			## shifting by 65 shifts by 1, matching [U64.shl_wrap].
 			##
-			## Lowers to `psllq` on x86-64, `shl` on AArch64 NEON, and `i64x2.shl`
-			## on wasm (wasm masks the count, so the at-or-past-width case needs a
-			## fixup there).
-			shift_left_by : U64x2, U8 -> U64x2
-			shift_left_by = |vector, count| U64x2.from_u128_bits(simd128_shift_left(vector.to_u128_bits(), 64, count))
+			## Lowers to `psllq` on x86-64 with the count masked to the lane
+			## width first, `shl` on AArch64 NEON taking the pre-masked count,
+			## and `i64x2.shl` on wasm, which masks the count natively.
+			shl_wrap : U64x2, U8 -> U64x2
+			shl_wrap = |vector, count| U64x2.from_u128_bits(simd128_shift_left(vector.to_u128_bits(), 64, count))
 
 			## Shift every lane's bits right by the same count, filling with
-			## zeros. For unsigned lanes this behaves the same as
-			## [U64x2.shift_right_zf_by].
-			shift_right_by : U64x2, U8 -> U64x2
-			shift_right_by = |vector, count| U64x2.shift_right_zf_by(vector, count)
+			## zeros. The count is taken modulo 64. For unsigned lanes this
+			## behaves the same as [U64x2.shr_zf_wrap].
+			shr_wrap : U64x2, U8 -> U64x2
+			shr_wrap = |vector, count| U64x2.shr_zf_wrap(vector, count)
 
 			## Shift every lane's bits right by the same count, filling the
-			## vacated high bits with zeros. Counts of 64 or more produce 0 in
-			## every lane, matching [U64.shift_right_zf_by].
+			## vacated high bits with zeros. The count is taken modulo 64:
+			## shifting by 64 leaves every lane unchanged and shifting by 65
+			## shifts by 1, matching [U64.shr_zf_wrap].
 			##
-			## Lowers to `psrlq` on x86-64, `ushr` on AArch64 NEON, and
-			## `i64x2.shr_u` on wasm.
-			shift_right_zf_by : U64x2, U8 -> U64x2
-			shift_right_zf_by = |vector, count| U64x2.from_u128_bits(simd128_shift_right_zf(vector.to_u128_bits(), 64, count))
+			## Lowers to `psrlq` on x86-64 with the count masked to the lane
+			## width first, `ushr` on AArch64 NEON taking the pre-masked count,
+			## and `i64x2.shr_u` on wasm, which masks the count natively.
+			shr_zf_wrap : U64x2, U8 -> U64x2
+			shr_zf_wrap = |vector, count| U64x2.from_u128_bits(simd128_shift_right_zf(vector.to_u128_bits(), 64, count))
 
 			## The value of the lane at the given index. Crashes if the index
 			## is 2 or greater. (Lane indices are expected to be compile-time
@@ -20267,34 +20295,38 @@ Builtin :: [].{
 			all_lanes_set : I64x2 -> Bool
 			all_lanes_set = |vector| I64x2.to_bitmask(vector) == 3
 
-			## Shift every lane's bits left by the same count. Counts of 64 or
-			## more produce 0 in every lane, matching [I64.shift_left_by].
+			## Shift every lane's bits left by the same count. The count is
+			## taken modulo 64: shifting by 64 leaves every lane unchanged and
+			## shifting by 65 shifts by 1, matching [I64.shl_wrap].
 			##
-			## Lowers to `psllq` on x86-64, `shl` on AArch64 NEON, and `i64x2.shl`
-			## on wasm (wasm masks the count, so the at-or-past-width case needs a
-			## fixup there).
-			shift_left_by : I64x2, U8 -> I64x2
-			shift_left_by = |vector, count| I64x2.from_u128_bits(simd128_shift_left(vector.to_u128_bits(), 64, count))
+			## Lowers to `psllq` on x86-64 with the count masked to the lane
+			## width first, `shl` on AArch64 NEON taking the pre-masked count,
+			## and `i64x2.shl` on wasm, which masks the count natively.
+			shl_wrap : I64x2, U8 -> I64x2
+			shl_wrap = |vector, count| I64x2.from_u128_bits(simd128_shift_left(vector.to_u128_bits(), 64, count))
 
 			## Shift every lane's bits right by the same count, replicating the
-			## sign bit into the vacated high bits (arithmetic shift). Counts of
-			## 64 or more fill every lane with the sign bit, matching
-			## [I64.shift_right_by].
+			## sign bit into the vacated high bits (arithmetic shift). The count
+			## is taken modulo 64: shifting by 64 leaves every lane unchanged and
+			## shifting by 65 shifts by 1, matching [I64.shr_wrap].
 			##
 			## x86-64 has no signed 64-bit lane shift below AVX-512, so this lowers
-			## to a `psrlq` + sign-fixup sequence; AArch64 NEON `sshr`; wasm
-			## `i64x2.shr_s`.
-			shift_right_by : I64x2, U8 -> I64x2
-			shift_right_by = |vector, count| I64x2.from_u128_bits(simd128_shift_right_arith(vector.to_u128_bits(), 64, count))
+			## to a `psrlq` + sign-fixup sequence, with the count masked to the
+			## lane width first; AArch64 NEON `sshr` takes the pre-masked count;
+			## wasm `i64x2.shr_s` masks the count natively.
+			shr_wrap : I64x2, U8 -> I64x2
+			shr_wrap = |vector, count| I64x2.from_u128_bits(simd128_shift_right_arith(vector.to_u128_bits(), 64, count))
 
 			## Shift every lane's bits right by the same count, filling the
-			## vacated high bits with zeros. Counts of 64 or more produce 0 in
-			## every lane, matching [I64.shift_right_zf_by].
+			## vacated high bits with zeros. The count is taken modulo 64:
+			## shifting by 64 leaves every lane unchanged and shifting by 65
+			## shifts by 1, matching [I64.shr_zf_wrap].
 			##
-			## Lowers to `psrlq` on x86-64, `ushr` on AArch64 NEON, and
-			## `i64x2.shr_u` on wasm.
-			shift_right_zf_by : I64x2, U8 -> I64x2
-			shift_right_zf_by = |vector, count| I64x2.from_u128_bits(simd128_shift_right_zf(vector.to_u128_bits(), 64, count))
+			## Lowers to `psrlq` on x86-64 with the count masked to the lane
+			## width first, `ushr` on AArch64 NEON taking the pre-masked count,
+			## and `i64x2.shr_u` on wasm, which masks the count natively.
+			shr_zf_wrap : I64x2, U8 -> I64x2
+			shr_zf_wrap = |vector, count| I64x2.from_u128_bits(simd128_shift_right_zf(vector.to_u128_bits(), 64, count))
 
 			## The value of the lane at the given index. Crashes if the index
 			## is 2 or greater. (Lane indices are expected to be compile-time
@@ -22478,29 +22510,25 @@ simd128_bitmask = |a, lane_bits| {
 	$mask
 }
 
-# Uniform lane-wise shifts with the scalar reference semantics: a count at or
-# past the lane width produces 0 (left and zero-fill right) or the sign fill
-# (arithmetic right).
+# Uniform lane-wise shifts where the count is taken modulo the lane width, so a
+# count equal to the lane width leaves every lane unchanged and larger counts
+# wrap around. This matches the scalar shl_wrap family.
 simd128_shift_left : U128, U8, U8 -> U128
-simd128_shift_left = |a, lane_bits, count|
-	if count >= lane_bits {
-		0
-	} else {
-		simd128_map1(a, lane_bits, |lane| U64.shift_left_by(lane, count))
-	}
+simd128_shift_left = |a, lane_bits, count| {
+	effective = count % lane_bits
+	simd128_map1(a, lane_bits, |lane| U64.shift_left_by(lane, effective))
+}
 
 simd128_shift_right_zf : U128, U8, U8 -> U128
-simd128_shift_right_zf = |a, lane_bits, count|
-	if count >= lane_bits {
-		0
-	} else {
-		simd128_map1(a, lane_bits, |lane| U64.shift_right_zf_by(lane, count))
-	}
+simd128_shift_right_zf = |a, lane_bits, count| {
+	effective = count % lane_bits
+	simd128_map1(a, lane_bits, |lane| U64.shift_right_zf_by(lane, effective))
+}
 
 simd128_shift_right_arith : U128, U8, U8 -> U128
 simd128_shift_right_arith = |a, lane_bits, count| {
-	clamped = U8.min(count, lane_bits - 1)
-	simd128_map1(a, lane_bits, |lane| I64.shift_right_by(simd128_lane_to_signed(lane, lane_bits), clamped).to_u64_wrap())
+	effective = count % lane_bits
+	simd128_map1(a, lane_bits, |lane| I64.shift_right_by(simd128_lane_to_signed(lane, lane_bits), effective).to_u64_wrap())
 }
 
 # Read 16 bytes starting at byte `index` as a little-endian 128-bit value.
