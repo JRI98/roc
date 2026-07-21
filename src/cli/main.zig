@@ -914,8 +914,11 @@ pub fn writeFdCoordinationFile(ctx: *CliCtx, temp_exe_path: []const u8, shm_hand
     };
     defer fd_file.close(ctx.io.std_io);
 
-    // Write shared memory info to file
-    const fd_str = try std.fmt.allocPrint(ctx.arena, "{}\n{}", .{ shm_handle.fd, shm_handle.size });
+    // Write shared memory info to file. The handle is written as a plain
+    // integer on both platforms -- on Windows it is a HANDLE (a pointer), and
+    // `ipc.coordination.parseHandle` turns the integer back into one.
+    const handle_int = if (is_windows) @intFromPtr(shm_handle.fd) else shm_handle.fd;
+    const fd_str = try std.fmt.allocPrint(ctx.arena, "{}\n{}", .{ handle_int, shm_handle.size });
     try fd_file.writeStreamingAll(ctx.io.std_io, fd_str);
     try fd_file.sync(ctx.io.std_io);
 }
@@ -3564,15 +3567,31 @@ fn runWithWindowsHandleInheritance(ctx: *CliCtx, exe_path: []const u8, shm_handl
         } }),
     };
 
-    // Create command line with handle and size as arguments, plus any app arguments
-    const handle_uint = @intFromPtr(shm_handle.fd);
+    // Hand the shared-memory handle and size to the child out of band, the same
+    // way the POSIX path does.
+    //
+    // These used to be passed as the first two command-line arguments. That put
+    // them in the child's argv, where the platform host has no way to tell them
+    // apart from the user's arguments and passes them straight through to the
+    // Roc application: `roc --opt=interpreter app.roc` gave the app
+    // `["...app.roc.exe", "448", "976608"]` instead of just the executable path.
+    // No platform host can be expected to know about roc's IPC plumbing, and
+    // none of them compensate for it, so keep argv clean instead.
+    writeFdCoordinationFile(ctx, exe_path, shm_handle) catch |err| {
+        const temp_dir = std.fs.path.dirname(exe_path) orelse exe_path;
+        const fd_file_path = std.fmt.allocPrint(ctx.arena, "{s}.txt", .{temp_dir}) catch exe_path;
+        return ctx.fail(.{ .file_write_failed = .{
+            .path = fd_file_path,
+            .err = err,
+        } });
+    };
 
     // Build command line string with proper quoting for Windows
     var cmd_builder = std.array_list.Managed(u8).initCapacity(ctx.gpa, 256) catch {
         return error.OutOfMemory;
     };
     defer cmd_builder.deinit();
-    try cmd_builder.print("\"{s}\" {} {}", .{ exe_path, handle_uint, shm_handle.size });
+    try cmd_builder.print("\"{s}\"", .{exe_path});
     for (app_args) |arg| {
         try cmd_builder.append(' ');
         try appendWindowsQuotedArg(&cmd_builder, arg);
@@ -3861,29 +3880,24 @@ fn spawnHotShimChild(
     shm_handle: SharedMemoryHandle,
     app_args: []const []const u8,
 ) (CliError || Allocator.Error || std.Thread.SpawnError || std.process.SpawnError)!*HotShimChild {
-    if (comptime !is_windows) {
-        writeFdCoordinationFile(ctx, exe_path, shm_handle) catch |err| {
-            const temp_dir = std.fs.path.dirname(exe_path) orelse exe_path;
-            const fd_file_path = std.fmt.allocPrint(ctx.arena, "{s}.txt", .{temp_dir}) catch exe_path;
-            return ctx.fail(.{ .file_write_failed = .{
-                .path = fd_file_path,
-                .err = err,
-            } });
-        };
-    }
+    // Every platform hands the shared-memory handle and size to the child
+    // through the coordination file. Windows used to append them to argv
+    // instead, which leaked roc's IPC plumbing into the Roc application's
+    // arguments -- see the note in `runWithWindowsHandleInheritance`.
+    writeFdCoordinationFile(ctx, exe_path, shm_handle) catch |err| {
+        const temp_dir = std.fs.path.dirname(exe_path) orelse exe_path;
+        const fd_file_path = std.fmt.allocPrint(ctx.arena, "{s}.txt", .{temp_dir}) catch exe_path;
+        return ctx.fail(.{ .file_write_failed = .{
+            .path = fd_file_path,
+            .err = err,
+        } });
+    };
     try makeSharedMemoryHandleInheritable(ctx, shm_handle);
 
-    const coordination_arg_count: usize = if (comptime is_windows) 2 else 0;
-    const argv = try ctx.arena.alloc([]const u8, 1 + coordination_arg_count + app_args.len);
+    const argv = try ctx.arena.alloc([]const u8, 1 + app_args.len);
     argv[0] = exe_path;
-    var app_arg_offset: usize = 1;
-    if (comptime is_windows) {
-        argv[1] = try std.fmt.allocPrint(ctx.arena, "{}", .{@intFromPtr(shm_handle.fd)});
-        argv[2] = try std.fmt.allocPrint(ctx.arena, "{}", .{shm_handle.size});
-        app_arg_offset = 3;
-    }
     for (app_args, 0..) |arg, i| {
-        argv[app_arg_offset + i] = arg;
+        argv[1 + i] = arg;
     }
 
     const child = std.process.spawn(ctx.io.std_io, .{

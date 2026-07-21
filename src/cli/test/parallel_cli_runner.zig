@@ -1049,6 +1049,7 @@ const subcommand_cases = [_]CliCase{
     .{ .id = 0, .suite = .subcommands, .name = "roc test restores stored parser FieldNames metadata", .body = .{ .command = .{ .args = &.{ "test", "--no-cache" }, .roc_file = "test/cli/ParserStoredTryFieldCaseless.roc", .contains = &.{.{ .stream = .stdout, .text = "passed" }}, .not_contains = &.{.{ .stream = .stderr, .text = "panic" }} } } },
     .{ .id = 0, .suite = .subcommands, .name = "roc test derives optional parser field with exact Missing tag", .body = .{ .command = .{ .args = &.{ "test", "--no-cache" }, .roc_file = "test/cli/ParserOptionalAbsentTagName.roc", .contains = &.{.{ .stream = .stdout, .text = "passed" }}, .not_contains = &.{.{ .stream = .stderr, .text = "panic" }} } } },
     .{ .id = 0, .suite = .subcommands, .name = "roc test derives optional non-Str parser field", .body = .{ .command = .{ .args = &.{ "test", "--no-cache" }, .roc_file = "test/cli/ParserOptionalNonStrField.roc", .contains = &.{.{ .stream = .stdout, .text = "passed" }}, .not_contains = &.{.{ .stream = .stderr, .text = "panic" }} } } },
+    .{ .id = 0, .suite = .subcommands, .name = "roc test derives optional parser field from wildcard Try error row", .body = .{ .command = .{ .args = &.{ "test", "--no-cache" }, .roc_file = "test/cli/ParserWildcardOptionalField.roc", .contains = &.{.{ .stream = .stdout, .text = "passed" }}, .not_contains = &.{.{ .stream = .stderr, .text = "panic" }} } } },
     .{ .id = 0, .suite = .subcommands, .name = "roc test uses custom nominal parser_for inside derived record", .body = .{ .command = .{ .args = &.{ "test", "--no-cache" }, .roc_file = "test/cli/ParserCustomNominalField.roc", .contains = &.{.{ .stream = .stdout, .text = "passed" }}, .not_contains = &.{.{ .stream = .stderr, .text = "panic" }} } } },
     .{ .id = 0, .suite = .subcommands, .name = "roc test supports structural encoder_for on records", .body = .{ .command = .{ .args = &.{ "test", "--no-cache" }, .roc_file = "test/cli/EncoderForStructuralRecord.roc", .contains = &.{.{ .stream = .stdout, .text = "passed" }}, .not_contains = &.{.{ .stream = .stderr, .text = "panic" }} } } },
     .{ .id = 0, .suite = .subcommands, .name = "roc test supports structural encoder_for on empty records without field methods", .body = .{ .command = .{ .args = &.{ "test", "--no-cache" }, .roc_file = "test/cli/EncoderForEmptyRecordNoFieldMethods.roc", .contains = &.{.{ .stream = .stdout, .text = "passed" }}, .not_contains = &.{.{ .stream = .stderr, .text = "panic" }} } } },
@@ -1382,15 +1383,17 @@ const TestResult = struct {
     message: ?[]const u8 = null,
 };
 
-fn serializeResult(fd: posix.fd_t, result: TestResult) void {
-    const stderr_data = result.stderr_capture orelse "";
-    const stdout_data = result.stdout_capture orelse "";
-    const message_data = result.message orelse "";
+const max_capture = 8192;
 
-    const max_capture = 8192;
-    const stderr_out = stderr_data[0..@min(stderr_data.len, max_capture)];
-    const stdout_out = stdout_data[0..@min(stdout_data.len, max_capture)];
-    const message_out = message_data[0..@min(message_data.len, max_capture)];
+fn cappedCapture(data: ?[]const u8) []const u8 {
+    const bytes = data orelse "";
+    return bytes[0..@min(bytes.len, max_capture)];
+}
+
+fn serializeResult(fd: posix.fd_t, result: TestResult) void {
+    const stderr_out = cappedCapture(result.stderr_capture);
+    const stdout_out = cappedCapture(result.stdout_capture);
+    const message_out = cappedCapture(result.message);
 
     const header = WireHeader{
         .status = @intFromEnum(result.status),
@@ -1410,37 +1413,15 @@ fn serializeResult(fd: posix.fd_t, result: TestResult) void {
     harness.writeAll(fd, message_out);
 }
 
-/// Streamed variant for persistent worker mode: writes a `u32` length prefix
-/// before the wire bytes so the parent can frame multiple results sharing
-/// the same stdout pipe.
+/// Streamed variant for persistent worker mode: the same wire bytes behind a
+/// u32 frame-length prefix.
 fn serializeResultStreamed(fd: posix.fd_t, result: TestResult) void {
-    const stderr_data = result.stderr_capture orelse "";
-    const stdout_data = result.stdout_capture orelse "";
-    const message_data = result.message orelse "";
-
-    const max_capture = 8192;
-    const stderr_out = stderr_data[0..@min(stderr_data.len, max_capture)];
-    const stdout_out = stdout_data[0..@min(stdout_data.len, max_capture)];
-    const message_out = message_data[0..@min(message_data.len, max_capture)];
-
-    const header = WireHeader{
-        .status = @intFromEnum(result.status),
-        .phase = @intFromEnum(result.phase),
-        .duration_ns = result.duration_ns,
-        .build_ns = result.build_ns,
-        .run_ns = result.run_ns,
-        .exit_code = result.exit_code,
-        .stderr_len = @intCast(stderr_out.len),
-        .stdout_len = @intCast(stdout_out.len),
-        .message_len = @intCast(message_out.len),
-    };
-
-    const length: u32 = @intCast(@sizeOf(WireHeader) + stderr_out.len + stdout_out.len + message_out.len);
-    harness.writeAll(fd, std.mem.asBytes(&length));
-    harness.writeAll(fd, std.mem.asBytes(&header));
-    harness.writeAll(fd, stderr_out);
-    harness.writeAll(fd, stdout_out);
-    harness.writeAll(fd, message_out);
+    const payload_len = @sizeOf(WireHeader) +
+        cappedCapture(result.stderr_capture).len +
+        cappedCapture(result.stdout_capture).len +
+        cappedCapture(result.message).len;
+    harness.writeFrameHeader(fd, payload_len);
+    serializeResult(fd, result);
 }
 
 fn deserializeResult(buf: []const u8, gpa: Allocator) ?TestResult {
@@ -2367,9 +2348,13 @@ fn customCliCacheRootsDistinct(io: std.Io, allocator: Allocator, timer: *harness
     const first = util.createIsolatedTestCacheDirs(io, allocator) catch |err|
         return customInfraFailure(allocator, timer, "failed to create first cache dirs: {}", .{err});
     defer first.deinit(allocator);
+    // Registered after the deinit defers so they run first, and after the
+    // openability assertions below, which need the directories to still exist.
+    defer util.cleanupTestCacheDirs(io, first);
     const second = util.createIsolatedTestCacheDirs(io, allocator) catch |err|
         return customInfraFailure(allocator, timer, "failed to create second cache dirs: {}", .{err});
     defer second.deinit(allocator);
+    defer util.cleanupTestCacheDirs(io, second);
 
     if (std.mem.eql(u8, first.roc_cache_dir, second.roc_cache_dir)) {
         return customFailure(allocator, timer, "ROC_CACHE_DIR paths were not distinct", .{});
@@ -8291,33 +8276,6 @@ fn customGlueCTests(io: std.Io, allocator: Allocator, env: *const CaseEnv, timer
 /// this runner. Starts with `selfExePath`, then preserves every original arg
 /// *except* `--worker N` / `--worker-backend NAME` (stripped to avoid
 /// duplication when the harness appends `--worker <idx>` per spawn).
-fn buildCliWorkerArgvTemplate(io: std.Io, arena: Allocator, process_args: std.process.Args) CliRunnerError![]const []const u8 {
-    var self_path_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const self_path_len = try std.process.executablePath(io, &self_path_buf);
-    const self_path = try arena.dupe(u8, self_path_buf[0..self_path_len]);
-
-    const raw = try process_args.toSlice(arena);
-    const original_args: []const []const u8 = @ptrCast(raw);
-
-    var argv: std.ArrayListUnmanaged([]const u8) = .empty;
-    try argv.append(arena, self_path);
-
-    var i: usize = 1;
-    while (i < original_args.len) : (i += 1) {
-        const arg = original_args[i];
-        if (harness.workerTemplateArgConsumesValue(arg)) {
-            i += 1;
-            continue;
-        }
-        if (harness.workerTemplateDropsFlag(arg)) {
-            continue;
-        }
-        try argv.append(arena, arg);
-    }
-
-    return try argv.toOwnedSlice(arena);
-}
-
 fn getTestName(spec: CliCase) []const u8 {
     return spec.name;
 }
@@ -8345,6 +8303,7 @@ fn stabilizeResult(gpa: Allocator, result: TestResult) TestResult {
 const Pool = harness.ProcessPool(CliCase, TestResult, .{
     .runTest = &runSingleTest,
     .serialize = &serializeResult,
+    .serializeStreamed = &serializeResultStreamed,
     .deserialize = &deserializeResult,
     .default_result = .{ .status = .crash },
     .timeout_result = .{ .status = .timeout },
@@ -8866,50 +8825,13 @@ pub fn main(init: std.process.Init) CliRunnerError!void {
     if (tests.len == 0) return;
     const timeout_ms = effectiveTimeoutMs(args, parsed.suites);
 
-    // Worker mode: parent spawned us with `--worker <idx>` to run a single
-    // test and serialize the result to stdout. Used on Windows where the
-    // harness runs N worker processes in parallel instead of forking.
-    if (args.worker_index) |idx| {
-        if (idx >= tests.len) std.process.exit(2);
-        var arena = collections.SingleThreadArena.init(std.heap.smp_allocator);
-        defer arena.deinit();
-        const result = runSingleTest(init.io, arena.allocator(), tests[idx], timeout_ms);
-        serializeResult(std.Io.File.stdout().handle, result);
-        return;
-    }
-
-    // Persistent worker mode: read test indices from stdin (one decimal per
-    // line), run each, write a u32-length-prefixed result to stdout, loop
-    // until stdin EOFs. Amortizes the per-Child process-boot cost across
-    // many tests on the same worker. Without this branch, a worker spawned
-    // with `--worker-stream` would fall through to the parent path below
-    // and reentrantly spawn its own pool of workers — fork-bombing the box.
-    if (args.worker_stream) {
-        var arena = collections.SingleThreadArena.init(std.heap.smp_allocator);
-        defer arena.deinit();
-
-        const stdin_handle = std.Io.File.stdin().handle;
-        const stdout_handle = std.Io.File.stdout().handle;
-
-        var line_buf: [32]u8 = undefined;
-        outer: while (true) {
-            var line_len: usize = 0;
-            while (true) {
-                if (line_len >= line_buf.len) break :outer;
-                const n = harness.posixRead(stdin_handle, line_buf[line_len .. line_len + 1]) catch break :outer;
-                if (n == 0) break :outer;
-                if (line_buf[line_len] == '\n') break;
-                line_len += 1;
-            }
-            const idx = std.fmt.parseInt(usize, line_buf[0..line_len], 10) catch continue;
-            if (idx >= tests.len) continue;
-
-            _ = arena.reset(.retain_capacity);
-            const result = runSingleTest(init.io, arena.allocator(), tests[idx], timeout_ms);
-            serializeResultStreamed(stdout_handle, result);
-        }
-        return;
-    }
+    // Worker modes: on Windows the harness pool spawned this process with
+    // `--worker <idx>` (single test) or `--worker-stream` (persistent). The
+    // worker rebuilt the same case list above, so indices stay aligned with
+    // the parent's. Handling these before the parent path matters: a worker
+    // that fell through would reentrantly spawn its own pool of workers —
+    // fork-bombing the box.
+    if (Pool.runWorkerMode(init.io, args, tests, timeout_ms)) return;
 
     const cpu_count = std.Thread.getCpuCount() catch 4;
     const max_children = args.max_threads orelse @min(cpu_count, tests.len);
@@ -8939,7 +8861,7 @@ pub fn main(init: std.process.Init) CliRunnerError!void {
     // single-test Child worker. On POSIX it's unused (fork path doesn't
     // re-exec). Always pass the positional `roc_binary` path through so the
     // child uses the same binary.
-    const worker_argv_template = try buildCliWorkerArgvTemplate(init.io, spec_arena.allocator(), init.minimal.args);
+    const worker_argv_template = try harness.buildWorkerArgvTemplate(init.io, spec_arena.allocator(), init.minimal.args);
 
     var wall_timer = harness.Timer.start() catch @panic("no clock");
     Pool.runWithSpans(init.io, tests, results, spans, max_children, timeout_ms, gpa, worker_argv_template);

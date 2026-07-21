@@ -996,6 +996,7 @@ const Certifier = struct {
             @intFromEnum(self.current_stmt),
         } ++ args;
         self.diag.context_stmt = self.current_stmt;
+        self.diag.context_proc = self.current_proc;
         self.diag.set("proc={d} stmt={d}: " ++ fmt, full_args);
         return error.Certification;
     }
