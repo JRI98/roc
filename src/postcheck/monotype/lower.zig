@@ -499,7 +499,7 @@ const StaticDataUse = struct {
     mono_type: Type.TypeId,
 };
 
-const StaticDataEligibilitySite = struct {
+const ConstNodeAddress = struct {
     module: checked.ModuleId,
     node: checked.ConstNodeId,
 };
@@ -633,7 +633,7 @@ const Builder = struct {
     nested_site_cache: std.AutoHashMap(NestedSiteAddress, names.ProcSiteId),
     const_expr_cache: std.AutoHashMap(ConstExprAddress, Ast.ExprId),
     static_data_ids: std.AutoHashMap(StaticDataUse, Common.StaticDataId),
-    static_data_eligibility: std.AutoHashMap(StaticDataEligibilitySite, bool),
+    static_data_eligibility: std.AutoHashMap(ConstNodeAddress, bool),
     inspect_defs: std.AutoHashMap(GeneratedHelperDefAddress, GeneratedHelperDefEntry),
     equality_defs: std.AutoHashMap(GeneratedHelperDefAddress, GeneratedHelperDefEntry),
     hash_defs: std.AutoHashMap(GeneratedHelperDefAddress, GeneratedHelperDefEntry),
@@ -690,7 +690,7 @@ const Builder = struct {
             .nested_site_cache = std.AutoHashMap(NestedSiteAddress, names.ProcSiteId).init(allocator),
             .const_expr_cache = std.AutoHashMap(ConstExprAddress, Ast.ExprId).init(allocator),
             .static_data_ids = std.AutoHashMap(StaticDataUse, Common.StaticDataId).init(allocator),
-            .static_data_eligibility = std.AutoHashMap(StaticDataEligibilitySite, bool).init(allocator),
+            .static_data_eligibility = std.AutoHashMap(ConstNodeAddress, bool).init(allocator),
             .inspect_defs = std.AutoHashMap(GeneratedHelperDefAddress, GeneratedHelperDefEntry).init(allocator),
             .equality_defs = std.AutoHashMap(GeneratedHelperDefAddress, GeneratedHelperDefEntry).init(allocator),
             .hash_defs = std.AutoHashMap(GeneratedHelperDefAddress, GeneratedHelperDefEntry).init(allocator),
@@ -1037,6 +1037,7 @@ const Builder = struct {
             .checked_type = request.checked_type,
             .ty = ret_ty,
             .def = def,
+            .const_locator = request.const_locator,
         });
         try self.appendRuntimeSchemaRequestsForType(ret_ty);
     }
@@ -2686,8 +2687,8 @@ const Builder = struct {
         view: ModuleView,
         node: checked.ConstNodeId,
     ) Allocator.Error!bool {
-        const site = StaticDataEligibilitySite{ .module = view.key, .node = node };
-        if (self.static_data_eligibility.get(site)) |stable| return stable;
+        const address = ConstNodeAddress{ .module = view.key, .node = node };
+        if (self.static_data_eligibility.get(address)) |stable| return stable;
 
         const stable = switch (view.const_store.get(node)) {
             .pending => Common.invariant("pending ConstStore node reached static data eligibility"),
@@ -2715,7 +2716,7 @@ const Builder = struct {
             },
             .nominal => |nominal| try self.constNodeHasStableStaticDataRepresentation(view, nominal.backing),
         };
-        try self.static_data_eligibility.put(site, stable);
+        try self.static_data_eligibility.put(address, stable);
         return stable;
     }
 
@@ -5707,6 +5708,7 @@ const DraftLayoutRequest = struct {
     checked_type: checked.CheckedTypeId,
     ty: DraftTypeCell,
     def: ?DraftDefId = null,
+    const_locator: ?checked.ConstLocator = null,
 };
 
 const DraftRuntimeSchemaRequest = struct {
@@ -6308,6 +6310,7 @@ const BodyDraftStore = struct {
                 .checked_type = request.checked_type,
                 .ty = try request.ty.seal(graph, sealer),
                 .def = if (request.def) |def_id| ids.def(def_id) else null,
+                .const_locator = request.const_locator,
             });
         }
 

@@ -465,6 +465,30 @@ not silently demote the value from compile-time evaluation. No backend may
 rediscover or guess root eligibility by scanning source syntax, function
 bodies, object symbols, or generated code.
 
+Target static data is produced from explicit, closed LIR initializer procedures.
+Monotype restoration builds each initializer from the stored `ConstStore` value,
+then closure lifting, lambda solving, layout commitment, structural LIR rewrites,
+and ARC run normally. The initializer's returned LIR value is the sole source of
+target representation: static materialization freezes its exact bytes,
+allocations, procedure relocations, and explicit generated-RC-helper
+relocations into readonly target data. It must not
+walk `ConstStore` in reverse using a type-derived storage plan, because a
+target-independent `ConstStore` node does not preserve the contextual callable
+encoding of every nested allocation.
+
+Static initializer execution uses target-width symbolic memory rather than host
+pointers. Every allocation records its committed target layout, alignment,
+reference-count metadata, and relocations. Materialization freezes the graph
+reachable from the returned value and may deduplicate only exact target
+representations. It must not choose callable variants, reconstruct layouts, or
+search for compatible encodings: those decisions already exist explicitly in
+the initializer's LIR. In particular, an erased callable's final-drop
+relocation carries its exact RC operation and capture-layout identity; a
+backend compiles that named atomic helper and never derives it from the
+capture layout or a symbol name.
+Initializer procedures are materialization-only LIR: they remain available to
+the freezer but runtime backends do not emit dead machine code for them.
+
 ## Backend Builtins
 
 Backend builtin linking is part of backend code generation, not a later repair
@@ -1862,6 +1886,13 @@ one with an annotation-only method such as `is_eq : _` or `map : _`. An exact
 method body remains an ordinary method implementation. Inspection is the sole
 exception to this opt-in rule: every type is inspectable, opaque values use the
 opaque representation, and an exact `to_inspect` method may override it.
+
+Canonicalization records each recognized associated underscore opt-in as an
+`e_derived_method` CIR expression carrying its exact derived-method kind. An
+ordinary annotation without a body remains `e_anno_only`; in a platform package,
+only that ordinary form may be rewritten into a hosted declaration. Checking and
+method-registry publication consume the explicit derived-method kind and must not
+recover compiler intent from identifier text or the annotation shape.
 
 Derived `map` and `map!` apply only to tag-union backing shapes. The checker
 selects one direct tag payload slot; it never descends into records, tuples, or
