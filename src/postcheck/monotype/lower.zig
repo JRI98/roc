@@ -499,7 +499,7 @@ const StaticDataUse = struct {
     mono_type: Type.TypeId,
 };
 
-const StaticDataEligibilityKey = struct {
+const StaticDataEligibilitySite = struct {
     module: checked.ModuleId,
     node: checked.ConstNodeId,
 };
@@ -633,7 +633,7 @@ const Builder = struct {
     nested_site_cache: std.AutoHashMap(NestedSiteAddress, names.ProcSiteId),
     const_expr_cache: std.AutoHashMap(ConstExprAddress, Ast.ExprId),
     static_data_ids: std.AutoHashMap(StaticDataUse, Common.StaticDataId),
-    static_data_eligibility: std.AutoHashMap(StaticDataEligibilityKey, bool),
+    static_data_eligibility: std.AutoHashMap(StaticDataEligibilitySite, bool),
     inspect_defs: std.AutoHashMap(GeneratedHelperDefAddress, GeneratedHelperDefEntry),
     equality_defs: std.AutoHashMap(GeneratedHelperDefAddress, GeneratedHelperDefEntry),
     hash_defs: std.AutoHashMap(GeneratedHelperDefAddress, GeneratedHelperDefEntry),
@@ -690,7 +690,7 @@ const Builder = struct {
             .nested_site_cache = std.AutoHashMap(NestedSiteAddress, names.ProcSiteId).init(allocator),
             .const_expr_cache = std.AutoHashMap(ConstExprAddress, Ast.ExprId).init(allocator),
             .static_data_ids = std.AutoHashMap(StaticDataUse, Common.StaticDataId).init(allocator),
-            .static_data_eligibility = std.AutoHashMap(StaticDataEligibilityKey, bool).init(allocator),
+            .static_data_eligibility = std.AutoHashMap(StaticDataEligibilitySite, bool).init(allocator),
             .inspect_defs = std.AutoHashMap(GeneratedHelperDefAddress, GeneratedHelperDefEntry).init(allocator),
             .equality_defs = std.AutoHashMap(GeneratedHelperDefAddress, GeneratedHelperDefEntry).init(allocator),
             .hash_defs = std.AutoHashMap(GeneratedHelperDefAddress, GeneratedHelperDefEntry).init(allocator),
@@ -2686,8 +2686,8 @@ const Builder = struct {
         view: ModuleView,
         node: checked.ConstNodeId,
     ) Allocator.Error!bool {
-        const key = StaticDataEligibilityKey{ .module = view.key, .node = node };
-        if (self.static_data_eligibility.get(key)) |stable| return stable;
+        const site = StaticDataEligibilitySite{ .module = view.key, .node = node };
+        if (self.static_data_eligibility.get(site)) |stable| return stable;
 
         const stable = switch (view.const_store.get(node)) {
             .pending => Common.invariant("pending ConstStore node reached static data eligibility"),
@@ -2715,7 +2715,7 @@ const Builder = struct {
             },
             .nominal => |nominal| try self.constNodeHasStableStaticDataRepresentation(view, nominal.backing),
         };
-        try self.static_data_eligibility.put(key, stable);
+        try self.static_data_eligibility.put(site, stable);
         return stable;
     }
 
