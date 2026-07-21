@@ -696,6 +696,7 @@ const all_syntax_expected_stdout =
     \\("Roc", 1.0, 1.0, 1.0)
     \\10.0
     \\{ age: 31, name: "Alice" }
+    \\{ age: 30, name: "Alice" }
     \\{ binary: 5.0, explicit_i128: 5, explicit_i16: 5, explicit_i32: 5, explicit_i64: 5, explicit_i8: 5, explicit_u128: 5, explicit_u16: 5, explicit_u32: 5, explicit_u64: 5, explicit_u8: 5, hex: 5.0, octal: 5.0, usage_based: 5.0 }
     \\<opaque>
     \\"The secret key is: my_secret_key"
