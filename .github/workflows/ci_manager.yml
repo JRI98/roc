@@ -100,19 +100,87 @@ jobs:
   # PRs run only `zig build minici` per OS; the full suite (LLVM eval,
   # valgrind, cross-compile, nix, the 6-OS matrix, ...) runs daily on main via
   # nightly_gate.yml, which gates the `nightly` branch.
-  zig-minici:
+  zig-minici-build:
     needs: check-changes
+    if: needs.check-changes.outputs.zig == 'true'
+    name: zig-minici-build (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-15, windows-2025]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # ratchet:actions/checkout@v6.0.2
+
+      - uses: xyzzylabs/setup-zig@09d85d9dbb73308882e7a26e61a8f706eed40df1 # ratchet:xyzzylabs/setup-zig@v1.0.2
+        with:
+          version: 0.16.0
+          use-cache: false
+
+      - name: Install Rust wasm target
+        run: rustup target add wasm32-unknown-unknown
+
+      - name: Install Rust musl target (Linux)
+        if: runner.os == 'Linux'
+        run: rustup target add x86_64-unknown-linux-musl
+
+      - name: Cache Zig dependency packages
+        uses: actions/cache@v6.1.0 # ratchet:actions/cache@v6.1.0
+        with:
+          # Zig stores fetched packages in the `p/` subdir of the global cache.
+          # Caching just that under a stable build.zig.zon-hash key keeps deps
+          # present across runs: it is read every run, so it stays warm and is
+          # not evicted by the setup action's churnier per-run cache. A cold runner then no
+          # longer re-downloads deps from GitHub and hits HttpConnectionClosing,
+          # while the setup action's own cache still handles build artifacts for speed.
+          path: ${{ env.ZIG_GLOBAL_CACHE_DIR }}/p
+          key: zig-deps-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('build.zig.zon') }}
+          restore-keys: |
+            zig-deps-${{ runner.os }}-${{ runner.arch }}-
+
+      - name: Restore or save MiniCI build cache
+        id: minici-build-cache
+        uses: actions/cache@v6.1.0 # ratchet:actions/cache@v6.1.0
+        with:
+          path: |
+            .zig-cache
+            zig-out/bin
+            zig-out/lib
+          key: minici-build-${{ runner.os }}-${{ runner.arch }}-${{ github.sha }}
+
+      # The embedded lld-link resolves /defaultlib via the LIB env and roc's
+      # linker locates the Windows SDK/MSVC libpaths at runtime (needed by
+      # run-test-cli / run-test-dylib / run-test-archive inside minici).
+      - name: Setup MSVC (Windows)
+        if: runner.os == 'Windows'
+        uses: TheMrMilchmann/setup-msvc-dev@79dac248aac9d0059f86eae9d8b5bfab4e95e97c # ratchet:TheMrMilchmann/setup-msvc-dev@v4.0.0
+        with:
+          arch: x64
+
+      # Dep fetching and compilation happen here, where network flakes surface
+      # on stdout for flaky-retry to match. The minici run below then hits a
+      # warm cache and goes straight to the run steps, so its failures are
+      # genuine and never retried.
+      - name: Build MiniCI binaries
+        if: steps.minici-build-cache.outputs.cache-hit != 'true'
+        uses: ./.github/actions/flaky-retry
+        with:
+          command: zig build build-ci
+          error_string_contains: "HttpConnectionClosing|build.zig.zon|TemporaryNameServerFailure|error: cannot download|EndOfStream|WriteFailed|503|bad HTTP response code"
+          retry_count: 3
+
+  zig-minici:
+    needs: [check-changes, zig-minici-build]
     if: needs.check-changes.outputs.zig == 'true'
     name: zig-minici (${{ matrix.shard }})
     runs-on: ${{ matrix.os }}
     timeout-minutes: ${{ matrix.timeout_minutes }}
     env:
-      # Must match the `cache-size-limit` that setup-zig is operating under.
-      # It is currently unset below, so this is the action's own default (MiB).
-      # The "Report .zig-cache composition" step compares against this and warns
-      # when the cache is over budget -- otherwise setup-zig clears it in its
-      # post step and says so only in a line nobody reads.
-      ZIG_CACHE_SIZE_LIMIT_MB: '2048'
+      # Warning threshold for the explicit MiniCI build cache. This is a
+      # sanity check for the cache artifact size, not a setup-zig setting.
+      MINICI_BUILD_CACHE_WARN_MB: '10240'
     strategy:
       fail-fast: false
       matrix:
@@ -152,8 +220,17 @@ jobs:
       - uses: xyzzylabs/setup-zig@09d85d9dbb73308882e7a26e61a8f706eed40df1 # ratchet:xyzzylabs/setup-zig@v1.0.2
         with:
           version: 0.16.0
-          use-cache: true
-          cache-key: ${{ matrix.shard }}
+          use-cache: false
+
+      - name: Restore MiniCI build cache
+        uses: actions/cache@v6.1.0 # ratchet:actions/cache@v6.1.0
+        with:
+          path: |
+            .zig-cache
+            zig-out/bin
+            zig-out/lib
+          key: minici-build-${{ runner.os }}-${{ runner.arch }}-${{ github.sha }}
+          fail-on-cache-miss: true
 
       - name: Install Rust wasm target
         run: rustup target add wasm32-unknown-unknown
@@ -161,26 +238,6 @@ jobs:
       - name: Install Rust musl target (Linux)
         if: runner.os == 'Linux'
         run: rustup target add x86_64-unknown-linux-musl
-
-      - name: Cache Zig dependency packages
-        uses: actions/cache@v6.1.0 # ratchet:actions/cache@v6.1.0
-        with:
-          # Zig stores fetched packages in the `p/` subdir of the global cache.
-          # Caching just that under a stable build.zig.zon-hash key keeps deps
-          # present across runs: it is read every run, so it stays warm and is
-          # not evicted by the setup action's churnier per-run cache. A cold runner then no
-          # longer re-downloads deps from GitHub and hits HttpConnectionClosing,
-          #
-          # Note this step is currently the ONLY working cache. The setup
-          # action also caches build artifacts, but `.zig-cache` exceeds its
-          # 2048 MiB cache-size-limit on every platform, so the action clears
-          # the directory in its post step and saves nothing -- every run then
-          # starts from a cold build cache. The "Report .zig-cache composition"
-          # step below measures this; sizing the limit is left to a follow-up.
-          path: ${{ env.ZIG_GLOBAL_CACHE_DIR }}/p
-          key: zig-deps-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('build.zig.zon') }}
-          restore-keys: |
-            zig-deps-${{ runner.os }}-${{ runner.arch }}-
 
       # The embedded lld-link resolves /defaultlib via the LIB env and roc's
       # linker locates the Windows SDK/MSVC libpaths at runtime (needed by
@@ -191,25 +248,13 @@ jobs:
         with:
           arch: x64
 
-      # Dep fetching and compilation happen here, where network flakes surface
-      # on stdout for flaky-retry to match. The minici run below then hits a
-      # warm cache and goes straight to the run steps, so its failures are
-      # genuine and never retried.
-      - name: Build MiniCI binaries
-        uses: ./.github/actions/flaky-retry
-        with:
-          command: zig build build-ci
-          retry_count: 3
-
       - name: Run MiniCI
-        run: zig build minici -- ${{ join(matrix.minici_args, ' ') }}
+        run: zig build minici -- --minici-skip-build ${{ join(matrix.minici_args, ' ') }}
 
-      # `.zig-cache` doubles as Zig's global cache, its local cache, the build
-      # temp dir, and (until it was moved out) the CLI tests' per-run scratch
-      # trees. When the total exceeds setup-zig's cache-size-limit the action
-      # clears the directory in its post step and saves nothing, so the next run
-      # does a fully cold build -- 30-39 minutes on Windows. That failure mode is
-      # invisible in the log, so report the composition on every run.
+      # `.zig-cache` doubles as Zig's global cache, its local cache, and the
+      # build temp dir. It is now restored from the explicit MiniCI build cache,
+      # so report the composition after each shard to measure cache size and
+      # growth from run-time build work.
       # One level deep on purpose: o/, h/, p/, tmp/ is the whole question.
       - name: Report .zig-cache composition
         if: always() && runner.os != 'Windows'
@@ -218,7 +263,7 @@ jobs:
         run: |
           set -uo pipefail
           root="${ZIG_LOCAL_CACHE_DIR:-$GITHUB_WORKSPACE/.zig-cache}"
-          limit_mb="$ZIG_CACHE_SIZE_LIMIT_MB"
+          limit_mb="$MINICI_BUILD_CACHE_WARN_MB"
           echo "root=$root  TMPDIR=${TMPDIR:-unset}"
           if [ ! -d "$root" ]; then echo "(no .zig-cache)"; exit 0; fi
           # `du -sk`, not `-sh`/`--block-size`: -k is POSIX and identical on BSD
@@ -231,7 +276,7 @@ jobs:
           awk -v k="$total_kb" -v l="$limit_mb" \
             'BEGIN { printf "%10.1f MB  TOTAL (limit %s MB)\n", k/1024, l }'
           if [ "$total_kb" -gt "$(( limit_mb * 1024 ))" ]; then
-            echo "::warning::.zig-cache is $(( total_kb / 1024 )) MB, over the ${limit_mb} MB cache-size-limit. setup-zig will clear it instead of saving it, so the next run starts from a cold build cache."
+            echo "::warning::.zig-cache is $(( total_kb / 1024 )) MB, over the ${limit_mb} MB MiniCI build-cache warning threshold."
           fi
 
       - name: Report .zig-cache composition (Windows)
@@ -241,7 +286,7 @@ jobs:
         run: |
           $root = if ($env:ZIG_LOCAL_CACHE_DIR) { $env:ZIG_LOCAL_CACHE_DIR }
                   else { Join-Path $env:GITHUB_WORKSPACE '.zig-cache' }
-          $limitMb = [int]$env:ZIG_CACHE_SIZE_LIMIT_MB
+          $limitMb = [int]$env:MINICI_BUILD_CACHE_WARN_MB
           Write-Host "root=$root  TEMP=$env:TEMP"
           if (-not (Test-Path -LiteralPath $root)) { Write-Host '(no .zig-cache)'; exit 0 }
           # -Force is required, or dotted/hidden subdirs are silently missed.
@@ -261,7 +306,7 @@ jobs:
           $totalFiles = ($rows | Measure-Object Files -Sum).Sum
           Write-Host ("TOTAL {0} MB across {1} files (limit {2} MB)" -f $totalMb, $totalFiles, $limitMb)
           if ($totalMb -gt $limitMb) {
-            Write-Host ("::warning::.zig-cache is {0} MB, over the {1} MB cache-size-limit. setup-zig will clear it instead of saving it, so the next run starts from a cold build cache." -f $totalMb, $limitMb)
+            Write-Host ("::warning::.zig-cache is {0} MB, over the {1} MB MiniCI build-cache warning threshold." -f $totalMb, $limitMb)
           }
 
       - name: Upload MiniCI report and logs
@@ -272,7 +317,7 @@ jobs:
           path: zig-out/minici/
 
   finish:
-    needs: [check-changes, zig-minici]
+    needs: [check-changes, zig-minici-build, zig-minici]
     runs-on: ubuntu-latest
     if: always()
     steps:
@@ -283,6 +328,10 @@ jobs:
             exit 1
           fi
           if [[ "${{ needs.check-changes.outputs.zig }}" == "true" ]]; then
+            if [[ "${{ needs.zig-minici-build.result }}" != "success" ]]; then
+              echo "zig-minici-build failed."
+              exit 1
+            fi
             if [[ "${{ needs.zig-minici.result }}" != "success" ]]; then
               echo "zig-minici failed."
               exit 1

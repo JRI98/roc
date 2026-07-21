@@ -61,6 +61,7 @@ const ParsedArgs = struct {
     zig_exe: []const u8,
     build_args: []const []const u8,
     selection: Selection,
+    skip_build: bool,
 };
 
 const jobs = [_]Job{
@@ -154,6 +155,7 @@ fn printSelectionUsage() void {
         \\  --minici-after <job>  execute MiniCI run jobs after this job
         \\  --minici-before <job> execute MiniCI run jobs before this job
         \\  --minici-only <job>   execute exactly one MiniCI run job
+        \\  --minici-skip-build   assume `build-ci` already ran and run selected jobs only
         \\
         \\Other arguments are forwarded to child `zig build` commands.
         \\
@@ -211,11 +213,14 @@ fn parseMiniArgs(allocator: std.mem.Allocator, args: []const []const u8) !Parsed
     var build_args = std.ArrayList([]const u8).empty;
     errdefer build_args.deinit(allocator);
     var selection = Selection{};
+    var skip_build = false;
 
     var i: usize = 2;
     while (i < args.len) : (i += 1) {
         const arg = args[i];
-        if (std.mem.eql(u8, arg, "--minici-from")) {
+        if (std.mem.eql(u8, arg, "--minici-skip-build")) {
+            skip_build = true;
+        } else if (std.mem.eql(u8, arg, "--minici-from")) {
             if (i + 1 >= args.len) {
                 printUsageError("missing value after `{s}`", arg);
                 return error.InvalidMiniCiArgument;
@@ -294,6 +299,7 @@ fn parseMiniArgs(allocator: std.mem.Allocator, args: []const []const u8) !Parsed
         .zig_exe = zig_exe,
         .build_args = try build_args.toOwnedSlice(allocator),
         .selection = selection,
+        .skip_build = skip_build,
     };
 }
 
@@ -451,6 +457,7 @@ fn isCheckJob(name: []const u8) bool {
 
 fn buildStatusText(result: CommandResult) []const u8 {
     if (isPass(result)) return "completed";
+    if (std.mem.eql(u8, result.status, "skip")) return "skipped";
     if (std.mem.eql(u8, result.status, "crash")) return "crashed";
     return "failed";
 }
@@ -1469,14 +1476,17 @@ pub fn main(init: std.process.Init) !void {
     const build_log = logs_dir ++ "/build-ci.txt";
     const build_progress = Progress{ .current = 1, .total = total_phases };
     printBuildStart(build_progress);
-    const build_result = try runCommand(allocator, io, build_argv, build_log, heartbeat_interval_ms, run_started_ns, build_progress);
+    const build_result = if (parsed_args.skip_build)
+        try skipCommand(io, build_argv, build_log, "skipped by --minici-skip-build\n", run_started_ns)
+    else
+        try runCommand(allocator, io, build_argv, build_log, heartbeat_interval_ms, run_started_ns, build_progress);
     if (build_result.heartbeat_printed) printBuildStart(build_progress);
     std.debug.print("{s} in {d:.3}s\n", .{ buildStatusText(build_result), seconds(build_result.duration_ns) });
 
     var results = std.ArrayList(CommandResult).empty;
     defer results.deinit(allocator);
 
-    if (!isPass(build_result)) {
+    if (!isSuccessful(build_result)) {
         printFailureLog(allocator, io, build_result);
         printRerunHint(build_result);
         try writeReportJson(allocator, io, run_started_unix_ms, build_result, results.items);
@@ -1554,6 +1564,7 @@ test "parseMiniArgs keeps MiniCI selection out of forwarded build args" {
         "--minici-after",
         "run-test-eval",
         "--minici-before=run-test-cli",
+        "--minici-skip-build",
         "-Ddebug-gpa-traces",
     };
     const parsed = try parseMiniArgs(std.testing.allocator, args);
@@ -1562,6 +1573,7 @@ test "parseMiniArgs keeps MiniCI selection out of forwarded build args" {
     try std.testing.expectEqualStrings("zig", parsed.zig_exe);
     try std.testing.expectEqualStrings("run-test-eval", parsed.selection.after orelse return error.MissingAfter);
     try std.testing.expectEqualStrings("run-test-cli", parsed.selection.before orelse return error.MissingBefore);
+    try std.testing.expect(parsed.skip_build);
     try std.testing.expectEqual(@as(usize, 3), parsed.build_args.len);
     try std.testing.expectEqualStrings("--search-prefix", parsed.build_args[0]);
     try std.testing.expectEqualStrings("/opt/zig", parsed.build_args[1]);
@@ -1575,6 +1587,7 @@ test "parseMiniArgs supports selecting one MiniCI job" {
 
     try std.testing.expectEqualStrings("run-test-zig-minici", parsed.selection.from orelse return error.MissingFrom);
     try std.testing.expectEqualStrings("run-test-zig-minici", parsed.selection.to orelse return error.MissingTo);
+    try std.testing.expect(!parsed.skip_build);
     try std.testing.expectEqual(@as(usize, 0), parsed.build_args.len);
 }
 
