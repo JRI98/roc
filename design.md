@@ -1024,6 +1024,30 @@ alias arguments, but references to the annotated value consume the annotation
 root. This is how alias spelling from annotations is preserved without making
 alias roots union-find representatives for concrete structures.
 
+## Module Completion Boundary
+
+The compile coordinator records phase progress separately from terminal module
+outcome. A terminal module has exactly one explicit outcome: success or failure.
+Successful completion means the module produced the complete semantic state
+required by importers, including its final content identity. Failed completion
+is terminal only for scheduling and accounting; any partial `ModuleEnv` retained
+for diagnostics or watch inputs is not semantic import data.
+
+Every semantic scheduling edge requires successful completion. Canonicalization,
+content-identity construction, checking, checked-cache publication, and platform
+requirement checking may consume only successful imported modules. A known
+failed module causes failure to propagate iteratively through all local-import,
+cross-package-import, and registered platform/app dependency edges. An import
+that cannot be resolved is distinct from a known failed module and proceeds only
+far enough for canonicalization to emit its source diagnostic.
+
+When a local import closes a cycle, the coordinator records the closing edge
+before reporting it. It then identifies the exact strongly connected component
+by mutual reachability, marks every member failed, and applies ordinary iterative
+failure propagation to all transitive dependents. Cycle members never masquerade
+as successfully completed modules and never provide partial environments or
+missing content identities to downstream stages.
+
 ## Cache Boundary
 
 The checked module cache is the only checked cache boundary in this design.
