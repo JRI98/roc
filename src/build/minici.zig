@@ -2,6 +2,7 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
+const build_options = @import("build_options");
 
 const out_dir = "zig-out/minici";
 const raw_dir = out_dir ++ "/raw";
@@ -1425,11 +1426,8 @@ fn applyMemoryAwareCpuLimit(io: std.Io, allocator: std.mem.Allocator, env: *cons
 /// on memory-constrained hosts (see `applyMemoryAwareCpuLimit`).
 pub fn main(init: std.process.Init) !void {
     const io = init.io;
-    // MiniCI stays standalone (no build_options wiring), so unlike the other
-    // first-party DebugAllocators this one keeps std's default allocation-site
-    // traces; it allocates too little for -Ddebug-gpa-traces to matter here.
-    var gpa_impl = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa_impl.deinit();
+    var gpa_impl = std.heap.DebugAllocator(.{ .stack_trace_frames = build_options.debug_gpa_stack_trace_frames }){};
+    defer _ = build_options.debugGpaOk(gpa_impl.deinit());
     const gpa = gpa_impl.allocator();
 
     var arena_impl = std.heap.ArenaAllocator.init(gpa);

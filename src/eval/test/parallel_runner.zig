@@ -848,13 +848,13 @@ fn runAllocationTest(
     const skips = if (comptime coverage_mode)
         [NUM_BACKENDS]bool{ skip.interpreter, true, true, true }
     else
-        [NUM_BACKENDS]bool{ skip.interpreter, skip.dev, skip.wasm, shouldSkipLlvm(skip.llvm) };
+        [NUM_BACKENDS]bool{ skip.interpreter, skip.dev, skip.wasm, true };
 
     const eval_fns = [NUM_BACKENDS]BackendEvalWithStatsFn{
         helpers.lirInterpreterStrWithStats,
         helpers.devEvaluatorStrWithStats,
         helpers.wasmEvaluatorStrWithStats,
-        helpers.devEvaluatorStrWithStats, // llvm placeholder
+        helpers.devEvaluatorStrWithStats, // unused; LLVM allocation stats are not implemented
     };
 
     var backends: [NUM_BACKENDS]BackendDetail = undefined;

@@ -30,6 +30,7 @@ const eval = @import("eval");
 const collections = @import("collections");
 const postcheck = @import("postcheck");
 const test_harness = @import("test_harness");
+const build_options = @import("build_options");
 
 const helpers = eval.test_helpers;
 const eval_tests = @import("eval_tests.zig");
@@ -443,8 +444,8 @@ pub fn main(init: std.process.Init) RunnerError!void {
         return error.RequiresDebugBuild;
     }
 
-    var gpa_impl: std.heap.DebugAllocator(.{}) = .init;
-    defer _ = gpa_impl.deinit();
+    var gpa_impl: std.heap.DebugAllocator(.{ .stack_trace_frames = build_options.debug_gpa_stack_trace_frames }) = .init;
+    defer _ = build_options.debugGpaOk(gpa_impl.deinit());
     const gpa = gpa_impl.allocator();
 
     var args_arena = collections.SingleThreadArena.init(gpa);
@@ -554,7 +555,7 @@ pub fn main(init: std.process.Init) RunnerError!void {
 
     if (comptime has_fork) {
         const cpu_count = std.Thread.getCpuCount() catch 4;
-        const default_jobs = @min(@max(cpu_count / 2, 1), 12);
+        const default_jobs = @min(cpu_count, 12);
         const job_limit = @max(cli.max_threads orelse default_jobs, 1);
         try runPool(gpa, io, run_list.items, job_limit, cli.timeout_ms, fail_fast, &report);
     } else {
@@ -627,6 +628,7 @@ fn printHelp() void {
             "tree-walking evaluator over the Debug-materialized Lambda Mono program.\n\n" ++
             "Options:\n" ++
             "  --filter <substr>   only run cases whose name/source matches (repeatable)\n" ++
+            "  --threads <n>       number of worker processes (default: min(cpu_count, 12))\n" ++
             "  --verbose           per-case logging\n" ++
             "  corpus-only         only the checked-in eval corpus\n" ++
             "  generated-only      only the generated sweep corpus\n" ++
