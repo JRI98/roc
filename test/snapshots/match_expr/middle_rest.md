@@ -86,7 +86,7 @@ match items {
 								(p-assign (ident "last")))
 							(rest-at (index 1)))))
 				(value
-					(e-dispatch-call (method "plus") (constraint-fn-var 207)
+					(e-dispatch-call (method "plus") (constraint-fn-var 231)
 						(receiver
 							(e-lookup-local
 								(p-assign (ident "first"))))
@@ -105,11 +105,11 @@ match items {
 							(rest-at (index 2)
 								(p-assign (ident "middle"))))))
 				(value
-					(e-dispatch-call (method "plus") (constraint-fn-var 213)
+					(e-dispatch-call (method "plus") (constraint-fn-var 237)
 						(receiver
-							(e-dispatch-call (method "plus") (constraint-fn-var 211)
+							(e-dispatch-call (method "plus") (constraint-fn-var 235)
 								(receiver
-									(e-dispatch-call (method "plus") (constraint-fn-var 209)
+									(e-dispatch-call (method "plus") (constraint-fn-var 233)
 										(receiver
 											(e-lookup-local
 												(p-assign (ident "a"))))

@@ -126,7 +126,7 @@ NO CHANGE
 		(e-lambda
 			(args
 				(p-underscore))
-			(e-call (constraint-fn-var 251)
+			(e-call (constraint-fn-var 275)
 				(e-lookup-local
 					(p-assign (ident "swapPair")))
 				(e-num (value "1"))

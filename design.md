@@ -5685,3 +5685,298 @@ Minimum boundary checks:
   their declaring modules are byte-identical.
 
 If a boundary check fails, the compiler stops as a compiler bug.
+
+
+## Integer SIMD Builtins
+
+This section describes the design of Roc's 128-bit integer SIMD builtins: the
+goals, the invariants they must preserve, the target architecture floors they
+assume, the type and naming design, and the pinned meaning of every
+operation class. The API itself lives in `src/build/roc/Builtin.roc` as eight
+nominal vector types nested in `Num`.
+
+### Goals
+
+The purpose of these builtins is to make it possible to write pure-Roc
+implementations of compression and image codecs — DEFLATE (plus zlib/gzip
+framing), PNG, JPEG, WebP, and AVIF, both encoding and decoding — whose
+performance approaches state-of-the-art native implementations (libdeflate,
+libjpeg-turbo, libwebp, dav1d, libaom) when both sides are held to 128-bit
+vectors and a single thread. The same operations also cover zstd, brotli,
+LZ4, base64/hex, UTF-8 validation and transcoding, JSON structural scanning,
+hashing (xxh3-class, CRC-32), and FLAC.
+
+The design center is *portable operations with pinned meaning*, not
+per-ISA intrinsics: each operation has exactly one meaning, and each backend
+lowers it to the best instruction sequence for that target. The one-line
+design law:
+
+> **Target-specific lowering is fine; target-specific meaning is not.**
+> Speed may vary by target. Bits may not.
+
+The op set was derived from the hot-kernel inventories of the codecs above —
+every operation is justified by named kernels that need it (DCT/IDCT
+multiply-accumulate, scanline filters, loop filters, CDEF, palette lookups,
+LZ77 copies, CRC folding, SAD-based encoder search, and so on). Nothing is
+included merely because some ISA has an instruction for it.
+
+### Invariants
+
+1. **Bit-identical results everywhere.** Pure Roc code produces the same
+   answer on every target and every backend — LLVM, both dev backends, wasm,
+   and the interpreter (including compile-time evaluation). Every SIMD
+   operation therefore has a precise scalar reference meaning, including
+   its edge cases: shift counts at or past the lane width, out-of-range
+   table-lookup indices, saturation boundaries, the `q15` multiply's
+   `-32768 × -32768` corner. Where an ISA's native behavior deviates from
+   the pinned meaning, that backend emits fixup instructions; it never
+   gets to leak its own behavior through.
+2. **No target-conditional Roc code.** There is no way, and will be no way,
+   for Roc source to ask "which CPU am I on?" The compiler alone knows.
+3. **Fixed 128-bit width.** A vector type is 128 bits, always, on every
+   target. This is itself a determinism feature: width-polymorphic APIs
+   (Highway-style) make *code* portable but let intermediate states vary by
+   target, which would leak target-dependence into observable results.
+   128-bit is the width that x86-64 (SSE through AVX2's 128-bit forms),
+   AArch64 NEON, and wasm simd128 all share natively. Wider types (`U8x32`,
+   …) can be added later as *new types* without changing what any existing
+   code means.
+
+Where an operation exists in wasm simd128, we pin wasm's meaning — that
+spec already solved "deterministic 128-bit SIMD that lowers well to both SSE
+and NEON," and it makes the wasm backend nearly free. (Operations from
+wasm's *relaxed-simd* extension are explicitly nondeterministic there;
+anything we take from that family gets pinned meaning here instead.)
+
+### Why integer-only (for now)
+
+All five target formats are integer in their specifications: AV1 decode is
+bit-exact integer by spec, libjpeg-turbo's production DCT is fixed-point
+integer, and DEFLATE/PNG/WebP have no arithmetic beyond integers. Float
+shows up only in encoder decision heuristics (rate-distortion lambdas,
+perceptual tuning), which convert cleanly to fixed-point — with the side
+benefit that Roc encoders become bit-reproducible across targets, which none
+of the C encoders guarantee. Float SIMD raises real cross-target determinism
+questions (FMA contraction, approximation instructions) that integer SIMD
+simply does not have, so it is deferred until something actually needs it.
+
+### Target floors
+
+Because SIMD operations inline into user code, there is no seam where
+runtime CPU dispatch could live (dispatch requires an out-of-line call
+boundary at kernel granularity, which is exactly what an inlined builtin
+does not have — and Roc has no startup hook for eager dispatch either).
+Instead, each (architecture, OS) target has a static floor:
+
+- **x86-64:** `x86-64-v3` **plus AES-NI and PCLMULQDQ** — i.e. Intel Haswell
+  (2013) and later, every AMD Zen. The v-levels deliberately exclude the two
+  crypto instructions (they were fused off on some budget parts before
+  ~2017), so the floor names them explicitly. Rationale: `pshufb`-class
+  byte shuffles (SSSE3) are load-bearing for nearly every codec kernel; the
+  VEX three-operand encodings and scalar BMI2 that v3 brings materially
+  speed up entropy-decode loops even at 128-bit vector width; carryless
+  multiply is required for competitive CRC-32. As of 2026 this floor covers
+  ~95% of the consumer installed base and 100% of what Windows 11 supports;
+  RHEL 10 already requires v3.
+- **AArch64:** ARMv8.2-class with the crypto extension — Cortex-A76 /
+  Neoverse-N1 (2018) and later. Covers every Apple Silicon Mac, every
+  Windows-on-ARM machine, every major ARM cloud chip (Graviton2+, Ampere,
+  Cobalt, Axion), and Raspberry Pi 5. Excludes Raspberry Pi 3/4 (their
+  cores lack the crypto extension carrying `pmull`).
+- **wasm:** the `simd128` feature (universally shipped in engines since
+  2021; the wasm backend already assumes it). wasm has no carryless
+  multiply and no AES instructions, so those two operations get slower —
+  but bit-identical — software lowerings on wasm.
+
+Under these floors both native architectures guarantee the same capability
+set: full 128-bit integer SIMD, a one-instruction byte shuffle, carryless
+multiply, and AES rounds. Floors only ever affect speed, never results, so
+adding a more conservative x64 variant target later would not violate
+anything.
+
+### Type design
+
+Eight concrete nominal types, siblings of the scalar number types in `Num`:
+
+```
+U8x16  I8x16  U16x8  I16x8  U32x4  I32x4  U64x2  I64x2
+```
+
+Deliberately **not** one parameterized `Vec(lane)` type, for three reasons:
+
+1. A large fraction of the op surface is lane-specific with cross-type
+   signatures (widening `U8x16 -> U16x8`, narrowing takes two `U16x8` to
+   one `U8x16`, `dot_pairs : I16x8, I16x8 -> I32x4`, byte shuffles only at
+   lane width 8, carryless multiply only at width 64). Under `Vec(lane)`
+   these all need concrete signatures anyway, so the parameterization buys
+   sharing only for the plain lane-wise suite while creating a "what rules
+   out `Vec(Str)`" problem and demanding a type-level next-wider-lane
+   function.
+2. Generic user code over vector types falls out of `where` method
+   constraints on the concrete types, exactly the way `List.sum` is generic
+   over `plus`/`default` — no `Lane` type or new machinery needed.
+3. It matches the house style: `Num` spells out thirteen scalar types
+   longhand; eight more siblings are stylistically seamless, and every op
+   stays monomorphic, which is what predictable lowering wants.
+
+Comparison results are **same-typed vectors** whose lanes are all-ones or
+all-zero (wasm-style) — there is no separate mask type. That is the machine
+representation on all three ISAs, and it composes with the bitwise ops and
+`bit_select` for free.
+
+#### Naming conventions
+
+- Lane-wise wrapping arithmetic is `plus_wrap` / `minus_wrap` /
+  `times_wrap` (never bare `plus`): scalar `plus` is
+  overflow-checked-and-crash, vectors cannot cheaply lane-check, and
+  hardware vector arithmetic wraps or saturates. The `_wrap` suffix keeps
+  the house rule that the suffix names the overflow behavior. Saturating
+  variants are `_saturated`, matching the scalars.
+- Operations returning per-lane comparison masks end in `_lanes`
+  (`eq_lanes`, `gt_lanes`, …); `is_eq` (returning `Bool`, all 128 bits
+  equal) keeps its usual meaning for `==` and tests.
+- Conversions follow scalar conventions: `to_u16x8_lo`/`_hi` for widening
+  halves, `narrow_to_u8x16_saturated`/`_wrap` for (two-input) narrowing,
+  `to_u32x4_bits` / `to_u128_bits` / `from_u128_bits` for free
+  reinterpretation of the same 128 bits.
+- Shifts are `shift_left_by` / `shift_right_by` / `shift_right_zf_by` with
+  a scalar `U8` count applied uniformly to every lane, matching the scalar
+  methods bit-for-bit per lane (see meaning below).
+- Every type carries the standard citizenship methods: `default` (zero
+  vector), `is_eq`, `to_hash`, `to_inspect`, plus `splat`, `from_list`,
+  `to_list`. The vector types deliberately do not participate in
+  `parser_for`/`encoder_for` derivation and have no `from_numeral` —
+  vectors are not literals or serialization leaves.
+
+#### Lane order
+
+Lane `i` of a vector occupies bits `[i * lane_bits, (i + 1) * lane_bits)`
+of the 128-bit value, and the vector's byte-serialized form (for `load`,
+`store`, `to_list` on `U8x16`, hashing) is little-endian — lane 0 first,
+each lane's bytes least-significant first. This matches the in-register and
+in-memory reality of x86-64, AArch64, and wasm, so no target pays a
+byte-swap tax.
+
+### Pinned meaning — the edge cases
+
+These are the cases where ISAs disagree natively and the spec must choose.
+The choices below are implemented by the reference implementations and are
+the contract every backend must match:
+
+- **Shifts** with count ≥ lane width: `shift_left_by` and
+  `shift_right_zf_by` produce 0; `shift_right_by` on signed lanes produces
+  the sign fill (0 or all-ones); on unsigned lanes it equals
+  `shift_right_zf_by`. This matches the scalar reference meaning (the
+  LLVM backend and both interpreters; the dev and wasm backends currently
+  diverge on the scalar versions — a pre-existing bug).
+- **`table_lookup`** (`pshufb` / `tbl` / `i8x16.swizzle`): any index ≥ 16
+  yields 0. (wasm/NEON meaning; on x86 `pshufb` needs a one-instruction
+  fixup because it wraps indices 16–127.)
+- **`times_fixed_q15_saturated`** (`pmulhrsw` / `sqrdmulh` /
+  `i16x8.q15mulr_sat_s`): `(-32768, -32768)` **saturates to +32767**
+  (wasm/NEON behavior; x86 `pmulhrsw` wraps on exactly this input and
+  needs a fixup, elidable whenever one operand is a constant that is not
+  -32768).
+- **`dot_pairs_saturated`** (`pmaddubsw`): unsigned × signed byte products
+  summed pairwise into `I16` lanes **with signed saturation** (x86
+  meaning, the useful one for filter kernels; NEON lowers via widening
+  multiplies plus a saturating pairwise combine).
+- **`sums_of_abs_diffs`** (`psadbw`): result lane 0 holds the sum of
+  absolute differences of bytes 0–7, lane 1 of bytes 8–15 (x86 layout,
+  pinned; NEON lowers via `uabdl`/`uadalp`).
+- **`avg_rounded`** (`pavgb` / `urhadd` / `avgr_u`): `(a + b + 1) >> 1` —
+  all three ISAs already agree.
+- **Saturating narrowing** uses the source signedness to clamp into the
+  destination range exactly as the scalar `to_*_try` bounds would define
+  (`packsswb`/`packuswb`-family, `sqxtn`/`sqxtun`, `narrow_i16x8_*`).
+- **`get_lane` / `with_lane` / `broadcast_lane`** crash on an out-of-range
+  lane index (like `div_by` crashes on zero), and `concat_shift_bytes`
+  crashes on a shift count > 16. These are expected to be compile-time
+  constants in practice.
+- **`to_bitmask`** collects each lane's most-significant bit, lane 0 in
+  bit 0 (`pmovmskb` / `i8x16.bitmask`; NEON emulates in a few
+  instructions). `any_lanes_set`/`all_lanes_set` are defined in terms of
+  it.
+
+### Current implementation state
+
+The API currently ships as **pure-Roc reference implementations**: each
+vector type is backed by `{ bits : U128 }` and every method has a real Roc
+body that implements the pinned meaning lane by lane. This is deliberate:
+
+1. The reference implementations *are* the definition of each operation, in
+   runnable form. The differential test harness compares every future backend lowering against
+   them, op by op, edge case by edge case, across all backends.
+2. The API, names, types, and doc comments are final and reviewable now,
+   independent of backend work.
+3. Nothing in the compiler needs to change for the API to land, and the
+   doc examples run as tests today.
+
+The implementation plan then replaces each method body with a bodiless
+declaration mapped to a low-level op, backend by backend, with the
+differential harness holding every backend to the reference behavior. The
+reference bodies move into the harness as the oracle at that point.
+Performance of the reference implementations is irrelevant — they exist for
+correctness, review, and testing.
+
+### Doc comments name the instructions
+
+Every operation's doc comment states the instruction (or short sequence)
+that implements it on x86-64, AArch64/NEON, and wasm simd128 — e.g.
+`table_lookup` names `pshufb`, `tbl`, and `i8x16.swizzle` — so that
+searching the docs for an instruction name finds the Roc builtin that
+provides it. Where a target needs a fixup or emulation, the doc says so.
+
+### Memory interop and streaming
+
+- `load : List(U8), U64 -> Try(V, [OutOfBounds, ..])` and
+  `store : V, List(U8), U64 -> Try(List(U8), [OutOfBounds, ..])` are the
+  checked bulk accessors (bytes, little-endian, any alignment — unaligned
+  128-bit access is effectively free on every supported CPU). The checked
+  form costs nothing in optimized loops: LLVM already merges the bounds
+  check of exactly this shape into the loop condition (see issue #10301,
+  case 1, where the checked `List.get` loop compiles to the same machine
+  loop as C).
+- `append_to : V, List(U8) -> List(U8)` appends 16 bytes for output
+  assembly.
+- `U8x16.iter_list : List(U8) -> { chunks : Iter(U8x16), tail : List(U8) }`
+  is the streaming chunk driver. Its current per-chunk overhead is tracked
+  in #10301 (case 4); codecs stream via `Iter` of chunks/rows, never per
+  byte.
+
+### Scalar-side gaps (tracked separately)
+
+Competitive codecs need the scalar side of the language to hold up too; the
+known gaps, deliberately excluded from the SIMD effort, are:
+
+- wrapping scalar arithmetic does not exist, and plain `+`/`-`/`*` are
+  checked (crash-on-overflow) even at `--opt=speed`, which also blocks
+  auto-vectorization of reductions — #10300;
+- `for`/`Iter` loops carry per-element step calls and refcount traffic
+  that the equivalent `while` loop does not — #10301;
+- no scalar rotate, byte-swap, or unaligned multi-byte loads from
+  `List(U8)` (bit-reader fuel for entropy decoders).
+
+### Benchmarking ground rules (for later)
+
+Single-threaded, competitors pinned to their 128-bit code paths (e.g.
+dav1d `--cpumask`, libjpeg-turbo's SSE2/NEON paths), same machine,
+CI-based. Encoder comparisons are speed at matched output quality
+(SSIMULACRA2-class metrics for images), not raw throughput. Their
+unrestricted AVX2/AVX-512 numbers may be recorded as context but are not
+the pass/fail bar while the language is 128-bit-only.
+
+### Open questions
+
+- Whether `get_lane`-style constant-index ops should eventually require
+  compile-time-constant arguments (today: crash on out-of-range, fast
+  paths when the optimizer sees a constant).
+- Whether a 32/48/64-byte `table_lookup` tier (NEON `tbl2`–`tbl4`) earns
+  its place once real kernels are measured (expressible today as multiple
+  16-byte lookups plus selects).
+- Typed-element loads (`List(U16)` → `U16x8`, etc.) — deferred until a
+  kernel wants them; byte buffers are the codec substrate.
+- Saturating arithmetic on 32/64-bit lanes, `abs` on `I64x2`, and unsigned
+  ordering compares on `U64x2` are omitted because no cataloged kernel
+  uses them and hardware support is ragged; any of them can be added later
+  without disturbing existing meaning.

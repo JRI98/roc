@@ -75,7 +75,7 @@ x = {
 		(p-assign (ident "x"))
 		(e-block
 			(s-expr
-				(e-dispatch-call (method "plus") (constraint-fn-var 191)
+				(e-dispatch-call (method "plus") (constraint-fn-var 215)
 					(receiver
 						(e-runtime-error (tag "ident_not_in_scope")))
 					(args
