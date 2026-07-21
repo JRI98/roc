@@ -5724,7 +5724,8 @@ included merely because some ISA has an instruction for it.
 
 1. **Bit-identical results everywhere.** Pure Roc code produces the same
    answer on every target and every backend — LLVM, both dev backends, wasm,
-   and the interpreter (including compile-time evaluation). Every SIMD
+   and the interpreter — and compile-time evaluation, which runs Roc code
+   on the dev backend, must agree with all of them. Every SIMD
    operation therefore has a precise scalar reference meaning, including
    its edge cases: shift counts at or past the lane width, out-of-range
    table-lookup indices, saturation boundaries, the `q15` multiply's
