@@ -1000,6 +1000,7 @@ const HoistSelectionTransaction = struct {
             .e_runtime_error,
             .e_ellipsis,
             .e_anno_only,
+            .e_derived_method,
             .e_crash,
             .e_closure,
             .e_lambda,
@@ -2540,6 +2541,7 @@ fn markHoistInvalidatedExprChildren(
         .e_crash,
         .e_ellipsis,
         .e_anno_only,
+        .e_derived_method,
         .e_break,
         .e_hosted_lambda,
         => {},
@@ -2699,6 +2701,7 @@ fn firstHoistSelectionTestExpr(checker: *Self) error{ExpectedHoistSelectionTestE
             .e_runtime_error,
             .e_ellipsis,
             .e_anno_only,
+            .e_derived_method,
             .e_crash,
             .e_closure,
             .e_lambda,
@@ -2997,6 +3000,7 @@ fn exprCanBeHoistedRoot(self: *Self, expr: CIR.Expr.Idx) bool {
         .e_runtime_error,
         .e_ellipsis,
         .e_anno_only,
+        .e_derived_method,
         .e_crash,
         .e_closure,
         .e_lambda,
@@ -3065,6 +3069,7 @@ fn exprCanCoverHoistedChildren(self: *Self, expr: CIR.Expr.Idx) bool {
         .e_runtime_error,
         .e_ellipsis,
         .e_anno_only,
+        .e_derived_method,
         .e_crash,
         .e_closure,
         .e_lambda,
@@ -3122,6 +3127,7 @@ fn exprCanBeHoistedBindingRoot(self: *Self, expr: CIR.Expr.Idx) bool {
         .e_runtime_error,
         .e_ellipsis,
         .e_anno_only,
+        .e_derived_method,
         .e_crash,
         .e_closure,
         .e_lambda,
@@ -5738,6 +5744,7 @@ fn hoistedRootDependenciesAreKeptInternal(
         .e_lookup_required,
         .e_ellipsis,
         .e_anno_only,
+        .e_derived_method,
         .e_crash,
         .e_closure,
         .e_lambda,
@@ -5877,6 +5884,7 @@ fn hoistedExprAllowsStoredConst(
         .e_runtime_error,
         .e_ellipsis,
         .e_anno_only,
+        .e_derived_method,
         .e_crash,
         .e_hosted_lambda,
         => true,
@@ -5997,6 +6005,7 @@ fn hoistedCallableDefForExpr(
         .e_runtime_error,
         .e_ellipsis,
         .e_anno_only,
+        .e_derived_method,
         .e_crash,
         .e_return,
         .e_break,
@@ -13373,15 +13382,11 @@ fn checkExpr(self: *Self, expr_idx: CIR.Expr.Idx, env: *Env, expected: Expected)
         },
         .e_anno_only => |anno| {
             if (expected.annotation != null and
-                ((can.BuiltinLowLevel.isBuiltinModule(self.cir) and
-                    can.BuiltinLowLevel.isIntrinsicAnnotation(self.cir, anno.ident)) or
-                    self.isGeneratedDerivedMethodAnnotation(anno.ident, expected.annotation.?)))
+                can.BuiltinLowLevel.isBuiltinModule(self.cir) and
+                can.BuiltinLowLevel.isIntrinsicAnnotation(self.cir, anno.ident))
             {
                 // Builtin.roc has a small explicit set of compiler-owned intrinsic
                 // wrappers that post-check lowering handles from checked data.
-                // Annotation-only derived-method declarations are opt-in markers
-                // whose generated targets are published in the static dispatch
-                // registry; every other annotation-only value remains an error.
             } else {
                 _ = try self.problems.appendProblem(self.gpa, .{ .annotation_only_value = .{
                     .region = if (expected.annotation) |annotation_idx|
@@ -13391,6 +13396,11 @@ fn checkExpr(self: *Self, expr_idx: CIR.Expr.Idx, env: *Env, expected: Expected)
                 } });
                 try self.unifyWith(expr_var, .err, env);
             }
+        },
+        .e_derived_method => {
+            // Canonicalization has already validated this explicit compiler-owned
+            // marker. Its generated target is published in the static dispatch
+            // registry after checking.
         },
         .e_return => |ret| {
             self.markCurrentHoistObservableEffect();
@@ -13952,13 +13962,7 @@ fn patternIdentInModule(module_env: *const ModuleEnv, def_idx: CIR.Def.Idx) ?Ide
 
 fn generatedDerivedMethodDef(module_env: *const ModuleEnv, def_idx: CIR.Def.Idx) bool {
     const def = module_env.store.getDef(def_idx);
-    const annotation_idx = def.annotation orelse return false;
-    switch (module_env.store.getExpr(def.expr)) {
-        .e_anno_only, .e_hosted_lambda => {},
-        else => return false,
-    }
-    const ident = patternIdentInModule(module_env, def_idx) orelse return false;
-    return can.BuiltinLowLevel.isDerivedMethodMarker(module_env, ident, annotation_idx);
+    return module_env.store.getExpr(def.expr) == .e_derived_method;
 }
 
 fn isExprNodeTag(tag: CIR.Node.Tag) bool {
@@ -13985,6 +13989,7 @@ fn isFunctionDef(store: *const CIR.NodeStore, expr: CIR.Expr) bool {
         },
         .e_lambda => true,
         .e_anno_only => true,
+        .e_derived_method => true,
         .e_hosted_lambda => true,
         else => false,
     };
@@ -21614,18 +21619,6 @@ fn satisfyImplicitEncoderForConstraint(
         },
         .unsupported => try self.reportConstraintError(dispatcher_var, constraint, .not_nominal, env, false),
     }
-}
-
-fn isGeneratedDerivedMethodAnnotation(self: *const Self, ident: Ident.Idx, annotation_idx: CIR.Annotation.Idx) bool {
-    const text = self.cir.getIdent(ident);
-    const is_derived = Ident.textEndsWith(text, ".is_eq") or
-        Ident.textEndsWith(text, ".to_hash") or
-        Ident.textEndsWith(text, ".parser_for") or
-        Ident.textEndsWith(text, ".encoder_for") or
-        Ident.textEndsWith(text, ".map") or
-        Ident.textEndsWith(text, ".map!");
-    if (!is_derived) return false;
-    return self.cir.store.getTypeAnno(self.cir.store.getAnnotation(annotation_idx).anno) == .underscore;
 }
 
 fn localLookupIsGeneratedDerivedMethodMarker(self: *const Self, pattern_idx: CIR.Pattern.Idx) bool {
