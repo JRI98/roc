@@ -433,6 +433,8 @@ pub const Root = struct {
 pub const LayoutRequest = struct {
     checked_type: checked.CheckedTypeId,
     ty: Type.TypeId,
+    initializer: ?FnId = null,
+    const_locator: ?checked.ConstLocator = null,
 };
 
 /// Runtime schema requested for a named runtime value shape.
