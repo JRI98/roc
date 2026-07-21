@@ -1622,13 +1622,9 @@ const Solver = struct {
         left: anytype,
         right: anytype,
     ) Allocator.Error!bool {
-        if (left.kind != right.kind) return false;
-        if (!sameSourceTypeDef(left.def, right.def)) return false;
-        _ = iteratorLikeOwnerFromPair(left.builtin_owner, right.builtin_owner) orelse return false;
+        if (MonoType.iteratorRelation(left, right) != .forced_dynamic) return false;
 
         const left_dynamic = left.def.iterator_representation == .forced_dynamic;
-        const right_dynamic = right.def.iterator_representation == .forced_dynamic;
-        if (left_dynamic == right_dynamic) return false;
         if (left.args.count() == 0 or right.args.count() == 0) {
             Common.invariant("forced-dynamic iterator reached Lambda Solved without a public item argument");
         }
@@ -1650,7 +1646,7 @@ const Solver = struct {
         left: anytype,
         right: anytype,
     ) Allocator.Error!bool {
-        if (!isGeneratedIteratorJoinPair(left, right)) return false;
+        if (MonoType.iteratorRelation(left, right) != .minted_join) return false;
 
         if (left.args.count() == 0 or right.args.count() == 0) {
             Common.invariant("generated iterator join reached Lambda Solved without a public item argument");
@@ -1683,7 +1679,7 @@ const Solver = struct {
         left: anytype,
         right: anytype,
     ) Allocator.Error!bool {
-        if (!isPublicGeneratedIteratorPair(left, right)) return false;
+        if (MonoType.iteratorRelation(left, right) != .public_minted) return false;
 
         if (left.args.count() == 0 or right.args.count() == 0) {
             Common.invariant("generated iterator evidence reached Lambda Solved without a public item argument");
@@ -2100,23 +2096,6 @@ fn isScoreSelectedEvidenceOwner(owner: ?static_dispatch.BuiltinOwner) bool {
     return isGeneratedOpaqueEvidenceOwner(resolved) and !static_dispatch.isIteratorOwner(resolved);
 }
 
-fn isPublicGeneratedIteratorPair(left: anytype, right: anytype) bool {
-    if (left.kind != right.kind) return false;
-    _ = iteratorLikeOwnerFromPair(left.builtin_owner, right.builtin_owner) orelse return false;
-    if (!sameSourceTypeDef(left.def, right.def)) return false;
-    return (left.def.iterator_representation == .minted and right.def.iterator_representation == .none) or
-        (left.def.iterator_representation == .none and right.def.iterator_representation == .minted);
-}
-
-fn isGeneratedIteratorJoinPair(left: anytype, right: anytype) bool {
-    if (left.kind != right.kind) return false;
-    _ = iteratorLikeOwnerFromPair(left.builtin_owner, right.builtin_owner) orelse return false;
-    if (!sameSourceTypeDef(left.def, right.def)) return false;
-    return left.def.iterator_representation == .minted and
-        right.def.iterator_representation == .minted and
-        !optionalDigestEql(left.def.generated, right.def.generated);
-}
-
 fn iteratorLikeOwnerFromPair(
     left: ?static_dispatch.BuiltinOwner,
     right: ?static_dispatch.BuiltinOwner,
@@ -2143,12 +2122,6 @@ fn isIteratorLikeOwner(owner: ?static_dispatch.BuiltinOwner) bool {
         => true,
         else => false,
     };
-}
-
-fn sameSourceTypeDef(left: MonoType.TypeDef, right: MonoType.TypeDef) bool {
-    return left.module == right.module and
-        left.type_name == right.type_name and
-        left.source_decl == right.source_decl;
 }
 
 fn sameMonoTypeDef(left: MonoType.TypeDef, right: MonoType.TypeDef) bool {
