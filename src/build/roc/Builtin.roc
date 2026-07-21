@@ -5918,34 +5918,43 @@ Builtin :: [].{
 			## Bits shifted past the most significant bit are discarded, and zeros
 			## are shifted in on the right. Each left shift by one is equivalent to
 			## multiplying by 2 (modulo 256).
+			## The count is taken modulo 8, so shifting by 8 leaves the value unchanged and shifting by 9 shifts by 1.
 			## ```roc
-			## expect U8.shift_left_by(1, 3) == 8
+			## expect U8.shl_wrap(1, 3) == 8
 			##
-			## expect U8.shift_left_by(0b0000_0101, 2) == 0b0001_0100
+			## expect U8.shl_wrap(0b0000_0101, 2) == 0b0001_0100
+			##
+			## expect U8.shl_wrap(1, 8) == 1
 			## ```
-			shift_left_by : U8, U8 -> U8
+			shl_wrap : U8, U8 -> U8
 
 			## Shift the bits of a [U8] to the right by the given number of positions.
 			## Bits shifted past the least significant bit are discarded, and zeros
 			## are shifted in on the left. Each right shift by one is equivalent to
 			## integer division by 2. For unsigned integers this behaves the same as
-			## [U8.shift_right_zf_by].
+			## [U8.shr_zf_wrap].
+			## The count is taken modulo 8, so shifting by 8 leaves the value unchanged and shifting by 9 shifts by 1.
 			## ```roc
-			## expect U8.shift_right_by(32, 2) == 8
+			## expect U8.shr_wrap(32, 2) == 8
 			##
-			## expect U8.shift_right_by(0b1010_0000, 3) == 0b0001_0100
+			## expect U8.shr_wrap(0b1010_0000, 3) == 0b0001_0100
+			##
+			## expect U8.shr_wrap(32, 8) == 32
 			## ```
-			shift_right_by : U8, U8 -> U8
+			shr_wrap : U8, U8 -> U8
 
 			## Shift the bits of a [U8] to the right by the given number of positions,
 			## filling the vacated high bits with zeros ("zero-fill"). For unsigned
-			## integers this behaves the same as [U8.shift_right_by].
+			## integers this behaves the same as [U8.shr_wrap].
+			## The count is taken modulo 8, so shifting by 8 leaves the value unchanged and shifting by 9 shifts by 1.
 			## ```roc
-			## expect U8.shift_right_zf_by(32, 2) == 8
+			## expect U8.shr_zf_wrap(32, 2) == 8
 			##
-			## expect U8.shift_right_zf_by(0b1010_0000, 3) == 0b0001_0100
+			## expect U8.shr_zf_wrap(0b1010_0000, 3) == 0b0001_0100
+			##
+			## expect U8.shr_zf_wrap(32, 8) == 32
 			## ```
-			shift_right_zf_by : U8, U8 -> U8
+			shr_zf_wrap : U8, U8 -> U8
 
 			## Returns the bitwise AND of two [U8] values. Each bit in the result is
 			## `1` only when the corresponding bit is `1` in both inputs.
@@ -6629,33 +6638,42 @@ Builtin :: [].{
 			## Shift the bits of an [I8] to the left by the given number of
 			## positions. Bits shifted past the most significant bit are discarded,
 			## and zeros are shifted in on the right.
+			## The count is taken modulo 8, so shifting by 8 leaves the value unchanged and shifting by 9 shifts by 1.
 			## ```roc
-			## expect I8.shift_left_by(1, 3) == 8
+			## expect I8.shl_wrap(1, 3) == 8
 			##
-			## expect I8.shift_left_by(0b0000_0101, 2) == 0b0001_0100
+			## expect I8.shl_wrap(0b0000_0101, 2) == 0b0001_0100
+			##
+			## expect I8.shl_wrap(1, 8) == 1
 			## ```
-			shift_left_by : I8, U8 -> I8
+			shl_wrap : I8, U8 -> I8
 
 			## Shift the bits of an [I8] to the right by the given number of
 			## positions, preserving the sign ("arithmetic shift"). The sign bit
 			## is shifted in on the left, so negative values remain negative. Each
 			## right shift by one is equivalent to integer division by 2 (rounding
 			## toward negative infinity).
+			## The count is taken modulo 8, so shifting by 8 leaves the value unchanged and shifting by 9 shifts by 1.
 			## ```roc
-			## expect I8.shift_right_by(32, 2) == 8
+			## expect I8.shr_wrap(32, 2) == 8
 			##
-			## expect I8.shift_right_by(-32, 2) == -8
+			## expect I8.shr_wrap(-32, 2) == -8
+			##
+			## expect I8.shr_wrap(32, 8) == 32
 			## ```
-			shift_right_by : I8, U8 -> I8
+			shr_wrap : I8, U8 -> I8
 
 			## Shift the bits of an [I8] to the right by the given number of
 			## positions.
+			## The count is taken modulo 8, so shifting by 8 leaves the value unchanged and shifting by 9 shifts by 1.
 			## ```roc
-			## expect I8.shift_right_zf_by(32, 2) == 8
+			## expect I8.shr_zf_wrap(32, 2) == 8
 			##
-			## expect I8.shift_right_zf_by(0b0101_0000, 3) == 0b0000_1010
+			## expect I8.shr_zf_wrap(0b0101_0000, 3) == 0b0000_1010
+			##
+			## expect I8.shr_zf_wrap(32, 8) == 32
 			## ```
-			shift_right_zf_by : I8, U8 -> I8
+			shr_zf_wrap : I8, U8 -> I8
 
 			## Returns the bitwise AND of two [I8] values. Each bit in the result is
 			## `1` only when the corresponding bit is `1` in both inputs.
@@ -7322,34 +7340,43 @@ Builtin :: [].{
 			## Bits shifted past the most significant bit are discarded, and zeros
 			## are shifted in on the right. Each left shift by one is equivalent to
 			## multiplying by 2 (modulo 65536).
+			## The count is taken modulo 16, so shifting by 16 leaves the value unchanged and shifting by 17 shifts by 1.
 			## ```roc
-			## expect U16.shift_left_by(1, 3) == 8
+			## expect U16.shl_wrap(1, 3) == 8
 			##
-			## expect U16.shift_left_by(0b0000_0101, 2) == 0b0001_0100
+			## expect U16.shl_wrap(0b0000_0101, 2) == 0b0001_0100
+			##
+			## expect U16.shl_wrap(1, 16) == 1
 			## ```
-			shift_left_by : U16, U8 -> U16
+			shl_wrap : U16, U8 -> U16
 
 			## Shift the bits of a [U16] to the right by the given number of positions.
 			## Bits shifted past the least significant bit are discarded, and zeros
 			## are shifted in on the left. Each right shift by one is equivalent to
 			## integer division by 2. For unsigned integers this behaves the same as
-			## [U16.shift_right_zf_by].
+			## [U16.shr_zf_wrap].
+			## The count is taken modulo 16, so shifting by 16 leaves the value unchanged and shifting by 17 shifts by 1.
 			## ```roc
-			## expect U16.shift_right_by(32, 2) == 8
+			## expect U16.shr_wrap(32, 2) == 8
 			##
-			## expect U16.shift_right_by(0b1010_0000, 3) == 0b0001_0100
+			## expect U16.shr_wrap(0b1010_0000, 3) == 0b0001_0100
+			##
+			## expect U16.shr_wrap(32, 16) == 32
 			## ```
-			shift_right_by : U16, U8 -> U16
+			shr_wrap : U16, U8 -> U16
 
 			## Shift the bits of a [U16] to the right by the given number of positions,
 			## filling the vacated high bits with zeros ("zero-fill"). For unsigned
-			## integers this behaves the same as [U16.shift_right_by].
+			## integers this behaves the same as [U16.shr_wrap].
+			## The count is taken modulo 16, so shifting by 16 leaves the value unchanged and shifting by 17 shifts by 1.
 			## ```roc
-			## expect U16.shift_right_zf_by(32, 2) == 8
+			## expect U16.shr_zf_wrap(32, 2) == 8
 			##
-			## expect U16.shift_right_zf_by(0b1010_0000, 3) == 0b0001_0100
+			## expect U16.shr_zf_wrap(0b1010_0000, 3) == 0b0001_0100
+			##
+			## expect U16.shr_zf_wrap(32, 16) == 32
 			## ```
-			shift_right_zf_by : U16, U8 -> U16
+			shr_zf_wrap : U16, U8 -> U16
 
 			## Returns the bitwise AND of two [U16] values. Each bit in the result is
 			## `1` only when the corresponding bit is `1` in both inputs.
@@ -8066,33 +8093,42 @@ Builtin :: [].{
 			## Shift the bits of an [I16] to the left by the given number of
 			## positions. Bits shifted past the most significant bit are discarded,
 			## and zeros are shifted in on the right.
+			## The count is taken modulo 16, so shifting by 16 leaves the value unchanged and shifting by 17 shifts by 1.
 			## ```roc
-			## expect I16.shift_left_by(1, 3) == 8
+			## expect I16.shl_wrap(1, 3) == 8
 			##
-			## expect I16.shift_left_by(0b0000_0101, 2) == 0b0001_0100
+			## expect I16.shl_wrap(0b0000_0101, 2) == 0b0001_0100
+			##
+			## expect I16.shl_wrap(1, 16) == 1
 			## ```
-			shift_left_by : I16, U8 -> I16
+			shl_wrap : I16, U8 -> I16
 
 			## Shift the bits of an [I16] to the right by the given number of
 			## positions, preserving the sign ("arithmetic shift"). The sign bit
 			## is shifted in on the left, so negative values remain negative. Each
 			## right shift by one is equivalent to integer division by 2 (rounding
 			## toward negative infinity).
+			## The count is taken modulo 16, so shifting by 16 leaves the value unchanged and shifting by 17 shifts by 1.
 			## ```roc
-			## expect I16.shift_right_by(32, 2) == 8
+			## expect I16.shr_wrap(32, 2) == 8
 			##
-			## expect I16.shift_right_by(-32, 2) == -8
+			## expect I16.shr_wrap(-32, 2) == -8
+			##
+			## expect I16.shr_wrap(32, 16) == 32
 			## ```
-			shift_right_by : I16, U8 -> I16
+			shr_wrap : I16, U8 -> I16
 
 			## Shift the bits of an [I16] to the right by the given number of
 			## positions.
+			## The count is taken modulo 16, so shifting by 16 leaves the value unchanged and shifting by 17 shifts by 1.
 			## ```roc
-			## expect I16.shift_right_zf_by(32, 2) == 8
+			## expect I16.shr_zf_wrap(32, 2) == 8
 			##
-			## expect I16.shift_right_zf_by(0b0101_0000, 3) == 0b0000_1010
+			## expect I16.shr_zf_wrap(0b0101_0000, 3) == 0b0000_1010
+			##
+			## expect I16.shr_zf_wrap(32, 16) == 32
 			## ```
-			shift_right_zf_by : I16, U8 -> I16
+			shr_zf_wrap : I16, U8 -> I16
 
 			## Returns the bitwise AND of two [I16] values. Each bit in the result is
 			## `1` only when the corresponding bit is `1` in both inputs.
@@ -8774,34 +8810,43 @@ Builtin :: [].{
 			## Bits shifted past the most significant bit are discarded, and zeros
 			## are shifted in on the right. Each left shift by one is equivalent to
 			## multiplying by 2 (modulo 4294967296).
+			## The count is taken modulo 32, so shifting by 32 leaves the value unchanged and shifting by 33 shifts by 1.
 			## ```roc
-			## expect U32.shift_left_by(1, 3) == 8
+			## expect U32.shl_wrap(1, 3) == 8
 			##
-			## expect U32.shift_left_by(0b0000_0101, 2) == 0b0001_0100
+			## expect U32.shl_wrap(0b0000_0101, 2) == 0b0001_0100
+			##
+			## expect U32.shl_wrap(1, 32) == 1
 			## ```
-			shift_left_by : U32, U8 -> U32
+			shl_wrap : U32, U8 -> U32
 
 			## Shift the bits of a [U32] to the right by the given number of positions.
 			## Bits shifted past the least significant bit are discarded, and zeros
 			## are shifted in on the left. Each right shift by one is equivalent to
 			## integer division by 2. For unsigned integers this behaves the same as
-			## [U32.shift_right_zf_by].
+			## [U32.shr_zf_wrap].
+			## The count is taken modulo 32, so shifting by 32 leaves the value unchanged and shifting by 33 shifts by 1.
 			## ```roc
-			## expect U32.shift_right_by(32, 2) == 8
+			## expect U32.shr_wrap(32, 2) == 8
 			##
-			## expect U32.shift_right_by(0b1010_0000, 3) == 0b0001_0100
+			## expect U32.shr_wrap(0b1010_0000, 3) == 0b0001_0100
+			##
+			## expect U32.shr_wrap(32, 32) == 32
 			## ```
-			shift_right_by : U32, U8 -> U32
+			shr_wrap : U32, U8 -> U32
 
 			## Shift the bits of a [U32] to the right by the given number of positions,
 			## filling the vacated high bits with zeros ("zero-fill"). For unsigned
-			## integers this behaves the same as [U32.shift_right_by].
+			## integers this behaves the same as [U32.shr_wrap].
+			## The count is taken modulo 32, so shifting by 32 leaves the value unchanged and shifting by 33 shifts by 1.
 			## ```roc
-			## expect U32.shift_right_zf_by(32, 2) == 8
+			## expect U32.shr_zf_wrap(32, 2) == 8
 			##
-			## expect U32.shift_right_zf_by(0b1010_0000, 3) == 0b0001_0100
+			## expect U32.shr_zf_wrap(0b1010_0000, 3) == 0b0001_0100
+			##
+			## expect U32.shr_zf_wrap(32, 32) == 32
 			## ```
-			shift_right_zf_by : U32, U8 -> U32
+			shr_zf_wrap : U32, U8 -> U32
 
 			## Returns the bitwise AND of two [U32] values. Each bit in the result is
 			## `1` only when the corresponding bit is `1` in both inputs.
@@ -9550,33 +9595,42 @@ Builtin :: [].{
 			## Shift the bits of an [I32] to the left by the given number of
 			## positions. Bits shifted past the most significant bit are discarded,
 			## and zeros are shifted in on the right.
+			## The count is taken modulo 32, so shifting by 32 leaves the value unchanged and shifting by 33 shifts by 1.
 			## ```roc
-			## expect I32.shift_left_by(1, 3) == 8
+			## expect I32.shl_wrap(1, 3) == 8
 			##
-			## expect I32.shift_left_by(0b0000_0101, 2) == 0b0001_0100
+			## expect I32.shl_wrap(0b0000_0101, 2) == 0b0001_0100
+			##
+			## expect I32.shl_wrap(1, 32) == 1
 			## ```
-			shift_left_by : I32, U8 -> I32
+			shl_wrap : I32, U8 -> I32
 
 			## Shift the bits of an [I32] to the right by the given number of
 			## positions, preserving the sign ("arithmetic shift"). The sign bit
 			## is shifted in on the left, so negative values remain negative. Each
 			## right shift by one is equivalent to integer division by 2 (rounding
 			## toward negative infinity).
+			## The count is taken modulo 32, so shifting by 32 leaves the value unchanged and shifting by 33 shifts by 1.
 			## ```roc
-			## expect I32.shift_right_by(32, 2) == 8
+			## expect I32.shr_wrap(32, 2) == 8
 			##
-			## expect I32.shift_right_by(-32, 2) == -8
+			## expect I32.shr_wrap(-32, 2) == -8
+			##
+			## expect I32.shr_wrap(32, 32) == 32
 			## ```
-			shift_right_by : I32, U8 -> I32
+			shr_wrap : I32, U8 -> I32
 
 			## Shift the bits of an [I32] to the right by the given number of
 			## positions.
+			## The count is taken modulo 32, so shifting by 32 leaves the value unchanged and shifting by 33 shifts by 1.
 			## ```roc
-			## expect I32.shift_right_zf_by(32, 2) == 8
+			## expect I32.shr_zf_wrap(32, 2) == 8
 			##
-			## expect I32.shift_right_zf_by(0b0101_0000, 3) == 0b0000_1010
+			## expect I32.shr_zf_wrap(0b0101_0000, 3) == 0b0000_1010
+			##
+			## expect I32.shr_zf_wrap(32, 32) == 32
 			## ```
-			shift_right_zf_by : I32, U8 -> I32
+			shr_zf_wrap : I32, U8 -> I32
 
 			## Returns the bitwise AND of two [I32] values. Each bit in the result is
 			## `1` only when the corresponding bit is `1` in both inputs.
@@ -10278,34 +10332,43 @@ Builtin :: [].{
 			## Bits shifted past the most significant bit are discarded, and zeros
 			## are shifted in on the right. Each left shift by one is equivalent to
 			## multiplying by 2 (modulo 2^64).
+			## The count is taken modulo 64, so shifting by 64 leaves the value unchanged and shifting by 65 shifts by 1.
 			## ```roc
-			## expect U64.shift_left_by(1, 3) == 8
+			## expect U64.shl_wrap(1, 3) == 8
 			##
-			## expect U64.shift_left_by(0b0000_0101, 2) == 0b0001_0100
+			## expect U64.shl_wrap(0b0000_0101, 2) == 0b0001_0100
+			##
+			## expect U64.shl_wrap(1, 64) == 1
 			## ```
-			shift_left_by : U64, U8 -> U64
+			shl_wrap : U64, U8 -> U64
 
 			## Shift the bits of a [U64] to the right by the given number of positions.
 			## Bits shifted past the least significant bit are discarded, and zeros
 			## are shifted in on the left. Each right shift by one is equivalent to
 			## integer division by 2. For unsigned integers this behaves the same as
-			## [U64.shift_right_zf_by].
+			## [U64.shr_zf_wrap].
+			## The count is taken modulo 64, so shifting by 64 leaves the value unchanged and shifting by 65 shifts by 1.
 			## ```roc
-			## expect U64.shift_right_by(32, 2) == 8
+			## expect U64.shr_wrap(32, 2) == 8
 			##
-			## expect U64.shift_right_by(0b1010_0000, 3) == 0b0001_0100
+			## expect U64.shr_wrap(0b1010_0000, 3) == 0b0001_0100
+			##
+			## expect U64.shr_wrap(32, 64) == 32
 			## ```
-			shift_right_by : U64, U8 -> U64
+			shr_wrap : U64, U8 -> U64
 
 			## Shift the bits of a [U64] to the right by the given number of positions,
 			## filling the vacated high bits with zeros ("zero-fill"). For unsigned
-			## integers this behaves the same as [U64.shift_right_by].
+			## integers this behaves the same as [U64.shr_wrap].
+			## The count is taken modulo 64, so shifting by 64 leaves the value unchanged and shifting by 65 shifts by 1.
 			## ```roc
-			## expect U64.shift_right_zf_by(32, 2) == 8
+			## expect U64.shr_zf_wrap(32, 2) == 8
 			##
-			## expect U64.shift_right_zf_by(0b1010_0000, 3) == 0b0001_0100
+			## expect U64.shr_zf_wrap(0b1010_0000, 3) == 0b0001_0100
+			##
+			## expect U64.shr_zf_wrap(32, 64) == 32
 			## ```
-			shift_right_zf_by : U64, U8 -> U64
+			shr_zf_wrap : U64, U8 -> U64
 
 			## Returns the bitwise AND of two [U64] values. Each bit in the result is
 			## `1` only when the corresponding bit is `1` in both inputs.
@@ -11096,33 +11159,42 @@ Builtin :: [].{
 			## Shift the bits of an [I64] to the left by the given number of
 			## positions. Bits shifted past the most significant bit are discarded,
 			## and zeros are shifted in on the right.
+			## The count is taken modulo 64, so shifting by 64 leaves the value unchanged and shifting by 65 shifts by 1.
 			## ```roc
-			## expect I64.shift_left_by(1, 3) == 8
+			## expect I64.shl_wrap(1, 3) == 8
 			##
-			## expect I64.shift_left_by(0b0000_0101, 2) == 0b0001_0100
+			## expect I64.shl_wrap(0b0000_0101, 2) == 0b0001_0100
+			##
+			## expect I64.shl_wrap(1, 64) == 1
 			## ```
-			shift_left_by : I64, U8 -> I64
+			shl_wrap : I64, U8 -> I64
 
 			## Shift the bits of an [I64] to the right by the given number of
 			## positions, preserving the sign ("arithmetic shift"). The sign bit
 			## is shifted in on the left, so negative values remain negative. Each
 			## right shift by one is equivalent to integer division by 2 (rounding
 			## toward negative infinity).
+			## The count is taken modulo 64, so shifting by 64 leaves the value unchanged and shifting by 65 shifts by 1.
 			## ```roc
-			## expect I64.shift_right_by(32, 2) == 8
+			## expect I64.shr_wrap(32, 2) == 8
 			##
-			## expect I64.shift_right_by(-32, 2) == -8
+			## expect I64.shr_wrap(-32, 2) == -8
+			##
+			## expect I64.shr_wrap(32, 64) == 32
 			## ```
-			shift_right_by : I64, U8 -> I64
+			shr_wrap : I64, U8 -> I64
 
 			## Shift the bits of an [I64] to the right by the given number of
 			## positions.
+			## The count is taken modulo 64, so shifting by 64 leaves the value unchanged and shifting by 65 shifts by 1.
 			## ```roc
-			## expect I64.shift_right_zf_by(32, 2) == 8
+			## expect I64.shr_zf_wrap(32, 2) == 8
 			##
-			## expect I64.shift_right_zf_by(0b0101_0000, 3) == 0b0000_1010
+			## expect I64.shr_zf_wrap(0b0101_0000, 3) == 0b0000_1010
+			##
+			## expect I64.shr_zf_wrap(32, 64) == 32
 			## ```
-			shift_right_zf_by : I64, U8 -> I64
+			shr_zf_wrap : I64, U8 -> I64
 
 			## Returns the bitwise AND of two [I64] values. Each bit in the result is
 			## `1` only when the corresponding bit is `1` in both inputs.
@@ -11852,34 +11924,43 @@ Builtin :: [].{
 			## Bits shifted past the most significant bit are discarded, and zeros
 			## are shifted in on the right. Each left shift by one is equivalent to
 			## multiplying by 2 (modulo 2^128).
+			## The count is taken modulo 128, so shifting by 128 leaves the value unchanged and shifting by 129 shifts by 1.
 			## ```roc
-			## expect U128.shift_left_by(1, 3) == 8
+			## expect U128.shl_wrap(1, 3) == 8
 			##
-			## expect U128.shift_left_by(0b0000_0101, 2) == 0b0001_0100
+			## expect U128.shl_wrap(0b0000_0101, 2) == 0b0001_0100
+			##
+			## expect U128.shl_wrap(1, 128) == 1
 			## ```
-			shift_left_by : U128, U8 -> U128
+			shl_wrap : U128, U8 -> U128
 
 			## Shift the bits of a [U128] to the right by the given number of positions.
 			## Bits shifted past the least significant bit are discarded, and zeros
 			## are shifted in on the left. Each right shift by one is equivalent to
 			## integer division by 2. For unsigned integers this behaves the same as
-			## [U128.shift_right_zf_by].
+			## [U128.shr_zf_wrap].
+			## The count is taken modulo 128, so shifting by 128 leaves the value unchanged and shifting by 129 shifts by 1.
 			## ```roc
-			## expect U128.shift_right_by(32, 2) == 8
+			## expect U128.shr_wrap(32, 2) == 8
 			##
-			## expect U128.shift_right_by(0b1010_0000, 3) == 0b0001_0100
+			## expect U128.shr_wrap(0b1010_0000, 3) == 0b0001_0100
+			##
+			## expect U128.shr_wrap(32, 128) == 32
 			## ```
-			shift_right_by : U128, U8 -> U128
+			shr_wrap : U128, U8 -> U128
 
 			## Shift the bits of a [U128] to the right by the given number of positions,
 			## filling the vacated high bits with zeros ("zero-fill"). For unsigned
-			## integers this behaves the same as [U128.shift_right_by].
+			## integers this behaves the same as [U128.shr_wrap].
+			## The count is taken modulo 128, so shifting by 128 leaves the value unchanged and shifting by 129 shifts by 1.
 			## ```roc
-			## expect U128.shift_right_zf_by(32, 2) == 8
+			## expect U128.shr_zf_wrap(32, 2) == 8
 			##
-			## expect U128.shift_right_zf_by(0b1010_0000, 3) == 0b0001_0100
+			## expect U128.shr_zf_wrap(0b1010_0000, 3) == 0b0001_0100
+			##
+			## expect U128.shr_zf_wrap(32, 128) == 32
 			## ```
-			shift_right_zf_by : U128, U8 -> U128
+			shr_zf_wrap : U128, U8 -> U128
 
 			## Returns the bitwise AND of two [U128] values. Each bit in the result is
 			## `1` only when the corresponding bit is `1` in both inputs.
@@ -12715,33 +12796,42 @@ Builtin :: [].{
 			## Shift the bits of an [I128] to the left by the given number of
 			## positions. Bits shifted past the most significant bit are discarded,
 			## and zeros are shifted in on the right.
+			## The count is taken modulo 128, so shifting by 128 leaves the value unchanged and shifting by 129 shifts by 1.
 			## ```roc
-			## expect I128.shift_left_by(1, 3) == 8
+			## expect I128.shl_wrap(1, 3) == 8
 			##
-			## expect I128.shift_left_by(0b0000_0101, 2) == 0b0001_0100
+			## expect I128.shl_wrap(0b0000_0101, 2) == 0b0001_0100
+			##
+			## expect I128.shl_wrap(1, 128) == 1
 			## ```
-			shift_left_by : I128, U8 -> I128
+			shl_wrap : I128, U8 -> I128
 
 			## Shift the bits of an [I128] to the right by the given number of
 			## positions, preserving the sign ("arithmetic shift"). The sign bit
 			## is shifted in on the left, so negative values remain negative. Each
 			## right shift by one is equivalent to integer division by 2 (rounding
 			## toward negative infinity).
+			## The count is taken modulo 128, so shifting by 128 leaves the value unchanged and shifting by 129 shifts by 1.
 			## ```roc
-			## expect I128.shift_right_by(32, 2) == 8
+			## expect I128.shr_wrap(32, 2) == 8
 			##
-			## expect I128.shift_right_by(-32, 2) == -8
+			## expect I128.shr_wrap(-32, 2) == -8
+			##
+			## expect I128.shr_wrap(32, 128) == 32
 			## ```
-			shift_right_by : I128, U8 -> I128
+			shr_wrap : I128, U8 -> I128
 
 			## Shift the bits of an [I128] to the right by the given number of
 			## positions.
+			## The count is taken modulo 128, so shifting by 128 leaves the value unchanged and shifting by 129 shifts by 1.
 			## ```roc
-			## expect I128.shift_right_zf_by(32, 2) == 8
+			## expect I128.shr_zf_wrap(32, 2) == 8
 			##
-			## expect I128.shift_right_zf_by(0b0101_0000, 3) == 0b0000_1010
+			## expect I128.shr_zf_wrap(0b0101_0000, 3) == 0b0000_1010
+			##
+			## expect I128.shr_zf_wrap(32, 128) == 32
 			## ```
-			shift_right_zf_by : I128, U8 -> I128
+			shr_zf_wrap : I128, U8 -> I128
 
 			## Returns the bitwise AND of two [I128] values. Each bit in the result is
 			## `1` only when the corresponding bit is `1` in both inputs.
@@ -20482,7 +20572,7 @@ dict_empty_bucket : Dict.DictBucket
 dict_empty_bucket = { dist_and_fingerprint: 0, entry_index: 0 }
 
 dict_dist_inc : U32
-dict_dist_inc = U32.shift_left_by(1, 8)
+dict_dist_inc = U32.shl_wrap(1, 8)
 
 dict_fingerprint_mask : U32
 dict_fingerprint_mask = dict_dist_inc - 1
@@ -20511,20 +20601,20 @@ dict_actual_shifts = |shifts| U8.bitwise_and(shifts, dict_shifts_mask)
 dict_shifts_for_current_seed : U8 -> U8
 dict_shifts_for_current_seed = |shifts| {
 	actual = dict_actual_shifts(shifts)
-	seed_high_byte = U64.to_u8_wrap(U64.shift_right_zf_by(dict_seed(), 56))
+	seed_high_byte = U64.to_u8_wrap(U64.shr_zf_wrap(dict_seed(), 56))
 	runtime_bit = U8.bitwise_and(seed_high_byte, dict_runtime_seed_bit)
 	U8.bitwise_or(actual, runtime_bit)
 }
 
 dict_seed_for_shifts : U8 -> U64
 dict_seed_for_shifts = |shifts| {
-	seed_mask_i8 = I8.shift_right_by(U8.to_i8_wrap(shifts), 7)
+	seed_mask_i8 = I8.shr_wrap(U8.to_i8_wrap(shifts), 7)
 	seed_mask = I8.to_u64_wrap(seed_mask_i8)
 	U64.bitwise_and(dict_seed(), seed_mask)
 }
 
 dict_bucket_count_for_shifts : U8 -> U64
-dict_bucket_count_for_shifts = |shifts| U64.shift_left_by(1, 64 - dict_actual_shifts(shifts))
+dict_bucket_count_for_shifts = |shifts| U64.shl_wrap(1, 64 - dict_actual_shifts(shifts))
 
 dict_max_entries_for_bucket_count : U64 -> U64
 dict_max_entries_for_bucket_count = |bucket_count|
@@ -20586,7 +20676,7 @@ dict_entry_index_from_u64 = |index|
 	}
 
 dict_bucket_index_from_hash : U64, U8 -> U64
-dict_bucket_index_from_hash = |hash, shifts| U64.shift_right_zf_by(hash, dict_actual_shifts(shifts))
+dict_bucket_index_from_hash = |hash, shifts| U64.shr_zf_wrap(hash, dict_actual_shifts(shifts))
 
 dict_dist_and_fingerprint_from_hash : U64 -> U32
 dict_dist_and_fingerprint_from_hash = |hash| {
@@ -21177,7 +21267,7 @@ crypto_digest_to_hex_bytes = |bytes| {
 
 	while $index < crypto_digest_byte_len {
 		byte = u8_list_get_unsafe(bytes, $index)
-		$out = u8_append($out, crypto_hex_digit(U8.shift_right_zf_by(byte, 4)))
+		$out = u8_append($out, crypto_hex_digit(U8.shr_zf_wrap(byte, 4)))
 		$out = u8_append($out, crypto_hex_digit(U8.bitwise_and(byte, 15)))
 		$index = $index + 1
 	}
@@ -21225,7 +21315,7 @@ crypto_digest_from_hex = |hex| {
 	while $index < crypto_digest_hex_len {
 		high = crypto_hex_nibble(u8_list_get_unsafe(bytes, $index), $index)?
 		low = crypto_hex_nibble(u8_list_get_unsafe(bytes, $index + 1), $index + 1)?
-		$out = u8_append($out, U8.bitwise_or(U8.shift_left_by(high, 4), low))
+		$out = u8_append($out, U8.bitwise_or(U8.shl_wrap(high, 4), low))
 		$index = $index + 2
 	}
 
@@ -22124,18 +22214,18 @@ append_utf8_code_point = |out, code_point|
 	if code_point < 128 {
 		u8_append(out, code_point.to_u8_wrap())
 	} else if code_point < 2048 {
-		b0 = 192 + code_point.shift_right_by(6)
+		b0 = 192 + code_point.shr_wrap(6)
 		b1 = 128 + code_point.bitwise_and(63)
 		u8_append(u8_append(out, b0.to_u8_wrap()), b1.to_u8_wrap())
 	} else if code_point < 65536 {
-		b0 = 224 + code_point.shift_right_by(12)
-		b1 = 128 + code_point.shift_right_by(6).bitwise_and(63)
+		b0 = 224 + code_point.shr_wrap(12)
+		b1 = 128 + code_point.shr_wrap(6).bitwise_and(63)
 		b2 = 128 + code_point.bitwise_and(63)
 		u8_append(u8_append(u8_append(out, b0.to_u8_wrap()), b1.to_u8_wrap()), b2.to_u8_wrap())
 	} else {
-		b0 = 240 + code_point.shift_right_by(18)
-		b1 = 128 + code_point.shift_right_by(12).bitwise_and(63)
-		b2 = 128 + code_point.shift_right_by(6).bitwise_and(63)
+		b0 = 240 + code_point.shr_wrap(18)
+		b1 = 128 + code_point.shr_wrap(12).bitwise_and(63)
+		b2 = 128 + code_point.shr_wrap(6).bitwise_and(63)
 		b3 = 128 + code_point.bitwise_and(63)
 		u8_append(u8_append(u8_append(u8_append(out, b0.to_u8_wrap()), b1.to_u8_wrap()), b2.to_u8_wrap()), b3.to_u8_wrap())
 	}
