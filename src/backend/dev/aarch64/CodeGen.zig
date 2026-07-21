@@ -693,8 +693,18 @@ pub fn CodeGen(comptime target: RocTarget) type {
 
         /// Emit conditional jump (returns patch location for fixup)
         pub fn emitCondJump(self: *Self, cond: Emit.Condition) Allocator.Error!usize {
+            // B.cond has only a signed 19-bit word offset (plus instruction
+            // alignment), which is too small for large generated switch arms.
+            // Emit the unknown-target form as:
+            //
+            //   B.<inverse> +8
+            //   B target
+            //
+            // The returned patch location points at the unconditional B, whose
+            // 26-bit immediate has the same range as any other patched jump.
+            try self.emit.bcond(cond.invert(), 8);
             const patch_loc = self.currentOffset();
-            try self.emit.bcond(cond, 0); // Placeholder offset
+            try self.emit.b(0);
             return patch_loc;
         }
 
@@ -709,15 +719,18 @@ pub fn CodeGen(comptime target: RocTarget) type {
             // Determine instruction type and patch accordingly
             if ((inst >> 26) == 0b000101) {
                 // B (unconditional): imm26 in bits [25:0]
+                std.debug.assert(offset_words >= std.math.minInt(i26) and offset_words <= std.math.maxInt(i26));
                 const imm26: u26 = @bitCast(@as(i26, @truncate(offset_words)));
                 inst = (inst & 0xFC000000) | imm26;
             } else if ((inst >> 24) == 0b01010100) {
                 // B.cond: imm19 in bits [23:5]
+                std.debug.assert(offset_words >= std.math.minInt(i19) and offset_words <= std.math.maxInt(i19));
                 const imm19: u19 = @bitCast(@as(i19, @truncate(offset_words)));
                 inst = (inst & 0xFF00001F) | (@as(u32, imm19) << 5);
             } else if (((inst >> 24) & 0b01111111) == 0b0110100 or ((inst >> 24) & 0b01111111) == 0b0110101) {
                 // CBZ/CBNZ: sf 011010 x imm19 Rt
                 // imm19 is in bits [23:5]
+                std.debug.assert(offset_words >= std.math.minInt(i19) and offset_words <= std.math.maxInt(i19));
                 const imm19: u19 = @bitCast(@as(i19, @truncate(offset_words)));
                 inst = (inst & 0xFF00001F) | (@as(u32, imm19) << 5);
             }
@@ -798,6 +811,26 @@ test "float operations" {
     try cg.emitDivF64(.V9, .V10, .V11);
 
     try std.testing.expect(cg.getCode().len > 0);
+}
+
+test "conditional jumps use long patchable form" {
+    var cg = LinuxCodeGen.init(std.testing.allocator);
+    defer cg.deinit();
+
+    const patch = try cg.emitCondJump(.ne);
+    try std.testing.expectEqual(@as(usize, 4), patch);
+
+    const first = std.mem.readInt(u32, cg.emit.buf.items[0..4], .little);
+    try std.testing.expectEqual(@as(u32, 0b01010100), first >> 24);
+    try std.testing.expectEqual(@as(u32, @intFromEnum(EmitMod.Emit(.arm64linux).Condition.eq)), first & 0xF);
+    try std.testing.expectEqual(@as(u32, 2), (first >> 5) & 0x7FFFF);
+
+    const target: usize = 2 * 1024 * 1024;
+    cg.patchJump(patch, target);
+
+    const second = std.mem.readInt(u32, cg.emit.buf.items[4..8], .little);
+    try std.testing.expectEqual(@as(u32, 0b000101), second >> 26);
+    try std.testing.expectEqual(@as(u32, @intCast((target - patch) / 4)), second & 0x03FF_FFFF);
 }
 
 test "CodeGen works for all aarch64 targets" {

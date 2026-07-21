@@ -9918,9 +9918,7 @@ pub fn LirCodeGen(comptime target: RocTarget) type {
             const skip_patch = blk: {
                 if (comptime target.toCpuArch() == .aarch64) {
                     try self.codegen.emit.cmpRegImm12(.w64, cap_reg, 0);
-                    const patch_loc = self.codegen.currentOffset();
-                    try self.codegen.emit.bcond(.mi, 0);
-                    break :blk patch_loc;
+                    break :blk try self.codegen.emitCondJump(.mi);
                 } else {
                     try self.codegen.emit.testRegReg(.w64, cap_reg, cap_reg);
                     break :blk try self.codegen.emitCondJump(.sign);
@@ -9958,9 +9956,7 @@ pub fn LirCodeGen(comptime target: RocTarget) type {
             const skip_patch = blk: {
                 if (comptime target.toCpuArch() == .aarch64) {
                     try self.codegen.emit.cmpRegImm12(.w64, cap_reg, 0);
-                    const patch_loc = self.codegen.currentOffset();
-                    try self.codegen.emit.bcond(.mi, 0);
-                    break :blk patch_loc;
+                    break :blk try self.codegen.emitCondJump(.mi);
                 } else {
                     try self.codegen.emit.testRegReg(.w64, cap_reg, cap_reg);
                     break :blk try self.codegen.emitCondJump(.sign);
@@ -11830,11 +11826,7 @@ pub fn LirCodeGen(comptime target: RocTarget) type {
         /// RETURNS: The patch location (where the displacement bytes are) for later patching.
         fn emitJumpIfNotEqual(self: *Self) Allocator.Error!usize {
             if (comptime target.toCpuArch() == .aarch64) {
-                // B.NE (branch if not equal) with placeholder offset
-                // On aarch64, the entire 4-byte instruction encodes the offset
-                const patch_loc = self.codegen.currentOffset();
-                try self.codegen.emit.bcond(.ne, 0);
-                return patch_loc;
+                return try self.codegen.emitCondJump(.ne);
             } else {
                 // JNE (jump if not equal) with placeholder offset
                 // x86_64: JNE rel32 is 0F 85 xx xx xx xx (6 bytes)
@@ -11848,10 +11840,7 @@ pub fn LirCodeGen(comptime target: RocTarget) type {
         /// Emit a conditional jump for unsigned less than (for list length comparisons)
         fn emitJumpIfEqual(self: *Self) Allocator.Error!usize {
             if (comptime target.toCpuArch() == .aarch64) {
-                // B.EQ (branch if equal) with placeholder offset
-                const patch_loc = self.codegen.currentOffset();
-                try self.codegen.emit.bcond(.eq, 0);
-                return patch_loc;
+                return try self.codegen.emitCondJump(.eq);
             } else {
                 // JE (jump if equal) with placeholder offset
                 const patch_loc = self.codegen.currentOffset() + 2;
