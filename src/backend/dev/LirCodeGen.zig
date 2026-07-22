@@ -12300,19 +12300,19 @@ pub fn LirCodeGen(comptime target: RocTarget) type {
                 switch (placement) {
                     .none => {},
                     .indirect => |location| switch (location) {
-                        .register => try builder.addLeaArg(frame_ptr, slot_off),
+                        .register => |register_index| builder.addLeaArgAt(register_index, frame_ptr, slot_off),
                         .stack => |stack_offset| builder.addStackLeaArgAt(stack_offset, frame_ptr, slot_off),
                     },
                     .stack_value => |stack_value| {
-                        try builder.addStackMemArgAt(stack_value.offset, frame_ptr, slot_off, stack_value.size);
+                        builder.addStackMemArgAt(stack_value.offset, frame_ptr, slot_off, stack_value.size);
                     },
                     .registers => |pieces| {
                         for (pieces) |assigned| {
                             const piece = assigned.piece;
                             const piece_off = slot_off + @as(i32, @intCast(piece.offset));
                             switch (piece.class) {
-                                .integer => try builder.addMemArg(frame_ptr, piece_off),
-                                .float, .vector => try builder.addFloatMemArg(frame_ptr, piece_off, piece.size),
+                                .integer => builder.addMemArgAt(assigned.register_index, frame_ptr, piece_off),
+                                .float, .vector => try builder.addFloatMemArgAt(assigned.register_index, frame_ptr, piece_off, piece.size),
                             }
                         }
                     },
@@ -12373,11 +12373,11 @@ pub fn LirCodeGen(comptime target: RocTarget) type {
             return result;
         }
 
-        /// Store hosted-call float result register `index` (0 or 1) into the return slot.
+        /// Store a hosted-call SIMD/FP result register into the return slot.
+        /// AArch64 homogeneous aggregates may return through v0..v3; x86-64
+        /// register-class returns use xmm0..xmm1.
         fn emitHostedFloatResultStore(self: *Self, dst_off: i32, index: usize, size: u8) Allocator.Error!void {
-            const freg0: FloatReg = if (arch == .x86_64) .XMM0 else .V0;
-            const freg1: FloatReg = if (arch == .x86_64) .XMM1 else .V1;
-            const freg = if (index == 0) freg0 else freg1;
+            const freg = hostedFloatResultReg(index);
             if (comptime target.toCpuArch() == .aarch64) {
                 switch (size) {
                     4 => try self.codegen.emitStoreStackF32(dst_off, freg),
@@ -12393,6 +12393,20 @@ pub fn LirCodeGen(comptime target: RocTarget) type {
                     else => unreachable,
                 }
             }
+        }
+
+        fn hostedFloatResultReg(index: usize) FloatReg {
+            return if (comptime target.toCpuArch() == .aarch64) switch (index) {
+                0 => .V0,
+                1 => .V1,
+                2 => .V2,
+                3 => .V3,
+                else => unreachable,
+            } else switch (index) {
+                0 => .XMM0,
+                1 => .XMM1,
+                else => unreachable,
+            };
         }
 
         /// Compare a general register against an immediate bit pattern.
@@ -17889,14 +17903,13 @@ pub fn LirCodeGen(comptime target: RocTarget) type {
         }
 
         /// A C-ABI piece of an entrypoint argument that arrives on the
-        /// caller's stack. `incoming_slot` indexes the caller's 8-byte
-        /// outgoing argument slots.
+        /// caller's stack. The offset is byte-exact because Apple arm64 packs
+        /// sub-word stack arguments more tightly than generic AAPCS64.
         const EntryStackCopy = struct {
             dest_off: i32,
-            incoming_slot: u32,
+            incoming_byte_offset: u32,
             kind: union(enum) {
-                /// Copy one slot's value into the destination, storing
-                /// `width` bytes (4 or 8).
+                /// Copy a naturally sized 1/2/4/8-byte piece.
                 value: u8,
                 /// The slot holds a pointer; copy this many bytes from it.
                 deref: u32,
@@ -18091,15 +18104,16 @@ pub fn LirCodeGen(comptime target: RocTarget) type {
                         const raw_size = self.layout_store.layoutSizeAlign(self.layout_store.getLayout(runtime_layout)).size;
                         const slot_size = @max(self.entrypointParamSlotSize(arg_layout), std.mem.alignForward(u32, raw_size, 8));
                         const slot = self.codegen.allocStackSlot(slot_size);
-                        const first_incoming_slot: u32 = stack_value.offset / 8;
-                        const slot_count = (raw_size + 7) / 8;
-                        var k: u32 = 0;
-                        while (k < slot_count) : (k += 1) {
+                        var copied: u32 = 0;
+                        while (copied < raw_size) {
+                            const remaining = raw_size - copied;
+                            const piece_size: u8 = if (remaining >= 8) 8 else if (remaining >= 4) 4 else if (remaining >= 2) 2 else 1;
                             try incoming_stack_copies.append(self.allocator, .{
-                                .dest_off = slot + @as(i32, @intCast(k * 8)),
-                                .incoming_slot = first_incoming_slot + k,
-                                .kind = .{ .value = @intCast(@min(@as(u32, 8), raw_size - k * 8)) },
+                                .dest_off = slot + @as(i32, @intCast(copied)),
+                                .incoming_byte_offset = stack_value.offset + copied,
+                                .kind = .{ .value = piece_size },
                             });
+                            copied += piece_size;
                         }
                         const loc = self.stackLocationForLayout(arg_layout, slot);
                         try self.scratch_arg_infos.append(.{
@@ -18131,7 +18145,7 @@ pub fn LirCodeGen(comptime target: RocTarget) type {
                             .stack => |stack_offset| {
                                 try incoming_stack_copies.append(self.allocator, .{
                                     .dest_off = slot,
-                                    .incoming_slot = stack_offset / 8,
+                                    .incoming_byte_offset = stack_offset,
                                     .kind = .{ .deref = raw_size },
                                 });
                             },
@@ -18174,15 +18188,18 @@ pub fn LirCodeGen(comptime target: RocTarget) type {
             // by emitEntryIncomingStackCopies right after the prologue.)
             if (comptime target.toCpuArch() == .x86_64) {
                 for (incoming_stack_copies.items) |copy| {
-                    const src_off = incoming_stack_arg_base_offset + @as(i32, @intCast(copy.incoming_slot)) * 8;
+                    const src_off = incoming_stack_arg_base_offset + @as(i32, @intCast(copy.incoming_byte_offset));
                     switch (copy.kind) {
                         .value => |width| {
-                            try self.emitLoad(.w64, scratch_reg, frame_ptr, src_off);
-                            if (width <= 4) {
-                                try self.emitStore(.w32, frame_ptr, copy.dest_off, scratch_reg);
-                            } else {
-                                try self.emitStore(.w64, frame_ptr, copy.dest_off, scratch_reg);
-                            }
+                            const register_width: x86_64.RegisterWidth = switch (width) {
+                                1 => .w8,
+                                2 => .w16,
+                                4 => .w32,
+                                8 => .w64,
+                                else => unreachable,
+                            };
+                            try self.codegen.emit.movRegMem(register_width, scratch_reg, frame_ptr, src_off);
+                            try self.codegen.emit.movMemReg(register_width, frame_ptr, copy.dest_off, scratch_reg);
                         },
                         .deref => |size| {
                             try self.emitLoad(.w64, scratch_reg, frame_ptr, src_off);
@@ -18292,22 +18309,35 @@ pub fn LirCodeGen(comptime target: RocTarget) type {
         }
 
         /// Copy entrypoint argument pieces from the caller's outgoing stack
-        /// slots into the frame. Emitted right after the prologue on aarch64,
-        /// where the caller's slots sit at [fp + frame_total].
+        /// area into the frame. Emitted right after the prologue on aarch64,
+        /// where that area begins at [fp + frame_total].
         fn emitEntryIncomingStackCopies(self: *Self, copies: []const EntryStackCopy, frame_total: i32) Allocator.Error!void {
             if (comptime target.toCpuArch() != .aarch64) {
                 std.debug.assert(copies.len == 0);
                 return;
             }
             for (copies) |copy| {
-                const src_off = frame_total + @as(i32, @intCast(copy.incoming_slot)) * 8;
+                const src_off = frame_total + @as(i32, @intCast(copy.incoming_byte_offset));
                 switch (copy.kind) {
                     .value => |width| {
-                        try self.emitLoad(.w64, .IP0, frame_ptr, src_off);
-                        if (width <= 4) {
-                            try self.emitStore(.w32, frame_ptr, copy.dest_off, .IP0);
-                        } else {
-                            try self.emitStore(.w64, frame_ptr, copy.dest_off, .IP0);
+                        switch (width) {
+                            1 => {
+                                try self.codegen.emit.ldrbRegMemSoff(.IP0, frame_ptr, src_off);
+                                try self.codegen.emit.strbRegMemSoff(.IP0, frame_ptr, copy.dest_off);
+                            },
+                            2 => {
+                                try self.codegen.emit.ldrhRegMemSoff(.IP0, frame_ptr, src_off);
+                                try self.codegen.emit.strhRegMemSoff(.IP0, frame_ptr, copy.dest_off);
+                            },
+                            4 => {
+                                try self.emitLoad(.w32, .IP0, frame_ptr, src_off);
+                                try self.emitStore(.w32, frame_ptr, copy.dest_off, .IP0);
+                            },
+                            8 => {
+                                try self.emitLoad(.w64, .IP0, frame_ptr, src_off);
+                                try self.emitStore(.w64, frame_ptr, copy.dest_off, .IP0);
+                            },
+                            else => unreachable,
                         }
                     },
                     .deref => |size| {
@@ -19803,4 +19833,12 @@ test "entrypoint param slots round aggregates to ABI word width" {
     try std.testing.expectEqual(@as(u32, 16), codegen.entrypointParamSlotSize(aggregate_layout));
     try std.testing.expectEqual(@as(u32, 24), codegen.entrypointParamSlotSize(.str));
     try std.testing.expectEqual(@as(u32, 8), codegen.entrypointParamSlotSize(.bool));
+}
+
+test "aarch64 hosted HFA and HVA returns expose V0 through V3" {
+    const ArmCodeGen = LirCodeGen(.arm64linux);
+    try std.testing.expectEqual(aarch64.FloatReg.V0, ArmCodeGen.hostedFloatResultReg(0));
+    try std.testing.expectEqual(aarch64.FloatReg.V1, ArmCodeGen.hostedFloatResultReg(1));
+    try std.testing.expectEqual(aarch64.FloatReg.V2, ArmCodeGen.hostedFloatResultReg(2));
+    try std.testing.expectEqual(aarch64.FloatReg.V3, ArmCodeGen.hostedFloatResultReg(3));
 }

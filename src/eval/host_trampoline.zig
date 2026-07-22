@@ -36,8 +36,9 @@ const Call = extern struct {
     sret: ?*anyopaque,
     /// Captured integer result registers after the call (x0,x1 / rax,rdx).
     res_gp: *[2]u64,
-    /// Captured SSE result registers after the call (v0,v1 / xmm0,xmm1).
-    res_sse: *[2]u128,
+    /// Captured SIMD/FP result registers after the call. AArch64 homogeneous
+    /// aggregates can use v0..v3; x86-64 writes the first two entries.
+    res_sse: *[max_result_sse]u128,
 };
 
 const supported = switch (builtin.cpu.arch) {
@@ -50,6 +51,7 @@ pub const available = supported;
 
 const max_gp = 8;
 const max_sse = 8;
+const max_result_sse = 4;
 /// Stack argument area: bounded; hosted functions with more than this much stack-passed
 /// argument data are rejected rather than silently truncated.
 const max_stack_bytes = 256;
@@ -133,7 +135,7 @@ pub fn call(
     }
 
     var res_gp: [2]u64 = @splat(0);
-    var res_sse: [2]u128 = @splat(0);
+    var res_sse: [max_result_sse]u128 = @splat(0);
     var ctl = Call{
         .target = target,
         .gp = &gp,
@@ -195,4 +197,12 @@ test "host_trampoline available on supported arches" {
     if (builtin.cpu.arch == .aarch64 or builtin.cpu.arch == .x86_64) {
         try std.testing.expect(available);
     }
+}
+
+test "host trampoline captures every AArch64 homogeneous aggregate result register" {
+    try std.testing.expectEqual(@as(usize, 4), max_result_sse);
+    const result_image = @typeInfo(@FieldType(Call, "res_sse")).pointer.child;
+    try std.testing.expectEqual(@as(usize, max_result_sse * @sizeOf(u128)), @sizeOf(result_image));
+    const assembly_source = @embedFile("host_trampoline.S");
+    try std.testing.expect(std.mem.find(u8, assembly_source, "stp q2, q3, [x9, #32]") != null);
 }

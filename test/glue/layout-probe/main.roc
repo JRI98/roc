@@ -22,7 +22,8 @@ platform ""
 		provide_spill_integer_pair : I64, I64, I64, I64, I64, I64, I64, Probe.IntegerPair -> Probe.IntegerPair,
 		provide_align_i128 : I64, I128 -> I128,
 		provide_spill_i128 : I64, I64, I64, I64, I64, I128 -> I128,
-		provide_spill_dec : I64, I64, I64, I64, I64, Dec -> Dec
+		provide_spill_dec : I64, I64, I64, I64, I64, Dec -> Dec,
+		provide_compact_stack : I64, I64, I64, I64, I64, I64, I64, I64, U8, U16, U32 -> U64
 	}
 	exposes [Probe]
 	packages {}
@@ -50,6 +51,7 @@ platform ""
 		"roc_provide_align_i128": provide_align_i128_for_host,
 		"roc_provide_spill_i128": provide_spill_i128_for_host,
 		"roc_provide_spill_dec": provide_spill_dec_for_host,
+		"roc_provide_compact_stack": provide_compact_stack_for_host,
 	}
 	hosted {
 		"roc_probe_roundtrip": Probe.roundtrip!,
@@ -74,6 +76,7 @@ platform ""
 		"roc_probe_align_i128": Probe.align_i128!,
 		"roc_probe_spill_i128": Probe.spill_i128!,
 		"roc_probe_spill_dec": Probe.spill_dec!,
+		"roc_probe_compact_stack": Probe.compact_stack!,
 	}
 	targets: {
 		inputs_dir: "targets/",
@@ -155,3 +158,5 @@ provide_align_i128_for_host = provide_align_i128
 provide_spill_i128_for_host = provide_spill_i128
 
 provide_spill_dec_for_host = provide_spill_dec
+
+provide_compact_stack_for_host = provide_compact_stack

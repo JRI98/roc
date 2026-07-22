@@ -139,6 +139,14 @@ RocDec roc_probe_spill_dec(int64_t arg0, int64_t arg1, int64_t arg2, int64_t arg
     (void)arg0; (void)arg1; (void)arg2; (void)arg3; (void)arg4;
     return arg5;
 }
+uint64_t roc_probe_compact_stack(
+    int64_t arg0, int64_t arg1, int64_t arg2, int64_t arg3,
+    int64_t arg4, int64_t arg5, int64_t arg6, int64_t arg7,
+    uint8_t tiny, uint16_t short_value, uint32_t word) {
+    (void)arg0; (void)arg1; (void)arg2; (void)arg3;
+    (void)arg4; (void)arg5; (void)arg6; (void)arg7;
+    return (uint64_t)tiny + (uint64_t)short_value + (uint64_t)word;
+}
 
 static void check_provided_abi(void) {
     const uint8_t expected[16] = {
@@ -244,6 +252,8 @@ static void check_provided_abi(void) {
     RocDec wide_dec = { .num = ((__int128)0x0123456789abcdefULL << 64) | (__int128)0xfedcba9876543210ULL };
     RocDec wide_dec_back = roc_provide_spill_dec(1, 2, 3, 4, 5, wide_dec);
     if (wide_dec_back.num != wide_dec.num) record_failure("provided spilled Dec mismatch");
+    const uint64_t compact = roc_provide_compact_stack(1, 2, 3, 4, 5, 6, 7, 8, 0x12, 0x3456, 0x789abcde);
+    if (compact != 0x12ULL + 0x3456ULL + 0x789abcdeULL) record_failure("provided compact stack mismatch");
 }
 
 int main(void) {

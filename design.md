@@ -6013,6 +6013,16 @@ aggregate instead and becomes aligned `byval` when both INTEGER eightbytes do
 not fit. Wrappers and machine-call consumers follow this explicit data
 directly.
 
+The concrete ABI placement is authoritative all the way through native call
+emission. Consumers address the recorded register index directly, including
+intentional holes before aligned AArch64 multi-register values. Stack
+placements remain byte offsets rather than being converted back into abstract
+eightbyte slots: this is required for Apple arm64's naturally aligned compact
+1/2/4-byte arguments. The inverse entrypoint wrappers copy from those same
+byte-exact offsets. AArch64 hosted result capture includes V0 through V3, the
+complete result-register set required by legal one-to-four-member HFAs and
+HVAs.
+
 On Windows x64, scalar `I128`/`U128` is indirect as an argument and returned in
 XMM0 with the compiler's `<2 x i64>` carrier. Generated `RocDec` remains an
 aggregate and is indirect in both directions. The ABI classifier distinguishes
@@ -6022,6 +6032,9 @@ The cross-language ABI fixture exercises these exhaustion rules in both call
 directions with generated C, Zig, and Rust declarations: nested transparent
 HFAs/HVAs after seven SIMD arguments, integer pairs after seven GP arguments,
 platform-specific `I128` register alignment, and exhausted SysV `I128`/`Dec`.
+It also exhausts all eight AArch64 GP argument registers before passing
+`U8`/`U16`/`U32`, which pins Apple's compact stack offsets in hosted and
+provided directions.
 
 ### Pinned meaning — the edge cases
 
@@ -6089,12 +6102,24 @@ explicit source/destination lane kinds, and operand bits through its ordinary
 internal call ABI; x86-64 and AArch64 wrappers preserve the corresponding
 two-register vector values and AArch64 has native Q-register movement. The
 interpreter and Lambda Mono evaluator invoke the same operation contract from
-their explicit layouts. Wasm instead emits `v128` operations and exact helper
+their explicit layouts. A Lambda Mono value that does not have an integer bit
+representation is rejected explicitly rather than being replaced with zero.
+Wasm instead emits `v128` operations and exact helper
 sequences, including software carryless multiplication where simd128 has no
 instruction.
 
+Structural equality treats vectors as ordinary value leaves. Solved-to-LIR
+lowering converts each vector operand to its complete 128-bit bit image and
+uses scalar `U128` equality, so every backend compares every lane without
+needing a vector-specific equality code path. This LIR bitcast does not alter
+host ABI classification.
+
 LLVM emits generic vector IR for ordinary operations and target intrinsics for
 operations whose pinned edge behavior or instruction selection requires them.
+The generic `dot_pairs_saturated` lowering widens unsigned and signed bytes to
+32-bit lanes, multiplies and pairwise-adds at that width, clamps to signed
+16-bit bounds, and narrows only after saturation; no intermediate 16-bit sum
+is permitted to wrap.
 `src/target/mod.zig` is the single authority for the LLVM target query, CPU
 name, and feature delta. Linked builds, optimized tests, and LLVM evaluation
 therefore all compile under the same x86-64-v3 plus AES/PCLMULQDQ, AArch64, or

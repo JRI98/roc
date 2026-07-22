@@ -203,6 +203,23 @@ export fn roc_probe_spill_dec(arg0: i64, arg1: i64, arg2: i64, arg3: i64, arg4: 
     return value;
 }
 
+export fn roc_probe_compact_stack(
+    arg0: i64,
+    arg1: i64,
+    arg2: i64,
+    arg3: i64,
+    arg4: i64,
+    arg5: i64,
+    arg6: i64,
+    arg7: i64,
+    tiny: u8,
+    short: u16,
+    word: u32,
+) callconv(.c) u64 {
+    _ = .{ arg0, arg1, arg2, arg3, arg4, arg5, arg6, arg7 };
+    return @as(u64, tiny) + short + word;
+}
+
 fn sameBytes(lhs: anytype, rhs: @TypeOf(lhs)) bool {
     return std.mem.eql(u8, std.mem.asBytes(&lhs), std.mem.asBytes(&rhs));
 }
@@ -265,6 +282,8 @@ fn checkProvidedAbi() void {
     if (abi.roc_provide_spill_i128(1, 2, 3, 4, 5, wide_i128) != wide_i128) fail("provided spilled i128 mismatch", .{});
     const wide_dec: abi.RocDec = .{ .num = 0x0123456789abcdeffedcba9876543210 };
     if (abi.roc_provide_spill_dec(1, 2, 3, 4, 5, wide_dec).num != wide_dec.num) fail("provided spilled Dec mismatch", .{});
+    const compact = abi.roc_provide_compact_stack(1, 2, 3, 4, 5, 6, 7, 8, 0x12, 0x3456, 0x789abcde);
+    if (compact != 0x12 + 0x3456 + 0x789abcde) fail("provided compact stack mismatch", .{});
 }
 
 fn runContract() c_int {

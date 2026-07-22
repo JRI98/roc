@@ -183,6 +183,13 @@ pub extern "C" fn roc_probe_spill_dec(
     _arg0: i64, _arg1: i64, _arg2: i64, _arg3: i64, _arg4: i64, arg5: abi::RocDec,
 ) -> abi::RocDec { arg5 }
 
+#[no_mangle]
+pub extern "C" fn roc_probe_compact_stack(
+    _arg0: i64, _arg1: i64, _arg2: i64, _arg3: i64,
+    _arg4: i64, _arg5: i64, _arg6: i64, _arg7: i64,
+    tiny: u8, short: u16, word: u32,
+) -> u64 { u64::from(tiny) + u64::from(short) + u64::from(word) }
+
 fn vector_from_bits<T: Copy>(bits: u128) -> T {
     assert!(core::mem::size_of::<T>() == core::mem::size_of::<u128>());
     unsafe { core::mem::transmute_copy(&bits) }

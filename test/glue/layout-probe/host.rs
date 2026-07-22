@@ -251,6 +251,13 @@ pub extern "C" fn roc_probe_spill_dec(
     _arg0: i64, _arg1: i64, _arg2: i64, _arg3: i64, _arg4: i64, arg5: abi::RocDec,
 ) -> abi::RocDec { arg5 }
 
+#[no_mangle]
+pub extern "C" fn roc_probe_compact_stack(
+    _arg0: i64, _arg1: i64, _arg2: i64, _arg3: i64,
+    _arg4: i64, _arg5: i64, _arg6: i64, _arg7: i64,
+    tiny: u8, short: u16, word: u32,
+) -> u64 { u64::from(tiny) + u64::from(short) + u64::from(word) }
+
 fn vector_from_bits<T: Copy>(bits: u128) -> T {
     assert!(core::mem::size_of::<T>() == core::mem::size_of::<u128>());
     unsafe { core::mem::transmute_copy(&bits) }
@@ -375,6 +382,8 @@ fn check_provided_abi() {
         if abi::roc_provide_spill_i128(1, 2, 3, 4, 5, wide_i128) != wide_i128 { fail("provided spilled i128 mismatch"); }
         let wide_dec = abi::RocDec { num: 0x0123456789abcdeffedcba9876543210_i128 };
         if abi::roc_provide_spill_dec(1, 2, 3, 4, 5, wide_dec).num != wide_dec.num { fail("provided spilled Dec mismatch"); }
+        let compact = abi::roc_provide_compact_stack(1, 2, 3, 4, 5, 6, 7, 8, 0x12, 0x3456, 0x789abcde);
+        if compact != 0x12_u64 + 0x3456_u64 + 0x789abcde_u64 { fail("provided compact stack mismatch"); }
     }
 }
 

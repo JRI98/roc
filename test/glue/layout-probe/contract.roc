@@ -22,6 +22,7 @@ app [
 	provide_align_i128,
 	provide_spill_i128,
 	provide_spill_dec,
+	provide_compact_stack,
 ] { pf: platform "./main.roc" }
 
 import pf.Probe exposing [LayoutProbe]
@@ -126,6 +127,8 @@ main! = || {
 	wide_dec = 123456789012345.125
 	spilled_dec = Probe.spill_dec!(1, 2, 3, 4, 5, wide_dec)
 	expect spilled_dec == wide_dec
+	compact_stack = Probe.compact_stack!(1, 2, 3, 4, 5, 6, 7, 8, 0x12, 0x3456, 0x789ABCDE)
+	expect compact_stack == 0x12 + 0x3456 + 0x789ABCDE
 
 	wide = Wide({
 		label: "layout-wide",
@@ -205,3 +208,7 @@ provide_align_i128 = |_, value| value
 provide_spill_i128 = |_, _, _, _, _, value| value
 
 provide_spill_dec = |_, _, _, _, _, value| value
+
+provide_compact_stack = |_, _, _, _, _, _, _, _, tiny, short, word| {
+	tiny.to_u64() + short.to_u64() + word.to_u64()
+}

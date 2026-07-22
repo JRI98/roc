@@ -35,4 +35,13 @@ pub const tests = [_]TestCase{
         .source = "U8x16.concat_shift_bytes(U8x16.splat(1), U8x16.splat(2), 17).to_u128_bits()",
         .expected = .{ .crash = {} },
     },
+    .{
+        .name = "SIMD structural equality compares all 128 bits",
+        .source =
+        \\left = { vector: U8x16.from_u128_bits(18446744073709551616) }
+        \\right = { vector: U8x16.from_u128_bits(36893488147419103232) }
+        \\left != right
+        ,
+        .expected = .{ .inspect_str = "True" },
+    },
 };

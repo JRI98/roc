@@ -5837,9 +5837,37 @@ const Lowerer = struct {
         if (primitive == .bool) {
             return try self.lowerBoolEqLocalsInto(target, lhs, rhs, negated, next);
         }
+
+        // SIMD leaves participate in structural equality, but scalar numeric
+        // equality operations do not accept vector operands. Compare the full
+        // 128-bit representation explicitly so every LIR consumer observes all
+        // lanes through the existing U128 equality operation.
+        switch (primitive) {
+            .u8x16, .i8x16, .u16x8, .i16x8, .u32x4, .i32x4, .u64x2, .i64x2 => {
+                const lhs_bits = try self.addLocalForLayout(.u128);
+                const rhs_bits = try self.addLocalForLayout(.u128);
+                const compare = try self.lowerPrimitiveEqLocalsInto(target, lhs_bits, rhs_bits, .u128, negated, next);
+                const lower_rhs = try self.result.store.addCFStmt(.{ .assign_low_level = .{
+                    .target = rhs_bits,
+                    .op = .simd_to_u128_bits,
+                    .rc_effect = LIR.LowLevel.simd_to_u128_bits.rcEffect(),
+                    .args = try self.result.store.addLocalSpan(&[_]LIR.LocalId{rhs}),
+                    .next = compare,
+                } });
+                return try self.result.store.addCFStmt(.{ .assign_low_level = .{
+                    .target = lhs_bits,
+                    .op = .simd_to_u128_bits,
+                    .rc_effect = LIR.LowLevel.simd_to_u128_bits.rcEffect(),
+                    .args = try self.result.store.addLocalSpan(&[_]LIR.LocalId{lhs}),
+                    .next = lower_rhs,
+                } });
+            },
+            else => {},
+        }
         const eq_op: LIR.LowLevel = switch (primitive) {
             .str => .str_is_eq,
-            .u8, .i8, .u16, .i16, .u32, .i32, .u64, .i64, .u128, .i128, .f32, .f64, .dec, .u8x16, .i8x16, .u16x8, .i16x8, .u32x4, .i32x4, .u64x2, .i64x2 => .num_is_eq,
+            .u8, .i8, .u16, .i16, .u32, .i32, .u64, .i64, .u128, .i128, .f32, .f64, .dec => .num_is_eq,
+            .u8x16, .i8x16, .u16x8, .i16x8, .u32x4, .i32x4, .u64x2, .i64x2 => unreachable,
             .bool => unreachable,
         };
         const args = [_]LIR.LocalId{ lhs, rhs };

@@ -179,6 +179,23 @@ export fn roc_probe_spill_dec(arg0: i64, arg1: i64, arg2: i64, arg3: i64, arg4: 
     return value;
 }
 
+export fn roc_probe_compact_stack(
+    arg0: i64,
+    arg1: i64,
+    arg2: i64,
+    arg3: i64,
+    arg4: i64,
+    arg5: i64,
+    arg6: i64,
+    arg7: i64,
+    tiny: u8,
+    short: u16,
+    word: u32,
+) callconv(.c) u64 {
+    _ = .{ arg0, arg1, arg2, arg3, arg4, arg5, arg6, arg7 };
+    return @as(u64, tiny) + short + word;
+}
+
 fn sameBytes(lhs: anytype, rhs: @TypeOf(lhs)) bool {
     return std.mem.eql(u8, std.mem.asBytes(&lhs), std.mem.asBytes(&rhs));
 }

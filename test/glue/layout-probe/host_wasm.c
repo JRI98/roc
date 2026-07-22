@@ -184,6 +184,14 @@ RocDec roc_probe_spill_dec(int64_t arg0, int64_t arg1, int64_t arg2, int64_t arg
     (void)arg0; (void)arg1; (void)arg2; (void)arg3; (void)arg4;
     return arg5;
 }
+uint64_t roc_probe_compact_stack(
+    int64_t arg0, int64_t arg1, int64_t arg2, int64_t arg3,
+    int64_t arg4, int64_t arg5, int64_t arg6, int64_t arg7,
+    uint8_t tiny, uint16_t short_value, uint32_t word) {
+    (void)arg0; (void)arg1; (void)arg2; (void)arg3;
+    (void)arg4; (void)arg5; (void)arg6; (void)arg7;
+    return (uint64_t)tiny + (uint64_t)short_value + (uint64_t)word;
+}
 
 static void check_provided_abi(void) {
     const uint8_t expected[16] = {

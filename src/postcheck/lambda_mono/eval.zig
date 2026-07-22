@@ -1714,11 +1714,11 @@ pub const Evaluator = struct {
         };
     }
 
-    fn valueBits(value: Value) u128 {
+    fn valueBits(value: Value) error{UnsupportedValue}!u128 {
         return switch (value) {
             .int => |int| @bitCast(int),
             .bool_ => |boolean| @intFromBool(boolean),
-            else => 0,
+            else => error.UnsupportedValue,
         };
     }
 
@@ -1741,7 +1741,9 @@ pub const Evaluator = struct {
         const destination = destination_kind orelse source;
 
         var operands = [_]u128{ 0, 0, 0 };
-        for (0..@min(args.len, operands.len)) |i| operands[i] = valueBits(args[i]);
+        for (0..@min(args.len, operands.len)) |i| {
+            operands[i] = valueBits(args[i]) catch return self.unsupported_("SIMD operand without integer bits");
+        }
         const simd_op: builtins.simd.Op = @enumFromInt(op.simdOpIndex() orelse unreachable);
         const result_bits = builtins.simd.eval(simd_op, source, destination, operands[0], operands[1], operands[2]);
         if (destination_kind != null) return .{ .int = @bitCast(result_bits) };
@@ -1755,9 +1757,12 @@ pub const Evaluator = struct {
             .list => |list| list,
             else => return self.unsupported_("SIMD load from non-list value"),
         };
-        const index: usize = @intCast(valueBits(args[1]));
+        const index: usize = @intCast(valueBits(args[1]) catch return self.unsupported_("SIMD load index without integer bits"));
         var bits: u128 = 0;
-        for (0..16) |i| bits |= @as(u128, @truncate(valueBits(bytes[index + i]))) << @intCast(i * 8);
+        for (0..16) |i| {
+            const byte_bits = valueBits(bytes[index + i]) catch return self.unsupported_("SIMD load byte without integer bits");
+            bits |= @as(u128, @truncate(byte_bits)) << @intCast(i * 8);
+        }
         return .{ .int = @bitCast(bits) };
     }
 
@@ -1767,8 +1772,8 @@ pub const Evaluator = struct {
             else => return self.unsupported_("SIMD store into non-list value"),
         };
         const result = self.alloc().dupe(Value, source) catch return error.OutOfMemory;
-        const bits = valueBits(args[0]);
-        const index: usize = @intCast(valueBits(args[2]));
+        const bits = valueBits(args[0]) catch return self.unsupported_("SIMD store value without integer bits");
+        const index: usize = @intCast(valueBits(args[2]) catch return self.unsupported_("SIMD store index without integer bits"));
         for (0..16) |i| {
             const byte: u8 = @truncate(bits >> @intCast(i * 8));
             result[index + i] = self.canonicalInt(.u8, byte);
@@ -1783,7 +1788,7 @@ pub const Evaluator = struct {
         };
         const result = self.alloc().alloc(Value, source.len + 16) catch return error.OutOfMemory;
         @memcpy(result[0..source.len], source);
-        const bits = valueBits(args[0]);
+        const bits = valueBits(args[0]) catch return self.unsupported_("SIMD append value without integer bits");
         for (0..16) |i| {
             const byte: u8 = @truncate(bits >> @intCast(i * 8));
             result[source.len + i] = self.canonicalInt(.u8, byte);
@@ -2812,4 +2817,9 @@ fn isNumericPrimitive(prim: Primitive) bool {
 
 test "lambda mono eval declarations are referenced" {
     std.testing.refAllDecls(@This());
+}
+
+test "SIMD bit extraction rejects values without an integer representation" {
+    try std.testing.expectError(error.UnsupportedValue, Evaluator.valueBits(.{ .float32 = 1.0 }));
+    try std.testing.expectEqual(@as(u128, 1), try Evaluator.valueBits(.{ .bool_ = true }));
 }

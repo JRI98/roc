@@ -4027,14 +4027,17 @@ pub const MonoLlvmCodeGen = struct {
                     try self.storeSimdLocal(target, try self.callBuiltin("llvm.x86.ssse3.pmadd.ub.sw.128", try self.simdRawType(16, 8), &.{ vector_ty, vector_ty }, &.{ lhs, rhs }));
                     return;
                 }
-                const lhs = try self.simdExtendVector(try self.loadSimdLocal(GuardedList.at(args, 0)), 16, 16, false);
-                const rhs = try self.simdExtendVector(try self.loadSimdLocal(GuardedList.at(args, 1)), 16, 16, true);
+                // A u8*i8 product fits in i16, but the sum of two products
+                // does not. Accumulate in i32 lanes and saturate before
+                // narrowing, matching PMADDUBSW rather than wrapping early.
+                const lhs = try self.simdExtendVector(try self.loadSimdLocal(GuardedList.at(args, 0)), 32, 16, false);
+                const rhs = try self.simdExtendVector(try self.loadSimdLocal(GuardedList.at(args, 1)), 32, 16, true);
                 const products = wip.bin(.mul, lhs, rhs, "") catch return error.OutOfMemory;
                 const even = try self.simdPairShuffle(products, 16, false);
                 const odd = try self.simdPairShuffle(products, 16, true);
                 const sums = wip.bin(.add, even, odd, "") catch return error.OutOfMemory;
-                const clamped = try self.simdClampVector(sums, 16, 8, -32768, 32767, true);
-                try self.storeSimdLocal(target, clamped);
+                const clamped = try self.simdClampVector(sums, 32, 8, -32768, 32767, true);
+                try self.storeSimdLocal(target, wip.cast(.trunc, clamped, try self.simdRawType(16, 8), "") catch return error.OutOfMemory);
             },
             .simd_sad => {
                 if (self.target.cpu.arch == .x86_64) {

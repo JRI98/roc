@@ -81,4 +81,5 @@ Probe := [].{
 	align_i128! : I64, I128 => I128
 	spill_i128! : I64, I64, I64, I64, I64, I128 => I128
 	spill_dec! : I64, I64, I64, I64, I64, Dec => Dec
+	compact_stack! : I64, I64, I64, I64, I64, I64, I64, I64, U8, U16, U32 => U64
 }
