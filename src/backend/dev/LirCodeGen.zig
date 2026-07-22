@@ -2,7 +2,7 @@
 //!
 //! This module generates native machine code from statement-only LIR procs.
 //! It uses the Emit.zig infrastructure for instruction encoding and
-//! ValueStorage.zig for register allocation.
+//! a single stable-location table for semantic values.
 //!
 //! Pipeline position:
 //! ```
@@ -11,7 +11,7 @@
 //!
 //! Key properties:
 //! - Uses real machine instructions via Emit.zig
-//! - Proper register allocation with spilling support
+//! - Bounded register use with semantic values materialized to stable stack locations
 //! - Handles System V ABI (x86_64/aarch64) calling convention
 //! - Generates position-independent code with relocations
 //! - Supports x86_64 and aarch64 architectures
@@ -77,7 +77,7 @@ const strWithCapacityC = builtins.str.withCapacityC;
 const strDropPrefix = builtins.str.strDropPrefix;
 const strDropPrefixCaselessAscii = builtins.str.strDropPrefixCaselessAscii;
 const strDropSuffix = builtins.str.strDropSuffix;
-const strFindFirst = builtins.str.findFirst;
+const strSplitFirst = builtins.str.splitFirst;
 const strWithAsciiLowercased = builtins.str.strWithAsciiLowercased;
 const strWithAsciiUppercased = builtins.str.strWithAsciiUppercased;
 const strFromUtf8Lossy = builtins.str.fromUtf8Lossy;
@@ -297,10 +297,10 @@ fn wrapStrCountUtf8Bytes(str_bytes: ?[*]u8, str_len: usize, str_cap: usize) call
     return strCountUtf8Bytes(s);
 }
 
-fn wrapStrFindFirst(out: *anyopaque, a_bytes: ?[*]u8, a_len: usize, a_cap: usize, b_bytes: ?[*]u8, b_len: usize, b_cap: usize, find_layout: *const dev_wrappers.StrFindFirstLayout, roc_ops: *RocOps) callconv(.c) void {
+fn wrapStrSplitFirst(out: *anyopaque, a_bytes: ?[*]u8, a_len: usize, a_cap: usize, b_bytes: ?[*]u8, b_len: usize, b_cap: usize, find_layout: *const dev_wrappers.StrSplitFirstLayout, roc_ops: *RocOps) callconv(.c) void {
     const a = RocStr{ .bytes = a_bytes, .length = a_len, .capacity_or_alloc_ptr = a_cap };
     const b = RocStr{ .bytes = b_bytes, .length = b_len, .capacity_or_alloc_ptr = b_cap };
-    const result = strFindFirst(a, b, roc_ops);
+    const result = strSplitFirst(a, b, roc_ops);
     const out_bytes: [*]u8 = @ptrCast(out);
 
     @as(*RocStr, @ptrCast(@alignCast(out_bytes + find_layout.after_offset))).* = result.after;
@@ -643,11 +643,6 @@ pub fn LirCodeGen(comptime target: RocTarget) type {
         /// debug crash sites in a proc keeps the frame from growing linearly
         /// with the number of debug asserts. Lazily allocated on first use.
         proc_debug_msg_slot: ?i32 = null,
-
-        /// Counter for unique temporary local IDs.
-        /// Starts at 0x8000_0000 to avoid collision with real local variables.
-        /// Used by allocTempGeneral() for temporaries that don't correspond to real locals.
-        next_temp_local: u32 = 0x8000_0000,
 
         /// Generation mode determines whether to use direct function pointers or symbol references.
         /// - native_execution: Code runs in-process (dev evaluator), direct function pointers work
@@ -2162,7 +2157,7 @@ pub fn LirCodeGen(comptime target: RocTarget) type {
                         .i8_to_f32, .i16_to_f32, .i32_to_f32, .i64_to_f32 => true,
                         else => false,
                     };
-                    const freg = self.codegen.allocFloat() orelse unreachable;
+                    const freg = try self.allocTempFloat();
                     if (comptime target.toCpuArch() == .aarch64) {
                         try self.codegen.emit.scvtfFloatFromGen(if (is_f32) .single else .double, freg, src_reg, .w64);
                     } else {
@@ -2205,7 +2200,7 @@ pub fn LirCodeGen(comptime target: RocTarget) type {
                         .u8_to_f32, .u16_to_f32, .u32_to_f32 => true,
                         else => false,
                     };
-                    const freg = self.codegen.allocFloat() orelse unreachable;
+                    const freg = try self.allocTempFloat();
                     if (comptime target.toCpuArch() == .aarch64) {
                         try self.codegen.emit.scvtfFloatFromGen(if (is_f32) .single else .double, freg, src_reg, .w64);
                     } else {
@@ -2227,7 +2222,7 @@ pub fn LirCodeGen(comptime target: RocTarget) type {
                     if (args.len < 1) unreachable;
                     const src_loc = try self.emitValueLocal(GuardedList.at(args, 0));
                     const src_reg = try self.ensureInGeneralReg(src_loc);
-                    const freg = self.codegen.allocFloat() orelse unreachable;
+                    const freg = try self.allocTempFloat();
                     const is_f32 = ll.op == .u64_to_f32;
 
                     if (comptime target.toCpuArch() == .aarch64) {
@@ -2298,7 +2293,7 @@ pub fn LirCodeGen(comptime target: RocTarget) type {
                     const src_width: FloatWidth = if (ll.op == .f32_to_f64) .f32 else .f64;
                     const dst_width: FloatWidth = if (ll.op == .f32_to_f64) .f64 else .f32;
                     const src_reg = try self.ensureInFloatReg(src_loc, src_width);
-                    const result_reg = try self.codegen.allocFloatFor(0);
+                    const result_reg = try self.allocTempFloat();
                     if (comptime target.toCpuArch() == .aarch64) {
                         try self.codegen.emit.fcvtFloatFloat(
                             if (dst_width == .f32) .single else .double,
@@ -2597,7 +2592,7 @@ pub fn LirCodeGen(comptime target: RocTarget) type {
                     const parts = try self.getI128Parts(src_loc, .signed); // Dec is signed i128
 
                     // Call roc_builtins_dec_to_i64_trunc(low, high) -> i64
-                    const result_reg = self.codegen.allocGeneral() orelse unreachable;
+                    const result_reg = try self.allocTempGeneral();
 
                     var builder = try Builder.init(&self.codegen.emit, &self.codegen.stack_offset);
                     try builder.addRegArg(parts.low);
@@ -2823,7 +2818,7 @@ pub fn LirCodeGen(comptime target: RocTarget) type {
                     const length_off = try self.ensureOnStack(length_loc, 8);
                     return try self.callStr2U64RocOpsToStr(str_off, start_off, length_off, LowLevelBuiltins.strOp(.str_substring_unsafe));
                 },
-                .str_find_first => {
+                .str_split_first => {
                     if (args.len != 2) unreachable;
                     const a_loc = try self.emitValueLocal(GuardedList.at(args, 0));
                     const b_loc = try self.emitValueLocal(GuardedList.at(args, 1));
@@ -2834,7 +2829,7 @@ pub fn LirCodeGen(comptime target: RocTarget) type {
                     const ls = self.layout_store;
                     const ret_layout_val = ls.getLayout(ll.ret_layout);
                     if (ret_layout_val.tag != .struct_) {
-                        std.debug.panic("LIR/codegen invariant violated: str_find_first expected record return layout", .{});
+                        std.debug.panic("LIR/codegen invariant violated: str_split_first expected record return layout", .{});
                     }
                     const record_idx = ret_layout_val.getStruct().idx;
                     const record_data = ls.getStructData(record_idx);
@@ -2844,14 +2839,14 @@ pub fn LirCodeGen(comptime target: RocTarget) type {
                         ls.getStructFieldLayoutByOriginalIndex(record_idx, 1) != .str or
                         ls.getStructFieldLayoutByOriginalIndex(record_idx, 2) != .bool)
                     {
-                        std.debug.panic("LIR/codegen invariant violated: str_find_first expected fields after Str, before Str, found Bool", .{});
+                        std.debug.panic("LIR/codegen invariant violated: str_split_first expected fields after Str, before Str, found Bool", .{});
                     }
 
                     const record_size = record_data.size.get(ls.targetUsize());
                     const result_offset = self.codegen.allocStackSlot(record_size);
                     try self.zeroStackArea(result_offset, record_size);
 
-                    const layout_slot = self.codegen.allocStackSlot(@sizeOf(dev_wrappers.StrFindFirstLayout));
+                    const layout_slot = self.codegen.allocStackSlot(@sizeOf(dev_wrappers.StrSplitFirstLayout));
                     const layout_reg = try self.allocTempGeneral();
                     try self.codegen.emitLoadImm(layout_reg, @intCast(ls.getStructFieldOffsetByOriginalIndex(record_idx, 0)));
                     try self.emitStore(.w32, frame_ptr, layout_slot, layout_reg);
@@ -2871,7 +2866,7 @@ pub fn LirCodeGen(comptime target: RocTarget) type {
                     try builder.addMemArg(frame_ptr, b_off + 8);
                     try builder.addLeaArg(frame_ptr, layout_slot);
                     try builder.addRegArg(roc_ops_reg);
-                    try self.callBuiltinWithAdapter(&builder, @intFromPtr(&wrapStrFindFirst), LowLevelBuiltins.strOp(.str_find_first));
+                    try self.callBuiltinWithAdapter(&builder, @intFromPtr(&wrapStrSplitFirst), LowLevelBuiltins.strOp(.str_split_first));
 
                     return self.stackLocationForLayout(ll.ret_layout, result_offset);
                 },
@@ -3707,7 +3702,7 @@ pub fn LirCodeGen(comptime target: RocTarget) type {
                     if (is_float) {
                         const width = FloatWidth.fromLayout(ll.ret_layout);
                         const float_reg = try self.ensureInFloatReg(inner_loc, width);
-                        const result_reg = try self.codegen.allocFloatFor(0);
+                        const result_reg = try self.allocTempFloat();
                         if (width == .f32) {
                             try self.codegen.emitNegF32(result_reg, float_reg);
                         } else {
@@ -3781,6 +3776,18 @@ pub fn LirCodeGen(comptime target: RocTarget) type {
                         self.codegen.freeGeneral(src_reg);
                         return .{ .general_reg = result_reg };
                     }
+                },
+
+                .num_count_one_bits,
+                .num_count_leading_zero_bits,
+                .num_count_trailing_zero_bits,
+                => {
+                    const inner_loc = try self.emitValueLocal(GuardedList.at(args, 0));
+                    const operand_layout = self.valueLayout(GuardedList.at(args, 0));
+                    if (operand_layout == .i128 or operand_layout == .u128) {
+                        return self.generateBitCount128(ll.op, inner_loc);
+                    }
+                    return self.generateBitCountScalar(ll.op, inner_loc, operand_layout);
                 },
 
                 .bool_not => {
@@ -3924,7 +3931,7 @@ pub fn LirCodeGen(comptime target: RocTarget) type {
 
                     const width = FloatWidth.fromLayout(ll.ret_layout);
                     const src_reg = try self.ensureInFloatReg(src_loc, width);
-                    const result_reg = try self.codegen.allocFloatFor(0);
+                    const result_reg = try self.allocTempFloat();
 
                     switch (ll.ret_layout) {
                         .f32 => {
@@ -6472,6 +6479,18 @@ pub fn LirCodeGen(comptime target: RocTarget) type {
                 else => false,
             };
 
+            // For shift ops, the count is taken modulo the type's bit width.
+            // Because the widths are powers of two, that means keeping the low
+            // log2(width) bits of the count, which the shl/lsr pair below does by
+            // shifting the other bits out. A 64-bit register shift already masks
+            // the count modulo 64, so this only narrows it for smaller types.
+            const shift_count_keep: u8 = switch (operand_layout) {
+                .u8, .i8 => 64 - 3,
+                .u16, .i16 => 64 - 4,
+                .u32, .i32 => 64 - 5,
+                else => 64 - 6,
+            };
+
             if (narrow_signed_shift > 0 and !is_unsigned) {
                 if (plain_op == .num_shift_right_zf_by) {
                     try self.emitShlImm(.w64, lhs_reg, lhs_reg, narrow_signed_shift);
@@ -6482,15 +6501,15 @@ pub fn LirCodeGen(comptime target: RocTarget) type {
                 }
 
                 if (is_shift_op) {
-                    try self.emitShlImm(.w64, rhs_reg, rhs_reg, 56);
-                    try self.emitLsrImm(.w64, rhs_reg, rhs_reg, 56);
+                    try self.emitShlImm(.w64, rhs_reg, rhs_reg, shift_count_keep);
+                    try self.emitLsrImm(.w64, rhs_reg, rhs_reg, shift_count_keep);
                 } else {
                     try self.emitShlImm(.w64, rhs_reg, rhs_reg, narrow_signed_shift);
                     try self.emitAsrImm(.w64, rhs_reg, rhs_reg, narrow_signed_shift);
                 }
             } else if (is_shift_op) {
-                try self.emitShlImm(.w64, rhs_reg, rhs_reg, 56);
-                try self.emitLsrImm(.w64, rhs_reg, rhs_reg, 56);
+                try self.emitShlImm(.w64, rhs_reg, rhs_reg, shift_count_keep);
+                try self.emitLsrImm(.w64, rhs_reg, rhs_reg, shift_count_keep);
             }
 
             // Allocate result register
@@ -6587,7 +6606,12 @@ pub fn LirCodeGen(comptime target: RocTarget) type {
                     if (mod_done_patch) |patch| self.codegen.patchJump(patch, self.codegen.currentOffset());
                 },
                 .num_shift_left_by => try self.emitShlReg(.w64, result_reg, lhs_reg, rhs_reg),
-                .num_shift_right_by => try self.emitAsrReg(.w64, result_reg, lhs_reg, rhs_reg),
+                // Signed types shift arithmetically (sign-filling); unsigned types
+                // shift logically (zero-filling).
+                .num_shift_right_by => if (is_unsigned)
+                    try self.emitLsrReg(.w64, result_reg, lhs_reg, rhs_reg)
+                else
+                    try self.emitAsrReg(.w64, result_reg, lhs_reg, rhs_reg),
                 .num_shift_right_zf_by => try self.emitLsrReg(.w64, result_reg, lhs_reg, rhs_reg),
                 .num_bitwise_and => try self.codegen.emitAnd(.w64, result_reg, lhs_reg, rhs_reg),
                 .num_bitwise_or => try self.codegen.emitOr(.w64, result_reg, lhs_reg, rhs_reg),
@@ -6995,7 +7019,7 @@ pub fn LirCodeGen(comptime target: RocTarget) type {
                             std.debug.assert(result_low != .RAX and result_low != .RDX);
                             std.debug.assert(result_high != .RAX and result_high != .RDX);
 
-                            // Mark RAX and RDX as in-use so allocGeneralFor won't return them
+                            // Mark RAX and RDX as in-use so temporary allocation won't return them.
                             self.codegen.markRegisterInUse(.RAX);
                             self.codegen.markRegisterInUse(.RDX);
 
@@ -7006,9 +7030,9 @@ pub fn LirCodeGen(comptime target: RocTarget) type {
                             };
 
                             const saveIfClobbered = struct {
-                                fn f(s: *Self, reg: GeneralReg, sentinel: u32) Allocator.Error!SavedReg {
+                                fn f(s: *Self, reg: GeneralReg) Allocator.Error!SavedReg {
                                     if (reg == .RAX or reg == .RDX) {
-                                        const saved = try s.codegen.allocGeneralFor(sentinel);
+                                        const saved = try s.allocTempGeneral();
                                         try s.codegen.emit.movRegReg(.w64, saved, reg);
                                         return .{ .reg = saved, .needs_free = true };
                                     }
@@ -7017,10 +7041,10 @@ pub fn LirCodeGen(comptime target: RocTarget) type {
                             }.f;
 
                             // Save inputs in RAX/RDX (at most 2 of 4 can be)
-                            const lhs_low = try saveIfClobbered(self, lhs_parts.low, 0xFFFC);
-                            const lhs_high = try saveIfClobbered(self, lhs_parts.high, 0xFFFD);
-                            const rhs_low = try saveIfClobbered(self, rhs_parts.low, 0xFFFE);
-                            const rhs_high = try saveIfClobbered(self, rhs_parts.high, 0xFFFF);
+                            const lhs_low = try saveIfClobbered(self, lhs_parts.low);
+                            const lhs_high = try saveIfClobbered(self, lhs_parts.high);
+                            const rhs_low = try saveIfClobbered(self, rhs_parts.low);
+                            const rhs_high = try saveIfClobbered(self, rhs_parts.high);
 
                             // Restore RAX/RDX to free pool (MUL will use them)
                             self.codegen.freeGeneral(.RAX);
@@ -7122,9 +7146,9 @@ pub fn LirCodeGen(comptime target: RocTarget) type {
                 },
                 // Comparison operations for i128/Dec
                 .num_is_eq => {
-                    // Free result_low/result_high first — they're not needed for comparisons,
-                    // and freeing them reduces register pressure (avoids spills that corrupt
-                    // input part registers on Windows x64 where only 9 regs are available).
+                    // Free result_low/result_high first: comparisons do not use them, and
+                    // releasing them keeps the short-lived working set within the Windows
+                    // x64 register pool.
                     self.codegen.freeGeneral(result_high);
                     self.codegen.freeGeneral(result_low);
 
@@ -7139,9 +7163,9 @@ pub fn LirCodeGen(comptime target: RocTarget) type {
                     return .{ .general_reg = result_reg };
                 },
                 .num_is_lt, .num_is_lte, .num_is_gt, .num_is_gte => {
-                    // Free result_low/result_high first — they're not needed for comparisons,
-                    // and freeing them reduces register pressure (avoids spills that corrupt
-                    // input part registers on Windows x64 where only 9 regs are available).
+                    // Free result_low/result_high first: comparisons do not use them, and
+                    // releasing them keeps the short-lived working set within the Windows
+                    // x64 register pool.
                     self.codegen.freeGeneral(result_high);
                     self.codegen.freeGeneral(result_low);
 
@@ -7205,7 +7229,7 @@ pub fn LirCodeGen(comptime target: RocTarget) type {
             self.codegen.freeGeneral(parts.low);
             self.codegen.freeGeneral(parts.high);
 
-            const freg = self.codegen.allocFloat() orelse unreachable;
+            const freg = try self.allocTempFloat();
             if (comptime target.toCpuArch() == .aarch64) {
                 try self.codegen.emit.fmovRegReg(if (width == .f32) .single else .double, freg, .V0);
             } else {
@@ -7257,7 +7281,7 @@ pub fn LirCodeGen(comptime target: RocTarget) type {
             try self.callBuiltin(&builder, builtin_fn);
             self.codegen.freeFloat(freg);
 
-            const result_reg = self.codegen.allocFloat() orelse unreachable;
+            const result_reg = try self.allocTempFloat();
             if (comptime target.toCpuArch() == .aarch64) {
                 if (result_reg != .V0) {
                     try self.codegen.emit.fmovRegReg(if (width == .f32) .single else .double, result_reg, .V0);
@@ -7302,7 +7326,7 @@ pub fn LirCodeGen(comptime target: RocTarget) type {
             }
             try self.callBuiltin(&builder, builtin_fn);
 
-            const result_reg = self.codegen.allocFloat() orelse unreachable;
+            const result_reg = try self.allocTempFloat();
             if (comptime target.toCpuArch() == .aarch64) {
                 if (result_reg != .V0) {
                     try self.codegen.emit.fmovRegReg(if (width == .f32) .single else .double, result_reg, .V0);
@@ -8077,6 +8101,173 @@ pub fn LirCodeGen(comptime target: RocTarget) type {
             try self.codegen.emitLoadStack(.w64, result_high, result_slot + 8);
         }
 
+        /// dst = number of set bits in the full 64-bit value `src`.
+        fn emitPopcount64(self: *Self, dst: GeneralReg, src: GeneralReg) Allocator.Error!void {
+            if (comptime target.toCpuArch() == .aarch64) {
+                // aarch64 has no scalar population-count instruction; use the
+                // classic SWAR sequence on general registers.
+                const t = try self.allocTempGeneral();
+                const m = try self.allocTempGeneral();
+                // x = src
+                try self.emitMovRegReg(dst, src);
+                // x = x - ((x >> 1) & 0x5555555555555555)
+                try self.emitLsrImm(.w64, t, dst, 1);
+                try self.codegen.emitLoadImm(m, @bitCast(@as(u64, 0x5555555555555555)));
+                try self.codegen.emitAnd(.w64, t, t, m);
+                try self.codegen.emitSub(.w64, dst, dst, t);
+                // x = (x & 0x3333...) + ((x >> 2) & 0x3333...)
+                try self.codegen.emitLoadImm(m, @bitCast(@as(u64, 0x3333333333333333)));
+                try self.codegen.emitAnd(.w64, t, dst, m);
+                try self.emitLsrImm(.w64, dst, dst, 2);
+                try self.codegen.emitAnd(.w64, dst, dst, m);
+                try self.codegen.emitAdd(.w64, dst, dst, t);
+                // x = (x + (x >> 4)) & 0x0f0f...
+                try self.emitLsrImm(.w64, t, dst, 4);
+                try self.codegen.emitAdd(.w64, dst, dst, t);
+                try self.codegen.emitLoadImm(m, @bitCast(@as(u64, 0x0f0f0f0f0f0f0f0f)));
+                try self.codegen.emitAnd(.w64, dst, dst, m);
+                // count = (x * 0x0101...) >> 56
+                try self.codegen.emitLoadImm(m, @bitCast(@as(u64, 0x0101010101010101)));
+                try self.codegen.emitMul(.w64, dst, dst, m);
+                try self.emitLsrImm(.w64, dst, dst, 56);
+                self.codegen.freeGeneral(t);
+                self.codegen.freeGeneral(m);
+            } else {
+                try self.codegen.emit.popcntRegReg(.w64, dst, src);
+            }
+        }
+
+        /// dst = number of leading zero bits of the full 64-bit value `src`
+        /// (64 when `src` is zero).
+        fn emitClz64(self: *Self, dst: GeneralReg, src: GeneralReg) Allocator.Error!void {
+            if (comptime target.toCpuArch() == .aarch64) {
+                try self.codegen.emit.clzRegReg(.w64, dst, src);
+            } else {
+                try self.codegen.emit.lzcntRegReg(.w64, dst, src);
+            }
+        }
+
+        /// dst = number of trailing zero bits of the full 64-bit value `src`
+        /// (64 when `src` is zero).
+        fn emitCtz64(self: *Self, dst: GeneralReg, src: GeneralReg) Allocator.Error!void {
+            if (comptime target.toCpuArch() == .aarch64) {
+                // No native ctz: reverse the bits, then count leading zeros.
+                try self.codegen.emit.rbitRegReg(.w64, dst, src);
+                try self.codegen.emit.clzRegReg(.w64, dst, dst);
+            } else {
+                try self.codegen.emit.tzcntRegReg(.w64, dst, src);
+            }
+        }
+
+        /// Lower a bit-count op on a scalar integer (width 8..64). The operand is
+        /// masked to its width so a sign-extended narrow value cannot corrupt the
+        /// count; leading-zero subtracts the (64 - width) bits outside the
+        /// operand, and trailing-zero ORs a sentinel bit so a zero operand yields
+        /// the width rather than 64. The result is a U8 in a general register.
+        fn generateBitCountScalar(self: *Self, op: lir.LowLevel, inner_loc: ValueLocation, operand_layout: layout.Idx) Allocator.Error!ValueLocation {
+            const width: u8 = switch (operand_layout) {
+                .u8, .i8 => 8,
+                .u16, .i16 => 16,
+                .u32, .i32 => 32,
+                .u64, .i64 => 64,
+                else => unreachable,
+            };
+            const src_reg = try self.ensureInGeneralReg(inner_loc);
+            const work = try self.allocTempGeneral();
+            try self.emitMovRegReg(work, src_reg);
+            self.codegen.freeGeneral(src_reg);
+            if (width < 64) {
+                const mask_reg = try self.allocTempGeneral();
+                const mask: i64 = @bitCast((@as(u64, 1) << @intCast(width)) - 1);
+                try self.codegen.emitLoadImm(mask_reg, mask);
+                try self.codegen.emitAnd(.w64, work, work, mask_reg);
+                self.codegen.freeGeneral(mask_reg);
+            }
+            const result = try self.allocTempGeneral();
+            switch (op) {
+                .num_count_one_bits => {
+                    try self.emitPopcount64(result, work);
+                },
+                .num_count_leading_zero_bits => {
+                    try self.emitClz64(result, work);
+                    if (width < 64) {
+                        const adj = try self.allocTempGeneral();
+                        try self.codegen.emitLoadImm(adj, @intCast(64 - @as(u32, width)));
+                        try self.codegen.emitSub(.w64, result, result, adj);
+                        self.codegen.freeGeneral(adj);
+                    }
+                },
+                .num_count_trailing_zero_bits => {
+                    if (width < 64) {
+                        const sent = try self.allocTempGeneral();
+                        try self.codegen.emitLoadImm(sent, @bitCast(@as(u64, 1) << @intCast(width)));
+                        try self.codegen.emitOr(.w64, work, work, sent);
+                        self.codegen.freeGeneral(sent);
+                    }
+                    try self.emitCtz64(result, work);
+                },
+                else => unreachable,
+            }
+            self.codegen.freeGeneral(work);
+            return .{ .general_reg = result };
+        }
+
+        /// Lower a bit-count op on a 128-bit integer, composing the two 64-bit
+        /// halves. leading/trailing use a branchless select built from a 0/1
+        /// comparison: e.g. clz128 = clz(high) + (high == 0 ? clz(low) : 0),
+        /// which yields 128 for a zero operand because clz(0) == 64. The result
+        /// is a U8 in a general register.
+        fn generateBitCount128(self: *Self, op: lir.LowLevel, inner_loc: ValueLocation) Allocator.Error!ValueLocation {
+            // A 128-bit value on the stack must be read as both 64-bit halves;
+            // `.stack` alone makes getI128Parts treat it as a 64-bit value.
+            const loc = if (inner_loc == .stack) ValueLocation{ .stack_i128 = inner_loc.stack.offset } else inner_loc;
+            const parts = try self.getI128Parts(loc, .unsigned);
+            const result = try self.allocTempGeneral();
+            switch (op) {
+                .num_count_one_bits => {
+                    const hi_count = try self.allocTempGeneral();
+                    try self.emitPopcount64(result, parts.low);
+                    try self.emitPopcount64(hi_count, parts.high);
+                    try self.codegen.emitAdd(.w64, result, result, hi_count);
+                    self.codegen.freeGeneral(hi_count);
+                },
+                .num_count_leading_zero_bits => {
+                    // result = clz(high) + (high == 0 ? clz(low) : 0)
+                    const lz_low = try self.allocTempGeneral();
+                    try self.emitClz64(result, parts.high);
+                    try self.emitClz64(lz_low, parts.low);
+                    const is_zero = try self.allocTempGeneral();
+                    const zero_reg = try self.allocTempGeneral();
+                    try self.codegen.emitLoadImm(zero_reg, 0);
+                    try self.codegen.emitCmp(.w64, is_zero, parts.high, zero_reg, condEqual());
+                    try self.codegen.emitMul(.w64, lz_low, lz_low, is_zero);
+                    try self.codegen.emitAdd(.w64, result, result, lz_low);
+                    self.codegen.freeGeneral(lz_low);
+                    self.codegen.freeGeneral(is_zero);
+                    self.codegen.freeGeneral(zero_reg);
+                },
+                .num_count_trailing_zero_bits => {
+                    // result = ctz(low) + (low == 0 ? ctz(high) : 0)
+                    const tz_high = try self.allocTempGeneral();
+                    try self.emitCtz64(result, parts.low);
+                    try self.emitCtz64(tz_high, parts.high);
+                    const is_zero = try self.allocTempGeneral();
+                    const zero_reg = try self.allocTempGeneral();
+                    try self.codegen.emitLoadImm(zero_reg, 0);
+                    try self.codegen.emitCmp(.w64, is_zero, parts.low, zero_reg, condEqual());
+                    try self.codegen.emitMul(.w64, tz_high, tz_high, is_zero);
+                    try self.codegen.emitAdd(.w64, result, result, tz_high);
+                    self.codegen.freeGeneral(tz_high);
+                    self.codegen.freeGeneral(is_zero);
+                    self.codegen.freeGeneral(zero_reg);
+                },
+                else => unreachable,
+            }
+            self.codegen.freeGeneral(parts.low);
+            self.codegen.freeGeneral(parts.high);
+            return .{ .general_reg = result };
+        }
+
         /// Get low and high 64-bit parts of a 128-bit value
         const I128Parts = struct {
             low: GeneralReg,
@@ -8325,7 +8516,6 @@ pub fn LirCodeGen(comptime target: RocTarget) type {
             ctr_slot: i32,
             offset_slot: i32,
             elem_size: u32,
-            eq_reg: GeneralReg,
             exit_patch: usize,
             len_ne_patch: usize,
             empty_patch: usize,
@@ -8351,8 +8541,8 @@ pub fn LirCodeGen(comptime target: RocTarget) type {
                 node_tag: struct { lhs_loc: ValueLocation, rhs_loc: ValueLocation, layout_idx: layout.Idx, result_reg: GeneralReg },
                 node_list: struct { lhs_loc: ValueLocation, rhs_loc: ValueLocation, layout_idx: layout.Idx, result_reg: GeneralReg },
                 // Struct field continuations.
-                struct_field: struct { result_slot: i32, lhs_off: i32, rhs_off: i32, field_layout_idx: layout.Idx, field_size: u32 },
-                struct_and: struct { result_slot: i32, field_eq_reg: GeneralReg },
+                struct_field: struct { result_slot: i32, lhs_off: i32, rhs_off: i32, field_layout_idx: layout.Idx, field_size: u32, result_reg: GeneralReg },
+                struct_and: struct { result_slot: i32, result_reg: GeneralReg },
                 struct_finish: struct { result_slot: i32, result_reg: GeneralReg },
                 // Tag union continuations.
                 tag_variant: struct { state: *EqTagState, variant_i: u32, payload_layout_idx: layout.Idx, payload_size: u32 },
@@ -8543,23 +8733,25 @@ pub fn LirCodeGen(comptime target: RocTarget) type {
                             .rhs_off = rhs_base + @as(i32, @intCast(field_offset)),
                             .field_layout_idx = field_layout_idx,
                             .field_size = field_size,
+                            .result_reg = rr,
                         } });
                     }
                 },
 
                 .struct_field => |sf| {
-                    const field_eq_reg = try self.allocTempGeneral();
-                    try work.append(wa, .{ .struct_and = .{ .result_slot = sf.result_slot, .field_eq_reg = field_eq_reg } });
-                    try work.append(wa, .{ .node_field = .{ .lhs_off = sf.lhs_off, .rhs_off = sf.rhs_off, .layout_idx = sf.field_layout_idx, .size = sf.field_size, .result_reg = field_eq_reg } });
+                    // The child finishes before `struct_and` runs, so both can reuse the
+                    // caller-provided result register. Register use stays constant as the
+                    // layout nesting depth grows.
+                    try work.append(wa, .{ .struct_and = .{ .result_slot = sf.result_slot, .result_reg = sf.result_reg } });
+                    try work.append(wa, .{ .node_field = .{ .lhs_off = sf.lhs_off, .rhs_off = sf.rhs_off, .layout_idx = sf.field_layout_idx, .size = sf.field_size, .result_reg = sf.result_reg } });
                 },
 
                 .struct_and => |sa_| {
                     const acc_reg = try self.allocTempGeneral();
                     try self.codegen.emitLoadStack(.w64, acc_reg, sa_.result_slot);
-                    try self.emitAndRegs(.w64, acc_reg, acc_reg, sa_.field_eq_reg);
+                    try self.emitAndRegs(.w64, acc_reg, acc_reg, sa_.result_reg);
                     try self.codegen.emitStoreStack(.w64, sa_.result_slot, acc_reg);
                     self.codegen.freeGeneral(acc_reg);
-                    self.codegen.freeGeneral(sa_.field_eq_reg);
                 },
 
                 .struct_finish => |sf| {
@@ -8789,7 +8981,6 @@ pub fn LirCodeGen(comptime target: RocTarget) type {
                         self.codegen.freeGeneral(tmp);
                         self.codegen.freeGeneral(ptr_reg);
                     }
-                    const eq_reg = try self.allocTempGeneral();
                     const state = try self.allocator.create(EqListState);
                     state.* = .{
                         .result_reg = rr,
@@ -8797,18 +8988,18 @@ pub fn LirCodeGen(comptime target: RocTarget) type {
                         .ctr_slot = ctr_slot,
                         .offset_slot = offset_slot,
                         .elem_size = elem_size,
-                        .eq_reg = eq_reg,
                         .exit_patch = exit_patch,
                         .len_ne_patch = len_ne_patch,
                         .empty_patch = empty_patch,
                     };
+                    // The nested element comparison completes before `list_finish` and
+                    // may therefore reuse the list's result register at every depth.
                     try work.append(wa, .{ .list_finish = state });
-                    try work.append(wa, .{ .node_field = .{ .lhs_off = lhs_elem_slot, .rhs_off = rhs_elem_slot, .layout_idx = elem_layout_idx, .size = elem_size, .result_reg = eq_reg } });
+                    try work.append(wa, .{ .node_field = .{ .lhs_off = lhs_elem_slot, .rhs_off = rhs_elem_slot, .layout_idx = elem_layout_idx, .size = elem_size, .result_reg = rr } });
                 },
 
                 .list_finish => |st| {
-                    try self.emitCmpImm(st.eq_reg, 1);
-                    self.codegen.freeGeneral(st.eq_reg);
+                    try self.emitCmpImm(st.result_reg, 1);
                     const ne_patch = try self.codegen.emitCondJump(condNotEqual());
                     {
                         const ctr_reg = try self.allocTempGeneral();
@@ -8882,8 +9073,8 @@ pub fn LirCodeGen(comptime target: RocTarget) type {
                 switch (op) {
                     .num_is_eq => {
                         // NaN-safe eq: (ZF=1) AND (PF=0) → sete + setnp + and
-                        const result_reg = try self.codegen.allocGeneralFor(0);
-                        const tmp_reg = try self.codegen.allocGeneralFor(0);
+                        const result_reg = try self.allocTempGeneral();
+                        const tmp_reg = try self.allocTempGeneral();
                         if (width == .f32) {
                             try self.codegen.emit.ucomissRegReg(lhs_reg, rhs_reg);
                         } else {
@@ -8900,7 +9091,7 @@ pub fn LirCodeGen(comptime target: RocTarget) type {
                     },
                     .num_is_lt => {
                         // NaN-safe lt: swap operands, use "above" (CF=0 AND ZF=0)
-                        const result_reg = try self.codegen.allocGeneralFor(0);
+                        const result_reg = try self.allocTempGeneral();
                         if (width == .f32)
                             try self.codegen.emitCmpF32(result_reg, rhs_reg, lhs_reg, .above)
                         else
@@ -8911,7 +9102,7 @@ pub fn LirCodeGen(comptime target: RocTarget) type {
                     },
                     .num_is_lte => {
                         // NaN-safe lte: swap operands, use "above_or_equal" (CF=0)
-                        const result_reg = try self.codegen.allocGeneralFor(0);
+                        const result_reg = try self.allocTempGeneral();
                         if (width == .f32)
                             try self.codegen.emitCmpF32(result_reg, rhs_reg, lhs_reg, .above_or_equal)
                         else
@@ -8923,7 +9114,7 @@ pub fn LirCodeGen(comptime target: RocTarget) type {
                     .num_is_gt, .num_is_gte => {
                         // gt/gte are already NaN-safe on x86_64 (above/above_or_equal return false for NaN)
                         const float_cond = floatCondition(op).?;
-                        const result_reg = try self.codegen.allocGeneralFor(0);
+                        const result_reg = try self.allocTempGeneral();
                         if (width == .f32)
                             try self.codegen.emitCmpF32(result_reg, lhs_reg, rhs_reg, float_cond)
                         else
@@ -8937,7 +9128,7 @@ pub fn LirCodeGen(comptime target: RocTarget) type {
             } else {
                 const float_cond = floatCondition(op);
                 if (float_cond) |cond| {
-                    const result_reg = try self.codegen.allocGeneralFor(0);
+                    const result_reg = try self.allocTempGeneral();
                     if (width == .f32)
                         try self.codegen.emitCmpF32(result_reg, lhs_reg, rhs_reg, cond)
                     else
@@ -8949,7 +9140,7 @@ pub fn LirCodeGen(comptime target: RocTarget) type {
             }
 
             // Arithmetic operations produce float results
-            const result_reg = try self.codegen.allocFloatFor(0);
+            const result_reg = try self.allocTempFloat();
 
             if (operand_layout == .f32) {
                 switch (op) {
@@ -9110,7 +9301,7 @@ pub fn LirCodeGen(comptime target: RocTarget) type {
         fn generateFloatAbs(self: *Self, val_loc: ValueLocation, operand_layout: layout.Idx) Allocator.Error!ValueLocation {
             const width = FloatWidth.fromLayout(operand_layout);
             const src_reg = try self.ensureInFloatReg(val_loc, width);
-            const result_reg = try self.codegen.allocFloatFor(0);
+            const result_reg = try self.allocTempFloat();
             if (width == .f32) {
                 try self.codegen.emitAbsF32(result_reg, src_reg);
             } else {
@@ -9137,7 +9328,7 @@ pub fn LirCodeGen(comptime target: RocTarget) type {
                     try self.codegen.emitSubF64(a_reg, a_reg, b_reg);
                 }
                 self.codegen.freeFloat(b_reg);
-                const result_reg = try self.codegen.allocFloatFor(0);
+                const result_reg = try self.allocTempFloat();
                 if (width == .f32) {
                     try self.codegen.emitAbsF32(result_reg, a_reg);
                 } else {
@@ -10567,9 +10758,7 @@ pub fn LirCodeGen(comptime target: RocTarget) type {
             const saved_callee_saved_used = self.codegen.callee_saved_used;
             const saved_callee_saved_available = self.codegen.callee_saved_available;
             const saved_free_general = self.codegen.free_general;
-            const saved_general_owners = self.codegen.general_owners;
             const saved_free_float = self.codegen.free_float;
-            const saved_float_owners = self.codegen.float_owners;
             const saved_roc_ops_reg = self.roc_ops_reg;
             const saved_ret_ptr_slot = self.ret_ptr_slot;
             const saved_uses_caller_stack_arg_base = self.uses_caller_stack_arg_base;
@@ -10579,9 +10768,7 @@ pub fn LirCodeGen(comptime target: RocTarget) type {
             self.codegen.callee_saved_used = 0;
             self.codegen.callee_saved_available = CodeGen.CALLEE_SAVED_GENERAL_MASK;
             self.codegen.free_general = CodeGen.INITIAL_FREE_GENERAL;
-            self.codegen.general_owners = [_]?u32{null} ** CodeGen.NUM_GENERAL_REGS;
             self.codegen.free_float = CodeGen.INITIAL_FREE_FLOAT;
-            self.codegen.float_owners = [_]?u32{null} ** CodeGen.NUM_FLOAT_REGS;
             self.roc_ops_reg = null;
             self.ret_ptr_slot = null;
             self.uses_caller_stack_arg_base = false;
@@ -10602,9 +10789,7 @@ pub fn LirCodeGen(comptime target: RocTarget) type {
                 self.codegen.callee_saved_used = saved_callee_saved_used;
                 self.codegen.callee_saved_available = saved_callee_saved_available;
                 self.codegen.free_general = saved_free_general;
-                self.codegen.general_owners = saved_general_owners;
                 self.codegen.free_float = saved_free_float;
-                self.codegen.float_owners = saved_float_owners;
                 self.roc_ops_reg = saved_roc_ops_reg;
                 self.ret_ptr_slot = saved_ret_ptr_slot;
                 self.uses_caller_stack_arg_base = saved_uses_caller_stack_arg_base;
@@ -10737,9 +10922,7 @@ pub fn LirCodeGen(comptime target: RocTarget) type {
             self.codegen.callee_saved_used = saved_callee_saved_used;
             self.codegen.callee_saved_available = saved_callee_saved_available;
             self.codegen.free_general = saved_free_general;
-            self.codegen.general_owners = saved_general_owners;
             self.codegen.free_float = saved_free_float;
-            self.codegen.float_owners = saved_float_owners;
             self.roc_ops_reg = saved_roc_ops_reg;
             self.ret_ptr_slot = saved_ret_ptr_slot;
             self.uses_caller_stack_arg_base = saved_uses_caller_stack_arg_base;
@@ -12442,13 +12625,22 @@ pub fn LirCodeGen(comptime target: RocTarget) type {
             return ls.layoutSizeAlign(layout_val).size;
         }
 
-        /// Allocate a general register with a unique temporary local ID.
-        /// Use this for temporary registers that don't correspond to real local variables.
-        /// This prevents register ownership conflicts that can corrupt spill tracking.
+        /// Allocate a short-lived general register used only during instruction selection.
+        /// Semantic values are materialized to `local_locations`; exhausting this pool
+        /// therefore indicates an internal lifetime bug rather than source-level pressure.
         fn allocTempGeneral(self: *Self) Allocator.Error!GeneralReg {
-            const local_id = self.next_temp_local;
-            self.next_temp_local +%= 1;
-            return self.codegen.allocGeneralFor(local_id);
+            return self.codegen.allocGeneral() orelse std.debug.panic(
+                "LirCodeGen invariant violated: bounded instruction selection exhausted the general-register pool",
+                .{},
+            );
+        }
+
+        /// Allocate a short-lived floating-point register used only during instruction selection.
+        fn allocTempFloat(self: *Self) Allocator.Error!FloatReg {
+            return self.codegen.allocFloat() orelse std.debug.panic(
+                "LirCodeGen invariant violated: bounded instruction selection exhausted the float-register pool",
+                .{},
+            );
         }
 
         /// Call a builtin function using either direct function pointer (native mode)
@@ -12810,7 +13002,7 @@ pub fn LirCodeGen(comptime target: RocTarget) type {
                     return float.reg;
                 },
                 .immediate_f32 => |val| {
-                    const reg = self.codegen.allocFloat() orelse unreachable;
+                    const reg = try self.allocTempFloat();
                     if (width != .f32) {
                         std.debug.panic("LIR/codegen invariant violated: requested F64 register from F32 immediate", .{});
                     }
@@ -12827,7 +13019,7 @@ pub fn LirCodeGen(comptime target: RocTarget) type {
                     return reg;
                 },
                 .immediate_f64 => |val| {
-                    const reg = self.codegen.allocFloat() orelse unreachable;
+                    const reg = try self.allocTempFloat();
                     if (width != .f64) {
                         std.debug.panic("LIR/codegen invariant violated: requested F32 register from F64 immediate", .{});
                     }
@@ -12852,7 +13044,7 @@ pub fn LirCodeGen(comptime target: RocTarget) type {
                     return reg;
                 },
                 .stack => |s| {
-                    const reg = self.codegen.allocFloat() orelse unreachable;
+                    const reg = try self.allocTempFloat();
                     if (width == .f32) {
                         if (s.size != .dword) {
                             std.debug.panic(
@@ -14116,9 +14308,7 @@ pub fn LirCodeGen(comptime target: RocTarget) type {
             const saved_callee_saved_used = self.codegen.callee_saved_used;
             const saved_callee_saved_available = self.codegen.callee_saved_available;
             const saved_free_general = self.codegen.free_general;
-            const saved_general_owners = self.codegen.general_owners;
             const saved_free_float = self.codegen.free_float;
-            const saved_float_owners = self.codegen.float_owners;
             const saved_roc_ops_reg = self.roc_ops_reg;
             const saved_ret_ptr_slot = self.ret_ptr_slot;
             const saved_uses_caller_stack_arg_base = self.uses_caller_stack_arg_base;
@@ -14150,9 +14340,7 @@ pub fn LirCodeGen(comptime target: RocTarget) type {
             self.codegen.callee_saved_used = 0;
             self.codegen.callee_saved_available = CodeGen.CALLEE_SAVED_GENERAL_MASK;
             self.codegen.free_general = CodeGen.INITIAL_FREE_GENERAL;
-            self.codegen.general_owners = [_]?u32{null} ** CodeGen.NUM_GENERAL_REGS;
             self.codegen.free_float = CodeGen.INITIAL_FREE_FLOAT;
-            self.codegen.float_owners = [_]?u32{null} ** CodeGen.NUM_FLOAT_REGS;
             self.roc_ops_reg = null;
             self.uses_caller_stack_arg_base = false;
             self.current_proc_name = proc.name;
@@ -14217,9 +14405,7 @@ pub fn LirCodeGen(comptime target: RocTarget) type {
                 self.codegen.callee_saved_used = saved_callee_saved_used;
                 self.codegen.callee_saved_available = saved_callee_saved_available;
                 self.codegen.free_general = saved_free_general;
-                self.codegen.general_owners = saved_general_owners;
                 self.codegen.free_float = saved_free_float;
-                self.codegen.float_owners = saved_float_owners;
                 self.roc_ops_reg = saved_roc_ops_reg;
                 self.uses_caller_stack_arg_base = saved_uses_caller_stack_arg_base;
                 self.current_proc_name = saved_current_proc_name;
@@ -14443,9 +14629,7 @@ pub fn LirCodeGen(comptime target: RocTarget) type {
             self.codegen.callee_saved_used = saved_callee_saved_used;
             self.codegen.callee_saved_available = saved_callee_saved_available;
             self.codegen.free_general = saved_free_general;
-            self.codegen.general_owners = saved_general_owners;
             self.codegen.free_float = saved_free_float;
-            self.codegen.float_owners = saved_float_owners;
             self.roc_ops_reg = saved_roc_ops_reg;
             self.uses_caller_stack_arg_base = saved_uses_caller_stack_arg_base;
             self.ret_ptr_slot = saved_ret_ptr_slot;
@@ -15046,9 +15230,6 @@ pub fn LirCodeGen(comptime target: RocTarget) type {
         fn markCallerStackArgBaseUsed(self: *Self) void {
             if (comptime arch == .aarch64 or arch == .aarch64_be) {
                 const bit = @as(u32, 1) << @intFromEnum(caller_stack_arg_base_reg);
-                if (std.debug.runtime_safety) {
-                    std.debug.assert(self.codegen.general_owners[@intFromEnum(caller_stack_arg_base_reg)] == null);
-                }
                 self.uses_caller_stack_arg_base = true;
                 self.codegen.callee_saved_used |= bit;
                 self.codegen.callee_saved_available &= ~bit;
@@ -19124,6 +19305,124 @@ test "generate shift right zero-fill" {
     try std.testing.expectEqual(@as(u64, 1), try runRootU64(&store, &test_state.layout_store, proc, .u64));
 }
 
+// Runs a scalar shift and returns the result truncated to the type's bit width
+// (as an unsigned bit pattern), so both signed and unsigned expectations can be
+// compared directly.
+const ShiftHarness = struct {
+    fn run(op: lir.LowLevel, lhs: i64, rhs: i64, operand_layout: layout.Idx, comptime width: u7) (Allocator.Error || error{ EmptyCode, MmapFailed, VirtualAllocFailed, MprotectFailed, VirtualProtectFailed, UnsupportedPlatform, UnwindRegistrationFailed })!u64 {
+        const allocator = std.testing.allocator;
+        var store = LirStore.init(allocator);
+        defer store.deinit();
+        var test_state = try TestLayoutState.init(allocator);
+        defer test_state.deinit();
+        const proc = try addBinaryLowLevelProc(&store, op, lhs, rhs, operand_layout, operand_layout);
+        const raw = try runRootU64(&store, &test_state.layout_store, proc, operand_layout);
+        return if (width == 64) raw else raw & ((@as(u64, 1) << width) - 1);
+    }
+    fn i8b(x: i8) u64 {
+        return @as(u64, @as(u8, @bitCast(x)));
+    }
+    fn i64b(x: i64) u64 {
+        return @bitCast(x);
+    }
+};
+
+test "generate shift modulo - unsigned widths" {
+    if (comptime builtin.cpu.arch != .x86_64 and builtin.cpu.arch != .aarch64) {
+        return error.SkipZigTest;
+    }
+    const H = ShiftHarness;
+    const shl = lir.LowLevel.num_shift_left_by;
+    const shr = lir.LowLevel.num_shift_right_by;
+    const shr_zf = lir.LowLevel.num_shift_right_zf_by;
+
+    // U8: count taken modulo 8.
+    try std.testing.expectEqual(@as(u64, 1), try H.run(shl, 1, 8, .u8, 8));
+    try std.testing.expectEqual(@as(u64, 2), try H.run(shl, 1, 9, .u8, 8));
+    try std.testing.expectEqual(@as(u64, 1), try H.run(shl, 1, 64, .u8, 8));
+    try std.testing.expectEqual(@as(u64, 2), try H.run(shl, 1, 65, .u8, 8));
+    try std.testing.expectEqual(@as(u64, 128), try H.run(shl, 1, 127, .u8, 8));
+    try std.testing.expectEqual(@as(u64, 1), try H.run(shl, 1, 128, .u8, 8));
+    try std.testing.expectEqual(@as(u64, 1), try H.run(shl, 1, 200, .u8, 8));
+    try std.testing.expectEqual(@as(u64, 128), try H.run(shl, 1, 255, .u8, 8));
+    try std.testing.expectEqual(@as(u64, 128), try H.run(shr, 128, 8, .u8, 8));
+    try std.testing.expectEqual(@as(u64, 64), try H.run(shr, 128, 9, .u8, 8));
+    try std.testing.expectEqual(@as(u64, 1), try H.run(shr, 128, 127, .u8, 8));
+    try std.testing.expectEqual(@as(u64, 1), try H.run(shr, 128, 255, .u8, 8));
+    // Unsigned right shift must be logical, not arithmetic.
+    try std.testing.expectEqual(@as(u64, 64), try H.run(shr, 128, 1, .u8, 8));
+    try std.testing.expectEqual(@as(u64, 64), try H.run(shr_zf, 128, 9, .u8, 8));
+    try std.testing.expectEqual(@as(u64, 128), try H.run(shr_zf, 128, 8, .u8, 8));
+
+    // U32: count taken modulo 32.
+    try std.testing.expectEqual(@as(u64, 1), try H.run(shl, 1, 32, .u32, 32));
+    try std.testing.expectEqual(@as(u64, 2), try H.run(shl, 1, 33, .u32, 32));
+    try std.testing.expectEqual(@as(u64, 1), try H.run(shl, 1, 64, .u32, 32));
+    try std.testing.expectEqual(@as(u64, 2), try H.run(shl, 1, 65, .u32, 32));
+    try std.testing.expectEqual(@as(u64, 0x8000_0000), try H.run(shl, 1, 127, .u32, 32));
+    try std.testing.expectEqual(@as(u64, 1), try H.run(shl, 1, 128, .u32, 32));
+    try std.testing.expectEqual(@as(u64, 256), try H.run(shl, 1, 200, .u32, 32));
+    try std.testing.expectEqual(@as(u64, 0x8000_0000), try H.run(shl, 1, 255, .u32, 32));
+    // Unsigned right shift of a top-bit-set value must be logical.
+    try std.testing.expectEqual(@as(u64, 0x4000_0000), try H.run(shr, 0x8000_0000, 1, .u32, 32));
+    try std.testing.expectEqual(@as(u64, 0x8000_0000), try H.run(shr, 0x8000_0000, 32, .u32, 32));
+    try std.testing.expectEqual(@as(u64, 0x4000_0000), try H.run(shr, 0x8000_0000, 33, .u32, 32));
+    try std.testing.expectEqual(@as(u64, 0x0080_0000), try H.run(shr, 0x8000_0000, 200, .u32, 32));
+    try std.testing.expectEqual(@as(u64, 1), try H.run(shr, 0x8000_0000, 255, .u32, 32));
+
+    // U64: count taken modulo 64.
+    const top64: i64 = @bitCast(@as(u64, 0x8000_0000_0000_0000));
+    try std.testing.expectEqual(@as(u64, 1), try H.run(shl, 1, 64, .u64, 64));
+    try std.testing.expectEqual(@as(u64, 2), try H.run(shl, 1, 65, .u64, 64));
+    try std.testing.expectEqual(@as(u64, 0x8000_0000_0000_0000), try H.run(shl, 1, 127, .u64, 64));
+    try std.testing.expectEqual(@as(u64, 1), try H.run(shl, 1, 128, .u64, 64));
+    try std.testing.expectEqual(@as(u64, 256), try H.run(shl, 1, 200, .u64, 64));
+    try std.testing.expectEqual(@as(u64, 0x8000_0000_0000_0000), try H.run(shl, 1, 255, .u64, 64));
+    // Unsigned right shift of a top-bit-set value must be logical (regression:
+    // this backend used to emit an arithmetic shift for unsigned types).
+    try std.testing.expectEqual(@as(u64, 0x4000_0000_0000_0000), try H.run(shr, top64, 1, .u64, 64));
+    try std.testing.expectEqual(@as(u64, 0x8000_0000_0000_0000), try H.run(shr, top64, 64, .u64, 64));
+    try std.testing.expectEqual(@as(u64, 0x4000_0000_0000_0000), try H.run(shr, top64, 65, .u64, 64));
+    try std.testing.expectEqual(@as(u64, 0x8000_0000_0000_0000), try H.run(shr, top64, 128, .u64, 64));
+    try std.testing.expectEqual(@as(u64, 1), try H.run(shr, top64, 255, .u64, 64));
+    try std.testing.expectEqual(@as(u64, 1), try H.run(shr_zf, top64, 63, .u64, 64));
+}
+
+test "generate shift modulo - signed widths" {
+    if (comptime builtin.cpu.arch != .x86_64 and builtin.cpu.arch != .aarch64) {
+        return error.SkipZigTest;
+    }
+    const H = ShiftHarness;
+    const shl = lir.LowLevel.num_shift_left_by;
+    const shr = lir.LowLevel.num_shift_right_by;
+    const shr_zf = lir.LowLevel.num_shift_right_zf_by;
+
+    // I8: arithmetic right shift, count taken modulo 8.
+    try std.testing.expectEqual(@as(u64, 1), try H.run(shl, 1, 8, .i8, 8));
+    try std.testing.expectEqual(@as(u64, 2), try H.run(shl, 1, 9, .i8, 8));
+    try std.testing.expectEqual(H.i8b(-1), try H.run(shr, -1, 8, .i8, 8));
+    try std.testing.expectEqual(H.i8b(-1), try H.run(shr, -1, 9, .i8, 8));
+    try std.testing.expectEqual(H.i8b(-1), try H.run(shr, -1, 255, .i8, 8));
+    try std.testing.expectEqual(H.i8b(-128), try H.run(shr, -128, 8, .i8, 8));
+    try std.testing.expectEqual(H.i8b(-64), try H.run(shr, -128, 9, .i8, 8));
+    try std.testing.expectEqual(H.i8b(-128), try H.run(shr, -128, 200, .i8, 8));
+    // Zero-fill right shift is logical even for signed types.
+    try std.testing.expectEqual(@as(u64, 127), try H.run(shr_zf, -1, 9, .i8, 8));
+    try std.testing.expectEqual(@as(u64, 64), try H.run(shr_zf, -128, 9, .i8, 8));
+
+    // I64: arithmetic right shift, count taken modulo 64.
+    try std.testing.expectEqual(@as(u64, 1), try H.run(shl, 1, 64, .i64, 64));
+    try std.testing.expectEqual(@as(u64, 2), try H.run(shl, 1, 65, .i64, 64));
+    try std.testing.expectEqual(@as(u64, 0x8000_0000_0000_0000), try H.run(shl, 1, 127, .i64, 64));
+    try std.testing.expectEqual(@as(u64, 256), try H.run(shl, 1, 200, .i64, 64));
+    try std.testing.expectEqual(H.i64b(-4), try H.run(shr, -8, 1, .i64, 64));
+    try std.testing.expectEqual(H.i64b(-8), try H.run(shr, -8, 64, .i64, 64));
+    try std.testing.expectEqual(H.i64b(-4), try H.run(shr, -8, 65, .i64, 64));
+    try std.testing.expectEqual(H.i64b(-8), try H.run(shr, -8, 128, .i64, 64));
+    try std.testing.expectEqual(H.i64b(-1), try H.run(shr, -8, 200, .i64, 64));
+    try std.testing.expectEqual(H.i64b(-1), try H.run(shr, -1, 65, .i64, 64));
+}
+
 test "generate unary minus" {
     if (comptime builtin.cpu.arch != .x86_64 and builtin.cpu.arch != .aarch64) {
         return error.SkipZigTest;
@@ -19137,6 +19436,111 @@ test "generate unary minus" {
 
     const proc = try addUnaryLowLevelProc(&store, .num_negate, 42, .i64, .i64);
     try std.testing.expectEqual(@as(i64, -42), try runRootI64(&store, &test_state.layout_store, proc));
+}
+
+test "generate bit-count ops (popcount/clz/ctz)" {
+    if (comptime builtin.cpu.arch != .x86_64 and builtin.cpu.arch != .aarch64) {
+        return error.SkipZigTest;
+    }
+
+    const allocator = std.testing.allocator;
+    const Case = struct { op: lir.LowLevel, value: i64, layout: layout.Idx, expected: u8 };
+    const cases = [_]Case{
+        .{ .op = .num_count_one_bits, .value = 0, .layout = .u8, .expected = 0 },
+        .{ .op = .num_count_leading_zero_bits, .value = 0, .layout = .u8, .expected = 8 },
+        .{ .op = .num_count_trailing_zero_bits, .value = 0, .layout = .u8, .expected = 8 },
+        .{ .op = .num_count_one_bits, .value = 255, .layout = .u8, .expected = 8 },
+        .{ .op = .num_count_leading_zero_bits, .value = 255, .layout = .u8, .expected = 0 },
+        .{ .op = .num_count_trailing_zero_bits, .value = 255, .layout = .u8, .expected = 0 },
+        .{ .op = .num_count_one_bits, .value = 1, .layout = .u8, .expected = 1 },
+        .{ .op = .num_count_leading_zero_bits, .value = 1, .layout = .u8, .expected = 7 },
+        .{ .op = .num_count_trailing_zero_bits, .value = 1, .layout = .u8, .expected = 0 },
+        .{ .op = .num_count_one_bits, .value = 128, .layout = .u8, .expected = 1 },
+        .{ .op = .num_count_leading_zero_bits, .value = 128, .layout = .u8, .expected = 0 },
+        .{ .op = .num_count_trailing_zero_bits, .value = 128, .layout = .u8, .expected = 7 },
+        .{ .op = .num_count_one_bits, .value = 44, .layout = .u8, .expected = 3 },
+        .{ .op = .num_count_leading_zero_bits, .value = 44, .layout = .u8, .expected = 2 },
+        .{ .op = .num_count_trailing_zero_bits, .value = 44, .layout = .u8, .expected = 2 },
+        .{ .op = .num_count_one_bits, .value = 0, .layout = .u32, .expected = 0 },
+        .{ .op = .num_count_leading_zero_bits, .value = 0, .layout = .u32, .expected = 32 },
+        .{ .op = .num_count_trailing_zero_bits, .value = 0, .layout = .u32, .expected = 32 },
+        .{ .op = .num_count_one_bits, .value = 4294967295, .layout = .u32, .expected = 32 },
+        .{ .op = .num_count_leading_zero_bits, .value = 4294967295, .layout = .u32, .expected = 0 },
+        .{ .op = .num_count_trailing_zero_bits, .value = 4294967295, .layout = .u32, .expected = 0 },
+        .{ .op = .num_count_one_bits, .value = 1, .layout = .u32, .expected = 1 },
+        .{ .op = .num_count_leading_zero_bits, .value = 1, .layout = .u32, .expected = 31 },
+        .{ .op = .num_count_trailing_zero_bits, .value = 1, .layout = .u32, .expected = 0 },
+        .{ .op = .num_count_one_bits, .value = 2147483648, .layout = .u32, .expected = 1 },
+        .{ .op = .num_count_leading_zero_bits, .value = 2147483648, .layout = .u32, .expected = 0 },
+        .{ .op = .num_count_trailing_zero_bits, .value = 2147483648, .layout = .u32, .expected = 31 },
+        .{ .op = .num_count_one_bits, .value = 16711935, .layout = .u32, .expected = 16 },
+        .{ .op = .num_count_leading_zero_bits, .value = 16711935, .layout = .u32, .expected = 8 },
+        .{ .op = .num_count_trailing_zero_bits, .value = 16711935, .layout = .u32, .expected = 0 },
+        .{ .op = .num_count_one_bits, .value = 0, .layout = .u64, .expected = 0 },
+        .{ .op = .num_count_leading_zero_bits, .value = 0, .layout = .u64, .expected = 64 },
+        .{ .op = .num_count_trailing_zero_bits, .value = 0, .layout = .u64, .expected = 64 },
+        .{ .op = .num_count_one_bits, .value = -1, .layout = .u64, .expected = 64 },
+        .{ .op = .num_count_leading_zero_bits, .value = -1, .layout = .u64, .expected = 0 },
+        .{ .op = .num_count_trailing_zero_bits, .value = -1, .layout = .u64, .expected = 0 },
+        .{ .op = .num_count_one_bits, .value = 1, .layout = .u64, .expected = 1 },
+        .{ .op = .num_count_leading_zero_bits, .value = 1, .layout = .u64, .expected = 63 },
+        .{ .op = .num_count_trailing_zero_bits, .value = 1, .layout = .u64, .expected = 0 },
+        .{ .op = .num_count_one_bits, .value = -9223372036854775808, .layout = .u64, .expected = 1 },
+        .{ .op = .num_count_leading_zero_bits, .value = -9223372036854775808, .layout = .u64, .expected = 0 },
+        .{ .op = .num_count_trailing_zero_bits, .value = -9223372036854775808, .layout = .u64, .expected = 63 },
+        .{ .op = .num_count_one_bits, .value = 1085102592571150095, .layout = .u64, .expected = 32 },
+        .{ .op = .num_count_leading_zero_bits, .value = 1085102592571150095, .layout = .u64, .expected = 4 },
+        .{ .op = .num_count_trailing_zero_bits, .value = 1085102592571150095, .layout = .u64, .expected = 0 },
+        .{ .op = .num_count_one_bits, .value = 0, .layout = .i8, .expected = 0 },
+        .{ .op = .num_count_leading_zero_bits, .value = 0, .layout = .i8, .expected = 8 },
+        .{ .op = .num_count_trailing_zero_bits, .value = 0, .layout = .i8, .expected = 8 },
+        .{ .op = .num_count_one_bits, .value = 255, .layout = .i8, .expected = 8 },
+        .{ .op = .num_count_leading_zero_bits, .value = 255, .layout = .i8, .expected = 0 },
+        .{ .op = .num_count_trailing_zero_bits, .value = 255, .layout = .i8, .expected = 0 },
+        .{ .op = .num_count_one_bits, .value = 1, .layout = .i8, .expected = 1 },
+        .{ .op = .num_count_leading_zero_bits, .value = 1, .layout = .i8, .expected = 7 },
+        .{ .op = .num_count_trailing_zero_bits, .value = 1, .layout = .i8, .expected = 0 },
+        .{ .op = .num_count_one_bits, .value = 128, .layout = .i8, .expected = 1 },
+        .{ .op = .num_count_leading_zero_bits, .value = 128, .layout = .i8, .expected = 0 },
+        .{ .op = .num_count_trailing_zero_bits, .value = 128, .layout = .i8, .expected = 7 },
+        .{ .op = .num_count_one_bits, .value = 248, .layout = .i8, .expected = 5 },
+        .{ .op = .num_count_leading_zero_bits, .value = 248, .layout = .i8, .expected = 0 },
+        .{ .op = .num_count_trailing_zero_bits, .value = 248, .layout = .i8, .expected = 3 },
+        .{ .op = .num_count_one_bits, .value = 0, .layout = .i64, .expected = 0 },
+        .{ .op = .num_count_leading_zero_bits, .value = 0, .layout = .i64, .expected = 64 },
+        .{ .op = .num_count_trailing_zero_bits, .value = 0, .layout = .i64, .expected = 64 },
+        .{ .op = .num_count_one_bits, .value = -1, .layout = .i64, .expected = 64 },
+        .{ .op = .num_count_leading_zero_bits, .value = -1, .layout = .i64, .expected = 0 },
+        .{ .op = .num_count_trailing_zero_bits, .value = -1, .layout = .i64, .expected = 0 },
+        .{ .op = .num_count_one_bits, .value = -2, .layout = .i64, .expected = 63 },
+        .{ .op = .num_count_leading_zero_bits, .value = -2, .layout = .i64, .expected = 0 },
+        .{ .op = .num_count_trailing_zero_bits, .value = -2, .layout = .i64, .expected = 1 },
+        .{ .op = .num_count_one_bits, .value = 0, .layout = .u128, .expected = 0 },
+        .{ .op = .num_count_leading_zero_bits, .value = 0, .layout = .u128, .expected = 128 },
+        .{ .op = .num_count_trailing_zero_bits, .value = 0, .layout = .u128, .expected = 128 },
+        .{ .op = .num_count_one_bits, .value = -1, .layout = .u128, .expected = 128 },
+        .{ .op = .num_count_leading_zero_bits, .value = -1, .layout = .u128, .expected = 0 },
+        .{ .op = .num_count_trailing_zero_bits, .value = -1, .layout = .u128, .expected = 0 },
+        .{ .op = .num_count_one_bits, .value = 0, .layout = .i128, .expected = 0 },
+        .{ .op = .num_count_leading_zero_bits, .value = 0, .layout = .i128, .expected = 128 },
+        .{ .op = .num_count_trailing_zero_bits, .value = 0, .layout = .i128, .expected = 128 },
+        .{ .op = .num_count_one_bits, .value = -1, .layout = .i128, .expected = 128 },
+        .{ .op = .num_count_leading_zero_bits, .value = -1, .layout = .i128, .expected = 0 },
+        .{ .op = .num_count_trailing_zero_bits, .value = -1, .layout = .i128, .expected = 0 },
+    };
+    for (cases) |c| {
+        var store = LirStore.init(allocator);
+        defer store.deinit();
+        var test_state = try TestLayoutState.init(allocator);
+        defer test_state.deinit();
+
+        const proc = try addUnaryLowLevelProc(&store, c.op, c.value, c.layout, .u8);
+        const got = try runRootU8(&store, &test_state.layout_store, proc, .u8);
+        std.testing.expectEqual(c.expected, got) catch |e| {
+            std.debug.print("bit-count case failed: op={s} value={d} layout={s} expected={d} got={d}\n", .{ @tagName(c.op), c.value, @tagName(c.layout), c.expected, got });
+            return e;
+        };
+    }
 }
 
 test "entrypoint arg offsets preserve Roc alignment order" {

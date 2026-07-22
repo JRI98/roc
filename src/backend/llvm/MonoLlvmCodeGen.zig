@@ -295,7 +295,7 @@ pub const MonoLlvmCodeGen = struct {
         inner_bad_utf8_tag: u32,
     };
 
-    const StrFindFirstLayoutInfo = struct {
+    const StrSplitFirstLayoutInfo = struct {
         after_offset: u32,
         before_offset: u32,
         found_offset: u32,
@@ -2895,6 +2895,10 @@ pub const MonoLlvmCodeGen = struct {
             .num_bitwise_xor,
             => try self.emitNumericBinary(target, op, arg_locals),
             .num_bitwise_not => try self.emitNumericBitwiseNot(target, GuardedList.at(arg_locals, 0)),
+            .num_count_one_bits,
+            .num_count_leading_zero_bits,
+            .num_count_trailing_zero_bits,
+            => try self.emitNumericBitCount(target, op, GuardedList.at(arg_locals, 0)),
             .num_negate, .num_negate_checked => try self.emitNumericNegate(target, op, GuardedList.at(arg_locals, 0)),
             .num_abs, .num_abs_checked => try self.emitNumericAbs(target, op, GuardedList.at(arg_locals, 0)),
             .num_abs_diff => try self.emitNumericAbsDiff(target, arg_locals),
@@ -2940,7 +2944,7 @@ pub const MonoLlvmCodeGen = struct {
             .str_count_utf8_bytes => try self.emitStrCountUtf8Bytes(target, GuardedList.at(arg_locals, 0)),
             .str_get_utf8_byte_unsafe => try self.emitStrGetUtf8ByteUnsafe(target, arg_locals),
             .str_substring_unsafe => try self.emitStrSubstringUnsafe(target, arg_locals),
-            .str_find_first => try self.emitStrFindFirst(target, arg_locals),
+            .str_split_first => try self.emitStrSplitFirst(target, arg_locals),
             .str_drop_prefix_caseless_ascii => try self.emitStrDropPrefixCaselessAscii(target, arg_locals),
             .str_concat => try self.emitStrRetBuiltin(target, builtinSymbol(LowLevelBuiltins.strOp(.str_concat)), arg_locals, unique_args),
             .str_trim => try self.emitStrUnaryRetBuiltin(target, builtinSymbol(LowLevelBuiltins.strOp(.str_trim)), GuardedList.at(arg_locals, 0), unique_args),
@@ -3428,27 +3432,22 @@ pub const MonoLlvmCodeGen = struct {
         const builder = self.builder orelse return error.CompilationFailed;
         const wip = self.wip orelse return error.CompilationFailed;
         const result_ty = self.scalarType(target_layout);
-        const shift_bits = builder.intValue(.i8, self.intBits(target_layout)) catch return error.OutOfMemory;
+        const width = self.intBits(target_layout);
         const rhs_u8 = try self.coerceScalar(rhs, .i8, false);
-        const too_large = wip.icmp(.uge, rhs_u8, shift_bits, "") catch return error.OutOfMemory;
         const amount = try self.coerceScalar(rhs_u8, result_ty, false);
-        if (op == .num_shift_right_by and target_layout.isSigned()) {
-            // Arithmetic right shift keeps filling with sign bits, so any
-            // amount >= the bit width behaves like shifting by bits - 1.
-            const max_amount = builder.intValue(result_ty, self.intBits(target_layout) - 1) catch return error.OutOfMemory;
-            const safe_amount = wip.select(.normal, too_large, max_amount, amount, "") catch return error.OutOfMemory;
-            return wip.bin(.ashr, lhs, safe_amount, "") catch return error.OutOfMemory;
-        }
-        const zero_amount = builder.zeroInitValue(result_ty) catch return error.OutOfMemory;
-        const safe_amount = wip.select(.normal, too_large, zero_amount, amount, "") catch return error.OutOfMemory;
+        // The shift count is taken modulo the bit width. The widths are all
+        // powers of two, so that is a bitwise AND with (width - 1). Masking also
+        // keeps LLVM's shl/lshr/ashr out of poison territory (their result is
+        // poison when the count is >= the bit width).
+        const mask = builder.intValue(result_ty, width - 1) catch return error.OutOfMemory;
+        const masked_amount = wip.bin(.@"and", amount, mask, "") catch return error.OutOfMemory;
         const tag: LlvmBuilder.Function.Instruction.Tag = switch (op) {
             .num_shift_left_by => .shl,
-            .num_shift_right_by, .num_shift_right_zf_by => .lshr,
+            .num_shift_right_by => if (target_layout.isSigned()) .ashr else .lshr,
+            .num_shift_right_zf_by => .lshr,
             else => unreachable,
         };
-        const shifted = wip.bin(tag, lhs, safe_amount, "") catch return error.OutOfMemory;
-        const zero_result = builder.zeroInitValue(result_ty) catch return error.OutOfMemory;
-        return wip.select(.normal, too_large, zero_result, shifted, "") catch return error.OutOfMemory;
+        return wip.bin(tag, lhs, masked_amount, "") catch return error.OutOfMemory;
     }
 
     fn emitDecBinary(self: *MonoLlvmCodeGen, target: LocalId, op: lir.LowLevel, args: anytype) Error!void {
@@ -3574,6 +3573,49 @@ pub const MonoLlvmCodeGen = struct {
         const target_layout = self.localLayout(target);
         const value = try self.loadScalar(self.slot(arg).ptr, self.localLayout(arg));
         const result = wip.not(value, "") catch return error.OutOfMemory;
+        try self.storeScalar(self.slot(target).ptr, target_layout, result);
+    }
+
+    /// Lower a bit-counting op (`count_one_bits`/`count_leading_zero_bits`/
+    /// `count_trailing_zero_bits`) to the corresponding LLVM intrinsic on the
+    /// operand's integer type (i8..i128; LLVM legalizes i128 itself). The
+    /// ctlz/cttz `is_zero_poison` flag is FALSE so a zero operand yields the
+    /// bit width, matching the spec. The intrinsic result has the operand's
+    /// width; `storeScalar` truncates it to the declared U8 return.
+    fn emitNumericBitCount(self: *MonoLlvmCodeGen, target: LocalId, op: lir.LowLevel, arg: LocalId) Error!void {
+        const builder = self.builder orelse return error.CompilationFailed;
+        const wip = self.wip orelse return error.CompilationFailed;
+        const target_layout = self.localLayout(target);
+        const value = try self.loadScalar(self.slot(arg).ptr, self.localLayout(arg));
+        const value_ty = value.typeOfWip(wip);
+        const zero_is_not_poison = builder.intValue(.i1, 0) catch return error.OutOfMemory;
+        const result = switch (op) {
+            .num_count_one_bits => wip.callIntrinsic(
+                .normal,
+                .none,
+                .ctpop,
+                &.{value_ty},
+                &.{value},
+                "",
+            ) catch return error.OutOfMemory,
+            .num_count_leading_zero_bits => wip.callIntrinsic(
+                .normal,
+                .none,
+                .ctlz,
+                &.{value_ty},
+                &.{ value, zero_is_not_poison },
+                "",
+            ) catch return error.OutOfMemory,
+            .num_count_trailing_zero_bits => wip.callIntrinsic(
+                .normal,
+                .none,
+                .cttz,
+                &.{value_ty},
+                &.{ value, zero_is_not_poison },
+                "",
+            ) catch return error.OutOfMemory,
+            else => unreachable,
+        };
         try self.storeScalar(self.slot(target).ptr, target_layout, result);
     }
 
@@ -6120,16 +6162,16 @@ pub const MonoLlvmCodeGen = struct {
         );
     }
 
-    fn emitStrFindFirst(self: *MonoLlvmCodeGen, target: LocalId, args: anytype) Error!void {
+    fn emitStrSplitFirst(self: *MonoLlvmCodeGen, target: LocalId, args: anytype) Error!void {
         const target_slot = self.slot(target);
-        const info = try self.resolveStrFindFirstLayout(target_slot.layout_idx);
+        const info = try self.resolveStrSplitFirstLayout(target_slot.layout_idx);
         if (target_slot.size > 0) try self.zeroBytes(target_slot.ptr, target_slot.size);
 
         const layout_ptr = try self.allocEntryBlockSlot(
             .i8,
-            @sizeOf(builtins.dev_wrappers.StrFindFirstLayout),
-            LlvmBuilder.Alignment.fromByteUnits(@alignOf(builtins.dev_wrappers.StrFindFirstLayout)),
-            "str_find_first_layout",
+            @sizeOf(builtins.dev_wrappers.StrSplitFirstLayout),
+            LlvmBuilder.Alignment.fromByteUnits(@alignOf(builtins.dev_wrappers.StrSplitFirstLayout)),
+            "str_split_first_layout",
         );
 
         try self.storeRawInt(layout_ptr, 0, .i32, info.after_offset, 4);
@@ -6141,7 +6183,7 @@ pub const MonoLlvmCodeGen = struct {
         try call_args.prepend(self.allocator, try self.ptrType(), target_slot.ptr);
         try call_args.append(self.allocator, try self.ptrType(), layout_ptr);
         try call_args.append(self.allocator, try self.ptrType(), self.rocOps());
-        try self.callBuiltinVoid(builtinSymbol(LowLevelBuiltins.strOp(.str_find_first)), call_args.types.items, call_args.values.items);
+        try self.callBuiltinVoid(builtinSymbol(LowLevelBuiltins.strOp(.str_split_first)), call_args.types.items, call_args.values.items);
     }
 
     fn emitStrDropPrefixCaselessAscii(self: *MonoLlvmCodeGen, target: LocalId, args: anytype) Error!void {
@@ -8264,7 +8306,7 @@ pub const MonoLlvmCodeGen = struct {
         };
     }
 
-    fn resolveStrFindFirstLayout(self: *MonoLlvmCodeGen, layout_idx: layout.Idx) Error!StrFindFirstLayoutInfo {
+    fn resolveStrSplitFirstLayout(self: *MonoLlvmCodeGen, layout_idx: layout.Idx) Error!StrSplitFirstLayoutInfo {
         const ret_layout_val = self.layoutValue(layout_idx);
         if (ret_layout_val.tag != .struct_) return error.CompilationFailed;
 

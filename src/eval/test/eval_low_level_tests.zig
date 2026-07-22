@@ -2227,10 +2227,10 @@ pub const tests = [_]TestCase{
         .expected = .{ .inspect_str = "\"hi\"" },
     },
     .{
-        .name = "low_level - Str.find_first returns seamless before and after slices",
+        .name = "low_level - Str.split_first returns seamless before and after slices",
         .source =
         \\{
-        \\x = match Str.find_first("alpha:beta", ":") {
+        \\x = match Str.split_first("alpha:beta", ":") {
         \\    Ok(parts) => Str.count_utf8_bytes(parts.before) * 100 + Str.count_utf8_bytes(parts.after)
         \\    Err(_) => 0
         \\}
@@ -3297,204 +3297,204 @@ pub const tests = [_]TestCase{
         .expected = .{ .inspect_str = "8" },
     },
     .{
-        .name = "low_level - U8.shift_left_by basic",
+        .name = "low_level - U8.shl_wrap basic",
         .source =
         \\{
         \\a : U8
         \\a = 5
-        \\x = a.shift_left_by(2)
+        \\x = a.shl_wrap(2)
         \\x
         \\}
         ,
         .expected = .{ .inspect_str = "20" },
     },
     .{
-        .name = "low_level - U8.shift_right_by basic",
+        .name = "low_level - U8.shr_wrap basic",
         .source =
         \\{
         \\a : U8
         \\a = 20
-        \\x = a.shift_right_by(2)
+        \\x = a.shr_wrap(2)
         \\x
         \\}
         ,
         .expected = .{ .inspect_str = "5" },
     },
     .{
-        .name = "low_level - U8.shift_right_zf_by basic",
+        .name = "low_level - U8.shr_zf_wrap basic",
         .source =
         \\{
         \\a : U8
         \\a = 128
-        \\x = a.shift_right_zf_by(2)
+        \\x = a.shr_zf_wrap(2)
         \\x
         \\}
         ,
         .expected = .{ .inspect_str = "32" },
     },
     .{
-        .name = "low_level - I8.shift_left_by positive",
+        .name = "low_level - I8.shl_wrap positive",
         .source =
         \\{
         \\a : I8
         \\a = 3
-        \\x = a.shift_left_by(3)
+        \\x = a.shl_wrap(3)
         \\x
         \\}
         ,
         .expected = .{ .inspect_str = "24" },
     },
     .{
-        .name = "low_level - I8.shift_right_by negative arithmetic",
+        .name = "low_level - I8.shr_wrap negative arithmetic",
         .source =
         \\{
         \\a : I8
         \\a = -8
-        \\x = a.shift_right_by(1)
+        \\x = a.shr_wrap(1)
         \\x
         \\}
         ,
         .expected = .{ .inspect_str = "-4" },
     },
     .{
-        .name = "low_level - I8.shift_right_zf_by negative zero_fill",
+        .name = "low_level - I8.shr_zf_wrap negative zero_fill",
         .source =
         \\{
         \\a : I8
         \\a = -8
-        \\x = a.shift_right_zf_by(1)
+        \\x = a.shr_zf_wrap(1)
         \\x
         \\}
         ,
         .expected = .{ .inspect_str = "124" },
     },
     .{
-        .name = "low_level - U16.shift_left_by",
+        .name = "low_level - U16.shl_wrap",
         .source =
         \\{
         \\a : U16
         \\a = 1
-        \\x = a.shift_left_by(4)
+        \\x = a.shl_wrap(4)
         \\x
         \\}
         ,
         .expected = .{ .inspect_str = "16" },
     },
     .{
-        .name = "low_level - I16.shift_right_by positive",
+        .name = "low_level - I16.shr_wrap positive",
         .source =
         \\{
         \\a : I16
         \\a = 64
-        \\x = a.shift_right_by(3)
+        \\x = a.shr_wrap(3)
         \\x
         \\}
         ,
         .expected = .{ .inspect_str = "8" },
     },
     .{
-        .name = "low_level - I16.shift_right_by negative",
+        .name = "low_level - I16.shr_wrap negative",
         .source =
         \\{
         \\a : I16
         \\a = -16
-        \\x = a.shift_right_by(2)
+        \\x = a.shr_wrap(2)
         \\x
         \\}
         ,
         .expected = .{ .inspect_str = "-4" },
     },
     .{
-        .name = "low_level - U32.shift_left_by",
+        .name = "low_level - U32.shl_wrap",
         .source =
         \\{
         \\a : U32
         \\a = 16
-        \\x = a.shift_left_by(3)
+        \\x = a.shl_wrap(3)
         \\x
         \\}
         ,
         .expected = .{ .inspect_str = "128" },
     },
     .{
-        .name = "low_level - I32.shift_right_by negative",
+        .name = "low_level - I32.shr_wrap negative",
         .source =
         \\{
         \\a : I32
         \\a = -32
-        \\x = a.shift_right_by(3)
+        \\x = a.shr_wrap(3)
         \\x
         \\}
         ,
         .expected = .{ .inspect_str = "-4" },
     },
     .{
-        .name = "low_level - U64.shift_left_by",
+        .name = "low_level - U64.shl_wrap",
         .source =
         \\{
         \\a : U64
         \\a = 255
-        \\x = a.shift_left_by(8)
+        \\x = a.shl_wrap(8)
         \\x
         \\}
         ,
         .expected = .{ .inspect_str = "65280" },
     },
     .{
-        .name = "low_level - I64.shift_right_by negative",
+        .name = "low_level - I64.shr_wrap negative",
         .source =
         \\{
         \\a : I64
         \\a = -1024
-        \\x = a.shift_right_by(2)
+        \\x = a.shr_wrap(2)
         \\x
         \\}
         ,
         .expected = .{ .inspect_str = "-256" },
     },
     .{
-        .name = "low_level - U128.shift_left_by",
+        .name = "low_level - U128.shl_wrap",
         .source =
         \\{
         \\a : U128
         \\a = 1
-        \\x = a.shift_left_by(10)
+        \\x = a.shl_wrap(10)
         \\x
         \\}
         ,
         .expected = .{ .inspect_str = "1024" },
     },
     .{
-        .name = "low_level - I128.shift_right_by negative",
+        .name = "low_level - I128.shr_wrap negative",
         .source =
         \\{
         \\a : I128
         \\a = -256
-        \\x = a.shift_right_by(4)
+        \\x = a.shr_wrap(4)
         \\x
         \\}
         ,
         .expected = .{ .inspect_str = "-16" },
     },
     .{
-        .name = "low_level - shift_left_by with zero shift",
+        .name = "low_level - shl_wrap with zero shift",
         .source =
         \\{
         \\a : U8
         \\a = 42
-        \\x = a.shift_left_by(0)
+        \\x = a.shl_wrap(0)
         \\x
         \\}
         ,
         .expected = .{ .inspect_str = "42" },
     },
     .{
-        .name = "low_level - shift_right_by with zero shift",
+        .name = "low_level - shr_wrap with zero shift",
         .source =
         \\{
         \\a : I8
         \\a = -42
-        \\x = a.shift_right_by(0)
+        \\x = a.shr_wrap(0)
         \\x
         \\}
         ,
@@ -3506,34 +3506,34 @@ pub const tests = [_]TestCase{
         \\{
         \\a : U32
         \\a = 100
-        \\b = a.shift_left_by(2)
-        \\c = b.shift_right_by(1)
-        \\x = c.shift_right_zf_by(1)
+        \\b = a.shl_wrap(2)
+        \\c = b.shr_wrap(1)
+        \\x = c.shr_zf_wrap(1)
         \\x
         \\}
         ,
         .expected = .{ .inspect_str = "100" },
     },
     .{
-        .name = "low_level - I8.shift_right_zf_by with -1",
+        .name = "low_level - I8.shr_zf_wrap with -1",
         .source =
         \\{
         \\a : I8
         \\a = -1
-        \\x = a.shift_right_zf_by(4)
+        \\x = a.shr_zf_wrap(4)
         \\x
         \\}
         ,
         .expected = .{ .inspect_str = "15" },
     },
     .{
-        .name = "low_level - U16.shift_right_zf_by equals shift_right_by for unsigned",
+        .name = "low_level - U16.shr_zf_wrap equals shr_wrap for unsigned",
         .source =
         \\{
         \\a : U16
         \\a = 256
-        \\b = a.shift_right_by(4)
-        \\c = a.shift_right_zf_by(4)
+        \\b = a.shr_wrap(4)
+        \\c = a.shr_zf_wrap(4)
         \\x = U16.is_eq(b, c)
         \\x
         \\}
@@ -3541,276 +3541,278 @@ pub const tests = [_]TestCase{
         .expected = .{ .inspect_str = "True" },
     },
     .{
-        .name = "low_level - U8.shift_left_by overflow wraps",
+        .name = "low_level - U8.shl_wrap overflow wraps",
         .source =
         \\{
         \\a : U8
         \\a = 128
-        \\x = a.shift_left_by(1)
+        \\x = a.shl_wrap(1)
         \\x
         \\}
         ,
         .expected = .{ .inspect_str = "0" },
     },
     .{
-        .name = "low_level - I8.shift_left_by overflow wraps",
+        .name = "low_level - I8.shl_wrap overflow wraps",
         .source =
         \\{
         \\a : I8
         \\a = 64
-        \\x = a.shift_left_by(2)
+        \\x = a.shl_wrap(2)
         \\x
         \\}
         ,
         .expected = .{ .inspect_str = "0" },
     },
     .{
-        .name = "low_level - I8.shift_left_by max value overflow",
+        .name = "low_level - I8.shl_wrap max value overflow",
         .source =
         \\{
         \\a : I8
         \\a = 127
-        \\x = a.shift_left_by(1)
+        \\x = a.shl_wrap(1)
         \\x
         \\}
         ,
         .expected = .{ .inspect_str = "-2" },
     },
     .{
-        .name = "low_level - U8.shift_right_by max value",
+        .name = "low_level - U8.shr_wrap max value",
         .source =
         \\{
         \\a : U8
         \\a = 255
-        \\x = a.shift_right_by(1)
+        \\x = a.shr_wrap(1)
         \\x
         \\}
         ,
         .expected = .{ .inspect_str = "127" },
     },
     .{
-        .name = "low_level - I8.shift_right_by min value",
+        .name = "low_level - I8.shr_wrap min value",
         .source =
         \\{
         \\a : I8
         \\a = -128
-        \\x = a.shift_right_by(1)
+        \\x = a.shr_wrap(1)
         \\x
         \\}
         ,
         .expected = .{ .inspect_str = "-64" },
     },
     .{
-        .name = "low_level - I8.shift_right_zf_by min value",
+        .name = "low_level - I8.shr_zf_wrap min value",
         .source =
         \\{
         \\a : I8
         \\a = -128
-        \\x = a.shift_right_zf_by(1)
+        \\x = a.shr_zf_wrap(1)
         \\x
         \\}
         ,
         .expected = .{ .inspect_str = "64" },
     },
     .{
-        .name = "low_level - shift_left_by amount at bit width boundary",
+        .name = "low_level - shl_wrap amount at bit width boundary",
         .source =
         \\{
         \\a : U8
         \\a = 1
-        \\x = a.shift_left_by(7)
+        \\x = a.shl_wrap(7)
         \\x
         \\}
         ,
         .expected = .{ .inspect_str = "128" },
     },
     .{
-        .name = "low_level - shift_right_by amount at bit width boundary",
+        .name = "low_level - shr_wrap amount at bit width boundary",
         .source =
         \\{
         \\a : U8
         \\a = 128
-        \\x = a.shift_right_by(7)
+        \\x = a.shr_wrap(7)
         \\x
         \\}
         ,
         .expected = .{ .inspect_str = "1" },
     },
     .{
-        .name = "low_level - I8.shift_right_by negative all ones preserves",
+        .name = "low_level - I8.shr_wrap negative all ones preserves",
         .source =
         \\{
         \\a : I8
         \\a = -1
-        \\x = a.shift_right_by(7)
+        \\x = a.shr_wrap(7)
         \\x
         \\}
         ,
         .expected = .{ .inspect_str = "-1" },
     },
     .{
-        .name = "low_level - I8.shift_right_by negative rounds toward negative infinity",
+        .name = "low_level - I8.shr_wrap negative rounds toward negative infinity",
         .source =
         \\{
         \\a : I8
         \\a = -3
-        \\x = a.shift_right_by(1)
+        \\x = a.shr_wrap(1)
         \\x
         \\}
         ,
         .expected = .{ .inspect_str = "-2" },
     },
     .{
-        .name = "low_level - U8.shift_right_zf_by all ones pattern",
+        .name = "low_level - U8.shr_zf_wrap all ones pattern",
         .source =
         \\{
         \\a : U8
         \\a = 255
-        \\x = a.shift_right_zf_by(1)
+        \\x = a.shr_zf_wrap(1)
         \\x
         \\}
         ,
         .expected = .{ .inspect_str = "127" },
     },
     .{
-        .name = "low_level - I8.shift_right_zf_by all ones from negative",
+        .name = "low_level - I8.shr_zf_wrap all ones from negative",
         .source =
         \\{
         \\a : I8
         \\a = -1
-        \\x = a.shift_right_zf_by(1)
+        \\x = a.shr_zf_wrap(1)
         \\x
         \\}
         ,
         .expected = .{ .inspect_str = "127" },
     },
     .{
-        .name = "low_level - shift_left_by with zero value",
+        .name = "low_level - shl_wrap with zero value",
         .source =
         \\{
         \\a : U8
         \\a = 0
-        \\x = a.shift_left_by(5)
+        \\x = a.shl_wrap(5)
         \\x
         \\}
         ,
         .expected = .{ .inspect_str = "0" },
     },
     .{
-        .name = "low_level - shift_right_zf_by with zero value",
+        .name = "low_level - shr_zf_wrap with zero value",
         .source =
         \\{
         \\a : I8
         \\a = 0
-        \\x = a.shift_right_zf_by(3)
+        \\x = a.shr_zf_wrap(3)
         \\x
         \\}
         ,
         .expected = .{ .inspect_str = "0" },
     },
     .{
-        .name = "low_level - shift_left_by large shift amount clamped U8",
+        .name = "low_level - shl_wrap large shift amount modulo U8",
         .source =
         \\{
         \\a : U8
         \\a = 1
-        \\x = a.shift_left_by(200)
+        \\x = a.shl_wrap(200)
         \\x
         \\}
         ,
-        .expected = .{ .inspect_str = "0" },
+        // 200 mod 8 = 0, so the value is unchanged.
+        .expected = .{ .inspect_str = "1" },
     },
     .{
-        .name = "low_level - shift_right_by large shift amount clamped",
+        .name = "low_level - shr_wrap large shift amount modulo",
         .source =
         \\{
         \\a : U8
         \\a = 255
-        \\x = a.shift_right_by(200)
+        \\x = a.shr_wrap(200)
         \\x
         \\}
         ,
-        .expected = .{ .inspect_str = "0" },
+        // 200 mod 8 = 0, so the value is unchanged.
+        .expected = .{ .inspect_str = "255" },
     },
     .{
-        .name = "low_level - U16.shift_left_by to max representable",
+        .name = "low_level - U16.shl_wrap to max representable",
         .source =
         \\{
         \\a : U16
         \\a = 1
-        \\x = a.shift_left_by(15)
+        \\x = a.shl_wrap(15)
         \\x
         \\}
         ,
         .expected = .{ .inspect_str = "32768" },
     },
     .{
-        .name = "low_level - U32.shift_left_by power of 2",
+        .name = "low_level - U32.shl_wrap power of 2",
         .source =
         \\{
         \\a : U32
         \\a = 1
-        \\x = a.shift_left_by(20)
+        \\x = a.shl_wrap(20)
         \\x
         \\}
         ,
         .expected = .{ .inspect_str = "1048576" },
     },
     .{
-        .name = "low_level - U64.shift_left_by large power",
+        .name = "low_level - U64.shl_wrap large power",
         .source =
         \\{
         \\a : U64
         \\a = 1
-        \\x = a.shift_left_by(40)
+        \\x = a.shl_wrap(40)
         \\x
         \\}
         ,
         .expected = .{ .inspect_str = "1099511627776" },
     },
     .{
-        .name = "low_level - U128.shift_left_by near max",
+        .name = "low_level - U128.shl_wrap near max",
         .source =
         \\{
         \\a : U128
         \\a = 1
-        \\x = a.shift_left_by(100)
+        \\x = a.shl_wrap(100)
         \\x
         \\}
         ,
         .expected = .{ .inspect_str = "1267650600228229401496703205376" },
     },
     .{
-        .name = "low_level - I16.shift_right_by negative large magnitude",
+        .name = "low_level - I16.shr_wrap negative large magnitude",
         .source =
         \\{
         \\a : I16
         \\a = -1024
-        \\x = a.shift_right_by(5)
+        \\x = a.shr_wrap(5)
         \\x
         \\}
         ,
         .expected = .{ .inspect_str = "-32" },
     },
     .{
-        .name = "low_level - I32.shift_right_by min value",
+        .name = "low_level - I32.shr_wrap min value",
         .source =
         \\{
         \\a : I32
         \\a = -2147483648
-        \\x = a.shift_right_by(1)
+        \\x = a.shr_wrap(1)
         \\x
         \\}
         ,
         .expected = .{ .inspect_str = "-1073741824" },
     },
     .{
-        .name = "low_level - I32.shift_right_zf_by min value",
+        .name = "low_level - I32.shr_zf_wrap min value",
         .source =
         \\{
         \\a : I32
         \\a = -2147483648
-        \\x = a.shift_right_zf_by(1)
+        \\x = a.shr_zf_wrap(1)
         \\x
         \\}
         ,
@@ -3822,60 +3824,281 @@ pub const tests = [_]TestCase{
         \\{
         \\a : U8
         \\a = 1
-        \\b = a.shift_left_by(5)
-        \\x = b.shift_right_by(5)
+        \\b = a.shl_wrap(5)
+        \\x = b.shr_wrap(5)
         \\x
         \\}
         ,
         .expected = .{ .inspect_str = "1" },
     },
     .{
-        .name = "low_level - I64.shift_right_by negative two",
+        .name = "low_level - I64.shr_wrap negative two",
         .source =
         \\{
         \\a : I64
         \\a = -2
-        \\x = a.shift_right_by(1)
+        \\x = a.shr_wrap(1)
         \\x
         \\}
         ,
         .expected = .{ .inspect_str = "-1" },
     },
     .{
-        .name = "low_level - U32.shift_left_by shift amount exactly at width",
+        .name = "low_level - U32.shl_wrap shift amount exactly at width",
         .source =
         \\{
         \\a : U32
         \\a = 1
-        \\x = a.shift_left_by(32)
+        \\x = a.shl_wrap(32)
         \\x
         \\}
         ,
-        .expected = .{ .inspect_str = "0" },
+        // 32 mod 32 = 0, so the value is unchanged.
+        .expected = .{ .inspect_str = "1" },
     },
     .{
-        .name = "low_level - I8.shift_right_by negative by 7 bits",
+        .name = "low_level - I8.shr_wrap negative by 7 bits",
         .source =
         \\{
         \\a : I8
         \\a = -127
-        \\x = a.shift_right_by(6)
+        \\x = a.shr_wrap(6)
         \\x
         \\}
         ,
         .expected = .{ .inspect_str = "-2" },
     },
     .{
-        .name = "low_level - U64.shift_right_zf_by max value by half",
+        .name = "low_level - U64.shr_zf_wrap max value by half",
         .source =
         \\{
         \\a : U64
         \\a = 18446744073709551615
-        \\x = a.shift_right_zf_by(32)
+        \\x = a.shr_zf_wrap(32)
         \\x
         \\}
         ,
         .expected = .{ .inspect_str = "4294967295" },
+    },
+    .{
+        .name = "low_level - U8.shl_wrap modulo 9",
+        .source =
+        \\{
+        \\a : U8
+        \\a = 1
+        \\x = a.shl_wrap(9)
+        \\x
+        \\}
+        ,
+        // 9 mod 8 = 1.
+        .expected = .{ .inspect_str = "2" },
+    },
+    .{
+        .name = "low_level - U8.shl_wrap modulo 255",
+        .source =
+        \\{
+        \\a : U8
+        \\a = 1
+        \\x = a.shl_wrap(255)
+        \\x
+        \\}
+        ,
+        // 255 mod 8 = 7.
+        .expected = .{ .inspect_str = "128" },
+    },
+    .{
+        .name = "low_level - U8.shr_wrap modulo 9 is logical",
+        .source =
+        \\{
+        \\a : U8
+        \\a = 128
+        \\x = a.shr_wrap(9)
+        \\x
+        \\}
+        ,
+        // 9 mod 8 = 1; unsigned shift is logical.
+        .expected = .{ .inspect_str = "64" },
+    },
+    .{
+        .name = "low_level - U32.shl_wrap modulo 33",
+        .source =
+        \\{
+        \\a : U32
+        \\a = 1
+        \\x = a.shl_wrap(33)
+        \\x
+        \\}
+        ,
+        // 33 mod 32 = 1.
+        .expected = .{ .inspect_str = "2" },
+    },
+    .{
+        .name = "low_level - U32.shr_wrap top bit is logical",
+        .source =
+        \\{
+        \\a : U32
+        \\a = 2147483648
+        \\x = a.shr_wrap(1)
+        \\x
+        \\}
+        ,
+        // Unsigned right shift must be logical, not arithmetic.
+        .expected = .{ .inspect_str = "1073741824" },
+    },
+    .{
+        .name = "low_level - U64.shl_wrap modulo 65",
+        .source =
+        \\{
+        \\a : U64
+        \\a = 1
+        \\x = a.shl_wrap(65)
+        \\x
+        \\}
+        ,
+        // 65 mod 64 = 1.
+        .expected = .{ .inspect_str = "2" },
+    },
+    .{
+        .name = "low_level - U64.shr_wrap top bit is logical",
+        .source =
+        \\{
+        \\a : U64
+        \\a = 9223372036854775808
+        \\x = a.shr_wrap(1)
+        \\x
+        \\}
+        ,
+        // Unsigned right shift must be logical, not arithmetic.
+        .expected = .{ .inspect_str = "4611686018427387904" },
+    },
+    .{
+        .name = "low_level - U128.shl_wrap modulo 128 is identity",
+        .source =
+        \\{
+        \\a : U128
+        \\a = 1
+        \\x = a.shl_wrap(128)
+        \\x
+        \\}
+        ,
+        // 128 mod 128 = 0.
+        .expected = .{ .inspect_str = "1" },
+    },
+    .{
+        .name = "low_level - U128.shl_wrap modulo 129",
+        .source =
+        \\{
+        \\a : U128
+        \\a = 1
+        \\x = a.shl_wrap(129)
+        \\x
+        \\}
+        ,
+        // 129 mod 128 = 1.
+        .expected = .{ .inspect_str = "2" },
+    },
+    .{
+        .name = "low_level - U128.shl_wrap modulo 127",
+        .source =
+        \\{
+        \\a : U128
+        \\a = 1
+        \\x = a.shl_wrap(127)
+        \\x
+        \\}
+        ,
+        // 1 << 127.
+        .expected = .{ .inspect_str = "170141183460469231731687303715884105728" },
+    },
+    .{
+        .name = "low_level - U128.shl_wrap modulo 255",
+        .source =
+        \\{
+        \\a : U128
+        \\a = 1
+        \\x = a.shl_wrap(255)
+        \\x
+        \\}
+        ,
+        // 255 mod 128 = 127.
+        .expected = .{ .inspect_str = "170141183460469231731687303715884105728" },
+    },
+    .{
+        .name = "low_level - U128.shr_wrap top bit is logical",
+        .source =
+        \\{
+        \\a : U128
+        \\a = 170141183460469231731687303715884105728
+        \\x = a.shr_wrap(1)
+        \\x
+        \\}
+        ,
+        // 2^127 >> 1, logical.
+        .expected = .{ .inspect_str = "85070591730234615865843651857942052864" },
+    },
+    .{
+        .name = "low_level - U128.shr_zf_wrap modulo 128 is identity",
+        .source =
+        \\{
+        \\a : U128
+        \\a = 170141183460469231731687303715884105728
+        \\x = a.shr_zf_wrap(128)
+        \\x
+        \\}
+        ,
+        // 128 mod 128 = 0.
+        .expected = .{ .inspect_str = "170141183460469231731687303715884105728" },
+    },
+    .{
+        .name = "low_level - I128.shl_wrap modulo 127 sets sign bit",
+        .source =
+        \\{
+        \\a : I128
+        \\a = 1
+        \\x = a.shl_wrap(127)
+        \\x
+        \\}
+        ,
+        // 1 << 127 sets the sign bit.
+        .expected = .{ .inspect_str = "-170141183460469231731687303715884105728" },
+    },
+    .{
+        .name = "low_level - I128.shr_wrap modulo 129 is arithmetic",
+        .source =
+        \\{
+        \\a : I128
+        \\a = -1
+        \\x = a.shr_wrap(129)
+        \\x
+        \\}
+        ,
+        // 129 mod 128 = 1; arithmetic shift keeps sign.
+        .expected = .{ .inspect_str = "-1" },
+    },
+    .{
+        .name = "low_level - I128.shr_wrap min value modulo 127",
+        .source =
+        \\{
+        \\a : I128
+        \\a = -170141183460469231731687303715884105728
+        \\x = a.shr_wrap(127)
+        \\x
+        \\}
+        ,
+        .expected = .{ .inspect_str = "-1" },
+    },
+    .{
+        .name = "low_level - I128.shr_wrap min value modulo 255",
+        .source =
+        \\{
+        \\a : I128
+        \\a = -170141183460469231731687303715884105728
+        \\x = a.shr_wrap(255)
+        \\x
+        \\}
+        ,
+        // 255 mod 128 = 127.
+        .expected = .{ .inspect_str = "-1" },
     },
     .{
         .name = "low_level - U8.bitwise_and basic",
@@ -5048,5 +5271,1265 @@ pub const tests = [_]TestCase{
         \\}
         ,
         .expected = .{ .inspect_str = "\"rat\"" },
+    },
+    .{
+        .name = "low_level - U8.count_one_bits zero",
+        .source =
+        \\{
+        \\a : U8
+        \\a = 0
+        \\x = a.count_one_bits()
+        \\x
+        \\}
+        ,
+        .expected = .{ .inspect_str = "0" },
+    },
+    .{
+        .name = "low_level - U8.count_leading_zero_bits zero",
+        .source =
+        \\{
+        \\a : U8
+        \\a = 0
+        \\x = a.count_leading_zero_bits()
+        \\x
+        \\}
+        ,
+        .expected = .{ .inspect_str = "8" },
+    },
+    .{
+        .name = "low_level - U8.count_trailing_zero_bits zero",
+        .source =
+        \\{
+        \\a : U8
+        \\a = 0
+        \\x = a.count_trailing_zero_bits()
+        \\x
+        \\}
+        ,
+        .expected = .{ .inspect_str = "8" },
+    },
+    .{
+        .name = "low_level - U8.count_one_bits all_ones",
+        .source =
+        \\{
+        \\a : U8
+        \\a = 255
+        \\x = a.count_one_bits()
+        \\x
+        \\}
+        ,
+        .expected = .{ .inspect_str = "8" },
+    },
+    .{
+        .name = "low_level - U8.count_leading_zero_bits all_ones",
+        .source =
+        \\{
+        \\a : U8
+        \\a = 255
+        \\x = a.count_leading_zero_bits()
+        \\x
+        \\}
+        ,
+        .expected = .{ .inspect_str = "0" },
+    },
+    .{
+        .name = "low_level - U8.count_trailing_zero_bits all_ones",
+        .source =
+        \\{
+        \\a : U8
+        \\a = 255
+        \\x = a.count_trailing_zero_bits()
+        \\x
+        \\}
+        ,
+        .expected = .{ .inspect_str = "0" },
+    },
+    .{
+        .name = "low_level - U8.count_one_bits one",
+        .source =
+        \\{
+        \\a : U8
+        \\a = 1
+        \\x = a.count_one_bits()
+        \\x
+        \\}
+        ,
+        .expected = .{ .inspect_str = "1" },
+    },
+    .{
+        .name = "low_level - U8.count_leading_zero_bits one",
+        .source =
+        \\{
+        \\a : U8
+        \\a = 1
+        \\x = a.count_leading_zero_bits()
+        \\x
+        \\}
+        ,
+        .expected = .{ .inspect_str = "7" },
+    },
+    .{
+        .name = "low_level - U8.count_trailing_zero_bits one",
+        .source =
+        \\{
+        \\a : U8
+        \\a = 1
+        \\x = a.count_trailing_zero_bits()
+        \\x
+        \\}
+        ,
+        .expected = .{ .inspect_str = "0" },
+    },
+    .{
+        .name = "low_level - U8.count_one_bits top_bit",
+        .source =
+        \\{
+        \\a : U8
+        \\a = 128
+        \\x = a.count_one_bits()
+        \\x
+        \\}
+        ,
+        .expected = .{ .inspect_str = "1" },
+    },
+    .{
+        .name = "low_level - U8.count_leading_zero_bits top_bit",
+        .source =
+        \\{
+        \\a : U8
+        \\a = 128
+        \\x = a.count_leading_zero_bits()
+        \\x
+        \\}
+        ,
+        .expected = .{ .inspect_str = "0" },
+    },
+    .{
+        .name = "low_level - U8.count_trailing_zero_bits top_bit",
+        .source =
+        \\{
+        \\a : U8
+        \\a = 128
+        \\x = a.count_trailing_zero_bits()
+        \\x
+        \\}
+        ,
+        .expected = .{ .inspect_str = "7" },
+    },
+    .{
+        .name = "low_level - U8.count_one_bits mixed",
+        .source =
+        \\{
+        \\a : U8
+        \\a = 44
+        \\x = a.count_one_bits()
+        \\x
+        \\}
+        ,
+        .expected = .{ .inspect_str = "3" },
+    },
+    .{
+        .name = "low_level - U8.count_leading_zero_bits mixed",
+        .source =
+        \\{
+        \\a : U8
+        \\a = 44
+        \\x = a.count_leading_zero_bits()
+        \\x
+        \\}
+        ,
+        .expected = .{ .inspect_str = "2" },
+    },
+    .{
+        .name = "low_level - U8.count_trailing_zero_bits mixed",
+        .source =
+        \\{
+        \\a : U8
+        \\a = 44
+        \\x = a.count_trailing_zero_bits()
+        \\x
+        \\}
+        ,
+        .expected = .{ .inspect_str = "2" },
+    },
+    .{
+        .name = "low_level - U16.count_one_bits zero",
+        .source =
+        \\{
+        \\a : U16
+        \\a = 0
+        \\x = a.count_one_bits()
+        \\x
+        \\}
+        ,
+        .expected = .{ .inspect_str = "0" },
+    },
+    .{
+        .name = "low_level - U16.count_leading_zero_bits zero",
+        .source =
+        \\{
+        \\a : U16
+        \\a = 0
+        \\x = a.count_leading_zero_bits()
+        \\x
+        \\}
+        ,
+        .expected = .{ .inspect_str = "16" },
+    },
+    .{
+        .name = "low_level - U16.count_trailing_zero_bits zero",
+        .source =
+        \\{
+        \\a : U16
+        \\a = 0
+        \\x = a.count_trailing_zero_bits()
+        \\x
+        \\}
+        ,
+        .expected = .{ .inspect_str = "16" },
+    },
+    .{
+        .name = "low_level - U16.count_one_bits all_ones",
+        .source =
+        \\{
+        \\a : U16
+        \\a = 65535
+        \\x = a.count_one_bits()
+        \\x
+        \\}
+        ,
+        .expected = .{ .inspect_str = "16" },
+    },
+    .{
+        .name = "low_level - U16.count_leading_zero_bits all_ones",
+        .source =
+        \\{
+        \\a : U16
+        \\a = 65535
+        \\x = a.count_leading_zero_bits()
+        \\x
+        \\}
+        ,
+        .expected = .{ .inspect_str = "0" },
+    },
+    .{
+        .name = "low_level - U16.count_trailing_zero_bits all_ones",
+        .source =
+        \\{
+        \\a : U16
+        \\a = 65535
+        \\x = a.count_trailing_zero_bits()
+        \\x
+        \\}
+        ,
+        .expected = .{ .inspect_str = "0" },
+    },
+    .{
+        .name = "low_level - U16.count_one_bits one",
+        .source =
+        \\{
+        \\a : U16
+        \\a = 1
+        \\x = a.count_one_bits()
+        \\x
+        \\}
+        ,
+        .expected = .{ .inspect_str = "1" },
+    },
+    .{
+        .name = "low_level - U16.count_leading_zero_bits one",
+        .source =
+        \\{
+        \\a : U16
+        \\a = 1
+        \\x = a.count_leading_zero_bits()
+        \\x
+        \\}
+        ,
+        .expected = .{ .inspect_str = "15" },
+    },
+    .{
+        .name = "low_level - U16.count_trailing_zero_bits one",
+        .source =
+        \\{
+        \\a : U16
+        \\a = 1
+        \\x = a.count_trailing_zero_bits()
+        \\x
+        \\}
+        ,
+        .expected = .{ .inspect_str = "0" },
+    },
+    .{
+        .name = "low_level - U16.count_one_bits top_bit",
+        .source =
+        \\{
+        \\a : U16
+        \\a = 32768
+        \\x = a.count_one_bits()
+        \\x
+        \\}
+        ,
+        .expected = .{ .inspect_str = "1" },
+    },
+    .{
+        .name = "low_level - U16.count_leading_zero_bits top_bit",
+        .source =
+        \\{
+        \\a : U16
+        \\a = 32768
+        \\x = a.count_leading_zero_bits()
+        \\x
+        \\}
+        ,
+        .expected = .{ .inspect_str = "0" },
+    },
+    .{
+        .name = "low_level - U16.count_trailing_zero_bits top_bit",
+        .source =
+        \\{
+        \\a : U16
+        \\a = 32768
+        \\x = a.count_trailing_zero_bits()
+        \\x
+        \\}
+        ,
+        .expected = .{ .inspect_str = "15" },
+    },
+    .{
+        .name = "low_level - U16.count_one_bits mixed",
+        .source =
+        \\{
+        \\a : U16
+        \\a = 3840
+        \\x = a.count_one_bits()
+        \\x
+        \\}
+        ,
+        .expected = .{ .inspect_str = "4" },
+    },
+    .{
+        .name = "low_level - U16.count_leading_zero_bits mixed",
+        .source =
+        \\{
+        \\a : U16
+        \\a = 3840
+        \\x = a.count_leading_zero_bits()
+        \\x
+        \\}
+        ,
+        .expected = .{ .inspect_str = "4" },
+    },
+    .{
+        .name = "low_level - U16.count_trailing_zero_bits mixed",
+        .source =
+        \\{
+        \\a : U16
+        \\a = 3840
+        \\x = a.count_trailing_zero_bits()
+        \\x
+        \\}
+        ,
+        .expected = .{ .inspect_str = "8" },
+    },
+    .{
+        .name = "low_level - U32.count_one_bits zero",
+        .source =
+        \\{
+        \\a : U32
+        \\a = 0
+        \\x = a.count_one_bits()
+        \\x
+        \\}
+        ,
+        .expected = .{ .inspect_str = "0" },
+    },
+    .{
+        .name = "low_level - U32.count_leading_zero_bits zero",
+        .source =
+        \\{
+        \\a : U32
+        \\a = 0
+        \\x = a.count_leading_zero_bits()
+        \\x
+        \\}
+        ,
+        .expected = .{ .inspect_str = "32" },
+    },
+    .{
+        .name = "low_level - U32.count_trailing_zero_bits zero",
+        .source =
+        \\{
+        \\a : U32
+        \\a = 0
+        \\x = a.count_trailing_zero_bits()
+        \\x
+        \\}
+        ,
+        .expected = .{ .inspect_str = "32" },
+    },
+    .{
+        .name = "low_level - U32.count_one_bits one",
+        .source =
+        \\{
+        \\a : U32
+        \\a = 1
+        \\x = a.count_one_bits()
+        \\x
+        \\}
+        ,
+        .expected = .{ .inspect_str = "1" },
+    },
+    .{
+        .name = "low_level - U32.count_leading_zero_bits one",
+        .source =
+        \\{
+        \\a : U32
+        \\a = 1
+        \\x = a.count_leading_zero_bits()
+        \\x
+        \\}
+        ,
+        .expected = .{ .inspect_str = "31" },
+    },
+    .{
+        .name = "low_level - U32.count_trailing_zero_bits one",
+        .source =
+        \\{
+        \\a : U32
+        \\a = 1
+        \\x = a.count_trailing_zero_bits()
+        \\x
+        \\}
+        ,
+        .expected = .{ .inspect_str = "0" },
+    },
+    .{
+        .name = "low_level - U32.count_one_bits top_bit",
+        .source =
+        \\{
+        \\a : U32
+        \\a = 2147483648
+        \\x = a.count_one_bits()
+        \\x
+        \\}
+        ,
+        .expected = .{ .inspect_str = "1" },
+    },
+    .{
+        .name = "low_level - U32.count_leading_zero_bits top_bit",
+        .source =
+        \\{
+        \\a : U32
+        \\a = 2147483648
+        \\x = a.count_leading_zero_bits()
+        \\x
+        \\}
+        ,
+        .expected = .{ .inspect_str = "0" },
+    },
+    .{
+        .name = "low_level - U32.count_trailing_zero_bits top_bit",
+        .source =
+        \\{
+        \\a : U32
+        \\a = 2147483648
+        \\x = a.count_trailing_zero_bits()
+        \\x
+        \\}
+        ,
+        .expected = .{ .inspect_str = "31" },
+    },
+    .{
+        .name = "low_level - U32.count_one_bits mixed",
+        .source =
+        \\{
+        \\a : U32
+        \\a = 255
+        \\x = a.count_one_bits()
+        \\x
+        \\}
+        ,
+        .expected = .{ .inspect_str = "8" },
+    },
+    .{
+        .name = "low_level - U32.count_leading_zero_bits mixed",
+        .source =
+        \\{
+        \\a : U32
+        \\a = 255
+        \\x = a.count_leading_zero_bits()
+        \\x
+        \\}
+        ,
+        .expected = .{ .inspect_str = "24" },
+    },
+    .{
+        .name = "low_level - U32.count_trailing_zero_bits mixed",
+        .source =
+        \\{
+        \\a : U32
+        \\a = 255
+        \\x = a.count_trailing_zero_bits()
+        \\x
+        \\}
+        ,
+        .expected = .{ .inspect_str = "0" },
+    },
+    .{
+        .name = "low_level - U64.count_one_bits zero",
+        .source =
+        \\{
+        \\a : U64
+        \\a = 0
+        \\x = a.count_one_bits()
+        \\x
+        \\}
+        ,
+        .expected = .{ .inspect_str = "0" },
+    },
+    .{
+        .name = "low_level - U64.count_leading_zero_bits zero",
+        .source =
+        \\{
+        \\a : U64
+        \\a = 0
+        \\x = a.count_leading_zero_bits()
+        \\x
+        \\}
+        ,
+        .expected = .{ .inspect_str = "64" },
+    },
+    .{
+        .name = "low_level - U64.count_trailing_zero_bits zero",
+        .source =
+        \\{
+        \\a : U64
+        \\a = 0
+        \\x = a.count_trailing_zero_bits()
+        \\x
+        \\}
+        ,
+        .expected = .{ .inspect_str = "64" },
+    },
+    .{
+        .name = "low_level - U64.count_one_bits all_ones",
+        .source =
+        \\{
+        \\a : U64
+        \\a = 18446744073709551615
+        \\x = a.count_one_bits()
+        \\x
+        \\}
+        ,
+        .expected = .{ .inspect_str = "64" },
+    },
+    .{
+        .name = "low_level - U64.count_leading_zero_bits all_ones",
+        .source =
+        \\{
+        \\a : U64
+        \\a = 18446744073709551615
+        \\x = a.count_leading_zero_bits()
+        \\x
+        \\}
+        ,
+        .expected = .{ .inspect_str = "0" },
+    },
+    .{
+        .name = "low_level - U64.count_trailing_zero_bits all_ones",
+        .source =
+        \\{
+        \\a : U64
+        \\a = 18446744073709551615
+        \\x = a.count_trailing_zero_bits()
+        \\x
+        \\}
+        ,
+        .expected = .{ .inspect_str = "0" },
+    },
+    .{
+        .name = "low_level - U64.count_one_bits one",
+        .source =
+        \\{
+        \\a : U64
+        \\a = 1
+        \\x = a.count_one_bits()
+        \\x
+        \\}
+        ,
+        .expected = .{ .inspect_str = "1" },
+    },
+    .{
+        .name = "low_level - U64.count_leading_zero_bits one",
+        .source =
+        \\{
+        \\a : U64
+        \\a = 1
+        \\x = a.count_leading_zero_bits()
+        \\x
+        \\}
+        ,
+        .expected = .{ .inspect_str = "63" },
+    },
+    .{
+        .name = "low_level - U64.count_trailing_zero_bits one",
+        .source =
+        \\{
+        \\a : U64
+        \\a = 1
+        \\x = a.count_trailing_zero_bits()
+        \\x
+        \\}
+        ,
+        .expected = .{ .inspect_str = "0" },
+    },
+    .{
+        .name = "low_level - U64.count_one_bits top_bit",
+        .source =
+        \\{
+        \\a : U64
+        \\a = 9223372036854775808
+        \\x = a.count_one_bits()
+        \\x
+        \\}
+        ,
+        .expected = .{ .inspect_str = "1" },
+    },
+    .{
+        .name = "low_level - U64.count_leading_zero_bits top_bit",
+        .source =
+        \\{
+        \\a : U64
+        \\a = 9223372036854775808
+        \\x = a.count_leading_zero_bits()
+        \\x
+        \\}
+        ,
+        .expected = .{ .inspect_str = "0" },
+    },
+    .{
+        .name = "low_level - U64.count_trailing_zero_bits top_bit",
+        .source =
+        \\{
+        \\a : U64
+        \\a = 9223372036854775808
+        \\x = a.count_trailing_zero_bits()
+        \\x
+        \\}
+        ,
+        .expected = .{ .inspect_str = "63" },
+    },
+    .{
+        .name = "low_level - I8.count_one_bits zero",
+        .source =
+        \\{
+        \\a : I8
+        \\a = 0
+        \\x = a.count_one_bits()
+        \\x
+        \\}
+        ,
+        .expected = .{ .inspect_str = "0" },
+    },
+    .{
+        .name = "low_level - I8.count_leading_zero_bits zero",
+        .source =
+        \\{
+        \\a : I8
+        \\a = 0
+        \\x = a.count_leading_zero_bits()
+        \\x
+        \\}
+        ,
+        .expected = .{ .inspect_str = "8" },
+    },
+    .{
+        .name = "low_level - I8.count_trailing_zero_bits zero",
+        .source =
+        \\{
+        \\a : I8
+        \\a = 0
+        \\x = a.count_trailing_zero_bits()
+        \\x
+        \\}
+        ,
+        .expected = .{ .inspect_str = "8" },
+    },
+    .{
+        .name = "low_level - I8.count_one_bits neg_one",
+        .source =
+        \\{
+        \\a : I8
+        \\a = -1
+        \\x = a.count_one_bits()
+        \\x
+        \\}
+        ,
+        .expected = .{ .inspect_str = "8" },
+    },
+    .{
+        .name = "low_level - I8.count_leading_zero_bits neg_one",
+        .source =
+        \\{
+        \\a : I8
+        \\a = -1
+        \\x = a.count_leading_zero_bits()
+        \\x
+        \\}
+        ,
+        .expected = .{ .inspect_str = "0" },
+    },
+    .{
+        .name = "low_level - I8.count_trailing_zero_bits neg_one",
+        .source =
+        \\{
+        \\a : I8
+        \\a = -1
+        \\x = a.count_trailing_zero_bits()
+        \\x
+        \\}
+        ,
+        .expected = .{ .inspect_str = "0" },
+    },
+    .{
+        .name = "low_level - I8.count_one_bits min",
+        .source =
+        \\{
+        \\a : I8
+        \\a = -128
+        \\x = a.count_one_bits()
+        \\x
+        \\}
+        ,
+        .expected = .{ .inspect_str = "1" },
+    },
+    .{
+        .name = "low_level - I8.count_leading_zero_bits min",
+        .source =
+        \\{
+        \\a : I8
+        \\a = -128
+        \\x = a.count_leading_zero_bits()
+        \\x
+        \\}
+        ,
+        .expected = .{ .inspect_str = "0" },
+    },
+    .{
+        .name = "low_level - I8.count_trailing_zero_bits min",
+        .source =
+        \\{
+        \\a : I8
+        \\a = -128
+        \\x = a.count_trailing_zero_bits()
+        \\x
+        \\}
+        ,
+        .expected = .{ .inspect_str = "7" },
+    },
+    .{
+        .name = "low_level - I8.count_one_bits one",
+        .source =
+        \\{
+        \\a : I8
+        \\a = 1
+        \\x = a.count_one_bits()
+        \\x
+        \\}
+        ,
+        .expected = .{ .inspect_str = "1" },
+    },
+    .{
+        .name = "low_level - I8.count_leading_zero_bits one",
+        .source =
+        \\{
+        \\a : I8
+        \\a = 1
+        \\x = a.count_leading_zero_bits()
+        \\x
+        \\}
+        ,
+        .expected = .{ .inspect_str = "7" },
+    },
+    .{
+        .name = "low_level - I8.count_trailing_zero_bits one",
+        .source =
+        \\{
+        \\a : I8
+        \\a = 1
+        \\x = a.count_trailing_zero_bits()
+        \\x
+        \\}
+        ,
+        .expected = .{ .inspect_str = "0" },
+    },
+    .{
+        .name = "low_level - I8.count_one_bits mixed_neg",
+        .source =
+        \\{
+        \\a : I8
+        \\a = -8
+        \\x = a.count_one_bits()
+        \\x
+        \\}
+        ,
+        .expected = .{ .inspect_str = "5" },
+    },
+    .{
+        .name = "low_level - I8.count_leading_zero_bits mixed_neg",
+        .source =
+        \\{
+        \\a : I8
+        \\a = -8
+        \\x = a.count_leading_zero_bits()
+        \\x
+        \\}
+        ,
+        .expected = .{ .inspect_str = "0" },
+    },
+    .{
+        .name = "low_level - I8.count_trailing_zero_bits mixed_neg",
+        .source =
+        \\{
+        \\a : I8
+        \\a = -8
+        \\x = a.count_trailing_zero_bits()
+        \\x
+        \\}
+        ,
+        .expected = .{ .inspect_str = "3" },
+    },
+    .{
+        .name = "low_level - I64.count_one_bits zero",
+        .source =
+        \\{
+        \\a : I64
+        \\a = 0
+        \\x = a.count_one_bits()
+        \\x
+        \\}
+        ,
+        .expected = .{ .inspect_str = "0" },
+    },
+    .{
+        .name = "low_level - I64.count_leading_zero_bits zero",
+        .source =
+        \\{
+        \\a : I64
+        \\a = 0
+        \\x = a.count_leading_zero_bits()
+        \\x
+        \\}
+        ,
+        .expected = .{ .inspect_str = "64" },
+    },
+    .{
+        .name = "low_level - I64.count_trailing_zero_bits zero",
+        .source =
+        \\{
+        \\a : I64
+        \\a = 0
+        \\x = a.count_trailing_zero_bits()
+        \\x
+        \\}
+        ,
+        .expected = .{ .inspect_str = "64" },
+    },
+    .{
+        .name = "low_level - I64.count_one_bits neg_one",
+        .source =
+        \\{
+        \\a : I64
+        \\a = -1
+        \\x = a.count_one_bits()
+        \\x
+        \\}
+        ,
+        .expected = .{ .inspect_str = "64" },
+    },
+    .{
+        .name = "low_level - I64.count_leading_zero_bits neg_one",
+        .source =
+        \\{
+        \\a : I64
+        \\a = -1
+        \\x = a.count_leading_zero_bits()
+        \\x
+        \\}
+        ,
+        .expected = .{ .inspect_str = "0" },
+    },
+    .{
+        .name = "low_level - I64.count_trailing_zero_bits neg_one",
+        .source =
+        \\{
+        \\a : I64
+        \\a = -1
+        \\x = a.count_trailing_zero_bits()
+        \\x
+        \\}
+        ,
+        .expected = .{ .inspect_str = "0" },
+    },
+    .{
+        .name = "low_level - I64.count_one_bits mixed_neg",
+        .source =
+        \\{
+        \\a : I64
+        \\a = -2
+        \\x = a.count_one_bits()
+        \\x
+        \\}
+        ,
+        .expected = .{ .inspect_str = "63" },
+    },
+    .{
+        .name = "low_level - I64.count_leading_zero_bits mixed_neg",
+        .source =
+        \\{
+        \\a : I64
+        \\a = -2
+        \\x = a.count_leading_zero_bits()
+        \\x
+        \\}
+        ,
+        .expected = .{ .inspect_str = "0" },
+    },
+    .{
+        .name = "low_level - I64.count_trailing_zero_bits mixed_neg",
+        .source =
+        \\{
+        \\a : I64
+        \\a = -2
+        \\x = a.count_trailing_zero_bits()
+        \\x
+        \\}
+        ,
+        .expected = .{ .inspect_str = "1" },
+    },
+    .{
+        .name = "low_level - U128.count_one_bits zero",
+        .source =
+        \\{
+        \\a : U128
+        \\a = 0
+        \\x = a.count_one_bits()
+        \\x
+        \\}
+        ,
+        .expected = .{ .inspect_str = "0" },
+    },
+    .{
+        .name = "low_level - U128.count_leading_zero_bits zero",
+        .source =
+        \\{
+        \\a : U128
+        \\a = 0
+        \\x = a.count_leading_zero_bits()
+        \\x
+        \\}
+        ,
+        .expected = .{ .inspect_str = "128" },
+    },
+    .{
+        .name = "low_level - U128.count_trailing_zero_bits zero",
+        .source =
+        \\{
+        \\a : U128
+        \\a = 0
+        \\x = a.count_trailing_zero_bits()
+        \\x
+        \\}
+        ,
+        .expected = .{ .inspect_str = "128" },
+    },
+    .{
+        .name = "low_level - U128.count_one_bits all_ones",
+        .source =
+        \\{
+        \\a : U128
+        \\a = 340282366920938463463374607431768211455
+        \\x = a.count_one_bits()
+        \\x
+        \\}
+        ,
+        .expected = .{ .inspect_str = "128" },
+    },
+    .{
+        .name = "low_level - U128.count_leading_zero_bits all_ones",
+        .source =
+        \\{
+        \\a : U128
+        \\a = 340282366920938463463374607431768211455
+        \\x = a.count_leading_zero_bits()
+        \\x
+        \\}
+        ,
+        .expected = .{ .inspect_str = "0" },
+    },
+    .{
+        .name = "low_level - U128.count_trailing_zero_bits all_ones",
+        .source =
+        \\{
+        \\a : U128
+        \\a = 340282366920938463463374607431768211455
+        \\x = a.count_trailing_zero_bits()
+        \\x
+        \\}
+        ,
+        .expected = .{ .inspect_str = "0" },
+    },
+    .{
+        .name = "low_level - U128.count_one_bits one",
+        .source =
+        \\{
+        \\a : U128
+        \\a = 1
+        \\x = a.count_one_bits()
+        \\x
+        \\}
+        ,
+        .expected = .{ .inspect_str = "1" },
+    },
+    .{
+        .name = "low_level - U128.count_leading_zero_bits one",
+        .source =
+        \\{
+        \\a : U128
+        \\a = 1
+        \\x = a.count_leading_zero_bits()
+        \\x
+        \\}
+        ,
+        .expected = .{ .inspect_str = "127" },
+    },
+    .{
+        .name = "low_level - U128.count_trailing_zero_bits one",
+        .source =
+        \\{
+        \\a : U128
+        \\a = 1
+        \\x = a.count_trailing_zero_bits()
+        \\x
+        \\}
+        ,
+        .expected = .{ .inspect_str = "0" },
+    },
+    .{
+        .name = "low_level - U128.count_one_bits top_bit",
+        .source =
+        \\{
+        \\a : U128
+        \\a = 170141183460469231731687303715884105728
+        \\x = a.count_one_bits()
+        \\x
+        \\}
+        ,
+        .expected = .{ .inspect_str = "1" },
+    },
+    .{
+        .name = "low_level - U128.count_leading_zero_bits top_bit",
+        .source =
+        \\{
+        \\a : U128
+        \\a = 170141183460469231731687303715884105728
+        \\x = a.count_leading_zero_bits()
+        \\x
+        \\}
+        ,
+        .expected = .{ .inspect_str = "0" },
+    },
+    .{
+        .name = "low_level - U128.count_trailing_zero_bits top_bit",
+        .source =
+        \\{
+        \\a : U128
+        \\a = 170141183460469231731687303715884105728
+        \\x = a.count_trailing_zero_bits()
+        \\x
+        \\}
+        ,
+        .expected = .{ .inspect_str = "127" },
+    },
+    .{
+        .name = "low_level - U128.count_one_bits low_half_only",
+        .source =
+        \\{
+        \\a : U128
+        \\a = 255
+        \\x = a.count_one_bits()
+        \\x
+        \\}
+        ,
+        .expected = .{ .inspect_str = "8" },
+    },
+    .{
+        .name = "low_level - U128.count_leading_zero_bits low_half_only",
+        .source =
+        \\{
+        \\a : U128
+        \\a = 255
+        \\x = a.count_leading_zero_bits()
+        \\x
+        \\}
+        ,
+        .expected = .{ .inspect_str = "120" },
+    },
+    .{
+        .name = "low_level - U128.count_trailing_zero_bits low_half_only",
+        .source =
+        \\{
+        \\a : U128
+        \\a = 255
+        \\x = a.count_trailing_zero_bits()
+        \\x
+        \\}
+        ,
+        .expected = .{ .inspect_str = "0" },
+    },
+    .{
+        .name = "low_level - U128.count_one_bits spans_halves",
+        .source =
+        \\{
+        \\a : U128
+        \\a = 18446744073709551617
+        \\x = a.count_one_bits()
+        \\x
+        \\}
+        ,
+        .expected = .{ .inspect_str = "2" },
+    },
+    .{
+        .name = "low_level - U128.count_leading_zero_bits spans_halves",
+        .source =
+        \\{
+        \\a : U128
+        \\a = 18446744073709551617
+        \\x = a.count_leading_zero_bits()
+        \\x
+        \\}
+        ,
+        .expected = .{ .inspect_str = "63" },
+    },
+    .{
+        .name = "low_level - U128.count_trailing_zero_bits spans_halves",
+        .source =
+        \\{
+        \\a : U128
+        \\a = 18446744073709551617
+        \\x = a.count_trailing_zero_bits()
+        \\x
+        \\}
+        ,
+        .expected = .{ .inspect_str = "0" },
+    },
+    .{
+        .name = "low_level - I128.count_one_bits zero",
+        .source =
+        \\{
+        \\a : I128
+        \\a = 0
+        \\x = a.count_one_bits()
+        \\x
+        \\}
+        ,
+        .expected = .{ .inspect_str = "0" },
+    },
+    .{
+        .name = "low_level - I128.count_leading_zero_bits zero",
+        .source =
+        \\{
+        \\a : I128
+        \\a = 0
+        \\x = a.count_leading_zero_bits()
+        \\x
+        \\}
+        ,
+        .expected = .{ .inspect_str = "128" },
+    },
+    .{
+        .name = "low_level - I128.count_trailing_zero_bits zero",
+        .source =
+        \\{
+        \\a : I128
+        \\a = 0
+        \\x = a.count_trailing_zero_bits()
+        \\x
+        \\}
+        ,
+        .expected = .{ .inspect_str = "128" },
+    },
+    .{
+        .name = "low_level - I128.count_one_bits neg_one",
+        .source =
+        \\{
+        \\a : I128
+        \\a = -1
+        \\x = a.count_one_bits()
+        \\x
+        \\}
+        ,
+        .expected = .{ .inspect_str = "128" },
+    },
+    .{
+        .name = "low_level - I128.count_leading_zero_bits neg_one",
+        .source =
+        \\{
+        \\a : I128
+        \\a = -1
+        \\x = a.count_leading_zero_bits()
+        \\x
+        \\}
+        ,
+        .expected = .{ .inspect_str = "0" },
+    },
+    .{
+        .name = "low_level - I128.count_trailing_zero_bits neg_one",
+        .source =
+        \\{
+        \\a : I128
+        \\a = -1
+        \\x = a.count_trailing_zero_bits()
+        \\x
+        \\}
+        ,
+        .expected = .{ .inspect_str = "0" },
+    },
+    .{
+        .name = "low_level - I128.count_one_bits low_half_only",
+        .source =
+        \\{
+        \\a : I128
+        \\a = 256
+        \\x = a.count_one_bits()
+        \\x
+        \\}
+        ,
+        .expected = .{ .inspect_str = "1" },
+    },
+    .{
+        .name = "low_level - I128.count_leading_zero_bits low_half_only",
+        .source =
+        \\{
+        \\a : I128
+        \\a = 256
+        \\x = a.count_leading_zero_bits()
+        \\x
+        \\}
+        ,
+        .expected = .{ .inspect_str = "119" },
+    },
+    .{
+        .name = "low_level - I128.count_trailing_zero_bits low_half_only",
+        .source =
+        \\{
+        \\a : I128
+        \\a = 256
+        \\x = a.count_trailing_zero_bits()
+        \\x
+        \\}
+        ,
+        .expected = .{ .inspect_str = "8" },
     },
 };

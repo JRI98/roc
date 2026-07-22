@@ -1032,8 +1032,8 @@ pub fn substringUnsafeC(
     return substringUnsafe(string, start, length, roc_ops);
 }
 
-/// Result layout for `Str.find_first`.
-pub const FindFirstResult = struct {
+/// Result layout for `Str.split_first`.
+pub const SplitFirstResult = struct {
     before: RocStr,
     found: bool,
     after: RocStr,
@@ -1062,7 +1062,7 @@ fn smallStringFromPtr(bytes: [*]const u8, length: usize) RocStr {
 }
 
 /// Find the first delimiter occurrence and return seamless slices around it.
-pub fn findFirst(source: RocStr, delimiter: RocStr, roc_ops: *RocOps) FindFirstResult {
+pub fn splitFirst(source: RocStr, delimiter: RocStr, roc_ops: *RocOps) SplitFirstResult {
     const source_bytes = source.asSlice();
     const delimiter_bytes = delimiter.asSlice();
 

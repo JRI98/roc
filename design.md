@@ -3375,7 +3375,8 @@ occurrence, then constraint fn types walked the same way). Index `k` in this
 list is the shared identity between a plan's `constraint(k)` resolution and
 the k-th evidence entry a call edge supplies. The definition's module and any
 importing module enumerate identical lists from their structural copies of the
-scheme.
+scheme. A dispatcher's requirements are a set keyed by method identity: repeated
+source constraints share one callable type and contribute one evidence param.
 
 **Edges supply evidence.** Checking persists every constrained-scheme edge.
 An ordinary instantiation records the (pristine var, fresh var) pairs of its
@@ -4814,6 +4815,25 @@ parallel insertion paths at any point:
    the low-level op table, the unique entries in `RcSig` and the
    specialization demand vector, check-free helper plans, and the certifier
    rule.
+
+## Dev Backend Register Lifetimes
+
+`LirCodeGen` is the sole authority for LIR local locations. Every assigned
+LIR local is materialized into a stable location—a stack slot for represented
+runtime data—before statement generation continues. Architecture-specific code
+generators own only architecture register masks for short-lived
+instruction-selection temporaries; they do not
+own a second local-location map, move live values between registers and stack,
+or reload LIR local values independently.
+
+The number of simultaneously live instruction-selection temporaries must be
+bounded by the emitted operation, never by source or layout nesting depth.
+Explicit emission worklists carry stack offsets and reuse their
+caller-provided result register across child continuations. They must not retain
+one newly allocated architecture register per recursive layout, control-flow node,
+list element layer, or tag payload layer. Register-pool exhaustion is therefore
+an internal lifetime-invariant failure, not a source-program condition and not
+an invitation for an architecture-specific best-effort spill.
 
 ## Compile-Time Constants
 

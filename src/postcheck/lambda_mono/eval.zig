@@ -1174,6 +1174,9 @@ pub const Evaluator = struct {
             .num_shift_left_by => self.numShift(args, arg_types, .shl),
             .num_shift_right_by => self.numShift(args, arg_types, .shr),
             .num_shift_right_zf_by => self.numShift(args, arg_types, .shr_zf),
+            .num_count_one_bits => self.numBitCount(args, arg_types, .count_ones),
+            .num_count_leading_zero_bits => self.numBitCount(args, arg_types, .count_leading_zeros),
+            .num_count_trailing_zero_bits => self.numBitCount(args, arg_types, .count_trailing_zeros),
 
             .bool_not => .{ .bool_ = !truthy(args[0]) },
 
@@ -1216,7 +1219,7 @@ pub const Evaluator = struct {
             .str_drop_prefix,
             .str_drop_prefix_caseless_ascii,
             .str_drop_suffix,
-            .str_find_first,
+            .str_split_first,
             .str_count_utf8_bytes,
             .str_with_capacity,
             .str_reserve,
@@ -1604,13 +1607,8 @@ pub const Evaluator = struct {
     fn shiftOp(comptime T: type, av: T, amount: u8, op: ShiftOp) T {
         const Bits = std.math.Log2Int(T);
         const max_bits = @typeInfo(T).int.bits;
-        if (amount >= max_bits) {
-            return switch (op) {
-                .shr => if (@typeInfo(T).int.signedness == .signed and av < 0) @as(T, -1) else 0,
-                .shl, .shr_zf => 0,
-            };
-        }
-        const shift: Bits = @intCast(amount);
+        // The shift count is taken modulo the bit width, matching every backend.
+        const shift: Bits = @intCast(amount % max_bits);
         return switch (op) {
             .shl => av << shift,
             .shr => av >> shift,
@@ -1618,6 +1616,28 @@ pub const Evaluator = struct {
                 const U = std.meta.Int(.unsigned, max_bits);
                 break :blk @bitCast(@as(U, @bitCast(av)) >> shift);
             },
+        };
+    }
+
+    const BitCountOp = enum { count_ones, count_leading_zeros, count_trailing_zeros };
+
+    /// Count one/leading-zero/trailing-zero bits. The result is always a U8,
+    /// independent of the operand width. `@clz`/`@ctz` of 0 return the operand's
+    /// bit width, matching the spec.
+    fn numBitCount(self: *Evaluator, args: []const Value, arg_types: []const Type.TypeId, op: BitCountOp) EvalError!Value {
+        const prim = self.primitiveOf(arg_types[0]) orelse return self.unsupported_("bit-count operand without primitive type");
+        return switch (prim) {
+            inline .u8, .i8, .u16, .i16, .u32, .i32, .u64, .i64, .u128, .i128 => |p| blk: {
+                const T = intType(p);
+                const a = readAs(T, args[0]);
+                const count: u8 = switch (op) {
+                    .count_ones => @popCount(a),
+                    .count_leading_zeros => @clz(a),
+                    .count_trailing_zeros => @ctz(a),
+                };
+                break :blk makeInt(u8, count);
+            },
+            else => self.unsupported_("bit-count on non-integer type"),
         };
     }
 
@@ -1743,7 +1763,7 @@ pub const Evaluator = struct {
             .str_join_with => return try self.strJoinWith(args[0], args[1].str),
             .str_inspect => return .{ .str = try self.strInspect(args[0].str) },
             .str_drop_prefix_caseless_ascii => return try self.strDropPrefixCaseless(result_ty, args[0].str, args[1].str),
-            .str_find_first => return try self.strFindFirst(result_ty, args[0].str, args[1].str),
+            .str_split_first => return try self.strSplitFirst(result_ty, args[0].str, args[1].str),
             .str_from_utf8 => return try self.strFromUtf8(result_ty, args[0]),
             .str_from_utf8_lossy => {
                 const elems = args[0].list;
@@ -1833,7 +1853,7 @@ pub const Evaluator = struct {
         });
     }
 
-    fn strFindFirst(self: *Evaluator, result_ty: Type.TypeId, source: []const u8, delimiter: []const u8) EvalError!Value {
+    fn strSplitFirst(self: *Evaluator, result_ty: Type.TypeId, source: []const u8, delimiter: []const u8) EvalError!Value {
         var before: []const u8 = "";
         var after: []const u8 = "";
         var found = false;
