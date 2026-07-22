@@ -5740,6 +5740,23 @@ test "issue 10301 producer effect runs exactly once when the loop fuses" {
     );
 }
 
+test "iterdiff: effect-produced fold agrees across inline modes" {
+    try expectSameObservationsAcrossInlineModes(
+        \\produce : U64 -> List(U64)
+        \\produce = |n| {
+        \\    dbg 7.U64
+        \\    [n, 2, 3]
+        \\}
+        \\
+        \\main : U64
+        \\main = {
+        \\    total = Iter.fold(produce(1).iter(), 0, |acc, byte| acc * 31 + byte)
+        \\    dbg total
+        \\    total
+        \\}
+    );
+}
+
 test "iterdiff: effect-produced for-loop agrees across inline modes" {
     try expectSameObservationsAcrossInlineModes(
         \\produce : U64 -> List(U64)
