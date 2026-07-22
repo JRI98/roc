@@ -401,6 +401,13 @@ const PendingLet = struct {
     /// binding created after an effect was emitted in its region must not
     /// move to the region's start, because it would cross that effect.
     marks: usize,
+    /// The effect-mark count from just before this binding's value expression
+    /// began cloning, making its emission window `[marks_before, marks]`. A
+    /// windowed binding may delegate to the region boundary even when its
+    /// value is effectful, because a valid window proves the hoist crosses no
+    /// other effect (see `pendingChainDelegates`). Null when the origin did
+    /// not track a window; an effectful binding with no window always pins.
+    marks_before: ?usize,
 };
 
 const LoopPattern = struct {
@@ -3267,6 +3274,15 @@ const Cloner = struct {
     /// nearest enclosing region boundary (`cloneExpr`), or earlier by any
     /// construct that pins its value with `resolvePending`.
     pending: std.ArrayList(PendingLet),
+    /// Emission-window starts for opaque values cloned from a known point,
+    /// keyed by their expression node. A value's window belongs to the node
+    /// itself — substitution passes the same node id around, so a pending
+    /// created for it at any later site can still prove where its effects
+    /// were emitted (see `pendingChainDelegates`). Only freshly emitted nodes
+    /// are recorded, and the first recording wins: a later touch of an
+    /// existing node is a lookup, and recording it would claim marks that
+    /// belong to other emissions.
+    expr_window_starts: std.AutoHashMap(Ast.ExprId, usize),
     /// Count of effect-bearing expressions emitted so far. Compared against
     /// `region_entry_marks` to decide whether a pending binding may move to
     /// its region's start without crossing an effect.
@@ -3323,6 +3339,7 @@ const Cloner = struct {
             .let_case_shape_arms_remaining = let_case_shape_arm_budget,
             .let_case_builds = .empty,
             .pending = .empty,
+            .expr_window_starts = std.AutoHashMap(Ast.ExprId, usize).init(pass.allocator),
             .effect_marks = 0,
             .region_entry_marks = 0,
             .inline_direct_calls = true,
@@ -3353,6 +3370,7 @@ const Cloner = struct {
             .let_case_shape_arms_remaining = let_case_shape_arm_budget,
             .let_case_builds = .empty,
             .pending = .empty,
+            .expr_window_starts = std.AutoHashMap(Ast.ExprId, usize).init(pass.allocator),
             .effect_marks = 0,
             .region_entry_marks = 0,
             .inline_direct_calls = true,
@@ -3370,7 +3388,12 @@ const Cloner = struct {
     }
 
     fn deinit(self: *Cloner) void {
+        // Every decline path shrinks the bindings it created and every region
+        // boundary flushes the rest; a binding surviving to teardown was
+        // emitted nowhere, which drops its evaluation from the program.
+        if (std.debug.runtime_safety) std.debug.assert(self.pending.items.len == 0);
         self.pending.deinit(self.pass.allocator);
+        self.expr_window_starts.deinit();
         self.inline_stack.deinit(self.pass.allocator);
         self.loop_stack.deinit(self.pass.allocator);
         self.join_stack.deinit(self.pass.allocator);
@@ -4028,7 +4051,9 @@ const Cloner = struct {
         self.region_entry_marks = self.effect_marks;
         defer self.region_entry_marks = saved_entry_marks;
         const result = try self.materialize(try self.cloneExprValue(expr_id));
-        return try self.flushPendingSince(pending_start, result);
+        const flushed = try self.flushPendingSince(pending_start, result);
+        if (std.debug.runtime_safety) std.debug.assert(self.pending.items.len == pending_start);
+        return flushed;
     }
 
     fn cloneExprValue(self: *Cloner, expr_id: Ast.ExprId) Common.LowerError!Value {
@@ -4360,7 +4385,13 @@ const Cloner = struct {
         const captures = try self.pass.arena.allocator().alloc(CaptureValue, capture_count);
         for (0..capture_count) |index| {
             const operand = self.pass.program.captureOperandAt(fn_ref.captures, index);
-            captures[index] = .{ .id = operand.id, .value = try self.cloneExprValue(operand.value) };
+            const window_start = self.effect_marks;
+            const expr_watermark = self.pass.program.exprCount();
+            captures[index] = .{
+                .id = operand.id,
+                .value = try self.cloneExprValue(operand.value),
+            };
+            try self.recordValueWindow(captures[index].value, window_start, expr_watermark);
         }
         return .{ .callable = .{
             .ty = ty,
@@ -4632,9 +4663,10 @@ const Cloner = struct {
     /// bindings: the value keeps its structure, uses substitute leaf
     /// references, and the pending bindings are emitted where the stack next
     /// flushes, still dominating every use. Sound only when every named leaf
-    /// is an effect-free computation created before any effect in its region,
-    /// and the value does not reference its own binder. Returns false with
-    /// all speculative work undone.
+    /// is an effect-free computation — a pure binding commutes with any
+    /// effect between its creation point and the flush — and the value does
+    /// not reference its own binder. Returns false with all speculative work
+    /// undone.
     fn bindPatToPendingReusableValue(
         self: *Cloner,
         pat_id: Ast.PatId,
@@ -4648,7 +4680,6 @@ const Cloner = struct {
             else => recursive,
         };
         if (self_referential) return false;
-        if (self.effect_marks != self.region_entry_marks) return false;
 
         const pending_before = self.pending.items.len;
         const change_before = self.changes.items.len;
@@ -5542,6 +5573,7 @@ const Cloner = struct {
         // erases at least one constructor leaf, so attempts are bounded by the
         // leaf count.
         while (has_constructor) {
+            const attempt_pending = self.pending.items.len;
             var new_params = std.ArrayList(Ast.TypedLocal).empty;
             defer new_params.deinit(self.pass.allocator);
 
@@ -5583,6 +5615,10 @@ const Cloner = struct {
             }
 
             self.restore(split_start);
+            // A discarded attempt must leave no pending binding behind: a
+            // survivor would flush at the region boundary as a live let for a
+            // clone that was thrown away, duplicating its evaluation.
+            if (std.debug.runtime_safety) std.debug.assert(self.pending.items.len == attempt_pending);
             // Back edges demoted their unsupplied leaves in place. Any slot that
             // still carries constructor structure is worth another split attempt.
             has_constructor = false;
@@ -5720,6 +5756,15 @@ const Cloner = struct {
         const change_start = self.changes.items.len;
         defer self.restore(change_start);
 
+        // Statement boundaries are sequencing points: bindings created by a
+        // later statement flush at that statement's own position, after every
+        // effect the earlier statements emitted, so window comparisons for
+        // those bindings restart at each boundary rather than spanning the
+        // whole block. The entry value is restored on exit so bindings in the
+        // enclosing region still compare against that region's entry.
+        const saved_entry_marks = self.region_entry_marks;
+        defer self.region_entry_marks = saved_entry_marks;
+
         const source = try GuardedList.dupe(self.pass.allocator, Ast.StmtId, self.pass.program.stmtSpan(block.statements));
         defer self.pass.allocator.free(source);
 
@@ -5752,6 +5797,7 @@ const Cloner = struct {
             const cloned = try self.cloneStmt(stmt);
             try self.appendPendingStmtsSince(pending_start, &statements);
             if (cloned) |cloned_stmt| try statements.append(self.pass.allocator, cloned_stmt);
+            self.region_entry_marks = self.effect_marks;
         }
 
         return try self.addExpr(.{ .ty = ty, .data = .{ .block = .{
@@ -6443,7 +6489,7 @@ const Cloner = struct {
         {
             return value;
         }
-        return try self.makeReusableForMatch(value);
+        return try self.makeReusableForMatchWindowed(value);
     }
 
     fn valueForInlineLocal(
@@ -6462,7 +6508,7 @@ const Cloner = struct {
         {
             return value;
         }
-        return try self.makeReusableForMatch(value);
+        return try self.makeReusableForMatchWindowed(value);
     }
 
     /// Reported size for a known value that exhausts the size work budget: a
@@ -6646,6 +6692,54 @@ const Cloner = struct {
         return try self.makeReusableForMatchBudgeted(value, &budget);
     }
 
+    /// Record the emission-window start for a value cloned from a known
+    /// point, keyed by its expression node. `expr_watermark` is the program's
+    /// expression count from just before the clone: only a node the clone
+    /// freshly emitted gets a window, because an existing node reached
+    /// through substitution was emitted elsewhere and a later recording
+    /// would claim marks that belong to other emissions.
+    fn recordValueWindow(self: *Cloner, value: Value, window_start: usize, expr_watermark: usize) Allocator.Error!void {
+        const expr = switch (value) {
+            .expr => |expr| expr,
+            else => return,
+        };
+        if (@intFromEnum(expr) < expr_watermark) return;
+        const entry = try self.expr_window_starts.getOrPut(expr);
+        if (!entry.found_existing) {
+            entry.value_ptr.* = window_start;
+        }
+    }
+
+    /// Like `makeReusableForMatch`, but consults the value's recorded
+    /// emission window: the binding then carries `[marks_before, marks]`,
+    /// which lets `resolvePending` delegate it even when the value is
+    /// effectful — a window chaining from the region entry proves the hoist
+    /// to the region boundary crosses no other effect. Only a single opaque
+    /// `.expr` value has a well-defined window; every other shape, and any
+    /// value with no recorded window, takes the untracked path.
+    fn makeReusableForMatchWindowed(self: *Cloner, value: Value) Common.LowerError!Value {
+        const expr = switch (value) {
+            .expr => |expr| expr,
+            else => return try self.makeReusableForMatch(value),
+        };
+        const window_start = self.expr_window_starts.get(expr) orelse return try self.makeReusableForMatch(value);
+        if (self.valueCanSubstitute(value)) return value;
+        if (std.debug.runtime_safety) std.debug.assert(window_start <= self.effect_marks);
+        const ty = self.pass.program.getExpr(expr).ty;
+        const local = try self.pass.program.addLocal(self.pass.symbols.fresh(), ty);
+        try self.pending.append(self.pass.allocator, .{
+            .local = local,
+            .ty = ty,
+            .value = expr,
+            .marks = self.effect_marks,
+            .marks_before = window_start,
+        });
+        return .{ .expr = try self.addExpr(.{
+            .ty = ty,
+            .data = .{ .local = local },
+        }) };
+    }
+
     fn makeReusableForMatchBudgeted(self: *Cloner, value: Value, budget: *u32) Common.LowerError!Value {
         if (budget.* == 0) return value;
         budget.* -= 1;
@@ -6659,6 +6753,7 @@ const Cloner = struct {
                     .ty = ty,
                     .value = expr,
                     .marks = self.effect_marks,
+                    .marks_before = null,
                 });
                 break :blk Value{ .expr = try self.addExpr(.{
                     .ty = ty,
@@ -6672,6 +6767,7 @@ const Cloner = struct {
                     .ty = candidate.ty,
                     .value = try self.materialize(value),
                     .marks = self.effect_marks,
+                    .marks_before = null,
                 });
                 break :blk Value{ .expr = try self.addExpr(.{
                     .ty = candidate.ty,
@@ -6780,27 +6876,45 @@ const Cloner = struct {
         self.pending.shrinkRetainingCapacity(start);
     }
 
+    /// Whether the pending bindings `[start..]` may delegate to the region
+    /// boundary under a structured body. The flushed let chain evaluates
+    /// oldest-first ahead of everything else in the region, so each
+    /// effect-carrying binding must be provably first among the effects that
+    /// remain: scanning oldest to newest, its emission window
+    /// `[marks_before, marks]` must begin exactly where the previous
+    /// effectful binding's window ended (the first at the region entry),
+    /// which proves no uncounted effect sits between them or before the
+    /// first. Bindings with effect-free values commute with every effect and
+    /// need no window. An effectful binding with no recorded window never
+    /// delegates.
+    fn pendingChainDelegates(self: *const Cloner, start: usize) bool {
+        var expected = self.region_entry_marks;
+        for (self.pending.items[start..]) |pending| {
+            if (exprHasNoObservableEffect(self.pass.program, self.pass.fn_effect_free, pending.value, false)) continue;
+            const window_start = pending.marks_before orelse {
+                return false;
+            };
+            if (window_start != expected) {
+                return false;
+            }
+            expected = pending.marks;
+        }
+        return true;
+    }
+
     /// Resolve the pending bindings a construct created while producing
-    /// `body`. A structured value whose bindings are all effect-free
-    /// computations, created in a region that has emitted no effect, keeps
-    /// its structure: the bindings stay pending and the region boundary
-    /// emits them, where they still dominate every leaf reference and cross
-    /// only effect-free evaluation. Anything else pins the value here — it
-    /// is materialized and wrapped so evaluation order and count stay
-    /// exactly as written.
+    /// `body`. A structured value keeps its structure when every binding it
+    /// created may move to the region boundary — effect-free bindings
+    /// commute with everything, and an effectful binding qualifies only when
+    /// its emission window chains from the region entry (see
+    /// `pendingChainDelegates`), so the hoist replays the region's effects
+    /// in source order. Anything else pins the value here — it is
+    /// materialized and wrapped so evaluation order and count stay exactly
+    /// as written.
     fn resolvePending(self: *Cloner, start: usize, body: Value) Common.LowerError!Value {
         if (self.pending.items.len <= start) return body;
-        if (body != .expr) {
-            var delegatable = true;
-            for (self.pending.items[start..]) |pending| {
-                if (pending.marks != self.region_entry_marks or
-                    !exprHasNoObservableEffect(self.pass.program, self.pass.fn_effect_free, pending.value, false))
-                {
-                    delegatable = false;
-                    break;
-                }
-            }
-            if (delegatable) return body;
+        if (body != .expr and self.pendingChainDelegates(start)) {
+            return body;
         }
         return .{ .expr = try self.flushPendingSince(start, try self.materialize(body)) };
     }
@@ -6991,14 +7105,17 @@ const Cloner = struct {
             const id = self.pass.program.captureIdOfLocal(source_capture.local);
             const capture_value = callableCaptureValueForId(callable.captures, id) orelse
                 Common.invariant("callable value had no value for a source capture slot");
-            prepared_captures[index] = try self.makeReusableForMatch(capture_value);
+            prepared_captures[index] = try self.makeReusableForMatchWindowed(capture_value);
             try self.putSubst(source_capture.local, prepared_captures[index]);
         }
 
         const arg_values = try self.pass.allocator.alloc(Value, args.len);
         defer self.pass.allocator.free(arg_values);
         for (args, 0..) |arg_expr, index| {
+            const window_start = self.effect_marks;
+            const expr_watermark = self.pass.program.exprCount();
             arg_values[index] = try self.cloneExprValue(arg_expr);
+            try self.recordValueWindow(arg_values[index], window_start, expr_watermark);
         }
 
         var unsafe_count: usize = 0;
@@ -7071,16 +7188,22 @@ const Cloner = struct {
         const capture_values = try self.pass.allocator.alloc(CaptureValue, operands.len);
         defer self.pass.allocator.free(capture_values);
         for (operands, 0..) |operand, index| {
+            const window_start = self.effect_marks;
+            const expr_watermark = self.pass.program.exprCount();
             capture_values[index] = .{
                 .id = operand.id,
                 .value = try self.cloneExprValue(operand.value),
             };
+            try self.recordValueWindow(capture_values[index].value, window_start, expr_watermark);
         }
 
         const arg_values = try self.pass.allocator.alloc(Value, args.len);
         defer self.pass.allocator.free(arg_values);
         for (args, 0..) |arg_expr, index| {
+            const window_start = self.effect_marks;
+            const expr_watermark = self.pass.program.exprCount();
             arg_values[index] = try self.cloneExprValue(arg_expr);
+            try self.recordValueWindow(arg_values[index], window_start, expr_watermark);
         }
 
         var unsafe_count: usize = 0;
@@ -7990,6 +8113,14 @@ const Cloner = struct {
     }
 
     fn addStmt(self: *Cloner, stmt: Ast.Stmt) Allocator.Error!Ast.StmtId {
+        // Statement-position effects never pass through `addExpr`, so they
+        // advance the effect marks here: an emission window that spanned such
+        // a statement without counting it would let `pendingChainDelegates`
+        // hoist an effectful binding across it.
+        switch (stmt) {
+            .expect, .dbg, .crash => self.effect_marks += 1,
+            .uninitialized, .let_, .expr, .return_ => {},
+        }
         const saved_loc = self.pass.program.current_loc;
         defer self.pass.program.current_loc = saved_loc;
         const saved_region = self.pass.program.current_region;

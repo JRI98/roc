@@ -5642,6 +5642,39 @@ test "compiler-generated dispatch classes lower via checked evidence" {
     try std.testing.expectEqualStrings("True", output);
 }
 
+// Repro for https://github.com/roc-lang/roc/issues/10301: a list produced by an
+// opaque effectful expression and iterated by `for` must scalarize into a raw
+// indexed loop in the root proc, leaving no per-element iterator-step calls in
+// any reachable proc.
+test "issue 10301 for-loop over effect-produced list scalarizes" {
+    const allocator = std.testing.allocator;
+    const source =
+        \\produce : U64 -> List(U64)
+        \\produce = |n| {
+        \\    dbg "produce"
+        \\    [n, 2, 3]
+        \\}
+        \\
+        \\main : U64
+        \\main = {
+        \\    var $sum = 0
+        \\    for byte in produce(1) {
+        \\        $sum = $sum * 31 + byte
+        \\    }
+        \\    $sum
+        \\}
+    ;
+    var optimized = try lowerModule(allocator, source, .wrappers);
+    defer optimized.deinit(allocator);
+
+    const root_shape = try collectProcShape(allocator, &optimized.lowered, try rootProc(&optimized.lowered));
+    const reachable_total = try reachableProcShapeFieldTotal(allocator, &optimized.lowered, "list_get_unsafe_count");
+    // Every raw list access lives in the root: the iterator scalarized into a
+    // direct indexed loop, and no per-element step proc remains reachable.
+    try std.testing.expect(root_shape.list_get_unsafe_count >= 1);
+    try std.testing.expectEqual(root_shape.list_get_unsafe_count, reachable_total);
+}
+
 // Repro for https://github.com/roc-lang/roc/issues/10253: the recursive call
 // must carry the current position, 1, into the next iteration's `prev_len`.
 test "issue 10253 optimized tail recursion preserves the previous scalar argument" {
