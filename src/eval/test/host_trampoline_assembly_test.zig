@@ -1,3 +1,5 @@
+//! Verifies platform-specific host trampoline assembly invariants.
+
 const std = @import("std");
 
 test "AArch64 host trampoline stores all four homogeneous aggregate result registers" {

@@ -1753,8 +1753,8 @@ fn hostStrSplitLast(_: ?*anyopaque, module: *bytebox.ModuleInstance, params: [*]
     const delimiter_slice = delimiter.data[0..delimiter.len];
     const maybe_index = bytesLastIndexOf(str_slice, delimiter_slice);
     if (maybe_index) |index| {
-        writeWasmStrViewFromStr(buffer, result_ptr + before_offset, str, 0, index);
-        writeWasmStrViewFromStr(buffer, result_ptr + after_offset, str, index + delimiter.len, str.len - index - delimiter.len);
+        writeWasmStrViewFromStr(module, buffer, result_ptr + before_offset, str, 0, index);
+        writeWasmStrViewFromStr(module, buffer, result_ptr + after_offset, str, index + delimiter.len, str.len - index - delimiter.len);
         buffer[result_ptr + found_offset] = 1;
     } else {
         writeWasmEmptyStr(buffer, result_ptr + before_offset);
