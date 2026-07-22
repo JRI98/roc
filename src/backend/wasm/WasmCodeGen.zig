@@ -429,7 +429,7 @@ str_trim_start_import: ?u32 = null,
 str_trim_end_import: ?u32 = null,
 str_split_import: ?u32 = null,
 str_join_with_import: ?u32 = null,
-str_find_first_import: ?u32 = null,
+str_split_first_import: ?u32 = null,
 str_drop_prefix_caseless_ascii_import: ?u32 = null,
 str_reserve_import: ?u32 = null,
 str_release_excess_capacity_import: ?u32 = null,
@@ -695,7 +695,7 @@ fn hostBuiltinImports(self: *const Self) HostBuiltinImports {
             .dec_from_str => self.dec_from_str_import,
             .float_from_str => self.float_from_str_import,
             .str_equal => self.str_eq_import,
-            .str_find_first => self.str_find_first_import,
+            .str_split_first => self.str_split_first_import,
             .str_concat => self.str_concat_import,
             .str_repeat => self.str_repeat_import,
             .str_trim => self.str_trim_import,
@@ -1855,9 +1855,9 @@ fn registerHostImports(self: *Self) Allocator.Error!void {
     self.str_repeat_import = try self.module.addImport("env", "roc_str_repeat", str_binary_type);
     self.str_reserve_import = try self.module.addImport("env", "roc_str_reserve", str_binary_type);
 
-    // roc_str_find_first: (source, delimiter, result, after_off, before_off, found_off) -> void
-    const str_find_first_type = try self.module.addFuncType(&.{ .i32, .i32, .i32, .i32, .i32, .i32 }, &.{});
-    self.str_find_first_import = try self.module.addImport("env", "roc_str_find_first", str_find_first_type);
+    // roc_str_split_first: (source, delimiter, result, after_off, before_off, found_off) -> void
+    const str_split_first_type = try self.module.addFuncType(&.{ .i32, .i32, .i32, .i32, .i32, .i32 }, &.{});
+    self.str_split_first_import = try self.module.addImport("env", "roc_str_split_first", str_split_first_type);
 
     // roc_str_drop_prefix_caseless_ascii: (source, prefix, result, after_off, found_off) -> void
     const str_drop_prefix_caseless_ascii_type = try self.module.addFuncType(&.{ .i32, .i32, .i32, .i32, .i32 }, &.{});
@@ -11929,7 +11929,7 @@ fn generateLowLevel(self: *Self, ll: anytype) Allocator.Error!void {
             try self.emitStrSubstringUnsafe(args);
         },
 
-        .str_find_first => {
+        .str_split_first => {
             try self.emitProcLocal(GuardedList.at(args, 0));
             const source = self.storage.allocAnonymousLocal(.i32) catch return error.OutOfMemory;
             try self.emitLocalSet(source);
@@ -11983,7 +11983,7 @@ fn generateLowLevel(self: *Self, ll: anytype) Allocator.Error!void {
                 try self.emitI32Const(@intCast(before_offset));
                 try self.emitI32Const(@intCast(found_offset));
             }
-            try self.emitBuiltinCall(BuiltinSignatures.kindOf(comptime LowLevelBuiltins.strOp(.str_find_first)), self.str_find_first_import);
+            try self.emitBuiltinCall(BuiltinSignatures.kindOf(comptime LowLevelBuiltins.strOp(.str_split_first)), self.str_split_first_import);
             try self.emitFpOffset(result_offset);
         },
 

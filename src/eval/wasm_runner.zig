@@ -299,7 +299,7 @@ pub fn runWasmStrWithStats(
         }) |entry| {
             env_imports.addHostFunction(entry[0], &[_]bytebox.ValType{ .I32, .I32, .I32 }, &[_]bytebox.ValType{}, entry[1], null) catch return error.WasmExecFailed;
         }
-        env_imports.addHostFunction("roc_str_find_first", &[_]bytebox.ValType{ .I32, .I32, .I32, .I32, .I32, .I32 }, &[_]bytebox.ValType{}, hostStrFindFirst, null) catch return error.WasmExecFailed;
+        env_imports.addHostFunction("roc_str_split_first", &[_]bytebox.ValType{ .I32, .I32, .I32, .I32, .I32, .I32 }, &[_]bytebox.ValType{}, hostStrSplitFirst, null) catch return error.WasmExecFailed;
         env_imports.addHostFunction("roc_str_drop_prefix_caseless_ascii", &[_]bytebox.ValType{ .I32, .I32, .I32, .I32, .I32 }, &[_]bytebox.ValType{}, hostStrDropPrefixCaselessAscii, null) catch return error.WasmExecFailed;
 
         env_imports.addHostFunction("roc_str_caseless_ascii_equals", &[_]bytebox.ValType{ .I32, .I32 }, &[_]bytebox.ValType{.I32}, hostStrCaselessAsciiEquals, null) catch return error.WasmExecFailed;
@@ -1599,7 +1599,7 @@ fn hostStrDropSuffix(_: ?*anyopaque, module: *bytebox.ModuleInstance, params: [*
     }
 }
 
-fn hostStrFindFirst(_: ?*anyopaque, module: *bytebox.ModuleInstance, params: [*]const bytebox.Val, _: [*]bytebox.Val) error{}!void {
+fn hostStrSplitFirst(_: ?*anyopaque, module: *bytebox.ModuleInstance, params: [*]const bytebox.Val, _: [*]bytebox.Val) error{}!void {
     const buffer = module.store.getMemory(0).buffer();
     const str = readWasmStr(buffer, @intCast(params[0].I32));
     const delimiter = readWasmStr(buffer, @intCast(params[1].I32));

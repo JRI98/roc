@@ -295,7 +295,7 @@ pub const MonoLlvmCodeGen = struct {
         inner_bad_utf8_tag: u32,
     };
 
-    const StrFindFirstLayoutInfo = struct {
+    const StrSplitFirstLayoutInfo = struct {
         after_offset: u32,
         before_offset: u32,
         found_offset: u32,
@@ -2944,7 +2944,7 @@ pub const MonoLlvmCodeGen = struct {
             .str_count_utf8_bytes => try self.emitStrCountUtf8Bytes(target, GuardedList.at(arg_locals, 0)),
             .str_get_utf8_byte_unsafe => try self.emitStrGetUtf8ByteUnsafe(target, arg_locals),
             .str_substring_unsafe => try self.emitStrSubstringUnsafe(target, arg_locals),
-            .str_find_first => try self.emitStrFindFirst(target, arg_locals),
+            .str_split_first => try self.emitStrSplitFirst(target, arg_locals),
             .str_drop_prefix_caseless_ascii => try self.emitStrDropPrefixCaselessAscii(target, arg_locals),
             .str_concat => try self.emitStrRetBuiltin(target, builtinSymbol(LowLevelBuiltins.strOp(.str_concat)), arg_locals, unique_args),
             .str_trim => try self.emitStrUnaryRetBuiltin(target, builtinSymbol(LowLevelBuiltins.strOp(.str_trim)), GuardedList.at(arg_locals, 0), unique_args),
@@ -6089,16 +6089,16 @@ pub const MonoLlvmCodeGen = struct {
         );
     }
 
-    fn emitStrFindFirst(self: *MonoLlvmCodeGen, target: LocalId, args: anytype) Error!void {
+    fn emitStrSplitFirst(self: *MonoLlvmCodeGen, target: LocalId, args: anytype) Error!void {
         const target_slot = self.slot(target);
-        const info = try self.resolveStrFindFirstLayout(target_slot.layout_idx);
+        const info = try self.resolveStrSplitFirstLayout(target_slot.layout_idx);
         if (target_slot.size > 0) try self.zeroBytes(target_slot.ptr, target_slot.size);
 
         const layout_ptr = try self.allocEntryBlockSlot(
             .i8,
-            @sizeOf(builtins.dev_wrappers.StrFindFirstLayout),
-            LlvmBuilder.Alignment.fromByteUnits(@alignOf(builtins.dev_wrappers.StrFindFirstLayout)),
-            "str_find_first_layout",
+            @sizeOf(builtins.dev_wrappers.StrSplitFirstLayout),
+            LlvmBuilder.Alignment.fromByteUnits(@alignOf(builtins.dev_wrappers.StrSplitFirstLayout)),
+            "str_split_first_layout",
         );
 
         try self.storeRawInt(layout_ptr, 0, .i32, info.after_offset, 4);
@@ -6110,7 +6110,7 @@ pub const MonoLlvmCodeGen = struct {
         try call_args.prepend(self.allocator, try self.ptrType(), target_slot.ptr);
         try call_args.append(self.allocator, try self.ptrType(), layout_ptr);
         try call_args.append(self.allocator, try self.ptrType(), self.rocOps());
-        try self.callBuiltinVoid(builtinSymbol(LowLevelBuiltins.strOp(.str_find_first)), call_args.types.items, call_args.values.items);
+        try self.callBuiltinVoid(builtinSymbol(LowLevelBuiltins.strOp(.str_split_first)), call_args.types.items, call_args.values.items);
     }
 
     fn emitStrDropPrefixCaselessAscii(self: *MonoLlvmCodeGen, target: LocalId, args: anytype) Error!void {
@@ -8184,7 +8184,7 @@ pub const MonoLlvmCodeGen = struct {
         };
     }
 
-    fn resolveStrFindFirstLayout(self: *MonoLlvmCodeGen, layout_idx: layout.Idx) Error!StrFindFirstLayoutInfo {
+    fn resolveStrSplitFirstLayout(self: *MonoLlvmCodeGen, layout_idx: layout.Idx) Error!StrSplitFirstLayoutInfo {
         const ret_layout_val = self.layoutValue(layout_idx);
         if (ret_layout_val.tag != .struct_) return error.CompilationFailed;
 

@@ -77,7 +77,7 @@ const strWithCapacityC = builtins.str.withCapacityC;
 const strDropPrefix = builtins.str.strDropPrefix;
 const strDropPrefixCaselessAscii = builtins.str.strDropPrefixCaselessAscii;
 const strDropSuffix = builtins.str.strDropSuffix;
-const strFindFirst = builtins.str.findFirst;
+const strSplitFirst = builtins.str.splitFirst;
 const strWithAsciiLowercased = builtins.str.strWithAsciiLowercased;
 const strWithAsciiUppercased = builtins.str.strWithAsciiUppercased;
 const strFromUtf8Lossy = builtins.str.fromUtf8Lossy;
@@ -297,10 +297,10 @@ fn wrapStrCountUtf8Bytes(str_bytes: ?[*]u8, str_len: usize, str_cap: usize) call
     return strCountUtf8Bytes(s);
 }
 
-fn wrapStrFindFirst(out: *anyopaque, a_bytes: ?[*]u8, a_len: usize, a_cap: usize, b_bytes: ?[*]u8, b_len: usize, b_cap: usize, find_layout: *const dev_wrappers.StrFindFirstLayout, roc_ops: *RocOps) callconv(.c) void {
+fn wrapStrSplitFirst(out: *anyopaque, a_bytes: ?[*]u8, a_len: usize, a_cap: usize, b_bytes: ?[*]u8, b_len: usize, b_cap: usize, find_layout: *const dev_wrappers.StrSplitFirstLayout, roc_ops: *RocOps) callconv(.c) void {
     const a = RocStr{ .bytes = a_bytes, .length = a_len, .capacity_or_alloc_ptr = a_cap };
     const b = RocStr{ .bytes = b_bytes, .length = b_len, .capacity_or_alloc_ptr = b_cap };
-    const result = strFindFirst(a, b, roc_ops);
+    const result = strSplitFirst(a, b, roc_ops);
     const out_bytes: [*]u8 = @ptrCast(out);
 
     @as(*RocStr, @ptrCast(@alignCast(out_bytes + find_layout.after_offset))).* = result.after;
@@ -2811,7 +2811,7 @@ pub fn LirCodeGen(comptime target: RocTarget) type {
                     const length_off = try self.ensureOnStack(length_loc, 8);
                     return try self.callStr2U64RocOpsToStr(str_off, start_off, length_off, LowLevelBuiltins.strOp(.str_substring_unsafe));
                 },
-                .str_find_first => {
+                .str_split_first => {
                     if (args.len != 2) unreachable;
                     const a_loc = try self.emitValueLocal(GuardedList.at(args, 0));
                     const b_loc = try self.emitValueLocal(GuardedList.at(args, 1));
@@ -2822,7 +2822,7 @@ pub fn LirCodeGen(comptime target: RocTarget) type {
                     const ls = self.layout_store;
                     const ret_layout_val = ls.getLayout(ll.ret_layout);
                     if (ret_layout_val.tag != .struct_) {
-                        std.debug.panic("LIR/codegen invariant violated: str_find_first expected record return layout", .{});
+                        std.debug.panic("LIR/codegen invariant violated: str_split_first expected record return layout", .{});
                     }
                     const record_idx = ret_layout_val.getStruct().idx;
                     const record_data = ls.getStructData(record_idx);
@@ -2832,14 +2832,14 @@ pub fn LirCodeGen(comptime target: RocTarget) type {
                         ls.getStructFieldLayoutByOriginalIndex(record_idx, 1) != .str or
                         ls.getStructFieldLayoutByOriginalIndex(record_idx, 2) != .bool)
                     {
-                        std.debug.panic("LIR/codegen invariant violated: str_find_first expected fields after Str, before Str, found Bool", .{});
+                        std.debug.panic("LIR/codegen invariant violated: str_split_first expected fields after Str, before Str, found Bool", .{});
                     }
 
                     const record_size = record_data.size.get(ls.targetUsize());
                     const result_offset = self.codegen.allocStackSlot(record_size);
                     try self.zeroStackArea(result_offset, record_size);
 
-                    const layout_slot = self.codegen.allocStackSlot(@sizeOf(dev_wrappers.StrFindFirstLayout));
+                    const layout_slot = self.codegen.allocStackSlot(@sizeOf(dev_wrappers.StrSplitFirstLayout));
                     const layout_reg = try self.allocTempGeneral();
                     try self.codegen.emitLoadImm(layout_reg, @intCast(ls.getStructFieldOffsetByOriginalIndex(record_idx, 0)));
                     try self.emitStore(.w32, frame_ptr, layout_slot, layout_reg);
@@ -2859,7 +2859,7 @@ pub fn LirCodeGen(comptime target: RocTarget) type {
                     try builder.addMemArg(frame_ptr, b_off + 8);
                     try builder.addLeaArg(frame_ptr, layout_slot);
                     try builder.addRegArg(roc_ops_reg);
-                    try self.callBuiltinWithAdapter(&builder, @intFromPtr(&wrapStrFindFirst), LowLevelBuiltins.strOp(.str_find_first));
+                    try self.callBuiltinWithAdapter(&builder, @intFromPtr(&wrapStrSplitFirst), LowLevelBuiltins.strOp(.str_split_first));
 
                     return self.stackLocationForLayout(ll.ret_layout, result_offset);
                 },

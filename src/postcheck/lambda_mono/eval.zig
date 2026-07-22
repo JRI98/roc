@@ -1219,7 +1219,7 @@ pub const Evaluator = struct {
             .str_drop_prefix,
             .str_drop_prefix_caseless_ascii,
             .str_drop_suffix,
-            .str_find_first,
+            .str_split_first,
             .str_count_utf8_bytes,
             .str_with_capacity,
             .str_reserve,
@@ -1751,7 +1751,7 @@ pub const Evaluator = struct {
             .str_join_with => return try self.strJoinWith(args[0], args[1].str),
             .str_inspect => return .{ .str = try self.strInspect(args[0].str) },
             .str_drop_prefix_caseless_ascii => return try self.strDropPrefixCaseless(result_ty, args[0].str, args[1].str),
-            .str_find_first => return try self.strFindFirst(result_ty, args[0].str, args[1].str),
+            .str_split_first => return try self.strSplitFirst(result_ty, args[0].str, args[1].str),
             .str_from_utf8 => return try self.strFromUtf8(result_ty, args[0]),
             .str_from_utf8_lossy => {
                 const elems = args[0].list;
@@ -1841,7 +1841,7 @@ pub const Evaluator = struct {
         });
     }
 
-    fn strFindFirst(self: *Evaluator, result_ty: Type.TypeId, source: []const u8, delimiter: []const u8) EvalError!Value {
+    fn strSplitFirst(self: *Evaluator, result_ty: Type.TypeId, source: []const u8, delimiter: []const u8) EvalError!Value {
         var before: []const u8 = "";
         var after: []const u8 = "";
         var found = false;

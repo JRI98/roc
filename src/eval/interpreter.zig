@@ -4788,16 +4788,16 @@ pub const Interpreter = struct {
             },
             .str_drop_prefix => self.callBuiltinStr2(builtins.str.strDropPrefix, valueToRocStr(args[0]), valueToRocStr(args[1]), ll.ret_layout),
             .str_drop_suffix => self.callBuiltinStr2(builtins.str.strDropSuffix, valueToRocStr(args[0]), valueToRocStr(args[1]), ll.ret_layout),
-            .str_find_first => blk: {
+            .str_split_first => blk: {
                 var crash_boundary = self.enterCrashBoundary();
                 defer crash_boundary.deinit();
                 const sj = crash_boundary.set();
                 if (sj != 0) return error.Crash;
-                const result = builtins.str.findFirst(valueToRocStr(args[0]), valueToRocStr(args[1]), &self.roc_ops);
+                const result = builtins.str.splitFirst(valueToRocStr(args[0]), valueToRocStr(args[1]), &self.roc_ops);
 
                 const layout_val = self.layout_store.getLayout(ll.ret_layout);
                 if (layout_val.tag != .struct_) {
-                    return self.runtimeError("str_find_first expected a record return layout");
+                    return self.runtimeError("str_split_first expected a record return layout");
                 }
                 const record_idx = layout_val.getStruct().idx;
                 const fields = self.layout_store.struct_fields.sliceRange(self.layout_store.getStructData(record_idx).getFields());
@@ -4806,7 +4806,7 @@ pub const Interpreter = struct {
                     self.layout_store.getStructFieldLayoutByOriginalIndex(record_idx, 1) != .str or
                     self.layout_store.getStructFieldLayoutByOriginalIndex(record_idx, 2) != .bool)
                 {
-                    return self.runtimeError("str_find_first expected fields after Str, before Str, found Bool");
+                    return self.runtimeError("str_split_first expected fields after Str, before Str, found Bool");
                 }
 
                 const val = try self.alloc(ll.ret_layout);

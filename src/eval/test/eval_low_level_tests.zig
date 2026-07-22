@@ -2113,10 +2113,10 @@ pub const tests = [_]TestCase{
         .expected = .{ .inspect_str = "\"hi\"" },
     },
     .{
-        .name = "low_level - Str.find_first returns seamless before and after slices",
+        .name = "low_level - Str.split_first returns seamless before and after slices",
         .source =
         \\{
-        \\x = match Str.find_first("alpha:beta", ":") {
+        \\x = match Str.split_first("alpha:beta", ":") {
         \\    Ok(parts) => Str.count_utf8_bytes(parts.before) * 100 + Str.count_utf8_bytes(parts.after)
         \\    Err(_) => 0
         \\}

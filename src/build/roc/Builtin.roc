@@ -374,10 +374,10 @@ Builtin :: [].{
 
 			split_json_number_exponent : Str -> Try({ mantissa : Str, exponent : Str }, [NotFound])
 			split_json_number_exponent = |value|
-				match Str.find_first(value, "e") {
+				match Str.split_first(value, "e") {
 					Ok(split) => Ok({ mantissa: split.before, exponent: split.after })
 					Err(NotFound) =>
-						match Str.find_first(value, "E") {
+						match Str.split_first(value, "E") {
 							Ok(split) => Ok({ mantissa: split.before, exponent: split.after })
 							Err(NotFound) => Err(NotFound)
 						}
@@ -403,7 +403,7 @@ Builtin :: [].{
 					mantissa
 				}
 
-				parts = match Str.find_first(unsigned_mantissa, ".") {
+				parts = match Str.split_first(unsigned_mantissa, ".") {
 					Ok(split) => { int_part: split.before, frac_part: split.after }
 					Err(NotFound) => { int_part: unsigned_mantissa, frac_part: "" }
 				}
@@ -775,7 +775,7 @@ Builtin :: [].{
 
 			snake_to_camel : Str -> Str
 			snake_to_camel = |text|
-				match Str.find_first(text, "_") {
+				match Str.split_first(text, "_") {
 					Ok({ before, after }) =>
 						before.concat(Json.upper_first_ascii(Json.snake_to_camel(after)))
 
@@ -1897,7 +1897,7 @@ Builtin :: [].{
 				if Str.is_empty(headers) {
 					Ok(Done({ rest: HttpHeaderState.{ raw: "" } }))
 				} else {
-					line_parts = match Str.find_first(headers, "\r\n") {
+					line_parts = match Str.split_first(headers, "\r\n") {
 						Ok(parts) => parts
 						Err(NotFound) => { before: headers, after: "" }
 					}
@@ -1905,7 +1905,7 @@ Builtin :: [].{
 					if Str.is_empty(line_parts.before) {
 						Ok(Done({ rest: HttpHeaderState.{ raw: line_parts.after } }))
 					} else {
-						match Str.find_first(headers, ":") {
+						match Str.split_first(headers, ":") {
 							Ok({ before: name, after: value_start }) => {
 								name_len = Str.count_utf8_bytes(name)
 								line_len = Str.count_utf8_bytes(line_parts.before)
@@ -1937,14 +1937,14 @@ Builtin :: [].{
 
 			take_header_value : Str -> Try({ value : Str, after : Str }, [BadHeader, ..])
 			take_header_value = |raw|
-				match Str.find_first(raw, "\r\n") {
+				match Str.split_first(raw, "\r\n") {
 					Ok({ before, after }) => Ok({ value: Str.trim(before), after })
 					Err(NotFound) => Ok({ value: Str.trim(raw), after: "" })
 				}
 
 			underscores_to_dashes : Str -> Str
 			underscores_to_dashes = |text|
-				match Str.find_first(text, "_") {
+				match Str.split_first(text, "_") {
 					Ok({ before, after }) =>
 						Str.concat(Str.concat(before, "-"), HttpHeader.underscores_to_dashes(after))
 
@@ -2162,17 +2162,18 @@ Builtin :: [].{
 		## ```
 		drop_suffix : Str, Str -> Str
 
-		## Finds the first occurrence of a delimiter in a string.
+		## Splits the string on the first occurrence of a delimiter, returning the
+		## parts before and after it.
 		##
 		## The returned strings are slices of the original string.
 		##
 		## ```roc
-		## expect "foo: bar".find_first(":") == Ok({ before: "foo", after: " bar" })
-		## expect "foo".find_first(":") == Err(NotFound)
+		## expect "foo: bar".split_first(":") == Ok({ before: "foo", after: " bar" })
+		## expect "foo".split_first(":") == Err(NotFound)
 		## ```
-		find_first : Str, Str -> Try({ before : Str, after : Str }, [NotFound])
-		find_first = |source, delimiter| {
-			split = str_find_first_raw(source, delimiter)
+		split_first : Str, Str -> Try({ before : Str, after : Str }, [NotFound])
+		split_first = |source, delimiter| {
+			split = str_split_first_raw(source, delimiter)
 
 			if split.found {
 				Ok({ before: split.before, after: split.after })
@@ -17869,7 +17870,7 @@ list_replace_unsafe : List(item), U64, item -> { list : List(item), prev : item 
 list_swap_unsafe : List(item), U64, U64 -> List(item)
 
 # Implemented by the compiler. Returns string slices into the source string.
-str_find_first_raw : Str, Str -> { before : Str, found : Bool, after : Str }
+str_split_first_raw : Str, Str -> { before : Str, found : Bool, after : Str }
 
 # Implemented by the compiler. Returns a string slice after the prefix when the
 # source starts with the prefix using ASCII-caseless comparison.

@@ -49,7 +49,7 @@ pub const BuiltinKind = enum {
     dec_from_str,
     float_from_str,
     str_equal,
-    str_find_first,
+    str_split_first,
     str_concat,
     str_repeat,
     str_trim,

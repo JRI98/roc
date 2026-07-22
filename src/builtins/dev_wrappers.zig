@@ -26,8 +26,8 @@ const FromUtf8Try = str.FromUtf8Try;
 // which has a tracy dependency. The actual struct layout is handled by utils.zig.
 const RocOps = utils.RocOps;
 
-/// Field offsets for the dev backend's `Str.find_first` result copy.
-pub const StrFindFirstLayout = extern struct {
+/// Field offsets for the dev backend's `Str.split_first` result copy.
+pub const StrSplitFirstLayout = extern struct {
     after_offset: u32,
     before_offset: u32,
     found_offset: u32,
@@ -255,11 +255,11 @@ pub fn roc_builtins_str_substring_unsafe(out: *RocStr, str_bytes: ?[*]u8, str_le
     out.* = str.substringUnsafeC(s, start, length, roc_ops);
 }
 
-/// Wrapper: findFirst(RocStr, RocStr, *RocOps) -> { before, found, after }
-pub fn roc_builtins_str_find_first(out: *anyopaque, a_bytes: ?[*]u8, a_len: usize, a_cap: usize, b_bytes: ?[*]u8, b_len: usize, b_cap: usize, layout: *const StrFindFirstLayout, roc_ops: *RocOps) callconv(.c) void {
+/// Wrapper: splitFirst(RocStr, RocStr, *RocOps) -> { before, found, after }
+pub fn roc_builtins_str_split_first(out: *anyopaque, a_bytes: ?[*]u8, a_len: usize, a_cap: usize, b_bytes: ?[*]u8, b_len: usize, b_cap: usize, layout: *const StrSplitFirstLayout, roc_ops: *RocOps) callconv(.c) void {
     const a = RocStr{ .bytes = a_bytes, .length = a_len, .capacity_or_alloc_ptr = a_cap };
     const b = RocStr{ .bytes = b_bytes, .length = b_len, .capacity_or_alloc_ptr = b_cap };
-    const result = str.findFirst(a, b, roc_ops);
+    const result = str.splitFirst(a, b, roc_ops);
     const out_bytes: [*]u8 = @ptrCast(out);
 
     @as(*RocStr, @ptrCast(@alignCast(out_bytes + layout.after_offset))).* = result.after;
