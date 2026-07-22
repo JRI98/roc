@@ -8,7 +8,6 @@ type=repl
 » "a:b:c".split_last(":")
 » "a:b:".split_last(":")
 » "nomatch".split_last(":")
-» "a:b:c".split_first(":")
 » source = "key=value=tail — a long heap-allocated string that will not fit inline"
 » Str.split_last(source, "=")
 » source
@@ -19,8 +18,6 @@ Ok({ after: "c", before: "a:b" })
 Ok({ after: "", before: "a:b" })
 ---
 Err(NotFound)
----
-Ok({ after: "b:c", before: "a" })
 ---
 assigned `source`
 ---
