@@ -813,6 +813,12 @@ fn getTempDir(allocator: Allocator) (Allocator.Error || error{TempDirUnavailable
         }
     }
 
+    // POSIX specifies /tmp as the conventional temporary directory when no
+    // environment override is present. In particular, the Roc CLI deliberately
+    // runs some compiler subprocesses with a minimal environment, so requiring
+    // TMPDIR would make LLVM evaluation depend on shell configuration.
+    if (builtin.os.tag != .windows) return allocator.dupe(u8, "/tmp");
+
     return error.TempDirUnavailable;
 }
 

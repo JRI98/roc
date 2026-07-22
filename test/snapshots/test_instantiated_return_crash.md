@@ -114,7 +114,7 @@ EndOfFile,
 					(elems
 						(e-string
 							(e-literal (string "hello"))))))))
-	(e-call (constraint-fn-var 269)
+	(e-call (constraint-fn-var 261)
 		(e-lookup-local
 			(p-assign (ident "needs_string")))
 		(e-lookup-local

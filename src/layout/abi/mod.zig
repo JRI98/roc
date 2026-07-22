@@ -25,6 +25,12 @@ pub const RegPiece = call.RegPiece;
 pub const RegClass = call.RegClass;
 pub const Target = call.Target;
 pub const lower = call.lower;
+pub const AssignedRegPiece = call.AssignedRegPiece;
+pub const StackValue = call.StackValue;
+pub const PointerLocation = call.PointerLocation;
+pub const PhysicalArg = call.PhysicalArg;
+pub const PhysicalCall = call.PhysicalCall;
+pub const assignPhysicalArgs = call.assignPhysicalArgs;
 
 /// Whether a hosted function with these argument and return layouts must be passed a leading
 /// `*RocOps` — i.e. whether it could allocate or free Roc-managed memory. True exactly when

@@ -93,11 +93,11 @@ NO CHANGE
 		(p-assign (ident "main"))
 		(e-tuple
 			(elems
-				(e-call (constraint-fn-var 236)
+				(e-call (constraint-fn-var 228)
 					(e-lookup-local
 						(p-assign (ident "picked")))
 					(e-num (value "1")))
-				(e-call (constraint-fn-var 245)
+				(e-call (constraint-fn-var 237)
 					(e-lookup-local
 						(p-assign (ident "picked")))
 					(e-string

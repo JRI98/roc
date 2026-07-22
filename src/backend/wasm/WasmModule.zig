@@ -61,6 +61,7 @@ pub const ValType = enum(u8) {
     i64 = 0x7E,
     f32 = 0x7D,
     f64 = 0x7C,
+    v128 = 0x7B,
 };
 
 /// Wasm export kinds
@@ -296,12 +297,132 @@ pub const Op = struct {
     pub const i32_extend8_s: u8 = 0xC0;
     pub const i32_extend16_s: u8 = 0xC1;
 
-    // SIMD prefix and selected 128-bit SIMD sub-opcodes.
+    // SIMD prefix and 128-bit integer SIMD sub-opcodes. Sub-opcodes are
+    // varuint32 values from the WebAssembly SIMD specification.
     pub const simd_prefix: u8 = 0xFD;
     pub const v128_load: u32 = 0x00;
+    pub const v128_store: u32 = 0x0B;
+    pub const v128_const: u32 = 0x0C;
+    pub const i8x16_shuffle: u32 = 0x0D;
+    pub const i8x16_swizzle: u32 = 0x0E;
     pub const i8x16_splat: u32 = 0x0F;
+    pub const i16x8_splat: u32 = 0x10;
+    pub const i32x4_splat: u32 = 0x11;
+    pub const i64x2_splat: u32 = 0x12;
     pub const i8x16_eq: u32 = 0x23;
+    pub const i8x16_gt_s: u32 = 0x27;
+    pub const i8x16_gt_u: u32 = 0x28;
+    pub const i8x16_ge_s: u32 = 0x2B;
+    pub const i8x16_ge_u: u32 = 0x2C;
+    pub const i16x8_eq: u32 = 0x2D;
+    pub const i16x8_gt_s: u32 = 0x31;
+    pub const i16x8_gt_u: u32 = 0x32;
+    pub const i16x8_ge_s: u32 = 0x35;
+    pub const i16x8_ge_u: u32 = 0x36;
+    pub const i32x4_eq: u32 = 0x37;
+    pub const i32x4_gt_s: u32 = 0x3B;
+    pub const i32x4_gt_u: u32 = 0x3C;
+    pub const i32x4_ge_s: u32 = 0x3F;
+    pub const i32x4_ge_u: u32 = 0x40;
+    pub const v128_not: u32 = 0x4D;
+    pub const v128_and: u32 = 0x4E;
+    pub const v128_or: u32 = 0x50;
+    pub const v128_xor: u32 = 0x51;
+    pub const v128_bitselect: u32 = 0x52;
+    pub const i8x16_abs: u32 = 0x60;
+    pub const i8x16_neg: u32 = 0x61;
     pub const i8x16_bitmask: u32 = 0x64;
+    pub const i8x16_narrow_i16x8_s: u32 = 0x65;
+    pub const i8x16_narrow_i16x8_u: u32 = 0x66;
+    pub const i8x16_shl: u32 = 0x6B;
+    pub const i8x16_shr_s: u32 = 0x6C;
+    pub const i8x16_shr_u: u32 = 0x6D;
+    pub const i8x16_add: u32 = 0x6E;
+    pub const i8x16_add_sat_s: u32 = 0x6F;
+    pub const i8x16_add_sat_u: u32 = 0x70;
+    pub const i8x16_sub: u32 = 0x71;
+    pub const i8x16_sub_sat_s: u32 = 0x72;
+    pub const i8x16_sub_sat_u: u32 = 0x73;
+    pub const i8x16_min_s: u32 = 0x76;
+    pub const i8x16_min_u: u32 = 0x77;
+    pub const i8x16_max_s: u32 = 0x78;
+    pub const i8x16_max_u: u32 = 0x79;
+    pub const i8x16_avgr_u: u32 = 0x7B;
+    pub const i16x8_extadd_pairwise_i8x16_s: u32 = 0x7C;
+    pub const i16x8_extadd_pairwise_i8x16_u: u32 = 0x7D;
+    pub const i32x4_extadd_pairwise_i16x8_s: u32 = 0x7E;
+    pub const i32x4_extadd_pairwise_i16x8_u: u32 = 0x7F;
+    pub const i16x8_abs: u32 = 0x80;
+    pub const i16x8_neg: u32 = 0x81;
+    pub const i16x8_q15mulr_sat_s: u32 = 0x82;
+    pub const i16x8_bitmask: u32 = 0x84;
+    pub const i16x8_narrow_i32x4_s: u32 = 0x85;
+    pub const i16x8_narrow_i32x4_u: u32 = 0x86;
+    pub const i16x8_extend_low_i8x16_s: u32 = 0x87;
+    pub const i16x8_extend_high_i8x16_s: u32 = 0x88;
+    pub const i16x8_extend_low_i8x16_u: u32 = 0x89;
+    pub const i16x8_extend_high_i8x16_u: u32 = 0x8A;
+    pub const i16x8_shl: u32 = 0x8B;
+    pub const i16x8_shr_s: u32 = 0x8C;
+    pub const i16x8_shr_u: u32 = 0x8D;
+    pub const i16x8_add: u32 = 0x8E;
+    pub const i16x8_add_sat_s: u32 = 0x8F;
+    pub const i16x8_add_sat_u: u32 = 0x90;
+    pub const i16x8_sub: u32 = 0x91;
+    pub const i16x8_sub_sat_s: u32 = 0x92;
+    pub const i16x8_sub_sat_u: u32 = 0x93;
+    pub const i16x8_mul: u32 = 0x95;
+    pub const i16x8_min_s: u32 = 0x96;
+    pub const i16x8_min_u: u32 = 0x97;
+    pub const i16x8_max_s: u32 = 0x98;
+    pub const i16x8_max_u: u32 = 0x99;
+    pub const i16x8_avgr_u: u32 = 0x9B;
+    pub const i16x8_extmul_low_i8x16_s: u32 = 0x9C;
+    pub const i16x8_extmul_high_i8x16_s: u32 = 0x9D;
+    pub const i16x8_extmul_low_i8x16_u: u32 = 0x9E;
+    pub const i16x8_extmul_high_i8x16_u: u32 = 0x9F;
+    pub const i32x4_abs: u32 = 0xA0;
+    pub const i32x4_neg: u32 = 0xA1;
+    pub const i32x4_bitmask: u32 = 0xA4;
+    pub const i32x4_extend_low_i16x8_s: u32 = 0xA7;
+    pub const i32x4_extend_high_i16x8_s: u32 = 0xA8;
+    pub const i32x4_extend_low_i16x8_u: u32 = 0xA9;
+    pub const i32x4_extend_high_i16x8_u: u32 = 0xAA;
+    pub const i32x4_shl: u32 = 0xAB;
+    pub const i32x4_shr_s: u32 = 0xAC;
+    pub const i32x4_shr_u: u32 = 0xAD;
+    pub const i32x4_add: u32 = 0xAE;
+    pub const i32x4_sub: u32 = 0xB1;
+    pub const i32x4_mul: u32 = 0xB5;
+    pub const i32x4_min_s: u32 = 0xB6;
+    pub const i32x4_min_u: u32 = 0xB7;
+    pub const i32x4_max_s: u32 = 0xB8;
+    pub const i32x4_max_u: u32 = 0xB9;
+    pub const i32x4_dot_i16x8_s: u32 = 0xBA;
+    pub const i32x4_extmul_low_i16x8_s: u32 = 0xBC;
+    pub const i32x4_extmul_high_i16x8_s: u32 = 0xBD;
+    pub const i32x4_extmul_low_i16x8_u: u32 = 0xBE;
+    pub const i32x4_extmul_high_i16x8_u: u32 = 0xBF;
+    pub const i64x2_abs: u32 = 0xC0;
+    pub const i64x2_neg: u32 = 0xC1;
+    pub const i64x2_bitmask: u32 = 0xC4;
+    pub const i64x2_extend_low_i32x4_s: u32 = 0xC7;
+    pub const i64x2_extend_high_i32x4_s: u32 = 0xC8;
+    pub const i64x2_extend_low_i32x4_u: u32 = 0xC9;
+    pub const i64x2_extend_high_i32x4_u: u32 = 0xCA;
+    pub const i64x2_shl: u32 = 0xCB;
+    pub const i64x2_shr_s: u32 = 0xCC;
+    pub const i64x2_shr_u: u32 = 0xCD;
+    pub const i64x2_add: u32 = 0xCE;
+    pub const i64x2_sub: u32 = 0xD1;
+    pub const i64x2_mul: u32 = 0xD5;
+    pub const i64x2_eq: u32 = 0xD6;
+    pub const i64x2_gt_s: u32 = 0xD9;
+    pub const i64x2_ge_s: u32 = 0xDB;
+    pub const i64x2_extmul_low_i32x4_s: u32 = 0xDC;
+    pub const i64x2_extmul_high_i32x4_s: u32 = 0xDD;
+    pub const i64x2_extmul_low_i32x4_u: u32 = 0xDE;
+    pub const i64x2_extmul_high_i32x4_u: u32 = 0xDF;
 };
 
 /// Block type for structured control flow
@@ -311,6 +432,7 @@ pub const BlockType = enum(u8) {
     i64 = 0x7E,
     f32 = 0x7D,
     f64 = 0x7C,
+    v128 = 0x7B,
 };
 
 /// A function type (signature)
@@ -700,6 +822,34 @@ pub fn addFuncType(self: *Self, params: []const ValType, results: []const ValTyp
     });
     try self.func_type_results.append(self.allocator, if (results.len > 0) results[0] else null);
     return idx;
+}
+
+/// Return whether a type-table entry has exactly the requested signature.
+///
+/// WebAssembly permits multiple type-table entries with the same structural
+/// signature, so ABI compatibility must not be decided by comparing type
+/// indices alone.
+pub fn funcTypeMatches(self: *const Self, type_idx: u32, params: []const ValType, results: []const ValType) bool {
+    if (type_idx >= self.func_types.items.len or results.len > 1) return false;
+
+    const actual_params = self.func_types.items[type_idx].params;
+    if (!std.mem.eql(ValType, actual_params, params)) return false;
+
+    const actual_result = self.func_type_results.items[type_idx];
+    return if (results.len == 0)
+        actual_result == null
+    else
+        actual_result == results[0];
+}
+
+/// Find an existing type-table entry with exactly the requested signature.
+pub fn findFuncType(self: *const Self, params: []const ValType, results: []const ValType) ?u32 {
+    for (0..self.func_types.items.len) |type_idx| {
+        if (self.funcTypeMatches(@intCast(type_idx), params, results)) {
+            return @intCast(type_idx);
+        }
+    }
+    return null;
 }
 
 /// Add a function (maps to a type index) and return the global function index.
@@ -4626,6 +4776,22 @@ test "preload — parses export section" {
     try std.testing.expectEqualStrings("_start", module.exports.items[0].name);
     try std.testing.expectEqual(ExportKind.func, module.exports.items[0].kind);
     try std.testing.expectEqual(@as(u32, 1), module.exports.items[0].idx);
+}
+
+test "function types match structurally rather than by table index" {
+    const allocator = std.testing.allocator;
+    var module = init(allocator);
+    defer module.deinit();
+
+    const first = try module.addFuncType(&.{ .i32, .v128 }, &.{.i64});
+    const duplicate = try module.addFuncType(&.{ .i32, .v128 }, &.{.i64});
+
+    try std.testing.expect(first != duplicate);
+    try std.testing.expect(module.funcTypeMatches(first, &.{ .i32, .v128 }, &.{.i64}));
+    try std.testing.expect(module.funcTypeMatches(duplicate, &.{ .i32, .v128 }, &.{.i64}));
+    try std.testing.expectEqual(first, module.findFuncType(&.{ .i32, .v128 }, &.{.i64}).?);
+    try std.testing.expect(!module.funcTypeMatches(duplicate, &.{ .i64, .v128 }, &.{.i64}));
+    try std.testing.expect(!module.funcTypeMatches(duplicate, &.{ .i32, .v128 }, &.{.i32}));
 }
 
 test "removeFunctionExports — removes only named function exports" {

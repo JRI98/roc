@@ -171,14 +171,14 @@ main! = |_| {
 		(e-lambda
 			(args
 				(p-assign (ident "n")))
-			(e-dispatch-call (method "plus") (constraint-fn-var 337)
+			(e-dispatch-call (method "plus") (constraint-fn-var 329)
 				(receiver
 					(e-num (value "1")))
 				(args
-					(e-call (constraint-fn-var 336)
+					(e-call (constraint-fn-var 328)
 						(e-lookup-local
 							(p-assign (ident "recurse")))
-						(e-dispatch-call (method "plus") (constraint-fn-var 316)
+						(e-dispatch-call (method "plus") (constraint-fn-var 308)
 							(receiver
 								(e-lookup-local
 									(p-assign (ident "n"))))
@@ -204,10 +204,10 @@ main! = |_| {
 								(e-num (value "0"))))
 						(e-num (value "1"))))
 				(if-else
-					(e-call (constraint-fn-var 427)
+					(e-call (constraint-fn-var 419)
 						(e-lookup-local
 							(p-assign (ident "pongIt")))
-						(e-dispatch-call (method "minus") (constraint-fn-var 407)
+						(e-dispatch-call (method "minus") (constraint-fn-var 399)
 							(receiver
 								(e-lookup-local
 									(p-assign (ident "n"))))
@@ -233,10 +233,10 @@ main! = |_| {
 								(e-num (value "0"))))
 						(e-num (value "2"))))
 				(if-else
-					(e-call (constraint-fn-var 512)
+					(e-call (constraint-fn-var 504)
 						(e-lookup-local
 							(p-assign (ident "pingIt")))
-						(e-dispatch-call (method "minus") (constraint-fn-var 492)
+						(e-dispatch-call (method "minus") (constraint-fn-var 484)
 							(receiver
 								(e-lookup-local
 									(p-assign (ident "n"))))
@@ -251,7 +251,7 @@ main! = |_| {
 		(e-lambda
 			(args
 				(p-assign (ident "n")))
-			(e-call (constraint-fn-var 527)
+			(e-call (constraint-fn-var 519)
 				(e-lookup-local
 					(p-assign (ident "recurse")))
 				(e-lookup-local
@@ -264,7 +264,7 @@ main! = |_| {
 			(e-block
 				(s-let
 					(p-underscore)
-					(e-call (constraint-fn-var 535)
+					(e-call (constraint-fn-var 527)
 						(e-lookup-local
 							(p-assign (ident "caller")))
 						(e-num (value "0"))))

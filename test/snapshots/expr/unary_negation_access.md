@@ -41,7 +41,7 @@ NO CHANGE
 ~~~
 # CANONICALIZE
 ~~~clojure
-(e-dispatch-call (method "negate") (constraint-fn-var 202)
+(e-dispatch-call (method "negate") (constraint-fn-var 194)
 	(receiver
 		(e-field-access (field "field")
 			(receiver

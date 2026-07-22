@@ -24,6 +24,10 @@ pub const symbol_prefix = "roc_builtins_";
 pub const BuiltinFn = enum {
     hasher_write_u64,
     hasher_write_u128,
+    simd_eval,
+    simd_load_16,
+    simd_store_16,
+    simd_append_16,
     hasher_write_f32_bits,
     hasher_write_f64_bits,
     hasher_write_bytes,
@@ -309,9 +313,6 @@ pub const BuiltinFn = enum {
             .hot_reload_erased_callable_drop,
             .hot_reload_leave,
             .hot_reload_retain_current,
-            .num_shl_u128,
-            .num_shr_i128,
-            .num_shr_u128,
             => .jit_only,
 
             else => .full,

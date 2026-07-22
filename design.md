@@ -438,18 +438,29 @@ they remain explicit reconstructions. Eligibility is computed by a memoized walk
 over explicit `ConstStore` edges, never inferred from runtime bytes or layout
 coincidence.
 
+The explicit static-root locator is recursive context. Restoration propagates
+it through every transparent and nominal construction layer and into tag,
+record, tuple, box, list, string, and callable captures. A wrapper must not drop
+that context and thereby turn a representation-stable descendant back into a
+runtime construction.
+
 Object emission, native compile-time execution, and interpreter compile-time
 execution consume the same target-layout static-data materializer. In-process
 evaluators own a relocated immutable data image and index its root addresses
 directly by compact `StaticDataId`; callable relocations carry explicit
 capture-offset metadata so the interpreter does not reconstruct ABI meaning from
-bytes or symbols. A static-data candidate is identified by its stored const node
-and concrete Monotype type; a checked type id alone cannot identify its
-representation across distinct specialization contexts. Direct LIR lowering
-deduplicates those candidates only when their concrete destination const plan and
-runtime layout also match. This preserves distinct specialized and narrowed
-representations of the same stored value while allowing each one to be emitted
-directly in the representation its consumer requires.
+bytes or symbols. A static-data candidate is identified by its stored const node,
+checked type, and concrete Monotype type; a checked type id alone cannot identify
+its representation across distinct specialization contexts. Raw stage-local
+Monotype ids are not representation identity. Candidates for the same stored node
+and checked type share one `StaticDataId` only after exact structural
+Monotype equality succeeds. All child lowering contexts in one specialization
+draft reuse that one closed candidate expression. Direct LIR lowering then reuses
+one initializer only for the same identified candidate and committed runtime
+layout. This is at least as strict as requiring identical destination const plans
+and layouts, preserves distinct specialized and narrowed representations, and
+prevents equivalent instantiations from rebuilding or repeatedly walking a large
+stored graph.
 
 Compile-time evaluation is allowed to fail with user diagnostics only during
 checking. After checking, stored constant data is ordinary checked output. A
@@ -1890,7 +1901,7 @@ Canonicalization records each recognized associated underscore opt-in as an
 `e_derived_method` CIR expression carrying its exact derived-method kind. An
 ordinary annotation without a body remains `e_anno_only`; in a platform package,
 only that ordinary form may be rewritten into a hosted declaration. Checking and
-method-registry publication consume the explicit derived-method kind and must not
+method-registry recording consume the explicit derived-method kind and must not
 recover compiler intent from identifier text or the annotation shape.
 
 Derived `map` and `map!` apply only to tag-union backing shapes. The checker
@@ -5742,6 +5753,13 @@ included merely because some ISA has an instruction for it.
    AArch64 NEON, and wasm simd128 all share natively. Wider types (`U8x32`,
    …) can be added later as *new types* without changing what any existing
    code means.
+4. **Ordinary host ABI values.** SIMD vectors may appear anywhere an ordinary
+   Roc value may appear, including directly or recursively inside hosted and
+   `provides` arguments and results. Every host boundary follows the selected
+   target's natural C ABI. Generated C, Zig, and Rust declarations use native
+   vector leaf types and C-layout aggregates whose size, alignment, field
+   offsets, argument placement, and result placement match the compiled Roc
+   code.
 
 Where an operation exists in wasm simd128, we pin wasm's meaning — that
 spec already solved "deterministic 128-bit SIMD that lowers well to both SSE
@@ -5858,6 +5876,61 @@ each lane's bytes least-significant first. This matches the in-register and
 in-memory reality of x86-64, AArch64, and wasm, so no target pays a
 byte-swap tax.
 
+### Host ABI
+
+The vector types are full participants in the Host Symbol ABI. There is no
+internal-only restriction, wrapper-call convention, byte-array boundary type,
+or source-level adapter. A Roc programmer may use a vector directly, place one
+inside a record, tuple, tag payload, list element, box payload, or another
+ordinary type, and use that type in either direction across a hosted or
+`provides` symbol.
+
+Layout commitment records each vector as a 16-byte, 16-byte-aligned native
+vector with its lane width and signedness. Host-call classification walks the
+complete committed argument and result layouts, including nested aggregates,
+and applies the target's C ABI:
+
+- On System V x86-64, a direct 128-bit vector has SSE/SSEUP class and occupies
+  one XMM register. A vector member contributes those classes to the containing
+  aggregate's recursive eightbyte classification.
+- On Windows x86-64's default C convention, a direct 128-bit vector argument
+  is passed through an aligned caller temporary and a pointer, while a direct
+  vector result is returned in XMM0. An aggregate containing a vector follows
+  the Win64 aggregate rules; it is not treated as the vector it contains.
+- Under AAPCS64, including fixed-prototype Windows-on-ARM64, a direct 128-bit
+  short vector occupies one Q register. Aggregates follow the ordinary
+  AAPCS64 rules, including homogeneous short-vector aggregates of up to four
+  identical members in consecutive vector registers.
+- Under the WebAssembly Basic C ABI, a direct vector is `v128`. Transparent
+  one-field aggregates retain the field's direct classification; other
+  aggregates follow the WebAssembly aggregate rules.
+
+These are target rules, not backend choices. LLVM, the native dev backends, the
+interpreter translation shim, wasm, and generated host declarations consume the
+same explicit ABI placements. A backend must not classify a vector from its
+name or reinterpret it as `U128`; in particular, two general-purpose 64-bit
+pieces are not interchangeable with one 128-bit vector register value.
+
+Generated glue makes the same contract usable without handwritten declarations.
+C glue selects the target's native integer-vector types, Zig glue uses
+lane-typed `@Vector` types with `callconv(.c)`, and Rust glue uses distinct
+`repr(transparent)` wrappers over the stable target-architecture SIMD types in
+C-ABI extern declarations together with `repr(C)` aggregates. All eight Roc
+vector names remain distinct binding names even where the target uses one
+underlying register type. C records expose their committed fields, and C tag
+unions expose named discriminants, concrete payload storage, and typed
+constructors/accessors. Generated size, alignment, discriminant, payload, and
+field-offset assertions lock aggregate layout. Cross-language tests compile the
+generated C, Zig, and Rust output and call every direct and aggregate shape in
+both directions, so a host compiler and Roc must independently choose the same
+ABI.
+
+ABI class assignment and concrete argument/result placement are separate explicit steps. The
+placement step accounts for each register class's remaining capacity, preserves
+a SysV SSE/SSEUP vector as one value, assigns AAPCS64 HVA members to consecutive
+Q registers, and commits stack or indirect locations after register exhaustion.
+Wrappers consume those locations directly; they do not recompute ABI classes.
+
 ### Pinned meaning — the edge cases
 
 These are the cases where ISAs disagree natively and the spec must choose.
@@ -5897,26 +5970,61 @@ the contract every backend must match:
   instructions). `any_lanes_set`/`all_lanes_set` are defined in terms of
   it.
 
-### Current implementation state
+### Compiler representation and lowering
 
-The API currently ships as **pure-Roc reference implementations**: each
-vector type is backed by `{ bits : U128 }` and every method has a real Roc
-body that implements the pinned meaning lane by lane. This is deliberate:
+Each vector type is compiler-provided and has its own first-class committed
+layout. The eight layouts share size, alignment, and vector register class but
+retain distinct lane width and signedness. Low-level operations are
+lane-parameterized; their argument and result layouts encode lane width and
+signedness, including both source and destination kinds for widening and
+narrowing.
 
-1. The reference implementations *are* the definition of each operation, in
-   runnable form. The differential test harness compares every future backend lowering against
-   them, op by op, edge case by edge case, across all backends.
-2. The API, names, types, and doc comments are final and reviewable now,
-   independent of backend work.
-3. Nothing in the compiler needs to change for the API to land, and the
-   doc examples run as tests today.
+Methods implemented directly by the compiler are bodiless declarations in
+`Builtin.roc`. Thin checked methods remain in Roc for range checks and for
+one-line compositions such as flipped comparisons, lane broadcast, bit casts
+between sibling vector types, collection conversions, inspection, hashing, and
+streaming. Every compiler-backed operation is implemented by LLVM, both native
+dev backends, wasm, the interpreter, and the Lambda Mono evaluator. Compile-time
+evaluation uses the same vector layouts and dev lowering as runtime dev code,
+and `ConstStore` preserves all 16 vector bytes under the checked vector type.
 
-The implementation plan then replaces each method body with a bodiless
-declaration mapped to a low-level op, backend by backend, with the
-differential harness holding every backend to the reference behavior. The
-reference bodies move into the harness as the oracle at that point.
-Performance of the reference implementations is irrelevant — they exist for
-correctness, review, and testing.
+The correctness-oriented native consumers use the exhaustive bit-level SIMD
+evaluator in `src/builtins/simd.zig`. Dev code passes the operation descriptor,
+explicit source/destination lane kinds, and operand bits through its ordinary
+internal call ABI; x86-64 and AArch64 wrappers preserve the corresponding
+two-register vector values and AArch64 has native Q-register movement. The
+interpreter and Lambda Mono evaluator invoke the same operation contract from
+their explicit layouts. Wasm instead emits `v128` operations and exact helper
+sequences, including software carryless multiplication where simd128 has no
+instruction.
+
+LLVM emits generic vector IR for ordinary operations and target intrinsics for
+operations whose pinned edge behavior or instruction selection requires them.
+`src/target/mod.zig` is the single authority for the LLVM target query, CPU
+name, and feature delta. Linked builds, optimized tests, and LLVM evaluation
+therefore all compile under the same x86-64-v3 plus AES/PCLMULQDQ, AArch64, or
+wasm simd128 floor.
+
+The former pure-Roc `{ bits : U128 }` implementations live only in the SIMD
+test oracle. They define each operation lane by lane without depending on the
+compiler vector types. The differential suite compares the oracle with runtime
+LLVM, both dev targets, wasm, the interpreter, the Lambda Mono evaluator, and
+compile-time evaluation over fixed edge corpora and deterministic generated
+inputs. The host-ABI suite separately compiles generated C, Zig, and Rust glue
+and verifies direct and nested vector values in both call directions.
+
+`zig build run-test-simd-differential` owns the shared proof source and runs the
+standalone dev and LLVM programs, optimized compile-time tests, every evaluator
+backend, and the Lambda Mono comparison in sequence. The corpus contains 294
+operation/type cases, fixed boundary values, algebraic properties, and at least
+64 deterministic generated inputs per applicable case. It is opt-in to ordinary
+test enumeration so normal suites remain bounded, but the dedicated gate has no
+backend skips. `zig build run-check-simd-codegen` separately requires optimized
+x86-64 output to contain representative byte-add, pairwise-dot, table-shuffle,
+and carryless-multiply instructions. `zig build run-check-glue-abi` compiles
+generated Zig and C declarations for x86-64 and AArch64 Linux/macOS/Windows plus
+wasm, compiles Rust for native and wasm, and the native/wasm glue runtime matrix
+calls the generated contracts in both directions.
 
 ### Doc comments name the instructions
 

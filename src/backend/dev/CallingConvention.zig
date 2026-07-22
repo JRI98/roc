@@ -334,6 +334,45 @@ pub fn CallBuilder(comptime EmitType: type) type {
             }
         }
 
+        /// Add a by-value argument at an ABI-assigned byte offset in the
+        /// outgoing stack argument area. Any alignment gap is represented by
+        /// zeroed slots so later arguments retain their exact offsets.
+        pub fn addStackMemArgAt(
+            self: *Self,
+            stack_byte_offset: u16,
+            base_reg: GeneralReg,
+            source_offset: i32,
+            size: usize,
+        ) Allocator.Error!void {
+            self.padStackArgsToOffset(stack_byte_offset);
+            try self.addStackMemArg(base_reg, source_offset, size);
+        }
+
+        /// Add an indirectly-passed argument pointer at an ABI-assigned stack
+        /// offset. The argument's pointee remains in the caller frame.
+        pub fn addStackLeaArgAt(
+            self: *Self,
+            stack_byte_offset: u16,
+            base_reg: GeneralReg,
+            source_offset: i32,
+        ) void {
+            self.padStackArgsToOffset(stack_byte_offset);
+            std.debug.assert(self.stack_arg_count < MAX_STACK_ARGS);
+            self.stack_args[self.stack_arg_count] = .{ .from_lea = .{ .base = base_reg, .offset = source_offset } };
+            self.stack_arg_count += 1;
+        }
+
+        fn padStackArgsToOffset(self: *Self, stack_byte_offset: u16) void {
+            std.debug.assert(stack_byte_offset % 8 == 0);
+            const target_slot: usize = stack_byte_offset / 8;
+            while (self.stack_arg_count < target_slot) {
+                std.debug.assert(self.stack_arg_count < MAX_STACK_ARGS);
+                self.stack_args[self.stack_arg_count] = .{ .from_imm = 0 };
+                self.stack_arg_count += 1;
+            }
+            std.debug.assert(self.stack_arg_count == target_slot);
+        }
+
         /// Add immediate value argument
         pub fn addImmArg(self: *Self, value: i64) Allocator.Error!void {
             if (self.int_arg_index < CC_EMIT.PARAM_REGS.len) {
@@ -460,6 +499,7 @@ pub fn CallBuilder(comptime EmitType: type) type {
                 switch (size) {
                     4 => try self.emit.fldrRegMemSoff(.single, dst, base_reg, offset),
                     8 => try self.emit.fldrRegMemSoff(.double, dst, base_reg, offset),
+                    16 => try self.emit.ldrQRegMemSoff(dst, base_reg, offset),
                     else => unreachable,
                 }
             } else if (comptime @hasDecl(EmitType, "fldrRegMemUoff")) {

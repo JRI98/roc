@@ -391,13 +391,13 @@ main = |_| {
 			(e-empty_list)))
 	(d-let
 		(p-assign (ident "empty_int_list"))
-		(e-call (constraint-fn-var 344)
+		(e-call (constraint-fn-var 336)
 			(e-lookup-local
 				(p-assign (ident "get_empty")))
 			(e-num (value "42"))))
 	(d-let
 		(p-assign (ident "empty_str_list"))
-		(e-call (constraint-fn-var 357)
+		(e-call (constraint-fn-var 349)
 			(e-lookup-local
 				(p-assign (ident "get_empty")))
 			(e-string
@@ -429,9 +429,9 @@ main = |_| {
 							(builtin))
 						(e-lookup-local
 							(p-assign (ident "all_float_list")))))
-				(e-dispatch-call (method "plus") (constraint-fn-var 376)
+				(e-dispatch-call (method "plus") (constraint-fn-var 368)
 					(receiver
-						(e-dispatch-call (method "plus") (constraint-fn-var 374)
+						(e-dispatch-call (method "plus") (constraint-fn-var 366)
 							(receiver
 								(e-lookup-local
 									(p-assign (ident "len1"))))

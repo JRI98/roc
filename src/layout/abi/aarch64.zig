@@ -32,12 +32,25 @@ pub const Class = union(enum) {
     double_integer,
     /// A homogeneous float aggregate passed in 1..4 SIMD registers.
     float_array: FloatArray,
+    /// A homogeneous short-vector aggregate passed in 1..4 SIMD registers.
+    vector_array: VectorArray,
 };
 
 /// A homogeneous aggregate of `count` floats, each `elem_bits` wide (32 or 64).
 pub const FloatArray = struct {
     count: u8,
     elem_bits: u16,
+};
+
+/// A homogeneous aggregate of `count` AAPCS64 short-vector members.
+pub const VectorArray = struct {
+    count: u8,
+    /// The vector shape used for the ABI coercion. AAPCS64's fundamental
+    /// short-vector type distinguishes only 64-bit from 128-bit vectors, not
+    /// their lane element type, so mixed Roc lane kinds are still homogeneous.
+    /// Every Roc vector is 128 bits; retaining the first kind gives consumers
+    /// a concrete LLVM/Zig vector type with which to carry the register bits.
+    kind: layout.Vector,
 };
 
 /// AAPCS64 passes a homogeneous float aggregate of at most four members in SIMD registers.
@@ -61,6 +74,8 @@ pub fn classifyType(store: *const Store, idx: Idx) Class {
                 .frac => return .byval,
                 // RocStr is a three-word aggregate; classify it by size like any aggregate.
                 .str => return classifyBySize(store, lay),
+                // A short vector is passed directly in one Q register.
+                .vector => return .byval,
             }
         },
         // A Box is a single pointer.
@@ -68,6 +83,14 @@ pub fn classifyType(store: *const Store, idx: Idx) Class {
         // RocList is a three-word aggregate.
         .list, .list_of_zst => return classifyBySize(store, lay),
         .struct_ => {
+            var maybe_vector_kind: ?layout.Vector = null;
+            const vector_count = countVectors(store, idx, &maybe_vector_kind);
+            if (vector_count >= 1 and vector_count <= max_hfa_floats) {
+                return .{ .vector_array = .{
+                    .count = vector_count,
+                    .kind = maybe_vector_kind.?,
+                } };
+            }
             var maybe_float_bits: ?u16 = null;
             const float_count = countFloats(store, idx, &maybe_float_bits);
             if (float_count >= 1 and float_count <= max_hfa_floats) {
@@ -78,10 +101,52 @@ pub fn classifyType(store: *const Store, idx: Idx) Class {
             }
             return classifyBySize(store, lay);
         },
-        // Tag unions carry a discriminant, closures and erased callables carry pointers, so
-        // none of these are homogeneous float aggregates — classify them purely by size.
-        .tag_union, .closure, .erased_callable => return classifyBySize(store, lay),
+        .tag_union => {
+            // Glue unwraps a single-variant union to its payload. Its layout has
+            // no runtime discriminant, so classification must unwrap it too.
+            // In particular, a transparent vector is a direct Q-register value
+            // and a transparent float is a direct SIMD-register value.
+            const info = store.getTagUnionInfo(lay);
+            if (info.variants.len == 1 and info.data.discriminant_size == 0) {
+                return classifyType(store, info.variants.get(0).payload_layout);
+            }
+            return classifyBySize(store, lay);
+        },
+        // Closures and erased callables carry pointers and are not homogeneous
+        // aggregates, so classify them purely by size.
+        .closure, .erased_callable => return classifyBySize(store, lay),
         .zst => unreachable, // filtered out by the assert above; ZSTs are never passed
+    }
+}
+
+fn countVectors(store: *const Store, idx: Idx, maybe_kind: *?layout.Vector) u8 {
+    const lay = store.getLayout(idx);
+    switch (lay.tag) {
+        .struct_ => {
+            const struct_idx = lay.getStruct().idx;
+            const field_count = store.getStructData(struct_idx).fields.count;
+            var count: u8 = 0;
+            var i: u32 = 0;
+            while (i < field_count) : (i += 1) {
+                if (store.getStructFieldIsPadding(struct_idx, i)) return invalid_float_count;
+                const field_count_vectors = countVectors(store, store.getStructFieldLayout(struct_idx, i), maybe_kind);
+                if (field_count_vectors == invalid_float_count) return invalid_float_count;
+                count += field_count_vectors;
+                if (count > max_hfa_floats) return invalid_float_count;
+            }
+            return count;
+        },
+        .scalar => {
+            const scalar = lay.getScalar();
+            if (scalar.tag != .vector) return invalid_float_count;
+            const kind = scalar.getVector();
+            // AAPCS64 defines vector64 and vector128 as the fundamental
+            // short-vector types. Lane width and signedness do not split the
+            // class. All Roc vectors are vector128, so any mixture is an HVA.
+            if (maybe_kind.* == null) maybe_kind.* = kind;
+            return 1;
+        },
+        else => return invalid_float_count,
     }
 }
 
@@ -164,6 +229,27 @@ test "aarch64 classify: scalars pass by value" {
     try testing.expectEqual(Class.byval, classifyType(&store, .f64));
     try testing.expectEqual(Class.byval, classifyType(&store, .dec));
     try testing.expectEqual(Class.byval, classifyType(&store, .opaque_ptr));
+    try testing.expectEqual(Class.byval, classifyType(&store, .u8x16));
+}
+
+test "aarch64 classify: homogeneous short-vector aggregates" {
+    var store = try Store.init(testing.allocator, .u64);
+    defer store.deinit();
+
+    const one = try testStruct(&store, &.{.u16x8});
+    try testing.expectEqual(Class{ .vector_array = .{ .count = 1, .kind = .u16x8 } }, classifyType(&store, one));
+
+    const nested_pair = try testStruct(&store, &.{ one, one });
+    try testing.expectEqual(Class{ .vector_array = .{ .count = 2, .kind = .u16x8 } }, classifyType(&store, nested_pair));
+
+    const four = try testStruct(&store, &.{ .i32x4, .i32x4, .i32x4, .i32x4 });
+    try testing.expectEqual(Class{ .vector_array = .{ .count = 4, .kind = .i32x4 } }, classifyType(&store, four));
+
+    const mixed = try testStruct(&store, &.{ .u8x16, .i8x16 });
+    try testing.expectEqual(Class{ .vector_array = .{ .count = 2, .kind = .u8x16 } }, classifyType(&store, mixed));
+
+    const wrapped = try store.putTagUnion(&.{.i16x8});
+    try testing.expectEqual(Class.byval, classifyType(&store, wrapped));
 }
 
 test "aarch64 classify: three-word aggregates go to memory" {

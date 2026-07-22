@@ -633,6 +633,11 @@ const Builder = struct {
     nested_site_cache: std.AutoHashMap(NestedSiteAddress, names.ProcSiteId),
     const_expr_cache: std.AutoHashMap(ConstExprAddress, Ast.ExprId),
     static_data_ids: std.AutoHashMap(StaticDataUse, Common.StaticDataId),
+    /// Static-data uses indexed by `StaticDataId`. Raw Monotype ids
+    /// are only a fast exact-key path; exact structural equality below is the
+    /// authority for reusing one representation across equivalent
+    /// instantiations.
+    static_data_uses: std.ArrayList(StaticDataUse),
     static_data_eligibility: std.AutoHashMap(ConstNodeAddress, bool),
     inspect_defs: std.AutoHashMap(GeneratedHelperDefAddress, GeneratedHelperDefEntry),
     equality_defs: std.AutoHashMap(GeneratedHelperDefAddress, GeneratedHelperDefEntry),
@@ -690,6 +695,7 @@ const Builder = struct {
             .nested_site_cache = std.AutoHashMap(NestedSiteAddress, names.ProcSiteId).init(allocator),
             .const_expr_cache = std.AutoHashMap(ConstExprAddress, Ast.ExprId).init(allocator),
             .static_data_ids = std.AutoHashMap(StaticDataUse, Common.StaticDataId).init(allocator),
+            .static_data_uses = .empty,
             .static_data_eligibility = std.AutoHashMap(ConstNodeAddress, bool).init(allocator),
             .inspect_defs = std.AutoHashMap(GeneratedHelperDefAddress, GeneratedHelperDefEntry).init(allocator),
             .equality_defs = std.AutoHashMap(GeneratedHelperDefAddress, GeneratedHelperDefEntry).init(allocator),
@@ -731,6 +737,7 @@ const Builder = struct {
         self.equality_defs.deinit();
         self.inspect_defs.deinit();
         self.static_data_eligibility.deinit();
+        self.static_data_uses.deinit(self.allocator);
         self.static_data_ids.deinit();
         self.const_expr_cache.deinit();
         self.nested_site_cache.deinit();
@@ -2657,20 +2664,39 @@ const Builder = struct {
         mono_type: Type.TypeId,
     ) Allocator.Error!Common.StaticDataId {
         const const_node = self.constNode(const_locator, node);
-        const gop = try self.static_data_ids.getOrPut(.{
+        const use = StaticDataUse{
             .module = const_node.module.key,
             .node = const_node.id,
             .checked_type = checked_type,
             .mono_type = mono_type,
-        });
-        if (!gop.found_existing) {
-            gop.value_ptr.* = try self.program.addStaticDataValue(.{
-                .const_locator = const_locator,
-                .node = node,
-                .checked_type = checked_type,
-            });
+        };
+        if (self.static_data_ids.get(use)) |existing| return existing;
+
+        for (self.static_data_uses.items, 0..) |existing, index| {
+            if (!moduleBytesEqual(existing.module.bytes, use.module.bytes) or
+                existing.node != use.node or
+                existing.checked_type != use.checked_type)
+            {
+                continue;
+            }
+            if (!try self.program.types.typeEql(&self.program.names, existing.mono_type, use.mono_type)) continue;
+
+            const id: Common.StaticDataId = @enumFromInt(@as(u32, @intCast(index)));
+            try self.static_data_ids.put(use, id);
+            return id;
         }
-        return gop.value_ptr.*;
+
+        const id = try self.program.addStaticDataValue(.{
+            .const_locator = const_locator,
+            .node = node,
+            .checked_type = checked_type,
+        });
+        if (@intFromEnum(id) != self.static_data_uses.items.len) {
+            Common.invariant("Monotype static-data use index diverged from program id");
+        }
+        try self.static_data_uses.append(self.allocator, use);
+        try self.static_data_ids.put(use, id);
+        return id;
     }
 
     const BareFnCandidate = enum {
@@ -5770,6 +5796,9 @@ const BodyDraftStore = struct {
     expr_regions: std.ArrayList(base.Region),
     stmt_locs: std.ArrayList(base.SourceLoc),
     stmt_regions: std.ArrayList(base.Region),
+    /// Closed static-data candidates are shared by every child lowering
+    /// context writing into this specialization draft.
+    static_data_candidate_exprs: std.AutoHashMap(Common.StaticDataId, DraftExprId),
 
     fn init(allocator: Allocator) BodyDraftStore {
         return .{
@@ -5808,10 +5837,12 @@ const BodyDraftStore = struct {
             .expr_regions = .empty,
             .stmt_locs = .empty,
             .stmt_regions = .empty,
+            .static_data_candidate_exprs = std.AutoHashMap(Common.StaticDataId, DraftExprId).init(allocator),
         };
     }
 
     fn deinit(self: *BodyDraftStore) void {
+        self.static_data_candidate_exprs.deinit();
         self.stmt_regions.deinit(self.allocator);
         self.stmt_locs.deinit(self.allocator);
         self.expr_regions.deinit(self.allocator);
@@ -17659,11 +17690,23 @@ const BodyContext = struct {
                 return try self.restoreConstFn(store_view, fn_id, ty, static_data_const_locator);
             },
             .tag, .record, .tuple => if (self.builder.nominalConstructionLayer(ty)) |layer| {
-                const backing_expr = try self.restoreConstNodeAtType(store_view, type_view, node, layer.backing);
+                const backing_expr = try self.restoreConstNodeAtTypeWithStaticRoot(
+                    store_view,
+                    type_view,
+                    node,
+                    layer.backing,
+                    static_data_const_locator,
+                );
                 return try self.addExpr(.{ .ty = layer.named, .data = .{ .nominal = backing_expr } });
             },
             .nominal => |nominal| if (self.builder.nominalConstructionLayer(ty)) |layer| {
-                const backing_expr = try self.restoreConstNodeAtType(store_view, type_view, nominal.backing, layer.backing);
+                const backing_expr = try self.restoreConstNodeAtTypeWithStaticRoot(
+                    store_view,
+                    type_view,
+                    nominal.backing,
+                    layer.backing,
+                    static_data_const_locator,
+                );
                 return try self.addExpr(.{ .ty = layer.named, .data = .{ .nominal = backing_expr } });
             },
             else => {},
@@ -17685,18 +17728,22 @@ const BodyContext = struct {
         if (!moduleBytesEqual(checked.constModuleId(const_locator).bytes, store_view.key.bytes)) {
             Common.invariant("static-data const context referenced a different ConstStore module");
         }
-        const runtime_expr = try self.restoreConstNodeAtTypeWithStaticRoot(store_view, type_view, node, ty, const_locator);
         if (self.builder.static_data_literals and
             try self.builder.constNodeHasStableStaticDataRepresentation(store_view, node) and
             self.builder.constNodeMayUseStaticDataCandidate(store_view, node, bare_fn))
         {
             const id = try self.builder.staticDataValue(const_locator, node, checked_type, ty);
-            return try self.addExpr(.{ .ty = ty, .data = .{ .static_data_candidate = .{
+            if (self.draft.static_data_candidate_exprs.get(id)) |existing| return existing;
+
+            const runtime_expr = try self.restoreConstNodeAtTypeWithStaticRoot(store_view, type_view, node, ty, const_locator);
+            const candidate_expr = try self.addExpr(.{ .ty = ty, .data = .{ .static_data_candidate = .{
                 .static_data = id,
                 .runtime_expr = runtime_expr,
             } } });
+            try self.draft.static_data_candidate_exprs.put(id, candidate_expr);
+            return candidate_expr;
         }
-        return runtime_expr;
+        return try self.restoreConstNodeAtTypeWithStaticRoot(store_view, type_view, node, ty, const_locator);
     }
 
     fn restoreConstData(
@@ -19748,7 +19795,7 @@ const BodyContext = struct {
                 const num = (try exact_numeral.decBits(self.allocator, exact)) orelse break :blk null;
                 break :blk .{ .dec = .{ .num = num } };
             },
-            .bool, .str => Common.invariant("numeric literal instantiated at a non-numeric Monotype primitive"),
+            .bool, .str, .u8x16, .i8x16, .u16x8, .i16x8, .u32x4, .i32x4, .u64x2, .i64x2 => Common.invariant("numeric literal instantiated at a non-numeric Monotype primitive"),
         };
     }
 
@@ -27381,7 +27428,7 @@ const BodyContext = struct {
 /// The exact-numeral target for a numeric Monotype primitive.
 fn numeralTargetFromPrimitive(primitive: Type.Primitive) exact_numeral.Target {
     return switch (primitive) {
-        .bool, .str => Common.invariant("non-numeric Monotype primitive has no numeral target"),
+        .bool, .str, .u8x16, .i8x16, .u16x8, .i16x8, .u32x4, .i32x4, .u64x2, .i64x2 => Common.invariant("non-numeric Monotype primitive has no numeral target"),
         inline else => |p| @field(exact_numeral.Target, @tagName(p)),
     };
 }
@@ -28256,6 +28303,7 @@ fn primitiveInspectLowLevelOp(primitive: Type.Primitive) can.CIR.Expr.LowLevel {
         .f32 => .f32_to_str,
         .f64 => .f64_to_str,
         .dec => .dec_to_str,
+        .u8x16, .i8x16, .u16x8, .i16x8, .u32x4, .i32x4, .u64x2, .i64x2 => Common.invariant("SIMD inspect must lower through its explicit Builtin body"),
         .bool => Common.invariant("Bool must lower as an ordinary tag union before Str.inspect"),
     };
 }

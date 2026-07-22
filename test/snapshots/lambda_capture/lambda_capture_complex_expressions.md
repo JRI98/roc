@@ -45,8 +45,8 @@ NO CHANGE
 ~~~
 # CANONICALIZE
 ~~~clojure
-(e-call (constraint-fn-var 242)
-	(e-call (constraint-fn-var 234)
+(e-call (constraint-fn-var 234)
+	(e-call (constraint-fn-var 226)
 		(e-lambda
 			(args
 				(p-assign (ident "outer")))
@@ -59,13 +59,13 @@ NO CHANGE
 					(e-if
 						(if-branches
 							(if-branch
-								(e-dispatch-call (method "is_gt") (constraint-fn-var 222)
+								(e-dispatch-call (method "is_gt") (constraint-fn-var 214)
 									(receiver
 										(e-lookup-local
 											(p-assign (ident "outer"))))
 									(args
 										(e-num (value "0"))))
-								(e-dispatch-call (method "plus") (constraint-fn-var 225)
+								(e-dispatch-call (method "plus") (constraint-fn-var 217)
 									(receiver
 										(e-lookup-local
 											(p-assign (ident "outer"))))

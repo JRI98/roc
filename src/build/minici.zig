@@ -51,6 +51,7 @@ const jobs = [_]Job{
     .{ .name = "run-check-test-wiring" },
     .{ .name = "run-check-builtin-format" },
     .{ .name = "run-check-glue-abi" },
+    .{ .name = "run-check-simd-codegen" },
     .{ .name = "run-check-snapshots" },
     .{ .name = "run-check-test-asset-coverage" },
     .{ .name = "run-test-zig-module-collections" },

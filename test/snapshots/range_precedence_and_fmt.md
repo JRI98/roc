@@ -48,11 +48,11 @@ r = 1..<n + 1
 		(e-num (value "3")))
 	(d-let
 		(p-assign (ident "r"))
-		(e-dispatch-call (method "range_exclusive") (constraint-fn-var 232)
+		(e-dispatch-call (method "range_exclusive") (constraint-fn-var 224)
 			(receiver
 				(e-num (value "1")))
 			(args
-				(e-dispatch-call (method "plus") (constraint-fn-var 226)
+				(e-dispatch-call (method "plus") (constraint-fn-var 218)
 					(receiver
 						(e-lookup-local
 							(p-assign (ident "n"))))

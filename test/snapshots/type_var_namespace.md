@@ -136,9 +136,9 @@ main! = |_| {}
 					(e-num (value "42")))
 				(s-let
 					(p-assign (ident "result"))
-					(e-dispatch-call (method "ok_or") (constraint-fn-var 256)
+					(e-dispatch-call (method "ok_or") (constraint-fn-var 248)
 						(receiver
-							(e-call (constraint-fn-var 255)
+							(e-call (constraint-fn-var 247)
 								(e-lookup-external
 									(builtin))
 								(e-lookup-local

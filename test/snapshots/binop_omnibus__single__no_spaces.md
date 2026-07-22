@@ -55,7 +55,7 @@ Err(foo) ?? 12 > 5 * 5 or 13 + 2 < 5 and 10 - 1 >= 16 or 12 <= 3 / 5
 (e-if
 	(if-branches
 		(if-branch
-			(e-dispatch-call (method "is_gt") (constraint-fn-var 287)
+			(e-dispatch-call (method "is_gt") (constraint-fn-var 279)
 				(receiver
 					(e-match
 						(match
@@ -80,7 +80,7 @@ Err(foo) ?? 12 > 5 * 5 or 13 + 2 < 5 and 10 - 1 >= 16 or 12 <= 3 / 5
 									(value
 										(e-num (value "12"))))))))
 				(args
-					(e-dispatch-call (method "times") (constraint-fn-var 284)
+					(e-dispatch-call (method "times") (constraint-fn-var 276)
 						(receiver
 							(e-num (value "5")))
 						(args
@@ -95,18 +95,18 @@ Err(foo) ?? 12 > 5 * 5 or 13 + 2 < 5 and 10 - 1 >= 16 or 12 <= 3 / 5
 					(e-if
 						(if-branches
 							(if-branch
-								(e-dispatch-call (method "is_lt") (constraint-fn-var 320)
+								(e-dispatch-call (method "is_lt") (constraint-fn-var 312)
 									(receiver
-										(e-dispatch-call (method "plus") (constraint-fn-var 310)
+										(e-dispatch-call (method "plus") (constraint-fn-var 302)
 											(receiver
 												(e-num (value "13")))
 											(args
 												(e-num (value "2")))))
 									(args
 										(e-num (value "5"))))
-								(e-dispatch-call (method "is_gte") (constraint-fn-var 347)
+								(e-dispatch-call (method "is_gte") (constraint-fn-var 339)
 									(receiver
-										(e-dispatch-call (method "minus") (constraint-fn-var 337)
+										(e-dispatch-call (method "minus") (constraint-fn-var 329)
 											(receiver
 												(e-num (value "10")))
 											(args
@@ -121,11 +121,11 @@ Err(foo) ?? 12 > 5 * 5 or 13 + 2 < 5 and 10 - 1 >= 16 or 12 <= 3 / 5
 						(builtin)
 						(e-tag (name "True")))))
 			(if-else
-				(e-dispatch-call (method "is_lte") (constraint-fn-var 384)
+				(e-dispatch-call (method "is_lte") (constraint-fn-var 376)
 					(receiver
 						(e-num (value "12")))
 					(args
-						(e-dispatch-call (method "div_by") (constraint-fn-var 381)
+						(e-dispatch-call (method "div_by") (constraint-fn-var 373)
 							(receiver
 								(e-num (value "3")))
 							(args

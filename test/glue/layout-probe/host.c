@@ -5,6 +5,7 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 
 static size_t alloc_count = 0;
 static size_t dealloc_count = 0;
@@ -80,8 +81,122 @@ ProbeLayoutProbe roc_probe_roundtrip(ProbeLayoutProbe arg0) {
     return arg0;
 }
 
+RocU8x16 roc_probe_roundtrip_u8x16(RocU8x16 arg0) { return arg0; }
+RocI8x16 roc_probe_roundtrip_i8x16(RocI8x16 arg0) { return arg0; }
+RocU16x8 roc_probe_roundtrip_u16x8(RocU16x8 arg0) { return arg0; }
+RocI16x8 roc_probe_roundtrip_i16x8(RocI16x8 arg0) { return arg0; }
+RocU32x4 roc_probe_roundtrip_u32x4(RocU32x4 arg0) { return arg0; }
+RocI32x4 roc_probe_roundtrip_i32x4(RocI32x4 arg0) { return arg0; }
+RocU64x2 roc_probe_roundtrip_u64x2(RocU64x2 arg0) { return arg0; }
+RocI64x2 roc_probe_roundtrip_i64x2(RocI64x2 arg0) { return arg0; }
+ProbeVectorRecord roc_probe_roundtrip_vector_record(ProbeVectorRecord arg0) { return arg0; }
+ProbeVectorQuad roc_probe_roundtrip_vector_quad(ProbeVectorQuad arg0) { return arg0; }
+ProbeVectorHva roc_probe_roundtrip_vector_hva(ProbeVectorHva arg0) { return arg0; }
+ProbeVectorWrapper roc_probe_roundtrip_vector_wrapper(ProbeVectorWrapper arg0) { return arg0; }
+ProbeVectorTag roc_probe_roundtrip_vector_tag(ProbeVectorTag arg0) { return arg0; }
+
+AnonStructFbe9eaebfd8c38fd roc_probe_roundtrip_vector_tuple(ProbeRoundtripVectorTupleArgs arg0) {
+    AnonStructFbe9eaebfd8c38fd result = { ._1 = arg0._1, ._2 = arg0._2, ._0 = arg0._0 };
+    return result;
+}
+
+RocU8x16 roc_probe_exhaust_registers(
+    int64_t arg0, int64_t arg1, int64_t arg2, int64_t arg3, int64_t arg4, int64_t arg5,
+    double arg6, double arg7, double arg8, double arg9, double arg10, double arg11, double arg12, double arg13,
+    RocU8x16 arg14) {
+    (void)arg0; (void)arg1; (void)arg2; (void)arg3; (void)arg4; (void)arg5;
+    (void)arg6; (void)arg7; (void)arg8; (void)arg9; (void)arg10; (void)arg11; (void)arg12; (void)arg13;
+    return arg14;
+}
+
+static void check_provided_abi(void) {
+    const uint8_t expected[16] = {
+        0x10, 0x21, 0x32, 0x43, 0x54, 0x65, 0x76, 0x87,
+        0x98, 0xa9, 0xba, 0xcb, 0xdc, 0xed, 0xfe, 0x0f,
+    };
+
+#define CHECK_PROVIDED_VECTOR(TYPE, FN, LABEL) do { \
+    TYPE input; \
+    memcpy(&input, expected, sizeof(input)); \
+    TYPE output = FN(input); \
+    if (memcmp(&output, expected, sizeof(output)) != 0) record_failure("provided " LABEL " mismatch"); \
+} while (0)
+
+    CHECK_PROVIDED_VECTOR(RocU8x16, roc_provide_u8x16, "U8x16");
+    CHECK_PROVIDED_VECTOR(RocI8x16, roc_provide_i8x16, "I8x16");
+    CHECK_PROVIDED_VECTOR(RocU16x8, roc_provide_u16x8, "U16x8");
+    CHECK_PROVIDED_VECTOR(RocI16x8, roc_provide_i16x8, "I16x8");
+    CHECK_PROVIDED_VECTOR(RocU32x4, roc_provide_u32x4, "U32x4");
+    CHECK_PROVIDED_VECTOR(RocI32x4, roc_provide_i32x4, "I32x4");
+    CHECK_PROVIDED_VECTOR(RocU64x2, roc_provide_u64x2, "U64x2");
+    CHECK_PROVIDED_VECTOR(RocI64x2, roc_provide_i64x2, "I64x2");
+
+#undef CHECK_PROVIDED_VECTOR
+
+    RocU8x16 bytes;
+    RocI16x8 words;
+    RocI32x4 dwords;
+    RocU32x4 udwords;
+    RocI64x2 qwords;
+    memcpy(&bytes, expected, sizeof(bytes));
+    memcpy(&words, expected, sizeof(words));
+    memcpy(&dwords, expected, sizeof(dwords));
+    memcpy(&udwords, expected, sizeof(udwords));
+    memcpy(&qwords, expected, sizeof(qwords));
+
+    ProbeVectorWrapper wrapper = { .only = bytes };
+    ProbeVectorWrapper wrapper_back = roc_provide_vector_wrapper(wrapper);
+    if (memcmp(&wrapper_back, &wrapper, sizeof(wrapper)) != 0) record_failure("provided vector wrapper mismatch");
+
+    ProbeVectorRecord record = { .bytes = bytes, .words = dwords, .before = 0x1020304050607080ULL, .after = 0xa0b0c0d0U };
+    ProbeVectorRecord record_back = roc_provide_vector_record(record);
+    if (memcmp(&record_back, &record, sizeof(record)) != 0) record_failure("provided vector record mismatch");
+
+    ProbeVectorQuad quad = { .a = bytes, .b = words, .c = udwords, .d = qwords };
+    ProbeVectorQuad quad_back = roc_provide_vector_quad(quad);
+    if (memcmp(&quad_back, &quad, sizeof(quad)) != 0) record_failure("provided vector quad mismatch");
+
+    ProbeVectorHva hva = { .a = bytes, .b = bytes, .c = bytes, .d = bytes };
+    ProbeVectorHva hva_back = roc_provide_vector_hva(hva);
+    if (memcmp(&hva_back, &hva, sizeof(hva)) != 0) record_failure("provided vector HVA mismatch");
+
+    AnonStructFbe9eaebfd8c38fd tuple = { ._1 = bytes, ._2 = words, ._0 = 0x1020304050607080ULL };
+    AnonStructFbe9eaebfd8c38fd tuple_back = roc_provide_vector_tuple(tuple);
+    if (memcmp(&tuple_back, &tuple, sizeof(tuple)) != 0) record_failure("provided vector tuple mismatch");
+
+    ProbeVectorTagPairPayload pair = { ._1 = words, ._0 = 0x1020304050607080ULL };
+    ProbeVectorTag tag = ProbeVectorTag_make_pair(pair);
+    ProbeVectorTag tag_back = roc_provide_vector_tag(tag);
+    ProbeVectorTagPairPayload pair_back = ProbeVectorTag_payload_pair(&tag_back);
+    if (tag_back.tag != ProbeVectorTagTag_Pair
+        || pair_back._0 != pair._0
+        || memcmp(&pair_back._1, &pair._1, sizeof(pair._1)) != 0) {
+        record_failure("provided host-constructed vector tag mismatch");
+    }
+
+    ProbeVectorTag roc_tag = roc_make_vector_tag();
+    ProbeVectorTag roc_tag_back = roc_provide_vector_tag(roc_tag);
+    ProbeVectorTagPairPayload roc_pair_back = ProbeVectorTag_payload_pair(&roc_tag_back);
+    const uint8_t expected_roc_tag_vector[16] = {
+        0xff, 0xee, 0xdd, 0xcc, 0xbb, 0xaa, 0x99, 0x88,
+        0x77, 0x66, 0x55, 0x44, 0x33, 0x22, 0x11, 0x00,
+    };
+    if (roc_tag_back.tag != ProbeVectorTagTag_Pair
+        || roc_pair_back._0 != 0x1020304050607080ULL
+        || memcmp(&roc_pair_back._1, expected_roc_tag_vector, sizeof(roc_pair_back._1)) != 0) {
+        record_failure("provided Roc-constructed vector tag mismatch");
+    }
+
+    RocU8x16 exhausted = roc_provide_exhaust_registers(
+        1, 2, 3, 4, 5, 6,
+        0.5, 1.5, 2.5, 3.5, 4.5, 5.5, 6.5, 7.5,
+        bytes);
+    if (memcmp(&exhausted, &bytes, sizeof(bytes)) != 0) record_failure("provided exhausted-register vector mismatch");
+}
+
 int main(void) {
     roc_main();
+    check_provided_abi();
     if (failure_count != 0) {
         fprintf(stderr, "%s\n", report[0] == 0 ? "FAIL layout-probe CGlue: unknown failure" : report);
         return 1;

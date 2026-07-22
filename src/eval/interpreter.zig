@@ -106,10 +106,6 @@ const InterpreterRocEnv = struct {
     jmp_buf: JmpBuf = undefined,
     active_jmp_buf: ?*JmpBuf = null,
     caller_roc_ops: *RocOps,
-    /// Interpreter currently executing through these RocOps. Erased-callable
-    /// trampolines use this explicit host context for static callable data,
-    /// whose immutable capture bytes cannot embed a mutable interpreter pointer.
-    active_interpreter: ?*anyopaque = null,
 
     fn init(allocator: Allocator, caller_roc_ops: *RocOps) InterpreterRocEnv {
         return .{
@@ -270,6 +266,11 @@ const InterpreterRocEnv = struct {
 /// Interprets statement-only LIR procs directly.
 pub const Interpreter = struct {
     const LirInterpreter = @This();
+    /// The interpreter whose Roc callback is synchronously callable on this
+    /// thread. A host invoking a Roc-created erased callable passes its own
+    /// `RocOps`, so callback dispatch cannot obtain the interpreter from
+    /// `ops.env`. Save and restore this around nested evaluations.
+    threadlocal var active_callback_interpreter: ?*LirInterpreter = null;
     const max_call_depth: usize = 1024;
     const stack_overflow_message =
         "This Roc program overflowed its stack memory. This usually means there is very deep or infinite recursion somewhere in the code.";
@@ -962,9 +963,9 @@ pub const Interpreter = struct {
 
     /// Evaluate a proc-root LIR program using the RocOps bound at initialization time.
     pub fn eval(self: *LirInterpreter, request: EvalRequest) Error!EvalResult {
-        const previous_interpreter = self.roc_env.active_interpreter;
-        self.roc_env.active_interpreter = @ptrCast(self);
-        defer self.roc_env.active_interpreter = previous_interpreter;
+        const previous_interpreter = active_callback_interpreter;
+        active_callback_interpreter = self;
+        defer active_callback_interpreter = previous_interpreter;
         self.roc_env.resetForEval();
         self.call_stack.clearRetainingCapacity();
         self.failed_call_stack.clearRetainingCapacity();
@@ -2911,24 +2912,22 @@ pub const Interpreter = struct {
     }
 
     fn interpreterErasedCallableTrampoline(
-        ops: *RocOps,
+        roc_ops: *RocOps,
         ret: ?[*]u8,
         args: ?[*]const u8,
         capture: ?[*]u8,
     ) callconv(.c) void {
-        const env: *InterpreterRocEnv = @ptrCast(@alignCast(ops.env));
-        const active_interpreter = env.active_interpreter orelse {
-            ops.crash("LIR/interpreter erased callable trampoline ran without an active interpreter");
+        const self = active_callback_interpreter orelse {
+            roc_ops.crash("LIR/interpreter erased callable trampoline ran without an active interpreter");
             unreachable;
         };
-        const self: *LirInterpreter = @ptrCast(@alignCast(active_interpreter));
         const callable = self.resolveInterpreterCallable(capture);
         self.callInterpreterErasedCallable(callable.proc_id, callable.capture_value_ptr, ret, args) catch |err| switch (err) {
-            error.OutOfMemory => ops.crash("LIR/interpreter erased callable trampoline ran out of memory"),
-            error.RuntimeError => ops.crash("LIR/interpreter erased callable trampoline hit runtime error"),
-            error.ComptimeExhaustiveness => ops.crash("LIR/interpreter erased callable trampoline hit compile-time exhaustiveness marker"),
-            error.DivisionByZero => ops.crash("LIR/interpreter erased callable trampoline hit division by zero"),
-            error.Crash => ops.crash("LIR/interpreter erased callable trampoline hit Roc crash"),
+            error.OutOfMemory => self.roc_ops.crash("LIR/interpreter erased callable trampoline ran out of memory"),
+            error.RuntimeError => self.roc_ops.crash("LIR/interpreter erased callable trampoline hit runtime error"),
+            error.ComptimeExhaustiveness => self.roc_ops.crash("LIR/interpreter erased callable trampoline hit compile-time exhaustiveness marker"),
+            error.DivisionByZero => self.roc_ops.crash("LIR/interpreter erased callable trampoline hit division by zero"),
+            error.Crash => self.roc_ops.crash("LIR/interpreter erased callable trampoline hit Roc crash"),
             // expect_err statements only occur in top-level expect test
             // roots, never in callable bodies.
             error.ExpectErr => unreachable,
@@ -5528,6 +5527,64 @@ pub const Interpreter = struct {
             .num_count_leading_zero_bits => self.numBitCountOp(args[0], ll.ret_layout, arg_layout, .count_leading_zeros),
             .num_count_trailing_zero_bits => self.numBitCountOp(args[0], ll.ret_layout, arg_layout, .count_trailing_zeros),
 
+            // ── Fixed-width integer SIMD ──
+            .simd_load_16_unchecked => self.evalSimdLoad(ll),
+            .simd_store_16_unchecked => self.evalSimdStore(ll),
+            .simd_append_16 => self.evalSimdAppend(ll),
+            .simd_splat,
+            .simd_get_lane_unchecked,
+            .simd_with_lane_unchecked,
+            .simd_to_u128_bits,
+            .simd_from_u128_bits,
+            .simd_add_wrap,
+            .simd_sub_wrap,
+            .simd_add_sat,
+            .simd_sub_sat,
+            .simd_neg_wrap,
+            .simd_abs_wrap,
+            .simd_min,
+            .simd_max,
+            .simd_abs_diff,
+            .simd_avg_rounded,
+            .simd_mul_wrap,
+            .simd_mul_high,
+            .simd_mul_q15_sat,
+            .simd_mul_wide_lo,
+            .simd_mul_wide_hi,
+            .simd_dot_pairs,
+            .simd_dot_pairs_sat,
+            .simd_sad,
+            .simd_and,
+            .simd_or,
+            .simd_xor,
+            .simd_not,
+            .simd_bit_select,
+            .simd_eq_lanes,
+            .simd_gt_lanes,
+            .simd_gte_lanes,
+            .simd_bitmask,
+            .simd_shl_wrap,
+            .simd_shr_wrap,
+            .simd_shr_zf_wrap,
+            .simd_shr_rounded,
+            .simd_interleave_lo,
+            .simd_interleave_hi,
+            .simd_even_lanes,
+            .simd_odd_lanes,
+            .simd_reverse_lanes,
+            .simd_table_lookup,
+            .simd_concat_shift_bytes,
+            .simd_widen_lo,
+            .simd_widen_hi,
+            .simd_pairwise_add_widen,
+            .simd_narrow_wrap,
+            .simd_narrow_sat,
+            .simd_sum_lanes,
+            .simd_sum_lanes_wrap,
+            .simd_clmul_lo,
+            .simd_clmul_hi,
+            => self.evalSimd(ll),
+
             // ── Comparison ──
             .num_is_eq => self.numCmpOp(args[0], args[1], arg_layout, .eq),
             .num_is_lt => self.numCmpOp(args[0], args[1], arg_layout, .lt),
@@ -6110,6 +6167,91 @@ pub const Interpreter = struct {
         dec,
     };
 
+    fn simdKind(self: *LirInterpreter, layout_idx: layout_mod.Idx) ?builtins.simd.Kind {
+        const value_layout = self.layout_store.getLayout(layout_idx);
+        if (value_layout.tag != .scalar or value_layout.getScalar().tag != .vector) return null;
+        return switch (value_layout.getScalar().getVector()) {
+            .u8x16 => .u8x16,
+            .i8x16 => .i8x16,
+            .u16x8 => .u16x8,
+            .i16x8 => .i16x8,
+            .u32x4 => .u32x4,
+            .i32x4 => .i32x4,
+            .u64x2 => .u64x2,
+            .i64x2 => .i64x2,
+        };
+    }
+
+    fn readLowBits(self: *LirInterpreter, value: Value, layout_idx: layout_mod.Idx) u128 {
+        var bits: u128 = 0;
+        const byte_count = @min(self.helper.sizeOf(layout_idx), @sizeOf(u128));
+        @memcpy(std.mem.asBytes(&bits)[0..byte_count], value.ptr[0..byte_count]);
+        return bits;
+    }
+
+    fn evalSimd(self: *LirInterpreter, ll: LowLevelEvalInput) Error!Value {
+        var arg_kind: ?builtins.simd.Kind = null;
+        for (ll.arg_layouts) |arg_layout_idx| {
+            arg_kind = self.simdKind(arg_layout_idx) orelse continue;
+            break;
+        }
+        const ret_kind = self.simdKind(ll.ret_layout);
+        const source_kind = arg_kind orelse ret_kind orelse return self.invariantFailedError(
+            "LIR/interpreter invariant violated: SIMD op {s} has no vector argument or result",
+            .{@tagName(ll.op)},
+        );
+        const destination_kind = ret_kind orelse source_kind;
+        var operands = [_]u128{ 0, 0, 0 };
+        for (0..@min(ll.args.len, operands.len)) |i| {
+            operands[i] = self.readLowBits(ll.args[i], try self.lowLevelArgLayout(ll, i));
+        }
+        const simd_op: builtins.simd.Op = @enumFromInt(ll.op.simdOpIndex() orelse unreachable);
+        const result_bits = builtins.simd.eval(simd_op, source_kind, destination_kind, operands[0], operands[1], operands[2]);
+        const result = try self.alloc(ll.ret_layout);
+        const result_size = @min(self.helper.sizeOf(ll.ret_layout), @sizeOf(u128));
+        @memcpy(result.ptr[0..result_size], std.mem.asBytes(&result_bits)[0..result_size]);
+        return result;
+    }
+
+    fn evalSimdLoad(self: *LirInterpreter, ll: LowLevelEvalInput) Error!Value {
+        const list = self.valueToRocListForLayout(ll.args[0], try self.lowLevelArgLayout(ll, 0));
+        const index: usize = @intCast(ll.args[1].read(u64));
+        const result = try self.alloc(ll.ret_layout);
+        @memcpy(result.ptr[0..16], list.bytes.?[index..][0..16]);
+        return result;
+    }
+
+    fn evalSimdStore(self: *LirInterpreter, ll: LowLevelEvalInput) Error!Value {
+        var list = self.valueToRocListForLayout(ll.args[1], try self.lowLevelArgLayout(ll, 1));
+        if (updateModeForArg1(ll.unique_args) == .Immutable) {
+            list = builtins.list.listClone(list, 1, 1, false, null, builtins.utils.rcNone, null, builtins.utils.rcNone, &self.roc_ops);
+        }
+        const index: usize = @intCast(ll.args[2].read(u64));
+        @memcpy(list.bytes.?[index..][0..16], ll.args[0].ptr[0..16]);
+        return self.rocListToValue(list, ll.ret_layout);
+    }
+
+    fn evalSimdAppend(self: *LirInterpreter, ll: LowLevelEvalInput) Error!Value {
+        var list = self.valueToRocListForLayout(ll.args[1], try self.lowLevelArgLayout(ll, 1));
+        list = builtins.list.listReserve(
+            list,
+            1,
+            16,
+            1,
+            false,
+            null,
+            builtins.utils.rcNone,
+            null,
+            builtins.utils.rcNone,
+            updateModeForArg1(ll.unique_args),
+            &self.roc_ops,
+        );
+        for (ll.args[0].readBytes(16)) |*byte| {
+            list = builtins.list.listAppendUnsafe(list, @ptrCast(@constCast(byte)), 1, &builtins.list.copy_fallback);
+        }
+        return self.rocListToValue(list, ll.ret_layout);
+    }
+
     /// Determine if a layout index represents a Dec type.
     fn isDec(layout_idx: layout_mod.Idx) bool {
         return layout_idx == .dec;
@@ -6287,6 +6429,7 @@ pub const Interpreter = struct {
                         .{ @intFromEnum(layout_idx), self.helper.sizeOf(layout_idx) },
                     ),
                 },
+                .vector => a.read(u128) == b.read(u128),
             },
             .box_of_zst => true,
             .box => blk: {

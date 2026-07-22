@@ -65,7 +65,7 @@ EndOfFile,
 			(e-literal (string "hello"))))
 	(s-let
 		(p-assign (ident "result"))
-		(e-dispatch-call (method "plus") (constraint-fn-var 232)
+		(e-dispatch-call (method "plus") (constraint-fn-var 224)
 			(receiver
 				(e-lookup-local
 					(p-assign (ident "x"))))

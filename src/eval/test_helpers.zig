@@ -12,6 +12,7 @@ const backend = @import("backend");
 const collections = @import("collections");
 const compiled_builtins = @import("compiled_builtins");
 const lir = @import("lir");
+const roc_target = @import("roc_target");
 const reporting = @import("reporting");
 
 const builtin_static = can.BuiltinStatic;
@@ -2322,22 +2323,46 @@ fn targetPtrWidthBits(target_usize: base.target.TargetUsize) u8 {
     return @intCast(target_usize.size() * 8);
 }
 
-fn llvmCompileOptions(target_usize: base.target.TargetUsize, opt: LlvmTestOpt) @import("llvm_compile").CompileOptions {
+const OwnedLlvmCompileOptions = struct {
+    options: @import("llvm_compile").CompileOptions,
+    cpu: [:0]u8,
+    features: [:0]u8,
+
+    fn deinit(self: *OwnedLlvmCompileOptions, allocator: Allocator) void {
+        allocator.free(self.cpu);
+        allocator.free(self.features);
+    }
+};
+
+fn llvmCompileOptions(allocator: Allocator, target_usize: base.target.TargetUsize, opt: LlvmTestOpt) TestHelperError!OwnedLlvmCompileOptions {
     const llvm_compile = @import("llvm_compile");
-    return switch (opt) {
+    const native_roc_target = roc_target.RocTarget.detectNative();
+    const resolved_target = std.zig.system.resolveTargetQuery(std.Options.debug_io, native_roc_target.llvmTargetQuery()) catch
+        return error.UnsupportedTarget;
+    const cpu = try allocator.dupeZ(u8, roc_target.llvmCpuName(resolved_target));
+    errdefer allocator.free(cpu);
+    const features = try roc_target.llvmFeatureString(allocator, resolved_target);
+    errdefer allocator.free(features);
+
+    const options: llvm_compile.CompileOptions = switch (opt) {
         .size => .{
             .function_sections = false,
             .use_module_target_triple = true,
             .optimization = llvm_compile.bindings.IrOptimizationLevel.Oz,
             .target_ptr_width_bits = targetPtrWidthBits(target_usize),
+            .cpu = cpu,
+            .features = features,
         },
         .speed => .{
             .function_sections = false,
             .use_module_target_triple = true,
             .optimization = llvm_compile.bindings.IrOptimizationLevel.O3,
             .target_ptr_width_bits = targetPtrWidthBits(target_usize),
+            .cpu = cpu,
+            .features = features,
         },
     };
+    return .{ .options = options, .cpu = cpu, .features = features };
 }
 
 fn callLlvmBoolRoot(
@@ -2634,11 +2659,13 @@ pub fn llvmEvalBoolRootModulesWithMaxWorkersAndCallbacks(
         bitcode_len += 1;
     }
 
+    var compile_options = try llvmCompileOptions(allocator, modules[0].layouts.targetUsize(), opt);
+    defer compile_options.deinit(allocator);
     const dylib_path = try llvm_compile.compileBitcodeModulesToSharedLibrary(
         allocator,
         std.Options.debug_io,
         bitcode_slices,
-        llvmCompileOptions(modules[0].layouts.targetUsize(), opt),
+        compile_options.options,
     );
     defer {
         std.Io.Dir.deleteFileAbsolute(std.Options.debug_io, std.mem.sliceTo(dylib_path, 0)) catch {};
@@ -2942,11 +2969,14 @@ pub fn llvmEvaluatorInspectedStr(allocator: Allocator, lowered: *const LoweredPr
         owned.deinit();
     }
 
-    const dylib_path = try llvm_compile.compileToSharedLibrary(allocator, std.Options.debug_io, bitcode.bitcode, .{
-        .function_sections = false,
-        .use_module_target_triple = true,
-        .target_ptr_width_bits = targetPtrWidthBits(lowered.view.layouts.targetUsize()),
-    });
+    var compile_options = try llvmCompileOptions(allocator, lowered.view.layouts.targetUsize(), .speed);
+    defer compile_options.deinit(allocator);
+    const dylib_path = try llvm_compile.compileToSharedLibrary(
+        allocator,
+        std.Options.debug_io,
+        bitcode.bitcode,
+        compile_options.options,
+    );
     defer {
         std.Io.Dir.deleteFileAbsolute(std.Options.debug_io, std.mem.sliceTo(dylib_path, 0)) catch {};
         allocator.free(dylib_path);
@@ -3016,7 +3046,10 @@ pub fn wasmEvaluatorStrWithStats(allocator: Allocator, lowered: *const LoweredPr
     defer codegen.deinit();
 
     const proc = lowered.view.store.getProcSpec(lowered.mainProc());
-    const wasm_result = codegen.generateModule(lowered.mainProc(), proc.ret_layout) catch return error.OutOfMemory;
+    const wasm_result = codegen.generateModule(lowered.mainProc(), proc.ret_layout) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.HostedFunctionTypeMismatch => return error.Internal,
+    };
     defer allocator.free(wasm_result.wasm_bytes);
 
     const result = try @import("wasm_runner.zig").runWasmStrWithStats(allocator, wasm_result.wasm_bytes, wasm_result.has_imports);

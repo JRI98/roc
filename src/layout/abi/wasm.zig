@@ -36,7 +36,7 @@ pub fn classifyType(store: *const Store, idx: Idx) Class {
         .scalar => {
             const scalar = lay.getScalar();
             switch (scalar.tag) {
-                .int, .frac, .opaque_ptr => return .{ .direct = idx },
+                .int, .frac, .opaque_ptr, .vector => return .{ .direct = idx },
                 // RocStr is a multi-field aggregate.
                 .str => return .indirect,
             }
@@ -79,7 +79,8 @@ pub fn classifyType(store: *const Store, idx: Idx) Class {
 
 /// Whether a directly-passed value is wider than 64 bits and must be lowered as two i64s.
 pub fn lowerAsDoubleI64(store: *const Store, idx: Idx) bool {
-    return store.layoutSize(store.getLayout(idx)) > 8;
+    const lay = store.getLayout(idx);
+    return store.layoutSize(lay) > 8 and !(lay.tag == .scalar and lay.getScalar().tag == .vector);
 }
 
 const testing = std.testing;
@@ -101,6 +102,8 @@ test "wasm classify: scalars are direct" {
     try testing.expectEqual(Class{ .direct = .i128 }, classifyType(&store, .i128));
     try testing.expect(lowerAsDoubleI64(&store, .i128));
     try testing.expect(!lowerAsDoubleI64(&store, .i32));
+    try testing.expectEqual(Class{ .direct = .u8x16 }, classifyType(&store, .u8x16));
+    try testing.expect(!lowerAsDoubleI64(&store, .u8x16));
 }
 
 test "wasm classify: aggregates are indirect, single-field structs unwrap" {
@@ -119,6 +122,12 @@ test "wasm classify: aggregates are indirect, single-field structs unwrap" {
     // A single-field struct is passed as its field.
     const wrapped = try testStruct(&store, &.{.i64});
     try testing.expectEqual(Class{ .direct = .i64 }, classifyType(&store, wrapped));
+
+    const wrapped_vector = try testStruct(&store, &.{.i16x8});
+    try testing.expectEqual(Class{ .direct = .i16x8 }, classifyType(&store, wrapped_vector));
+
+    const two_vectors = try testStruct(&store, &.{ .i16x8, .i16x8 });
+    try testing.expectEqual(Class.indirect, classifyType(&store, two_vectors));
 
     // A single-variant tag union has an implicit discriminant and follows the
     // payload's ABI.
