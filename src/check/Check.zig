@@ -1000,6 +1000,7 @@ const HoistSelectionTransaction = struct {
             .e_runtime_error,
             .e_ellipsis,
             .e_anno_only,
+            .e_derived_method,
             .e_crash,
             .e_closure,
             .e_lambda,
@@ -2540,6 +2541,7 @@ fn markHoistInvalidatedExprChildren(
         .e_crash,
         .e_ellipsis,
         .e_anno_only,
+        .e_derived_method,
         .e_break,
         .e_hosted_lambda,
         => {},
@@ -2699,6 +2701,7 @@ fn firstHoistSelectionTestExpr(checker: *Self) error{ExpectedHoistSelectionTestE
             .e_runtime_error,
             .e_ellipsis,
             .e_anno_only,
+            .e_derived_method,
             .e_crash,
             .e_closure,
             .e_lambda,
@@ -2997,6 +3000,7 @@ fn exprCanBeHoistedRoot(self: *Self, expr: CIR.Expr.Idx) bool {
         .e_runtime_error,
         .e_ellipsis,
         .e_anno_only,
+        .e_derived_method,
         .e_crash,
         .e_closure,
         .e_lambda,
@@ -3065,6 +3069,7 @@ fn exprCanCoverHoistedChildren(self: *Self, expr: CIR.Expr.Idx) bool {
         .e_runtime_error,
         .e_ellipsis,
         .e_anno_only,
+        .e_derived_method,
         .e_crash,
         .e_closure,
         .e_lambda,
@@ -3122,6 +3127,7 @@ fn exprCanBeHoistedBindingRoot(self: *Self, expr: CIR.Expr.Idx) bool {
         .e_runtime_error,
         .e_ellipsis,
         .e_anno_only,
+        .e_derived_method,
         .e_crash,
         .e_closure,
         .e_lambda,
@@ -5738,6 +5744,7 @@ fn hoistedRootDependenciesAreKeptInternal(
         .e_lookup_required,
         .e_ellipsis,
         .e_anno_only,
+        .e_derived_method,
         .e_crash,
         .e_closure,
         .e_lambda,
@@ -5877,6 +5884,7 @@ fn hoistedExprAllowsStoredConst(
         .e_runtime_error,
         .e_ellipsis,
         .e_anno_only,
+        .e_derived_method,
         .e_crash,
         .e_hosted_lambda,
         => true,
@@ -5997,6 +6005,7 @@ fn hoistedCallableDefForExpr(
         .e_runtime_error,
         .e_ellipsis,
         .e_anno_only,
+        .e_derived_method,
         .e_crash,
         .e_return,
         .e_break,
@@ -9884,9 +9893,25 @@ fn generateAnnoTypeInPlace(self: *Self, anno_idx: CIR.TypeAnno.Idx, env: *Env, c
                 try self.declareOwnedStaticDispatchConstraint(where_idx, anno_var, env);
             }
 
+            var constraint_representatives = std.AutoHashMap(Ident.Idx, usize).init(self.gpa);
+            defer constraint_representatives.deinit();
+            try constraint_representatives.ensureTotalCapacity(@intCast(owned_where_clauses.len));
+
+            // A dispatcher's requirements are a method-keyed set. Keep the
+            // first source occurrence as its stable evidence position, and
+            // share its callable type with every repeated source constraint.
             const static_dispatch_constraints_start = self.types.static_dispatch_constraints.len();
             for (0..owned_where_clauses.len) |offset| {
-                const scratch_constraint = self.scratch_static_dispatch_constraints.items.items[scratch_constraints_start + offset];
+                const scratch_index = scratch_constraints_start + offset;
+                const scratch_constraint = self.scratch_static_dispatch_constraints.items.items[scratch_index];
+                const representative = try constraint_representatives.getOrPut(scratch_constraint.constraint.fn_name);
+                if (representative.found_existing) {
+                    const representative_constraint = self.scratch_static_dispatch_constraints.items.items[representative.value_ptr.*];
+                    _ = try self.unify(representative_constraint.constraint.fn_var, scratch_constraint.constraint.fn_var, env);
+                    continue;
+                }
+
+                representative.value_ptr.* = scratch_index;
                 _ = try self.types.static_dispatch_constraints.append(self.types.gpa, scratch_constraint.constraint);
             }
             const static_dispatch_constraints_end = self.types.static_dispatch_constraints.len();
@@ -13373,15 +13398,11 @@ fn checkExpr(self: *Self, expr_idx: CIR.Expr.Idx, env: *Env, expected: Expected)
         },
         .e_anno_only => |anno| {
             if (expected.annotation != null and
-                ((can.BuiltinLowLevel.isBuiltinModule(self.cir) and
-                    can.BuiltinLowLevel.isIntrinsicAnnotation(self.cir, anno.ident)) or
-                    self.isGeneratedDerivedMethodAnnotation(anno.ident, expected.annotation.?)))
+                can.BuiltinLowLevel.isBuiltinModule(self.cir) and
+                can.BuiltinLowLevel.isIntrinsicAnnotation(self.cir, anno.ident))
             {
                 // Builtin.roc has a small explicit set of compiler-owned intrinsic
                 // wrappers that post-check lowering handles from checked data.
-                // Annotation-only derived-method declarations are opt-in markers
-                // whose generated targets are published in the static dispatch
-                // registry; every other annotation-only value remains an error.
             } else {
                 _ = try self.problems.appendProblem(self.gpa, .{ .annotation_only_value = .{
                     .region = if (expected.annotation) |annotation_idx|
@@ -13391,6 +13412,11 @@ fn checkExpr(self: *Self, expr_idx: CIR.Expr.Idx, env: *Env, expected: Expected)
                 } });
                 try self.unifyWith(expr_var, .err, env);
             }
+        },
+        .e_derived_method => {
+            // Canonicalization has already validated this explicit compiler-owned
+            // marker. Its generated target is published in the static dispatch
+            // registry after checking.
         },
         .e_return => |ret| {
             self.markCurrentHoistObservableEffect();
@@ -13952,13 +13978,7 @@ fn patternIdentInModule(module_env: *const ModuleEnv, def_idx: CIR.Def.Idx) ?Ide
 
 fn generatedDerivedMethodDef(module_env: *const ModuleEnv, def_idx: CIR.Def.Idx) bool {
     const def = module_env.store.getDef(def_idx);
-    const annotation_idx = def.annotation orelse return false;
-    switch (module_env.store.getExpr(def.expr)) {
-        .e_anno_only, .e_hosted_lambda => {},
-        else => return false,
-    }
-    const ident = patternIdentInModule(module_env, def_idx) orelse return false;
-    return can.BuiltinLowLevel.isDerivedMethodMarker(module_env, ident, annotation_idx);
+    return module_env.store.getExpr(def.expr) == .e_derived_method;
 }
 
 fn isExprNodeTag(tag: CIR.Node.Tag) bool {
@@ -13985,6 +14005,7 @@ fn isFunctionDef(store: *const CIR.NodeStore, expr: CIR.Expr) bool {
         },
         .e_lambda => true,
         .e_anno_only => true,
+        .e_derived_method => true,
         .e_hosted_lambda => true,
         else => false,
     };
@@ -20567,6 +20588,9 @@ fn nominalSupportsDerivedParseField(
         if (try self.jsonTryInfoFromNominal(nominal)) |info| {
             return try self.varSupportsDerivedParseShape(info.ok_var, env, region);
         }
+        if (try self.unboundTryInfoFromNominal(nominal)) |info| {
+            return try self.varSupportsDerivedParseShape(info.ok_var, env, region);
+        }
         return false;
     }
 
@@ -20782,6 +20806,31 @@ fn missingTryInfoFromNominal(
     return .{
         .ok_var = try_info.ok_var,
         .err_var = try_info.err_var,
+    };
+}
+
+/// A builtin `Try` whose error row is still an unbound flex var, as in a
+/// record field annotated `Try(ok, _)`. Such a field opts into the
+/// optional-field convention; parse derivation pins the row to `[Missing]`.
+fn unboundTryInfoFromNominal(
+    self: *Self,
+    nominal: types_mod.NominalType,
+) Allocator.Error!?BuiltinTryInfo {
+    const try_info = (try self.builtinTryInfoFromNominal(nominal)) orelse return null;
+    return switch (self.types.resolveVar(try_info.err_var).desc.content) {
+        .flex => try_info,
+        else => null,
+    };
+}
+
+fn unboundTryInfoForVar(self: *Self, var_: Var) Allocator.Error!?BuiltinTryInfo {
+    return switch (self.types.resolveVar(var_).desc.content) {
+        .structure => |structure| switch (structure) {
+            .nominal_type => |nominal| try self.unboundTryInfoFromNominal(nominal),
+            else => null,
+        },
+        .alias => |alias| try self.unboundTryInfoForVar(self.types.getAliasBackingVar(alias)),
+        .err, .flex, .rigid => null,
     };
 }
 
@@ -21614,18 +21663,6 @@ fn satisfyImplicitEncoderForConstraint(
         },
         .unsupported => try self.reportConstraintError(dispatcher_var, constraint, .not_nominal, env, false),
     }
-}
-
-fn isGeneratedDerivedMethodAnnotation(self: *const Self, ident: Ident.Idx, annotation_idx: CIR.Annotation.Idx) bool {
-    const text = self.cir.getIdent(ident);
-    const is_derived = Ident.textEndsWith(text, ".is_eq") or
-        Ident.textEndsWith(text, ".to_hash") or
-        Ident.textEndsWith(text, ".parser_for") or
-        Ident.textEndsWith(text, ".encoder_for") or
-        Ident.textEndsWith(text, ".map") or
-        Ident.textEndsWith(text, ".map!");
-    if (!is_derived) return false;
-    return self.cir.store.getTypeAnno(self.cir.store.getAnnotation(annotation_idx).anno) == .underscore;
 }
 
 fn localLookupIsGeneratedDerivedMethodMarker(self: *const Self, pattern_idx: CIR.Pattern.Idx) bool {
@@ -22532,16 +22569,22 @@ fn validateDerivedParseRecord(
         .ok => {},
         .unsupported, .reported_error => |result| return result,
     }
+    const fields = self.types.getRecordFieldsSlice(fields_range);
+    const field_vars = try self.gpa.dupe(Var, fields.items(.var_));
+    defer self.gpa.free(field_vars);
+
+    for (field_vars) |field_var| {
+        switch (try self.pinWildcardOptionalParseField(field_var, env, region)) {
+            .ok => {},
+            .unsupported, .reported_error => |result| return result,
+        }
+    }
     if (try self.recordParseNeedsRequiredFieldError(fields_range)) {
         switch (try self.constrainDerivedParserRequiredFieldError(err_var, env, region)) {
             .ok => {},
             .unsupported, .reported_error => |result| return result,
         }
     }
-
-    const fields = self.types.getRecordFieldsSlice(fields_range);
-    const field_vars = try self.gpa.dupe(Var, fields.items(.var_));
-    defer self.gpa.free(field_vars);
 
     for (field_vars) |field_var| {
         switch (try self.validateDerivedParseVar(field_var, encoding_var, state_var, err_var, constraint, env, region, visited, .record_field)) {
@@ -22581,6 +22624,24 @@ fn validateDerivedParseTuple(
         }
     }
     return .ok;
+}
+
+/// A record field annotated `Try(ok, _)` opts into the optional-field
+/// convention: pin its unbound error row to the exact `[Missing]` marker so
+/// optional classification and lowering see the one canonical optional shape.
+fn pinWildcardOptionalParseField(
+    self: *Self,
+    field_var: Var,
+    env: *Env,
+    region: Region,
+) Allocator.Error!DerivedParseValidation {
+    const info = (try self.unboundTryInfoForVar(field_var)) orelse return .ok;
+    const tag_name = try @constCast(self.cir).insertIdent(base.Ident.for_text("Missing"));
+    const tag = try self.types.mkTag(tag_name, &.{});
+    const ext_var = try self.freshFromContent(.{ .structure = .empty_tag_union }, env, region);
+    const missing_var = try self.freshFromContent(try self.types.mkTagUnion(&.{tag}, ext_var), env, region);
+    const result = try self.unify(info.err_var, missing_var, env);
+    return if (result.isOk()) .ok else .reported_error;
 }
 
 fn recordParseNeedsRequiredFieldError(

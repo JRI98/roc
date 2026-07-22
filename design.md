@@ -465,6 +465,65 @@ not silently demote the value from compile-time evaluation. No backend may
 rediscover or guess root eligibility by scanning source syntax, function
 bodies, object symbols, or generated code.
 
+Target static data is produced from explicit, closed LIR initializer procedures.
+Monotype restoration builds each initializer from the stored `ConstStore` value,
+then closure lifting, lambda solving, layout commitment, structural LIR rewrites,
+and ARC run normally. The initializer's returned LIR value is the sole source of
+target representation: static materialization freezes its exact bytes,
+allocations, procedure relocations, and explicit generated-RC-helper
+relocations into readonly target data. It must not
+walk `ConstStore` in reverse using a type-derived storage plan, because a
+target-independent `ConstStore` node does not preserve the contextual callable
+encoding of every nested allocation.
+
+F32 and F64 are distinct representations throughout the post-check pipeline.
+An F32 local, immediate, register value, stack slot, call argument, return, and
+builtin-wrapper parameter/result must remain IEEE binary32. A backend must not
+implement an F32 LIR operation by widening its operands to F64, performing the
+F64 operation, and narrowing the result. F64 may enter an F32 value's dataflow
+only at an explicit language conversion between F32 and F64. Integer and Dec
+conversions to F32 must round directly to binary32 rather than converting to
+F64 first, so they cannot double-round.
+
+Floating-point evaluation has an explicit NaN mode. Ordinary runtime execution
+uses `preserve`, which permits the target's native f32 and f64 NaN sign, payload,
+and signaling-bit result. Any interpreter or backend used to execute a static
+initializer must instead use `normalize`. In that mode, every f32 or f64 value
+produced by an LIR assignment is canonicalized before it is bound to its local:
+all f32 NaNs become bits `0x7fc00000`, and all f64 NaNs become bits
+`0x7ff8000000000000`. This producer-side invariant includes results nested into
+later aggregates because aggregate construction consumes already-normalized
+locals. The `ConstStore` writer and target static-data materializer must freeze
+the value they receive and must not inspect, repair, or guess floating-point
+behavior. Consequently, the same checked initializer has byte-identical NaNs
+whether compile-time evaluation runs through the interpreter or native code,
+and regardless of the host used for cross-compilation.
+
+Runtime NaNs need not have identical in-memory bits, but Roc code must not be
+able to distinguish their sign or payload. The float `to_bits` operations and
+hashing canonicalize every NaN at their public observation boundaries, and
+`to_str` renders every NaN as `"nan"` without a sign. Fallible float-to-integer
+conversions and fallible f64-to-f32 narrowing reject non-finite inputs before
+conversion; wrapping float-to-integer conversions have explicit
+target-independent modulo behavior and map every non-finite input to zero.
+Encoders may distinguish NaN, positive infinity, and negative infinity, but not
+individual NaN representations. A new float operation or observation boundary
+must preserve these rules explicitly; a backend must never infer from its use
+whether normalization is required.
+
+Static initializer execution uses target-width symbolic memory rather than host
+pointers. Every allocation records its committed target layout, alignment,
+reference-count metadata, and relocations. Materialization freezes the graph
+reachable from the returned value and may deduplicate only exact target
+representations. It must not choose callable variants, reconstruct layouts, or
+search for compatible encodings: those decisions already exist explicitly in
+the initializer's LIR. In particular, an erased callable's final-drop
+relocation carries its exact RC operation and capture-layout identity; a
+backend compiles that named atomic helper and never derives it from the
+capture layout or a symbol name.
+Initializer procedures are materialization-only LIR: they remain available to
+the freezer but runtime backends do not emit dead machine code for them.
+
 Release builds of the compiler must never impose artificial resource limits on
 compile-time evaluation. In particular, the interpreter's call-depth guard
 (`max_call_depth` in `src/eval/interpreter.zig`) is enforced only in Debug
@@ -1062,18 +1121,19 @@ alias roots union-find representatives for concrete structures.
 
 The compile coordinator records phase progress separately from terminal module
 outcome. A terminal module has exactly one explicit outcome: success or failure.
-Successful completion means the module produced the complete semantic state
-required by importers, including its final content identity. Failed completion
-is terminal only for scheduling and accounting; any partial `ModuleEnv` retained
-for diagnostics or watch inputs is not semantic import data.
+Successful completion means the module produced the complete `ModuleEnv` and
+checked module data required by importers, including its final content identity.
+Failed completion is terminal only for scheduling and accounting; any partial
+`ModuleEnv` retained for diagnostics or watch inputs is not valid importer input.
 
-Every semantic scheduling edge requires successful completion. Canonicalization,
-content-identity construction, checking, checked-cache publication, and platform
-requirement checking may consume only successful imported modules. A known
-failed module causes failure to propagate iteratively through all local-import,
-cross-package-import, and registered platform/app dependency edges. An import
-that cannot be resolved is distinct from a known failed module and proceeds only
-far enough for canonicalization to emit its source diagnostic.
+Every scheduling edge that consumes imported `ModuleEnv` or checked module data
+requires successful completion. Canonicalization, content-identity construction,
+checking, checked module cache construction, and platform requirement checking
+may consume only successful imported modules. A known failed module causes
+failure to propagate iteratively through all local-import, cross-package-import,
+and registered platform/app dependency edges. An import that cannot be resolved
+is distinct from a known failed module and proceeds only far enough for
+canonicalization to emit its source diagnostic.
 
 When a local import closes a cycle, the coordinator records the closing edge
 before reporting it. It then identifies the exact strongly connected component
@@ -1872,6 +1932,14 @@ one with an annotation-only method such as `is_eq : _` or `map : _`. An exact
 method body remains an ordinary method implementation. Inspection is the sole
 exception to this opt-in rule: every type is inspectable, opaque values use the
 opaque representation, and an exact `to_inspect` method may override it.
+
+Canonicalization records each recognized associated underscore opt-in as an
+`e_derived_method` CIR expression carrying its exact derived-method kind. An
+ordinary annotation without a body remains `e_anno_only`; in a platform package,
+only that ordinary form may be rewritten into a hosted declaration. Checking and
+insertion into the checked method registry consume the explicit derived-method
+kind and must not recover compiler intent from identifier text or the annotation
+shape.
 
 Derived `map` and `map!` apply only to tag-union backing shapes. The checker
 selects one direct tag payload slot; it never descends into records, tuples, or
@@ -3310,7 +3378,8 @@ occurrence, then constraint fn types walked the same way). Index `k` in this
 list is the shared identity between a plan's `constraint(k)` resolution and
 the k-th evidence entry a call edge supplies. The definition's module and any
 importing module enumerate identical lists from their structural copies of the
-scheme.
+scheme. A dispatcher's requirements are a set keyed by method identity: repeated
+source constraints share one callable type and contribute one evidence param.
 
 **Edges supply evidence.** Checking persists every constrained-scheme edge.
 An ordinary instantiation records the (pristine var, fresh var) pairs of its
@@ -4749,6 +4818,25 @@ parallel insertion paths at any point:
    the low-level op table, the unique entries in `RcSig` and the
    specialization demand vector, check-free helper plans, and the certifier
    rule.
+
+## Dev Backend Register Lifetimes
+
+`LirCodeGen` is the sole authority for LIR local locations. Every assigned
+LIR local is materialized into a stable location—a stack slot for represented
+runtime data—before statement generation continues. Architecture-specific code
+generators own only architecture register masks for short-lived
+instruction-selection temporaries; they do not
+own a second local-location map, move live values between registers and stack,
+or reload LIR local values independently.
+
+The number of simultaneously live instruction-selection temporaries must be
+bounded by the emitted operation, never by source or layout nesting depth.
+Explicit emission worklists carry stack offsets and reuse their
+caller-provided result register across child continuations. They must not retain
+one newly allocated architecture register per recursive layout, control-flow node,
+list element layer, or tag payload layer. Register-pool exhaustion is therefore
+an internal lifetime-invariant failure, not a source-program condition and not
+an invitation for an architecture-specific best-effort spill.
 
 ## Compile-Time Constants
 
