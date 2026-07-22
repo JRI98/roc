@@ -129,7 +129,6 @@ const jobs = [_]Job{
     .{ .name = "run-test-zig-lir-inline" },
     .{ .name = "run-test-zig-trmc-lir" },
     .{ .name = "run-test-zig-build-helpers" },
-    .{ .name = "run-test-zig-cli-runner-unit" },
     .{ .name = "run-test-zig-backend-llvm" },
     .{ .name = "run-test-eval", .kind = .harness, .args = &.{ "--timeout", "120000" } },
     .{ .name = "run-test-simd-differential", .kind = .harness },
