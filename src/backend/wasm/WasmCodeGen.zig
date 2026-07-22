@@ -5888,6 +5888,21 @@ fn emitI128Sub(self: *Self, lhs_local: u32, rhs_local: u32) Allocator.Error!void
 /// Emit i128 × i128 → i128 truncating multiply.
 /// Takes two i32 pointers to 16-byte i128 values in linear memory.
 /// Pushes an i32 pointer to the 16-byte result.
+/// Push a scalar shift count onto the stack, taken modulo the type's bit width.
+/// The wasm i32/i64 shift instructions already mask the count modulo 32/64, so
+/// only the 8- and 16-bit types (which live in an i32) need an explicit mask.
+/// The count is a U8; for 64-bit types it is extended to i64 to match the value.
+fn emitScalarShiftCount(self: *Self, shift_arg: ProcLocalId, layout_idx: layout.Idx, vt: ValType) Allocator.Error!void {
+    try self.emitProcLocal(shift_arg);
+    const width = shiftBitWidth(layout_idx);
+    if (width < 32) {
+        self.currentCode().append(self.allocator, Op.i32_const) catch return error.OutOfMemory;
+        WasmModule.leb128WriteI32(self.allocator, self.currentCode(), @intCast(width - 1)) catch return error.OutOfMemory;
+        self.currentCode().append(self.allocator, Op.i32_and) catch return error.OutOfMemory;
+    }
+    if (vt == .i64) self.currentCode().append(self.allocator, Op.i64_extend_i32_u) catch return error.OutOfMemory;
+}
+
 /// Emit i128/u128 shift operation. LHS is composite (16 bytes), RHS is U8 (i32 on wasm stack).
 /// Uses wasm structured if/else to handle shift amounts >= 64.
 /// Pushes an i32 pointer to the 16-byte result on the wasm stack.
@@ -5917,9 +5932,30 @@ fn emitI128Shift(self: *Self, op: anytype, args: anytype) Allocator.Error!void {
     self.currentCode().append(self.allocator, Op.i64_extend_i32_u) catch return error.OutOfMemory;
     try self.emitLocalSet(shift_local);
 
+    // The shift count is taken modulo 128.
+    try self.emitLocalGet(shift_local);
+    self.currentCode().append(self.allocator, Op.i64_const) catch return error.OutOfMemory;
+    WasmModule.leb128WriteI64(self.allocator, self.currentCode(), 127) catch return error.OutOfMemory;
+    self.currentCode().append(self.allocator, Op.i64_and) catch return error.OutOfMemory;
+    try self.emitLocalSet(shift_local);
+
     // Locals for result
     const r_low = self.storage.allocAnonymousLocal(.i64) catch return error.OutOfMemory;
     const r_high = self.storage.allocAnonymousLocal(.i64) catch return error.OutOfMemory;
+
+    // Shifting by zero (modulo 128, so also counts that are multiples of 128)
+    // leaves the value unchanged. Handling it explicitly keeps the < 64 path
+    // below from computing `word >> 64`, which wasm would mask to `>> 0` and so
+    // produce the wrong result.
+    try self.emitLocalGet(shift_local);
+    self.currentCode().append(self.allocator, Op.i64_eqz) catch return error.OutOfMemory;
+    self.currentCode().append(self.allocator, Op.@"if") catch return error.OutOfMemory;
+    self.currentCode().append(self.allocator, @intFromEnum(WasmModule.BlockType.void)) catch return error.OutOfMemory;
+    try self.emitLocalGet(a_low);
+    try self.emitLocalSet(r_low);
+    try self.emitLocalGet(a_high);
+    try self.emitLocalSet(r_high);
+    self.currentCode().append(self.allocator, Op.@"else") catch return error.OutOfMemory;
 
     // Branch: if shift >= 64
     try self.emitLocalGet(shift_local);
@@ -6039,6 +6075,9 @@ fn emitI128Shift(self: *Self, op: anytype, args: anytype) Allocator.Error!void {
         else => unreachable,
     }
 
+    // Close the `shift >= 64` if/else.
+    self.currentCode().append(self.allocator, Op.end) catch return error.OutOfMemory;
+    // Close the `shift == 0` if/else.
     self.currentCode().append(self.allocator, Op.end) catch return error.OutOfMemory;
 
     // Store results
@@ -14393,7 +14432,13 @@ fn emitNumericLowLevel(self: *Self, op: anytype, args: anytype, ret_layout: layo
     }
     // I128/U128 shifts: LHS is composite but RHS is U8 — needs dedicated handling.
     if (is_shift and (try self.isCompositeLocal(GuardedList.at(args, 0)) or try self.isCompositeLayout(operand_layout))) {
-        return self.emitI128Shift(plain_op, args);
+        // For unsigned 128-bit values, `num_shift_right_by` is a logical shift,
+        // which is exactly what `num_shift_right_zf_by` emits.
+        const shift_op: lir.LowLevel = if (plain_op == .num_shift_right_by and operand_layout == .u128)
+            .num_shift_right_zf_by
+        else
+            plain_op;
+        return self.emitI128Shift(shift_op, args);
     }
 
     if (plain_op == .num_negate and try self.isCompositeLayout(operand_layout)) {
@@ -14734,89 +14779,48 @@ fn emitNumericLowLevel(self: *Self, op: anytype, args: anytype, ret_layout: layo
             }
         },
         .num_shift_left_by => {
-            const shift_local = self.storage.allocAnonymousLocal(.i32) catch return error.OutOfMemory;
-            try self.emitProcLocal(GuardedList.at(args, 1));
-            try self.emitLocalSet(shift_local);
-
-            self.currentCode().append(self.allocator, Op.local_get) catch return error.OutOfMemory;
-            WasmModule.leb128WriteU32(self.allocator, self.currentCode(), shift_local) catch return error.OutOfMemory;
-            self.currentCode().append(self.allocator, Op.i32_const) catch return error.OutOfMemory;
-            WasmModule.leb128WriteI32(self.allocator, self.currentCode(), @intCast(shiftBitWidth(layout_idx))) catch return error.OutOfMemory;
-            self.currentCode().append(self.allocator, Op.i32_ge_u) catch return error.OutOfMemory;
-            self.currentCode().append(self.allocator, Op.@"if") catch return error.OutOfMemory;
-            self.currentCode().append(self.allocator, @intFromEnum(if (vt == .i64) WasmModule.BlockType.i64 else WasmModule.BlockType.i32)) catch return error.OutOfMemory;
-
-            if (vt == .i64) {
-                self.currentCode().append(self.allocator, Op.i64_const) catch return error.OutOfMemory;
-                WasmModule.leb128WriteI64(self.allocator, self.currentCode(), 0) catch return error.OutOfMemory;
-            } else {
-                self.currentCode().append(self.allocator, Op.i32_const) catch return error.OutOfMemory;
-                WasmModule.leb128WriteI32(self.allocator, self.currentCode(), 0) catch return error.OutOfMemory;
-            }
-
-            self.currentCode().append(self.allocator, Op.@"else") catch return error.OutOfMemory;
             try self.emitProcLocal(GuardedList.at(args, 0));
-            self.currentCode().append(self.allocator, Op.local_get) catch return error.OutOfMemory;
-            WasmModule.leb128WriteU32(self.allocator, self.currentCode(), shift_local) catch return error.OutOfMemory;
-            if (vt == .i64) self.currentCode().append(self.allocator, Op.i64_extend_i32_u) catch return error.OutOfMemory;
+            try self.emitScalarShiftCount(GuardedList.at(args, 1), layout_idx, vt);
             const wasm_op: u8 = switch (vt) {
                 .i32 => Op.i32_shl,
                 .i64 => Op.i64_shl,
                 .f32, .f64 => unreachable,
             };
             self.currentCode().append(self.allocator, wasm_op) catch return error.OutOfMemory;
-            self.currentCode().append(self.allocator, Op.end) catch return error.OutOfMemory;
         },
         .num_shift_right_by => {
+            const is_unsigned = switch (layout_idx) {
+                .u8, .u16, .u32, .u64 => true,
+                else => false,
+            };
             try self.emitProcLocal(GuardedList.at(args, 0));
-            try self.emitProcLocal(GuardedList.at(args, 1));
-            if (vt == .i64) self.currentCode().append(self.allocator, Op.i64_extend_i32_u) catch return error.OutOfMemory;
+            try self.emitScalarShiftCount(GuardedList.at(args, 1), layout_idx, vt);
+            // Signed types shift arithmetically (sign-filling); unsigned types
+            // shift logically (zero-filling).
             const wasm_op: u8 = switch (vt) {
-                .i32 => Op.i32_shr_s,
-                .i64 => Op.i64_shr_s,
+                .i32 => if (is_unsigned) Op.i32_shr_u else Op.i32_shr_s,
+                .i64 => if (is_unsigned) Op.i64_shr_u else Op.i64_shr_s,
                 .f32, .f64 => unreachable,
             };
             self.currentCode().append(self.allocator, wasm_op) catch return error.OutOfMemory;
         },
         .num_shift_right_zf_by => {
-            const shift_local = self.storage.allocAnonymousLocal(.i32) catch return error.OutOfMemory;
-            try self.emitProcLocal(GuardedList.at(args, 1));
-            try self.emitLocalSet(shift_local);
-
-            self.currentCode().append(self.allocator, Op.local_get) catch return error.OutOfMemory;
-            WasmModule.leb128WriteU32(self.allocator, self.currentCode(), shift_local) catch return error.OutOfMemory;
-            self.currentCode().append(self.allocator, Op.i32_const) catch return error.OutOfMemory;
-            WasmModule.leb128WriteI32(self.allocator, self.currentCode(), @intCast(shiftBitWidth(layout_idx))) catch return error.OutOfMemory;
-            self.currentCode().append(self.allocator, Op.i32_ge_u) catch return error.OutOfMemory;
-            self.currentCode().append(self.allocator, Op.@"if") catch return error.OutOfMemory;
-            self.currentCode().append(self.allocator, @intFromEnum(if (vt == .i64) WasmModule.BlockType.i64 else WasmModule.BlockType.i32)) catch return error.OutOfMemory;
-
-            if (vt == .i64) {
-                self.currentCode().append(self.allocator, Op.i64_const) catch return error.OutOfMemory;
-                WasmModule.leb128WriteI64(self.allocator, self.currentCode(), 0) catch return error.OutOfMemory;
-            } else {
-                self.currentCode().append(self.allocator, Op.i32_const) catch return error.OutOfMemory;
-                WasmModule.leb128WriteI32(self.allocator, self.currentCode(), 0) catch return error.OutOfMemory;
-            }
-
-            self.currentCode().append(self.allocator, Op.@"else") catch return error.OutOfMemory;
             try self.emitProcLocal(GuardedList.at(args, 0));
+            // Narrow signed types are stored sign-extended in their i32; mask to
+            // the type width first so the vacated high bits are zero-filled.
             if (shiftNeedsZeroFillMask(layout_idx) and vt == .i32) {
                 self.currentCode().append(self.allocator, Op.i32_const) catch return error.OutOfMemory;
                 const mask: i32 = if (layout_idx == .i8) 0xFF else 0xFFFF;
                 WasmModule.leb128WriteI32(self.allocator, self.currentCode(), mask) catch return error.OutOfMemory;
                 self.currentCode().append(self.allocator, Op.i32_and) catch return error.OutOfMemory;
             }
-            self.currentCode().append(self.allocator, Op.local_get) catch return error.OutOfMemory;
-            WasmModule.leb128WriteU32(self.allocator, self.currentCode(), shift_local) catch return error.OutOfMemory;
-            if (vt == .i64) self.currentCode().append(self.allocator, Op.i64_extend_i32_u) catch return error.OutOfMemory;
+            try self.emitScalarShiftCount(GuardedList.at(args, 1), layout_idx, vt);
             const wasm_op: u8 = switch (vt) {
                 .i32 => Op.i32_shr_u,
                 .i64 => Op.i64_shr_u,
                 .f32, .f64 => unreachable,
             };
             self.currentCode().append(self.allocator, wasm_op) catch return error.OutOfMemory;
-            self.currentCode().append(self.allocator, Op.end) catch return error.OutOfMemory;
         },
         .num_bitwise_and => {
             try self.emitProcLocal(GuardedList.at(args, 0));

@@ -6396,6 +6396,18 @@ pub fn LirCodeGen(comptime target: RocTarget) type {
                 else => false,
             };
 
+            // For shift ops, the count is taken modulo the type's bit width.
+            // Because the widths are powers of two, that means keeping the low
+            // log2(width) bits of the count, which the shl/lsr pair below does by
+            // shifting the other bits out. A 64-bit register shift already masks
+            // the count modulo 64, so this only narrows it for smaller types.
+            const shift_count_keep: u8 = switch (operand_layout) {
+                .u8, .i8 => 64 - 3,
+                .u16, .i16 => 64 - 4,
+                .u32, .i32 => 64 - 5,
+                else => 64 - 6,
+            };
+
             if (narrow_signed_shift > 0 and !is_unsigned) {
                 if (plain_op == .num_shift_right_zf_by) {
                     try self.emitShlImm(.w64, lhs_reg, lhs_reg, narrow_signed_shift);
@@ -6406,15 +6418,15 @@ pub fn LirCodeGen(comptime target: RocTarget) type {
                 }
 
                 if (is_shift_op) {
-                    try self.emitShlImm(.w64, rhs_reg, rhs_reg, 56);
-                    try self.emitLsrImm(.w64, rhs_reg, rhs_reg, 56);
+                    try self.emitShlImm(.w64, rhs_reg, rhs_reg, shift_count_keep);
+                    try self.emitLsrImm(.w64, rhs_reg, rhs_reg, shift_count_keep);
                 } else {
                     try self.emitShlImm(.w64, rhs_reg, rhs_reg, narrow_signed_shift);
                     try self.emitAsrImm(.w64, rhs_reg, rhs_reg, narrow_signed_shift);
                 }
             } else if (is_shift_op) {
-                try self.emitShlImm(.w64, rhs_reg, rhs_reg, 56);
-                try self.emitLsrImm(.w64, rhs_reg, rhs_reg, 56);
+                try self.emitShlImm(.w64, rhs_reg, rhs_reg, shift_count_keep);
+                try self.emitLsrImm(.w64, rhs_reg, rhs_reg, shift_count_keep);
             }
 
             // Allocate result register
@@ -6511,7 +6523,12 @@ pub fn LirCodeGen(comptime target: RocTarget) type {
                     if (mod_done_patch) |patch| self.codegen.patchJump(patch, self.codegen.currentOffset());
                 },
                 .num_shift_left_by => try self.emitShlReg(.w64, result_reg, lhs_reg, rhs_reg),
-                .num_shift_right_by => try self.emitAsrReg(.w64, result_reg, lhs_reg, rhs_reg),
+                // Signed types shift arithmetically (sign-filling); unsigned types
+                // shift logically (zero-filling).
+                .num_shift_right_by => if (is_unsigned)
+                    try self.emitLsrReg(.w64, result_reg, lhs_reg, rhs_reg)
+                else
+                    try self.emitAsrReg(.w64, result_reg, lhs_reg, rhs_reg),
                 .num_shift_right_zf_by => try self.emitLsrReg(.w64, result_reg, lhs_reg, rhs_reg),
                 .num_bitwise_and => try self.codegen.emitAnd(.w64, result_reg, lhs_reg, rhs_reg),
                 .num_bitwise_or => try self.codegen.emitOr(.w64, result_reg, lhs_reg, rhs_reg),
@@ -19029,6 +19046,124 @@ test "generate shift right zero-fill" {
     const lhs_bits: i64 = @bitCast(@as(u64, 0x8000_0000_0000_0000));
     const proc = try addBinaryLowLevelProc(&store, .num_shift_right_zf_by, lhs_bits, 63, .u64, .u64);
     try std.testing.expectEqual(@as(u64, 1), try runRootU64(&store, &test_state.layout_store, proc, .u64));
+}
+
+// Runs a scalar shift and returns the result truncated to the type's bit width
+// (as an unsigned bit pattern), so both signed and unsigned expectations can be
+// compared directly.
+const ShiftHarness = struct {
+    fn run(op: lir.LowLevel, lhs: i64, rhs: i64, operand_layout: layout.Idx, comptime width: u7) (Allocator.Error || error{ EmptyCode, MmapFailed, VirtualAllocFailed, MprotectFailed, VirtualProtectFailed, UnsupportedPlatform, UnwindRegistrationFailed })!u64 {
+        const allocator = std.testing.allocator;
+        var store = LirStore.init(allocator);
+        defer store.deinit();
+        var test_state = try TestLayoutState.init(allocator);
+        defer test_state.deinit();
+        const proc = try addBinaryLowLevelProc(&store, op, lhs, rhs, operand_layout, operand_layout);
+        const raw = try runRootU64(&store, &test_state.layout_store, proc, operand_layout);
+        return if (width == 64) raw else raw & ((@as(u64, 1) << width) - 1);
+    }
+    fn i8b(x: i8) u64 {
+        return @as(u64, @as(u8, @bitCast(x)));
+    }
+    fn i64b(x: i64) u64 {
+        return @bitCast(x);
+    }
+};
+
+test "generate shift modulo - unsigned widths" {
+    if (comptime builtin.cpu.arch != .x86_64 and builtin.cpu.arch != .aarch64) {
+        return error.SkipZigTest;
+    }
+    const H = ShiftHarness;
+    const shl = lir.LowLevel.num_shift_left_by;
+    const shr = lir.LowLevel.num_shift_right_by;
+    const shr_zf = lir.LowLevel.num_shift_right_zf_by;
+
+    // U8: count taken modulo 8.
+    try std.testing.expectEqual(@as(u64, 1), try H.run(shl, 1, 8, .u8, 8));
+    try std.testing.expectEqual(@as(u64, 2), try H.run(shl, 1, 9, .u8, 8));
+    try std.testing.expectEqual(@as(u64, 1), try H.run(shl, 1, 64, .u8, 8));
+    try std.testing.expectEqual(@as(u64, 2), try H.run(shl, 1, 65, .u8, 8));
+    try std.testing.expectEqual(@as(u64, 128), try H.run(shl, 1, 127, .u8, 8));
+    try std.testing.expectEqual(@as(u64, 1), try H.run(shl, 1, 128, .u8, 8));
+    try std.testing.expectEqual(@as(u64, 1), try H.run(shl, 1, 200, .u8, 8));
+    try std.testing.expectEqual(@as(u64, 128), try H.run(shl, 1, 255, .u8, 8));
+    try std.testing.expectEqual(@as(u64, 128), try H.run(shr, 128, 8, .u8, 8));
+    try std.testing.expectEqual(@as(u64, 64), try H.run(shr, 128, 9, .u8, 8));
+    try std.testing.expectEqual(@as(u64, 1), try H.run(shr, 128, 127, .u8, 8));
+    try std.testing.expectEqual(@as(u64, 1), try H.run(shr, 128, 255, .u8, 8));
+    // Unsigned right shift must be logical, not arithmetic.
+    try std.testing.expectEqual(@as(u64, 64), try H.run(shr, 128, 1, .u8, 8));
+    try std.testing.expectEqual(@as(u64, 64), try H.run(shr_zf, 128, 9, .u8, 8));
+    try std.testing.expectEqual(@as(u64, 128), try H.run(shr_zf, 128, 8, .u8, 8));
+
+    // U32: count taken modulo 32.
+    try std.testing.expectEqual(@as(u64, 1), try H.run(shl, 1, 32, .u32, 32));
+    try std.testing.expectEqual(@as(u64, 2), try H.run(shl, 1, 33, .u32, 32));
+    try std.testing.expectEqual(@as(u64, 1), try H.run(shl, 1, 64, .u32, 32));
+    try std.testing.expectEqual(@as(u64, 2), try H.run(shl, 1, 65, .u32, 32));
+    try std.testing.expectEqual(@as(u64, 0x8000_0000), try H.run(shl, 1, 127, .u32, 32));
+    try std.testing.expectEqual(@as(u64, 1), try H.run(shl, 1, 128, .u32, 32));
+    try std.testing.expectEqual(@as(u64, 256), try H.run(shl, 1, 200, .u32, 32));
+    try std.testing.expectEqual(@as(u64, 0x8000_0000), try H.run(shl, 1, 255, .u32, 32));
+    // Unsigned right shift of a top-bit-set value must be logical.
+    try std.testing.expectEqual(@as(u64, 0x4000_0000), try H.run(shr, 0x8000_0000, 1, .u32, 32));
+    try std.testing.expectEqual(@as(u64, 0x8000_0000), try H.run(shr, 0x8000_0000, 32, .u32, 32));
+    try std.testing.expectEqual(@as(u64, 0x4000_0000), try H.run(shr, 0x8000_0000, 33, .u32, 32));
+    try std.testing.expectEqual(@as(u64, 0x0080_0000), try H.run(shr, 0x8000_0000, 200, .u32, 32));
+    try std.testing.expectEqual(@as(u64, 1), try H.run(shr, 0x8000_0000, 255, .u32, 32));
+
+    // U64: count taken modulo 64.
+    const top64: i64 = @bitCast(@as(u64, 0x8000_0000_0000_0000));
+    try std.testing.expectEqual(@as(u64, 1), try H.run(shl, 1, 64, .u64, 64));
+    try std.testing.expectEqual(@as(u64, 2), try H.run(shl, 1, 65, .u64, 64));
+    try std.testing.expectEqual(@as(u64, 0x8000_0000_0000_0000), try H.run(shl, 1, 127, .u64, 64));
+    try std.testing.expectEqual(@as(u64, 1), try H.run(shl, 1, 128, .u64, 64));
+    try std.testing.expectEqual(@as(u64, 256), try H.run(shl, 1, 200, .u64, 64));
+    try std.testing.expectEqual(@as(u64, 0x8000_0000_0000_0000), try H.run(shl, 1, 255, .u64, 64));
+    // Unsigned right shift of a top-bit-set value must be logical (regression:
+    // this backend used to emit an arithmetic shift for unsigned types).
+    try std.testing.expectEqual(@as(u64, 0x4000_0000_0000_0000), try H.run(shr, top64, 1, .u64, 64));
+    try std.testing.expectEqual(@as(u64, 0x8000_0000_0000_0000), try H.run(shr, top64, 64, .u64, 64));
+    try std.testing.expectEqual(@as(u64, 0x4000_0000_0000_0000), try H.run(shr, top64, 65, .u64, 64));
+    try std.testing.expectEqual(@as(u64, 0x8000_0000_0000_0000), try H.run(shr, top64, 128, .u64, 64));
+    try std.testing.expectEqual(@as(u64, 1), try H.run(shr, top64, 255, .u64, 64));
+    try std.testing.expectEqual(@as(u64, 1), try H.run(shr_zf, top64, 63, .u64, 64));
+}
+
+test "generate shift modulo - signed widths" {
+    if (comptime builtin.cpu.arch != .x86_64 and builtin.cpu.arch != .aarch64) {
+        return error.SkipZigTest;
+    }
+    const H = ShiftHarness;
+    const shl = lir.LowLevel.num_shift_left_by;
+    const shr = lir.LowLevel.num_shift_right_by;
+    const shr_zf = lir.LowLevel.num_shift_right_zf_by;
+
+    // I8: arithmetic right shift, count taken modulo 8.
+    try std.testing.expectEqual(@as(u64, 1), try H.run(shl, 1, 8, .i8, 8));
+    try std.testing.expectEqual(@as(u64, 2), try H.run(shl, 1, 9, .i8, 8));
+    try std.testing.expectEqual(H.i8b(-1), try H.run(shr, -1, 8, .i8, 8));
+    try std.testing.expectEqual(H.i8b(-1), try H.run(shr, -1, 9, .i8, 8));
+    try std.testing.expectEqual(H.i8b(-1), try H.run(shr, -1, 255, .i8, 8));
+    try std.testing.expectEqual(H.i8b(-128), try H.run(shr, -128, 8, .i8, 8));
+    try std.testing.expectEqual(H.i8b(-64), try H.run(shr, -128, 9, .i8, 8));
+    try std.testing.expectEqual(H.i8b(-128), try H.run(shr, -128, 200, .i8, 8));
+    // Zero-fill right shift is logical even for signed types.
+    try std.testing.expectEqual(@as(u64, 127), try H.run(shr_zf, -1, 9, .i8, 8));
+    try std.testing.expectEqual(@as(u64, 64), try H.run(shr_zf, -128, 9, .i8, 8));
+
+    // I64: arithmetic right shift, count taken modulo 64.
+    try std.testing.expectEqual(@as(u64, 1), try H.run(shl, 1, 64, .i64, 64));
+    try std.testing.expectEqual(@as(u64, 2), try H.run(shl, 1, 65, .i64, 64));
+    try std.testing.expectEqual(@as(u64, 0x8000_0000_0000_0000), try H.run(shl, 1, 127, .i64, 64));
+    try std.testing.expectEqual(@as(u64, 256), try H.run(shl, 1, 200, .i64, 64));
+    try std.testing.expectEqual(H.i64b(-4), try H.run(shr, -8, 1, .i64, 64));
+    try std.testing.expectEqual(H.i64b(-8), try H.run(shr, -8, 64, .i64, 64));
+    try std.testing.expectEqual(H.i64b(-4), try H.run(shr, -8, 65, .i64, 64));
+    try std.testing.expectEqual(H.i64b(-8), try H.run(shr, -8, 128, .i64, 64));
+    try std.testing.expectEqual(H.i64b(-1), try H.run(shr, -8, 200, .i64, 64));
+    try std.testing.expectEqual(H.i64b(-1), try H.run(shr, -1, 65, .i64, 64));
 }
 
 test "generate unary minus" {
