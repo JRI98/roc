@@ -374,10 +374,10 @@ Builtin :: [].{
 
 			split_json_number_exponent : Str -> Try({ mantissa : Str, exponent : Str }, [NotFound])
 			split_json_number_exponent = |value|
-				match Str.find_first(value, "e") {
+				match Str.split_first(value, "e") {
 					Ok(split) => Ok({ mantissa: split.before, exponent: split.after })
 					Err(NotFound) =>
-						match Str.find_first(value, "E") {
+						match Str.split_first(value, "E") {
 							Ok(split) => Ok({ mantissa: split.before, exponent: split.after })
 							Err(NotFound) => Err(NotFound)
 						}
@@ -403,7 +403,7 @@ Builtin :: [].{
 					mantissa
 				}
 
-				parts = match Str.find_first(unsigned_mantissa, ".") {
+				parts = match Str.split_first(unsigned_mantissa, ".") {
 					Ok(split) => { int_part: split.before, frac_part: split.after }
 					Err(NotFound) => { int_part: unsigned_mantissa, frac_part: "" }
 				}
@@ -775,7 +775,7 @@ Builtin :: [].{
 
 			snake_to_camel : Str -> Str
 			snake_to_camel = |text|
-				match Str.find_first(text, "_") {
+				match Str.split_first(text, "_") {
 					Ok({ before, after }) =>
 						before.concat(Json.upper_first_ascii(Json.snake_to_camel(after)))
 
@@ -1232,14 +1232,13 @@ Builtin :: [].{
 
 			is_json_unsigned_int_literal : Str -> Bool
 			is_json_unsigned_int_literal = |value| {
-				bytes = Str.to_utf8(value)
-				len = List.len(bytes)
+				len = Str.count_utf8_bytes(value)
 
 				if len == 0 {
 					return False
 				}
 
-				first = list_get_unsafe(bytes, 0)
+				first = str_get_utf8_byte_unsafe(value, 0)
 
 				if first == 48 {
 					return len == 1
@@ -1252,7 +1251,7 @@ Builtin :: [].{
 				var $index = 1
 
 				while $index < len {
-					byte = list_get_unsafe(bytes, $index)
+					byte = str_get_utf8_byte_unsafe(value, $index)
 
 					if Json.is_json_digit(byte) {
 						$index = $index + 1
@@ -1325,35 +1324,41 @@ Builtin :: [].{
 			## keeps that delimiter. Both results are zero-copy slices.
 			split_json_scalar_tail : Str -> Try({ value : Str, after : Str }, [InvalidJson(Str), ..])
 			split_json_scalar_tail = |raw| {
-				bytes = Str.to_utf8(raw)
+				len = Str.count_utf8_bytes(raw)
+				var $index = 0
+				var $found = False
 
-				match List.find_first_index(bytes, is_json_scalar_delimiter) {
-					Ok(0) => {
-						# missing scalar value
-						Err(Json.invalid_json)
+				while $index < len {
+					if is_json_scalar_delimiter(str_get_utf8_byte_unsafe(raw, $index)) {
+						$found = True
+						break
+					} else {
+						$index = $index + 1
 					}
-					Ok(index) => {
-						value = match Str.from_utf8(List.take_first(bytes, index)) {
+				}
+
+				if $found {
+					if $index == 0 {
+						Err(Json.invalid_json)
+					} else {
+						value = match Str.drop_last_bytes(raw, len - $index) {
 							Ok(v) => v
-							# unreachable: the split point is an ASCII delimiter, so the prefix is always valid UTF-8
-							Err(_) => {
-								crash "Json scalar splitter invariant violated: split at a delimiter was not valid UTF-8"
+							Err(BadUtf8) => {
+								crash "Json scalar splitter invariant violated: ASCII delimiter was not a UTF-8 boundary"
 							}
 						}
-
-						# `value` is a content-matched prefix of `raw`, so dropping it yields the
-						# tail beginning with the delimiter — a zero-copy slice operation.
-						Ok({ value, after: Str.drop_prefix(raw, value) })
-					}
-					Err(NotFound) => {
-						if Str.is_empty(raw) {
-							# missing scalar value (end of input)
-							Err(Json.invalid_json)
-						} else {
-							# the scalar runs to the end of the input
-							Ok({ value: raw, after: "" })
+						after = match Str.drop_first_bytes(raw, $index) {
+							Ok(v) => v
+							Err(BadUtf8) => {
+								crash "Json scalar splitter invariant violated: ASCII delimiter was not a UTF-8 boundary"
+							}
 						}
+						Ok({ value, after })
 					}
+				} else if $index == 0 {
+					Err(Json.invalid_json)
+				} else {
+					Ok({ value: raw, after: "" })
 				}
 			}
 		}
@@ -1892,7 +1897,7 @@ Builtin :: [].{
 				if Str.is_empty(headers) {
 					Ok(Done({ rest: HttpHeaderState.{ raw: "" } }))
 				} else {
-					line_parts = match Str.find_first(headers, "\r\n") {
+					line_parts = match Str.split_first(headers, "\r\n") {
 						Ok(parts) => parts
 						Err(NotFound) => { before: headers, after: "" }
 					}
@@ -1900,7 +1905,7 @@ Builtin :: [].{
 					if Str.is_empty(line_parts.before) {
 						Ok(Done({ rest: HttpHeaderState.{ raw: line_parts.after } }))
 					} else {
-						match Str.find_first(headers, ":") {
+						match Str.split_first(headers, ":") {
 							Ok({ before: name, after: value_start }) => {
 								name_len = Str.count_utf8_bytes(name)
 								line_len = Str.count_utf8_bytes(line_parts.before)
@@ -1932,14 +1937,14 @@ Builtin :: [].{
 
 			take_header_value : Str -> Try({ value : Str, after : Str }, [BadHeader, ..])
 			take_header_value = |raw|
-				match Str.find_first(raw, "\r\n") {
+				match Str.split_first(raw, "\r\n") {
 					Ok({ before, after }) => Ok({ value: Str.trim(before), after })
 					Err(NotFound) => Ok({ value: Str.trim(raw), after: "" })
 				}
 
 			underscores_to_dashes : Str -> Str
 			underscores_to_dashes = |text|
-				match Str.find_first(text, "_") {
+				match Str.split_first(text, "_") {
 					Ok({ before, after }) =>
 						Str.concat(Str.concat(before, "-"), HttpHeader.underscores_to_dashes(after))
 
@@ -2157,17 +2162,18 @@ Builtin :: [].{
 		## ```
 		drop_suffix : Str, Str -> Str
 
-		## Finds the first occurrence of a delimiter in a string.
+		## Splits the string on the first occurrence of a delimiter, returning the
+		## parts before and after it.
 		##
 		## The returned strings are slices of the original string.
 		##
 		## ```roc
-		## expect "foo: bar".find_first(":") == Ok({ before: "foo", after: " bar" })
-		## expect "foo".find_first(":") == Err(NotFound)
+		## expect "foo: bar".split_first(":") == Ok({ before: "foo", after: " bar" })
+		## expect "foo".split_first(":") == Err(NotFound)
 		## ```
-		find_first : Str, Str -> Try({ before : Str, after : Str }, [NotFound])
-		find_first = |source, delimiter| {
-			split = str_find_first_raw(source, delimiter)
+		split_first : Str, Str -> Try({ before : Str, after : Str }, [NotFound])
+		split_first = |source, delimiter| {
+			split = str_split_first_raw(source, delimiter)
 
 			if split.found {
 				Ok({ before: split.before, after: split.after })
@@ -2181,6 +2187,68 @@ Builtin :: [].{
 		## expect "Hello World".count_utf8_bytes() == 11
 		## ```
 		count_utf8_bytes : Str -> U64
+
+		## Iterate over this string's UTF-8 code units in byte order. The iterator's
+		## known length is the string's byte length. Iteration does not allocate.
+		iter_utf8 : Str -> Iter(U8)
+		iter_utf8 = |str| {
+			make = |index| {
+				len = Str.count_utf8_bytes(str)
+
+				iter_from_step(
+					Known(len - index),
+					||
+						if index == len {
+							Done
+						} else {
+							One({ item: str_get_utf8_byte_unsafe(str, index), rest: make(index + 1) })
+						},
+				)
+			}
+
+			make(0)
+		}
+
+		## Drop a byte count from the start of a string. Counts at or beyond the
+		## byte length return `Ok("")`; an in-range cut inside a UTF-8 code point
+		## returns `Err(BadUtf8)`. Valid slices do not allocate.
+		drop_first_bytes : Str, U64 -> Try(Str, [BadUtf8, ..])
+		drop_first_bytes = |str, count| {
+			len = Str.count_utf8_bytes(str)
+			if count >= len {
+				Ok("")
+			} else {
+				byte = str_get_utf8_byte_unsafe(str, count)
+				if byte >= 128 and byte < 192 {
+					Err(BadUtf8)
+				} else {
+					Ok(str_substring_unsafe(str, count, len - count))
+				}
+			}
+		}
+
+		## Drop a byte count from the end of a string. Counts at or beyond the byte
+		## length return `Ok("")`; an in-range cut inside a UTF-8 code point returns
+		## `Err(BadUtf8)`. Valid slices do not allocate.
+		drop_last_bytes : Str, U64 -> Try(Str, [BadUtf8, ..])
+		drop_last_bytes = |str, count| {
+			if count == 0 {
+				Ok(str)
+			} else {
+				len = Str.count_utf8_bytes(str)
+				if count >= len {
+					Ok("")
+				} else {
+					end = len - count
+					byte = str_get_utf8_byte_unsafe(str, end)
+					if byte >= 128 and byte < 192 {
+						Err(BadUtf8)
+					} else {
+						Ok(str_substring_unsafe(str, 0, end))
+					}
+				}
+			}
+		}
 
 		## Returns a string of the specified capacity without any content.
 		##
@@ -2429,10 +2497,12 @@ Builtin :: [].{
 		## Feed an [I128] into the hasher.
 		write_i128 : Hasher, I128 -> Hasher
 
-		## Feed an [F32] into the hasher.
+		## Feed an [F32] into the hasher. Positive and negative zero hash
+		## identically, and every `NaN` representation hashes identically.
 		write_f32 : Hasher, F32 -> Hasher
 
-		## Feed an [F64] into the hasher.
+		## Feed an [F64] into the hasher. Positive and negative zero hash
+		## identically, and every `NaN` representation hashes identically.
 		write_f64 : Hasher, F64 -> Hasher
 
 		## Feed a [Dec] into the hasher.
@@ -3782,6 +3852,97 @@ Builtin :: [].{
 						acc
 					},
 			)
+
+		## Like [List.map], but the transform can fail. Runs a `Try`-returning
+		## function on each element and collects the `Ok` values. Stops at the first
+		## `Err` and returns it, so the result is either all the transformed values
+		## or the first failure.
+		## ```roc
+		## expect [1.I64, 2, 3].map_try(|n| if n < 3 { Ok(n) } else { Err(TooBig) }) == Err(TooBig)
+		## ```
+		map_try : List(a), (a -> Try(b, err)) -> Try(List(b), err)
+		map_try = |list, transform| {
+			var $out = List.with_capacity(list.len())
+			for elem in list {
+				$out = list_append_unsafe($out, transform(elem)?)
+			}
+			Ok($out)
+		}
+
+		## Like [List.map_try], but the transform is effectful. It runs on each
+		## element until one returns `Err`, then stops.
+		## ```roc
+		## rows.map_try!(|row| SQL.insert!("INSERT INTO t VALUES (?)", [row]))
+		## ```
+		map_try! : List(a), (a => Try(b, err)) => Try(List(b), err)
+		map_try! = |list, transform!| {
+			var $out = List.with_capacity(list.len())
+			for elem in list {
+				$out = list_append_unsafe($out, transform!(elem)?)
+			}
+			Ok($out)
+		}
+
+		## Like [List.keep_if], but the predicate can fail. Runs a `Try`-returning
+		## predicate on each element, keeping the ones it maps to `Ok(Bool.True)`.
+		## Stops at the first `Err` and returns it.
+		## ```roc
+		## expect [1.I64, 2, 3].keep_if_try(|n| Ok(n > 1)) == Ok([2, 3])
+		## ```
+		keep_if_try : List(a), (a -> Try(Bool, err)) -> Try(List(a), err)
+		keep_if_try = |list, predicate| {
+			var $out = []
+			for elem in list {
+				if predicate(elem)? {
+					$out = List.concat($out, [elem])
+				}
+			}
+			Ok($out)
+		}
+
+		## Like [List.keep_if_try], but the predicate is effectful. It runs on each
+		## element until one returns `Err`, then stops.
+		## ```roc
+		## users.keep_if_try!(|user| SQL.query_bool!("SELECT is_active FROM users WHERE id = ?", [user.id]))
+		## ```
+		keep_if_try! : List(a), (a => Try(Bool, err)) => Try(List(a), err)
+		keep_if_try! = |list, predicate!| {
+			var $out = []
+			for elem in list {
+				if predicate!(elem)? {
+					$out = List.concat($out, [elem])
+				}
+			}
+			Ok($out)
+		}
+
+		## Like [List.fold], but the step function can fail. Threads `state` through
+		## the list, and if a step returns `Err`, stops and returns it.
+		## ```roc
+		## expect [1.I64, 2, 3].fold_try(0, |sum, n| if n < 3 { Ok(sum + n) } else { Err(Stop) }) == Err(Stop)
+		## ```
+		fold_try : List(item), state, (state, item -> Try(state, err)) -> Try(state, err)
+		fold_try = |list, initial, step| {
+			var $state = initial
+			for elem in list {
+				$state = step($state, elem)?
+			}
+			Ok($state)
+		}
+
+		## Like [List.fold_try], but the step function is effectful. It runs on each
+		## element until one returns `Err`, then stops.
+		## ```roc
+		## events.fold_try!(State.init, |state, event| Store.apply!(state, event))
+		## ```
+		fold_try! : List(item), state, (state, item => Try(state, err)) => Try(state, err)
+		fold_try! = |list, initial, step!| {
+			var $state = initial
+			for elem in list {
+				$state = step!($state, elem)?
+			}
+			Ok($state)
+		}
 
 		## Build a value using each element in the list.
 		##
@@ -14228,7 +14389,8 @@ Builtin :: [].{
 			tau : F32
 			tau = F32.from_bits(1086918619)
 
-			## Convert an [F32] to its decimal string representation.
+			## Convert an [F32] to its decimal string representation. Every NaN
+			## representation, including negative NaNs, becomes `"nan"`.
 			## ```roc
 			## expect F32.to_str(42.5) == "42.5"
 			##
@@ -14236,7 +14398,9 @@ Builtin :: [].{
 			## ```
 			to_str : F32 -> Str
 
-			## Return the raw IEEE 754 bit pattern of an [F32].
+			## Return the IEEE 754 bit pattern of an [F32]. All `NaN` values return
+			## the canonical quiet-NaN bits `2143289344`; every non-NaN value
+			## returns its exact bits.
 			## ```roc
 			## expect F32.to_bits(F32.from_bits(1069547520)) == 1069547520
 			##
@@ -14244,7 +14408,9 @@ Builtin :: [].{
 			## ```
 			to_bits : F32 -> U32
 
-			## Build an [F32] from a raw IEEE 754 bit pattern.
+			## Build an [F32] from a raw IEEE 754 bit pattern. Any NaN payload or
+			## sign can be supplied, but [F32.to_bits] and hashing intentionally
+			## collapse all NaN representations.
 			## ```roc
 			## expect F32.from_bits(F32.to_bits(-0.0)).to_bits() == F32.to_bits(-0.0)
 			##
@@ -14881,8 +15047,7 @@ Builtin :: [].{
 			## toward zero; the integer part wraps on overflow. Integer-part
 			## values from `-128` to `127` are preserved; other values wrap by
 			## truncating to the low 8 bits and reinterpreting them in two's
-			## complement. The result for `NaN`, `inf`, or `-inf` is
-			## implementation-defined.
+			## complement. `NaN`, `inf`, and `-inf` all return `0`.
 			## ```roc
 			## expect F32.to_i8_wrap(42.7) == 42
 			## ```
@@ -14905,8 +15070,7 @@ Builtin :: [].{
 			## toward zero; the integer part wraps on overflow. Integer-part
 			## values from `-32768` to `32767` are preserved; other values wrap
 			## by truncating to the low 16 bits and reinterpreting them in two's
-			## complement. The result for `NaN`, `inf`, or `-inf` is
-			## implementation-defined.
+			## complement. `NaN`, `inf`, and `-inf` all return `0`.
 			## ```roc
 			## expect F32.to_i16_wrap(42.5) == 42
 			## ```
@@ -14926,8 +15090,8 @@ Builtin :: [].{
 			to_i16_try = |num| out_of_range_try(f32_to_i16_try_unsafe(num))
 
 			## Convert an [F32] to an [I32]. The fractional part is truncated
-			## toward zero; the integer part wraps on overflow. The result for
-			## `NaN`, `inf`, or `-inf` is implementation-defined.
+			## toward zero; the integer part wraps on overflow. `NaN`, `inf`, and
+			## `-inf` all return `0`.
 			## ```roc
 			## expect F32.to_i32_wrap(42.5) == 42
 			## ```
@@ -14943,8 +15107,8 @@ Builtin :: [].{
 			to_i32_try = |num| out_of_range_try(f32_to_i32_try_unsafe(num))
 
 			## Convert an [F32] to an [I64]. The fractional part is truncated
-			## toward zero; the integer part wraps on overflow. The result for
-			## `NaN`, `inf`, or `-inf` is implementation-defined.
+			## toward zero; the integer part wraps on overflow. `NaN`, `inf`, and
+			## `-inf` all return `0`.
 			## ```roc
 			## expect F32.to_i64_wrap(42.5) == 42
 			## ```
@@ -14960,8 +15124,8 @@ Builtin :: [].{
 			to_i64_try = |num| out_of_range_try(f32_to_i64_try_unsafe(num))
 
 			## Convert an [F32] to an [I128]. The fractional part is truncated
-			## toward zero; the integer part wraps on overflow. The result for
-			## `NaN`, `inf`, or `-inf` is implementation-defined.
+			## toward zero; the integer part wraps modulo 2^128 and is interpreted
+			## using two's complement. `NaN`, `inf`, and `-inf` all return `0`.
 			## ```roc
 			## expect F32.to_i128_wrap(42.5) == 42
 			## ```
@@ -14979,9 +15143,8 @@ Builtin :: [].{
 			# Conversions to unsigned integers (all lossy - truncation + range check)
 
 			## Convert an [F32] to a [U8]. The fractional part is truncated
-			## toward zero; the integer part wraps on overflow. The result for
-			## negative values, `NaN`, `inf`, or `-inf` is
-			## implementation-defined.
+			## toward zero; the integer part wraps modulo 2^8. `NaN`, `inf`, and
+			## `-inf` all return `0`.
 			## ```roc
 			## expect F32.to_u8_wrap(42.7) == 42
 			## ```
@@ -15000,9 +15163,8 @@ Builtin :: [].{
 			to_u8_try = |num| out_of_range_try(f32_to_u8_try_unsafe(num))
 
 			## Convert an [F32] to a [U16]. The fractional part is truncated
-			## toward zero; the integer part wraps on overflow. The result for
-			## negative values, `NaN`, `inf`, or `-inf` is
-			## implementation-defined.
+			## toward zero; the integer part wraps modulo 2^16. `NaN`, `inf`, and
+			## `-inf` all return `0`.
 			## ```roc
 			## expect F32.to_u16_wrap(42.5) == 42
 			## ```
@@ -15019,9 +15181,8 @@ Builtin :: [].{
 			to_u16_try = |num| out_of_range_try(f32_to_u16_try_unsafe(num))
 
 			## Convert an [F32] to a [U32]. The fractional part is truncated
-			## toward zero; the integer part wraps on overflow. The result for
-			## negative values, `NaN`, `inf`, or `-inf` is
-			## implementation-defined.
+			## toward zero; the integer part wraps modulo 2^32. `NaN`, `inf`, and
+			## `-inf` all return `0`.
 			## ```roc
 			## expect F32.to_u32_wrap(42.5) == 42
 			## ```
@@ -15038,9 +15199,8 @@ Builtin :: [].{
 			to_u32_try = |num| out_of_range_try(f32_to_u32_try_unsafe(num))
 
 			## Convert an [F32] to a [U64]. The fractional part is truncated
-			## toward zero; the integer part wraps on overflow. The result for
-			## negative values, `NaN`, `inf`, or `-inf` is
-			## implementation-defined.
+			## toward zero; the integer part wraps modulo 2^64. `NaN`, `inf`, and
+			## `-inf` all return `0`.
 			## ```roc
 			## expect F32.to_u64_wrap(42.5) == 42
 			## ```
@@ -15057,9 +15217,8 @@ Builtin :: [].{
 			to_u64_try = |num| out_of_range_try(f32_to_u64_try_unsafe(num))
 
 			## Convert an [F32] to a [U128]. The fractional part is truncated
-			## toward zero; the integer part wraps on overflow. The result for
-			## negative values, `NaN`, `inf`, or `-inf` is
-			## implementation-defined.
+			## toward zero; the integer part wraps modulo 2^128. `NaN`, `inf`, and
+			## `-inf` all return `0`.
 			## ```roc
 			## expect F32.to_u128_wrap(42.5) == 42
 			## ```
@@ -15177,7 +15336,8 @@ Builtin :: [].{
 			tau : F64
 			tau = F64.from_bits(4618760256179416344)
 
-			## Convert an [F64] to its decimal string representation.
+			## Convert an [F64] to its decimal string representation. Every NaN
+			## representation, including negative NaNs, becomes `"nan"`.
 			## ```roc
 			## expect F64.to_str(42.5) == "42.5"
 			##
@@ -15185,7 +15345,9 @@ Builtin :: [].{
 			## ```
 			to_str : F64 -> Str
 
-			## Return the raw IEEE 754 bit pattern of an [F64].
+			## Return the IEEE 754 bit pattern of an [F64]. All `NaN` values return
+			## the canonical quiet-NaN bits `9221120237041090560`; every non-NaN
+			## value returns its exact bits.
 			## ```roc
 			## expect F64.to_bits(F64.from_bits(4609434218613702656)) == 4609434218613702656
 			##
@@ -15193,7 +15355,9 @@ Builtin :: [].{
 			## ```
 			to_bits : F64 -> U64
 
-			## Build an [F64] from a raw IEEE 754 bit pattern.
+			## Build an [F64] from a raw IEEE 754 bit pattern. Any NaN payload or
+			## sign can be supplied, but [F64.to_bits] and hashing intentionally
+			## collapse all NaN representations.
 			## ```roc
 			## expect F64.from_bits(F64.to_bits(-0.0)).to_bits() == F64.to_bits(-0.0)
 			##
@@ -15830,8 +15994,7 @@ Builtin :: [].{
 			## toward zero; the integer part wraps on overflow. Integer-part
 			## values from `-128` to `127` are preserved; other values wrap by
 			## truncating to the low 8 bits and reinterpreting them in two's
-			## complement. The result for `NaN`, `inf`, or `-inf` is
-			## implementation-defined.
+			## complement. `NaN`, `inf`, and `-inf` all return `0`.
 			## ```roc
 			## expect F64.to_i8_wrap(42.7) == 42
 			## ```
@@ -15854,8 +16017,7 @@ Builtin :: [].{
 			## toward zero; the integer part wraps on overflow. Integer-part
 			## values from `-32768` to `32767` are preserved; other values wrap
 			## by truncating to the low 16 bits and reinterpreting them in two's
-			## complement. The result for `NaN`, `inf`, or `-inf` is
-			## implementation-defined.
+			## complement. `NaN`, `inf`, and `-inf` all return `0`.
 			## ```roc
 			## expect F64.to_i16_wrap(42.5) == 42
 			## ```
@@ -15875,8 +16037,8 @@ Builtin :: [].{
 			to_i16_try = |num| out_of_range_try(f64_to_i16_try_unsafe(num))
 
 			## Convert an [F64] to an [I32]. The fractional part is truncated
-			## toward zero; the integer part wraps on overflow. The result for
-			## `NaN`, `inf`, or `-inf` is implementation-defined.
+			## toward zero; the integer part wraps on overflow. `NaN`, `inf`, and
+			## `-inf` all return `0`.
 			## ```roc
 			## expect F64.to_i32_wrap(42.5) == 42
 			## ```
@@ -15892,8 +16054,8 @@ Builtin :: [].{
 			to_i32_try = |num| out_of_range_try(f64_to_i32_try_unsafe(num))
 
 			## Convert an [F64] to an [I64]. The fractional part is truncated
-			## toward zero; the integer part wraps on overflow. The result for
-			## `NaN`, `inf`, or `-inf` is implementation-defined.
+			## toward zero; the integer part wraps on overflow. `NaN`, `inf`, and
+			## `-inf` all return `0`.
 			## ```roc
 			## expect F64.to_i64_wrap(42.5) == 42
 			## ```
@@ -15909,8 +16071,8 @@ Builtin :: [].{
 			to_i64_try = |num| out_of_range_try(f64_to_i64_try_unsafe(num))
 
 			## Convert an [F64] to an [I128]. The fractional part is truncated
-			## toward zero; the integer part wraps on overflow. The result for
-			## `NaN`, `inf`, or `-inf` is implementation-defined.
+			## toward zero; the integer part wraps modulo 2^128 and is interpreted
+			## using two's complement. `NaN`, `inf`, and `-inf` all return `0`.
 			## ```roc
 			## expect F64.to_i128_wrap(42.5) == 42
 			## ```
@@ -15928,9 +16090,8 @@ Builtin :: [].{
 			# Conversions to unsigned integers (all lossy - truncation + range check)
 
 			## Convert an [F64] to a [U8]. The fractional part is truncated
-			## toward zero; the integer part wraps on overflow. The result for
-			## negative values, `NaN`, `inf`, or `-inf` is
-			## implementation-defined.
+			## toward zero; the integer part wraps modulo 2^8. `NaN`, `inf`, and
+			## `-inf` all return `0`.
 			## ```roc
 			## expect F64.to_u8_wrap(42.7) == 42
 			## ```
@@ -15949,9 +16110,8 @@ Builtin :: [].{
 			to_u8_try = |num| out_of_range_try(f64_to_u8_try_unsafe(num))
 
 			## Convert an [F64] to a [U16]. The fractional part is truncated
-			## toward zero; the integer part wraps on overflow. The result for
-			## negative values, `NaN`, `inf`, or `-inf` is
-			## implementation-defined.
+			## toward zero; the integer part wraps modulo 2^16. `NaN`, `inf`, and
+			## `-inf` all return `0`.
 			## ```roc
 			## expect F64.to_u16_wrap(42.5) == 42
 			## ```
@@ -15968,9 +16128,8 @@ Builtin :: [].{
 			to_u16_try = |num| out_of_range_try(f64_to_u16_try_unsafe(num))
 
 			## Convert an [F64] to a [U32]. The fractional part is truncated
-			## toward zero; the integer part wraps on overflow. The result for
-			## negative values, `NaN`, `inf`, or `-inf` is
-			## implementation-defined.
+			## toward zero; the integer part wraps modulo 2^32. `NaN`, `inf`, and
+			## `-inf` all return `0`.
 			## ```roc
 			## expect F64.to_u32_wrap(42.5) == 42
 			## ```
@@ -15987,9 +16146,8 @@ Builtin :: [].{
 			to_u32_try = |num| out_of_range_try(f64_to_u32_try_unsafe(num))
 
 			## Convert an [F64] to a [U64]. The fractional part is truncated
-			## toward zero; the integer part wraps on overflow. The result for
-			## negative values, `NaN`, `inf`, or `-inf` is
-			## implementation-defined.
+			## toward zero; the integer part wraps modulo 2^64. `NaN`, `inf`, and
+			## `-inf` all return `0`.
 			## ```roc
 			## expect F64.to_u64_wrap(42.5) == 42
 			## ```
@@ -16006,9 +16164,8 @@ Builtin :: [].{
 			to_u64_try = |num| out_of_range_try(f64_to_u64_try_unsafe(num))
 
 			## Convert an [F64] to a [U128]. The fractional part is truncated
-			## toward zero; the integer part wraps on overflow. The result for
-			## negative values, `NaN`, `inf`, or `-inf` is
-			## implementation-defined.
+			## toward zero; the integer part wraps modulo 2^128. `NaN`, `inf`, and
+			## `-inf` all return `0`.
 			## ```roc
 			## expect F64.to_u128_wrap(42.5) == 42
 			## ```
@@ -21228,22 +21385,23 @@ is_json_whitespace = |byte|
 ## or revalidated, so a call costs O(leading whitespace).
 json_trim_start : Str -> Str
 json_trim_start = |s| {
-	bytes = Str.to_utf8(s)
-
-	index = match List.find_first_index(bytes, |byte| !is_json_whitespace(byte)) {
-		Ok(idx) => idx
-		Err(NotFound) => List.len(bytes)
+	len = Str.count_utf8_bytes(s)
+	var $index = 0
+	while $index < len {
+		if is_json_whitespace(str_get_utf8_byte_unsafe(s, $index)) {
+			$index = $index + 1
+		} else {
+			break
+		}
 	}
 
-	if index == 0 {
+	if $index == 0 {
 		s
 	} else {
-		match Str.from_utf8(List.take_first(bytes, index)) {
-			# the prefix is ASCII whitespace, so it is always valid UTF-8 and
-			# dropping it is a byte compare plus a zero-copy slice
-			Ok(prefix) => Str.drop_prefix(s, prefix)
-			Err(_) => {
-				crash "json_trim_start invariant violated: an ASCII whitespace prefix was not valid UTF-8"
+		match Str.drop_first_bytes(s, $index) {
+			Ok(trimmed) => trimmed
+			Err(BadUtf8) => {
+				crash "json_trim_start invariant violated: ASCII whitespace ended inside UTF-8"
 			}
 		}
 	}
@@ -21297,11 +21455,18 @@ list_replace_unsafe : List(item), U64, item -> { list : List(item), prev : item 
 list_swap_unsafe : List(item), U64, U64 -> List(item)
 
 # Implemented by the compiler. Returns string slices into the source string.
-str_find_first_raw : Str, Str -> { before : Str, found : Bool, after : Str }
+str_split_first_raw : Str, Str -> { before : Str, found : Bool, after : Str }
 
 # Implemented by the compiler. Returns a string slice after the prefix when the
 # source starts with the prefix using ASCII-caseless comparison.
 str_drop_prefix_caseless_ascii_raw : Str, Str -> { after : Str, found : Bool }
+
+# Implemented by the compiler. The caller guarantees the index is in bounds.
+str_get_utf8_byte_unsafe : Str, U64 -> U8
+
+# Implemented by the compiler. The caller guarantees the byte range is in bounds.
+# The result shares the source string's allocation.
+str_substring_unsafe : Str, U64, U64 -> Str
 
 # Implemented by the compiler. Returns 1 (otherwise 0) when List.map may reuse
 # the input list's allocation for its output: the input and output element
