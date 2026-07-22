@@ -5675,6 +5675,140 @@ test "issue 10301 for-loop over effect-produced list scalarizes" {
     try std.testing.expectEqual(root_shape.list_get_unsafe_count, reachable_total);
 }
 
+fn hasRawListAccess(shape: ProcShape) bool {
+    return shape.list_get_unsafe_count >= 1;
+}
+
+fn isFusedRawListLoop(shape: ProcShape) bool {
+    return shape.list_get_unsafe_count >= 1 and
+        shape.join_count >= 1 and
+        shape.direct_call_count == 0;
+}
+
+test "sequential effect-produced for-loops both scalarize" {
+    const allocator = std.testing.allocator;
+    const source =
+        \\produce : U64 -> List(U64)
+        \\produce = |n| {
+        \\    dbg 7
+        \\    [n, 2, 3]
+        \\}
+        \\
+        \\main : U64
+        \\main = {
+        \\    var $a = 0.U64
+        \\    for x in produce(1) {
+        \\        $a = $a + x
+        \\    }
+        \\    var $b = 0.U64
+        \\    for y in produce(4) {
+        \\        $b = $b * 2 + y
+        \\    }
+        \\    $a + $b
+        \\}
+    ;
+    var optimized = try lowerModule(allocator, source, .wrappers);
+    defer optimized.deinit(allocator);
+
+    const root_shape = try collectProcShape(allocator, &optimized.lowered, try rootProc(&optimized.lowered));
+    const reachable_total = try reachableProcShapeFieldTotal(allocator, &optimized.lowered, "list_get_unsafe_count");
+    // Both loops fuse: each contributes its raw indexed access in the root and
+    // no step proc remains reachable for either.
+    try std.testing.expect(root_shape.list_get_unsafe_count >= 2);
+    try std.testing.expectEqual(root_shape.list_get_unsafe_count, reachable_total);
+}
+
+test "issue 10301 producer effect runs exactly once when the loop fuses" {
+    try expectOptimizedDbgEvents(
+        \\produce : U64 -> List(U64)
+        \\produce = |n| {
+        \\    dbg 7.U64
+        \\    [n, 2, 3]
+        \\}
+        \\
+        \\main : {}
+        \\main = {
+        \\    var $sum = 0.U64
+        \\    for byte in produce(1) {
+        \\        $sum = $sum * 31 + byte
+        \\    }
+        \\    dbg $sum
+        \\    {}
+        \\}
+    ,
+        &.{ "7", "1026" },
+    );
+}
+
+test "iterdiff: effect-produced for-loop agrees across inline modes" {
+    try expectSameObservationsAcrossInlineModes(
+        \\produce : U64 -> List(U64)
+        \\produce = |n| {
+        \\    dbg 7
+        \\    [n, 2, 3]
+        \\}
+        \\
+        \\main : U64
+        \\main = {
+        \\    var $sum = 0.U64
+        \\    for byte in produce(1) {
+        \\        dbg byte
+        \\        $sum = $sum * 31 + byte
+        \\    }
+        \\    dbg $sum
+        \\    $sum
+        \\}
+    );
+}
+
+test "iterdiff: two effect producers keep source order across inline modes" {
+    try expectSameObservationsAcrossInlineModes(
+        \\produce : U64, U64 -> List(U64)
+        \\produce = |label, n| {
+        \\    dbg label
+        \\    [n, 2, 3]
+        \\}
+        \\
+        \\combine : List(U64), List(U64) -> U64
+        \\combine = |xs, ys| {
+        \\    var $sum = 0.U64
+        \\    for x in xs {
+        \\        $sum = $sum + x
+        \\    }
+        \\    for y in ys {
+        \\        $sum = $sum * 2 + y
+        \\    }
+        \\    $sum
+        \\}
+        \\
+        \\main : U64
+        \\main = combine(produce(1, 10), produce(2, 20))
+    );
+}
+
+test "iterdiff: conditional effect producer stays conditional across inline modes" {
+    try expectSameObservationsAcrossInlineModes(
+        \\produce : U64 -> List(U64)
+        \\produce = |n| {
+        \\    dbg n
+        \\    [n, 2, 3]
+        \\}
+        \\
+        \\pick : Bool -> U64
+        \\pick = |flag| {
+        \\    xs = if flag { produce(1) } else { [] }
+        \\    var $sum = 0.U64
+        \\    for x in xs {
+        \\        $sum = $sum + x
+        \\    }
+        \\    $sum
+        \\}
+        \\
+        \\main : U64
+        \\main = pick(Bool.True) + pick(Bool.False)
+    );
+}
+
 // Repro for https://github.com/roc-lang/roc/issues/10253: the recursive call
 // must carry the current position, 1, into the next iteration's `prev_len`.
 test "issue 10253 optimized tail recursion preserves the previous scalar argument" {
