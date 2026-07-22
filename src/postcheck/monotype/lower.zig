@@ -499,11 +499,6 @@ const StaticDataUse = struct {
     mono_type: Type.TypeId,
 };
 
-const ConstNodeAddress = struct {
-    module: checked.ModuleId,
-    node: checked.ConstNodeId,
-};
-
 /// Key for a memoized structural-derivation helper def. `value_ty` is the type
 /// being derived over; `result_ty` is the derivation's auxiliary type (the
 /// produced Str for inspect, the Bool for equality, the Hasher for hashing).
@@ -633,7 +628,6 @@ const Builder = struct {
     nested_site_cache: std.AutoHashMap(NestedSiteAddress, names.ProcSiteId),
     const_expr_cache: std.AutoHashMap(ConstExprAddress, Ast.ExprId),
     static_data_ids: std.AutoHashMap(StaticDataUse, Common.StaticDataId),
-    static_data_eligibility: std.AutoHashMap(ConstNodeAddress, bool),
     inspect_defs: std.AutoHashMap(GeneratedHelperDefAddress, GeneratedHelperDefEntry),
     equality_defs: std.AutoHashMap(GeneratedHelperDefAddress, GeneratedHelperDefEntry),
     hash_defs: std.AutoHashMap(GeneratedHelperDefAddress, GeneratedHelperDefEntry),
@@ -690,7 +684,6 @@ const Builder = struct {
             .nested_site_cache = std.AutoHashMap(NestedSiteAddress, names.ProcSiteId).init(allocator),
             .const_expr_cache = std.AutoHashMap(ConstExprAddress, Ast.ExprId).init(allocator),
             .static_data_ids = std.AutoHashMap(StaticDataUse, Common.StaticDataId).init(allocator),
-            .static_data_eligibility = std.AutoHashMap(ConstNodeAddress, bool).init(allocator),
             .inspect_defs = std.AutoHashMap(GeneratedHelperDefAddress, GeneratedHelperDefEntry).init(allocator),
             .equality_defs = std.AutoHashMap(GeneratedHelperDefAddress, GeneratedHelperDefEntry).init(allocator),
             .hash_defs = std.AutoHashMap(GeneratedHelperDefAddress, GeneratedHelperDefEntry).init(allocator),
@@ -730,7 +723,6 @@ const Builder = struct {
         self.hash_defs.deinit();
         self.equality_defs.deinit();
         self.inspect_defs.deinit();
-        self.static_data_eligibility.deinit();
         self.static_data_ids.deinit();
         self.const_expr_cache.deinit();
         self.nested_site_cache.deinit();
@@ -2680,44 +2672,6 @@ const Builder = struct {
 
     fn constNodeMayUseStaticDataCandidate(self: *Builder, view: ModuleView, node: checked.ConstNodeId, bare_fn: BareFnCandidate) bool {
         return self.constValueMayUseStaticDataCandidate(view, view.const_store.get(node), bare_fn);
-    }
-
-    fn constNodeHasStableStaticDataRepresentation(
-        self: *Builder,
-        view: ModuleView,
-        node: checked.ConstNodeId,
-    ) Allocator.Error!bool {
-        const address = ConstNodeAddress{ .module = view.key, .node = node };
-        if (self.static_data_eligibility.get(address)) |stable| return stable;
-
-        const stable = switch (view.const_store.get(node)) {
-            .pending => Common.invariant("pending ConstStore node reached static data eligibility"),
-            .fn_value => false,
-            .zst,
-            .scalar,
-            .str,
-            .crash,
-            => true,
-            .box => |child| try self.constNodeHasStableStaticDataRepresentation(view, child),
-            .list,
-            .tuple,
-            .record,
-            => |children| blk: {
-                for (children) |child| {
-                    if (!try self.constNodeHasStableStaticDataRepresentation(view, child)) break :blk false;
-                }
-                break :blk true;
-            },
-            .tag => |tag| blk: {
-                for (tag.payloads) |child| {
-                    if (!try self.constNodeHasStableStaticDataRepresentation(view, child)) break :blk false;
-                }
-                break :blk true;
-            },
-            .nominal => |nominal| try self.constNodeHasStableStaticDataRepresentation(view, nominal.backing),
-        };
-        try self.static_data_eligibility.put(address, stable);
-        return stable;
     }
 
     fn constValueMayUseStaticDataCandidate(self: *Builder, view: ModuleView, value: checked.ConstValue, bare_fn: BareFnCandidate) bool {
@@ -10049,6 +10003,10 @@ const BodyContext = struct {
         return Ident.textEql(text, "Builtin.List.iter");
     }
 
+    fn isBuiltinStrIterUtf8Text(text: []const u8) bool {
+        return Ident.textEql(text, "Builtin.Str.iter_utf8");
+    }
+
     fn isBuiltinIterMapText(text: []const u8) bool {
         return Ident.textEql(text, "Builtin.Iter.map");
     }
@@ -11240,6 +11198,23 @@ const BodyContext = struct {
             if (try self.generatedIteratorExpectedProducerFunctionType(.list, arg_tys, expected_ret_ty)) |expected_fn| return expected_fn;
             const components = [_]Type.TypeId{arg_tys[0]};
             return try self.functionTypeWithReturn(arg_tys, try self.generatedIteratorType(.list, fn_data.ret, &components, null));
+        }
+
+        if (isBuiltinStrIterUtf8Text(text)) {
+            if (checked_args.len != 1 or arg_tys.len != 1) Common.invariant("Str.iter_utf8 reached Monotype with an unexpected arity");
+            if (expected_ret_ty) |expected| {
+                if (self.isGeneratedIteratorEvidenceType(expected)) {
+                    const stable_expected = try self.stableGeneratedIteratorEvidenceType(expected);
+                    if (self.isForcedDynamicIteratorType(stable_expected)) {
+                        return try self.functionTypeWithReturn(arg_tys, stable_expected);
+                    }
+                    const expected_args = try self.generatedIteratorComponentArgs(stable_expected, 1);
+                    defer self.allocator.free(expected_args);
+                    return try self.functionTypeWithReturn(expected_args, stable_expected);
+                }
+            }
+            const components = [_]Type.TypeId{arg_tys[0]};
+            return try self.functionTypeWithReturn(arg_tys, try self.generatedIteratorType(.str, fn_data.ret, &components, null));
         }
 
         if (isBuiltinIterSingleText(text)) {
@@ -17686,10 +17661,11 @@ const BodyContext = struct {
             Common.invariant("static-data const context referenced a different ConstStore module");
         }
         const runtime_expr = try self.restoreConstNodeAtTypeWithStaticRoot(store_view, type_view, node, ty, const_locator);
-        if (self.builder.static_data_literals and
-            try self.builder.constNodeHasStableStaticDataRepresentation(store_view, node) and
-            self.builder.constNodeMayUseStaticDataCandidate(store_view, node, bare_fn))
-        {
+        // The candidate carries the exact restored expression. Static-data
+        // lowering turns that expression into a closed LIR initializer, so
+        // nested callable encodings come from committed LIR rather than a
+        // second structural walk over ConstStore.
+        if (self.builder.static_data_literals and self.builder.constNodeMayUseStaticDataCandidate(store_view, node, bare_fn)) {
             const id = try self.builder.staticDataValue(const_locator, node, checked_type, ty);
             return try self.addExpr(.{ .ty = ty, .data = .{ .static_data_candidate = .{
                 .static_data = id,
