@@ -2901,7 +2901,7 @@ pub const MonoLlvmCodeGen = struct {
             .num_pow => if (self.localLayout(target) == .dec)
                 try self.emitDecPow(target, arg_locals)
             else
-                try self.emitNumericFloatBinaryIntrinsic(target, arg_locals, .pow),
+                try self.emitNumericFloatPow(target, arg_locals),
             .num_sqrt => try self.emitNumericSqrt(target, GuardedList.at(arg_locals, 0)),
             .num_sin => try self.emitNumericUnaryMath(target, GuardedList.at(arg_locals, 0), .num_sin),
             .num_cos => try self.emitNumericUnaryMath(target, GuardedList.at(arg_locals, 0), .num_cos),
@@ -6445,20 +6445,21 @@ pub const MonoLlvmCodeGen = struct {
         try self.storeScalar(self.slot(target).ptr, target_layout, result);
     }
 
-    fn emitNumericFloatBinaryIntrinsic(self: *MonoLlvmCodeGen, target: LocalId, args: anytype, intrinsic: LlvmBuilder.Intrinsic) Error!void {
-        const wip = self.wip orelse return error.CompilationFailed;
+    fn emitNumericFloatPow(self: *MonoLlvmCodeGen, target: LocalId, args: anytype) Error!void {
         const target_layout = self.localLayout(target);
-        const target_ty = self.scalarType(target_layout);
+        const target_ty: LlvmBuilder.Type = switch (target_layout) {
+            .f32 => .float,
+            .f64 => .double,
+            else => return error.UnsupportedLowLevel,
+        };
         const lhs = try self.coerceScalar(try self.loadScalar(self.slot(GuardedList.at(args, 0)).ptr, self.localLayout(GuardedList.at(args, 0))), target_ty, false);
         const rhs = try self.coerceScalar(try self.loadScalar(self.slot(GuardedList.at(args, 1)).ptr, self.localLayout(GuardedList.at(args, 1))), target_ty, false);
-        const result = wip.callIntrinsic(
-            .normal,
-            .none,
-            intrinsic,
-            &.{target_ty},
+        const result = try self.callBuiltin(
+            LowLevelBuiltins.floatPow(target_layout == .f32).symbolName(),
+            target_ty,
+            &.{ target_ty, target_ty },
             &.{ lhs, rhs },
-            "",
-        ) catch return error.OutOfMemory;
+        );
         try self.storeScalar(self.slot(target).ptr, target_layout, result);
     }
 

@@ -6534,7 +6534,7 @@ pub const Interpreter = struct {
             },
             .float => |bits| switch (bits) {
                 32 => val.write(f32, builtins.float_math_f32.pow(a.read(f32), b.read(f32))),
-                64 => val.write(f64, std.math.pow(f64, a.read(f64), b.read(f64))),
+                64 => val.write(f64, builtins.float_math_f64.pow(a.read(f64), b.read(f64))),
                 else => return self.invariantFailedError("LIR/interpreter invariant violated: unsupported float pow width {d}", .{bits}),
             },
             .signed_int, .unsigned_int => return self.invariantFailedError(

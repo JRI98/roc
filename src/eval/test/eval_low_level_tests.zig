@@ -251,6 +251,14 @@ pub const tests = [_]TestCase{
         .expected = .{ .inspect_str = "True" },
     },
     .{
+        .name = "low_level - F64 pow exact bits agree across backends",
+        .source =
+        \\F64.to_bits(F64.pow(0.2, 3.3)) == 4572341155028887174
+        \\    and F64.to_bits(F64.pow(17.54697502703452, 3.3204523365293763)) == 4668664093059486920
+        ,
+        .expected = .{ .inspect_str = "True" },
+    },
+    .{
         .name = "low_level - F32 tan matrix",
         .source =
         \\{

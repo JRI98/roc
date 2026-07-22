@@ -1536,7 +1536,7 @@ pub const Evaluator = struct {
         const prim = self.primitiveOf(arg_types[0]) orelse return self.unsupported_("pow operand without primitive type");
         switch (prim) {
             .f32 => return .{ .float32 = builtins.float_math_f32.pow(args[0].float32, args[1].float32) },
-            .f64 => return .{ .float64 = std.math.pow(f64, args[0].float64, args[1].float64) },
+            .f64 => return .{ .float64 = builtins.float_math_f64.pow(args[0].float64, args[1].float64) },
             .dec => return self.unsupported_("dec transcendental op"),
             else => return self.unsupported_("integer pow op"),
         }

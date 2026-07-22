@@ -910,6 +910,7 @@ pub const tests = [_]TestCase{
     .{ .name = "comptime float bits - F64 sine infinity NaN", .source_kind = .module, .source = "main : F64\nmain = F64.sin(F64.infinity)", .expected = .{ .comptime_f64_bits = 0x7ff8000000000000 } },
     .{ .name = "comptime float bits - F64 arcsine domain NaN", .source_kind = .module, .source = "main : F64\nmain = F64.asin(2.0)", .expected = .{ .comptime_f64_bits = 0x7ff8000000000000 } },
     .{ .name = "comptime float bits - F64 payload propagation", .source_kind = .module, .source = "main : F64\nmain = F64.plus(F64.from_bits(9220034518954349876), 1.0)", .expected = .{ .comptime_f64_bits = 0x7ff8000000000000 } },
+    .{ .name = "comptime float bits - F64 deterministic power", .source_kind = .module, .source = "main : F64\nmain = F64.pow(0.2, 3.3)", .expected = .{ .comptime_f64_bits = 0x3f74380e21656686 } },
     .{ .name = "comptime float bits - F64 NaN narrowed to F32", .source_kind = .module, .source = "main : F32\nmain = F64.to_f32_wrap(F64.from_bits(9221120237041090561))", .expected = .{ .comptime_f32_bits = 0x7fc00000 } },
     .{
         .name = "comptime float bits - F32 NaNs are normalized inside static lists",
