@@ -905,7 +905,16 @@ const Pass = struct {
             },
             .loop_ => |loop| {
                 const initial_values = self.program.exprSpan(loop.initial_values);
-                for (0..initial_values.len) |index| try self.markArgUsesInExpr(fn_id, GuardedList.at(initial_values, index), changed);
+                for (0..initial_values.len) |index| {
+                    const initial = GuardedList.at(initial_values, index);
+                    // A loop-carried argument is a shape-relevant use: the
+                    // split scalarizes the slot only when the entry shape is
+                    // known, so a caller must expose the construction it
+                    // passes here.
+                    self.markArgUseIfLocal(fn_id, initial, changed);
+                    self.markShapeDemandIfDirect(fn_id, initial);
+                    try self.markArgUsesInExpr(fn_id, initial, changed);
+                }
                 try self.markArgUsesInExpr(fn_id, loop.body, changed);
             },
             .break_ => |maybe| if (maybe) |value| try self.markArgUsesInExpr(fn_id, value, changed),
@@ -3809,8 +3818,16 @@ const Cloner = struct {
 
         const values = try self.pass.allocator.alloc(Value, args.len);
         defer self.pass.allocator.free(values);
+        // A used argument's constructor only becomes visible after its
+        // construction call inlines (an iterator chain is a call, not a
+        // surface constructor), so expose it the same way `cloneCallProc`'s
+        // rewrite does; an unused argument's shape cannot matter.
+        const callee_uses = self.pass.plans[raw].used_args;
         for (args, 0..) |arg, index| {
-            values[index] = try self.cloneExprValue(arg);
+            values[index] = if (callee_uses[index])
+                try self.cloneExprValueDemandingShape(arg)
+            else
+                try self.cloneExprValue(arg);
         }
 
         for (self.pass.plans[raw].specs.items) |spec| {
