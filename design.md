@@ -6137,9 +6137,16 @@ and verifies direct and nested vector values in both call directions.
 standalone dev and LLVM programs, optimized compile-time tests, every evaluator
 backend, and the Lambda Mono comparison in sequence. The corpus contains 294
 operation/type cases, fixed boundary values, algebraic properties, and at least
-64 deterministic generated inputs per applicable case. It is opt-in to ordinary
-test enumeration so normal suites remain bounded, but the dedicated gate has no
-backend skips. `zig build run-check-simd-codegen` separately requires optimized
+64 deterministic generated inputs per applicable case. Every shift operation is
+checked directly against the scalar oracle for each semantically distinct count,
+then all 256 possible `U8` counts are proven equal to their oracle-checked
+modulo-lane-width count. This targeted loop does not repeat count-independent
+cases. Checked memory access pins the final valid 16-byte window, the first
+invalid offset, and `U64.highest`; every public
+lane accessor pins its exact first-invalid index. The corpus is opt-in to
+ordinary test enumeration so the normal eval and Lambda Mono steps do not run
+it twice, but MiniCI runs the dedicated no-skip gate explicitly.
+`zig build run-check-simd-codegen` separately requires optimized
 x86-64 output to contain representative byte-add, pairwise-dot, table-shuffle,
 and carryless-multiply instructions. `zig build run-check-glue-abi` compiles
 generated Zig and C declarations for x86-64 and AArch64 Linux/macOS/Windows plus

@@ -1,7 +1,8 @@
 # Generated, exhaustive cross-check of compiler SIMD low-levels against the
 # independent scalar { bits : U128 } oracle. Every invocation checks every
 # supported low-level/type combination over 64 deterministic pseudo-random
-# vectors, the pinned edge corpus, and all shift counts.
+# vectors and the pinned edge corpus. Shift operations additionally cover all
+# 256 possible U8 counts without repeating count-independent operations.
 
 import oracle.SimdOracle
 
@@ -1138,6 +1139,317 @@ SimdDifferential := [].{
 		{}
 	}
 
+	# Directly cross-check each semantically distinct count against the scalar
+	# oracle. Counts above a lane width are covered transitively by
+	# check_shift_masked_count below.
+	check_shift_reference_count : U128, U8 -> {}
+	check_shift_reference_count = |bits, count| {
+		if count < 8 {
+			if U8x16.shl_wrap(U8x16.from_u128_bits(bits), count).to_u128_bits() != SimdOracle.U8x16.shl_wrap(SimdOracle.U8x16.from_u128_bits(bits), count).to_u128_bits() {
+				crash "SIMD differential mismatch: U8x16.shl_wrap canonical count"
+			} else {}
+			if U8x16.shr_wrap(U8x16.from_u128_bits(bits), count).to_u128_bits() != SimdOracle.U8x16.shr_wrap(SimdOracle.U8x16.from_u128_bits(bits), count).to_u128_bits() {
+				crash "SIMD differential mismatch: U8x16.shr_wrap canonical count"
+			} else {}
+			if U8x16.shr_zf_wrap(U8x16.from_u128_bits(bits), count).to_u128_bits() != SimdOracle.U8x16.shr_zf_wrap(SimdOracle.U8x16.from_u128_bits(bits), count).to_u128_bits() {
+				crash "SIMD differential mismatch: U8x16.shr_zf_wrap canonical count"
+			} else {}
+			if I8x16.shl_wrap(I8x16.from_u128_bits(bits), count).to_u128_bits() != SimdOracle.I8x16.shl_wrap(SimdOracle.I8x16.from_u128_bits(bits), count).to_u128_bits() {
+				crash "SIMD differential mismatch: I8x16.shl_wrap canonical count"
+			} else {}
+			if I8x16.shr_wrap(I8x16.from_u128_bits(bits), count).to_u128_bits() != SimdOracle.I8x16.shr_wrap(SimdOracle.I8x16.from_u128_bits(bits), count).to_u128_bits() {
+				crash "SIMD differential mismatch: I8x16.shr_wrap canonical count"
+			} else {}
+			if I8x16.shr_zf_wrap(I8x16.from_u128_bits(bits), count).to_u128_bits() != SimdOracle.I8x16.shr_zf_wrap(SimdOracle.I8x16.from_u128_bits(bits), count).to_u128_bits() {
+				crash "SIMD differential mismatch: I8x16.shr_zf_wrap canonical count"
+			} else {}
+		} else {}
+		if count < 16 {
+			if U16x8.shl_wrap(U16x8.from_u128_bits(bits), count).to_u128_bits() != SimdOracle.U16x8.shl_wrap(SimdOracle.U16x8.from_u128_bits(bits), count).to_u128_bits() {
+				crash "SIMD differential mismatch: U16x8.shl_wrap canonical count"
+			} else {}
+			if U16x8.shr_wrap(U16x8.from_u128_bits(bits), count).to_u128_bits() != SimdOracle.U16x8.shr_wrap(SimdOracle.U16x8.from_u128_bits(bits), count).to_u128_bits() {
+				crash "SIMD differential mismatch: U16x8.shr_wrap canonical count"
+			} else {}
+			if U16x8.shr_zf_wrap(U16x8.from_u128_bits(bits), count).to_u128_bits() != SimdOracle.U16x8.shr_zf_wrap(SimdOracle.U16x8.from_u128_bits(bits), count).to_u128_bits() {
+				crash "SIMD differential mismatch: U16x8.shr_zf_wrap canonical count"
+			} else {}
+			if I16x8.shl_wrap(I16x8.from_u128_bits(bits), count).to_u128_bits() != SimdOracle.I16x8.shl_wrap(SimdOracle.I16x8.from_u128_bits(bits), count).to_u128_bits() {
+				crash "SIMD differential mismatch: I16x8.shl_wrap canonical count"
+			} else {}
+			if I16x8.shr_wrap(I16x8.from_u128_bits(bits), count).to_u128_bits() != SimdOracle.I16x8.shr_wrap(SimdOracle.I16x8.from_u128_bits(bits), count).to_u128_bits() {
+				crash "SIMD differential mismatch: I16x8.shr_wrap canonical count"
+			} else {}
+			if I16x8.shr_zf_wrap(I16x8.from_u128_bits(bits), count).to_u128_bits() != SimdOracle.I16x8.shr_zf_wrap(SimdOracle.I16x8.from_u128_bits(bits), count).to_u128_bits() {
+				crash "SIMD differential mismatch: I16x8.shr_zf_wrap canonical count"
+			} else {}
+		} else {}
+		if count < 32 {
+			if U32x4.shl_wrap(U32x4.from_u128_bits(bits), count).to_u128_bits() != SimdOracle.U32x4.shl_wrap(SimdOracle.U32x4.from_u128_bits(bits), count).to_u128_bits() {
+				crash "SIMD differential mismatch: U32x4.shl_wrap canonical count"
+			} else {}
+			if U32x4.shr_wrap(U32x4.from_u128_bits(bits), count).to_u128_bits() != SimdOracle.U32x4.shr_wrap(SimdOracle.U32x4.from_u128_bits(bits), count).to_u128_bits() {
+				crash "SIMD differential mismatch: U32x4.shr_wrap canonical count"
+			} else {}
+			if U32x4.shr_zf_wrap(U32x4.from_u128_bits(bits), count).to_u128_bits() != SimdOracle.U32x4.shr_zf_wrap(SimdOracle.U32x4.from_u128_bits(bits), count).to_u128_bits() {
+				crash "SIMD differential mismatch: U32x4.shr_zf_wrap canonical count"
+			} else {}
+			if I32x4.shl_wrap(I32x4.from_u128_bits(bits), count).to_u128_bits() != SimdOracle.I32x4.shl_wrap(SimdOracle.I32x4.from_u128_bits(bits), count).to_u128_bits() {
+				crash "SIMD differential mismatch: I32x4.shl_wrap canonical count"
+			} else {}
+			if I32x4.shr_wrap(I32x4.from_u128_bits(bits), count).to_u128_bits() != SimdOracle.I32x4.shr_wrap(SimdOracle.I32x4.from_u128_bits(bits), count).to_u128_bits() {
+				crash "SIMD differential mismatch: I32x4.shr_wrap canonical count"
+			} else {}
+			if I32x4.shr_zf_wrap(I32x4.from_u128_bits(bits), count).to_u128_bits() != SimdOracle.I32x4.shr_zf_wrap(SimdOracle.I32x4.from_u128_bits(bits), count).to_u128_bits() {
+				crash "SIMD differential mismatch: I32x4.shr_zf_wrap canonical count"
+			} else {}
+		} else {}
+		if count < 64 {
+			if U64x2.shl_wrap(U64x2.from_u128_bits(bits), count).to_u128_bits() != SimdOracle.U64x2.shl_wrap(SimdOracle.U64x2.from_u128_bits(bits), count).to_u128_bits() {
+				crash "SIMD differential mismatch: U64x2.shl_wrap canonical count"
+			} else {}
+			if U64x2.shr_wrap(U64x2.from_u128_bits(bits), count).to_u128_bits() != SimdOracle.U64x2.shr_wrap(SimdOracle.U64x2.from_u128_bits(bits), count).to_u128_bits() {
+				crash "SIMD differential mismatch: U64x2.shr_wrap canonical count"
+			} else {}
+			if U64x2.shr_zf_wrap(U64x2.from_u128_bits(bits), count).to_u128_bits() != SimdOracle.U64x2.shr_zf_wrap(SimdOracle.U64x2.from_u128_bits(bits), count).to_u128_bits() {
+				crash "SIMD differential mismatch: U64x2.shr_zf_wrap canonical count"
+			} else {}
+			if I64x2.shl_wrap(I64x2.from_u128_bits(bits), count).to_u128_bits() != SimdOracle.I64x2.shl_wrap(SimdOracle.I64x2.from_u128_bits(bits), count).to_u128_bits() {
+				crash "SIMD differential mismatch: I64x2.shl_wrap canonical count"
+			} else {}
+			if I64x2.shr_wrap(I64x2.from_u128_bits(bits), count).to_u128_bits() != SimdOracle.I64x2.shr_wrap(SimdOracle.I64x2.from_u128_bits(bits), count).to_u128_bits() {
+				crash "SIMD differential mismatch: I64x2.shr_wrap canonical count"
+			} else {}
+			if I64x2.shr_zf_wrap(I64x2.from_u128_bits(bits), count).to_u128_bits() != SimdOracle.I64x2.shr_zf_wrap(SimdOracle.I64x2.from_u128_bits(bits), count).to_u128_bits() {
+				crash "SIMD differential mismatch: I64x2.shr_zf_wrap canonical count"
+			} else {}
+		} else {}
+		{}
+	}
+
+	# Prove every non-canonical U8 count has the specified modulo-lane-width
+	# result. The canonical side of each equality is checked against the scalar
+	# oracle above, so these equalities extend that differential proof to all 256
+	# possible counts without recomputing the expensive scalar oracle.
+	check_shift_masked_count : U128, U8 -> {}
+	check_shift_masked_count = |bits, count| {
+		if count >= 8 {
+			effective = count % 8
+			if U8x16.shl_wrap(U8x16.from_u128_bits(bits), count).to_u128_bits() != U8x16.shl_wrap(U8x16.from_u128_bits(bits), effective).to_u128_bits() {
+				crash "SIMD count masking mismatch: U8x16.shl_wrap"
+			} else {}
+			if U8x16.shr_wrap(U8x16.from_u128_bits(bits), count).to_u128_bits() != U8x16.shr_wrap(U8x16.from_u128_bits(bits), effective).to_u128_bits() {
+				crash "SIMD count masking mismatch: U8x16.shr_wrap"
+			} else {}
+			if U8x16.shr_zf_wrap(U8x16.from_u128_bits(bits), count).to_u128_bits() != U8x16.shr_zf_wrap(U8x16.from_u128_bits(bits), effective).to_u128_bits() {
+				crash "SIMD count masking mismatch: U8x16.shr_zf_wrap"
+			} else {}
+			if I8x16.shl_wrap(I8x16.from_u128_bits(bits), count).to_u128_bits() != I8x16.shl_wrap(I8x16.from_u128_bits(bits), effective).to_u128_bits() {
+				crash "SIMD count masking mismatch: I8x16.shl_wrap"
+			} else {}
+			if I8x16.shr_wrap(I8x16.from_u128_bits(bits), count).to_u128_bits() != I8x16.shr_wrap(I8x16.from_u128_bits(bits), effective).to_u128_bits() {
+				crash "SIMD count masking mismatch: I8x16.shr_wrap"
+			} else {}
+			if I8x16.shr_zf_wrap(I8x16.from_u128_bits(bits), count).to_u128_bits() != I8x16.shr_zf_wrap(I8x16.from_u128_bits(bits), effective).to_u128_bits() {
+				crash "SIMD count masking mismatch: I8x16.shr_zf_wrap"
+			} else {}
+		} else {}
+		if count >= 16 {
+			effective = count % 16
+			if U16x8.shl_wrap(U16x8.from_u128_bits(bits), count).to_u128_bits() != U16x8.shl_wrap(U16x8.from_u128_bits(bits), effective).to_u128_bits() {
+				crash "SIMD count masking mismatch: U16x8.shl_wrap"
+			} else {}
+			if U16x8.shr_wrap(U16x8.from_u128_bits(bits), count).to_u128_bits() != U16x8.shr_wrap(U16x8.from_u128_bits(bits), effective).to_u128_bits() {
+				crash "SIMD count masking mismatch: U16x8.shr_wrap"
+			} else {}
+			if U16x8.shr_zf_wrap(U16x8.from_u128_bits(bits), count).to_u128_bits() != U16x8.shr_zf_wrap(U16x8.from_u128_bits(bits), effective).to_u128_bits() {
+				crash "SIMD count masking mismatch: U16x8.shr_zf_wrap"
+			} else {}
+			if I16x8.shl_wrap(I16x8.from_u128_bits(bits), count).to_u128_bits() != I16x8.shl_wrap(I16x8.from_u128_bits(bits), effective).to_u128_bits() {
+				crash "SIMD count masking mismatch: I16x8.shl_wrap"
+			} else {}
+			if I16x8.shr_wrap(I16x8.from_u128_bits(bits), count).to_u128_bits() != I16x8.shr_wrap(I16x8.from_u128_bits(bits), effective).to_u128_bits() {
+				crash "SIMD count masking mismatch: I16x8.shr_wrap"
+			} else {}
+			if I16x8.shr_zf_wrap(I16x8.from_u128_bits(bits), count).to_u128_bits() != I16x8.shr_zf_wrap(I16x8.from_u128_bits(bits), effective).to_u128_bits() {
+				crash "SIMD count masking mismatch: I16x8.shr_zf_wrap"
+			} else {}
+		} else {}
+		if count >= 32 {
+			effective = count % 32
+			if U32x4.shl_wrap(U32x4.from_u128_bits(bits), count).to_u128_bits() != U32x4.shl_wrap(U32x4.from_u128_bits(bits), effective).to_u128_bits() {
+				crash "SIMD count masking mismatch: U32x4.shl_wrap"
+			} else {}
+			if U32x4.shr_wrap(U32x4.from_u128_bits(bits), count).to_u128_bits() != U32x4.shr_wrap(U32x4.from_u128_bits(bits), effective).to_u128_bits() {
+				crash "SIMD count masking mismatch: U32x4.shr_wrap"
+			} else {}
+			if U32x4.shr_zf_wrap(U32x4.from_u128_bits(bits), count).to_u128_bits() != U32x4.shr_zf_wrap(U32x4.from_u128_bits(bits), effective).to_u128_bits() {
+				crash "SIMD count masking mismatch: U32x4.shr_zf_wrap"
+			} else {}
+			if I32x4.shl_wrap(I32x4.from_u128_bits(bits), count).to_u128_bits() != I32x4.shl_wrap(I32x4.from_u128_bits(bits), effective).to_u128_bits() {
+				crash "SIMD count masking mismatch: I32x4.shl_wrap"
+			} else {}
+			if I32x4.shr_wrap(I32x4.from_u128_bits(bits), count).to_u128_bits() != I32x4.shr_wrap(I32x4.from_u128_bits(bits), effective).to_u128_bits() {
+				crash "SIMD count masking mismatch: I32x4.shr_wrap"
+			} else {}
+			if I32x4.shr_zf_wrap(I32x4.from_u128_bits(bits), count).to_u128_bits() != I32x4.shr_zf_wrap(I32x4.from_u128_bits(bits), effective).to_u128_bits() {
+				crash "SIMD count masking mismatch: I32x4.shr_zf_wrap"
+			} else {}
+		} else {}
+		if count >= 64 {
+			effective = count % 64
+			if U64x2.shl_wrap(U64x2.from_u128_bits(bits), count).to_u128_bits() != U64x2.shl_wrap(U64x2.from_u128_bits(bits), effective).to_u128_bits() {
+				crash "SIMD count masking mismatch: U64x2.shl_wrap"
+			} else {}
+			if U64x2.shr_wrap(U64x2.from_u128_bits(bits), count).to_u128_bits() != U64x2.shr_wrap(U64x2.from_u128_bits(bits), effective).to_u128_bits() {
+				crash "SIMD count masking mismatch: U64x2.shr_wrap"
+			} else {}
+			if U64x2.shr_zf_wrap(U64x2.from_u128_bits(bits), count).to_u128_bits() != U64x2.shr_zf_wrap(U64x2.from_u128_bits(bits), effective).to_u128_bits() {
+				crash "SIMD count masking mismatch: U64x2.shr_zf_wrap"
+			} else {}
+			if I64x2.shl_wrap(I64x2.from_u128_bits(bits), count).to_u128_bits() != I64x2.shl_wrap(I64x2.from_u128_bits(bits), effective).to_u128_bits() {
+				crash "SIMD count masking mismatch: I64x2.shl_wrap"
+			} else {}
+			if I64x2.shr_wrap(I64x2.from_u128_bits(bits), count).to_u128_bits() != I64x2.shr_wrap(I64x2.from_u128_bits(bits), effective).to_u128_bits() {
+				crash "SIMD count masking mismatch: I64x2.shr_wrap"
+			} else {}
+			if I64x2.shr_zf_wrap(I64x2.from_u128_bits(bits), count).to_u128_bits() != I64x2.shr_zf_wrap(I64x2.from_u128_bits(bits), effective).to_u128_bits() {
+				crash "SIMD count masking mismatch: I64x2.shr_zf_wrap"
+			} else {}
+		} else {}
+		{}
+	}
+
+	check_load_store_out_of_bounds : U128, List(U8), U64 -> {}
+	check_load_store_out_of_bounds = |bits, bytes, index| {
+		match U8x16.load(bytes, index) {
+			Err(OutOfBounds) => {}
+			_ => {
+				crash "SIMD bounds mismatch: U8x16.load accepted invalid offset"
+			}
+		}
+		match U8x16.store(U8x16.from_u128_bits(bits), bytes, index) {
+			Err(OutOfBounds) => {}
+			_ => {
+				crash "SIMD bounds mismatch: U8x16.store accepted invalid offset"
+			}
+		}
+		match I8x16.load(bytes, index) {
+			Err(OutOfBounds) => {}
+			_ => {
+				crash "SIMD bounds mismatch: I8x16.load accepted invalid offset"
+			}
+		}
+		match I8x16.store(I8x16.from_u128_bits(bits), bytes, index) {
+			Err(OutOfBounds) => {}
+			_ => {
+				crash "SIMD bounds mismatch: I8x16.store accepted invalid offset"
+			}
+		}
+		match U16x8.load(bytes, index) {
+			Err(OutOfBounds) => {}
+			_ => {
+				crash "SIMD bounds mismatch: U16x8.load accepted invalid offset"
+			}
+		}
+		match U16x8.store(U16x8.from_u128_bits(bits), bytes, index) {
+			Err(OutOfBounds) => {}
+			_ => {
+				crash "SIMD bounds mismatch: U16x8.store accepted invalid offset"
+			}
+		}
+		match I16x8.load(bytes, index) {
+			Err(OutOfBounds) => {}
+			_ => {
+				crash "SIMD bounds mismatch: I16x8.load accepted invalid offset"
+			}
+		}
+		match I16x8.store(I16x8.from_u128_bits(bits), bytes, index) {
+			Err(OutOfBounds) => {}
+			_ => {
+				crash "SIMD bounds mismatch: I16x8.store accepted invalid offset"
+			}
+		}
+		match U32x4.load(bytes, index) {
+			Err(OutOfBounds) => {}
+			_ => {
+				crash "SIMD bounds mismatch: U32x4.load accepted invalid offset"
+			}
+		}
+		match U32x4.store(U32x4.from_u128_bits(bits), bytes, index) {
+			Err(OutOfBounds) => {}
+			_ => {
+				crash "SIMD bounds mismatch: U32x4.store accepted invalid offset"
+			}
+		}
+		match I32x4.load(bytes, index) {
+			Err(OutOfBounds) => {}
+			_ => {
+				crash "SIMD bounds mismatch: I32x4.load accepted invalid offset"
+			}
+		}
+		match I32x4.store(I32x4.from_u128_bits(bits), bytes, index) {
+			Err(OutOfBounds) => {}
+			_ => {
+				crash "SIMD bounds mismatch: I32x4.store accepted invalid offset"
+			}
+		}
+		match U64x2.load(bytes, index) {
+			Err(OutOfBounds) => {}
+			_ => {
+				crash "SIMD bounds mismatch: U64x2.load accepted invalid offset"
+			}
+		}
+		match U64x2.store(U64x2.from_u128_bits(bits), bytes, index) {
+			Err(OutOfBounds) => {}
+			_ => {
+				crash "SIMD bounds mismatch: U64x2.store accepted invalid offset"
+			}
+		}
+		match I64x2.load(bytes, index) {
+			Err(OutOfBounds) => {}
+			_ => {
+				crash "SIMD bounds mismatch: I64x2.load accepted invalid offset"
+			}
+		}
+		match I64x2.store(I64x2.from_u128_bits(bits), bytes, index) {
+			Err(OutOfBounds) => {}
+			_ => {
+				crash "SIMD bounds mismatch: I64x2.store accepted invalid offset"
+			}
+		}
+		{}
+	}
+
+	check_store_last_valid : U128, List(U8), U64 -> {}
+	check_store_last_valid = |bits, bytes, index| {
+		if U8x16.store(U8x16.from_u128_bits(bits), bytes, index) != SimdOracle.U8x16.store(SimdOracle.U8x16.from_u128_bits(bits), bytes, index) {
+			crash "SIMD bounds mismatch: U8x16.store at last valid offset"
+		} else {}
+		if I8x16.store(I8x16.from_u128_bits(bits), bytes, index) != SimdOracle.I8x16.store(SimdOracle.I8x16.from_u128_bits(bits), bytes, index) {
+			crash "SIMD bounds mismatch: I8x16.store at last valid offset"
+		} else {}
+		if U16x8.store(U16x8.from_u128_bits(bits), bytes, index) != SimdOracle.U16x8.store(SimdOracle.U16x8.from_u128_bits(bits), bytes, index) {
+			crash "SIMD bounds mismatch: U16x8.store at last valid offset"
+		} else {}
+		if I16x8.store(I16x8.from_u128_bits(bits), bytes, index) != SimdOracle.I16x8.store(SimdOracle.I16x8.from_u128_bits(bits), bytes, index) {
+			crash "SIMD bounds mismatch: I16x8.store at last valid offset"
+		} else {}
+		if U32x4.store(U32x4.from_u128_bits(bits), bytes, index) != SimdOracle.U32x4.store(SimdOracle.U32x4.from_u128_bits(bits), bytes, index) {
+			crash "SIMD bounds mismatch: U32x4.store at last valid offset"
+		} else {}
+		if I32x4.store(I32x4.from_u128_bits(bits), bytes, index) != SimdOracle.I32x4.store(SimdOracle.I32x4.from_u128_bits(bits), bytes, index) {
+			crash "SIMD bounds mismatch: I32x4.store at last valid offset"
+		} else {}
+		if U64x2.store(U64x2.from_u128_bits(bits), bytes, index) != SimdOracle.U64x2.store(SimdOracle.U64x2.from_u128_bits(bits), bytes, index) {
+			crash "SIMD bounds mismatch: U64x2.store at last valid offset"
+		} else {}
+		if I64x2.store(I64x2.from_u128_bits(bits), bytes, index) != SimdOracle.I64x2.store(SimdOracle.I64x2.from_u128_bits(bits), bytes, index) {
+			crash "SIMD bounds mismatch: I64x2.store at last valid offset"
+		} else {}
+		{}
+	}
+
 	check_all : U128, U128, U128, U8, List(U8) -> {}
 	check_all = |a, b, c, count, bytes| {
 		check_u8x16(a, b, c, count, bytes)
@@ -1161,6 +1473,12 @@ SimdDifferential := [].{
 	check_edge_corpus : {} -> {}
 	check_edge_corpus = |_| {
 		bytes = List.repeat(171.U8, 49)
+		# Offset 33 is the last valid 16-byte window. Pin both sides of that
+		# boundary, plus the overflow-resistant index > len guard.
+		check_loads(33, bytes)
+		check_store_last_valid(U128.highest, bytes, 33)
+		check_load_store_out_of_bounds(U128.highest, bytes, 34)
+		check_load_store_out_of_bounds(U128.highest, bytes, U64.highest)
 		# Zero, all-ones, top-bit, and alternating-bit vectors.
 		check_all(0, U128.highest, 1, 0, bytes)
 		check_all(1, 170141183460469231731687303715884105728, U128.highest, 1, bytes)
@@ -1335,7 +1653,6 @@ SimdDifferential := [].{
 	run_corpus : U128 -> Bool
 	run_corpus = |seed| {
 		check_edge_corpus({})
-		counts = [0.U8, 1, 7, 8, 9, 15, 16, 17, 31, 32, 33, 63, 64, 65, 127, 128, 200, 255]
 		var $state = seed
 		var $i = 0.U64
 		while $i < 64 {
@@ -1347,16 +1664,20 @@ SimdDifferential := [].{
 			c = $state
 			check_properties(a, b)
 			bytes = List.repeat(a.to_u8_wrap(), 49)
-			var $j = 0.U64
-			while $j < List.len(counts) {
-				count = match List.get(counts, $j) {
-					Ok(value) => value
-					Err(OutOfBounds) => {
-						crash "SIMD differential count index invariant violated"
-					}
-				}
-				check_all(a, b, c, count, bytes)
-				$j = $j + 1
+			# Count-independent operations, lane access, concat, and memory
+			# operations run once for each generated vector.
+			check_all(a, b, c, a.to_u8_wrap(), bytes)
+			# Shift semantics accept U8, so this loop proves every possible count.
+			# Canonical counts are checked directly against the scalar oracle; all
+			# other counts are proven equal to their checked modulo-width count.
+			var $count = 0.U64
+			while $count < 256 {
+				count = $count.to_u8_wrap()
+				if count < 64 {
+					check_shift_reference_count(a, count)
+				} else {}
+				check_shift_masked_count(a, count)
+				$count = $count + 1
 			}
 			$i = $i + 1
 		}

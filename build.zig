@@ -3896,7 +3896,7 @@ pub fn build(b: *std.Build) void {
         }
         break :blk lm_args_list.toOwnedSlice(b.allocator) catch @panic("OOM");
     } else run_args;
-    _ = install_and_run(
+    const lambda_mono_differential_install = install_and_run(
         b,
         no_bin,
         lambda_mono_differential_exe,
@@ -3922,18 +3922,27 @@ pub fn build(b: *std.Build) void {
 
     run_simd_eval.step.dependOn(&run_simd_ctfe.step);
 
-    const run_simd_lambda_mono = b.addRunArtifact(lambda_mono_differential_exe);
-    run_simd_lambda_mono.addArgs(&.{
-        "--filter",
-        "SIMD full differential corpus",
-        "--threads",
-        "1",
-        "--timeout",
-        "900000",
-        "corpus-only",
-    });
-    run_simd_lambda_mono.step.dependOn(&run_simd_eval.step);
-    run_test_simd_differential_step.dependOn(&run_simd_lambda_mono.step);
+    if (lambda_mono_differential_install) |install| {
+        // Evaluator tests compile temporary Roc programs beneath `.zig-cache`.
+        // Run the installed Lambda Mono runner so this final gate does not
+        // depend on a cache artifact surviving the preceding evaluator.
+        const run_simd_lambda_mono = b.addSystemCommand(&.{b.getInstallPath(.bin, lambda_mono_differential_exe.out_filename)});
+        run_simd_lambda_mono.addArgs(&.{
+            "--filter",
+            "SIMD full differential corpus",
+            "--threads",
+            "1",
+            "--timeout",
+            "900000",
+            "corpus-only",
+        });
+        run_simd_lambda_mono.addArgs(run_args);
+        run_simd_lambda_mono.step.dependOn(&install.step);
+        run_simd_lambda_mono.step.dependOn(&run_simd_eval.step);
+        run_test_simd_differential_step.dependOn(&run_simd_lambda_mono.step);
+    } else {
+        run_test_simd_differential_step.dependOn(&lambda_mono_differential_exe.step);
+    }
 
     const playground_exe = b.addExecutable(.{
         .name = "playground",
