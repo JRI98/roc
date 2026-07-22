@@ -10003,6 +10003,10 @@ const BodyContext = struct {
         return Ident.textEql(text, "Builtin.List.iter");
     }
 
+    fn isBuiltinStrIterUtf8Text(text: []const u8) bool {
+        return Ident.textEql(text, "Builtin.Str.iter_utf8");
+    }
+
     fn isBuiltinIterMapText(text: []const u8) bool {
         return Ident.textEql(text, "Builtin.Iter.map");
     }
@@ -11194,6 +11198,23 @@ const BodyContext = struct {
             if (try self.generatedIteratorExpectedProducerFunctionType(.list, arg_tys, expected_ret_ty)) |expected_fn| return expected_fn;
             const components = [_]Type.TypeId{arg_tys[0]};
             return try self.functionTypeWithReturn(arg_tys, try self.generatedIteratorType(.list, fn_data.ret, &components, null));
+        }
+
+        if (isBuiltinStrIterUtf8Text(text)) {
+            if (checked_args.len != 1 or arg_tys.len != 1) Common.invariant("Str.iter_utf8 reached Monotype with an unexpected arity");
+            if (expected_ret_ty) |expected| {
+                if (self.isGeneratedIteratorEvidenceType(expected)) {
+                    const stable_expected = try self.stableGeneratedIteratorEvidenceType(expected);
+                    if (self.isForcedDynamicIteratorType(stable_expected)) {
+                        return try self.functionTypeWithReturn(arg_tys, stable_expected);
+                    }
+                    const expected_args = try self.generatedIteratorComponentArgs(stable_expected, 1);
+                    defer self.allocator.free(expected_args);
+                    return try self.functionTypeWithReturn(expected_args, stable_expected);
+                }
+            }
+            const components = [_]Type.TypeId{arg_tys[0]};
+            return try self.functionTypeWithReturn(arg_tys, try self.generatedIteratorType(.str, fn_data.ret, &components, null));
         }
 
         if (isBuiltinIterSingleText(text)) {
