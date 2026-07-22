@@ -2,7 +2,7 @@
 //!
 //! This module generates native machine code from statement-only LIR procs.
 //! It uses the Emit.zig infrastructure for instruction encoding and
-//! ValueStorage.zig for register allocation.
+//! a single stable-location table for semantic values.
 //!
 //! Pipeline position:
 //! ```
@@ -11,7 +11,7 @@
 //!
 //! Key properties:
 //! - Uses real machine instructions via Emit.zig
-//! - Proper register allocation with spilling support
+//! - Bounded register use with semantic values materialized to stable stack locations
 //! - Handles System V ABI (x86_64/aarch64) calling convention
 //! - Generates position-independent code with relocations
 //! - Supports x86_64 and aarch64 architectures
@@ -640,11 +640,6 @@ pub fn LirCodeGen(comptime target: RocTarget) type {
         /// debug crash sites in a proc keeps the frame from growing linearly
         /// with the number of debug asserts. Lazily allocated on first use.
         proc_debug_msg_slot: ?i32 = null,
-
-        /// Counter for unique temporary local IDs.
-        /// Starts at 0x8000_0000 to avoid collision with real local variables.
-        /// Used by allocTempGeneral() for temporaries that don't correspond to real locals.
-        next_temp_local: u32 = 0x8000_0000,
 
         /// Generation mode determines whether to use direct function pointers or symbol references.
         /// - native_execution: Code runs in-process (dev evaluator), direct function pointers work
@@ -2123,7 +2118,7 @@ pub fn LirCodeGen(comptime target: RocTarget) type {
                     }
 
                     // Convert signed i64 to f64
-                    const freg = self.codegen.allocFloat() orelse unreachable;
+                    const freg = try self.allocTempFloat();
                     if (comptime target.toCpuArch() == .aarch64) {
                         try self.codegen.emit.scvtfFloatFromGen(.double, freg, src_reg, .w64);
                     } else {
@@ -2159,7 +2154,7 @@ pub fn LirCodeGen(comptime target: RocTarget) type {
                     try self.emitLsrImm(.w64, src_reg, src_reg, shift_amount);
 
                     // Convert (now fits in positive i64) to f64
-                    const freg = self.codegen.allocFloat() orelse unreachable;
+                    const freg = try self.allocTempFloat();
                     if (comptime target.toCpuArch() == .aarch64) {
                         try self.codegen.emit.scvtfFloatFromGen(.double, freg, src_reg, .w64);
                     } else {
@@ -2177,7 +2172,7 @@ pub fn LirCodeGen(comptime target: RocTarget) type {
                     if (args.len < 1) unreachable;
                     const src_loc = try self.emitValueLocal(GuardedList.at(args, 0));
                     const src_reg = try self.ensureInGeneralReg(src_loc);
-                    const freg = self.codegen.allocFloat() orelse unreachable;
+                    const freg = try self.allocTempFloat();
 
                     if (comptime target.toCpuArch() == .aarch64) {
                         // UCVTF handles unsigned integers directly
@@ -2293,7 +2288,7 @@ pub fn LirCodeGen(comptime target: RocTarget) type {
                     const src_loc = try self.emitValueLocal(GuardedList.at(args, 0));
                     const freg = try self.ensureInFloatReg(src_loc);
 
-                    const dst_reg = self.codegen.allocGeneral() orelse unreachable;
+                    const dst_reg = try self.allocTempGeneral();
                     if (comptime target.toCpuArch() == .aarch64) {
                         // FCVTZS natively saturates and handles NaN (→0)
                         try self.codegen.emit.fcvtzsGenFromFloat(.double, dst_reg, freg, .w64);
@@ -2337,7 +2332,7 @@ pub fn LirCodeGen(comptime target: RocTarget) type {
                     const src_loc = try self.emitValueLocal(GuardedList.at(args, 0));
                     const freg = try self.ensureInFloatReg(src_loc);
 
-                    const dst_reg = self.codegen.allocGeneral() orelse unreachable;
+                    const dst_reg = try self.allocTempGeneral();
                     if (comptime target.toCpuArch() == .aarch64) {
                         // FCVTZU natively handles unsigned conversion with saturation
                         try self.codegen.emit.fcvtzuGenFromFloat(.double, dst_reg, freg, .w64);
@@ -2569,7 +2564,7 @@ pub fn LirCodeGen(comptime target: RocTarget) type {
                     const parts = try self.getI128Parts(src_loc, .signed); // Dec is signed i128
 
                     // Call roc_builtins_dec_to_i64_trunc(low, high) -> i64
-                    const result_reg = self.codegen.allocGeneral() orelse unreachable;
+                    const result_reg = try self.allocTempGeneral();
 
                     var builder = try Builder.init(&self.codegen.emit, &self.codegen.stack_offset);
                     try builder.addRegArg(parts.low);
@@ -3670,7 +3665,7 @@ pub fn LirCodeGen(comptime target: RocTarget) type {
 
                     if (is_float) {
                         const float_reg = try self.ensureInFloatReg(inner_loc);
-                        const result_reg = try self.codegen.allocFloatFor(0);
+                        const result_reg = try self.allocTempFloat();
                         try self.codegen.emitNegF64(result_reg, float_reg);
                         self.codegen.freeFloat(float_reg);
                         return .{ .float_reg = result_reg };
@@ -3882,7 +3877,7 @@ pub fn LirCodeGen(comptime target: RocTarget) type {
                     }
 
                     const src_reg = try self.ensureInFloatReg(src_loc);
-                    const result_reg = try self.codegen.allocFloatFor(0);
+                    const result_reg = try self.allocTempFloat();
 
                     switch (ll.ret_layout) {
                         .f32 => {
@@ -6852,7 +6847,7 @@ pub fn LirCodeGen(comptime target: RocTarget) type {
                             std.debug.assert(result_low != .RAX and result_low != .RDX);
                             std.debug.assert(result_high != .RAX and result_high != .RDX);
 
-                            // Mark RAX and RDX as in-use so allocGeneralFor won't return them
+                            // Mark RAX and RDX as in-use so temporary allocation won't return them.
                             self.codegen.markRegisterInUse(.RAX);
                             self.codegen.markRegisterInUse(.RDX);
 
@@ -6863,9 +6858,9 @@ pub fn LirCodeGen(comptime target: RocTarget) type {
                             };
 
                             const saveIfClobbered = struct {
-                                fn f(s: *Self, reg: GeneralReg, sentinel: u32) Allocator.Error!SavedReg {
+                                fn f(s: *Self, reg: GeneralReg) Allocator.Error!SavedReg {
                                     if (reg == .RAX or reg == .RDX) {
-                                        const saved = try s.codegen.allocGeneralFor(sentinel);
+                                        const saved = try s.allocTempGeneral();
                                         try s.codegen.emit.movRegReg(.w64, saved, reg);
                                         return .{ .reg = saved, .needs_free = true };
                                     }
@@ -6874,10 +6869,10 @@ pub fn LirCodeGen(comptime target: RocTarget) type {
                             }.f;
 
                             // Save inputs in RAX/RDX (at most 2 of 4 can be)
-                            const lhs_low = try saveIfClobbered(self, lhs_parts.low, 0xFFFC);
-                            const lhs_high = try saveIfClobbered(self, lhs_parts.high, 0xFFFD);
-                            const rhs_low = try saveIfClobbered(self, rhs_parts.low, 0xFFFE);
-                            const rhs_high = try saveIfClobbered(self, rhs_parts.high, 0xFFFF);
+                            const lhs_low = try saveIfClobbered(self, lhs_parts.low);
+                            const lhs_high = try saveIfClobbered(self, lhs_parts.high);
+                            const rhs_low = try saveIfClobbered(self, rhs_parts.low);
+                            const rhs_high = try saveIfClobbered(self, rhs_parts.high);
 
                             // Restore RAX/RDX to free pool (MUL will use them)
                             self.codegen.freeGeneral(.RAX);
@@ -6979,9 +6974,9 @@ pub fn LirCodeGen(comptime target: RocTarget) type {
                 },
                 // Comparison operations for i128/Dec
                 .num_is_eq => {
-                    // Free result_low/result_high first — they're not needed for comparisons,
-                    // and freeing them reduces register pressure (avoids spills that corrupt
-                    // input part registers on Windows x64 where only 9 regs are available).
+                    // Free result_low/result_high first: comparisons do not use them, and
+                    // releasing them keeps the short-lived working set within the Windows
+                    // x64 register pool.
                     self.codegen.freeGeneral(result_high);
                     self.codegen.freeGeneral(result_low);
 
@@ -6996,9 +6991,9 @@ pub fn LirCodeGen(comptime target: RocTarget) type {
                     return .{ .general_reg = result_reg };
                 },
                 .num_is_lt, .num_is_lte, .num_is_gt, .num_is_gte => {
-                    // Free result_low/result_high first — they're not needed for comparisons,
-                    // and freeing them reduces register pressure (avoids spills that corrupt
-                    // input part registers on Windows x64 where only 9 regs are available).
+                    // Free result_low/result_high first: comparisons do not use them, and
+                    // releasing them keeps the short-lived working set within the Windows
+                    // x64 register pool.
                     self.codegen.freeGeneral(result_high);
                     self.codegen.freeGeneral(result_low);
 
@@ -7064,7 +7059,7 @@ pub fn LirCodeGen(comptime target: RocTarget) type {
             self.codegen.freeGeneral(parts.high);
 
             // f64 return value is in the float return register
-            const freg = self.codegen.allocFloat() orelse unreachable;
+            const freg = try self.allocTempFloat();
             if (comptime target.toCpuArch() == .aarch64) {
                 try self.codegen.emit.fmovRegReg(.double, freg, .V0);
             } else {
@@ -7115,7 +7110,7 @@ pub fn LirCodeGen(comptime target: RocTarget) type {
             try self.callBuiltin(&builder, builtin_fn);
             self.codegen.freeFloat(freg);
 
-            const result_reg = self.codegen.allocFloat() orelse unreachable;
+            const result_reg = try self.allocTempFloat();
             if (comptime target.toCpuArch() == .aarch64) {
                 if (result_reg != .V0) {
                     try self.codegen.emit.fmovRegReg(.double, result_reg, .V0);
@@ -7160,7 +7155,7 @@ pub fn LirCodeGen(comptime target: RocTarget) type {
             try builder.addImmArg(float_width);
             try self.callBuiltin(&builder, builtin_fn);
 
-            const result_reg = self.codegen.allocFloat() orelse unreachable;
+            const result_reg = try self.allocTempFloat();
             if (comptime target.toCpuArch() == .aarch64) {
                 if (result_reg != .V0) {
                     try self.codegen.emit.fmovRegReg(.double, result_reg, .V0);
@@ -8177,7 +8172,6 @@ pub fn LirCodeGen(comptime target: RocTarget) type {
             ctr_slot: i32,
             offset_slot: i32,
             elem_size: u32,
-            eq_reg: GeneralReg,
             exit_patch: usize,
             len_ne_patch: usize,
             empty_patch: usize,
@@ -8203,8 +8197,8 @@ pub fn LirCodeGen(comptime target: RocTarget) type {
                 node_tag: struct { lhs_loc: ValueLocation, rhs_loc: ValueLocation, layout_idx: layout.Idx, result_reg: GeneralReg },
                 node_list: struct { lhs_loc: ValueLocation, rhs_loc: ValueLocation, layout_idx: layout.Idx, result_reg: GeneralReg },
                 // Struct field continuations.
-                struct_field: struct { result_slot: i32, lhs_off: i32, rhs_off: i32, field_layout_idx: layout.Idx, field_size: u32 },
-                struct_and: struct { result_slot: i32, field_eq_reg: GeneralReg },
+                struct_field: struct { result_slot: i32, lhs_off: i32, rhs_off: i32, field_layout_idx: layout.Idx, field_size: u32, result_reg: GeneralReg },
+                struct_and: struct { result_slot: i32, result_reg: GeneralReg },
                 struct_finish: struct { result_slot: i32, result_reg: GeneralReg },
                 // Tag union continuations.
                 tag_variant: struct { state: *EqTagState, variant_i: u32, payload_layout_idx: layout.Idx, payload_size: u32 },
@@ -8395,23 +8389,25 @@ pub fn LirCodeGen(comptime target: RocTarget) type {
                             .rhs_off = rhs_base + @as(i32, @intCast(field_offset)),
                             .field_layout_idx = field_layout_idx,
                             .field_size = field_size,
+                            .result_reg = rr,
                         } });
                     }
                 },
 
                 .struct_field => |sf| {
-                    const field_eq_reg = try self.allocTempGeneral();
-                    try work.append(wa, .{ .struct_and = .{ .result_slot = sf.result_slot, .field_eq_reg = field_eq_reg } });
-                    try work.append(wa, .{ .node_field = .{ .lhs_off = sf.lhs_off, .rhs_off = sf.rhs_off, .layout_idx = sf.field_layout_idx, .size = sf.field_size, .result_reg = field_eq_reg } });
+                    // The child finishes before `struct_and` runs, so both can reuse the
+                    // caller-provided result register. Register use stays constant as the
+                    // layout nesting depth grows.
+                    try work.append(wa, .{ .struct_and = .{ .result_slot = sf.result_slot, .result_reg = sf.result_reg } });
+                    try work.append(wa, .{ .node_field = .{ .lhs_off = sf.lhs_off, .rhs_off = sf.rhs_off, .layout_idx = sf.field_layout_idx, .size = sf.field_size, .result_reg = sf.result_reg } });
                 },
 
                 .struct_and => |sa_| {
                     const acc_reg = try self.allocTempGeneral();
                     try self.codegen.emitLoadStack(.w64, acc_reg, sa_.result_slot);
-                    try self.emitAndRegs(.w64, acc_reg, acc_reg, sa_.field_eq_reg);
+                    try self.emitAndRegs(.w64, acc_reg, acc_reg, sa_.result_reg);
                     try self.codegen.emitStoreStack(.w64, sa_.result_slot, acc_reg);
                     self.codegen.freeGeneral(acc_reg);
-                    self.codegen.freeGeneral(sa_.field_eq_reg);
                 },
 
                 .struct_finish => |sf| {
@@ -8641,7 +8637,6 @@ pub fn LirCodeGen(comptime target: RocTarget) type {
                         self.codegen.freeGeneral(tmp);
                         self.codegen.freeGeneral(ptr_reg);
                     }
-                    const eq_reg = try self.allocTempGeneral();
                     const state = try self.allocator.create(EqListState);
                     state.* = .{
                         .result_reg = rr,
@@ -8649,18 +8644,18 @@ pub fn LirCodeGen(comptime target: RocTarget) type {
                         .ctr_slot = ctr_slot,
                         .offset_slot = offset_slot,
                         .elem_size = elem_size,
-                        .eq_reg = eq_reg,
                         .exit_patch = exit_patch,
                         .len_ne_patch = len_ne_patch,
                         .empty_patch = empty_patch,
                     };
+                    // The nested element comparison completes before `list_finish` and
+                    // may therefore reuse the list's result register at every depth.
                     try work.append(wa, .{ .list_finish = state });
-                    try work.append(wa, .{ .node_field = .{ .lhs_off = lhs_elem_slot, .rhs_off = rhs_elem_slot, .layout_idx = elem_layout_idx, .size = elem_size, .result_reg = eq_reg } });
+                    try work.append(wa, .{ .node_field = .{ .lhs_off = lhs_elem_slot, .rhs_off = rhs_elem_slot, .layout_idx = elem_layout_idx, .size = elem_size, .result_reg = rr } });
                 },
 
                 .list_finish => |st| {
-                    try self.emitCmpImm(st.eq_reg, 1);
-                    self.codegen.freeGeneral(st.eq_reg);
+                    try self.emitCmpImm(st.result_reg, 1);
                     const ne_patch = try self.codegen.emitCondJump(condNotEqual());
                     {
                         const ctr_reg = try self.allocTempGeneral();
@@ -8732,8 +8727,8 @@ pub fn LirCodeGen(comptime target: RocTarget) type {
                 switch (op) {
                     .num_is_eq => {
                         // NaN-safe eq: (ZF=1) AND (PF=0) → sete + setnp + and
-                        const result_reg = try self.codegen.allocGeneralFor(0);
-                        const tmp_reg = try self.codegen.allocGeneralFor(0);
+                        const result_reg = try self.allocTempGeneral();
+                        const tmp_reg = try self.allocTempGeneral();
                         try self.codegen.emit.ucomisdRegReg(lhs_reg, rhs_reg);
                         try self.codegen.emit.setcc(.equal, result_reg);
                         try self.codegen.emit.setcc(.parity_odd, tmp_reg);
@@ -8746,7 +8741,7 @@ pub fn LirCodeGen(comptime target: RocTarget) type {
                     },
                     .num_is_lt => {
                         // NaN-safe lt: swap operands, use "above" (CF=0 AND ZF=0)
-                        const result_reg = try self.codegen.allocGeneralFor(0);
+                        const result_reg = try self.allocTempGeneral();
                         try self.codegen.emitCmpF64(result_reg, rhs_reg, lhs_reg, .above);
                         self.codegen.freeFloat(lhs_reg);
                         self.codegen.freeFloat(rhs_reg);
@@ -8754,7 +8749,7 @@ pub fn LirCodeGen(comptime target: RocTarget) type {
                     },
                     .num_is_lte => {
                         // NaN-safe lte: swap operands, use "above_or_equal" (CF=0)
-                        const result_reg = try self.codegen.allocGeneralFor(0);
+                        const result_reg = try self.allocTempGeneral();
                         try self.codegen.emitCmpF64(result_reg, rhs_reg, lhs_reg, .above_or_equal);
                         self.codegen.freeFloat(lhs_reg);
                         self.codegen.freeFloat(rhs_reg);
@@ -8763,7 +8758,7 @@ pub fn LirCodeGen(comptime target: RocTarget) type {
                     .num_is_gt, .num_is_gte => {
                         // gt/gte are already NaN-safe on x86_64 (above/above_or_equal return false for NaN)
                         const float_cond = floatCondition(op).?;
-                        const result_reg = try self.codegen.allocGeneralFor(0);
+                        const result_reg = try self.allocTempGeneral();
                         try self.codegen.emitCmpF64(result_reg, lhs_reg, rhs_reg, float_cond);
                         self.codegen.freeFloat(lhs_reg);
                         self.codegen.freeFloat(rhs_reg);
@@ -8774,7 +8769,7 @@ pub fn LirCodeGen(comptime target: RocTarget) type {
             } else {
                 const float_cond = floatCondition(op);
                 if (float_cond) |cond| {
-                    const result_reg = try self.codegen.allocGeneralFor(0);
+                    const result_reg = try self.allocTempGeneral();
                     try self.codegen.emitCmpF64(result_reg, lhs_reg, rhs_reg, cond);
                     self.codegen.freeFloat(lhs_reg);
                     self.codegen.freeFloat(rhs_reg);
@@ -8783,7 +8778,7 @@ pub fn LirCodeGen(comptime target: RocTarget) type {
             }
 
             // Arithmetic operations produce float results
-            const result_reg = try self.codegen.allocFloatFor(0);
+            const result_reg = try self.allocTempFloat();
 
             switch (op) {
                 .num_plus => try self.codegen.emitAddF64(result_reg, lhs_reg, rhs_reg),
@@ -8933,7 +8928,7 @@ pub fn LirCodeGen(comptime target: RocTarget) type {
         /// Generate float absolute value
         fn generateFloatAbs(self: *Self, val_loc: ValueLocation) Allocator.Error!ValueLocation {
             const src_reg = try self.ensureInFloatReg(val_loc);
-            const result_reg = try self.codegen.allocFloatFor(0);
+            const result_reg = try self.allocTempFloat();
             try self.codegen.emitAbsF64(result_reg, src_reg);
             self.codegen.freeFloat(src_reg);
             return .{ .float_reg = result_reg };
@@ -8951,7 +8946,7 @@ pub fn LirCodeGen(comptime target: RocTarget) type {
                 const b_reg = try self.ensureInFloatReg(b_loc);
                 try self.codegen.emitSubF64(a_reg, a_reg, b_reg);
                 self.codegen.freeFloat(b_reg);
-                const result_reg = try self.codegen.allocFloatFor(0);
+                const result_reg = try self.allocTempFloat();
                 try self.codegen.emitAbsF64(result_reg, a_reg);
                 self.codegen.freeFloat(a_reg);
                 return .{ .float_reg = result_reg };
@@ -10377,9 +10372,7 @@ pub fn LirCodeGen(comptime target: RocTarget) type {
             const saved_callee_saved_used = self.codegen.callee_saved_used;
             const saved_callee_saved_available = self.codegen.callee_saved_available;
             const saved_free_general = self.codegen.free_general;
-            const saved_general_owners = self.codegen.general_owners;
             const saved_free_float = self.codegen.free_float;
-            const saved_float_owners = self.codegen.float_owners;
             const saved_roc_ops_reg = self.roc_ops_reg;
             const saved_ret_ptr_slot = self.ret_ptr_slot;
             const saved_uses_caller_stack_arg_base = self.uses_caller_stack_arg_base;
@@ -10389,9 +10382,7 @@ pub fn LirCodeGen(comptime target: RocTarget) type {
             self.codegen.callee_saved_used = 0;
             self.codegen.callee_saved_available = CodeGen.CALLEE_SAVED_GENERAL_MASK;
             self.codegen.free_general = CodeGen.INITIAL_FREE_GENERAL;
-            self.codegen.general_owners = [_]?u32{null} ** CodeGen.NUM_GENERAL_REGS;
             self.codegen.free_float = CodeGen.INITIAL_FREE_FLOAT;
-            self.codegen.float_owners = [_]?u32{null} ** CodeGen.NUM_FLOAT_REGS;
             self.roc_ops_reg = null;
             self.ret_ptr_slot = null;
             self.uses_caller_stack_arg_base = false;
@@ -10412,9 +10403,7 @@ pub fn LirCodeGen(comptime target: RocTarget) type {
                 self.codegen.callee_saved_used = saved_callee_saved_used;
                 self.codegen.callee_saved_available = saved_callee_saved_available;
                 self.codegen.free_general = saved_free_general;
-                self.codegen.general_owners = saved_general_owners;
                 self.codegen.free_float = saved_free_float;
-                self.codegen.float_owners = saved_float_owners;
                 self.roc_ops_reg = saved_roc_ops_reg;
                 self.ret_ptr_slot = saved_ret_ptr_slot;
                 self.uses_caller_stack_arg_base = saved_uses_caller_stack_arg_base;
@@ -10547,9 +10536,7 @@ pub fn LirCodeGen(comptime target: RocTarget) type {
             self.codegen.callee_saved_used = saved_callee_saved_used;
             self.codegen.callee_saved_available = saved_callee_saved_available;
             self.codegen.free_general = saved_free_general;
-            self.codegen.general_owners = saved_general_owners;
             self.codegen.free_float = saved_free_float;
-            self.codegen.float_owners = saved_float_owners;
             self.roc_ops_reg = saved_roc_ops_reg;
             self.ret_ptr_slot = saved_ret_ptr_slot;
             self.uses_caller_stack_arg_base = saved_uses_caller_stack_arg_base;
@@ -12242,13 +12229,22 @@ pub fn LirCodeGen(comptime target: RocTarget) type {
             return ls.layoutSizeAlign(layout_val).size;
         }
 
-        /// Allocate a general register with a unique temporary local ID.
-        /// Use this for temporary registers that don't correspond to real local variables.
-        /// This prevents register ownership conflicts that can corrupt spill tracking.
+        /// Allocate a short-lived general register used only during instruction selection.
+        /// Semantic values are materialized to `local_locations`; exhausting this pool
+        /// therefore indicates an internal lifetime bug rather than source-level pressure.
         fn allocTempGeneral(self: *Self) Allocator.Error!GeneralReg {
-            const local_id = self.next_temp_local;
-            self.next_temp_local +%= 1;
-            return self.codegen.allocGeneralFor(local_id);
+            return self.codegen.allocGeneral() orelse std.debug.panic(
+                "LirCodeGen invariant violated: bounded instruction selection exhausted the general-register pool",
+                .{},
+            );
+        }
+
+        /// Allocate a short-lived floating-point register used only during instruction selection.
+        fn allocTempFloat(self: *Self) Allocator.Error!FloatReg {
+            return self.codegen.allocFloat() orelse std.debug.panic(
+                "LirCodeGen invariant violated: bounded instruction selection exhausted the float-register pool",
+                .{},
+            );
         }
 
         /// Call a builtin function using either direct function pointer (native mode)
@@ -12464,7 +12460,7 @@ pub fn LirCodeGen(comptime target: RocTarget) type {
                         // by float temporaries. Preserve those payload bits as-is.
                         try self.codegen.emitLoadStack(.w32, reg, s.offset);
                     } else {
-                        const freg = self.codegen.allocFloat() orelse unreachable;
+                        const freg = try self.allocTempFloat();
                         try self.codegen.emitLoadStackF64(freg, s.offset);
                         if (comptime target.toCpuArch() == .aarch64) {
                             try self.codegen.emit.fcvtFloatFloat(.single, freg, .double, freg);
@@ -12582,7 +12578,7 @@ pub fn LirCodeGen(comptime target: RocTarget) type {
             while (true) switch (loc) {
                 .float_reg => |reg| return reg,
                 .immediate_f64 => |val| {
-                    const reg = self.codegen.allocFloat() orelse unreachable;
+                    const reg = try self.allocTempFloat();
                     const bits: u64 = @bitCast(val);
 
                     if (bits == 0) {
@@ -12608,7 +12604,7 @@ pub fn LirCodeGen(comptime target: RocTarget) type {
                     return reg;
                 },
                 .stack => |s| {
-                    const reg = self.codegen.allocFloat() orelse unreachable;
+                    const reg = try self.allocTempFloat();
                     if (s.size == .dword) {
                         if (comptime target.toCpuArch() == .aarch64) {
                             const bits_reg = try self.allocTempGeneral();
@@ -12776,7 +12772,7 @@ pub fn LirCodeGen(comptime target: RocTarget) type {
                                 const offset = s.offset;
                                 // Value was spilled to stack as F64 by stabilize.
                                 // Load as F64, convert to F32, then store 4 bytes.
-                                const freg = self.codegen.allocFloat() orelse unreachable;
+                                const freg = try self.allocTempFloat();
                                 try self.codegen.emitLoadStackF64(freg, offset);
                                 if (comptime target.toCpuArch() == .aarch64) {
                                     try self.codegen.emit.fcvtFloatFloat(.single, freg, .double, freg);
@@ -13886,9 +13882,7 @@ pub fn LirCodeGen(comptime target: RocTarget) type {
             const saved_callee_saved_used = self.codegen.callee_saved_used;
             const saved_callee_saved_available = self.codegen.callee_saved_available;
             const saved_free_general = self.codegen.free_general;
-            const saved_general_owners = self.codegen.general_owners;
             const saved_free_float = self.codegen.free_float;
-            const saved_float_owners = self.codegen.float_owners;
             const saved_roc_ops_reg = self.roc_ops_reg;
             const saved_ret_ptr_slot = self.ret_ptr_slot;
             const saved_uses_caller_stack_arg_base = self.uses_caller_stack_arg_base;
@@ -13920,9 +13914,7 @@ pub fn LirCodeGen(comptime target: RocTarget) type {
             self.codegen.callee_saved_used = 0;
             self.codegen.callee_saved_available = CodeGen.CALLEE_SAVED_GENERAL_MASK;
             self.codegen.free_general = CodeGen.INITIAL_FREE_GENERAL;
-            self.codegen.general_owners = [_]?u32{null} ** CodeGen.NUM_GENERAL_REGS;
             self.codegen.free_float = CodeGen.INITIAL_FREE_FLOAT;
-            self.codegen.float_owners = [_]?u32{null} ** CodeGen.NUM_FLOAT_REGS;
             self.roc_ops_reg = null;
             self.uses_caller_stack_arg_base = false;
             self.current_proc_name = proc.name;
@@ -13987,9 +13979,7 @@ pub fn LirCodeGen(comptime target: RocTarget) type {
                 self.codegen.callee_saved_used = saved_callee_saved_used;
                 self.codegen.callee_saved_available = saved_callee_saved_available;
                 self.codegen.free_general = saved_free_general;
-                self.codegen.general_owners = saved_general_owners;
                 self.codegen.free_float = saved_free_float;
-                self.codegen.float_owners = saved_float_owners;
                 self.roc_ops_reg = saved_roc_ops_reg;
                 self.uses_caller_stack_arg_base = saved_uses_caller_stack_arg_base;
                 self.current_proc_name = saved_current_proc_name;
@@ -14213,9 +14203,7 @@ pub fn LirCodeGen(comptime target: RocTarget) type {
             self.codegen.callee_saved_used = saved_callee_saved_used;
             self.codegen.callee_saved_available = saved_callee_saved_available;
             self.codegen.free_general = saved_free_general;
-            self.codegen.general_owners = saved_general_owners;
             self.codegen.free_float = saved_free_float;
-            self.codegen.float_owners = saved_float_owners;
             self.roc_ops_reg = saved_roc_ops_reg;
             self.uses_caller_stack_arg_base = saved_uses_caller_stack_arg_base;
             self.ret_ptr_slot = saved_ret_ptr_slot;
@@ -14477,12 +14465,12 @@ pub fn LirCodeGen(comptime target: RocTarget) type {
                     .float_reg => |freg| {
                         const slot = self.codegen.allocStackSlot(4);
                         if (comptime target.toCpuArch() == .aarch64) {
-                            const tmp = self.codegen.allocFloat() orelse unreachable;
+                            const tmp = try self.allocTempFloat();
                             try self.codegen.emit.fcvtFloatFloat(.single, tmp, .double, freg);
                             try self.codegen.emitStoreStackF32(slot, tmp);
                             self.codegen.freeFloat(tmp);
                         } else {
-                            const tmp = self.codegen.allocFloat() orelse unreachable;
+                            const tmp = try self.allocTempFloat();
                             try self.codegen.emit.cvtsd2ssRegReg(tmp, freg);
                             try self.codegen.emitStoreStackF32(slot, tmp);
                             self.codegen.freeFloat(tmp);
@@ -14515,7 +14503,7 @@ pub fn LirCodeGen(comptime target: RocTarget) type {
                         try self.emitStore(.w32, frame_ptr, slot, scratch_reg);
                     },
                     .stack => |s| {
-                        const tmp = self.codegen.allocFloat() orelse unreachable;
+                        const tmp = try self.allocTempFloat();
                         try self.codegen.emitLoadStackF64(tmp, s.offset);
                         if (comptime target.toCpuArch() == .aarch64) {
                             try self.codegen.emit.fcvtFloatFloat(.single, tmp, .double, tmp);
@@ -14832,9 +14820,6 @@ pub fn LirCodeGen(comptime target: RocTarget) type {
         fn markCallerStackArgBaseUsed(self: *Self) void {
             if (comptime arch == .aarch64 or arch == .aarch64_be) {
                 const bit = @as(u32, 1) << @intFromEnum(caller_stack_arg_base_reg);
-                if (std.debug.runtime_safety) {
-                    std.debug.assert(self.codegen.general_owners[@intFromEnum(caller_stack_arg_base_reg)] == null);
-                }
                 self.uses_caller_stack_arg_base = true;
                 self.codegen.callee_saved_used |= bit;
                 self.codegen.callee_saved_available &= ~bit;
