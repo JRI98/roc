@@ -485,6 +485,7 @@ fn replaceProvidedByCompilerLowLevels(env: *ModuleEnv) (Allocator.Error || error
         try putLowLevelFmt(&low_level_map, env, &name_scratch, "simd_{s}_load_16_unchecked", .{simd_type}, .simd_load_16_unchecked);
         try putLowLevelFmt(&low_level_map, env, &name_scratch, "simd_{s}_store_16_unchecked", .{simd_type}, .simd_store_16_unchecked);
     }
+    try putLowLevelFmt(&low_level_map, env, &name_scratch, "simd_u8x16_concat_shift_bytes_unchecked", .{}, .simd_concat_shift_bytes);
 
     const simd_method_mappings = [_]struct { owner: []const u8, name: []const u8, op: CIR.Expr.LowLevel }{
         .{ .owner = "U8x16", .name = "plus_saturated", .op = .simd_add_sat },
@@ -515,7 +516,6 @@ fn replaceProvidedByCompilerLowLevels(env: *ModuleEnv) (Allocator.Error || error
         .{ .owner = "I16x8", .name = "shift_right_rounded_by", .op = .simd_shr_rounded },
         .{ .owner = "I32x4", .name = "shift_right_rounded_by", .op = .simd_shr_rounded },
         .{ .owner = "U8x16", .name = "table_lookup", .op = .simd_table_lookup },
-        .{ .owner = "U8x16", .name = "concat_shift_bytes", .op = .simd_concat_shift_bytes },
         .{ .owner = "U64x2", .name = "carryless_times_lo", .op = .simd_clmul_lo },
         .{ .owner = "U64x2", .name = "carryless_times_hi", .op = .simd_clmul_hi },
     };

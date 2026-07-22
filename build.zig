@@ -3842,6 +3842,10 @@ pub fn build(b: *std.Build) void {
 
     const lambda_mono_differential_exe = b.addExecutable(.{
         .name = "lambda-mono-differential-runner",
+        // Linux compiler targets use musl so Roc-produced binaries are portable.
+        // Keep this host-executed test runner portable too instead of requiring
+        // the host to provide musl's dynamic loader.
+        .linkage = .static,
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/eval/test/lambda_mono_differential_runner.zig"),
             .target = target,

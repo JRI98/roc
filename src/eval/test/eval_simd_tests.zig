@@ -19,13 +19,20 @@ fn differentialSource() []const u8 {
 
 /// The dedicated SIMD gate runs this single source through every eval backend;
 /// the runtime app and its `expect` supply the standalone and CTFE lanes.
-pub const tests = [_]TestCase{.{
-    .name = "SIMD full differential corpus",
-    .source = "SimdDifferential.run_corpus(21345817372864405881847059188222722561)",
-    .imports = &.{
-        .{ .name = "SimdOracle", .source = oracle_source },
-        .{ .name = "SimdDifferential", .source = differentialSource() },
+pub const tests = [_]TestCase{
+    .{
+        .name = "SIMD full differential corpus",
+        .source = "SimdDifferential.run_corpus(21345817372864405881847059188222722561)",
+        .imports = &.{
+            .{ .name = "SimdOracle", .source = oracle_source },
+            .{ .name = "SimdDifferential", .source = differentialSource() },
+        },
+        .expected = .{ .inspect_str = "True" },
+        .opt_in = true,
     },
-    .expected = .{ .inspect_str = "True" },
-    .opt_in = true,
-}};
+    .{
+        .name = "SIMD concat shift rejects counts above sixteen",
+        .source = "U8x16.concat_shift_bytes(U8x16.splat(1), U8x16.splat(2), 17).to_u128_bits()",
+        .expected = .{ .crash = {} },
+    },
+};

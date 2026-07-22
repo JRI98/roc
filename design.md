@@ -5938,7 +5938,9 @@ and applies the target's C ABI:
 - Under AAPCS64, including fixed-prototype Windows-on-ARM64, a direct 128-bit
   short vector occupies one Q register. Aggregates follow the ordinary
   AAPCS64 rules, including homogeneous short-vector aggregates of up to four
-  identical members in consecutive vector registers.
+  members of the same fundamental `vector128` type in consecutive vector
+  registers. AAPCS64 does not distinguish lane width or signedness within that
+  fundamental type, so mixed Roc vector kinds still form an HVA.
 - Under the WebAssembly Basic C ABI, a direct vector is `v128`. Transparent
   one-field aggregates retain the field's direct classification; other
   aggregates follow the WebAssembly aggregate rules.

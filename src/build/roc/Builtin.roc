@@ -16597,6 +16597,12 @@ Builtin :: [].{
 			## Lowers to `palignr` on x86-64, `ext` on AArch64 NEON, and a
 			## constant `i8x16.shuffle` on wasm.
 			concat_shift_bytes : U8x16, U8x16, U8 -> U8x16
+			concat_shift_bytes = |lo, hi, count|
+				if count > 16 {
+					crash "U8x16.concat_shift_bytes: count out of range"
+				} else {
+					simd_u8x16_concat_shift_bytes_unchecked(lo, hi, count)
+				}
 
 			## For each lane of `indices`: the lane of `table` it names, or 0
 			## if the index is 16 or greater. This dynamic byte shuffle powers
@@ -21617,6 +21623,8 @@ simd_u8x16_with_lane_unchecked : Num.U8x16, U64, U8 -> Num.U8x16
 simd_u8x16_load_16_unchecked : List(U8), U64 -> Num.U8x16
 
 simd_u8x16_store_16_unchecked : Num.U8x16, List(U8), U64 -> List(U8)
+
+simd_u8x16_concat_shift_bytes_unchecked : Num.U8x16, Num.U8x16, U8 -> Num.U8x16
 
 simd_i8x16_get_lane_unchecked : Num.I8x16, U64 -> I8
 
