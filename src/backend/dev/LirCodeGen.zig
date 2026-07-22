@@ -3760,6 +3760,18 @@ pub fn LirCodeGen(comptime target: RocTarget) type {
                     }
                 },
 
+                .num_count_one_bits,
+                .num_count_leading_zero_bits,
+                .num_count_trailing_zero_bits,
+                => {
+                    const inner_loc = try self.emitValueLocal(GuardedList.at(args, 0));
+                    const operand_layout = self.valueLayout(GuardedList.at(args, 0));
+                    if (operand_layout == .i128 or operand_layout == .u128) {
+                        return self.generateBitCount128(ll.op, inner_loc);
+                    }
+                    return self.generateBitCountScalar(ll.op, inner_loc, operand_layout);
+                },
+
                 .bool_not => {
                     const inner_loc = try self.emitValueLocal(GuardedList.at(args, 0));
                     const src_reg = try self.ensureInGeneralReg(inner_loc);
@@ -7982,6 +7994,173 @@ pub fn LirCodeGen(comptime target: RocTarget) type {
 
             try self.codegen.emitLoadStack(.w64, result_low, result_slot);
             try self.codegen.emitLoadStack(.w64, result_high, result_slot + 8);
+        }
+
+        /// dst = number of set bits in the full 64-bit value `src`.
+        fn emitPopcount64(self: *Self, dst: GeneralReg, src: GeneralReg) Allocator.Error!void {
+            if (comptime target.toCpuArch() == .aarch64) {
+                // aarch64 has no scalar population-count instruction; use the
+                // classic SWAR sequence on general registers.
+                const t = try self.allocTempGeneral();
+                const m = try self.allocTempGeneral();
+                // x = src
+                try self.emitMovRegReg(dst, src);
+                // x = x - ((x >> 1) & 0x5555555555555555)
+                try self.emitLsrImm(.w64, t, dst, 1);
+                try self.codegen.emitLoadImm(m, @bitCast(@as(u64, 0x5555555555555555)));
+                try self.codegen.emitAnd(.w64, t, t, m);
+                try self.codegen.emitSub(.w64, dst, dst, t);
+                // x = (x & 0x3333...) + ((x >> 2) & 0x3333...)
+                try self.codegen.emitLoadImm(m, @bitCast(@as(u64, 0x3333333333333333)));
+                try self.codegen.emitAnd(.w64, t, dst, m);
+                try self.emitLsrImm(.w64, dst, dst, 2);
+                try self.codegen.emitAnd(.w64, dst, dst, m);
+                try self.codegen.emitAdd(.w64, dst, dst, t);
+                // x = (x + (x >> 4)) & 0x0f0f...
+                try self.emitLsrImm(.w64, t, dst, 4);
+                try self.codegen.emitAdd(.w64, dst, dst, t);
+                try self.codegen.emitLoadImm(m, @bitCast(@as(u64, 0x0f0f0f0f0f0f0f0f)));
+                try self.codegen.emitAnd(.w64, dst, dst, m);
+                // count = (x * 0x0101...) >> 56
+                try self.codegen.emitLoadImm(m, @bitCast(@as(u64, 0x0101010101010101)));
+                try self.codegen.emitMul(.w64, dst, dst, m);
+                try self.emitLsrImm(.w64, dst, dst, 56);
+                self.codegen.freeGeneral(t);
+                self.codegen.freeGeneral(m);
+            } else {
+                try self.codegen.emit.popcntRegReg(.w64, dst, src);
+            }
+        }
+
+        /// dst = number of leading zero bits of the full 64-bit value `src`
+        /// (64 when `src` is zero).
+        fn emitClz64(self: *Self, dst: GeneralReg, src: GeneralReg) Allocator.Error!void {
+            if (comptime target.toCpuArch() == .aarch64) {
+                try self.codegen.emit.clzRegReg(.w64, dst, src);
+            } else {
+                try self.codegen.emit.lzcntRegReg(.w64, dst, src);
+            }
+        }
+
+        /// dst = number of trailing zero bits of the full 64-bit value `src`
+        /// (64 when `src` is zero).
+        fn emitCtz64(self: *Self, dst: GeneralReg, src: GeneralReg) Allocator.Error!void {
+            if (comptime target.toCpuArch() == .aarch64) {
+                // No native ctz: reverse the bits, then count leading zeros.
+                try self.codegen.emit.rbitRegReg(.w64, dst, src);
+                try self.codegen.emit.clzRegReg(.w64, dst, dst);
+            } else {
+                try self.codegen.emit.tzcntRegReg(.w64, dst, src);
+            }
+        }
+
+        /// Lower a bit-count op on a scalar integer (width 8..64). The operand is
+        /// masked to its width so a sign-extended narrow value cannot corrupt the
+        /// count; leading-zero subtracts the (64 - width) bits outside the
+        /// operand, and trailing-zero ORs a sentinel bit so a zero operand yields
+        /// the width rather than 64. The result is a U8 in a general register.
+        fn generateBitCountScalar(self: *Self, op: lir.LowLevel, inner_loc: ValueLocation, operand_layout: layout.Idx) Allocator.Error!ValueLocation {
+            const width: u8 = switch (operand_layout) {
+                .u8, .i8 => 8,
+                .u16, .i16 => 16,
+                .u32, .i32 => 32,
+                .u64, .i64 => 64,
+                else => unreachable,
+            };
+            const src_reg = try self.ensureInGeneralReg(inner_loc);
+            const work = try self.allocTempGeneral();
+            try self.emitMovRegReg(work, src_reg);
+            self.codegen.freeGeneral(src_reg);
+            if (width < 64) {
+                const mask_reg = try self.allocTempGeneral();
+                const mask: i64 = @bitCast((@as(u64, 1) << @intCast(width)) - 1);
+                try self.codegen.emitLoadImm(mask_reg, mask);
+                try self.codegen.emitAnd(.w64, work, work, mask_reg);
+                self.codegen.freeGeneral(mask_reg);
+            }
+            const result = try self.allocTempGeneral();
+            switch (op) {
+                .num_count_one_bits => {
+                    try self.emitPopcount64(result, work);
+                },
+                .num_count_leading_zero_bits => {
+                    try self.emitClz64(result, work);
+                    if (width < 64) {
+                        const adj = try self.allocTempGeneral();
+                        try self.codegen.emitLoadImm(adj, @intCast(64 - @as(u32, width)));
+                        try self.codegen.emitSub(.w64, result, result, adj);
+                        self.codegen.freeGeneral(adj);
+                    }
+                },
+                .num_count_trailing_zero_bits => {
+                    if (width < 64) {
+                        const sent = try self.allocTempGeneral();
+                        try self.codegen.emitLoadImm(sent, @bitCast(@as(u64, 1) << @intCast(width)));
+                        try self.codegen.emitOr(.w64, work, work, sent);
+                        self.codegen.freeGeneral(sent);
+                    }
+                    try self.emitCtz64(result, work);
+                },
+                else => unreachable,
+            }
+            self.codegen.freeGeneral(work);
+            return .{ .general_reg = result };
+        }
+
+        /// Lower a bit-count op on a 128-bit integer, composing the two 64-bit
+        /// halves. leading/trailing use a branchless select built from a 0/1
+        /// comparison: e.g. clz128 = clz(high) + (high == 0 ? clz(low) : 0),
+        /// which yields 128 for a zero operand because clz(0) == 64. The result
+        /// is a U8 in a general register.
+        fn generateBitCount128(self: *Self, op: lir.LowLevel, inner_loc: ValueLocation) Allocator.Error!ValueLocation {
+            // A 128-bit value on the stack must be read as both 64-bit halves;
+            // `.stack` alone makes getI128Parts treat it as a 64-bit value.
+            const loc = if (inner_loc == .stack) ValueLocation{ .stack_i128 = inner_loc.stack.offset } else inner_loc;
+            const parts = try self.getI128Parts(loc, .unsigned);
+            const result = try self.allocTempGeneral();
+            switch (op) {
+                .num_count_one_bits => {
+                    const hi_count = try self.allocTempGeneral();
+                    try self.emitPopcount64(result, parts.low);
+                    try self.emitPopcount64(hi_count, parts.high);
+                    try self.codegen.emitAdd(.w64, result, result, hi_count);
+                    self.codegen.freeGeneral(hi_count);
+                },
+                .num_count_leading_zero_bits => {
+                    // result = clz(high) + (high == 0 ? clz(low) : 0)
+                    const lz_low = try self.allocTempGeneral();
+                    try self.emitClz64(result, parts.high);
+                    try self.emitClz64(lz_low, parts.low);
+                    const is_zero = try self.allocTempGeneral();
+                    const zero_reg = try self.allocTempGeneral();
+                    try self.codegen.emitLoadImm(zero_reg, 0);
+                    try self.codegen.emitCmp(.w64, is_zero, parts.high, zero_reg, condEqual());
+                    try self.codegen.emitMul(.w64, lz_low, lz_low, is_zero);
+                    try self.codegen.emitAdd(.w64, result, result, lz_low);
+                    self.codegen.freeGeneral(lz_low);
+                    self.codegen.freeGeneral(is_zero);
+                    self.codegen.freeGeneral(zero_reg);
+                },
+                .num_count_trailing_zero_bits => {
+                    // result = ctz(low) + (low == 0 ? ctz(high) : 0)
+                    const tz_high = try self.allocTempGeneral();
+                    try self.emitCtz64(result, parts.low);
+                    try self.emitCtz64(tz_high, parts.high);
+                    const is_zero = try self.allocTempGeneral();
+                    const zero_reg = try self.allocTempGeneral();
+                    try self.codegen.emitLoadImm(zero_reg, 0);
+                    try self.codegen.emitCmp(.w64, is_zero, parts.low, zero_reg, condEqual());
+                    try self.codegen.emitMul(.w64, tz_high, tz_high, is_zero);
+                    try self.codegen.emitAdd(.w64, result, result, tz_high);
+                    self.codegen.freeGeneral(tz_high);
+                    self.codegen.freeGeneral(is_zero);
+                    self.codegen.freeGeneral(zero_reg);
+                },
+                else => unreachable,
+            }
+            self.codegen.freeGeneral(parts.low);
+            self.codegen.freeGeneral(parts.high);
+            return .{ .general_reg = result };
         }
 
         /// Get low and high 64-bit parts of a 128-bit value
@@ -18865,6 +19044,111 @@ test "generate unary minus" {
 
     const proc = try addUnaryLowLevelProc(&store, .num_negate, 42, .i64, .i64);
     try std.testing.expectEqual(@as(i64, -42), try runRootI64(&store, &test_state.layout_store, proc));
+}
+
+test "generate bit-count ops (popcount/clz/ctz)" {
+    if (comptime builtin.cpu.arch != .x86_64 and builtin.cpu.arch != .aarch64) {
+        return error.SkipZigTest;
+    }
+
+    const allocator = std.testing.allocator;
+    const Case = struct { op: lir.LowLevel, value: i64, layout: layout.Idx, expected: u8 };
+    const cases = [_]Case{
+        .{ .op = .num_count_one_bits, .value = 0, .layout = .u8, .expected = 0 },
+        .{ .op = .num_count_leading_zero_bits, .value = 0, .layout = .u8, .expected = 8 },
+        .{ .op = .num_count_trailing_zero_bits, .value = 0, .layout = .u8, .expected = 8 },
+        .{ .op = .num_count_one_bits, .value = 255, .layout = .u8, .expected = 8 },
+        .{ .op = .num_count_leading_zero_bits, .value = 255, .layout = .u8, .expected = 0 },
+        .{ .op = .num_count_trailing_zero_bits, .value = 255, .layout = .u8, .expected = 0 },
+        .{ .op = .num_count_one_bits, .value = 1, .layout = .u8, .expected = 1 },
+        .{ .op = .num_count_leading_zero_bits, .value = 1, .layout = .u8, .expected = 7 },
+        .{ .op = .num_count_trailing_zero_bits, .value = 1, .layout = .u8, .expected = 0 },
+        .{ .op = .num_count_one_bits, .value = 128, .layout = .u8, .expected = 1 },
+        .{ .op = .num_count_leading_zero_bits, .value = 128, .layout = .u8, .expected = 0 },
+        .{ .op = .num_count_trailing_zero_bits, .value = 128, .layout = .u8, .expected = 7 },
+        .{ .op = .num_count_one_bits, .value = 44, .layout = .u8, .expected = 3 },
+        .{ .op = .num_count_leading_zero_bits, .value = 44, .layout = .u8, .expected = 2 },
+        .{ .op = .num_count_trailing_zero_bits, .value = 44, .layout = .u8, .expected = 2 },
+        .{ .op = .num_count_one_bits, .value = 0, .layout = .u32, .expected = 0 },
+        .{ .op = .num_count_leading_zero_bits, .value = 0, .layout = .u32, .expected = 32 },
+        .{ .op = .num_count_trailing_zero_bits, .value = 0, .layout = .u32, .expected = 32 },
+        .{ .op = .num_count_one_bits, .value = 4294967295, .layout = .u32, .expected = 32 },
+        .{ .op = .num_count_leading_zero_bits, .value = 4294967295, .layout = .u32, .expected = 0 },
+        .{ .op = .num_count_trailing_zero_bits, .value = 4294967295, .layout = .u32, .expected = 0 },
+        .{ .op = .num_count_one_bits, .value = 1, .layout = .u32, .expected = 1 },
+        .{ .op = .num_count_leading_zero_bits, .value = 1, .layout = .u32, .expected = 31 },
+        .{ .op = .num_count_trailing_zero_bits, .value = 1, .layout = .u32, .expected = 0 },
+        .{ .op = .num_count_one_bits, .value = 2147483648, .layout = .u32, .expected = 1 },
+        .{ .op = .num_count_leading_zero_bits, .value = 2147483648, .layout = .u32, .expected = 0 },
+        .{ .op = .num_count_trailing_zero_bits, .value = 2147483648, .layout = .u32, .expected = 31 },
+        .{ .op = .num_count_one_bits, .value = 16711935, .layout = .u32, .expected = 16 },
+        .{ .op = .num_count_leading_zero_bits, .value = 16711935, .layout = .u32, .expected = 8 },
+        .{ .op = .num_count_trailing_zero_bits, .value = 16711935, .layout = .u32, .expected = 0 },
+        .{ .op = .num_count_one_bits, .value = 0, .layout = .u64, .expected = 0 },
+        .{ .op = .num_count_leading_zero_bits, .value = 0, .layout = .u64, .expected = 64 },
+        .{ .op = .num_count_trailing_zero_bits, .value = 0, .layout = .u64, .expected = 64 },
+        .{ .op = .num_count_one_bits, .value = -1, .layout = .u64, .expected = 64 },
+        .{ .op = .num_count_leading_zero_bits, .value = -1, .layout = .u64, .expected = 0 },
+        .{ .op = .num_count_trailing_zero_bits, .value = -1, .layout = .u64, .expected = 0 },
+        .{ .op = .num_count_one_bits, .value = 1, .layout = .u64, .expected = 1 },
+        .{ .op = .num_count_leading_zero_bits, .value = 1, .layout = .u64, .expected = 63 },
+        .{ .op = .num_count_trailing_zero_bits, .value = 1, .layout = .u64, .expected = 0 },
+        .{ .op = .num_count_one_bits, .value = -9223372036854775808, .layout = .u64, .expected = 1 },
+        .{ .op = .num_count_leading_zero_bits, .value = -9223372036854775808, .layout = .u64, .expected = 0 },
+        .{ .op = .num_count_trailing_zero_bits, .value = -9223372036854775808, .layout = .u64, .expected = 63 },
+        .{ .op = .num_count_one_bits, .value = 1085102592571150095, .layout = .u64, .expected = 32 },
+        .{ .op = .num_count_leading_zero_bits, .value = 1085102592571150095, .layout = .u64, .expected = 4 },
+        .{ .op = .num_count_trailing_zero_bits, .value = 1085102592571150095, .layout = .u64, .expected = 0 },
+        .{ .op = .num_count_one_bits, .value = 0, .layout = .i8, .expected = 0 },
+        .{ .op = .num_count_leading_zero_bits, .value = 0, .layout = .i8, .expected = 8 },
+        .{ .op = .num_count_trailing_zero_bits, .value = 0, .layout = .i8, .expected = 8 },
+        .{ .op = .num_count_one_bits, .value = 255, .layout = .i8, .expected = 8 },
+        .{ .op = .num_count_leading_zero_bits, .value = 255, .layout = .i8, .expected = 0 },
+        .{ .op = .num_count_trailing_zero_bits, .value = 255, .layout = .i8, .expected = 0 },
+        .{ .op = .num_count_one_bits, .value = 1, .layout = .i8, .expected = 1 },
+        .{ .op = .num_count_leading_zero_bits, .value = 1, .layout = .i8, .expected = 7 },
+        .{ .op = .num_count_trailing_zero_bits, .value = 1, .layout = .i8, .expected = 0 },
+        .{ .op = .num_count_one_bits, .value = 128, .layout = .i8, .expected = 1 },
+        .{ .op = .num_count_leading_zero_bits, .value = 128, .layout = .i8, .expected = 0 },
+        .{ .op = .num_count_trailing_zero_bits, .value = 128, .layout = .i8, .expected = 7 },
+        .{ .op = .num_count_one_bits, .value = 248, .layout = .i8, .expected = 5 },
+        .{ .op = .num_count_leading_zero_bits, .value = 248, .layout = .i8, .expected = 0 },
+        .{ .op = .num_count_trailing_zero_bits, .value = 248, .layout = .i8, .expected = 3 },
+        .{ .op = .num_count_one_bits, .value = 0, .layout = .i64, .expected = 0 },
+        .{ .op = .num_count_leading_zero_bits, .value = 0, .layout = .i64, .expected = 64 },
+        .{ .op = .num_count_trailing_zero_bits, .value = 0, .layout = .i64, .expected = 64 },
+        .{ .op = .num_count_one_bits, .value = -1, .layout = .i64, .expected = 64 },
+        .{ .op = .num_count_leading_zero_bits, .value = -1, .layout = .i64, .expected = 0 },
+        .{ .op = .num_count_trailing_zero_bits, .value = -1, .layout = .i64, .expected = 0 },
+        .{ .op = .num_count_one_bits, .value = -2, .layout = .i64, .expected = 63 },
+        .{ .op = .num_count_leading_zero_bits, .value = -2, .layout = .i64, .expected = 0 },
+        .{ .op = .num_count_trailing_zero_bits, .value = -2, .layout = .i64, .expected = 1 },
+        .{ .op = .num_count_one_bits, .value = 0, .layout = .u128, .expected = 0 },
+        .{ .op = .num_count_leading_zero_bits, .value = 0, .layout = .u128, .expected = 128 },
+        .{ .op = .num_count_trailing_zero_bits, .value = 0, .layout = .u128, .expected = 128 },
+        .{ .op = .num_count_one_bits, .value = -1, .layout = .u128, .expected = 128 },
+        .{ .op = .num_count_leading_zero_bits, .value = -1, .layout = .u128, .expected = 0 },
+        .{ .op = .num_count_trailing_zero_bits, .value = -1, .layout = .u128, .expected = 0 },
+        .{ .op = .num_count_one_bits, .value = 0, .layout = .i128, .expected = 0 },
+        .{ .op = .num_count_leading_zero_bits, .value = 0, .layout = .i128, .expected = 128 },
+        .{ .op = .num_count_trailing_zero_bits, .value = 0, .layout = .i128, .expected = 128 },
+        .{ .op = .num_count_one_bits, .value = -1, .layout = .i128, .expected = 128 },
+        .{ .op = .num_count_leading_zero_bits, .value = -1, .layout = .i128, .expected = 0 },
+        .{ .op = .num_count_trailing_zero_bits, .value = -1, .layout = .i128, .expected = 0 },
+    };
+    for (cases) |c| {
+        var store = LirStore.init(allocator);
+        defer store.deinit();
+        var test_state = try TestLayoutState.init(allocator);
+        defer test_state.deinit();
+
+        const proc = try addUnaryLowLevelProc(&store, c.op, c.value, c.layout, .u8);
+        const got = try runRootU8(&store, &test_state.layout_store, proc, .u8);
+        std.testing.expectEqual(c.expected, got) catch |e| {
+            std.debug.print("bit-count case failed: op={s} value={d} layout={s} expected={d} got={d}\n", .{ @tagName(c.op), c.value, @tagName(c.layout), c.expected, got });
+            return e;
+        };
+    }
 }
 
 test "entrypoint arg offsets preserve Roc alignment order" {

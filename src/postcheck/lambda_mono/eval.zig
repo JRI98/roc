@@ -1174,6 +1174,9 @@ pub const Evaluator = struct {
             .num_shift_left_by => self.numShift(args, arg_types, .shl),
             .num_shift_right_by => self.numShift(args, arg_types, .shr),
             .num_shift_right_zf_by => self.numShift(args, arg_types, .shr_zf),
+            .num_count_one_bits => self.numBitCount(args, arg_types, .count_ones),
+            .num_count_leading_zero_bits => self.numBitCount(args, arg_types, .count_leading_zeros),
+            .num_count_trailing_zero_bits => self.numBitCount(args, arg_types, .count_trailing_zeros),
 
             .bool_not => .{ .bool_ = !truthy(args[0]) },
 
@@ -1606,6 +1609,28 @@ pub const Evaluator = struct {
                 const U = std.meta.Int(.unsigned, max_bits);
                 break :blk @bitCast(@as(U, @bitCast(av)) >> shift);
             },
+        };
+    }
+
+    const BitCountOp = enum { count_ones, count_leading_zeros, count_trailing_zeros };
+
+    /// Count one/leading-zero/trailing-zero bits. The result is always a U8,
+    /// independent of the operand width. `@clz`/`@ctz` of 0 return the operand's
+    /// bit width, matching the spec.
+    fn numBitCount(self: *Evaluator, args: []const Value, arg_types: []const Type.TypeId, op: BitCountOp) EvalError!Value {
+        const prim = self.primitiveOf(arg_types[0]) orelse return self.unsupported_("bit-count operand without primitive type");
+        return switch (prim) {
+            inline .u8, .i8, .u16, .i16, .u32, .i32, .u64, .i64, .u128, .i128 => |p| blk: {
+                const T = intType(p);
+                const a = readAs(T, args[0]);
+                const count: u8 = switch (op) {
+                    .count_ones => @popCount(a),
+                    .count_leading_zeros => @clz(a),
+                    .count_trailing_zeros => @ctz(a),
+                };
+                break :blk makeInt(u8, count);
+            },
+            else => self.unsupported_("bit-count on non-integer type"),
         };
     }
 

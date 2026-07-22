@@ -468,6 +468,15 @@ fn replaceProvidedByCompilerLowLevels(env: *ModuleEnv) (Allocator.Error || error
         try putLowLevelFmt(&low_level_map, env, &name_scratch, "Builtin.Num.{s}.shift_right_zf_by", .{num_type}, .num_shift_right_zf_by);
     }
 
+    // Bit-counting operations (integer types only). The operand's layout carries
+    // the width, so a single low-level op serves every integer type. Each returns
+    // a U8 regardless of operand width.
+    for (integer_types) |num_type| {
+        try putLowLevelFmt(&low_level_map, env, &name_scratch, "Builtin.Num.{s}.count_one_bits", .{num_type}, .num_count_one_bits);
+        try putLowLevelFmt(&low_level_map, env, &name_scratch, "Builtin.Num.{s}.count_leading_zero_bits", .{num_type}, .num_count_leading_zero_bits);
+        try putLowLevelFmt(&low_level_map, env, &name_scratch, "Builtin.Num.{s}.count_trailing_zero_bits", .{num_type}, .num_count_trailing_zero_bits);
+    }
+
     // Bitwise logical operations (integer types only)
     for (integer_types) |num_type| {
         var buf: [256]u8 = undefined;

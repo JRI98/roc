@@ -4832,8 +4832,74 @@ fn emitCompositeNumericOp(self: *Self, op: anytype, args: anytype, ret_layout: l
                     try self.emitCompositeI128Abs(GuardedList.at(args, 0));
                 }
             },
+            .num_count_one_bits, .num_count_leading_zero_bits, .num_count_trailing_zero_bits => {
+                try self.emitCompositeI128BitCount(lhs_local, op);
+            },
             else => unreachable,
         }
+    }
+}
+
+/// Count one/leading-zero/trailing-zero bits of a 128-bit value (pointer in
+/// `ptr_local`, low word at offset 0, high word at offset 8), composing the two
+/// 64-bit halves. Pushes an i32 (the U8 result). A zero operand yields 128 for
+/// leading/trailing zeros and 0 for one bits.
+fn emitCompositeI128BitCount(self: *Self, ptr_local: u32, op: anytype) Allocator.Error!void {
+    switch (op) {
+        .num_count_one_bits => {
+            // popcount(low) + popcount(high)
+            try self.emitLocalGet(ptr_local);
+            try self.emitLoadOp(.i64, 0);
+            self.currentCode().append(self.allocator, Op.i64_popcnt) catch return error.OutOfMemory;
+            try self.emitLocalGet(ptr_local);
+            try self.emitLoadOp(.i64, 8);
+            self.currentCode().append(self.allocator, Op.i64_popcnt) catch return error.OutOfMemory;
+            self.currentCode().append(self.allocator, Op.i64_add) catch return error.OutOfMemory;
+            self.currentCode().append(self.allocator, Op.i32_wrap_i64) catch return error.OutOfMemory;
+        },
+        .num_count_leading_zero_bits => {
+            // high == 0 ? 64 + clz(low) : clz(high)
+            try self.emitLocalGet(ptr_local);
+            try self.emitLoadOp(.i64, 8);
+            self.currentCode().append(self.allocator, Op.i64_eqz) catch return error.OutOfMemory;
+            self.currentCode().append(self.allocator, Op.@"if") catch return error.OutOfMemory;
+            self.currentCode().append(self.allocator, @intFromEnum(WasmModule.BlockType.i32)) catch return error.OutOfMemory;
+            try self.emitLocalGet(ptr_local);
+            try self.emitLoadOp(.i64, 0);
+            self.currentCode().append(self.allocator, Op.i64_clz) catch return error.OutOfMemory;
+            self.currentCode().append(self.allocator, Op.i64_const) catch return error.OutOfMemory;
+            WasmModule.leb128WriteI64(self.allocator, self.currentCode(), 64) catch return error.OutOfMemory;
+            self.currentCode().append(self.allocator, Op.i64_add) catch return error.OutOfMemory;
+            self.currentCode().append(self.allocator, Op.i32_wrap_i64) catch return error.OutOfMemory;
+            self.currentCode().append(self.allocator, Op.@"else") catch return error.OutOfMemory;
+            try self.emitLocalGet(ptr_local);
+            try self.emitLoadOp(.i64, 8);
+            self.currentCode().append(self.allocator, Op.i64_clz) catch return error.OutOfMemory;
+            self.currentCode().append(self.allocator, Op.i32_wrap_i64) catch return error.OutOfMemory;
+            self.currentCode().append(self.allocator, Op.end) catch return error.OutOfMemory;
+        },
+        .num_count_trailing_zero_bits => {
+            // low == 0 ? 64 + ctz(high) : ctz(low)
+            try self.emitLocalGet(ptr_local);
+            try self.emitLoadOp(.i64, 0);
+            self.currentCode().append(self.allocator, Op.i64_eqz) catch return error.OutOfMemory;
+            self.currentCode().append(self.allocator, Op.@"if") catch return error.OutOfMemory;
+            self.currentCode().append(self.allocator, @intFromEnum(WasmModule.BlockType.i32)) catch return error.OutOfMemory;
+            try self.emitLocalGet(ptr_local);
+            try self.emitLoadOp(.i64, 8);
+            self.currentCode().append(self.allocator, Op.i64_ctz) catch return error.OutOfMemory;
+            self.currentCode().append(self.allocator, Op.i64_const) catch return error.OutOfMemory;
+            WasmModule.leb128WriteI64(self.allocator, self.currentCode(), 64) catch return error.OutOfMemory;
+            self.currentCode().append(self.allocator, Op.i64_add) catch return error.OutOfMemory;
+            self.currentCode().append(self.allocator, Op.i32_wrap_i64) catch return error.OutOfMemory;
+            self.currentCode().append(self.allocator, Op.@"else") catch return error.OutOfMemory;
+            try self.emitLocalGet(ptr_local);
+            try self.emitLoadOp(.i64, 0);
+            self.currentCode().append(self.allocator, Op.i64_ctz) catch return error.OutOfMemory;
+            self.currentCode().append(self.allocator, Op.i32_wrap_i64) catch return error.OutOfMemory;
+            self.currentCode().append(self.allocator, Op.end) catch return error.OutOfMemory;
+        },
+        else => unreachable,
     }
 }
 
@@ -11215,6 +11281,11 @@ fn generateLowLevel(self: *Self, ll: anytype) Allocator.Error!void {
             return self.emitNumericLowLevel(ll.op, args, ll.ret_layout);
         },
 
+        .num_count_one_bits, .num_count_leading_zero_bits, .num_count_trailing_zero_bits => {
+            // Bit-counting operations: count_x(value) -> U8
+            return self.emitNumericLowLevel(ll.op, args, ll.ret_layout);
+        },
+
         .list_drop_at => {
             try self.generateLLListDropAt(args, ll.ret_layout, ll.unique_args);
         },
@@ -14790,6 +14861,68 @@ fn emitNumericLowLevel(self: *Self, op: anytype, args: anytype, ret_layout: layo
                     self.currentCode().append(self.allocator, Op.i64_const) catch return error.OutOfMemory;
                     WasmModule.leb128WriteI64(self.allocator, self.currentCode(), -1) catch return error.OutOfMemory;
                     self.currentCode().append(self.allocator, Op.i64_xor) catch return error.OutOfMemory;
+                },
+                .f32, .f64 => unreachable,
+            }
+        },
+        .num_count_one_bits, .num_count_leading_zero_bits, .num_count_trailing_zero_bits => {
+            // Bit-counting: count_x(value) -> U8. The operand's width is carried
+            // by its layout; 128-bit operands are handled by the composite path.
+            const width: u32 = switch (operand_layout) {
+                .u8, .i8 => 8,
+                .u16, .i16 => 16,
+                .u32, .i32 => 32,
+                .u64, .i64 => 64,
+                else => unreachable,
+            };
+            switch (vt) {
+                .i32 => {
+                    try self.emitProcLocal(GuardedList.at(args, 0));
+                    // Mask to the operand's width so a signed narrow value stored
+                    // with high bits set does not inflate the count.
+                    if (width < 32) {
+                        const mask: i32 = @intCast((@as(u32, 1) << @as(u5, @intCast(width))) - 1);
+                        self.currentCode().append(self.allocator, Op.i32_const) catch return error.OutOfMemory;
+                        WasmModule.leb128WriteI32(self.allocator, self.currentCode(), mask) catch return error.OutOfMemory;
+                        self.currentCode().append(self.allocator, Op.i32_and) catch return error.OutOfMemory;
+                    }
+                    switch (plain_op) {
+                        .num_count_one_bits => self.currentCode().append(self.allocator, Op.i32_popcnt) catch return error.OutOfMemory,
+                        .num_count_leading_zero_bits => {
+                            self.currentCode().append(self.allocator, Op.i32_clz) catch return error.OutOfMemory;
+                            if (width < 32) {
+                                // i32.clz counts in 32-bit space; subtract the
+                                // (32 - width) high bits outside the operand.
+                                self.currentCode().append(self.allocator, Op.i32_const) catch return error.OutOfMemory;
+                                WasmModule.leb128WriteI32(self.allocator, self.currentCode(), @intCast(32 - width)) catch return error.OutOfMemory;
+                                self.currentCode().append(self.allocator, Op.i32_sub) catch return error.OutOfMemory;
+                            }
+                        },
+                        .num_count_trailing_zero_bits => {
+                            if (width < 32) {
+                                // Sentinel bit at position `width`: makes a zero
+                                // operand yield `width`; a nonzero operand keeps
+                                // its lower trailing-zero count.
+                                const sentinel: i32 = @intCast(@as(u32, 1) << @as(u5, @intCast(width)));
+                                self.currentCode().append(self.allocator, Op.i32_const) catch return error.OutOfMemory;
+                                WasmModule.leb128WriteI32(self.allocator, self.currentCode(), sentinel) catch return error.OutOfMemory;
+                                self.currentCode().append(self.allocator, Op.i32_or) catch return error.OutOfMemory;
+                            }
+                            self.currentCode().append(self.allocator, Op.i32_ctz) catch return error.OutOfMemory;
+                        },
+                        else => unreachable,
+                    }
+                },
+                .i64 => {
+                    try self.emitProcLocal(GuardedList.at(args, 0));
+                    switch (plain_op) {
+                        .num_count_one_bits => self.currentCode().append(self.allocator, Op.i64_popcnt) catch return error.OutOfMemory,
+                        .num_count_leading_zero_bits => self.currentCode().append(self.allocator, Op.i64_clz) catch return error.OutOfMemory,
+                        .num_count_trailing_zero_bits => self.currentCode().append(self.allocator, Op.i64_ctz) catch return error.OutOfMemory,
+                        else => unreachable,
+                    }
+                    // i64.{clz,ctz,popcnt} yield an i64; the U8 return is an i32.
+                    self.currentCode().append(self.allocator, Op.i32_wrap_i64) catch return error.OutOfMemory;
                 },
                 .f32, .f64 => unreachable,
             }
