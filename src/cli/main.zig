@@ -8281,6 +8281,10 @@ fn compileLlvmAppObject(
     entrypoints: []const backend.Entrypoint,
     enable_default_platform_runtime: bool,
     enable_default_platform_hosted_calls: bool,
+    // When present, the caller has an active "Code Generation" phase covering
+    // LIR-to-bitcode lowering; this transitions it to a distinct
+    // "LLVM Optimize + Emit" phase at the point LLVM takes over the bitcode.
+    reporter: ?*progress.Reporter,
 ) CliMainError!LlvmObjectPaths {
     const std_target = try stdTargetForLlvmBuild(ctx, target);
     const llvm_cpu = llvmCpuNameForTarget(std_target);
@@ -8337,6 +8341,13 @@ fn compileLlvmAppObject(
         std.log.err("Failed to write LLVM bitcode {s}: {}", .{ bitcode_path, err });
         return err;
     };
+
+    // Bitcode is generated; the remaining work is LLVM's optimization pipeline
+    // and object emission, which dominates large builds and warrants its own row.
+    if (reporter) |r| {
+        r.end();
+        r.begin("LLVM Optimize + Emit");
+    }
 
     const compile_config = builder.CompileConfig{
         .input_path = bitcode_path,
@@ -8453,7 +8464,9 @@ fn rocBuildWasmLlvm(
         unreachable;
     }
 
-    const app_object = try compileLlvmAppObject(ctx, args, .wasm32, link_type, lowered, entrypoints, false, false);
+    // wasm LLVM output codegen, optimize, emit, and link within one phase, so no
+    // separate "LLVM Optimize + Emit" row is reported here.
+    const app_object = try compileLlvmAppObject(ctx, args, .wasm32, link_type, lowered, entrypoints, false, false, null);
     defer std.Io.Dir.cwd().deleteTree(ctx.io.std_io, app_object.artifact_dir) catch {};
 
     var owned_inputs: std.ArrayList([]u8) = .empty;
@@ -8770,6 +8783,7 @@ fn rocBuildLlvm(ctx: *CliCtx, args: cli_args.BuildArgs) CliMainError!void {
             entrypoints,
             enable_default_platform_runtime,
             args.synthetic_default_platform,
+            &reporter,
         );
         defer std.Io.Dir.cwd().deleteTree(ctx.io.std_io, app_object.artifact_dir) catch {};
 
