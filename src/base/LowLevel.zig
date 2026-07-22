@@ -27,6 +27,8 @@ pub const LowLevel = enum(u16) {
     str_drop_suffix,
     str_find_first,
     str_count_utf8_bytes,
+    str_get_utf8_byte_unsafe,
+    str_substring_unsafe,
     str_with_capacity,
     str_reserve,
     str_release_excess_capacity,
@@ -680,6 +682,7 @@ pub const LowLevel = enum(u16) {
 
             .str_drop_prefix,
             .str_drop_suffix,
+            .str_substring_unsafe,
             => RcEffect.retainsSharingArgs(argMask(&.{0})),
 
             .str_drop_prefix_caseless_ascii,
@@ -803,6 +806,7 @@ pub const LowLevel = enum(u16) {
             .str_starts_with,
             .str_ends_with,
             .str_count_utf8_bytes,
+            .str_get_utf8_byte_unsafe,
             .list_len,
             .bool_not,
             .dict_pseudo_seed,
