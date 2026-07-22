@@ -12274,7 +12274,7 @@ pub fn LirCodeGen(comptime target: RocTarget) type {
             // Lower the call to the platform C ABI (shared classifier, same as the LLVM
             // backend and interpreter trampoline).
             const abi_target: layout.abi.Target = if (comptime target.toCpuArch() == .aarch64)
-                .aarch64
+                layout.abi.aarch64Target(target.toOsTag())
             else if (comptime roc_target.isWindows())
                 .x86_64_windows
             else
@@ -12335,10 +12335,10 @@ pub fn LirCodeGen(comptime target: RocTarget) type {
             const hosted_ret_reg_1: GeneralReg = if (arch == .x86_64) .RDX else .X1;
             switch (lowered.ret) {
                 .none, .indirect => {},
-                .registers => |pieces| {
+                .registers => |registers| {
                     var gp_i: usize = 0;
                     var sse_i: usize = 0;
-                    for (pieces) |piece| {
+                    for (registers.pieces) |piece| {
                         const dst_off = ret_slot + @as(i32, @intCast(piece.offset));
                         switch (piece.class) {
                             .integer => {
@@ -18013,7 +18013,7 @@ pub fn LirCodeGen(comptime target: RocTarget) type {
             }
 
             const abi_target: layout.abi.Target = if (comptime target.toCpuArch() == .aarch64)
-                .aarch64
+                layout.abi.aarch64Target(target.toOsTag())
             else if (comptime roc_target.isWindows())
                 .x86_64_windows
             else
@@ -18221,12 +18221,12 @@ pub fn LirCodeGen(comptime target: RocTarget) type {
                         try self.codegen.emit.movRegReg(.w64, .RAX, sret_reg);
                     }
                 },
-                .registers => |pieces| {
+                .registers => |registers| {
                     const ret_size = self.getLayoutSize(ret_layout);
                     const ret_slot = try self.ensureOnStack(result_loc, ret_size);
                     var gp_i: usize = 0;
                     var fp_i: usize = 0;
-                    for (pieces) |piece| {
+                    for (registers.pieces) |piece| {
                         const src_off = ret_slot + @as(i32, @intCast(piece.offset));
                         switch (piece.class) {
                             .integer => {

@@ -5954,15 +5954,18 @@ and applies the target's C ABI:
   is passed through an aligned caller temporary and a pointer, while a direct
   vector result is returned in XMM0. An aggregate containing a vector follows
   the Win64 aggregate rules; it is not treated as the vector it contains.
-- Under AAPCS64, including fixed-prototype Windows-on-ARM64, a direct 128-bit
-  short vector occupies one Q register. Aggregates follow the ordinary
-  AAPCS64 rules, including homogeneous short-vector aggregates of up to four
-  members of the same fundamental `vector128` type in consecutive vector
-  registers. AAPCS64 does not distinguish lane width or signedness within that
-  fundamental type, so mixed Roc vector kinds still form an HVA.
+- Under AArch64 C ABIs, including fixed-prototype Windows-on-ARM64, a direct
+  128-bit short vector occupies one Q register. Aggregates follow the
+  platform's AAPCS64-derived rules, including homogeneous short-vector
+  aggregates of up to four members of the same fundamental `vector128` type in
+  consecutive vector registers. These rules do not distinguish lane width or
+  signedness within that fundamental type, so mixed Roc vector kinds still form
+  an HVA. HFA/HVA discovery recursively erases the same transparent
+  single-variant wrappers as generated glue.
 - Under the WebAssembly Basic C ABI, a direct vector is `v128`. Transparent
   one-field aggregates retain the field's direct classification; other
-  aggregates follow the WebAssembly aggregate rules.
+  aggregates follow the WebAssembly aggregate rules. An erased callable is the
+  direct pointer value exposed by the C, Zig, and Rust glue aliases.
 
 These are target rules, not backend choices. LLVM, the native dev backends, the
 interpreter translation shim, wasm, and generated host declarations consume the
@@ -5984,11 +5987,41 @@ generated C, Zig, and Rust output and call every direct and aggregate shape in
 both directions, so a host compiler and Roc must independently choose the same
 ABI.
 
-ABI class assignment and concrete argument/result placement are separate explicit steps. The
-placement step accounts for each register class's remaining capacity, preserves
-a SysV SSE/SSEUP vector as one value, assigns AAPCS64 HVA members to consecutive
-Q registers, and commits stack or indirect locations after register exhaustion.
-Wrappers consume those locations directly; they do not recompute ABI classes.
+ABI class assignment, LLVM carrier selection, and concrete argument/result
+placement are separate explicit steps. Every register placement records both
+its byte pieces and their atomic carrier. Piecewise carriers become independent
+LLVM parameters, structure carriers preserve aggregate results even when they
+contain one field, scalar 128-bit integer arguments remain one naturally aligned
+`i128`, and AArch64 integer pairs/HFAs/HVAs remain one homogeneous array. On
+ELF AArch64, HFA/HVA parameters additionally carry `alignstack(8)` for F32/F64
+HFAs or `alignstack(16)` for HVAs; Mach-O and Windows use the same array carrier
+without that LLVM attribute. LLVM wrappers marshal exactly that carrier instead
+of flattening it and relying on a later stage to reconstruct argument identity.
+Mixed-kind HVA argument arrays use the first fundamental vector type, while
+structure returns retain each committed field's exact vector kind.
+
+Concrete argument assignment accounts for each register class's remaining capacity,
+preserves a SysV SSE/SSEUP vector as one value, assigns AArch64 HVA members to
+consecutive Q registers, applies the base AAPCS64 and Windows even-X-register
+rule for 16-byte-aligned multiword arguments, and spills an entire atomic value
+when the remaining registers cannot hold it. Apple arm64 removes that
+even-register rule and packs stack arguments at their natural alignment; both
+differences are explicit target data. On SysV, scalar `I128`/`U128` uses two
+`i64` parameters while both INTEGER eightbytes fit and one `i128` parameter
+when the complete scalar must go to the stack. Generated `RocDec` is an
+aggregate instead and becomes aligned `byval` when both INTEGER eightbytes do
+not fit. Wrappers and machine-call consumers follow this explicit data
+directly.
+
+On Windows x64, scalar `I128`/`U128` is indirect as an argument and returned in
+XMM0 with the compiler's `<2 x i64>` carrier. Generated `RocDec` remains an
+aggregate and is indirect in both directions. The ABI classifier distinguishes
+the C spelling even though both Roc layouts contain the same 128 payload bits.
+
+The cross-language ABI fixture exercises these exhaustion rules in both call
+directions with generated C, Zig, and Rust declarations: nested transparent
+HFAs/HVAs after seven SIMD arguments, integer pairs after seven GP arguments,
+platform-specific `I128` register alignment, and exhausted SysV `I128`/`Dec`.
 
 ### Pinned meaning — the edge cases
 
@@ -6022,8 +6055,11 @@ the contract every backend must match:
   (`packsswb`/`packuswb`-family, `sqxtn`/`sqxtun`, `narrow_i16x8_*`).
 - **`get_lane` / `with_lane` / `broadcast_lane`** crash on an out-of-range
   lane index (like `div_by` crashes on zero), and `concat_shift_bytes`
-  crashes on a shift count > 16. These are expected to be compile-time
-  constants in practice.
+  crashes on a shift count > 16. For `concat_shift_bytes`, a constant count
+  selects the immediate `palignr`, AArch64 `ext`, or wasm `i8x16.shuffle`
+  form. A runtime count is equally valid and uses shift/combine sequences on
+  native targets or a spill plus dynamic 16-byte load on wasm, because those
+  three instructions have immediate-only indices.
 - **`to_bitmask`** collects each lane's most-significant bit, lane 0 in
   bit 0 (`pmovmskb` / `i8x16.bitmask`; NEON emulates in a few
   instructions). `any_lanes_set`/`all_lanes_set` are defined in terms of

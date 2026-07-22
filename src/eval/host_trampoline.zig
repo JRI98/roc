@@ -74,7 +74,7 @@ pub fn call(
     if (!supported) return Error.UnsupportedArch;
 
     const target_abi: layout.abi.Target = switch (builtin.cpu.arch) {
-        .aarch64, .aarch64_be => .aarch64,
+        .aarch64, .aarch64_be => layout.abi.aarch64Target(builtin.os.tag),
         .x86_64 => if (builtin.os.tag == .windows) .x86_64_windows else .x86_64_sysv,
         else => return Error.UnsupportedArch,
     };
@@ -149,10 +149,10 @@ pub fn call(
     // Gather a register-class return back into the result buffer.
     switch (lowered.ret) {
         .none, .indirect => {},
-        .registers => |pieces| {
+        .registers => |registers| {
             var gpi: usize = 0;
             var ssei: usize = 0;
-            for (pieces) |piece| {
+            for (registers.pieces) |piece| {
                 switch (piece.class) {
                     .integer => {
                         writeUnaligned(ret_buf + piece.offset, std.mem.asBytes(&res_gp[gpi])[0..piece.size]);

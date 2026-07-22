@@ -151,6 +151,38 @@ pub extern "C" fn roc_probe_exhaust_registers(
     arg14
 }
 
+#[no_mangle]
+pub extern "C" fn roc_probe_spill_vector_hva(
+    _arg0: abi::RocU8x16, _arg1: abi::RocU8x16, _arg2: abi::RocU8x16, _arg3: abi::RocU8x16,
+    _arg4: abi::RocU8x16, _arg5: abi::RocU8x16, _arg6: abi::RocU8x16,
+    arg7: abi::ProbeNestedVectorHva,
+) -> abi::ProbeNestedVectorHva { arg7 }
+
+#[no_mangle]
+pub extern "C" fn roc_probe_spill_float_hfa(
+    _arg0: f64, _arg1: f64, _arg2: f64, _arg3: f64, _arg4: f64, _arg5: f64, _arg6: f64,
+    arg7: abi::ProbeNestedFloatHfa,
+) -> abi::ProbeNestedFloatHfa { arg7 }
+
+#[no_mangle]
+pub extern "C" fn roc_probe_spill_integer_pair(
+    _arg0: i64, _arg1: i64, _arg2: i64, _arg3: i64, _arg4: i64, _arg5: i64, _arg6: i64,
+    arg7: abi::ProbeIntegerPair,
+) -> abi::ProbeIntegerPair { arg7 }
+
+#[no_mangle]
+pub extern "C" fn roc_probe_align_i128(_arg0: i64, arg1: i128) -> i128 { arg1 }
+
+#[no_mangle]
+pub extern "C" fn roc_probe_spill_i128(
+    _arg0: i64, _arg1: i64, _arg2: i64, _arg3: i64, _arg4: i64, arg5: i128,
+) -> i128 { arg5 }
+
+#[no_mangle]
+pub extern "C" fn roc_probe_spill_dec(
+    _arg0: i64, _arg1: i64, _arg2: i64, _arg3: i64, _arg4: i64, arg5: abi::RocDec,
+) -> abi::RocDec { arg5 }
+
 fn vector_from_bits<T: Copy>(bits: u128) -> T {
     assert!(core::mem::size_of::<T>() == core::mem::size_of::<u128>());
     unsafe { core::mem::transmute_copy(&bits) }

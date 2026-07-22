@@ -147,6 +147,62 @@ export fn roc_probe_exhaust_registers(
     return arg14;
 }
 
+export fn roc_probe_spill_vector_hva(
+    arg0: abi.RocU8x16,
+    arg1: abi.RocU8x16,
+    arg2: abi.RocU8x16,
+    arg3: abi.RocU8x16,
+    arg4: abi.RocU8x16,
+    arg5: abi.RocU8x16,
+    arg6: abi.RocU8x16,
+    arg7: abi.ProbeNestedVectorHva,
+) callconv(.c) abi.ProbeNestedVectorHva {
+    _ = .{ arg0, arg1, arg2, arg3, arg4, arg5, arg6 };
+    return arg7;
+}
+
+export fn roc_probe_spill_float_hfa(
+    arg0: f64,
+    arg1: f64,
+    arg2: f64,
+    arg3: f64,
+    arg4: f64,
+    arg5: f64,
+    arg6: f64,
+    arg7: abi.ProbeNestedFloatHfa,
+) callconv(.c) abi.ProbeNestedFloatHfa {
+    _ = .{ arg0, arg1, arg2, arg3, arg4, arg5, arg6 };
+    return arg7;
+}
+
+export fn roc_probe_spill_integer_pair(
+    arg0: i64,
+    arg1: i64,
+    arg2: i64,
+    arg3: i64,
+    arg4: i64,
+    arg5: i64,
+    arg6: i64,
+    arg7: abi.ProbeIntegerPair,
+) callconv(.c) abi.ProbeIntegerPair {
+    _ = .{ arg0, arg1, arg2, arg3, arg4, arg5, arg6 };
+    return arg7;
+}
+
+export fn roc_probe_align_i128(_: i64, value: i128) callconv(.c) i128 {
+    return value;
+}
+
+export fn roc_probe_spill_i128(arg0: i64, arg1: i64, arg2: i64, arg3: i64, arg4: i64, value: i128) callconv(.c) i128 {
+    _ = .{ arg0, arg1, arg2, arg3, arg4 };
+    return value;
+}
+
+export fn roc_probe_spill_dec(arg0: i64, arg1: i64, arg2: i64, arg3: i64, arg4: i64, value: abi.RocDec) callconv(.c) abi.RocDec {
+    _ = .{ arg0, arg1, arg2, arg3, arg4 };
+    return value;
+}
+
 fn sameBytes(lhs: anytype, rhs: @TypeOf(lhs)) bool {
     return std.mem.eql(u8, std.mem.asBytes(&lhs), std.mem.asBytes(&rhs));
 }
@@ -191,6 +247,24 @@ fn checkProvidedAbi() void {
 
     const exhausted = abi.roc_provide_exhaust_registers(1, 2, 3, 4, 5, 6, 0.5, 1.5, 2.5, 3.5, 4.5, 5.5, 6.5, 7.5, u8x16);
     if (!sameBytes(exhausted, u8x16)) fail("provided exhausted-register vector mismatch", .{});
+
+    const nested_hva: abi.ProbeNestedVectorHva = .{ .wrapped = u8x16, .raw = u8x16 };
+    const nested_hva_back = abi.roc_provide_spill_vector_hva(u8x16, u8x16, u8x16, u8x16, u8x16, u8x16, u8x16, nested_hva);
+    if (!sameBytes(nested_hva_back, nested_hva)) fail("provided spilled HVA mismatch", .{});
+
+    const nested_hfa: abi.ProbeNestedFloatHfa = .{ .wrapped = 12.5, .raw = -7.25 };
+    const nested_hfa_back = abi.roc_provide_spill_float_hfa(0.5, 1.5, 2.5, 3.5, 4.5, 5.5, 6.5, nested_hfa);
+    if (!sameBytes(nested_hfa_back, nested_hfa)) fail("provided spilled HFA mismatch", .{});
+
+    const pair: abi.ProbeIntegerPair = .{ .first = -0x102030405060708, .second = 0x8877665544332211 };
+    const pair_back = abi.roc_provide_spill_integer_pair(1, 2, 3, 4, 5, 6, 7, pair);
+    if (!sameBytes(pair_back, pair)) fail("provided spilled integer pair mismatch", .{});
+
+    const wide_i128: i128 = 0x00112233445566778899aabbccddeeff;
+    if (abi.roc_provide_align_i128(9, wide_i128) != wide_i128) fail("provided aligned i128 mismatch", .{});
+    if (abi.roc_provide_spill_i128(1, 2, 3, 4, 5, wide_i128) != wide_i128) fail("provided spilled i128 mismatch", .{});
+    const wide_dec: abi.RocDec = .{ .num = 0x0123456789abcdeffedcba9876543210 };
+    if (abi.roc_provide_spill_dec(1, 2, 3, 4, 5, wide_dec).num != wide_dec.num) fail("provided spilled Dec mismatch", .{});
 }
 
 fn runContract() c_int {

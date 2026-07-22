@@ -146,6 +146,11 @@ fn countVectors(store: *const Store, idx: Idx, maybe_kind: *?layout.Vector) u8 {
             if (maybe_kind.* == null) maybe_kind.* = kind;
             return 1;
         },
+        .tag_union => {
+            const info = store.getTagUnionInfo(lay);
+            if (info.variants.len != 1 or info.data.discriminant_size != 0) return invalid_float_count;
+            return countVectors(store, info.variants.get(0).payload_layout, maybe_kind);
+        },
         else => return invalid_float_count,
     }
 }
@@ -202,7 +207,13 @@ fn countFloats(store: *const Store, idx: Idx, maybe_float_bits: *?u16) u8 {
             maybe_float_bits.* = bits;
             return 1;
         },
-        // Anything else (pointer, list, box, tag union, …) makes the aggregate non-homogeneous.
+        .tag_union => {
+            const info = store.getTagUnionInfo(lay);
+            if (info.variants.len != 1 or info.data.discriminant_size != 0) return invalid_float_count;
+            return countFloats(store, info.variants.get(0).payload_layout, maybe_float_bits);
+        },
+        // Anything else (pointer, list, box, non-transparent tag union, …)
+        // makes the aggregate non-homogeneous.
         else => return invalid_float_count,
     }
 }
@@ -250,6 +261,11 @@ test "aarch64 classify: homogeneous short-vector aggregates" {
 
     const wrapped = try store.putTagUnion(&.{.i16x8});
     try testing.expectEqual(Class.byval, classifyType(&store, wrapped));
+
+    // Glue recursively erases a transparent single-variant wrapper, including
+    // when it appears as one field of an outer aggregate.
+    const wrapped_pair = try testStruct(&store, &.{ wrapped, .u8x16 });
+    try testing.expectEqual(Class{ .vector_array = .{ .count = 2, .kind = .i16x8 } }, classifyType(&store, wrapped_pair));
 }
 
 test "aarch64 classify: three-word aggregates go to memory" {
@@ -299,6 +315,10 @@ test "aarch64 classify: homogeneous float aggregates" {
 
     const four_f64 = try testStruct(&store, &.{ .f64, .f64, .f64, .f64 });
     try testing.expectEqual(Class{ .float_array = .{ .count = 4, .elem_bits = 64 } }, classifyType(&store, four_f64));
+
+    const wrapped_f64 = try store.putTagUnion(&.{.f64});
+    const wrapped_pair = try testStruct(&store, &.{ wrapped_f64, .f64 });
+    try testing.expectEqual(Class{ .float_array = .{ .count = 2, .elem_bits = 64 } }, classifyType(&store, wrapped_pair));
 
     // Five floats exceeds the HFA limit (and is 40 bytes) -> memory.
     const five_f64 = try testStruct(&store, &.{ .f64, .f64, .f64, .f64, .f64 });

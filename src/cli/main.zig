@@ -2001,7 +2001,7 @@ fn entrypointAbiDigestFromLirData(
     target: RocTarget,
 ) (Allocator.Error || CliError)![32]u8 {
     const abi_target: layout.abi.Target = switch (target.toCpuArch()) {
-        .aarch64 => .aarch64,
+        .aarch64 => layout.abi.aarch64Target(target.toOsTag()),
         .x86_64 => if (target.toOsTag() == .windows) .x86_64_windows else .x86_64_sysv,
         .wasm32 => .wasm32,
         else => return ctx.fail(.{ .shim_generation_failed = .{ .err = error.UnsupportedTarget } }),
@@ -2015,13 +2015,19 @@ fn entrypointAbiDigestFromLirData(
             switch (placement) {
                 .none => updateHashU32(h, 0),
                 .indirect => updateHashU32(h, 1),
-                .registers => |pieces| {
+                .registers => |registers| {
                     updateHashU32(h, 2);
-                    updateHashU32(h, @intCast(pieces.len));
-                    for (pieces) |piece| {
+                    updateHashU32(h, @intFromEnum(std.meta.activeTag(registers.carrier)));
+                    switch (registers.carrier) {
+                        .array => |alignment| updateHashU32(h, alignment orelse 0),
+                        .piecewise, .structure, .integer => {},
+                    }
+                    updateHashU32(h, @intCast(registers.pieces.len));
+                    for (registers.pieces) |piece| {
                         updateHashU32(h, @intFromEnum(piece.class));
                         updateHashU32(h, piece.offset);
                         updateHashU32(h, piece.size);
+                        updateHashU32(h, if (piece.vector_kind) |kind| @intFromEnum(kind) + 1 else 0);
                     }
                 },
             }

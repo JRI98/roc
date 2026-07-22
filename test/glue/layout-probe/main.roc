@@ -16,7 +16,13 @@ platform ""
 		provide_vector_tuple : (U64, U8x16, I16x8) -> (U64, U8x16, I16x8),
 		provide_vector_tag : Probe.VectorTag -> Probe.VectorTag,
 		make_vector_tag : {} -> Probe.VectorTag,
-		provide_exhaust_registers : I64, I64, I64, I64, I64, I64, F64, F64, F64, F64, F64, F64, F64, F64, U8x16 -> U8x16
+		provide_exhaust_registers : I64, I64, I64, I64, I64, I64, F64, F64, F64, F64, F64, F64, F64, F64, U8x16 -> U8x16,
+		provide_spill_vector_hva : U8x16, U8x16, U8x16, U8x16, U8x16, U8x16, U8x16, Probe.NestedVectorHva -> Probe.NestedVectorHva,
+		provide_spill_float_hfa : F64, F64, F64, F64, F64, F64, F64, Probe.NestedFloatHfa -> Probe.NestedFloatHfa,
+		provide_spill_integer_pair : I64, I64, I64, I64, I64, I64, I64, Probe.IntegerPair -> Probe.IntegerPair,
+		provide_align_i128 : I64, I128 -> I128,
+		provide_spill_i128 : I64, I64, I64, I64, I64, I128 -> I128,
+		provide_spill_dec : I64, I64, I64, I64, I64, Dec -> Dec
 	}
 	exposes [Probe]
 	packages {}
@@ -38,6 +44,12 @@ platform ""
 		"roc_provide_vector_tag": provide_vector_tag_for_host,
 		"roc_make_vector_tag": make_vector_tag_for_host,
 		"roc_provide_exhaust_registers": provide_exhaust_registers_for_host,
+		"roc_provide_spill_vector_hva": provide_spill_vector_hva_for_host,
+		"roc_provide_spill_float_hfa": provide_spill_float_hfa_for_host,
+		"roc_provide_spill_integer_pair": provide_spill_integer_pair_for_host,
+		"roc_provide_align_i128": provide_align_i128_for_host,
+		"roc_provide_spill_i128": provide_spill_i128_for_host,
+		"roc_provide_spill_dec": provide_spill_dec_for_host,
 	}
 	hosted {
 		"roc_probe_roundtrip": Probe.roundtrip!,
@@ -56,6 +68,12 @@ platform ""
 		"roc_probe_roundtrip_vector_tuple": Probe.roundtrip_vector_tuple!,
 		"roc_probe_roundtrip_vector_tag": Probe.roundtrip_vector_tag!,
 		"roc_probe_exhaust_registers": Probe.exhaust_registers!,
+		"roc_probe_spill_vector_hva": Probe.spill_vector_hva!,
+		"roc_probe_spill_float_hfa": Probe.spill_float_hfa!,
+		"roc_probe_spill_integer_pair": Probe.spill_integer_pair!,
+		"roc_probe_align_i128": Probe.align_i128!,
+		"roc_probe_spill_i128": Probe.spill_i128!,
+		"roc_probe_spill_dec": Probe.spill_dec!,
 	}
 	targets: {
 		inputs_dir: "targets/",
@@ -125,3 +143,15 @@ provide_vector_tag_for_host = provide_vector_tag
 make_vector_tag_for_host = make_vector_tag
 
 provide_exhaust_registers_for_host = provide_exhaust_registers
+
+provide_spill_vector_hva_for_host = provide_spill_vector_hva
+
+provide_spill_float_hfa_for_host = provide_spill_float_hfa
+
+provide_spill_integer_pair_for_host = provide_spill_integer_pair
+
+provide_align_i128_for_host = provide_align_i128
+
+provide_spill_i128_for_host = provide_spill_i128
+
+provide_spill_dec_for_host = provide_spill_dec

@@ -1567,7 +1567,7 @@ pub const MonoLlvmCodeGen = struct {
         defer attrs_wip.deinit(builder);
 
         var ret_ty: LlvmBuilder.Type = .void;
-        var ret_pieces: []const layout.abi.RegPiece = &.{};
+        var ret_registers: ?layout.abi.RegisterPlacement = null;
         var ret_is_indirect = false;
         switch (lowered.ret) {
             .none => {},
@@ -1577,15 +1577,9 @@ pub const MonoLlvmCodeGen = struct {
                 try param_types.append(self.allocator, ptr_ty);
                 ret_is_indirect = true;
             },
-            .registers => |pieces| {
-                ret_pieces = pieces;
-                if (pieces.len == 1) {
-                    ret_ty = try self.cAbiPieceLlvmType(builder, pieces[0]);
-                } else {
-                    const field_types = try arena.alloc(LlvmBuilder.Type, pieces.len);
-                    for (pieces, field_types) |piece, *t| t.* = try self.cAbiPieceLlvmType(builder, piece);
-                    ret_ty = builder.structType(.normal, field_types) catch return error.OutOfMemory;
-                }
+            .registers => |registers| {
+                ret_registers = registers;
+                ret_ty = try self.cAbiRegisterCarrierType(builder, registers);
             },
         }
 
@@ -1599,11 +1593,7 @@ pub const MonoLlvmCodeGen = struct {
                     }
                     try param_types.append(self.allocator, ptr_ty);
                 },
-                .registers => |pieces| {
-                    for (pieces) |piece| {
-                        try param_types.append(self.allocator, try self.cAbiPieceLlvmType(builder, piece));
-                    }
-                },
+                .registers => |registers| try self.appendCAbiRegisterParamTypes(builder, &attrs_wip, &param_types, registers),
             }
         }
 
@@ -1663,16 +1653,13 @@ pub const MonoLlvmCodeGen = struct {
                         try self.copyBytes(try self.offsetPtr(args_buf, offset), src, size, self.alignmentForLayout(arg_layout));
                     }
                 },
-                .registers => |pieces| {
-                    const arg_align = self.alignmentForLayout(arg_layout);
-                    for (pieces) |piece| {
-                        const val = wip.arg(param_cursor);
-                        param_cursor += 1;
-                        const dst = try self.offsetPtr(args_buf, offset + piece.offset);
-                        const store_val = try self.coerceScalar(val, try pieceLlvmType(builder, piece), self.cAbiPieceIsSigned(arg_layout));
-                        _ = wip.store(.normal, store_val, dst, arg_align) catch return error.OutOfMemory;
-                    }
-                },
+                .registers => |registers| try self.storeCAbiRegisterParam(
+                    builder,
+                    registers,
+                    &param_cursor,
+                    try self.offsetPtr(args_buf, offset),
+                    arg_layout,
+                ),
             }
         }
 
@@ -1693,28 +1680,10 @@ pub const MonoLlvmCodeGen = struct {
             _ = try self.callFunctionIndex(proc_fn.?, &.{ ret_slot, args_buf }, false);
         }
 
-        if (ret_pieces.len == 0) {
-            _ = wip.retVoid() catch return error.OutOfMemory;
+        if (ret_registers) |registers| {
+            _ = wip.ret(try self.loadCAbiRegisterResult(builder, registers, ret_slot, ret_layout)) catch return error.OutOfMemory;
         } else {
-            const ret_align = self.alignmentForLayout(ret_layout);
-            if (ret_pieces.len == 1) {
-                const src = try self.offsetPtr(ret_slot, ret_pieces[0].offset);
-                const piece_ty = try pieceLlvmType(builder, ret_pieces[0]);
-                const val = wip.load(.normal, piece_ty, src, ret_align, "") catch return error.OutOfMemory;
-                const ret_val = try self.coerceScalar(val, ret_ty, self.cAbiPieceIsSigned(ret_layout));
-                _ = wip.ret(ret_val) catch return error.OutOfMemory;
-            } else {
-                var agg = builder.poisonValue(ret_ty) catch return error.OutOfMemory;
-                for (ret_pieces, 0..) |piece, i| {
-                    const piece_ty = try pieceLlvmType(builder, piece);
-                    const src = try self.offsetPtr(ret_slot, piece.offset);
-                    const val = wip.load(.normal, piece_ty, src, ret_align, "") catch return error.OutOfMemory;
-                    const field_ty = try self.cAbiPieceLlvmType(builder, piece);
-                    const field = try self.coerceScalar(val, field_ty, self.cAbiPieceIsSigned(ret_layout));
-                    agg = wip.insertValue(agg, field, &.{@intCast(i)}, "") catch return error.OutOfMemory;
-                }
-                _ = wip.ret(agg) catch return error.OutOfMemory;
-            }
+            _ = wip.retVoid() catch return error.OutOfMemory;
         }
 
         try self.finishCurrentWipFunction();
@@ -8752,6 +8721,13 @@ pub const MonoLlvmCodeGen = struct {
         return self.llvmAlignment(self.sizeAlignOf(layout_idx).alignment);
     }
 
+    fn alignmentForLayoutOffset(self: *MonoLlvmCodeGen, layout_idx: layout.Idx, offset: u32) LlvmBuilder.Alignment {
+        const base_alignment = @max(self.sizeAlignOf(layout_idx).alignment.toByteUnits(), 1);
+        if (offset == 0) return LlvmBuilder.Alignment.fromByteUnits(base_alignment);
+        const offset_alignment = @as(u32, 1) << @intCast(@ctz(offset));
+        return LlvmBuilder.Alignment.fromByteUnits(@min(base_alignment, offset_alignment));
+    }
+
     fn offsetPtr(self: *MonoLlvmCodeGen, ptr: LlvmBuilder.Value, offset: u32) Error!LlvmBuilder.Value {
         if (offset == 0) return ptr;
         const builder = self.builder orelse return error.CompilationFailed;
@@ -9301,7 +9277,7 @@ pub const MonoLlvmCodeGen = struct {
     /// The C-ABI target this build is compiling for.
     fn abiTarget(self: *const MonoLlvmCodeGen) layout.abi.Target {
         return switch (self.target.cpu.arch) {
-            .aarch64, .aarch64_be => .aarch64,
+            .aarch64, .aarch64_be => layout.abi.aarch64Target(self.target.os.tag),
             .x86_64 => if (self.target.os.tag == .windows) .x86_64_windows else .x86_64_sysv,
             .wasm32 => .wasm32,
             .wasm64 => .wasm64,
@@ -9360,6 +9336,241 @@ pub const MonoLlvmCodeGen = struct {
             .tag_union, .box, .box_of_zst, .ptr => false,
             else => direct_idx.isSigned(),
         };
+    }
+
+    /// The one LLVM value type that preserves an ABI register placement's
+    /// required grouping. Piecewise arguments are handled separately because
+    /// each piece is its own parameter; aggregate returns use `structure` even
+    /// when they contain only one register piece.
+    fn cAbiRegisterCarrierType(
+        self: *MonoLlvmCodeGen,
+        builder: *LlvmBuilder,
+        registers: layout.abi.RegisterPlacement,
+    ) Error!LlvmBuilder.Type {
+        return switch (registers.carrier) {
+            .piecewise => {
+                if (registers.pieces.len == 1) {
+                    return self.cAbiPieceLlvmType(builder, registers.pieces[0]);
+                }
+                const field_types = try self.allocator.alloc(LlvmBuilder.Type, registers.pieces.len);
+                defer self.allocator.free(field_types);
+                for (registers.pieces, field_types) |piece, *field_ty| {
+                    field_ty.* = try self.cAbiPieceLlvmType(builder, piece);
+                }
+                return builder.structType(.normal, field_types) catch return error.OutOfMemory;
+            },
+            .structure => {
+                const field_types = try self.allocator.alloc(LlvmBuilder.Type, registers.pieces.len);
+                defer self.allocator.free(field_types);
+                for (registers.pieces, field_types) |piece, *field_ty| {
+                    field_ty.* = try self.cAbiPieceLlvmType(builder, piece);
+                }
+                return builder.structType(.normal, field_types) catch return error.OutOfMemory;
+            },
+            .integer => {
+                var byte_size: u16 = 0;
+                for (registers.pieces) |piece| byte_size = @max(byte_size, piece.offset + piece.size);
+                return builder.intType(@as(u24, byte_size) * 8) catch return error.OutOfMemory;
+            },
+            .array => {
+                std.debug.assert(registers.pieces.len > 0);
+                const elem_ty = try self.cAbiPieceLlvmType(builder, registers.pieces[0]);
+                return builder.arrayType(registers.pieces.len, elem_ty) catch return error.OutOfMemory;
+            },
+        };
+    }
+
+    fn appendCAbiRegisterParamTypes(
+        self: *MonoLlvmCodeGen,
+        builder: *LlvmBuilder,
+        attrs: *LlvmBuilder.FunctionAttributes.Wip,
+        param_types: *std.ArrayList(LlvmBuilder.Type),
+        registers: layout.abi.RegisterPlacement,
+    ) Error!void {
+        switch (registers.carrier) {
+            .piecewise => for (registers.pieces) |piece| {
+                try param_types.append(self.allocator, try self.cAbiPieceLlvmType(builder, piece));
+            },
+            .structure, .integer, .array => {
+                if (registers.carrier == .array) {
+                    if (registers.carrier.array) |alignment| {
+                        try attrs.addParamAttr(param_types.items.len, .{
+                            .alignstack = .wrap(LlvmBuilder.Alignment.fromByteUnits(alignment)),
+                        }, builder);
+                    }
+                }
+                try param_types.append(self.allocator, try self.cAbiRegisterCarrierType(builder, registers));
+            },
+        }
+    }
+
+    fn storeCAbiRegisterParam(
+        self: *MonoLlvmCodeGen,
+        builder: *LlvmBuilder,
+        registers: layout.abi.RegisterPlacement,
+        param_cursor: *u32,
+        dst: LlvmBuilder.Value,
+        arg_layout: layout.Idx,
+    ) Error!void {
+        const wip = self.wip orelse return error.CompilationFailed;
+        switch (registers.carrier) {
+            .piecewise => for (registers.pieces) |piece| {
+                const val = wip.arg(param_cursor.*);
+                param_cursor.* += 1;
+                const piece_dst = try self.offsetPtr(dst, piece.offset);
+                const store_val = try self.coerceScalar(val, try pieceLlvmType(builder, piece), self.cAbiPieceIsSigned(arg_layout));
+                _ = wip.store(.normal, store_val, piece_dst, self.alignmentForLayoutOffset(arg_layout, piece.offset)) catch return error.OutOfMemory;
+            },
+            .integer => {
+                const val = wip.arg(param_cursor.*);
+                param_cursor.* += 1;
+                const piece_dst = try self.offsetPtr(dst, registers.pieces[0].offset);
+                _ = wip.store(.normal, val, piece_dst, self.alignmentForLayoutOffset(arg_layout, registers.pieces[0].offset)) catch return error.OutOfMemory;
+            },
+            .structure, .array => {
+                const aggregate = wip.arg(param_cursor.*);
+                param_cursor.* += 1;
+                for (registers.pieces, 0..) |piece, i| {
+                    const field = wip.extractValue(aggregate, &.{@intCast(i)}, "") catch return error.OutOfMemory;
+                    const piece_dst = try self.offsetPtr(dst, piece.offset);
+                    const store_val = try self.coerceScalar(field, try pieceLlvmType(builder, piece), self.cAbiPieceIsSigned(arg_layout));
+                    _ = wip.store(.normal, store_val, piece_dst, self.alignmentForLayoutOffset(arg_layout, piece.offset)) catch return error.OutOfMemory;
+                }
+            },
+        }
+    }
+
+    fn appendCAbiRegisterCallArg(
+        self: *MonoLlvmCodeGen,
+        builder: *LlvmBuilder,
+        attrs: *LlvmBuilder.FunctionAttributes.Wip,
+        param_types: *std.ArrayList(LlvmBuilder.Type),
+        call_args: *std.ArrayList(LlvmBuilder.Value),
+        registers: layout.abi.RegisterPlacement,
+        arg_ptr: LlvmBuilder.Value,
+        arg_layout: layout.Idx,
+    ) Error!void {
+        const wip = self.wip orelse return error.CompilationFailed;
+        switch (registers.carrier) {
+            .piecewise => for (registers.pieces) |piece| {
+                const piece_ty = try pieceLlvmType(builder, piece);
+                const src = try self.offsetPtr(arg_ptr, piece.offset);
+                const val = wip.load(.normal, piece_ty, src, self.alignmentForLayoutOffset(arg_layout, piece.offset), "") catch return error.OutOfMemory;
+                const carrier_ty = try self.cAbiPieceLlvmType(builder, piece);
+                try param_types.append(self.allocator, carrier_ty);
+                try call_args.append(self.allocator, try self.coerceScalar(val, carrier_ty, self.cAbiPieceIsSigned(arg_layout)));
+            },
+            .integer => {
+                const carrier_ty = try self.cAbiRegisterCarrierType(builder, registers);
+                const src = try self.offsetPtr(arg_ptr, registers.pieces[0].offset);
+                const val = wip.load(.normal, carrier_ty, src, self.alignmentForLayoutOffset(arg_layout, registers.pieces[0].offset), "") catch return error.OutOfMemory;
+                try param_types.append(self.allocator, carrier_ty);
+                try call_args.append(self.allocator, val);
+            },
+            .structure => {
+                const carrier_ty = try self.cAbiRegisterCarrierType(builder, registers);
+                var aggregate = builder.poisonValue(carrier_ty) catch return error.OutOfMemory;
+                for (registers.pieces, 0..) |piece, i| {
+                    const piece_ty = try pieceLlvmType(builder, piece);
+                    const src = try self.offsetPtr(arg_ptr, piece.offset);
+                    const val = wip.load(.normal, piece_ty, src, self.alignmentForLayoutOffset(arg_layout, piece.offset), "") catch return error.OutOfMemory;
+                    const field_ty = try self.cAbiPieceLlvmType(builder, piece);
+                    const field = try self.coerceScalar(val, field_ty, self.cAbiPieceIsSigned(arg_layout));
+                    aggregate = wip.insertValue(aggregate, field, &.{@intCast(i)}, "") catch return error.OutOfMemory;
+                }
+                try param_types.append(self.allocator, carrier_ty);
+                try call_args.append(self.allocator, aggregate);
+            },
+            .array => {
+                if (registers.carrier.array) |alignment| {
+                    try attrs.addParamAttr(param_types.items.len, .{
+                        .alignstack = .wrap(LlvmBuilder.Alignment.fromByteUnits(alignment)),
+                    }, builder);
+                }
+                const carrier_ty = try self.cAbiRegisterCarrierType(builder, registers);
+                var aggregate = builder.poisonValue(carrier_ty) catch return error.OutOfMemory;
+                const array_elem_ty = try self.cAbiPieceLlvmType(builder, registers.pieces[0]);
+                for (registers.pieces, 0..) |piece, i| {
+                    const piece_ty = try pieceLlvmType(builder, piece);
+                    const src = try self.offsetPtr(arg_ptr, piece.offset);
+                    const val = wip.load(.normal, piece_ty, src, self.alignmentForLayoutOffset(arg_layout, piece.offset), "") catch return error.OutOfMemory;
+                    const field = try self.coerceScalar(val, array_elem_ty, self.cAbiPieceIsSigned(arg_layout));
+                    aggregate = wip.insertValue(aggregate, field, &.{@intCast(i)}, "") catch return error.OutOfMemory;
+                }
+                try param_types.append(self.allocator, carrier_ty);
+                try call_args.append(self.allocator, aggregate);
+            },
+        }
+    }
+
+    fn storeCAbiRegisterResult(
+        self: *MonoLlvmCodeGen,
+        builder: *LlvmBuilder,
+        registers: layout.abi.RegisterPlacement,
+        result: LlvmBuilder.Value,
+        ret_ptr: LlvmBuilder.Value,
+        ret_layout: layout.Idx,
+    ) Error!void {
+        const wip = self.wip orelse return error.CompilationFailed;
+        switch (registers.carrier) {
+            .integer => {
+                const dst = try self.offsetPtr(ret_ptr, registers.pieces[0].offset);
+                _ = wip.store(.normal, result, dst, self.alignmentForLayoutOffset(ret_layout, registers.pieces[0].offset)) catch return error.OutOfMemory;
+            },
+            .piecewise, .structure, .array => {
+                if (registers.carrier == .piecewise and registers.pieces.len == 1) {
+                    const piece = registers.pieces[0];
+                    const dst = try self.offsetPtr(ret_ptr, piece.offset);
+                    const store_val = try self.coerceScalar(result, try pieceLlvmType(builder, piece), self.cAbiPieceIsSigned(ret_layout));
+                    _ = wip.store(.normal, store_val, dst, self.alignmentForLayoutOffset(ret_layout, piece.offset)) catch return error.OutOfMemory;
+                    return;
+                }
+                for (registers.pieces, 0..) |piece, i| {
+                    const field = wip.extractValue(result, &.{@intCast(i)}, "") catch return error.OutOfMemory;
+                    const dst = try self.offsetPtr(ret_ptr, piece.offset);
+                    const store_val = try self.coerceScalar(field, try pieceLlvmType(builder, piece), self.cAbiPieceIsSigned(ret_layout));
+                    _ = wip.store(.normal, store_val, dst, self.alignmentForLayoutOffset(ret_layout, piece.offset)) catch return error.OutOfMemory;
+                }
+            },
+        }
+    }
+
+    fn loadCAbiRegisterResult(
+        self: *MonoLlvmCodeGen,
+        builder: *LlvmBuilder,
+        registers: layout.abi.RegisterPlacement,
+        ret_ptr: LlvmBuilder.Value,
+        ret_layout: layout.Idx,
+    ) Error!LlvmBuilder.Value {
+        const wip = self.wip orelse return error.CompilationFailed;
+        const carrier_ty = try self.cAbiRegisterCarrierType(builder, registers);
+        switch (registers.carrier) {
+            .integer => {
+                const src = try self.offsetPtr(ret_ptr, registers.pieces[0].offset);
+                return wip.load(.normal, carrier_ty, src, self.alignmentForLayoutOffset(ret_layout, registers.pieces[0].offset), "") catch return error.OutOfMemory;
+            },
+            .piecewise, .structure, .array => {
+                if (registers.carrier == .piecewise and registers.pieces.len == 1) {
+                    const piece = registers.pieces[0];
+                    const src = try self.offsetPtr(ret_ptr, piece.offset);
+                    const val = wip.load(.normal, try pieceLlvmType(builder, piece), src, self.alignmentForLayoutOffset(ret_layout, piece.offset), "") catch return error.OutOfMemory;
+                    return self.coerceScalar(val, carrier_ty, self.cAbiPieceIsSigned(ret_layout));
+                }
+                var aggregate = builder.poisonValue(carrier_ty) catch return error.OutOfMemory;
+                const array_elem_ty: ?LlvmBuilder.Type = if (registers.carrier == .array)
+                    try self.cAbiPieceLlvmType(builder, registers.pieces[0])
+                else
+                    null;
+                for (registers.pieces, 0..) |piece, i| {
+                    const src = try self.offsetPtr(ret_ptr, piece.offset);
+                    const val = wip.load(.normal, try pieceLlvmType(builder, piece), src, self.alignmentForLayoutOffset(ret_layout, piece.offset), "") catch return error.OutOfMemory;
+                    const field_ty = array_elem_ty orelse try self.cAbiPieceLlvmType(builder, piece);
+                    const field = try self.coerceScalar(val, field_ty, self.cAbiPieceIsSigned(ret_layout));
+                    aggregate = wip.insertValue(aggregate, field, &.{@intCast(i)}, "") catch return error.OutOfMemory;
+                }
+                return aggregate;
+            },
+        }
     }
 
     /// A type with the exact size and alignment of `layout_idx`, for a `byval`/`sret`
@@ -9551,7 +9762,7 @@ pub const MonoLlvmCodeGen = struct {
 
         // Return value: registers (coerced struct/scalar) or sret pointer.
         var ret_ty: LlvmBuilder.Type = .void;
-        var ret_pieces: []const layout.abi.RegPiece = &.{};
+        var ret_registers: ?layout.abi.RegisterPlacement = null;
         switch (lowered.ret) {
             .none => {},
             .indirect => {
@@ -9560,15 +9771,9 @@ pub const MonoLlvmCodeGen = struct {
                 try param_types.append(self.allocator, ptr_ty);
                 try call_args.append(self.allocator, ret_ptr);
             },
-            .registers => |pieces| {
-                ret_pieces = pieces;
-                if (pieces.len == 1) {
-                    ret_ty = try self.cAbiPieceLlvmType(builder, pieces[0]);
-                } else {
-                    const field_types = try arena.alloc(LlvmBuilder.Type, pieces.len);
-                    for (pieces, field_types) |piece, *t| t.* = try self.cAbiPieceLlvmType(builder, piece);
-                    ret_ty = builder.structType(.normal, field_types) catch return error.OutOfMemory;
-                }
+            .registers => |registers| {
+                ret_registers = registers;
+                ret_ty = try self.cAbiRegisterCarrierType(builder, registers);
             },
         }
 
@@ -9577,9 +9782,9 @@ pub const MonoLlvmCodeGen = struct {
             try call_args.append(self.allocator, self.rocOps());
         }
 
-        // Arguments: register pieces are flattened into separate values, each loaded exactly
-        // from its byte offset (avoiding struct-padding over-reads); memory args pass a byval
-        // pointer.
+        // Arguments use the classifier's explicit scalar/array/piecewise
+        // carrier. Each memory piece is loaded from its exact byte range;
+        // memory-class arguments pass their ABI pointer/byval form.
         for (lowered.args, arg_ptrs, arg_layouts) |placement, arg_ptr, arg_layout| {
             switch (placement) {
                 .none => {},
@@ -9591,17 +9796,15 @@ pub const MonoLlvmCodeGen = struct {
                     try param_types.append(self.allocator, ptr_ty);
                     try call_args.append(self.allocator, arg_ptr);
                 },
-                .registers => |pieces| {
-                    const arg_align = self.alignmentForLayout(arg_layout);
-                    for (pieces) |piece| {
-                        const piece_ty = try pieceLlvmType(builder, piece);
-                        const src = try self.offsetPtr(arg_ptr, piece.offset);
-                        const val = wip.load(.normal, piece_ty, src, arg_align, "") catch return error.OutOfMemory;
-                        const carrier_ty = try self.cAbiPieceLlvmType(builder, piece);
-                        try param_types.append(self.allocator, carrier_ty);
-                        try call_args.append(self.allocator, try self.coerceScalar(val, carrier_ty, self.cAbiPieceIsSigned(arg_layout)));
-                    }
-                },
+                .registers => |registers| try self.appendCAbiRegisterCallArg(
+                    builder,
+                    &attrs_wip,
+                    &param_types,
+                    &call_args,
+                    registers,
+                    arg_ptr,
+                    arg_layout,
+                ),
             }
         }
 
@@ -9622,20 +9825,8 @@ pub const MonoLlvmCodeGen = struct {
         const result = wip.call(.normal, .ccc, attrs, fn_ty, callee, call_args.items, "") catch return error.OutOfMemory;
 
         // Register return: store each piece back into the result slot at its byte offset.
-        if (ret_pieces.len > 0) {
-            const ret_align = self.alignmentForLayout(ret_layout);
-            if (ret_pieces.len == 1) {
-                const dst = try self.offsetPtr(ret_ptr, ret_pieces[0].offset);
-                const store_val = try self.coerceScalar(result, try pieceLlvmType(builder, ret_pieces[0]), self.cAbiPieceIsSigned(ret_layout));
-                _ = wip.store(.normal, store_val, dst, ret_align) catch return error.OutOfMemory;
-            } else {
-                for (ret_pieces, 0..) |piece, i| {
-                    const field = wip.extractValue(result, &.{@intCast(i)}, "") catch return error.OutOfMemory;
-                    const dst = try self.offsetPtr(ret_ptr, piece.offset);
-                    const store_val = try self.coerceScalar(field, try pieceLlvmType(builder, piece), self.cAbiPieceIsSigned(ret_layout));
-                    _ = wip.store(.normal, store_val, dst, ret_align) catch return error.OutOfMemory;
-                }
-            }
+        if (ret_registers) |registers| {
+            try self.storeCAbiRegisterResult(builder, registers, result, ret_ptr, ret_layout);
         }
     }
 

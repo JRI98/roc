@@ -29,7 +29,9 @@ pub const Class = enum {
     x87up,
     none,
     memory,
-    /// Win64 passes 128-bit integers in memory but returns them in an SSE register.
+    /// A Win64 128-bit leaf: scalar integers and vectors are indirect as
+    /// arguments and return in XMM0; the caller-facing lowering separately
+    /// keeps generated C aggregates such as RocDec indirect on return.
     win_i128,
     /// An SSE eightbyte holding a single f32.
     float,

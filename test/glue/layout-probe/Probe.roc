@@ -21,6 +21,11 @@ Probe := [].{
 	}
 
 	VectorWrapper := { only : U8x16 }
+	TransparentVector := [VectorOnly(U8x16)]
+	NestedVectorHva := { wrapped : TransparentVector, raw : U8x16 }
+	TransparentFloat := [FloatOnly(F64)]
+	NestedFloatHfa := { wrapped : TransparentFloat, raw : F64 }
+	IntegerPair := { first : I64, second : U64 }
 
 	VectorTag := [Bytes(U8x16), Empty, Pair(U64, I16x8)]
 
@@ -70,4 +75,10 @@ Probe := [].{
 	roundtrip_vector_tuple! : (U64, U8x16, I16x8) => (U64, U8x16, I16x8)
 	roundtrip_vector_tag! : VectorTag => VectorTag
 	exhaust_registers! : I64, I64, I64, I64, I64, I64, F64, F64, F64, F64, F64, F64, F64, F64, U8x16 => U8x16
+	spill_vector_hva! : U8x16, U8x16, U8x16, U8x16, U8x16, U8x16, U8x16, NestedVectorHva => NestedVectorHva
+	spill_float_hfa! : F64, F64, F64, F64, F64, F64, F64, NestedFloatHfa => NestedFloatHfa
+	spill_integer_pair! : I64, I64, I64, I64, I64, I64, I64, IntegerPair => IntegerPair
+	align_i128! : I64, I128 => I128
+	spill_i128! : I64, I64, I64, I64, I64, I128 => I128
+	spill_dec! : I64, I64, I64, I64, I64, Dec => Dec
 }

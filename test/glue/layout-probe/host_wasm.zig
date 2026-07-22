@@ -123,6 +123,62 @@ export fn roc_probe_exhaust_registers(
     return arg14;
 }
 
+export fn roc_probe_spill_vector_hva(
+    arg0: abi.RocU8x16,
+    arg1: abi.RocU8x16,
+    arg2: abi.RocU8x16,
+    arg3: abi.RocU8x16,
+    arg4: abi.RocU8x16,
+    arg5: abi.RocU8x16,
+    arg6: abi.RocU8x16,
+    arg7: abi.ProbeNestedVectorHva,
+) callconv(.c) abi.ProbeNestedVectorHva {
+    _ = .{ arg0, arg1, arg2, arg3, arg4, arg5, arg6 };
+    return arg7;
+}
+
+export fn roc_probe_spill_float_hfa(
+    arg0: f64,
+    arg1: f64,
+    arg2: f64,
+    arg3: f64,
+    arg4: f64,
+    arg5: f64,
+    arg6: f64,
+    arg7: abi.ProbeNestedFloatHfa,
+) callconv(.c) abi.ProbeNestedFloatHfa {
+    _ = .{ arg0, arg1, arg2, arg3, arg4, arg5, arg6 };
+    return arg7;
+}
+
+export fn roc_probe_spill_integer_pair(
+    arg0: i64,
+    arg1: i64,
+    arg2: i64,
+    arg3: i64,
+    arg4: i64,
+    arg5: i64,
+    arg6: i64,
+    arg7: abi.ProbeIntegerPair,
+) callconv(.c) abi.ProbeIntegerPair {
+    _ = .{ arg0, arg1, arg2, arg3, arg4, arg5, arg6 };
+    return arg7;
+}
+
+export fn roc_probe_align_i128(_: i64, value: i128) callconv(.c) i128 {
+    return value;
+}
+
+export fn roc_probe_spill_i128(arg0: i64, arg1: i64, arg2: i64, arg3: i64, arg4: i64, value: i128) callconv(.c) i128 {
+    _ = .{ arg0, arg1, arg2, arg3, arg4 };
+    return value;
+}
+
+export fn roc_probe_spill_dec(arg0: i64, arg1: i64, arg2: i64, arg3: i64, arg4: i64, value: abi.RocDec) callconv(.c) abi.RocDec {
+    _ = .{ arg0, arg1, arg2, arg3, arg4 };
+    return value;
+}
+
 fn sameBytes(lhs: anytype, rhs: @TypeOf(lhs)) bool {
     return std.mem.eql(u8, std.mem.asBytes(&lhs), std.mem.asBytes(&rhs));
 }

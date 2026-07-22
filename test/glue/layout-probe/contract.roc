@@ -16,6 +16,12 @@ app [
 	provide_vector_tag,
 	make_vector_tag,
 	provide_exhaust_registers,
+	provide_spill_vector_hva,
+	provide_spill_float_hfa,
+	provide_spill_integer_pair,
+	provide_align_i128,
+	provide_spill_i128,
+	provide_spill_dec,
 ] { pf: platform "./main.roc" }
 
 import pf.Probe exposing [LayoutProbe]
@@ -92,6 +98,35 @@ main! = || {
 	exhausted = Probe.exhaust_registers!(1, 2, 3, 4, 5, 6, 0.5, 1.5, 2.5, 3.5, 4.5, 5.5, 6.5, 7.5, u8x16)
 	expect exhausted.to_u128_bits() == bits_a
 
+	nested_hva = { wrapped: VectorOnly(u8x16), raw: U8x16.from_u128_bits(bits_b) }
+	nested_hva_back = Probe.spill_vector_hva!(u8x16, u8x16, u8x16, u8x16, u8x16, u8x16, u8x16, nested_hva)
+	expect
+		match nested_hva_back.wrapped {
+			VectorOnly(vector) => vector.to_u128_bits() == bits_a and nested_hva_back.raw.to_u128_bits() == bits_b
+		}
+
+	nested_hfa = { wrapped: FloatOnly(12.5), raw: -7.25 }
+	nested_hfa_back = Probe.spill_float_hfa!(0.5, 1.5, 2.5, 3.5, 4.5, 5.5, 6.5, nested_hfa)
+	expect
+		match nested_hfa_back.wrapped {
+			FloatOnly(number) => number == 12.5 and nested_hfa_back.raw == -7.25
+		}
+
+	integer_pair = { first: -0x102030405060708, second: 0x8877665544332211 }
+	integer_pair_back = Probe.spill_integer_pair!(1, 2, 3, 4, 5, 6, 7, integer_pair)
+	expect integer_pair_back.first == integer_pair.first and integer_pair_back.second == integer_pair.second
+
+	wide_i128 : I128
+	wide_i128 = 0x00112233445566778899AABBCCDDEEFF
+	aligned_i128 = Probe.align_i128!(9, wide_i128)
+	expect aligned_i128 == wide_i128
+	spilled_i128 = Probe.spill_i128!(1, 2, 3, 4, 5, wide_i128)
+	expect spilled_i128 == wide_i128
+	wide_dec : Dec
+	wide_dec = 123456789012345.125
+	spilled_dec = Probe.spill_dec!(1, 2, 3, 4, 5, wide_dec)
+	expect spilled_dec == wide_dec
+
 	wide = Wide({
 		label: "layout-wide",
 		a: Box.box(1),
@@ -158,3 +193,15 @@ provide_vector_tag = |value| value
 make_vector_tag = |_| Pair(0x1020304050607080, I16x8.from_u128_bits(0x00112233445566778899AABBCCDDEEFF))
 
 provide_exhaust_registers = |_, _, _, _, _, _, _, _, _, _, _, _, _, _, value| value
+
+provide_spill_vector_hva = |_, _, _, _, _, _, _, value| value
+
+provide_spill_float_hfa = |_, _, _, _, _, _, _, value| value
+
+provide_spill_integer_pair = |_, _, _, _, _, _, _, value| value
+
+provide_align_i128 = |_, value| value
+
+provide_spill_i128 = |_, _, _, _, _, value| value
+
+provide_spill_dec = |_, _, _, _, _, value| value

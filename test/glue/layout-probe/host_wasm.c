@@ -154,6 +154,37 @@ RocU8x16 roc_probe_exhaust_registers(
     return arg14;
 }
 
+ProbeNestedVectorHva roc_probe_spill_vector_hva(
+    RocU8x16 arg0, RocU8x16 arg1, RocU8x16 arg2, RocU8x16 arg3,
+    RocU8x16 arg4, RocU8x16 arg5, RocU8x16 arg6, ProbeNestedVectorHva arg7) {
+    (void)arg0; (void)arg1; (void)arg2; (void)arg3; (void)arg4; (void)arg5; (void)arg6;
+    return arg7;
+}
+
+ProbeNestedFloatHfa roc_probe_spill_float_hfa(
+    double arg0, double arg1, double arg2, double arg3, double arg4, double arg5, double arg6,
+    ProbeNestedFloatHfa arg7) {
+    (void)arg0; (void)arg1; (void)arg2; (void)arg3; (void)arg4; (void)arg5; (void)arg6;
+    return arg7;
+}
+
+ProbeIntegerPair roc_probe_spill_integer_pair(
+    int64_t arg0, int64_t arg1, int64_t arg2, int64_t arg3, int64_t arg4, int64_t arg5, int64_t arg6,
+    ProbeIntegerPair arg7) {
+    (void)arg0; (void)arg1; (void)arg2; (void)arg3; (void)arg4; (void)arg5; (void)arg6;
+    return arg7;
+}
+
+__int128 roc_probe_align_i128(int64_t arg0, __int128 arg1) { (void)arg0; return arg1; }
+__int128 roc_probe_spill_i128(int64_t arg0, int64_t arg1, int64_t arg2, int64_t arg3, int64_t arg4, __int128 arg5) {
+    (void)arg0; (void)arg1; (void)arg2; (void)arg3; (void)arg4;
+    return arg5;
+}
+RocDec roc_probe_spill_dec(int64_t arg0, int64_t arg1, int64_t arg2, int64_t arg3, int64_t arg4, RocDec arg5) {
+    (void)arg0; (void)arg1; (void)arg2; (void)arg3; (void)arg4;
+    return arg5;
+}
+
 static void check_provided_abi(void) {
     const uint8_t expected[16] = {
         0x10, 0x21, 0x32, 0x43, 0x54, 0x65, 0x76, 0x87,

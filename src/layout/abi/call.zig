@@ -2,8 +2,8 @@
 //! computed from the per-target C-ABI classifiers (`aarch64.zig`, `x86_64.zig`, `wasm.zig`).
 //!
 //! A `LoweredCall` says, for the return value and each argument, whether it travels in
-//! registers (and which bytes go in which register file) or "indirect" (memory). Each
-//! consumer interprets "indirect" for its own world:
+//! registers (which bytes go in which register file, and which pieces form one LLVM
+//! carrier) or "indirect" (memory). Each consumer interprets "indirect" for its own world:
 //!   - the LLVM backend emits a pointer parameter, adding `byval` only for targets whose C
 //!     ABI passes that memory-class argument as a stack copy rather than a pointer;
 //!   - the dev backend and the interpreter's call trampoline place the bytes in the stack
@@ -39,12 +39,38 @@ pub const RegPiece = struct {
     vector_kind: ?layout.Vector = null,
 };
 
+/// How LLVM must preserve the logical register pieces as one C-ABI carrier.
+/// Physical-call consumers use `pieces`; LLVM consumers must additionally use
+/// this carrier instead of reconstructing argument grouping from the pieces.
+pub const RegisterCarrier = union(enum) {
+    /// Arguments are separate LLVM parameters. A multi-piece scalar return is
+    /// one LLVM struct because LLVM functions have only one return value.
+    piecewise,
+    /// All pieces are one LLVM struct, including a one-piece aggregate return.
+    structure,
+    /// All pieces are one naturally aligned LLVM integer (for example AAPCS64
+    /// `i128`, and a SysV `i128` argument that does not fit in the remaining
+    /// registers). This preserves atomic allocation and the base AAPCS64
+    /// even-register rule.
+    integer,
+    /// All pieces are one homogeneous LLVM array. The optional byte alignment
+    /// is the ELF AArch64 `alignstack` parameter attribute required by
+    /// HFAs/HVAs.
+    array: ?u8,
+};
+
+/// Logical register pieces for one value plus their indivisible LLVM form.
+pub const RegisterPlacement = struct {
+    pieces: []const RegPiece,
+    carrier: RegisterCarrier = .piecewise,
+};
+
 /// How a single value (an argument or the return) is passed.
 pub const Placement = union(enum) {
     /// Zero-sized: not passed at all.
     none,
     /// Passed/returned in these registers, in order.
-    registers: []const RegPiece,
+    registers: RegisterPlacement,
     /// Passed in memory: by `byval`/`sret` pointer or stack copy, per the consumer/target.
     indirect,
 };
@@ -99,10 +125,36 @@ pub const PhysicalCall = struct {
     stack_size: u16,
 };
 
-/// The host targets whose C ABI we lower for. AArch64 is uniform across OSes (Windows on
-/// ARM64 follows AAPCS64 for fixed prototypes); x86-64 splits System V vs Windows; wasm's
-/// pointer width is reflected in the store's `targetUsize`.
-pub const Target = enum { aarch64, x86_64_sysv, x86_64_windows, wasm32, wasm64 };
+/// The host targets whose C ABI we lower for. AArch64 has distinct LLVM carrier
+/// attributes on ELF, Mach-O, and Windows, and Apple removes the base AAPCS64
+/// even-register rule. X86-64 splits System V vs Windows; wasm's pointer width
+/// is reflected in the store's `targetUsize`.
+pub const Target = enum {
+    /// AAPCS64 on ELF targets.
+    aarch64,
+    aarch64_macho,
+    aarch64_windows,
+    x86_64_sysv,
+    x86_64_windows,
+    wasm32,
+    wasm64,
+};
+
+/// Select the explicit AArch64 C-ABI variant for an operating system.
+pub fn aarch64Target(os: std.Target.Os.Tag) Target {
+    return switch (os) {
+        .driverkit, .ios, .maccatalyst, .macos, .tvos, .visionos, .watchos => .aarch64_macho,
+        .windows => .aarch64_windows,
+        else => .aarch64,
+    };
+}
+
+fn isAarch64(target: Target) bool {
+    return switch (target) {
+        .aarch64, .aarch64_macho, .aarch64_windows => true,
+        .x86_64_sysv, .x86_64_windows, .wasm32, .wasm64 => false,
+    };
+}
 
 /// Lower a hosted call's signature for `target`. `arg_idxs`/`ret_idx` are layout indices;
 /// `needs_ops` (from `needsRocOps`) decides the leading `*RocOps`. Allocations for the
@@ -133,8 +185,8 @@ pub fn lower(
         for (args, arg_idxs) |*placement, arg_idx| {
             switch (placement.*) {
                 .none, .indirect => {},
-                .registers => |pieces| {
-                    const counts = pieceCounts(pieces);
+                .registers => |registers| {
+                    const counts = pieceCounts(registers.pieces);
                     const fits = gp_used + counts.gp <= sysv_gp_registers and
                         sse_used + counts.sse <= simd_argument_registers;
                     if (fits) {
@@ -142,6 +194,11 @@ pub fn lower(
                         sse_used += counts.sse;
                     } else if (isCAbiAggregate(store, arg_idx)) {
                         placement.* = .indirect;
+                    } else if (isCAbiI128Scalar(store, arg_idx)) {
+                        // Clang uses two i64 parameters while both INTEGER
+                        // eightbytes fit, but one atomic i128 parameter when
+                        // the scalar must go to the stack.
+                        placement.registers.carrier = .integer;
                     }
                 },
             }
@@ -177,7 +234,13 @@ fn pieceCounts(pieces: []const RegPiece) PieceCounts {
 fn isCAbiAggregate(store: *const Store, idx: Idx) bool {
     const lay = store.getLayout(idx);
     return switch (lay.tag) {
-        .struct_, .closure, .erased_callable => true,
+        .struct_, .closure => true,
+        // Glue exposes this layout as a pointer typedef.
+        .erased_callable => false,
+        // Glue exposes Dec as `struct RocDec { __int128 num; }`, not as a C
+        // scalar. SysV therefore changes it to aligned `byval` when its two
+        // INTEGER eightbytes do not both fit.
+        .scalar => lay.getScalar().tag == .frac and lay.getScalar().getFrac() == .dec,
         .tag_union => blk: {
             const info = store.getTagUnionInfo(lay);
             if (info.variants.len == 1 and info.data.discriminant_size == 0) {
@@ -186,6 +249,39 @@ fn isCAbiAggregate(store: *const Store, idx: Idx) bool {
             break :blk true;
         },
         else => false,
+    };
+}
+
+fn isCAbiI128Scalar(store: *const Store, idx: Idx) bool {
+    const lay = store.getLayout(idx);
+    return switch (lay.tag) {
+        .scalar => lay.getScalar().tag == .int and store.layoutSize(lay) == 16,
+        .tag_union => blk: {
+            const info = store.getTagUnionInfo(lay);
+            if (info.variants.len == 1 and info.data.discriminant_size == 0) {
+                break :blk isCAbiI128Scalar(store, info.variants.get(0).payload_layout);
+            }
+            break :blk false;
+        },
+        else => false,
+    };
+}
+
+fn cAbiI128VectorKind(store: *const Store, idx: Idx) ?layout.Vector {
+    const lay = store.getLayout(idx);
+    return switch (lay.tag) {
+        .scalar => if (lay.getScalar().tag == .int and store.layoutSize(lay) == 16)
+            if (idx.isSigned()) .i64x2 else .u64x2
+        else
+            null,
+        .tag_union => blk: {
+            const info = store.getTagUnionInfo(lay);
+            if (info.variants.len == 1 and info.data.discriminant_size == 0) {
+                break :blk cAbiI128VectorKind(store, info.variants.get(0).payload_layout);
+            }
+            break :blk null;
+        },
+        else => null,
     };
 }
 
@@ -215,7 +311,7 @@ pub fn assignPhysicalArgs(
             gp_used = 1;
             win_position = 1;
         },
-        .aarch64 => {}, // AAPCS64 uses the dedicated x8 indirect-result register.
+        .aarch64, .aarch64_macho, .aarch64_windows => {}, // AAPCS64 uses the dedicated x8 indirect-result register.
         .wasm32, .wasm64 => unreachable,
     };
     if (lowered.leading_ops) switch (target) {
@@ -223,13 +319,15 @@ pub fn assignPhysicalArgs(
             gp_used += 1;
             win_position += 1;
         },
-        .x86_64_sysv, .aarch64 => gp_used += 1,
+        .x86_64_sysv, .aarch64, .aarch64_macho, .aarch64_windows => gp_used += 1,
         .wasm32, .wasm64 => unreachable,
     };
 
     for (lowered.args, arg_idxs, args) |placement, arg_idx, *assigned| {
         const size_align = store.layoutSizeAlign(store.getLayout(arg_idx));
-        const value_alignment: u8 = @intCast(@min(@as(u32, 16), @max(@as(u32, 8), size_align.alignment.toByteUnits())));
+        const natural_alignment: u8 = @intCast(@min(@as(u32, 16), @max(@as(u32, 1), size_align.alignment.toByteUnits())));
+        const value_alignment: u8 = if (target == .aarch64_macho) natural_alignment else @max(8, natural_alignment);
+        const stack_slot_alignment: u8 = if (target == .aarch64_macho) 1 else 8;
 
         switch (placement) {
             .none => assigned.* = .none,
@@ -238,8 +336,9 @@ pub fn assignPhysicalArgs(
                     &stack_size,
                     size_align.size,
                     value_alignment,
+                    stack_slot_alignment,
                 ) },
-                .aarch64 => {
+                .aarch64, .aarch64_macho, .aarch64_windows => {
                     if (gp_used < aarch64_gp_registers) {
                         assigned.* = .{ .indirect = .{ .register = gp_used } };
                         gp_used += 1;
@@ -258,8 +357,9 @@ pub fn assignPhysicalArgs(
                 },
                 .wasm32, .wasm64 => unreachable,
             },
-            .registers => |pieces| switch (target) {
+            .registers => |registers| switch (target) {
                 .x86_64_windows => {
+                    const pieces = registers.pieces;
                     std.debug.assert(pieces.len == 1);
                     if (win_position < win64_argument_registers) {
                         const regs = try arena.alloc(AssignedRegPiece, 1);
@@ -275,12 +375,21 @@ pub fn assignPhysicalArgs(
                     win_position += 1;
                     gp_used = win_position;
                 },
-                .x86_64_sysv, .aarch64 => {
+                .x86_64_sysv, .aarch64, .aarch64_macho, .aarch64_windows => {
+                    const pieces = registers.pieces;
                     const counts = pieceCounts(pieces);
-                    const gp_limit: u8 = if (target == .aarch64) aarch64_gp_registers else sysv_gp_registers;
-                    if (gp_used + counts.gp <= gp_limit and sse_used + counts.sse <= simd_argument_registers) {
+                    const aarch64_target = isAarch64(target);
+                    const gp_limit: u8 = if (aarch64_target) aarch64_gp_registers else sysv_gp_registers;
+                    // AAPCS64 rule C.8 rounds NGRN to an even register before
+                    // allocating a 16-byte-aligned, multi-register argument.
+                    // Apple's arm64 ABI explicitly removes that rule.
+                    const first_gp = if (aarch64_target and target != .aarch64_macho and counts.gp > 1 and value_alignment == 16)
+                        std.mem.alignForward(u8, gp_used, 2)
+                    else
+                        gp_used;
+                    if (first_gp + counts.gp <= gp_limit and sse_used + counts.sse <= simd_argument_registers) {
                         const regs = try arena.alloc(AssignedRegPiece, pieces.len);
-                        var next_gp = gp_used;
+                        var next_gp = first_gp;
                         var next_sse = sse_used;
                         for (pieces, regs) |piece, *reg| switch (piece.class) {
                             .integer => {
@@ -303,13 +412,14 @@ pub fn assignPhysicalArgs(
                             &stack_size,
                             size_align.size,
                             value_alignment,
+                            stack_slot_alignment,
                         ) };
-                        if (target == .aarch64 and counts.sse != 0) {
+                        if (aarch64_target and counts.sse != 0) {
                             // AAPCS64 rule C.5 closes the SIMD register pool once
                             // an HFA/HVA cannot be allocated in full.
                             sse_used = simd_argument_registers;
                         }
-                        if (target == .aarch64 and counts.gp != 0) {
+                        if (aarch64_target and counts.gp != 0) {
                             // AAPCS64 rule C.13 similarly closes the general
                             // register pool when a multiword value cannot fit.
                             gp_used = aarch64_gp_registers;
@@ -327,10 +437,10 @@ pub fn assignPhysicalArgs(
     };
 }
 
-fn assignStackValue(stack_size: *u16, size: u32, alignment: u8) StackValue {
+fn assignStackValue(stack_size: *u16, size: u32, alignment: u8, slot_alignment: u8) StackValue {
     stack_size.* = std.mem.alignForward(u16, stack_size.*, alignment);
     const offset = stack_size.*;
-    stack_size.* += @intCast(std.mem.alignForward(u32, size, 8));
+    stack_size.* += @intCast(std.mem.alignForward(u32, size, slot_alignment));
     return .{ .offset = offset, .size = size, .alignment = alignment };
 }
 
@@ -360,7 +470,7 @@ fn placementFor(
     if (store.layoutSize(lay) == 0) return .none;
 
     return switch (target) {
-        .aarch64 => placementAarch64(arena, store, idx),
+        .aarch64, .aarch64_macho, .aarch64_windows => placementAarch64(arena, store, target, idx, ctx),
         .x86_64_sysv => placementSysV(arena, store, idx, ctx),
         .x86_64_windows => placementWin64(arena, store, idx, ctx),
         .wasm32, .wasm64 => placementWasm(arena, store, idx),
@@ -370,11 +480,15 @@ fn placementFor(
 fn onePiece(arena: std.mem.Allocator, class: RegClass, offset: u16, size: u8) std.mem.Allocator.Error!Placement {
     const pieces = try arena.alloc(RegPiece, 1);
     pieces[0] = .{ .class = class, .offset = offset, .size = size };
-    return .{ .registers = pieces };
+    return .{ .registers = .{ .pieces = pieces } };
 }
 
 /// Split a `size`-byte integer value into 8-byte general-purpose register pieces.
-fn integerPieces(arena: std.mem.Allocator, size: u32) std.mem.Allocator.Error!Placement {
+fn integerPieces(
+    arena: std.mem.Allocator,
+    size: u32,
+    carrier: RegisterCarrier,
+) std.mem.Allocator.Error!Placement {
     const count = (size + 7) / 8;
     const pieces = try arena.alloc(RegPiece, count);
     var i: u32 = 0;
@@ -385,16 +499,65 @@ fn integerPieces(arena: std.mem.Allocator, size: u32) std.mem.Allocator.Error!Pl
             .size = @intCast(@min(8, size - i * 8)),
         };
     }
-    return .{ .registers = pieces };
+    return .{ .registers = .{ .pieces = pieces, .carrier = carrier } };
 }
 
-fn placementAarch64(arena: std.mem.Allocator, store: *const Store, idx: Idx) std.mem.Allocator.Error!Placement {
+fn fillAarch64HvaPieces(
+    store: *const Store,
+    idx: Idx,
+    base_offset: u16,
+    pieces: []RegPiece,
+    cursor: *usize,
+) void {
+    const lay = store.getLayout(idx);
+    switch (lay.tag) {
+        .scalar => {
+            std.debug.assert(lay.getScalar().tag == .vector);
+            pieces[cursor.*] = .{
+                .class = .vector,
+                .offset = base_offset,
+                .size = 16,
+                .vector_kind = lay.getScalar().getVector(),
+            };
+            cursor.* += 1;
+        },
+        .struct_ => {
+            const struct_idx = lay.getStruct().idx;
+            const field_count = store.getStructData(struct_idx).fields.count;
+            var i: u32 = 0;
+            while (i < field_count) : (i += 1) {
+                std.debug.assert(!store.getStructFieldIsPadding(struct_idx, i));
+                fillAarch64HvaPieces(
+                    store,
+                    store.getStructFieldLayout(struct_idx, i),
+                    base_offset + @as(u16, @intCast(store.getStructFieldOffset(struct_idx, i))),
+                    pieces,
+                    cursor,
+                );
+            }
+        },
+        .tag_union => {
+            const info = store.getTagUnionInfo(lay);
+            std.debug.assert(info.variants.len == 1 and info.data.discriminant_size == 0);
+            fillAarch64HvaPieces(store, info.variants.get(0).payload_layout, base_offset, pieces, cursor);
+        },
+        else => unreachable,
+    }
+}
+
+fn placementAarch64(
+    arena: std.mem.Allocator,
+    store: *const Store,
+    target: Target,
+    idx: Idx,
+    ctx: Context,
+) std.mem.Allocator.Error!Placement {
     const lay = store.getLayout(idx);
     const size = store.layoutSize(lay);
     switch (aarch64.classifyType(store, idx)) {
         .memory => return .indirect,
         .integer => return onePiece(arena, .integer, 0, @intCast(size)),
-        .double_integer => return integerPieces(arena, size),
+        .double_integer => return integerPieces(arena, size, .{ .array = null }),
         .float_array => |fa| {
             const elem_bytes: u8 = @intCast(fa.elem_bits / 8);
             const pieces = try arena.alloc(RegPiece, fa.count);
@@ -402,15 +565,26 @@ fn placementAarch64(arena: std.mem.Allocator, store: *const Store, idx: Idx) std
             while (i < fa.count) : (i += 1) {
                 pieces[i] = .{ .class = .float, .offset = @as(u16, i) * elem_bytes, .size = elem_bytes };
             }
-            return .{ .registers = pieces };
+            return .{ .registers = .{
+                .pieces = pieces,
+                .carrier = if (ctx == .arg)
+                    .{ .array = if (target == .aarch64) @max(elem_bytes, 8) else null }
+                else
+                    .structure,
+            } };
         },
         .vector_array => |va| {
             const pieces = try arena.alloc(RegPiece, va.count);
-            var i: u8 = 0;
-            while (i < va.count) : (i += 1) {
-                pieces[i] = .{ .class = .vector, .offset = @as(u16, i) * 16, .size = 16, .vector_kind = va.kind };
-            }
-            return .{ .registers = pieces };
+            var cursor: usize = 0;
+            fillAarch64HvaPieces(store, idx, 0, pieces, &cursor);
+            std.debug.assert(cursor == va.count and pieces[0].vector_kind == va.kind);
+            return .{ .registers = .{
+                .pieces = pieces,
+                .carrier = if (ctx == .arg)
+                    .{ .array = if (target == .aarch64) 16 else null }
+                else
+                    .structure,
+            } };
         },
         .byval => switch (lay.tag) {
             .scalar => {
@@ -419,21 +593,21 @@ fn placementAarch64(arena: std.mem.Allocator, store: *const Store, idx: Idx) std
                     return switch (scalar.getFrac()) {
                         .f32 => onePiece(arena, .float, 0, 4),
                         .f64 => onePiece(arena, .float, 0, 8),
-                        .dec => integerPieces(arena, size),
+                        .dec => integerPieces(arena, size, .integer),
                     };
                 }
                 if (scalar.tag == .vector) {
                     const pieces = try arena.alloc(RegPiece, 1);
                     pieces[0] = .{ .class = .vector, .offset = 0, .size = 16, .vector_kind = scalar.getVector() };
-                    return .{ .registers = pieces };
+                    return .{ .registers = .{ .pieces = pieces } };
                 }
-                return integerPieces(arena, size);
+                return integerPieces(arena, size, if (size == 16) .integer else .piecewise);
             },
-            .box, .box_of_zst, .ptr => return integerPieces(arena, size),
+            .box, .box_of_zst, .ptr => return integerPieces(arena, size, .piecewise),
             .tag_union => {
                 const info = store.getTagUnionInfo(lay);
                 std.debug.assert(info.variants.len == 1 and info.data.discriminant_size == 0);
-                return placementAarch64(arena, store, info.variants.get(0).payload_layout);
+                return placementAarch64(arena, store, target, info.variants.get(0).payload_layout, ctx);
             },
             else => unreachable,
         },
@@ -471,7 +645,9 @@ fn placementSysV(arena: std.mem.Allocator, store: *const Store, idx: Idx, ctx: C
             else => return .indirect,
         }
     }
-    return .{ .registers = try pieces.toOwnedSlice(arena) };
+    return .{ .registers = .{
+        .pieces = try pieces.toOwnedSlice(arena),
+    } };
 }
 
 fn placementWin64(arena: std.mem.Allocator, store: *const Store, idx: Idx, ctx: Context) std.mem.Allocator.Error!Placement {
@@ -480,14 +656,23 @@ fn placementWin64(arena: std.mem.Allocator, store: *const Store, idx: Idx, ctx: 
         .memory => return .indirect,
         .integer => return onePiece(arena, .integer, 0, @intCast(size)),
         .sse => return onePiece(arena, .float, 0, @intCast(@min(@as(u32, 16), size))),
-        // Win64 passes a 128-bit integer in memory but returns it in an SSE register.
-        .win_i128 => if (ctx == .ret) {
+        // Win64 passes a scalar 128-bit integer in memory but returns it in
+        // XMM0 as <2 x i64>. Generated RocDec is a C aggregate instead, so it
+        // is indirect in both directions.
+        .win_i128 => if (ctx == .ret and !isCAbiAggregate(store, idx)) {
             if (findVectorKind(store, idx)) |kind| {
                 const pieces = try arena.alloc(RegPiece, 1);
                 pieces[0] = .{ .class = .vector, .offset = 0, .size = 16, .vector_kind = kind };
-                return .{ .registers = pieces };
+                return .{ .registers = .{ .pieces = pieces } };
             }
-            return onePiece(arena, .float, 0, 16);
+            const pieces = try arena.alloc(RegPiece, 1);
+            pieces[0] = .{
+                .class = .vector,
+                .offset = 0,
+                .size = 16,
+                .vector_kind = cAbiI128VectorKind(store, idx) orelse unreachable,
+            };
+            return .{ .registers = .{ .pieces = pieces } };
         } else return .indirect,
         else => return .indirect,
     }
@@ -504,12 +689,12 @@ fn placementWasm(arena: std.mem.Allocator, store: *const Store, idx: Idx) std.me
             const class: RegClass = if (is_vector) .vector else if (is_float) .float else .integer;
             if (wasm.lowerAsDoubleI64(store, direct_idx)) {
                 // A value wider than 64 bits is passed as two i64s.
-                return integerPieces(arena, size);
+                return integerPieces(arena, size, .piecewise);
             }
             if (is_vector) {
                 const pieces = try arena.alloc(RegPiece, 1);
                 pieces[0] = .{ .class = .vector, .offset = 0, .size = @intCast(size), .vector_kind = dlay.getScalar().getVector() };
-                return .{ .registers = pieces };
+                return .{ .registers = .{ .pieces = pieces } };
             }
             return onePiece(arena, class, 0, @intCast(size));
         },
@@ -554,7 +739,14 @@ fn testStruct(store: *Store, field_idxs: []const Idx) std.mem.Allocator.Error!Id
 
 fn expectRegisters(expected: []const RegPiece, actual: Placement) error{ TestUnexpectedResult, TestExpectedEqual }!void {
     try testing.expect(actual == .registers);
-    try testing.expectEqualSlices(RegPiece, expected, actual.registers);
+    try testing.expectEqualSlices(RegPiece, expected, actual.registers.pieces);
+}
+
+test "AArch64 ABI target preserves operating-system variants" {
+    try testing.expectEqual(Target.aarch64, aarch64Target(.linux));
+    try testing.expectEqual(Target.aarch64_macho, aarch64Target(.macos));
+    try testing.expectEqual(Target.aarch64_macho, aarch64Target(.ios));
+    try testing.expectEqual(Target.aarch64_windows, aarch64Target(.windows));
 }
 
 test "lower aarch64: random_plant(i32) -> Plant is all registers, no ops" {
@@ -723,6 +915,19 @@ test "lower win64: 16-byte struct is indirect, Plant is one register" {
     const two_words = try testStruct(&store, &.{ .i64, .i64 });
     const c2 = try lower(arena, &store, .x86_64_windows, &.{two_words}, .i32, false);
     try testing.expectEqual(Placement.indirect, c2.args[0]);
+
+    const scalar_i128 = try lower(arena, &store, .x86_64_windows, &.{.i128}, .i128, false);
+    try testing.expectEqual(Placement.indirect, scalar_i128.args[0]);
+    try expectRegisters(&.{.{
+        .class = .vector,
+        .offset = 0,
+        .size = 16,
+        .vector_kind = .i64x2,
+    }}, scalar_i128.ret);
+
+    const dec = try lower(arena, &store, .x86_64_windows, &.{.dec}, .dec, false);
+    try testing.expectEqual(Placement.indirect, dec.args[0]);
+    try testing.expectEqual(Placement.indirect, dec.ret);
 }
 
 test "lower wasm32: single-variant tag union returns payload register" {
@@ -822,4 +1027,101 @@ test "physical aarch64 allocation spills complete HVA and integer aggregates" {
     // Rule C.13 closes the GP pool after the pair fails to fit in x7 alone.
     try testing.expect(physical.args[17] == .stack_value);
     try testing.expectEqual(@as(u16, 64), physical.args[17].stack_value.offset);
+}
+
+test "LLVM carriers preserve native multi-register argument identity" {
+    var store = try Store.init(testing.allocator, .u64);
+    defer store.deinit();
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const pair = try testStruct(&store, &.{ .i64, .i64 });
+    const hva = try testStruct(&store, &.{ .u8x16, .i16x8 });
+    const f32_hfa = try testStruct(&store, &.{ .f32, .f32 });
+
+    const aarch = try lower(arena, &store, .aarch64, &.{ .i128, pair, hva, f32_hfa }, hva, false);
+    try testing.expectEqual(RegisterCarrier.integer, aarch.args[0].registers.carrier);
+    try testing.expectEqual(RegisterCarrier{ .array = null }, aarch.args[1].registers.carrier);
+    try testing.expectEqual(RegisterCarrier{ .array = 16 }, aarch.args[2].registers.carrier);
+    try testing.expectEqual(layout.Vector.u8x16, aarch.args[2].registers.pieces[0].vector_kind.?);
+    try testing.expectEqual(layout.Vector.i16x8, aarch.args[2].registers.pieces[1].vector_kind.?);
+    try testing.expectEqual(RegisterCarrier{ .array = 8 }, aarch.args[3].registers.carrier);
+    // AAPCS64 returns an HVA as one struct-valued LLVM result.
+    try testing.expectEqual(RegisterCarrier.structure, aarch.ret.registers.carrier);
+    try testing.expectEqual(layout.Vector.u8x16, aarch.ret.registers.pieces[0].vector_kind.?);
+    try testing.expectEqual(layout.Vector.i16x8, aarch.ret.registers.pieces[1].vector_kind.?);
+
+    const macho = try lower(arena, &store, .aarch64_macho, &.{ f32_hfa, hva }, hva, false);
+    try testing.expectEqual(RegisterCarrier{ .array = null }, macho.args[0].registers.carrier);
+    try testing.expectEqual(RegisterCarrier{ .array = null }, macho.args[1].registers.carrier);
+
+    const windows = try lower(arena, &store, .aarch64_windows, &.{ f32_hfa, hva }, hva, false);
+    try testing.expectEqual(RegisterCarrier{ .array = null }, windows.args[0].registers.carrier);
+    try testing.expectEqual(RegisterCarrier{ .array = null }, windows.args[1].registers.carrier);
+
+    const sysv_i128_args = [_]Idx{ .i64, .i64, .i64, .i64, .i64, .i128 };
+    const sysv_i128 = try lower(arena, &store, .x86_64_sysv, &sysv_i128_args, .i32, false);
+    try testing.expectEqual(RegisterCarrier.integer, sysv_i128.args[5].registers.carrier);
+
+    const sysv_register_i128 = try lower(arena, &store, .x86_64_sysv, &.{.i128}, .i32, false);
+    try testing.expectEqual(RegisterCarrier.piecewise, sysv_register_i128.args[0].registers.carrier);
+
+    const wrapped_i128 = try store.putTagUnion(&.{.i128});
+    const sysv_wrapped_args = [_]Idx{ .i64, .i64, .i64, .i64, .i64, wrapped_i128 };
+    const sysv_wrapped = try lower(arena, &store, .x86_64_sysv, &sysv_wrapped_args, .i32, false);
+    try testing.expectEqual(RegisterCarrier.integer, sysv_wrapped.args[5].registers.carrier);
+
+    const sysv_dec_args = [_]Idx{ .i64, .i64, .i64, .i64, .i64, .dec };
+    const sysv_dec = try lower(arena, &store, .x86_64_sysv, &sysv_dec_args, .i32, false);
+    try testing.expectEqual(Placement.indirect, sysv_dec.args[5]);
+}
+
+test "physical aarch64 aligns 16-byte multiword arguments to even GP registers" {
+    var store = try Store.init(testing.allocator, .u64);
+    defer store.deinit();
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const args = [_]Idx{ .i64, .i128 };
+    const lowered = try lower(arena, &store, .aarch64, &args, .i32, false);
+    const physical = try assignPhysicalArgs(arena, &store, .aarch64, lowered, &args);
+
+    try testing.expectEqual(@as(u8, 0), physical.args[0].registers[0].register_index);
+    try testing.expectEqual(@as(u8, 2), physical.args[1].registers[0].register_index);
+    try testing.expectEqual(@as(u8, 3), physical.args[1].registers[1].register_index);
+
+    const macho_lowered = try lower(arena, &store, .aarch64_macho, &args, .i32, false);
+    const macho_physical = try assignPhysicalArgs(arena, &store, .aarch64_macho, macho_lowered, &args);
+    try testing.expectEqual(@as(u8, 1), macho_physical.args[1].registers[0].register_index);
+    try testing.expectEqual(@as(u8, 2), macho_physical.args[1].registers[1].register_index);
+
+    const windows_lowered = try lower(arena, &store, .aarch64_windows, &args, .i32, false);
+    const windows_physical = try assignPhysicalArgs(arena, &store, .aarch64_windows, windows_lowered, &args);
+    try testing.expectEqual(@as(u8, 2), windows_physical.args[1].registers[0].register_index);
+    try testing.expectEqual(@as(u8, 3), windows_physical.args[1].registers[1].register_index);
+}
+
+test "physical Apple arm64 stack arguments use compact natural alignment" {
+    var store = try Store.init(testing.allocator, .u64);
+    defer store.deinit();
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const args = [_]Idx{ .i64, .i64, .i64, .i64, .i64, .i64, .i64, .i64, .u8, .u16, .u32 };
+    const macho_lowered = try lower(arena, &store, .aarch64_macho, &args, .i32, false);
+    const macho = try assignPhysicalArgs(arena, &store, .aarch64_macho, macho_lowered, &args);
+    try testing.expectEqual(@as(u16, 0), macho.args[8].stack_value.offset);
+    try testing.expectEqual(@as(u16, 2), macho.args[9].stack_value.offset);
+    try testing.expectEqual(@as(u16, 4), macho.args[10].stack_value.offset);
+    try testing.expectEqual(@as(u16, 8), macho.stack_size);
+
+    const elf_lowered = try lower(arena, &store, .aarch64, &args, .i32, false);
+    const elf = try assignPhysicalArgs(arena, &store, .aarch64, elf_lowered, &args);
+    try testing.expectEqual(@as(u16, 0), elf.args[8].stack_value.offset);
+    try testing.expectEqual(@as(u16, 8), elf.args[9].stack_value.offset);
+    try testing.expectEqual(@as(u16, 16), elf.args[10].stack_value.offset);
+    try testing.expectEqual(@as(u16, 24), elf.stack_size);
 }

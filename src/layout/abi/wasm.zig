@@ -72,7 +72,9 @@ pub fn classifyType(store: *const Store, idx: Idx) Class {
             return .{ .direct = idx };
         },
         .closure => return classifyType(store, lay.getClosure().captures_layout_idx),
-        .erased_callable => return .indirect,
+        // Glue exposes an erased callable as `RocErasedCallable`, a pointer
+        // typedef. The pointer value itself is therefore the direct ABI value.
+        .erased_callable => return .{ .direct = idx },
         .zst => unreachable,
     }
 }
@@ -148,6 +150,15 @@ test "wasm classify: enums are direct, Bool included" {
 
     // Bool is a no-payload tag union -> a direct integer.
     try testing.expectEqual(Class{ .direct = .bool }, classifyType(&store, .bool));
+}
+
+test "wasm classify: erased callable is a direct pointer" {
+    var store = try Store.init(testing.allocator, .u32);
+    defer store.deinit();
+
+    const erased_callable = try store.insertErasedCallable();
+    try testing.expectEqual(Class{ .direct = erased_callable }, classifyType(&store, erased_callable));
+    try testing.expect(!lowerAsDoubleI64(&store, erased_callable));
 }
 
 test "wasm classify: single-variant tag union with aggregate payload follows payload ABI" {

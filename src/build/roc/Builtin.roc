@@ -16594,8 +16594,11 @@ Builtin :: [].{
 			## greater than 16. This is the sliding-window operation behind
 			## filter kernels and overlapped LZ77 copies.
 			##
-			## Lowers to `palignr` on x86-64, `ext` on AArch64 NEON, and a
-			## constant `i8x16.shuffle` on wasm.
+			## A compile-time-constant count lowers to immediate `palignr` on
+			## x86-64, `ext` on AArch64 NEON, and `i8x16.shuffle` on wasm.
+			## Those instructions cannot take a runtime count; a dynamic count
+			## uses bit shifts and combines on native targets, and an equivalent
+			## spill plus dynamic 16-byte load on wasm.
 			concat_shift_bytes : U8x16, U8x16, U8 -> U8x16
 			concat_shift_bytes = |lo, hi, count|
 				if count > 16 {

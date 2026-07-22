@@ -219,6 +219,38 @@ pub extern "C" fn roc_probe_exhaust_registers(
     arg14
 }
 
+#[no_mangle]
+pub extern "C" fn roc_probe_spill_vector_hva(
+    _arg0: abi::RocU8x16, _arg1: abi::RocU8x16, _arg2: abi::RocU8x16, _arg3: abi::RocU8x16,
+    _arg4: abi::RocU8x16, _arg5: abi::RocU8x16, _arg6: abi::RocU8x16,
+    arg7: abi::ProbeNestedVectorHva,
+) -> abi::ProbeNestedVectorHva { arg7 }
+
+#[no_mangle]
+pub extern "C" fn roc_probe_spill_float_hfa(
+    _arg0: f64, _arg1: f64, _arg2: f64, _arg3: f64, _arg4: f64, _arg5: f64, _arg6: f64,
+    arg7: abi::ProbeNestedFloatHfa,
+) -> abi::ProbeNestedFloatHfa { arg7 }
+
+#[no_mangle]
+pub extern "C" fn roc_probe_spill_integer_pair(
+    _arg0: i64, _arg1: i64, _arg2: i64, _arg3: i64, _arg4: i64, _arg5: i64, _arg6: i64,
+    arg7: abi::ProbeIntegerPair,
+) -> abi::ProbeIntegerPair { arg7 }
+
+#[no_mangle]
+pub extern "C" fn roc_probe_align_i128(_arg0: i64, arg1: i128) -> i128 { arg1 }
+
+#[no_mangle]
+pub extern "C" fn roc_probe_spill_i128(
+    _arg0: i64, _arg1: i64, _arg2: i64, _arg3: i64, _arg4: i64, arg5: i128,
+) -> i128 { arg5 }
+
+#[no_mangle]
+pub extern "C" fn roc_probe_spill_dec(
+    _arg0: i64, _arg1: i64, _arg2: i64, _arg3: i64, _arg4: i64, arg5: abi::RocDec,
+) -> abi::RocDec { arg5 }
+
 fn vector_from_bits<T: Copy>(bits: u128) -> T {
     assert!(core::mem::size_of::<T>() == core::mem::size_of::<u128>());
     unsafe { core::mem::transmute_copy(&bits) }
@@ -319,6 +351,30 @@ fn check_provided_abi() {
             1, 2, 3, 4, 5, 6, 0.5, 1.5, 2.5, 3.5, 4.5, 5.5, 6.5, 7.5, u8x16,
         );
         if vector_bits(exhausted) != bits { fail("provided exhausted-register vector mismatch"); }
+
+        let nested_hva = abi::ProbeNestedVectorHva { wrapped: u8x16, raw: u8x16 };
+        let nested_hva_back = abi::roc_provide_spill_vector_hva(u8x16, u8x16, u8x16, u8x16, u8x16, u8x16, u8x16, nested_hva);
+        if vector_bits(nested_hva_back.wrapped) != bits || vector_bits(nested_hva_back.raw) != bits {
+            fail("provided spilled HVA mismatch");
+        }
+
+        let nested_hfa = abi::ProbeNestedFloatHfa { wrapped: 12.5, raw: -7.25 };
+        let nested_hfa_back = abi::roc_provide_spill_float_hfa(0.5, 1.5, 2.5, 3.5, 4.5, 5.5, 6.5, nested_hfa);
+        if nested_hfa_back.wrapped != nested_hfa.wrapped || nested_hfa_back.raw != nested_hfa.raw {
+            fail("provided spilled HFA mismatch");
+        }
+
+        let pair = abi::ProbeIntegerPair { first: -0x102030405060708, second: 0x8877665544332211 };
+        let pair_back = abi::roc_provide_spill_integer_pair(1, 2, 3, 4, 5, 6, 7, pair);
+        if pair_back.first != pair.first || pair_back.second != pair.second {
+            fail("provided spilled integer pair mismatch");
+        }
+
+        let wide_i128 = 0x00112233445566778899aabbccddeeff_i128;
+        if abi::roc_provide_align_i128(9, wide_i128) != wide_i128 { fail("provided aligned i128 mismatch"); }
+        if abi::roc_provide_spill_i128(1, 2, 3, 4, 5, wide_i128) != wide_i128 { fail("provided spilled i128 mismatch"); }
+        let wide_dec = abi::RocDec { num: 0x0123456789abcdeffedcba9876543210_i128 };
+        if abi::roc_provide_spill_dec(1, 2, 3, 4, 5, wide_dec).num != wide_dec.num { fail("provided spilled Dec mismatch"); }
     }
 }
 

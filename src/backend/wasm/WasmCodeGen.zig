@@ -1981,18 +1981,18 @@ pub fn generateEntrypointWrapper(
         switch (placement) {
             .none => {},
             .indirect => try param_types.append(self.allocator, .i32),
-            .registers => |pieces| {
-                for (pieces) |piece| try param_types.append(self.allocator, pieceValType(piece));
+            .registers => |registers| {
+                for (registers.pieces) |piece| try param_types.append(self.allocator, pieceValType(piece));
             },
         }
     }
     switch (lowered.ret) {
         .none, .indirect => {},
-        .registers => |pieces| {
+        .registers => |registers| {
             // Wasm's C ABI returns at most one direct value; larger results
             // are indirect.
-            std.debug.assert(pieces.len == 1);
-            try result_types.append(self.allocator, pieceValType(pieces[0]));
+            std.debug.assert(registers.pieces.len == 1);
+            try result_types.append(self.allocator, pieceValType(registers.pieces[0]));
         },
     }
 
@@ -2031,8 +2031,8 @@ pub fn generateEntrypointWrapper(
                 const local = self.storage.allocAnonymousLocal(.i32) catch return error.OutOfMemory;
                 try piece_locals.append(self.allocator, local);
             },
-            .registers => |pieces| {
-                for (pieces) |piece| {
+            .registers => |registers| {
+                for (registers.pieces) |piece| {
                     const local = self.storage.allocAnonymousLocal(pieceValType(piece)) catch return error.OutOfMemory;
                     try piece_locals.append(self.allocator, local);
                 }
@@ -2071,8 +2071,8 @@ pub fn generateEntrypointWrapper(
                 try self.emitMemCopy(dst_local, 0, piece_locals.items[arg_first_piece[i]], size);
                 arg_values[i] = .{ .ptr = dst_local };
             },
-            .registers => |pieces| {
-                if (!composite and pieces.len == 1) {
+            .registers => |registers| {
+                if (!composite and registers.pieces.len == 1) {
                     arg_values[i] = .{ .direct = piece_locals.items[arg_first_piece[i]] };
                 } else {
                     const arg_align = try self.layoutStorageByteAlign(runtime_layout);
@@ -2080,7 +2080,7 @@ pub fn generateEntrypointWrapper(
                     const dst_local = self.storage.allocAnonymousLocal(.i32) catch return error.OutOfMemory;
                     try self.emitFpOffset(slot);
                     try self.emitLocalSet(dst_local);
-                    for (pieces, 0..) |piece, k| {
+                    for (registers.pieces, 0..) |piece, k| {
                         try self.emitLocalGet(piece_locals.items[arg_first_piece[i] + @as(u32, @intCast(k))]);
                         try self.emitStoreToMemSized(dst_local, piece.offset, pieceValType(piece), piece.size);
                     }
@@ -2117,8 +2117,8 @@ pub fn generateEntrypointWrapper(
                 try self.emitStoreToMemSized(sret_local, 0, try self.resolveValType(ret_layout), ret_size);
             }
         },
-        .registers => |pieces| {
-            const piece = pieces[0];
+        .registers => |registers| {
+            const piece = registers.pieces[0];
             if (try self.isCompositeLayout(ret_layout)) {
                 const result_ptr = self.storage.allocAnonymousLocal(.i32) catch return error.OutOfMemory;
                 try self.emitLocalSet(result_ptr);
@@ -8334,15 +8334,15 @@ pub fn registerHostedSymbolTargets(self: *Self, proc_specs: []const LIR.LirProcS
             switch (placement) {
                 .none => {},
                 .indirect => try params.append(self.allocator, .i32),
-                .registers => |pieces| {
-                    for (pieces) |piece| try params.append(self.allocator, pieceValType(piece));
+                .registers => |registers| {
+                    for (registers.pieces) |piece| try params.append(self.allocator, pieceValType(piece));
                 },
             }
         }
         switch (lowered.ret) {
             .none, .indirect => {},
-            .registers => |pieces| {
-                for (pieces) |piece| try results.append(self.allocator, pieceValType(piece));
+            .registers => |registers| {
+                for (registers.pieces) |piece| try results.append(self.allocator, pieceValType(piece));
             },
         }
 
@@ -8431,8 +8431,8 @@ fn emitHostedCall(
                     self.currentCode().append(self.allocator, Op.i32_add) catch return error.OutOfMemory;
                 }
             },
-            .registers => |pieces| {
-                for (pieces) |piece| {
+            .registers => |registers| {
+                for (registers.pieces) |piece| {
                     const vt = pieceValType(piece);
                     try self.emitLocalGet(args_ptr_local);
                     try self.emitLoadOpSized(vt, piece.size, arg_offset + piece.offset);
@@ -8458,11 +8458,11 @@ fn emitHostedCall(
     // stack with the last result on top, so store them in reverse order.
     switch (lowered.ret) {
         .none, .indirect => {},
-        .registers => |pieces| {
-            var i: usize = pieces.len;
+        .registers => |registers| {
+            var i: usize = registers.pieces.len;
             while (i > 0) {
                 i -= 1;
-                const piece = pieces[i];
+                const piece = registers.pieces[i];
                 try self.emitStoreToMemSized(ret_ptr_local, piece.offset, pieceValType(piece), piece.size);
             }
         },

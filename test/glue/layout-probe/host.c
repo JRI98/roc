@@ -109,6 +109,37 @@ RocU8x16 roc_probe_exhaust_registers(
     return arg14;
 }
 
+ProbeNestedVectorHva roc_probe_spill_vector_hva(
+    RocU8x16 arg0, RocU8x16 arg1, RocU8x16 arg2, RocU8x16 arg3,
+    RocU8x16 arg4, RocU8x16 arg5, RocU8x16 arg6, ProbeNestedVectorHva arg7) {
+    (void)arg0; (void)arg1; (void)arg2; (void)arg3; (void)arg4; (void)arg5; (void)arg6;
+    return arg7;
+}
+
+ProbeNestedFloatHfa roc_probe_spill_float_hfa(
+    double arg0, double arg1, double arg2, double arg3, double arg4, double arg5, double arg6,
+    ProbeNestedFloatHfa arg7) {
+    (void)arg0; (void)arg1; (void)arg2; (void)arg3; (void)arg4; (void)arg5; (void)arg6;
+    return arg7;
+}
+
+ProbeIntegerPair roc_probe_spill_integer_pair(
+    int64_t arg0, int64_t arg1, int64_t arg2, int64_t arg3, int64_t arg4, int64_t arg5, int64_t arg6,
+    ProbeIntegerPair arg7) {
+    (void)arg0; (void)arg1; (void)arg2; (void)arg3; (void)arg4; (void)arg5; (void)arg6;
+    return arg7;
+}
+
+__int128 roc_probe_align_i128(int64_t arg0, __int128 arg1) { (void)arg0; return arg1; }
+__int128 roc_probe_spill_i128(int64_t arg0, int64_t arg1, int64_t arg2, int64_t arg3, int64_t arg4, __int128 arg5) {
+    (void)arg0; (void)arg1; (void)arg2; (void)arg3; (void)arg4;
+    return arg5;
+}
+RocDec roc_probe_spill_dec(int64_t arg0, int64_t arg1, int64_t arg2, int64_t arg3, int64_t arg4, RocDec arg5) {
+    (void)arg0; (void)arg1; (void)arg2; (void)arg3; (void)arg4;
+    return arg5;
+}
+
 static void check_provided_abi(void) {
     const uint8_t expected[16] = {
         0x10, 0x21, 0x32, 0x43, 0x54, 0x65, 0x76, 0x87,
@@ -192,6 +223,27 @@ static void check_provided_abi(void) {
         0.5, 1.5, 2.5, 3.5, 4.5, 5.5, 6.5, 7.5,
         bytes);
     if (memcmp(&exhausted, &bytes, sizeof(bytes)) != 0) record_failure("provided exhausted-register vector mismatch");
+
+    ProbeNestedVectorHva nested_hva = { .wrapped = bytes, .raw = bytes };
+    ProbeNestedVectorHva nested_hva_back = roc_provide_spill_vector_hva(
+        bytes, bytes, bytes, bytes, bytes, bytes, bytes, nested_hva);
+    if (memcmp(&nested_hva_back, &nested_hva, sizeof(nested_hva)) != 0) record_failure("provided spilled HVA mismatch");
+
+    ProbeNestedFloatHfa nested_hfa = { .wrapped = 12.5, .raw = -7.25 };
+    ProbeNestedFloatHfa nested_hfa_back = roc_provide_spill_float_hfa(
+        0.5, 1.5, 2.5, 3.5, 4.5, 5.5, 6.5, nested_hfa);
+    if (memcmp(&nested_hfa_back, &nested_hfa, sizeof(nested_hfa)) != 0) record_failure("provided spilled HFA mismatch");
+
+    ProbeIntegerPair pair_value = { .first = -0x102030405060708LL, .second = 0x8877665544332211ULL };
+    ProbeIntegerPair pair_value_back = roc_provide_spill_integer_pair(1, 2, 3, 4, 5, 6, 7, pair_value);
+    if (memcmp(&pair_value_back, &pair_value, sizeof(pair_value)) != 0) record_failure("provided spilled integer pair mismatch");
+
+    const __int128 wide_i128 = ((__int128)0x0011223344556677ULL << 64) | (__int128)0x8899aabbccddeeffULL;
+    if (roc_provide_align_i128(9, wide_i128) != wide_i128) record_failure("provided aligned i128 mismatch");
+    if (roc_provide_spill_i128(1, 2, 3, 4, 5, wide_i128) != wide_i128) record_failure("provided spilled i128 mismatch");
+    RocDec wide_dec = { .num = ((__int128)0x0123456789abcdefULL << 64) | (__int128)0xfedcba9876543210ULL };
+    RocDec wide_dec_back = roc_provide_spill_dec(1, 2, 3, 4, 5, wide_dec);
+    if (wide_dec_back.num != wide_dec.num) record_failure("provided spilled Dec mismatch");
 }
 
 int main(void) {
