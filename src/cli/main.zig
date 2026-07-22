@@ -5486,6 +5486,7 @@ fn writeDevRunImageToSharedMemory(
             store,
             layouts,
             static_strings.entries,
+            .preserve,
         );
         defer codegen.deinit();
         codegen.generation_mode = .shim_execution;
@@ -5748,7 +5749,7 @@ fn evaluateLirImageEntrypoint(
     ret_ptr: ?*anyopaque,
     arg_ptr: ?*anyopaque,
 ) Allocator.Error!void {
-    var interpreter = try eval.LirInterpreter.init(allocator, &view.store, &view.layouts, ops);
+    var interpreter = try eval.LirInterpreter.init(allocator, &view.store, &view.layouts, ops, .preserve);
     defer interpreter.deinit();
 
     _ = interpreter.runEntrypoint(view, ordinal, arg_ptr, ret_ptr) catch |err| switch (err) {
@@ -10746,6 +10747,7 @@ fn runInterpreterTestRoots(
         &lowered.lir_result.store,
         &lowered.lir_result.layouts,
         &roc_ops,
+        .preserve,
     );
     defer interpreter.deinit();
 

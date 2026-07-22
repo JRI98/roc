@@ -2429,10 +2429,12 @@ Builtin :: [].{
 		## Feed an [I128] into the hasher.
 		write_i128 : Hasher, I128 -> Hasher
 
-		## Feed an [F32] into the hasher.
+		## Feed an [F32] into the hasher. Positive and negative zero hash
+		## identically, and every `NaN` representation hashes identically.
 		write_f32 : Hasher, F32 -> Hasher
 
-		## Feed an [F64] into the hasher.
+		## Feed an [F64] into the hasher. Positive and negative zero hash
+		## identically, and every `NaN` representation hashes identically.
 		write_f64 : Hasher, F64 -> Hasher
 
 		## Feed a [Dec] into the hasher.
@@ -14168,7 +14170,8 @@ Builtin :: [].{
 			tau : F32
 			tau = F32.from_bits(1086918619)
 
-			## Convert an [F32] to its decimal string representation.
+			## Convert an [F32] to its decimal string representation. Every NaN
+			## representation, including negative NaNs, becomes `"nan"`.
 			## ```roc
 			## expect F32.to_str(42.5) == "42.5"
 			##
@@ -14176,7 +14179,9 @@ Builtin :: [].{
 			## ```
 			to_str : F32 -> Str
 
-			## Return the raw IEEE 754 bit pattern of an [F32].
+			## Return the IEEE 754 bit pattern of an [F32]. All `NaN` values return
+			## the canonical quiet-NaN bits `2143289344`; every non-NaN value
+			## returns its exact bits.
 			## ```roc
 			## expect F32.to_bits(F32.from_bits(1069547520)) == 1069547520
 			##
@@ -14184,7 +14189,9 @@ Builtin :: [].{
 			## ```
 			to_bits : F32 -> U32
 
-			## Build an [F32] from a raw IEEE 754 bit pattern.
+			## Build an [F32] from a raw IEEE 754 bit pattern. Any NaN payload or
+			## sign can be supplied, but [F32.to_bits] and hashing intentionally
+			## collapse all NaN representations.
 			## ```roc
 			## expect F32.from_bits(F32.to_bits(-0.0)).to_bits() == F32.to_bits(-0.0)
 			##
@@ -14821,8 +14828,7 @@ Builtin :: [].{
 			## toward zero; the integer part wraps on overflow. Integer-part
 			## values from `-128` to `127` are preserved; other values wrap by
 			## truncating to the low 8 bits and reinterpreting them in two's
-			## complement. The result for `NaN`, `inf`, or `-inf` is
-			## implementation-defined.
+			## complement. `NaN`, `inf`, and `-inf` all return `0`.
 			## ```roc
 			## expect F32.to_i8_wrap(42.7) == 42
 			## ```
@@ -14845,8 +14851,7 @@ Builtin :: [].{
 			## toward zero; the integer part wraps on overflow. Integer-part
 			## values from `-32768` to `32767` are preserved; other values wrap
 			## by truncating to the low 16 bits and reinterpreting them in two's
-			## complement. The result for `NaN`, `inf`, or `-inf` is
-			## implementation-defined.
+			## complement. `NaN`, `inf`, and `-inf` all return `0`.
 			## ```roc
 			## expect F32.to_i16_wrap(42.5) == 42
 			## ```
@@ -14866,8 +14871,8 @@ Builtin :: [].{
 			to_i16_try = |num| out_of_range_try(f32_to_i16_try_unsafe(num))
 
 			## Convert an [F32] to an [I32]. The fractional part is truncated
-			## toward zero; the integer part wraps on overflow. The result for
-			## `NaN`, `inf`, or `-inf` is implementation-defined.
+			## toward zero; the integer part wraps on overflow. `NaN`, `inf`, and
+			## `-inf` all return `0`.
 			## ```roc
 			## expect F32.to_i32_wrap(42.5) == 42
 			## ```
@@ -14883,8 +14888,8 @@ Builtin :: [].{
 			to_i32_try = |num| out_of_range_try(f32_to_i32_try_unsafe(num))
 
 			## Convert an [F32] to an [I64]. The fractional part is truncated
-			## toward zero; the integer part wraps on overflow. The result for
-			## `NaN`, `inf`, or `-inf` is implementation-defined.
+			## toward zero; the integer part wraps on overflow. `NaN`, `inf`, and
+			## `-inf` all return `0`.
 			## ```roc
 			## expect F32.to_i64_wrap(42.5) == 42
 			## ```
@@ -14900,8 +14905,8 @@ Builtin :: [].{
 			to_i64_try = |num| out_of_range_try(f32_to_i64_try_unsafe(num))
 
 			## Convert an [F32] to an [I128]. The fractional part is truncated
-			## toward zero; the integer part wraps on overflow. The result for
-			## `NaN`, `inf`, or `-inf` is implementation-defined.
+			## toward zero; the integer part wraps modulo 2^128 and is interpreted
+			## using two's complement. `NaN`, `inf`, and `-inf` all return `0`.
 			## ```roc
 			## expect F32.to_i128_wrap(42.5) == 42
 			## ```
@@ -14919,9 +14924,8 @@ Builtin :: [].{
 			# Conversions to unsigned integers (all lossy - truncation + range check)
 
 			## Convert an [F32] to a [U8]. The fractional part is truncated
-			## toward zero; the integer part wraps on overflow. The result for
-			## negative values, `NaN`, `inf`, or `-inf` is
-			## implementation-defined.
+			## toward zero; the integer part wraps modulo 2^8. `NaN`, `inf`, and
+			## `-inf` all return `0`.
 			## ```roc
 			## expect F32.to_u8_wrap(42.7) == 42
 			## ```
@@ -14940,9 +14944,8 @@ Builtin :: [].{
 			to_u8_try = |num| out_of_range_try(f32_to_u8_try_unsafe(num))
 
 			## Convert an [F32] to a [U16]. The fractional part is truncated
-			## toward zero; the integer part wraps on overflow. The result for
-			## negative values, `NaN`, `inf`, or `-inf` is
-			## implementation-defined.
+			## toward zero; the integer part wraps modulo 2^16. `NaN`, `inf`, and
+			## `-inf` all return `0`.
 			## ```roc
 			## expect F32.to_u16_wrap(42.5) == 42
 			## ```
@@ -14959,9 +14962,8 @@ Builtin :: [].{
 			to_u16_try = |num| out_of_range_try(f32_to_u16_try_unsafe(num))
 
 			## Convert an [F32] to a [U32]. The fractional part is truncated
-			## toward zero; the integer part wraps on overflow. The result for
-			## negative values, `NaN`, `inf`, or `-inf` is
-			## implementation-defined.
+			## toward zero; the integer part wraps modulo 2^32. `NaN`, `inf`, and
+			## `-inf` all return `0`.
 			## ```roc
 			## expect F32.to_u32_wrap(42.5) == 42
 			## ```
@@ -14978,9 +14980,8 @@ Builtin :: [].{
 			to_u32_try = |num| out_of_range_try(f32_to_u32_try_unsafe(num))
 
 			## Convert an [F32] to a [U64]. The fractional part is truncated
-			## toward zero; the integer part wraps on overflow. The result for
-			## negative values, `NaN`, `inf`, or `-inf` is
-			## implementation-defined.
+			## toward zero; the integer part wraps modulo 2^64. `NaN`, `inf`, and
+			## `-inf` all return `0`.
 			## ```roc
 			## expect F32.to_u64_wrap(42.5) == 42
 			## ```
@@ -14997,9 +14998,8 @@ Builtin :: [].{
 			to_u64_try = |num| out_of_range_try(f32_to_u64_try_unsafe(num))
 
 			## Convert an [F32] to a [U128]. The fractional part is truncated
-			## toward zero; the integer part wraps on overflow. The result for
-			## negative values, `NaN`, `inf`, or `-inf` is
-			## implementation-defined.
+			## toward zero; the integer part wraps modulo 2^128. `NaN`, `inf`, and
+			## `-inf` all return `0`.
 			## ```roc
 			## expect F32.to_u128_wrap(42.5) == 42
 			## ```
@@ -15117,7 +15117,8 @@ Builtin :: [].{
 			tau : F64
 			tau = F64.from_bits(4618760256179416344)
 
-			## Convert an [F64] to its decimal string representation.
+			## Convert an [F64] to its decimal string representation. Every NaN
+			## representation, including negative NaNs, becomes `"nan"`.
 			## ```roc
 			## expect F64.to_str(42.5) == "42.5"
 			##
@@ -15125,7 +15126,9 @@ Builtin :: [].{
 			## ```
 			to_str : F64 -> Str
 
-			## Return the raw IEEE 754 bit pattern of an [F64].
+			## Return the IEEE 754 bit pattern of an [F64]. All `NaN` values return
+			## the canonical quiet-NaN bits `9221120237041090560`; every non-NaN
+			## value returns its exact bits.
 			## ```roc
 			## expect F64.to_bits(F64.from_bits(4609434218613702656)) == 4609434218613702656
 			##
@@ -15133,7 +15136,9 @@ Builtin :: [].{
 			## ```
 			to_bits : F64 -> U64
 
-			## Build an [F64] from a raw IEEE 754 bit pattern.
+			## Build an [F64] from a raw IEEE 754 bit pattern. Any NaN payload or
+			## sign can be supplied, but [F64.to_bits] and hashing intentionally
+			## collapse all NaN representations.
 			## ```roc
 			## expect F64.from_bits(F64.to_bits(-0.0)).to_bits() == F64.to_bits(-0.0)
 			##
@@ -15770,8 +15775,7 @@ Builtin :: [].{
 			## toward zero; the integer part wraps on overflow. Integer-part
 			## values from `-128` to `127` are preserved; other values wrap by
 			## truncating to the low 8 bits and reinterpreting them in two's
-			## complement. The result for `NaN`, `inf`, or `-inf` is
-			## implementation-defined.
+			## complement. `NaN`, `inf`, and `-inf` all return `0`.
 			## ```roc
 			## expect F64.to_i8_wrap(42.7) == 42
 			## ```
@@ -15794,8 +15798,7 @@ Builtin :: [].{
 			## toward zero; the integer part wraps on overflow. Integer-part
 			## values from `-32768` to `32767` are preserved; other values wrap
 			## by truncating to the low 16 bits and reinterpreting them in two's
-			## complement. The result for `NaN`, `inf`, or `-inf` is
-			## implementation-defined.
+			## complement. `NaN`, `inf`, and `-inf` all return `0`.
 			## ```roc
 			## expect F64.to_i16_wrap(42.5) == 42
 			## ```
@@ -15815,8 +15818,8 @@ Builtin :: [].{
 			to_i16_try = |num| out_of_range_try(f64_to_i16_try_unsafe(num))
 
 			## Convert an [F64] to an [I32]. The fractional part is truncated
-			## toward zero; the integer part wraps on overflow. The result for
-			## `NaN`, `inf`, or `-inf` is implementation-defined.
+			## toward zero; the integer part wraps on overflow. `NaN`, `inf`, and
+			## `-inf` all return `0`.
 			## ```roc
 			## expect F64.to_i32_wrap(42.5) == 42
 			## ```
@@ -15832,8 +15835,8 @@ Builtin :: [].{
 			to_i32_try = |num| out_of_range_try(f64_to_i32_try_unsafe(num))
 
 			## Convert an [F64] to an [I64]. The fractional part is truncated
-			## toward zero; the integer part wraps on overflow. The result for
-			## `NaN`, `inf`, or `-inf` is implementation-defined.
+			## toward zero; the integer part wraps on overflow. `NaN`, `inf`, and
+			## `-inf` all return `0`.
 			## ```roc
 			## expect F64.to_i64_wrap(42.5) == 42
 			## ```
@@ -15849,8 +15852,8 @@ Builtin :: [].{
 			to_i64_try = |num| out_of_range_try(f64_to_i64_try_unsafe(num))
 
 			## Convert an [F64] to an [I128]. The fractional part is truncated
-			## toward zero; the integer part wraps on overflow. The result for
-			## `NaN`, `inf`, or `-inf` is implementation-defined.
+			## toward zero; the integer part wraps modulo 2^128 and is interpreted
+			## using two's complement. `NaN`, `inf`, and `-inf` all return `0`.
 			## ```roc
 			## expect F64.to_i128_wrap(42.5) == 42
 			## ```
@@ -15868,9 +15871,8 @@ Builtin :: [].{
 			# Conversions to unsigned integers (all lossy - truncation + range check)
 
 			## Convert an [F64] to a [U8]. The fractional part is truncated
-			## toward zero; the integer part wraps on overflow. The result for
-			## negative values, `NaN`, `inf`, or `-inf` is
-			## implementation-defined.
+			## toward zero; the integer part wraps modulo 2^8. `NaN`, `inf`, and
+			## `-inf` all return `0`.
 			## ```roc
 			## expect F64.to_u8_wrap(42.7) == 42
 			## ```
@@ -15889,9 +15891,8 @@ Builtin :: [].{
 			to_u8_try = |num| out_of_range_try(f64_to_u8_try_unsafe(num))
 
 			## Convert an [F64] to a [U16]. The fractional part is truncated
-			## toward zero; the integer part wraps on overflow. The result for
-			## negative values, `NaN`, `inf`, or `-inf` is
-			## implementation-defined.
+			## toward zero; the integer part wraps modulo 2^16. `NaN`, `inf`, and
+			## `-inf` all return `0`.
 			## ```roc
 			## expect F64.to_u16_wrap(42.5) == 42
 			## ```
@@ -15908,9 +15909,8 @@ Builtin :: [].{
 			to_u16_try = |num| out_of_range_try(f64_to_u16_try_unsafe(num))
 
 			## Convert an [F64] to a [U32]. The fractional part is truncated
-			## toward zero; the integer part wraps on overflow. The result for
-			## negative values, `NaN`, `inf`, or `-inf` is
-			## implementation-defined.
+			## toward zero; the integer part wraps modulo 2^32. `NaN`, `inf`, and
+			## `-inf` all return `0`.
 			## ```roc
 			## expect F64.to_u32_wrap(42.5) == 42
 			## ```
@@ -15927,9 +15927,8 @@ Builtin :: [].{
 			to_u32_try = |num| out_of_range_try(f64_to_u32_try_unsafe(num))
 
 			## Convert an [F64] to a [U64]. The fractional part is truncated
-			## toward zero; the integer part wraps on overflow. The result for
-			## negative values, `NaN`, `inf`, or `-inf` is
-			## implementation-defined.
+			## toward zero; the integer part wraps modulo 2^64. `NaN`, `inf`, and
+			## `-inf` all return `0`.
 			## ```roc
 			## expect F64.to_u64_wrap(42.5) == 42
 			## ```
@@ -15946,9 +15945,8 @@ Builtin :: [].{
 			to_u64_try = |num| out_of_range_try(f64_to_u64_try_unsafe(num))
 
 			## Convert an [F64] to a [U128]. The fractional part is truncated
-			## toward zero; the integer part wraps on overflow. The result for
-			## negative values, `NaN`, `inf`, or `-inf` is
-			## implementation-defined.
+			## toward zero; the integer part wraps modulo 2^128. `NaN`, `inf`, and
+			## `-inf` all return `0`.
 			## ```roc
 			## expect F64.to_u128_wrap(42.5) == 42
 			## ```

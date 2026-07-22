@@ -114,6 +114,14 @@ pub const TestCase = struct {
     pub const Expected = union(enum) {
         inspect_str: []const u8,
         allocations_at_most: AllocationExpectation,
+        /// Exact IEEE-754 bits stored in the checked module's ConstStore after
+        /// compile-time finalization. Unlike an `inspect_str` expectation,
+        /// this observes the static-data source directly, before any runtime
+        /// backend or public `to_bits` operation can normalize it.
+        comptime_f32_bits: u32,
+        comptime_f64_bits: u64,
+        comptime_f32_list_bits: []const u32,
+        comptime_f64_list_bits: []const u64,
         problem: void,
         crash: void,
         problem_and_crash: void,
@@ -122,6 +130,7 @@ pub const TestCase = struct {
             return switch (self) {
                 .inspect_str => |value| value,
                 .allocations_at_most => |value| value.output,
+                .comptime_f32_bits, .comptime_f64_bits, .comptime_f32_list_bits, .comptime_f64_list_bits => null,
                 .problem => null,
                 .crash => null,
                 .problem_and_crash => null,
@@ -698,6 +707,22 @@ fn runSingleTest(io: std.Io, allocator: std.mem.Allocator, tc: TestCase, timeout
                     .typecheck_ns = compiled.resources.typecheck_ns,
                 };
             },
+            .comptime_f32_bits, .comptime_f64_bits, .comptime_f32_list_bits, .comptime_f64_list_bits => blk: {
+                var resources = helpers.parseAndCanonicalizeProgram(allocator, tc.source_kind, tc.source, tc.imports) catch {
+                    return .{
+                        .status = .fail,
+                        .message = "INVALID_SYNTAX — skipped compile-time float-bits test has parse/check errors",
+                        .has_backend_details = false,
+                        .backends = undefined,
+                    };
+                };
+                defer resources.deinit(allocator);
+                break :blk EvalTimings{
+                    .parse_ns = resources.parse_ns,
+                    .canonicalize_ns = resources.canonicalize_ns,
+                    .typecheck_ns = resources.typecheck_ns,
+                };
+            },
             .crash, .problem_and_crash => blk: {
                 var compiled = helpers.compileInspectedProgram(allocator, io, tc.source_kind, tc.source, tc.imports) catch {
                     return .{
@@ -818,9 +843,139 @@ fn runSingleTestInner(io: std.Io, allocator: std.mem.Allocator, tc: TestCase, ti
     return switch (tc.expected) {
         .inspect_str => runInspectTest(io, allocator, tc.source_kind, tc.source, tc.imports, tc.expected, tc.skip, timeout_ms),
         .allocations_at_most => |expected| runAllocationTest(io, allocator, tc.source_kind, tc.source, tc.imports, expected, tc.skip),
+        .comptime_f32_bits, .comptime_f64_bits, .comptime_f32_list_bits, .comptime_f64_list_bits => runComptimeFloatBitsTest(allocator, tc.source_kind, tc.source, tc.imports, tc.expected),
         .problem => runTestProblem(allocator, tc.source_kind, tc.source, tc.imports),
         .crash => runCrashTest(io, allocator, tc.source_kind, tc.source, tc.imports, tc.skip, false, timeout_ms),
         .problem_and_crash => runCrashTest(io, allocator, tc.source_kind, tc.source, tc.imports, tc.skip, true, timeout_ms),
+    };
+}
+
+fn runComptimeFloatBitsTest(
+    allocator: std.mem.Allocator,
+    source_kind: helpers.SourceKind,
+    src: []const u8,
+    imports: []const helpers.ModuleSource,
+    expected: TestCase.Expected,
+) RunnerError!TestOutcome {
+    var resources = try helpers.parseAndCanonicalizeProgram(allocator, source_kind, src, imports);
+    defer resources.deinit(allocator);
+
+    const timings = EvalTimings{
+        .parse_ns = resources.parse_ns,
+        .canonicalize_ns = resources.canonicalize_ns,
+        .typecheck_ns = resources.typecheck_ns,
+    };
+    const roots = resources.checked_artifact.compile_time_roots.roots;
+    if (roots.len != 1) {
+        return .{
+            .status = .fail,
+            .message = try std.fmt.allocPrint(allocator, "expected exactly one compile-time root, found {d}", .{roots.len}),
+            .timings = timings,
+            .has_backend_details = false,
+            .backends = undefined,
+        };
+    }
+
+    const node = switch (roots[0].payload) {
+        .const_node => |value| value,
+        .pending, .fn_value, .expect => {
+            return .{
+                .status = .fail,
+                .message = "compile-time float root did not produce a ConstStore node",
+                .timings = timings,
+                .has_backend_details = false,
+                .backends = undefined,
+            };
+        },
+    };
+    const stored = resources.checked_artifact.const_store.get(node);
+    const const_store = &resources.checked_artifact.const_store;
+
+    const matches = switch (expected) {
+        .comptime_f32_bits => |expected_bits| switch (stored) {
+            .scalar => |scalar| switch (scalar) {
+                .f32_bits => |actual_bits| actual_bits == expected_bits,
+                else => false,
+            },
+            else => false,
+        },
+        .comptime_f64_bits => |expected_bits| switch (stored) {
+            .scalar => |scalar| switch (scalar) {
+                .f64_bits => |actual_bits| actual_bits == expected_bits,
+                else => false,
+            },
+            else => false,
+        },
+        .comptime_f32_list_bits => |expected_bits| switch (stored) {
+            .list => |items| blk: {
+                if (items.len != expected_bits.len) break :blk false;
+                for (items, expected_bits) |item, bits| {
+                    const actual = switch (const_store.get(item)) {
+                        .scalar => |scalar| switch (scalar) {
+                            .f32_bits => |actual_bits| actual_bits,
+                            else => break :blk false,
+                        },
+                        else => break :blk false,
+                    };
+                    if (actual != bits) break :blk false;
+                }
+                break :blk true;
+            },
+            else => false,
+        },
+        .comptime_f64_list_bits => |expected_bits| switch (stored) {
+            .list => |items| blk: {
+                if (items.len != expected_bits.len) break :blk false;
+                for (items, expected_bits) |item, bits| {
+                    const actual = switch (const_store.get(item)) {
+                        .scalar => |scalar| switch (scalar) {
+                            .f64_bits => |actual_bits| actual_bits,
+                            else => break :blk false,
+                        },
+                        else => break :blk false,
+                    };
+                    if (actual != bits) break :blk false;
+                }
+                break :blk true;
+            },
+            else => false,
+        },
+        else => unreachable,
+    };
+    if (!matches) {
+        const message = switch (expected) {
+            .comptime_f32_bits => |expected_bits| switch (stored) {
+                .scalar => |scalar| switch (scalar) {
+                    .f32_bits => |actual_bits| try std.fmt.allocPrint(allocator, "ConstStore F32 bits: expected 0x{x:0>8}, got 0x{x:0>8}", .{ expected_bits, actual_bits }),
+                    else => "ConstStore root was not an F32 scalar",
+                },
+                else => "ConstStore root was not a scalar",
+            },
+            .comptime_f64_bits => |expected_bits| switch (stored) {
+                .scalar => |scalar| switch (scalar) {
+                    .f64_bits => |actual_bits| try std.fmt.allocPrint(allocator, "ConstStore F64 bits: expected 0x{x:0>16}, got 0x{x:0>16}", .{ expected_bits, actual_bits }),
+                    else => "ConstStore root was not an F64 scalar",
+                },
+                else => "ConstStore root was not a scalar",
+            },
+            .comptime_f32_list_bits => "ConstStore F32 list did not contain the expected exact element bits",
+            .comptime_f64_list_bits => "ConstStore F64 list did not contain the expected exact element bits",
+            else => unreachable,
+        };
+        return .{
+            .status = .fail,
+            .message = message,
+            .timings = timings,
+            .has_backend_details = false,
+            .backends = undefined,
+        };
+    }
+
+    return .{
+        .status = .pass,
+        .timings = timings,
+        .has_backend_details = false,
+        .backends = undefined,
     };
 }
 
@@ -1025,6 +1180,7 @@ fn runInspectTest(
                 const expected_str = switch (expected) {
                     .inspect_str => |value| value,
                     .allocations_at_most => unreachable,
+                    .comptime_f32_bits, .comptime_f64_bits, .comptime_f32_list_bits, .comptime_f64_list_bits => unreachable,
                     .problem => unreachable,
                     .crash => unreachable,
                     .problem_and_crash => unreachable,

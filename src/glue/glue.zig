@@ -428,6 +428,7 @@ fn runGlueSpecInterpreter(
         &lowered.lir_result.store,
         &lowered.lir_result.layouts,
         roc_ops,
+        .preserve,
     ) catch return error.OutOfMemory;
     defer interpreter.deinit();
 
@@ -469,6 +470,7 @@ fn runGlueSpecDev(
             &lowered.lir_result.store,
             &lowered.lir_result.layouts,
             static_strings.entries,
+            .preserve,
         ) catch return error.OutOfMemory;
         defer codegen.deinit();
 

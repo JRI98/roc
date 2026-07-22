@@ -15,11 +15,13 @@ pub const tests = [_]TestCase{
         .expected = .{ .inspect_str = "1069547520" },
     },
     .{
-        .name = "low_level - F32.from_bits to_bits preserves quiet NaN payload",
+        .name = "low_level - F32.to_bits collapses every NaN representation",
         .source =
         \\{
-        \\bits = 2143289345
-        \\F32.to_bits(F32.from_bits(bits)) == bits
+        \\F32.to_bits(F32.from_bits(2143289345)) == 2143289344
+        \\    and F32.to_bits(F32.from_bits(4290772993)) == 2143289344
+        \\    and F32.to_bits(F32.from_bits(2139095041)) == 2143289344
+        \\    and F32.to_bits(F32.from_bits(4286578689)) == 2143289344
         \\}
         ,
         .expected = .{ .inspect_str = "True" },
@@ -35,12 +37,73 @@ pub const tests = [_]TestCase{
         .expected = .{ .inspect_str = "4609434218613702656" },
     },
     .{
-        .name = "low_level - F64.from_bits to_bits preserves quiet NaN payload",
+        .name = "low_level - F64.to_bits collapses every NaN representation",
         .source =
         \\{
-        \\bits = 9221120237041090561
-        \\F64.to_bits(F64.from_bits(bits)) == bits
+        \\F64.to_bits(F64.from_bits(9221120237041090561)) == 9221120237041090560
+        \\    and F64.to_bits(F64.from_bits(18444492273895866369)) == 9221120237041090560
+        \\    and F64.to_bits(F64.from_bits(9218868437227405313)) == 9221120237041090560
+        \\    and F64.to_bits(F64.from_bits(18442240474082181121)) == 9221120237041090560
         \\}
+        ,
+        .expected = .{ .inspect_str = "True" },
+    },
+    .{
+        .name = "low_level - float to_str collapses NaN signs and payloads",
+        .source =
+        \\{
+        \\F32.to_str(F32.from_bits(2143289345)) == "nan"
+        \\    and F32.to_str(F32.from_bits(4290772993)) == "nan"
+        \\    and F32.to_str(F32.from_bits(4286578689)) == "nan"
+        \\    and F64.to_str(F64.from_bits(9221120237041090561)) == "nan"
+        \\    and F64.to_str(F64.from_bits(18444492273895866369)) == "nan"
+        \\    and F64.to_str(F64.from_bits(18442240474082181121)) == "nan"
+        \\}
+        ,
+        .expected = .{ .inspect_str = "True" },
+    },
+    .{
+        .name = "low_level - JSON encoding classifies every NaN representation identically",
+        .source_kind = .module,
+        .source =
+        \\f32_result : Try(Str, [Infinity, NaN, NegativeInfinity])
+        \\f32_result = Json.to_str_try(F32.from_bits(4286578689))
+        \\f64_result : Try(Str, [Infinity, NaN, NegativeInfinity])
+        \\f64_result = Json.to_str_try(F64.from_bits(18444492273895866369))
+        \\main = f32_result == Err(NaN) and f64_result == Err(NaN)
+        ,
+        .expected = .{ .inspect_str = "True" },
+    },
+    .{
+        .name = "low_level - float hashes collapse NaN signs and payloads",
+        .source_kind = .module,
+        .source =
+        \\F32Key := { value : F32 }.{
+        \\    is_eq : F32Key, F32Key -> Bool
+        \\    is_eq = |_, _| True
+        \\    to_hash : F32Key, Hasher -> Hasher
+        \\    to_hash = |key, hasher| F32.to_hash(key.value, hasher)
+        \\}
+        \\
+        \\F64Key := { value : F64 }.{
+        \\    is_eq : F64Key, F64Key -> Bool
+        \\    is_eq = |_, _| True
+        \\    to_hash : F64Key, Hasher -> Hasher
+        \\    to_hash = |key, hasher| F64.to_hash(key.value, hasher)
+        \\}
+        \\
+        \\f32_first : F32Key
+        \\f32_first = { value: F32.from_bits(2143289345) }
+        \\f32_second : F32Key
+        \\f32_second = { value: F32.from_bits(4286578689) }
+        \\f64_first : F64Key
+        \\f64_first = { value: F64.from_bits(9221120237041090561) }
+        \\f64_second : F64Key
+        \\f64_second = { value: F64.from_bits(18442240474082181121) }
+        \\
+        \\main =
+        \\    Dict.empty().insert(f32_first, 32).get(f32_second) == Ok(32)
+        \\        and Dict.empty().insert(f64_first, 64).get(f64_second) == Ok(64)
         ,
         .expected = .{ .inspect_str = "True" },
     },
@@ -249,6 +312,36 @@ pub const tests = [_]TestCase{
         \\}
         ,
         .expected = .{ .inspect_str = "True" },
+    },
+    .{
+        .name = "low_level - F32 div_trunc_by truncates toward zero",
+        .source = "F32.div_trunc_by(-7.5, 2.0)",
+        .expected = .{ .inspect_str = "-3" },
+    },
+    .{
+        .name = "low_level - F64 div_trunc_by truncates toward zero",
+        .source = "F64.div_trunc_by(-7.5, 2.0)",
+        .expected = .{ .inspect_str = "-3" },
+    },
+    .{
+        .name = "low_level - F32 rem_by has dividend sign",
+        .source = "F32.rem_by(-7.5, 2.0)",
+        .expected = .{ .inspect_str = "-1.5" },
+    },
+    .{
+        .name = "low_level - F64 rem_by has dividend sign",
+        .source = "F64.rem_by(-7.5, 2.0)",
+        .expected = .{ .inspect_str = "-1.5" },
+    },
+    .{
+        .name = "low_level - F32 rem_by retains quotient bits for large dividends",
+        .source = "F32.rem_by(10000000000.0, 3.0)",
+        .expected = .{ .inspect_str = "1" },
+    },
+    .{
+        .name = "low_level - F64 rem_by retains quotient bits for large dividends",
+        .source = "F64.rem_by(100000000000000000000.0, 3.0)",
+        .expected = .{ .inspect_str = "1" },
     },
     // Single float->int conversions, kept separate from the compound tests
     // above so a regression in one conversion isn't masked by `and`
@@ -2294,6 +2387,51 @@ pub const tests = [_]TestCase{
         .expected = .{ .inspect_str = "255" },
     },
     .{
+        .name = "low_level - I64.to_f32 rounds directly without an F64 intermediate",
+        .source = "F32.to_bits(I64.to_f32(4611686293305294849))",
+        .expected = .{ .inspect_str = "1585446913" },
+    },
+    .{
+        .name = "low_level - U64.to_f32 rounds directly without an F64 intermediate",
+        .source = "F32.to_bits(U64.to_f32(4611686293305294849))",
+        .expected = .{ .inspect_str = "1585446913" },
+    },
+    .{
+        .name = "low_level - I128.to_f32 rounds directly without an F64 intermediate",
+        .source = "F32.to_bits(I128.to_f32(1267650675786093127411026624513))",
+        .expected = .{ .inspect_str = "1904214017" },
+    },
+    .{
+        .name = "low_level - U128.to_f32 rounds directly without an F64 intermediate",
+        .source = "F32.to_bits(U128.to_f32(1267650675786093127411026624513))",
+        .expected = .{ .inspect_str = "1904214017" },
+    },
+    .{
+        .name = "low_level - U128.to_f64 reconstructs all bits before rounding",
+        .source = "F64.to_bits(U128.to_f64(175041171847383136912074030835181917))",
+        .expected = .{ .inspect_str = "5134344476044778477" },
+    },
+    .{
+        .name = "low_level - negative I128.to_f64 reconstructs all bits before rounding",
+        .source = "F64.to_bits(I128.to_f64(-1895924119892032041906877393309381507))",
+        .expected = .{ .inspect_str = "14372906452092052893" },
+    },
+    .{
+        .name = "low_level - Dec.to_f64 reads the full 128-bit representation",
+        .source = "F64.to_bits(Dec.to_f64(10000000000000000000))",
+        .expected = .{ .inspect_str = "4891288408196988160" },
+    },
+    .{
+        .name = "low_level - Dec.to_f32 rounds directly without an F64 intermediate",
+        .source = "F32.to_bits(Dec.to_f32_wrap(0.000000145576585453))",
+        .expected = .{ .inspect_str = "874270665" },
+    },
+    .{
+        .name = "low_level - Dec.to_f32_try rounds directly without an F64 intermediate",
+        .source = "F32.to_bits(Dec.to_f32_try(0.000000145576585453).ok_or(0.0))",
+        .expected = .{ .inspect_str = "874270665" },
+    },
+    .{
         .name = "low_level - U8.to_dec",
         .source =
         \\{
@@ -2385,6 +2523,94 @@ pub const tests = [_]TestCase{
         \\}
         ,
         .expected = .{ .inspect_str = "Err(OutOfRange)" },
+    },
+    .{
+        .name = "low_level - F32 wrapping float-to-int conversions define non-finite and negative inputs",
+        .source =
+        \\{
+        \\F32.to_i8_wrap(F32.nan) == 0
+        \\    and F32.to_i64_wrap(F32.infinity) == 0
+        \\    and F32.to_u32_wrap(F32.negate(F32.infinity)) == 0
+        \\    and F32.to_u8_wrap(-1.0) == 255
+        \\    and F32.to_u32_wrap(-1.0) == 4294967295
+        \\}
+        ,
+        .expected = .{ .inspect_str = "True" },
+    },
+    .{ .name = "low_level - F32 wrap NaN to I8 is zero", .source = "F32.to_i8_wrap(F32.nan)", .expected = .{ .inspect_str = "0" } },
+    .{ .name = "low_level - F32 wrap positive infinity to I64 is zero", .source = "F32.to_i64_wrap(F32.infinity)", .expected = .{ .inspect_str = "0" } },
+    .{ .name = "low_level - F32 wrap negative infinity to U32 is zero", .source = "F32.to_u32_wrap(F32.negate(F32.infinity))", .expected = .{ .inspect_str = "0" } },
+    .{ .name = "low_level - F32 wrap negative one to U8", .source = "F32.to_u8_wrap(-1.0)", .expected = .{ .inspect_str = "255" } },
+    .{ .name = "low_level - F32 wrap negative one to U32", .source = "F32.to_u32_wrap(-1.0)", .expected = .{ .inspect_str = "4294967295" } },
+    .{
+        .name = "low_level - F64 wrapping float-to-int conversions define non-finite and out-of-range inputs",
+        .source =
+        \\{
+        \\F64.to_i8_wrap(F64.nan) == 0
+        \\    and F64.to_i64_wrap(F64.infinity) == 0
+        \\    and F64.to_u64_wrap(F64.negate(F64.infinity)) == 0
+        \\    and F64.to_i128_wrap(F64.nan) == 0
+        \\    and F64.to_u128_wrap(F64.highest) == 0
+        \\    and F64.to_u64_wrap(-1.0) == 18446744073709551615
+        \\    and F64.to_u128_wrap(-1.0) == 340282366920938463463374607431768211455
+        \\    and F64.to_i128_wrap(170141183460469231731687303715884105728.0) == -170141183460469231731687303715884105728
+        \\}
+        ,
+        .expected = .{ .inspect_str = "True" },
+    },
+    .{
+        .name = "low_level - F32 wrapping float-to-int conversions use exact modulo boundaries",
+        .source =
+        \\F32.to_u8_wrap(257.75) == 1
+        \\    and F32.to_u8_wrap(-257.75) == 255
+        \\    and F32.to_u32_wrap(4294967808.0) == 512
+        \\    and F32.to_u64_wrap(18446744073709551616.0) == 0
+        \\    and F32.to_u128_wrap(1267650600228229401496703205376.0) == 1267650600228229401496703205376
+        \\    and F32.to_u128_wrap(-0.75) == 0
+        ,
+        .expected = .{ .inspect_str = "True" },
+    },
+    .{
+        .name = "low_level - F64 wrapping float-to-int conversions use exact modulo boundaries",
+        .source =
+        \\F64.to_u8_wrap(257.75) == 1
+        \\    and F64.to_u8_wrap(-257.75) == 255
+        \\    and F64.to_u64_wrap(18446744073709555712.0) == 4096
+        \\    and F64.to_u64_wrap(-18446744073709555712.0) == 18446744073709547520
+        \\    and F64.to_u128_wrap(1267650600228229682971679916032.0) == 1267650600228229682971679916032
+        \\    and F64.to_u128_wrap(-1267650600228229682971679916032.0) == 340282365653287863235144924460088295424
+        \\    and F64.to_u128_wrap(340282366920938463463374607431768211456.0) == 0
+        \\    and F64.to_u128_wrap(-0.75) == 0
+        ,
+        .expected = .{ .inspect_str = "True" },
+    },
+    .{
+        .name = "low_level - F32 fallible float-to-int conversions reject every non-finite class",
+        .source =
+        \\F32.to_i32_try(F32.nan) == Err(OutOfRange)
+        \\    and F32.to_i32_try(F32.infinity) == Err(OutOfRange)
+        \\    and F32.to_i32_try(F32.negate(F32.infinity)) == Err(OutOfRange)
+        ,
+        .expected = .{ .inspect_str = "True" },
+    },
+    .{
+        .name = "low_level - F64 fallible float-to-int conversions reject every non-finite class",
+        .source =
+        \\F64.to_u128_try(F64.nan) == Err(OutOfRange)
+        \\    and F64.to_u128_try(F64.infinity) == Err(OutOfRange)
+        \\    and F64.to_u128_try(F64.negate(F64.infinity)) == Err(OutOfRange)
+        ,
+        .expected = .{ .inspect_str = "True" },
+    },
+    .{
+        .name = "low_level - F64.to_f32_try rejects NaN infinities and finite overflow",
+        .source =
+        \\F64.to_f32_try(F64.nan) == Err(OutOfRange)
+        \\    and F64.to_f32_try(F64.infinity) == Err(OutOfRange)
+        \\    and F64.to_f32_try(F64.negate(F64.infinity)) == Err(OutOfRange)
+        \\    and F64.to_f32_try(F64.highest) == Err(OutOfRange)
+        ,
+        .expected = .{ .inspect_str = "True" },
     },
     .{
         .name = "low_level - Dec.to_i8_try truncates fractional part",

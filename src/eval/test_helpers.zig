@@ -2285,7 +2285,7 @@ pub fn devEvalBoolRoots(
         );
         defer static_strings.deinit();
 
-        var codegen = try HostLirCodeGen.init(allocator, store, layouts, static_strings.entries);
+        var codegen = try HostLirCodeGen.init(allocator, store, layouts, static_strings.entries, .preserve);
         defer codegen.deinit();
         try codegen.compileAllProcSpecs(store.getProcSpecs());
 
@@ -2687,6 +2687,7 @@ pub fn lirInterpreterStrWithStats(allocator: Allocator, lowered: *const LoweredP
         &lowered.view.store,
         &lowered.view.layouts,
         runtime_env.get_ops(),
+        .preserve,
     );
     defer interp.deinit();
 
@@ -2761,6 +2762,7 @@ pub fn lirInterpreterTranscript(allocator: Allocator, lowered: *const LoweredPro
         &lowered.view.store,
         &lowered.view.layouts,
         runtime_env.get_ops(),
+        .preserve,
     );
     defer interp.deinit();
 
@@ -2855,6 +2857,7 @@ pub fn devEvaluatorStrWithStats(allocator: Allocator, lowered: *const LoweredPro
             &lowered.view.store,
             &lowered.view.layouts,
             static_strings.entries,
+            .preserve,
         );
         defer codegen.deinit();
         try codegen.compileAllProcSpecs(lowered.view.store.getProcSpecs());
