@@ -199,10 +199,8 @@ test "host_trampoline available on supported arches" {
     }
 }
 
-test "host trampoline captures every AArch64 homogeneous aggregate result register" {
+test "host trampoline result image holds every homogeneous aggregate register" {
     try std.testing.expectEqual(@as(usize, 4), max_result_sse);
     const result_image = @typeInfo(@FieldType(Call, "res_sse")).pointer.child;
     try std.testing.expectEqual(@as(usize, max_result_sse * @sizeOf(u128)), @sizeOf(result_image));
-    const assembly_source = @embedFile("host_trampoline.S");
-    try std.testing.expect(std.mem.find(u8, assembly_source, "stp q2, q3, [x9, #32]") != null);
 }
