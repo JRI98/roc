@@ -262,14 +262,12 @@ pub const CacheModule = struct {
     /// Load a cache file, memory-mapping it when `roc_ctx` can map files and
     /// reading it onto the heap otherwise.
     ///
-    /// The mapping is copy-on-write (`CoreCtx.mapFilePrivate`): deserialization
-    /// relocates serialized pointers in place, writing fixups into the buffer, and
-    /// copy-on-write keeps those writes process-private so the cache file on disk
-    /// is never modified.
-    ///
-    /// The mapped region must outlive any deserialized `ModuleEnv` that aliases it;
-    /// free it through `CacheData.deinit`, which unmaps a `.mapped` value and never
-    /// routes it through the heap allocator.
+    /// The mapping is copy-on-write (`CoreCtx.mapFilePrivate`), so callers may
+    /// write into the returned bytes (for example, relocating serialized
+    /// pointers in place) without those writes ever reaching the cache file on
+    /// disk. If a caller keeps references into the mapped bytes, the mapping
+    /// must outlive them; free it through `CacheData.deinit`, which unmaps a
+    /// `.mapped` value and never routes it through the heap allocator.
     ///
     /// An empty file, a mapping error, or a `roc_ctx` that cannot map files (a
     /// virtual filesystem, a target without `mmap`) uses the heap-read path via
@@ -322,9 +320,13 @@ test "readFromFileMapped memory-maps a cache file copy-on-write" {
 
     const testing = std.testing;
     const roc_ctx = CoreCtx.default(testing.allocator, testing.allocator, testing.io);
-    const path = "roc-cache-module-mmap-roundtrip.tmp";
-    roc_ctx.deleteFile(path) catch {};
-    defer roc_ctx.deleteFile(path) catch {};
+
+    var tmp_dir = testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    const tmp_path = try tmp_dir.dir.realPathFileAlloc(testing.io, ".", testing.allocator);
+    defer testing.allocator.free(tmp_path);
+    const path = try std.fs.path.join(testing.allocator, &.{ tmp_path, "mmap-roundtrip.bin" });
+    defer testing.allocator.free(path);
 
     // A page of deterministic bytes so the mapped data spans the whole page.
     var payload: [4096]u8 = undefined;

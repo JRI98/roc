@@ -529,11 +529,14 @@ compile-time evaluation. In particular, the interpreter's call-depth guard
 (`max_call_depth` in `src/eval/interpreter.zig`) is enforced only in Debug
 builds of the compiler, where it turns runaway recursion into a deterministic
 Roc crash with interpreter context attached. In release builds, evaluation
-depth is bounded only by actual native stack memory, with exhaustion reported
-by the stack overflow guard in `src/base`. An arbitrary depth budget in
-release would make a program's compile-time-evaluability depend on a compiler
-build constant rather than on the program itself, and would let Debug and
-release builds disagree about whether the same program compiles.
+depth is bounded only by actual native stack memory, and exhaustion is
+reported by whoever owns the executing thread: compile-time evaluation runs on
+compiler threads covered by the stack overflow guard in `src/base`, while
+runtime interpretation runs in the shim/app process, where stack-overflow
+reporting belongs to the platform host. An arbitrary depth budget in release
+would make a program's compile-time-evaluability depend on a compiler build
+constant rather than on the program itself, and would let Debug and release
+builds disagree about whether the same program compiles.
 
 ## Backend Builtins
 

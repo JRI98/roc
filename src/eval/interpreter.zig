@@ -275,11 +275,14 @@ pub const Interpreter = struct {
     /// can do, including how deeply it recurses — an arbitrary depth budget
     /// would make well-formed programs compile in Debug and fail in release,
     /// or vice versa. In release builds recursion is bounded only by actual
-    /// native stack memory, and exhausting it is reported by the stack
-    /// overflow guard in `src/base`. The Debug check exists to turn runaway
-    /// recursion into a deterministic Roc crash with this interpreter's
-    /// context attached instead of a native fault. See design.md
-    /// ("Compile-Time Evaluation And Static Storage").
+    /// native stack memory. Exhausting it is reported by whoever owns the
+    /// executing thread: compile-time evaluation runs on compiler threads
+    /// covered by the stack overflow guard in `src/base`, while runtime
+    /// interpretation runs in the shim/app process, where stack-overflow
+    /// reporting belongs to the platform host. The Debug check exists to turn
+    /// runaway recursion into a deterministic Roc crash with this
+    /// interpreter's context attached instead of a native fault. See
+    /// design.md ("Compile-Time Evaluation And Static Storage").
     const max_call_depth: usize = 1024;
     const stack_overflow_message =
         "This Roc program overflowed its stack memory. This usually means there is very deep or infinite recursion somewhere in the code.";

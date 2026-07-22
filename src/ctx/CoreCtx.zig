@@ -186,13 +186,13 @@ pub fn stat(self: Self, path: []const u8) StatError!FileInfo {
     return self.vtable.stat(self.ctx, self.std_io, path);
 }
 
-/// Backward-compat alias for `stat`.
 /// Map the file at `path` as a private, copy-on-write mapping, or `null` when
 /// this context or target cannot map it. Release with `MappedFile.unmap`.
 pub fn mapFilePrivate(self: Self, path: []const u8) ?MappedFile {
     return self.vtable.mapFilePrivate(self.ctx, self.std_io, path);
 }
 
+/// Backward-compat alias for `stat`.
 pub fn getFileInfo(self: Self, path: []const u8) StatError!FileInfo {
     return self.vtable.stat(self.ctx, self.std_io, path);
 }
