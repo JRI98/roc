@@ -5675,14 +5675,39 @@ test "issue 10301 for-loop over effect-produced list scalarizes" {
     try std.testing.expectEqual(root_shape.list_get_unsafe_count, reachable_total);
 }
 
-fn hasRawListAccess(shape: ProcShape) bool {
-    return shape.list_get_unsafe_count >= 1;
-}
-
 fn isFusedRawListLoop(shape: ProcShape) bool {
     return shape.list_get_unsafe_count >= 1 and
         shape.join_count >= 1 and
         shape.direct_call_count == 0;
+}
+
+fn rawListAccessOutsideLoop(shape: ProcShape) bool {
+    return shape.list_get_unsafe_count >= 1 and shape.join_count == 0;
+}
+
+test "issue 10301 fold over effect-produced list scalarizes" {
+    const allocator = std.testing.allocator;
+    const source =
+        \\produce : U64 -> List(U64)
+        \\produce = |n| {
+        \\    dbg 7.U64
+        \\    [n, 2, 3]
+        \\}
+        \\
+        \\main : U64
+        \\main = Iter.fold(produce(1).iter(), 0, |acc, byte| acc * 31 + byte)
+    ;
+    var optimized = try lowerModule(allocator, source, .wrappers);
+    defer optimized.deinit(allocator);
+
+    // The fold fuses as a peel plus worker, the same shape a static-list fold
+    // takes: the root runs the first step inline and calls the fused worker
+    // once for the rest. Exactly one reachable proc is a self-contained
+    // raw-indexed loop with no per-element call, and every raw list access
+    // lives inside a loop-carrying proc — a retained per-element step proc is
+    // loop-less, so none may remain.
+    try std.testing.expectEqual(@as(usize, 1), try reachableProcShapeCount(allocator, &optimized.lowered, isFusedRawListLoop));
+    try std.testing.expectEqual(@as(usize, 0), try reachableProcShapeCount(allocator, &optimized.lowered, rawListAccessOutsideLoop));
 }
 
 test "sequential effect-produced for-loops both scalarize" {

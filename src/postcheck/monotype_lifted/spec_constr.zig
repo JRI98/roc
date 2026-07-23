@@ -3462,8 +3462,25 @@ const Cloner = struct {
                 const args = try GuardedList.dupe(self.pass.allocator, Ast.ExprId, self.pass.program.exprSpan(call.args));
                 defer self.pass.allocator.free(args);
 
+                // Shape detection is a discarded probe: it clones the arguments
+                // only to read their constructor shapes and emits nothing. Run
+                // it in an isolated effect context so its windows chain from a
+                // clean region entry. Effects counted while probing earlier
+                // calls in the same walk otherwise leave the effect marks
+                // advanced while the region entry stays put, so a constructed
+                // argument that carries its own effectful producer (an iterator
+                // over an effect-produced list) has that producer's emission
+                // window fall past the region entry and is pinned to an opaque
+                // value, hiding the constructor the pattern needs.
                 const pending_start = self.pending.items.len;
-                defer self.pending.shrinkRetainingCapacity(pending_start);
+                const saved_effect_marks = self.effect_marks;
+                const saved_region_entry = self.region_entry_marks;
+                self.region_entry_marks = self.effect_marks;
+                defer {
+                    self.pending.shrinkRetainingCapacity(pending_start);
+                    self.effect_marks = saved_effect_marks;
+                    self.region_entry_marks = saved_region_entry;
+                }
 
                 const values = try self.pass.allocator.alloc(Value, args.len);
                 defer self.pass.allocator.free(values);
