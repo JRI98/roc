@@ -76,9 +76,11 @@ pub const tests = [_]TestCase{
     .{
         .name = "SIMD structural equality compares all 128 bits",
         .source =
-        \\left = { vector: U8x16.from_u128_bits(18446744073709551616) }
-        \\right = { vector: U8x16.from_u128_bits(36893488147419103232) }
-        \\left != right
+        \\{
+        \\    left = { vector: U8x16.from_u128_bits(18446744073709551616) }
+        \\    right = { vector: U8x16.from_u128_bits(36893488147419103232) }
+        \\    left != right
+        \\}
         ,
         .expected = .{ .inspect_str = "True" },
     },

@@ -12,6 +12,7 @@ pub const dev_wrappers = @import("dev_wrappers.zig");
 pub const erased_callable = @import("erased_callable.zig");
 pub const float_bits = @import("float_bits.zig");
 pub const float_math_f32 = @import("float_math/f32.zig");
+pub const float_math_f64 = @import("float_math/f64.zig");
 pub const hash = @import("hash.zig");
 pub const list = @import("list.zig");
 pub const num = @import("num.zig");
@@ -20,7 +21,6 @@ pub const sort = @import("sort.zig");
 pub const simd = @import("simd.zig");
 pub const str = @import("str.zig");
 pub const utils = @import("utils.zig");
-pub const float_math_tan = @import("float_math/tan.zig");
 
 test "builtins tests" {
     std.testing.refAllDecls(@import("builtin_registry.zig"));
@@ -30,6 +30,7 @@ test "builtins tests" {
     std.testing.refAllDecls(@import("erased_callable.zig"));
     std.testing.refAllDecls(@import("float_bits.zig"));
     std.testing.refAllDecls(@import("float_math/f32.zig"));
+    std.testing.refAllDecls(@import("float_math/f64.zig"));
     std.testing.refAllDecls(@import("float_math/tan.zig"));
     std.testing.refAllDecls(@import("hash.zig"));
     std.testing.refAllDecls(@import("host_abi.zig"));

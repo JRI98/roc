@@ -210,29 +210,29 @@ main! = |_| {
 			(e-block
 				(s-let
 					(p-assign (ident "result1"))
-					(e-call (constraint-fn-var 272)
+					(e-call (constraint-fn-var 275)
 						(e-lookup-local
 							(p-assign (ident "identity")))
 						(e-num (value "42"))))
 				(s-let
 					(p-assign (ident "result2"))
-					(e-call (constraint-fn-var 283)
+					(e-call (constraint-fn-var 286)
 						(e-lookup-local
 							(p-assign (ident "identity2")))
 						(e-string
 							(e-literal (string "hello")))))
 				(s-let
 					(p-assign (ident "result3"))
-					(e-call (constraint-fn-var 288)
+					(e-call (constraint-fn-var 291)
 						(e-lookup-local
 							(p-assign (ident "pair")))
 						(e-lookup-local
 							(p-assign (ident "result1")))
 						(e-lookup-local
 							(p-assign (ident "result2")))))
-				(e-dispatch-call (method "plus") (constraint-fn-var 291)
+				(e-dispatch-call (method "plus") (constraint-fn-var 294)
 					(receiver
-						(e-dispatch-call (method "plus") (constraint-fn-var 289)
+						(e-dispatch-call (method "plus") (constraint-fn-var 292)
 							(receiver
 								(e-lookup-local
 									(p-assign (ident "a"))))

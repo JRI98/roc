@@ -46,7 +46,7 @@ add2 = x + 2
 (can-ir
 	(d-let
 		(p-assign (ident "add2"))
-		(e-dispatch-call (method "plus") (constraint-fn-var 200)
+		(e-dispatch-call (method "plus") (constraint-fn-var 203)
 			(receiver
 				(e-runtime-error (tag "ident_not_in_scope")))
 			(args

@@ -1953,6 +1953,7 @@ fn registerHostImports(self: *Self) Allocator.Error!void {
 pub const GenerateResult = struct {
     wasm_bytes: []u8,
     result_layout: layout.Idx,
+    heap_base: u32,
     has_imports: bool = false,
 };
 
@@ -2168,10 +2169,43 @@ pub fn generateEntrypointWrapper(
 
 /// Generate a complete wasm module for a zero-argument root proc.
 /// The exported `main` function initializes RocOps and tail-calls the root proc.
-pub fn generateModule(self: *Self, root_proc_id: LIR.LirProcSpecId, result_layout: layout.Idx) HostedSymbolError!GenerateResult {
+/// Builtin call sites target definitions merged from `wasm32_builtins_object`.
+/// Dead-code elimination removes the superseded builtin callback imports, so
+/// the encoded module retains only the reachable platform runtime callbacks.
+pub fn generateModule(
+    self: *Self,
+    root_proc_id: LIR.LirProcSpecId,
+    result_layout: layout.Idx,
+    wasm32_builtins_object: []const u8,
+) HostedSymbolError!GenerateResult {
+    // generateModule always runs data DCE, so every generated static-data
+    // address must carry the relocation edge that makes its segment live.
+    self.configureStaticDataAddressTracking();
+
     // Register host function imports (must be done before addFunction calls)
     self.registerHostImports() catch return error.OutOfMemory;
     try self.registerHostedSymbolTargets(self.store.getProcSpecs());
+
+    if (wasm32_builtins_object.len == 0) {
+        wasmInvariantFmt("WASM/codegen invariant violated: eval builtin object is empty", .{});
+    }
+
+    var builtins_module = WasmModule.preload(self.allocator, wasm32_builtins_object, true) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => wasmInvariantFmt("WASM/codegen invariant violated: invalid eval builtin object: {s}", .{@errorName(err)}),
+    };
+    defer builtins_module.deinit();
+
+    var merge_result = self.module.mergeModule(&builtins_module) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => wasmInvariantFmt("WASM/codegen invariant violated: eval builtin merge failed: {s}", .{@errorName(err)}),
+    };
+    merge_result.deinit();
+
+    const builtin_symbols = BuiltinSignatures.populateForRelocs(&self.module) catch {
+        wasmInvariantFmt("WASM/codegen invariant violated: merged eval module is missing a builtin symbol", .{});
+    };
+    self.configureBuiltinRelocs(builtin_symbols);
 
     // Compile all procedures before the synthetic main wrapper.
     const proc_specs = self.store.getProcSpecs();
@@ -2295,15 +2329,30 @@ pub fn generateModule(self: *Self, root_proc_id: LIR.LirProcSpecId, result_layou
     self.currentCode().append(self.allocator, Op.end) catch return error.OutOfMemory;
     self.endFunction();
     try self.flushPendingBodies();
+    self.module.addExport("main", .func, func_idx) catch return error.OutOfMemory;
+    self.module.resolveRelocations() catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.InvalidRelocation => wasmInvariantFmt("WASM/codegen invariant violated: eval builtin relocation failed", .{}),
+    };
+
+    const called_fns = self.allocator.alloc(bool, self.module.liveFunctionCount()) catch return error.OutOfMemory;
+    defer self.allocator.free(called_fns);
+    @memset(called_fns, false);
+    self.module.eliminateDeadCode(called_fns) catch return error.OutOfMemory;
+    self.module.verifyNoBuiltinImports() catch {
+        wasmInvariantFmt("WASM/codegen invariant violated: eval module retains a builtin host import", .{});
+    };
     try self.module.materializeFuncBodies();
 
-    self.module.addExport("main", .func, func_idx) catch return error.OutOfMemory;
-
-    const wasm_bytes = self.module.encode(self.allocator) catch return error.OutOfMemory;
+    const wasm_bytes = self.module.encode(self.allocator) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.NonZeroZeroFillSegment => wasmInvariantFmt("WASM/codegen invariant violated: eval module contains nonzero omitted data", .{}),
+    };
 
     return .{
         .wasm_bytes = wasm_bytes,
         .result_layout = result_layout,
+        .heap_base = self.module.heapBase(),
         .has_imports = self.module.importCount() > 0,
     };
 }
@@ -10863,6 +10912,7 @@ fn generateLowLevel(self: *Self, ll: anytype) Allocator.Error!void {
         .simd_clmul_hi,
         => return self.emitSimdLowLevel(ll, args),
 
+        .num_plus_wrap, .num_minus_wrap, .num_times_wrap => unreachable,
         // Numeric operations (arithmetic, comparisons, shifts)
         .num_plus,
         .num_plus_checked,
@@ -14590,7 +14640,7 @@ fn generateLowLevel(self: *Self, ll: anytype) Allocator.Error!void {
     }
 }
 
-/// Generate numeric low-level operations (num_add, num_sub, etc.)
+/// Generate numeric low-level operations (num_plus, num_minus, etc.)
 /// Handles both scalar and composite (i128/Dec) types.
 fn emitNumericLowLevel(self: *Self, op: anytype, args: anytype, ret_layout: layout.Idx) Allocator.Error!void {
     const operand_layout = self.procLocalLayoutIdx(GuardedList.at(args, 0));

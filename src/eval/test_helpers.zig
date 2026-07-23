@@ -11,6 +11,7 @@ const builtins = @import("builtins");
 const backend = @import("backend");
 const collections = @import("collections");
 const compiled_builtins = @import("compiled_builtins");
+const wasm32_builtins = @import("wasm32_builtins");
 const lir = @import("lir");
 const roc_target = @import("roc_target");
 const reporting = @import("reporting");
@@ -308,7 +309,10 @@ pub const ParsedResources = struct {
 // reservations, not commitments. On Windows the reservation cost matters for
 // throughput because every parallel worker reserves its own region: keeping
 // it modest (1 GB) lets MapViewOfFile complete quickly and lets us scale to
-// many workers without tripping system address-space accounting.
+// many workers without tripping system address-space accounting. The full
+// SIMD differential module needs more than 256 MB of LIR image space, so 1 GB
+// is also the smallest power-of-two reservation that covers the exhaustive
+// compiler test corpus with useful headroom.
 //
 // If the OS rejects the preferred reservation (e.g. aarch64 Linux with
 // CONFIG_ARM64_VA_BITS=39 — default on 64-bit Raspberry Pi OS — caps user
@@ -322,15 +326,15 @@ else if (@sizeOf(usize) < 8)
 else if (builtin.os.tag == .macos)
     8 * 1024 * 1024 * 1024
 else if (builtin.os.tag == .windows)
-    256 * 1024 * 1024 // 256 MB on Windows — reservation cost matters for parallel workers
+    1024 * 1024 * 1024
 else
     2 * 1024 * 1024 * 1024 * 1024;
 
-// Floor for the retry loop. Eval tests need very little arena, so 256 MB is
-// plenty; any 64-bit Linux kernel can fit this even with reduced VA bits. The
-// allocator clamps this down to `EVAL_SHARED_MEMORY_SIZE` for targets whose
-// preferred size is smaller.
-const EVAL_SHARED_MEMORY_MIN_SIZE: usize = 256 * 1024 * 1024;
+// Floor for the retry loop. The exhaustive SIMD module needs more than 256 MB,
+// so every 64-bit target must retain the same tested 1 GB minimum as Windows.
+// The allocator clamps this down to `EVAL_SHARED_MEMORY_SIZE` for 32-bit and
+// freestanding targets whose preferred reservation is smaller.
+const EVAL_SHARED_MEMORY_MIN_SIZE: usize = 1024 * 1024 * 1024;
 
 fn configuredSharedMemorySize() usize {
     if (comptime build_options.shared_memory_size > std.math.maxInt(usize)) {
@@ -2991,13 +2995,13 @@ pub fn wasmEvaluatorStrWithStats(allocator: Allocator, lowered: *const LoweredPr
     defer codegen.deinit();
 
     const proc = lowered.view.store.getProcSpec(lowered.mainProc());
-    const wasm_result = codegen.generateModule(lowered.mainProc(), proc.ret_layout) catch |err| switch (err) {
+    const wasm_result = codegen.generateModule(lowered.mainProc(), proc.ret_layout, wasm32_builtins.bytes) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         error.HostedFunctionTypeMismatch => return error.Internal,
     };
     defer allocator.free(wasm_result.wasm_bytes);
 
-    const result = try @import("wasm_runner.zig").runWasmStrWithStats(allocator, wasm_result.wasm_bytes, wasm_result.has_imports);
+    const result = try @import("wasm_runner.zig").runWasmStrWithStats(allocator, wasm_result.wasm_bytes, wasm_result.heap_base, wasm_result.has_imports);
     return .{
         .output = result.output,
         .allocation_count = result.allocation_count,

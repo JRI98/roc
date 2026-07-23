@@ -522,6 +522,14 @@ individual NaN representations. A new float operation or observation boundary
 must preserve these rules explicitly; a backend must never infer from its use
 whether normalization is required.
 
+Finite float bits remain observable through `to_bits`. A transcendental whose
+finite result is not fixed by a correctly-rounded IEEE operation must therefore
+use one explicit target-independent implementation for each float width across
+compile-time evaluation, the interpreter, and every backend. Backends must not
+substitute a target libm call or LLVM intrinsic for that implementation. The
+implementation must keep F32 operations binary32 and F64 operations binary64,
+and exact-bit backend tests pin representative finite results.
+
 Static initializer execution uses target-width symbolic memory rather than host
 pointers. Every allocation records its committed target layout, alignment,
 reference-count metadata, and relocations. Materialization freezes the graph
@@ -534,6 +542,20 @@ backend compiles that named atomic helper and never derives it from the
 capture layout or a symbol name.
 Initializer procedures are materialization-only LIR: they remain available to
 the freezer but runtime backends do not emit dead machine code for them.
+
+Release builds of the compiler must never impose artificial resource limits on
+compile-time evaluation. In particular, the interpreter's call-depth guard
+(`max_call_depth` in `src/eval/interpreter.zig`) is enforced only in Debug
+builds of the compiler, where it turns runaway recursion into a deterministic
+Roc crash with interpreter context attached. In release builds, evaluation
+depth is bounded only by actual native stack memory, and exhaustion is
+reported by whoever owns the executing thread: compile-time evaluation runs on
+compiler threads covered by the stack overflow guard in `src/base`, while
+runtime interpretation runs in the shim/app process, where stack-overflow
+reporting belongs to the platform host. An arbitrary depth budget in release
+would make a program's compile-time-evaluability depend on a compiler build
+constant rather than on the program itself, and would let Debug and release
+builds disagree about whether the same program compiles.
 
 ## Backend Builtins
 
@@ -1932,6 +1954,16 @@ one with an annotation-only method such as `is_eq : _` or `map : _`. An exact
 method body remains an ordinary method implementation. Inspection is the sole
 exception to this opt-in rule: every type is inspectable, opaque values use the
 opaque representation, and an exact `to_inspect` method may override it.
+
+Derived container encoders carry two explicit state types. The outer state is
+accepted and returned by `encode_tag`, `encode_record`, `encode_tuple`, and
+`encode_list`, and by each value-writer callback. The container callback and
+its field or element writer instead thread a format-owned cursor type, which
+may differ from the outer state. Checking validates that associated cursor type
+through the format method's complete callback protocol;
+Monotype consumes the same checked method shape when generating callbacks. It
+must never assume that the two state types are equal or reconstruct one from
+the other.
 
 Canonicalization records each recognized associated underscore opt-in as an
 `e_derived_method` CIR expression carrying its exact derived-method kind. An

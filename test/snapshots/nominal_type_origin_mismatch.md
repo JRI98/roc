@@ -102,7 +102,7 @@ main =
 				(ty-lookup (name "Str") (builtin)))))
 	(d-let
 		(p-assign (ident "main"))
-		(e-call (constraint-fn-var 247)
+		(e-call (constraint-fn-var 250)
 			(e-lookup-local
 				(p-assign (ident "expectsPerson")))
 			(e-string

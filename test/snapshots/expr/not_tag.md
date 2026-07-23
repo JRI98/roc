@@ -43,7 +43,7 @@ NO CHANGE
 ~~~
 # CANONICALIZE
 ~~~clojure
-(e-dispatch-call (method "not") (constraint-fn-var 198)
+(e-dispatch-call (method "not") (constraint-fn-var 201)
 	(receiver
 		(e-tag (name "C")
 			(args

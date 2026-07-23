@@ -151,9 +151,10 @@ pub const RunWasmStrResult = struct {
 pub fn runWasmStr(
     allocator: std.mem.Allocator,
     wasm_bytes: []const u8,
+    heap_base: u32,
     has_imports: bool,
 ) WasmEvalError![]u8 {
-    const result = try runWasmStrWithStats(allocator, wasm_bytes, has_imports);
+    const result = try runWasmStrWithStats(allocator, wasm_bytes, heap_base, has_imports);
     return result.output;
 }
 
@@ -161,9 +162,10 @@ pub fn runWasmStr(
 pub fn runWasmStrWithStats(
     allocator: std.mem.Allocator,
     wasm_bytes: []const u8,
+    heap_base: u32,
     has_imports: bool,
 ) WasmEvalError!RunWasmStrResult {
-    wasm_heap_ptr = 0;
+    wasm_heap_ptr = heap_base;
     wasm_allocation_count = 0;
     wasm_crash_state = .none;
 
@@ -363,11 +365,6 @@ pub fn runWasmStrWithStats(
             return error.WasmExecFailed;
         };
     }
-
-    // The compiled module's initial memory contains static data and its
-    // downward-growing stack. Host allocations begin after that entire
-    // region, and grow linear memory upward as needed.
-    wasm_heap_ptr = @intCast(module_instance.memoryAll().len);
 
     const handle = module_instance.getFunctionHandle("main") catch |err| {
         if (std.debug.runtime_safety) {

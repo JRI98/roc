@@ -813,11 +813,13 @@ fn getTempDir(allocator: Allocator) (Allocator.Error || error{TempDirUnavailable
         }
     }
 
-    // POSIX specifies /tmp as the conventional temporary directory when no
-    // environment override is present. In particular, the Roc CLI deliberately
-    // runs some compiler subprocesses with a minimal environment, so requiring
-    // TMPDIR would make LLVM evaluation depend on shell configuration.
-    if (builtin.os.tag != .windows) return allocator.dupe(u8, "/tmp");
+    // POSIX does not require TMPDIR to be set. Match the other compiler temp
+    // paths and standard library behavior by using the conventional location.
+    // Zig's createDirPath rejects macOS's /tmp symlink, so use its real path.
+    if (builtin.os.tag != .windows) return allocator.dupe(
+        u8,
+        if (builtin.os.tag == .macos) "/private/tmp" else "/tmp",
+    );
 
     return error.TempDirUnavailable;
 }

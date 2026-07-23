@@ -119,7 +119,7 @@ EndOfFile,
 							(p-assign (ident "y"))))))))
 	(s-let
 		(p-assign (ident "pair1"))
-		(e-call (constraint-fn-var 246)
+		(e-call (constraint-fn-var 249)
 			(e-lookup-local
 				(p-assign (ident "make_pair")))
 			(e-num (value "1"))
@@ -127,7 +127,7 @@ EndOfFile,
 				(e-literal (string "a")))))
 	(s-let
 		(p-assign (ident "pair2"))
-		(e-call (constraint-fn-var 266)
+		(e-call (constraint-fn-var 269)
 			(e-lookup-local
 				(p-assign (ident "make_pair")))
 			(e-string
@@ -135,12 +135,12 @@ EndOfFile,
 			(e-num (value "42"))))
 	(s-let
 		(p-assign (ident "pair3"))
-		(e-call (constraint-fn-var 273)
+		(e-call (constraint-fn-var 276)
 			(e-lookup-local
 				(p-assign (ident "make_pair")))
 			(e-tag (name "True"))
 			(e-tag (name "False"))))
-	(e-dispatch-call (method "to_str") (constraint-fn-var 275)
+	(e-dispatch-call (method "to_str") (constraint-fn-var 278)
 		(receiver
 			(e-record
 				(fields

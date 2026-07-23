@@ -270,6 +270,19 @@ const InterpreterRocEnv = struct {
 /// Interprets statement-only LIR procs directly.
 pub const Interpreter = struct {
     const LirInterpreter = @This();
+    /// Debug-build-only call-depth guard. Release builds of the compiler must
+    /// never constrain what compile-time evaluation (or interpreted execution)
+    /// can do, including how deeply it recurses — an arbitrary depth budget
+    /// would make well-formed programs compile in Debug and fail in release,
+    /// or vice versa. In release builds recursion is bounded only by actual
+    /// native stack memory. Exhausting it is reported by whoever owns the
+    /// executing thread: compile-time evaluation runs on compiler threads
+    /// covered by the stack overflow guard in `src/base`, while runtime
+    /// interpretation runs in the shim/app process, where stack-overflow
+    /// reporting belongs to the platform host. The Debug check exists to turn
+    /// runaway recursion into a deterministic Roc crash with this
+    /// interpreter's context attached instead of a native fault. See
+    /// design.md ("Compile-Time Evaluation And Static Storage").
     const max_call_depth: usize = 1024;
     const stack_overflow_message =
         "This Roc program overflowed its stack memory. This usually means there is very deep or infinite recursion somewhere in the code.";
@@ -1693,8 +1706,10 @@ pub const Interpreter = struct {
         defer _ = self.call_stack.pop();
         errdefer self.recordFailedCallStackIfUnset() catch {};
 
-        if (self.call_depth >= max_call_depth) {
-            return self.triggerCrash(stack_overflow_message);
+        if (comptime builtin.mode == .Debug) {
+            if (self.call_depth >= max_call_depth) {
+                return self.triggerCrash(stack_overflow_message);
+            }
         }
         if (args.len != arg_layouts.len) {
             return self.invariantFailedError(
@@ -4736,6 +4751,7 @@ pub const Interpreter = struct {
             ll.ret_layout;
 
         return switch (ll.op) {
+            .num_plus_wrap, .num_minus_wrap, .num_times_wrap => unreachable,
             // ── String ops ──
             .str_is_eq => blk: {
                 const result = builtins.str.strEqual(valueToRocStr(args[0]), valueToRocStr(args[1]));
@@ -6737,7 +6753,7 @@ pub const Interpreter = struct {
             },
             .float => |bits| switch (bits) {
                 32 => val.write(f32, builtins.float_math_f32.pow(a.read(f32), b.read(f32))),
-                64 => val.write(f64, std.math.pow(f64, a.read(f64), b.read(f64))),
+                64 => val.write(f64, builtins.float_math_f64.pow(a.read(f64), b.read(f64))),
                 else => return self.invariantFailedError("LIR/interpreter invariant violated: unsupported float pow width {d}", .{bits}),
             },
             .signed_int, .unsigned_int => return self.invariantFailedError(
@@ -6815,12 +6831,12 @@ pub const Interpreter = struct {
             };
         }
         return switch (op) {
-            .sin => std.math.sin(value),
-            .cos => std.math.cos(value),
-            .tan => std.math.tan(value),
-            .asin => std.math.asin(value),
-            .acos => std.math.acos(value),
-            .atan => std.math.atan(value),
+            .sin => builtins.float_math_f64.sin(value),
+            .cos => builtins.float_math_f64.cos(value),
+            .tan => builtins.float_math_f64.tan(value),
+            .asin => builtins.float_math_f64.asin(value),
+            .acos => builtins.float_math_f64.acos(value),
+            .atan => builtins.float_math_f64.atan(value),
         };
     }
 
