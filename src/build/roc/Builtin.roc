@@ -3573,6 +3573,26 @@ Builtin :: [].{
 		subscript : List(item), U64 -> Try(item, [OutOfBounds, ..])
 		subscript = |list, index| List.get(list, index)
 
+		## Returns the element at the given index, wrapping back to the start when the
+		## index is past the end (the index is taken modulo the length).
+		##
+		## You may know a similar function named `getWrap`, or indexing that wraps a
+		## negative or out-of-range index, in other languages.
+		##
+		## Returns `Err(ListWasEmpty)` if the list is empty.
+		## ```roc
+		## expect ["a", "b", "c"].get_wrap(4) == Ok("b")
+		## ```
+		get_wrap : List(item), U64 -> Try(item, [ListWasEmpty, ..])
+		get_wrap = |list, index| {
+			len = List.len(list)
+			if len == 0 {
+				Try.Err(ListWasEmpty)
+			} else {
+				Try.Ok(list_get_unsafe(list, index % len))
+			}
+		}
+
 		## Replaces the element at the given index with a new value.
 		## ```roc
 		## expect [10, 20, 30].set(1, 99) == Ok([10, 99, 30])
@@ -4151,6 +4171,24 @@ Builtin :: [].{
 		## expect [10, 20, 30].drop_at(5) == [10, 20, 30]
 		## ```
 		drop_at : List(a), U64 -> List(a)
+
+		## Removes the element at the given index by moving the last element into its
+		## place, so the order of the remaining elements is not preserved. This is O(1),
+		## unlike `drop_at`, which shifts every later element down.
+		##
+		## Returns the list unchanged if the index is out of bounds.
+		## ```roc
+		## expect [1.I64, 2, 3, 4].drop_at_unordered(1) == [1, 4, 3]
+		## ```
+		drop_at_unordered : List(a), U64 -> List(a)
+		drop_at_unordered = |list, index| {
+			len = List.len(list)
+			if index < len {
+				List.drop_last(list_swap_unsafe(list, index, len - 1), 1)
+			} else {
+				list
+			}
+		}
 
 		## Return a sublist of the list starting at `start` and containing up to `len`
 		## elements. Out-of-bounds ranges are clamped, producing a shorter or empty list.
