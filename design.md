@@ -6138,7 +6138,8 @@ standalone dev and LLVM programs, optimized compile-time tests, every evaluator
 backend, and the Lambda Mono comparison in sequence. The corpus contains 294
 operation/type cases, fixed boundary values, algebraic properties, and at least
 64 deterministic generated inputs per applicable case. Every shift operation is
-checked directly against the scalar oracle for each semantically distinct count,
+checked directly against the scalar oracle for every count from zero through one
+less than the lane width,
 then all 256 possible `U8` counts are proven equal to their oracle-checked
 modulo-lane-width count. This targeted loop does not repeat count-independent
 cases. Checked memory access pins the final valid 16-byte window, the first
