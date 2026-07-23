@@ -837,6 +837,29 @@ pub fn compileInspectedProgram(
     return compileInspectedProgramImpl(allocator, io, source_kind, source, imports, null, null);
 }
 
+/// Parse, check, and publish an inspect-wrapped program without lowering it.
+pub fn parseAndCanonicalizeInspectedProgram(
+    allocator: Allocator,
+    source_kind: SourceKind,
+    source: []const u8,
+    imports: []const ModuleSource,
+) TestHelperError!ParsedResources {
+    return parseInspectedProgramImpl(allocator, source_kind, source, imports, null, null);
+}
+
+/// Same as `parseAndCanonicalizeInspectedProgram` but reuses a pre-published
+/// Builtin artifact owned by the caller.
+pub fn parseAndCanonicalizeInspectedProgramWithBuiltin(
+    allocator: Allocator,
+    source_kind: SourceKind,
+    source: []const u8,
+    imports: []const ModuleSource,
+    pre_published_builtin: PrePublishedBuiltin,
+    roc_ctx: ?CoreCtx,
+) TestHelperError!ParsedResources {
+    return parseInspectedProgramImpl(allocator, source_kind, source, imports, pre_published_builtin, roc_ctx);
+}
+
 /// Same as `compileInspectedProgram` but reuses a pre-published Builtin
 /// artifact owned by the caller. `roc_ctx` supplies filesystem access for file
 /// imports (the REPL passes its real `CoreCtx`); pass `null` otherwise.
@@ -861,7 +884,27 @@ fn compileInspectedProgramImpl(
     pre_published_builtin: ?PrePublishedBuiltin,
     roc_ctx: ?CoreCtx,
 ) TestHelperError!CompiledProgram {
-    var resources = try parseAndCanonicalizeProgramWithRootMode(
+    const resources = try parseInspectedProgramImpl(
+        allocator,
+        source_kind,
+        source,
+        imports,
+        pre_published_builtin,
+        roc_ctx,
+    );
+
+    return lowerInspectedProgram(allocator, io, resources);
+}
+
+fn parseInspectedProgramImpl(
+    allocator: Allocator,
+    source_kind: SourceKind,
+    source: []const u8,
+    imports: []const ModuleSource,
+    pre_published_builtin: ?PrePublishedBuiltin,
+    roc_ctx: ?CoreCtx,
+) TestHelperError!ParsedResources {
+    return parseAndCanonicalizeProgramWithRootMode(
         allocator,
         source_kind,
         source,
@@ -871,22 +914,33 @@ fn compileInspectedProgramImpl(
         pre_published_builtin,
         roc_ctx,
     );
-    errdefer cleanupParseAndCanonical(allocator, resources);
+}
 
-    const lowered = try lowerParsedProgramToLir(allocator, io, &resources, .native);
+/// Lower already-published inspect-wrapped resources for native and wasm
+/// evaluation. This function takes ownership of `resources`, including when
+/// lowering returns an error.
+pub fn lowerInspectedProgram(
+    allocator: Allocator,
+    io: std.Io,
+    resources: ParsedResources,
+) TestHelperError!CompiledProgram {
+    var owned_resources = resources;
+    errdefer cleanupParseAndCanonical(allocator, owned_resources);
+
+    const lowered = try lowerParsedProgramToLir(allocator, io, &owned_resources, .native);
     errdefer {
         var owned = lowered;
         owned.deinit(allocator);
     }
 
-    const wasm_lowered = try lowerParsedProgramToLir(allocator, io, &resources, .u32);
+    const wasm_lowered = try lowerParsedProgramToLir(allocator, io, &owned_resources, .u32);
     errdefer {
         var owned = wasm_lowered;
         owned.deinit(allocator);
     }
 
     return .{
-        .resources = resources,
+        .resources = owned_resources,
         .lowered = lowered,
         .wasm_lowered = wasm_lowered,
     };

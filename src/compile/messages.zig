@@ -232,6 +232,7 @@ pub const CanonicalizedResult = struct {
     canonicalize_diagnostics_ns: u64,
 };
 
+/// Worker-owned checked-module output transferred to the coordinator.
 pub const TypeCheckedPublication = union(enum) {
     published: CheckedArtifact.CheckedModuleArtifact,
     deferred: *DeferredPublicationState,

@@ -168,7 +168,7 @@ R000ee(k) := [No0e(R000ee(o))].{
 						(e-match
 							(match
 								(cond
-									(e-num (value "0")))
+									(e-runtime-error (tag "erroneous_value_expr")))
 								(branches
 									(branch
 										(patterns
@@ -176,7 +176,7 @@ R000ee(k) := [No0e(R000ee(o))].{
 												(p-nominal
 													(p-applied-tag))))
 										(value
-											(e-num (value "0"))))))))))))
+											(e-runtime-error (tag "erroneous_value_expr"))))))))))))
 	(s-nominal-decl
 		(ty-header (name "R000ee")
 			(ty-args

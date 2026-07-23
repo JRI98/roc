@@ -141,9 +141,7 @@ h = {
 (can-ir
 	(d-let
 		(p-assign (ident "h"))
-		(e-block
-			(e-block
-				(e-runtime-error (tag "empty_tuple")))))
+		(e-runtime-error (tag "erroneous_value_expr")))
 	(s-alias-decl
 		(ty-header (name "A"))
 		(ty-malformed))

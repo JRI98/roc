@@ -333,6 +333,7 @@ pub const SemanticModuleData = struct {
     checked_artifact: ?*const CheckedArtifact.CheckedModuleArtifact,
 };
 
+/// Checked-module output is either complete now or retained for platform/app finalization.
 pub const TypeCheckPublication = union(enum) {
     published: CheckedArtifact.CheckedModuleArtifact,
     deferred,

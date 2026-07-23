@@ -12873,8 +12873,11 @@ fn checkExpr(self: *Self, expr_idx: CIR.Expr.Idx, env: *Env, expected: Expected)
 
                     if (did_err) {
                         // If the fn or any args had error, propagate the error
-                        // without doing any additional work
+                        // without doing any additional work. The call itself is
+                        // the executable boundary that reaches the invalid
+                        // child, so publish it as an explicit runtime error.
                         try self.unifyWith(expr_var, .err, env);
+                        try self.erroneous_value_exprs.put(self.gpa, expr_idx, {});
                     } else {
                         // From the base function type, extract its shape. Effect
                         // classification happens only after arguments unify below:
@@ -12959,6 +12962,7 @@ fn checkExpr(self: *Self, expr_idx: CIR.Expr.Idx, env: *Env, expected: Expected)
                                                 // Context already set by unifyInContext
                                                 // Stop execution
                                                 try self.unifyWith(expr_var, .err, env);
+                                                try self.erroneous_value_exprs.put(self.gpa, expr_idx, {});
                                                 break :blk;
                                             }
                                         }
@@ -12979,6 +12983,7 @@ fn checkExpr(self: *Self, expr_idx: CIR.Expr.Idx, env: *Env, expected: Expected)
                                     if (unify_result.isProblem()) {
                                         // Stop execution
                                         try self.unifyWith(expr_var, .err, env);
+                                        try self.erroneous_value_exprs.put(self.gpa, expr_idx, {});
                                         break :blk;
                                     }
                                 }
@@ -12987,6 +12992,7 @@ fn checkExpr(self: *Self, expr_idx: CIR.Expr.Idx, env: *Env, expected: Expected)
                                     const result = try self.enforceRecordBuilderMap2Return(func, env, expr_idx, func_name);
                                     if (result.isProblem()) {
                                         try self.unifyWith(expr_var, .err, env);
+                                        try self.erroneous_value_exprs.put(self.gpa, expr_idx, {});
                                         break :blk;
                                     }
                                 }
@@ -13008,11 +13014,14 @@ fn checkExpr(self: *Self, expr_idx: CIR.Expr.Idx, env: *Env, expected: Expected)
                                 const call_func_content = try self.types.mkFuncUnbound(call_arg_vars, call_func_ret);
                                 const call_func_var = try self.freshFromContent(call_func_content, env, expr_region);
 
-                                _ = try self.unifyInContext(func_var, call_func_var, env, .{ .fn_call_arity = .{
+                                const arity_result = try self.unifyInContext(func_var, call_func_var, env, .{ .fn_call_arity = .{
                                     .fn_name = func_name,
                                     .expected_args = @intCast(func_args_len),
                                     .actual_args = @intCast(call_arg_expr_idxs.len),
                                 } });
+                                if (arity_result.isProblem()) {
+                                    try self.erroneous_value_exprs.put(self.gpa, expr_idx, {});
+                                }
 
                                 // Then, we set the root expr to redirect to the return
                                 // type of that function, since a call expr ultimate
@@ -13037,7 +13046,10 @@ fn checkExpr(self: *Self, expr_idx: CIR.Expr.Idx, env: *Env, expected: Expected)
                             const call_func_content = try self.types.mkFuncUnbound(call_arg_vars, call_func_ret);
                             const call_func_var = try self.freshFromContent(call_func_content, env, expr_region);
 
-                            _ = try self.unify(func_var, call_func_var, env);
+                            const call_result = try self.unify(func_var, call_func_var, env);
+                            if (call_result.isProblem()) {
+                                try self.erroneous_value_exprs.put(self.gpa, expr_idx, {});
+                            }
 
                             // Then, we set the root expr to redirect to the return
                             // type of that function, since a call expr ultimate
