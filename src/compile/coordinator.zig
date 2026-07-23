@@ -4054,6 +4054,15 @@ pub const Coordinator = struct {
         var imports = std.ArrayList(check.CheckedArtifact.PublishImportArtifact).empty;
         errdefer imports.deinit(allocator);
 
+        // buildTypecheckImportedEnvs always installs the compiler-owned Builtin
+        // module at index 0, including while checking Builtin. Keep the artifact
+        // input in exact lockstep with that environment input.
+        try imports.append(allocator, .{
+            .module_idx = 0,
+            .key = self.builtin_modules.checked_artifact.key,
+            .view = check.CheckedArtifact.importedView(&self.builtin_modules.checked_artifact),
+        });
+
         const module_env = mod.moduleEnv().?;
         const direct_imports = module_env.imports.imports.items.items;
         for (direct_imports, 0..) |str_idx, i| {
@@ -4062,11 +4071,7 @@ pub const Coordinator = struct {
             const resolved_module_idx = module_env.imports.getResolvedModule(import_idx) orelse continue;
 
             if (can.CIR.Import.isCompilerBuiltinImportName(import_name)) {
-                try imports.append(allocator, .{
-                    .module_idx = resolved_module_idx,
-                    .key = self.builtin_modules.checked_artifact.key,
-                    .view = check.CheckedArtifact.importedView(&self.builtin_modules.checked_artifact),
-                });
+                std.debug.assert(resolved_module_idx == 0);
                 continue;
             }
 

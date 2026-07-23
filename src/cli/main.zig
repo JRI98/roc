@@ -5443,6 +5443,12 @@ fn rocInternalHotReloadDev(ctx: *CliCtx, raw_args: []const []const u8) CliMainEr
 
     try writeHotReloadWatchPathsFile(ctx, args.watch_inputs_file, lowered_result.watch_inputs, source_rewrite);
 
+    // A normal `roc run` may execute a checked runtime-error node so the
+    // diagnostic is observable at the point that bad code runs. A hot reload
+    // has a stronger publication contract: keep the last accepted generation
+    // active until a diagnostic-free replacement is ready.
+    if (lowered_result.counts.errors != 0) return error.TypeCheckingFailed;
+
     const checked_host_identity = lowered_result.checked_host_identity;
     if (!std.mem.eql(u8, &checked_host_identity, &args.expected_host_identity)) {
         try ctx.io.stderr().writeAll("Error: hot reload changed the platform host interface; restart `roc --watch`.\n");

@@ -699,6 +699,15 @@ fn evaluateExpression(self: *ReplSession, expr: []const u8, report_config: repor
     };
     defer compiled.deinit(self.allocator);
 
+    // Checked publication deliberately succeeds in the presence of user
+    // diagnostics so build/run/test can execute independent roots. A REPL
+    // expression is a single interactive transaction: report its diagnostics
+    // and leave the session definitions intact instead of executing the
+    // explicit runtime-error node and aborting the remaining batch input.
+    if (try parsedResourcesHaveDiagnostics(&compiled.resources)) {
+        return .{ .diagnostic = try self.renderModuleProblems(source, import_sources, report_config) };
+    }
+
     return switch (self.backend_kind) {
         .interpreter => .{ .output = try eval.test_helpers.lirInterpreterInspectedStr(self.allocator, &compiled.lowered) },
         .dev => .{ .output = try eval.test_helpers.devEvaluatorInspectedStr(self.allocator, &compiled.lowered) },

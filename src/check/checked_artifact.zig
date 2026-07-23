@@ -4555,6 +4555,7 @@ fn appendCheckedNominalDeclarationFromStatement(
     _: bool,
 ) Allocator.Error!void {
     if (anno_idx == .placeholder) return;
+    if (!localNominalDeclarationIsValid(module, statement_idx)) return;
 
     const statement_root = try appendCheckedTypeRoot(
         allocator,
@@ -4572,7 +4573,10 @@ fn appendCheckedNominalDeclarationFromStatement(
 
     const statement_nominal = switch (store.payloads.items[statement_root_index]) {
         .nominal => |nominal| nominal,
-        else => checkedArtifactInvariant("nominal declaration statement root was not a nominal checked type", .{}),
+        else => checkedArtifactInvariant(
+            "nominal declaration statement root was not a nominal checked type (source content {s})",
+            .{@tagName(module.typeStoreConst().resolveVar(ModuleEnv.varFrom(statement_idx)).desc.content)},
+        ),
     };
 
     const module_env = module.moduleEnvConst();
@@ -7091,11 +7095,24 @@ fn localNominalDeclarationIdForStatement(
             else => continue,
         };
         if (nominal.anno == .placeholder) continue;
+        if (!localNominalDeclarationIsValid(module, candidate)) continue;
         const id: CheckedNominalDeclarationId = @enumFromInt(next_id);
         next_id += 1;
         if (candidate == statement_idx) return id;
     }
     checkedArtifactInvariant("checked nominal declaration statement had no declaration id", .{});
+}
+
+fn localNominalDeclarationIsValid(
+    module: TypedCIR.Module,
+    statement_idx: CIR.Statement.Idx,
+) bool {
+    const types_store = module.typeStoreConst();
+    const decl_idx = types_store.lookupNominalDeclByKey(
+        module.moduleEnvConst().selfModuleIdentity(),
+        @intFromEnum(statement_idx),
+    ) orelse checkedArtifactInvariant("checked local nominal declaration had no checker declaration entry", .{});
+    return types_store.getNominalDecl(decl_idx).isValid();
 }
 
 fn copyOptionalIdentText(
@@ -18501,8 +18518,12 @@ fn verifyCompileTimeRootPayloadMatchesKind(kind: CompileTimeRootKind, payload: C
             .pending, .fn_value, .expect => false,
         },
         .callable_binding => switch (payload) {
-            .fn_value => true,
-            .pending, .const_node, .expect => false,
+            // A callable initializer that reaches an explicit checked error is
+            // stored as a divergent ConstStore node. Monotype restores that
+            // node at the callable's expected type, so execution crashes at
+            // the exact invalid binding while independent roots remain usable.
+            .fn_value, .const_node => true,
+            .pending, .expect => false,
         },
         .expect => switch (payload) {
             .expect => true,

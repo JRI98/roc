@@ -1255,8 +1255,9 @@ const Builder = struct {
         const root = view.compile_time_roots.root(template.root);
         return switch (root.payload) {
             .fn_value => |fn_id| try self.restoreConstFnExpr(view, fn_id, mono_fn_ty, null),
+            .const_node => |node| try self.restoreConstNodeAtType(view, view, node, mono_fn_ty),
             .pending => try self.lowerPendingCallableEvalBindingValue(view, template, root, mono_fn_ty),
-            else => Common.invariant("callable eval binding root did not output a callable value"),
+            .expect => Common.invariant("callable eval binding root output an expect payload"),
         };
     }
 
@@ -7612,6 +7613,9 @@ const BodyContext = struct {
 
     fn toInspectCall(self: *BodyContext, value: DraftExprId, value_ty: Type.TypeId, str_ty: Type.TypeId) Allocator.Error!?DraftExprId {
         const lookup = (try self.builder.componentMethodTargetByName(self.method_scope, value_ty, "to_inspect")) orelse return null;
+        if (lookup.view.types.payload(lookup.target.callable_ty) == .err) {
+            return try self.runtimeCrashExpr(str_ty, "runtime error");
+        }
         const callable_mono_ty = try self.methodTargetMonoTypeFromArgs(lookup, &.{value_ty}, str_ty);
         const callee = try self.methodTargetCalleeWithMono(lookup, callable_mono_ty, .synthesize);
 
@@ -9820,8 +9824,9 @@ const BodyContext = struct {
         const root = view.compile_time_roots.root(template.root);
         return switch (root.payload) {
             .fn_value => |fn_id| try self.restoreConstFn(view, fn_id, mono_fn_ty, null),
+            .const_node => |node| try self.restoreConstNodeAtType(view, view, node, mono_fn_ty),
             .pending => try self.lowerPendingCallableEvalBindingValue(view, template, root, mono_fn_ty),
-            else => Common.invariant("callable eval binding root did not output a callable value"),
+            .expect => Common.invariant("callable eval binding root output an expect payload"),
         };
     }
 
@@ -25518,6 +25523,10 @@ const BodyContext = struct {
             .diverges = false,
         };
         for (checked_statements) |statement| {
+            // A checked divergent statement is an explicit control-flow
+            // boundary. Later statements are unreachable and may refer to
+            // binders or types that checking intentionally did not produce.
+            if (lowered.diverges) break;
             if (!self.checkedStatementHasRuntimeEffect(statement)) continue;
             if (!try self.appendExpandedPatternStatement(statement, &lowered)) {
                 try lowered.append(self.allocator, try self.lowerStatement(statement));
@@ -25541,7 +25550,7 @@ const BodyContext = struct {
         self.builder.program.current_region = statement.source_region;
         const pattern, const expr = switch (statement.data) {
             .decl => |decl| blk: {
-                if (self.statementValueIsLocalProc(decl.expr)) return false;
+                if (self.statementDeclIsLocalProc(decl.pattern, decl.expr)) return false;
                 break :blk .{ decl.pattern, decl.expr };
             },
             .var_ => |decl| .{ decl.pattern, decl.expr },
@@ -25621,7 +25630,13 @@ const BodyContext = struct {
             Common.invariant("checked runtime statement filter referenced a missing statement");
         }
         return switch (self.view.bodies.statement(@enumFromInt(raw)).data) {
-            .decl => |decl| self.view.hoisted_constants.lookupByPattern(decl.pattern) == null,
+            .decl => |decl| switch (self.view.bodies.expr(decl.expr).data) {
+                // A dangling annotation carries diagnostics and checked type
+                // information but has no runtime value to bind.
+                .anno_only => false,
+                .pending => Common.invariant("pending checked declaration reached Monotype runtime statement filter"),
+                else => self.view.hoisted_constants.lookupByPattern(decl.pattern) == null,
+            },
             .var_,
             .var_uninitialized,
             .reassign,
@@ -25634,6 +25649,7 @@ const BodyContext = struct {
             .breakable_loop,
             .break_,
             .return_,
+            .runtime_error,
             => true,
             .expect => self.builder.inline_expects == .run,
             .import_,
@@ -25642,9 +25658,7 @@ const BodyContext = struct {
             .type_anno,
             .type_var_alias,
             => false,
-            .pending,
-            .runtime_error,
-            => Common.invariant("invalid checked statement reached Monotype runtime statement filter"),
+            .pending => Common.invariant("pending checked statement reached Monotype runtime statement filter"),
         };
     }
 
@@ -25655,8 +25669,24 @@ const BodyContext = struct {
     ) Allocator.Error!DraftExprId {
         const checked_expr = self.view.bodies.expr(checked_expr_id);
         switch (checked_expr.data) {
-            .match_ => |match| return try self.lowerMatchExpr(checked_expr_id, match, ty),
-            .if_ => |if_| return try self.lowerIfExpr(checked_expr_id, if_, ty),
+            .match_ => |match| {
+                if (self.checkedExprDivergesInLoweredRuntime(match.cond)) {
+                    return try self.addExpr(.{
+                        .ty = ty,
+                        .data = try self.lowerDivergentExprForEffectDataAtType(match.cond, ty),
+                    });
+                }
+                return try self.lowerMatchExpr(checked_expr_id, match, ty);
+            },
+            .if_ => |if_| {
+                if (if_.branches.len > 0 and self.checkedExprDivergesInLoweredRuntime(if_.branches[0].cond)) {
+                    return try self.addExpr(.{
+                        .ty = ty,
+                        .data = try self.lowerDivergentExprForEffectDataAtType(if_.branches[0].cond, ty),
+                    });
+                }
+                return try self.lowerIfExpr(checked_expr_id, if_, ty);
+            },
             else => {},
         }
 
@@ -26876,7 +26906,7 @@ const BodyContext = struct {
             => Common.invariant("non-runtime checked statement reached Monotype lowering"),
             .runtime_error => .{ .crash = try self.addStringLiteral("runtime error") },
             .decl => |decl| blk: {
-                if (self.statementValueIsLocalProc(decl.expr)) {
+                if (self.statementDeclIsLocalProc(decl.pattern, decl.expr)) {
                     try self.registerLocalProc(decl.pattern);
                     const unit_ty = try self.unitType();
                     break :blk .{ .expr = try self.addExpr(.{ .ty = unit_ty, .data = .unit }) };
@@ -27072,11 +27102,16 @@ const BodyContext = struct {
         } };
     }
 
-    fn statementValueIsLocalProc(self: *BodyContext, expr_id: checked.CheckedExprId) bool {
+    fn statementDeclIsLocalProc(
+        self: *BodyContext,
+        pattern_id: checked.CheckedPatternId,
+        expr_id: checked.CheckedExprId,
+    ) bool {
+        // A local procedure declaration has a named binder. A lambda assigned
+        // to an ignored or erroneous pattern remains an ordinary value.
+        if (self.view.bodies.pattern(pattern_id).data != .assign) return false;
         return switch (self.view.bodies.expr(expr_id).data) {
-            .lambda,
-            .closure,
-            => true,
+            .lambda, .closure => true,
             else => false,
         };
     }

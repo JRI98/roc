@@ -1134,10 +1134,15 @@ fn publishProgramForComptimeProblemsImpl(
     );
     defer cleanupParseAndCanonical(allocator, resources);
 
-    return if (resources.checker.problems.problems.items.len == 0)
-        .no_problems
-    else
-        .comptime_problems;
+    if (resources.checker.problems.problems.items.len != 0) {
+        return .comptime_problems;
+    }
+    for (resources.extra_modules) |module| {
+        if (module.checker.problems.problems.items.len != 0) {
+            return .comptime_problems;
+        }
+    }
+    return .no_problems;
 }
 
 /// Publish a program with compile-time evaluation problems routed into each

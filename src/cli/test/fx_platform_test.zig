@@ -1449,9 +1449,9 @@ test "fx platform fold_rev static dispatch regression" {
 }
 
 test "fx platform invalid nested where-clause static dispatch fails in check" {
-    // Regression test for #9657: the original repro's top-level decode_i64 and
-    // encode_i64 declarations are not I64.decode/I64.encode methods, so check
-    // must reject the where-clause contract before post-check lowering.
+    // Regression test for #9657: I64's builtin decode/encode methods do not
+    // have the signatures required by this where-clause, so check must reject
+    // the contract before post-check lowering.
     const allocator = testing.allocator;
 
     var env = try util.buildIsolatedTestEnvMap(std.testing.io, allocator, null);
@@ -1474,7 +1474,7 @@ test "fx platform invalid nested where-clause static dispatch fails in check" {
         .stderr = check_result.stderr,
         .term = check_result.term,
     });
-    try testing.expect(std.mem.find(u8, check_result.stderr, "MISSING METHOD") != null);
+    try testing.expect(std.mem.find(u8, check_result.stderr, "TYPE MISMATCH") != null);
     try testing.expect(std.mem.find(u8, check_result.stderr, "postcheck invariant violated") == null);
 }
 
