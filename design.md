@@ -2222,6 +2222,25 @@ body still sees the shape; and a join with exactly one jump site is not shared
 control at all — its body is cloned directly at that site against the site's
 full symbolic values.
 
+SpecConstr's symbolic values carry only pure structure; effects live in
+bindings. A pending binding created for an effectful computation may move to
+its region boundary only when its recorded emission window proves the hoist
+crosses no other effect: windows chain from the region entry, effect-free
+bindings commute and need no window, and an effectful binding with no window
+pins its value in place. Emission windows belong to values, not call paths —
+they are keyed by the expression node, which substitution preserves, so a
+producer cloned once as an argument still proves its window when it becomes a
+binding at a later use site. Two properties are load-bearing for this policy.
+First, the effect-mark counter must observe every observable-effect emission,
+expression and statement position alike — a window that silently spanned an
+uncounted emission could hoist a binding across it. Second, any construct that
+can conditionally skip the code after it without advancing the effect marks (a
+`try` sequence's early return) must clone its continuation inside its own
+region: the region boundary is what keeps a producer created after the
+divergence from becoming a hoist candidate beside it. A rewrite that cloned a
+try continuation in its enclosing region would silently reopen effect
+reordering, and the window chain check cannot detect that itself.
+
 Every SpecConstr clone is hygienic. A retained pattern, loop parameter, join
 parameter, try-sequence local, or other runtime binder receives a fresh lifted
 local identity in each emitted copy, and every occurrence in that binder's
