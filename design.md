@@ -117,6 +117,31 @@ constructor specialization bounds its substitution-candidate value walk
 (`valueCanSubstitute`), because a loop-carried value can reference itself and
 a cyclic value is correctly non-substitutable anyway.
 
+Cycles in a constructor-specialization `Value` tree form through two pointer
+edges — a nominal value's backing and a static-data candidate's runtime
+value — and a callable value's captures can carry either edge inside them, so
+every walk that follows the pointer edges or descends through callable
+captures carries an explicit bound. The size, substitution, unsafe-leaf, and reusability measures
+spend a shared per-node work budget and report the conservative answer when it
+runs out; the constructor-size measure saturates its sums so an exhausted child
+propagates the cap rather than overflowing, which makes "measured size equals
+the cap" a reliable exhaustion signal. A value flagged by that signal is never
+materialized: the inliners rebind it through a plain clone of its source
+expression, and a match over such a scrutinee emits a residual runtime match
+over a plain clone of the source scrutinee, both finite by construction. The
+value matchers (`bindPatToValue`, `bindPatToMatchValue`, `bindPatToFlowValue`),
+the field, item, and tag readers (`fieldFromValue`, `itemFromValue`,
+`tagFromValue`, `recordFromValue`, `tupleFromValue`), and `materialize` each
+count the pointer edges they follow against a shared strip cap; the matchers
+decline toward a residual runtime match on exhaustion, while those readers and
+`materialize` — which only ever run on values already proven acyclic by the
+rules above — treat reaching the cap as a compiler bug. The shape-driven walks (`valueFromShapeArgs`,
+`appendExprsFromValue`, `supplyLoopSlotLeaves`, `shapeMatchesValue`, `shapeEql`)
+carry no budget: `Shape` trees are finite and acyclic by construction — they are
+produced only by the budgeted derivations and a nominal shape's backing is a
+fresh allocation, never a back-reference — so those walks terminate on the
+structure alone.
+
 ## Checking Effects And Const Roots
 
 Checking owns Roc effect validation, compile-time evaluation eligibility, and
@@ -2257,6 +2282,42 @@ values agree on one structure skeleton, so specialization inside the shared
 body still sees the shape; and a join with exactly one jump site is not shared
 control at all — its body is cloned directly at that site against the site's
 full symbolic values.
+
+SpecConstr's symbolic values carry only pure structure; effects live in
+bindings. A pending binding created for an effectful computation may move to
+its region boundary only when its recorded emission window proves the hoist
+crosses no other effect: windows chain from the region entry, effect-free
+bindings commute and need no window, and an effectful binding with no window
+pins its value in place. Emission windows belong to values, not call paths —
+they are keyed by the expression node, which substitution preserves, so a
+producer cloned once as an argument still proves its window when it becomes a
+binding at a later use site. Two properties are load-bearing for this policy.
+First, the effect-mark counter must observe every observable-effect emission,
+expression and statement position alike — a window that silently spanned an
+uncounted emission could hoist a binding across it. Second, any construct that
+can conditionally skip the code after it without advancing the effect marks (a
+`try` sequence's early return) must clone its continuation inside its own
+region: the region boundary is what keeps a producer created after the
+divergence from becoming a hoist candidate beside it. A rewrite that cloned a
+try continuation in its enclosing region would silently reopen effect
+reordering, and the window chain check cannot detect that itself.
+
+A loop-carried variable's reassigned copies share its source binder but not
+its local id, so once a loop clone rebinds the carried slot, binder identity
+is the only path those copies resolve through. Cloning a loop therefore drops
+the pre-loop binder value, installs the emitted param under the slot's binder
+identity for any value variant — an opaque scalar param must reach the copies
+too — and, while the loop clone is active, keeps a reassigned carried binder's
+entry pointing at its latest merged value across the restores of escaping
+`let` clones. Arm and join boundaries restore plainly, so a reassignment
+inside one branch never leaks to its sibling or past the join. Resolving a
+carried read to anything else is unsound in one of two ways: a read that
+reaches a vanished pre-loop local becomes a phantom argument when capture
+recomputation promotes the dangling reference, and a read that reaches the
+loop-entry value silently discards the reassignment. Two Debug validators
+guard the pair: no rewritten function may gain a capture its source did not
+declare, and every local reference in a rewritten body must resolve to an
+in-scope binding, argument, or recomputed capture.
 
 Every SpecConstr clone is hygienic. A retained pattern, loop parameter, join
 parameter, try-sequence local, or other runtime binder receives a fresh lifted
