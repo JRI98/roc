@@ -265,8 +265,7 @@ NO CHANGE
 		(e-dec-small (numerator "42") (denominator-power-of-ten "1") (value "4.2")))
 	(d-let
 		(p-assign (ident "str"))
-		(e-string
-			(e-literal (string "hello"))))
+		(e-runtime-error (tag "erroneous_value_expr")))
 	(d-let
 		(p-assign (ident "my_empty_list"))
 		(e-empty_list))
