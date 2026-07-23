@@ -1141,28 +1141,29 @@ alias roots union-find representatives for concrete structures.
 
 ## Module Completion Boundary
 
-The compile coordinator records phase progress separately from terminal module
-outcome. A terminal module has exactly one explicit outcome: success or failure.
-Successful completion means the module produced the complete `ModuleEnv` and
-checked module data required by importers, including its final content identity.
-Failed completion is terminal only for scheduling and accounting; any partial
-`ModuleEnv` retained for diagnostics or watch inputs is not valid importer input.
+The compile coordinator records phase progress separately from user diagnostics.
+A source module that reaches checking has no user-error `Failure` outcome. It
+must produce its complete `ModuleEnv`, final content identity, and CheckedModule
+data required by importers. The Check type-check result carries exactly one of:
 
-Every scheduling edge that consumes imported `ModuleEnv` or checked module data
-requires successful completion. Canonicalization, content-identity construction,
-checking, checked module cache construction, and platform requirement checking
-may consume only successful imported modules. A known failed module causes
-failure to propagate iteratively through all local-import, cross-package-import,
-and registered platform/app dependency edges. An import that cannot be resolved
-is distinct from a known failed module and proceeds only far enough for
-canonicalization to emit its source diagnostic.
+- the complete CheckedModule
+- the complete checker-owned continuation for platform/app relation
+  construction, which waits for both CheckedModule inputs
 
-When a local import closes a cycle, the coordinator records the closing edge
-before reporting it. It then identifies the exact strongly connected component
-by mutual reachability, marks every member failed, and applies ordinary iterative
-failure propagation to all transitive dependents. Cycle members never masquerade
-as successfully completed modules and never provide partial environments or
-missing content identities to downstream stages.
+User diagnostics never select a third outcome and never propagate dependency
+failure. Every invalid source construct is represented at its first owning
+producer boundary by explicit checked data: a checked runtime-error expression,
+a checked-error dispatch plan, a crash constant, or a checked-error platform
+requirement. Importers and every post-check stage consume that data normally.
+Independent definitions, imports, compile-time roots, and runtime paths remain
+available; execution crashes only if it reaches a recorded checked error.
+
+Parsing and error reporting may recover malformed source in order to construct
+the explicit malformed/runtime-error nodes that later stages consume. I/O,
+allocation failure, unsupported compiler hosts, corrupt serialized CheckedModule
+inputs, and compiler invariant violations are operational aborts, not user-error
+module outcomes. They must propagate as operation errors rather than being
+converted into a user diagnostic or a module `Failure` value.
 
 ## Cache Boundary
 
@@ -1507,10 +1508,13 @@ and pairs the platform requirement payload's identity nodes with the recorded
 solutions slot by slot. No stage after check completion resolves an app export
 by name, re-checks requirement/provided type compatibility, or re-derives
 identity bindings by structurally matching platform types against app types. A
-requirement/app mismatch is only ever a check-time diagnostic; a missing
-solution row is the record of an app-side check failure and is consumed only by
-flows that permit user errors, which output the platform root without a
-relation.
+requirement/app mismatch is only ever a check-time diagnostic. Finalization
+constructs one total outcome per platform requirement: an exact relation/binding
+for a successful solution or an explicit checked-error requirement index for a
+failed solution. The relation-bearing platform CheckedModule preserves successful
+sibling bindings, and a lookup at a checked-error index lowers to a runtime
+crash. There is no relation-less error fallback and no separate flow that
+"permits" user errors.
 
 A platform requirement's for-clause alias is a binder over an app-supplied
 type: the requirement's `Model` IS the app's `Model` by the for-clause's own
@@ -5190,9 +5194,11 @@ that value kind must be added explicitly here with a checked cache rule.
 Compile-time evaluation failures are owned by checking finalization because the
 module has not been output yet. User-written compile-time crashes, invalid
 compile-time host interaction, and unsupported compile-time operations become
-checking diagnostics attached to the checked root being finalized. OOM remains
-OOM. A post-check invariant failure while lowering or interpreting a
-compile-time root is still a compiler bug, not a user-facing diagnostic.
+checking diagnostics attached to the checked root being finalized, and the
+root's `ConstStore` entry is completed with an explicit crash constant. Sibling
+roots continue finalizing. OOM remains OOM. A post-check invariant failure while
+lowering or interpreting a compile-time root is still a compiler bug, not a
+user-facing diagnostic.
 
 While storing an eval result, the builder may reserve a `ConstNodeId` before
 storing its children so repeated references to the same acyclic runtime value

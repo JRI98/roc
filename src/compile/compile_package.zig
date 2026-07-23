@@ -333,26 +333,42 @@ pub const SemanticModuleData = struct {
     checked_artifact: ?*const CheckedArtifact.CheckedModuleArtifact,
 };
 
+/// Checked-module output is either complete now or retained for platform/app finalization.
+pub const TypeCheckPublication = union(enum) {
+    published: CheckedArtifact.CheckedModuleArtifact,
+    deferred,
+};
+
 /// Owned output from type checking before module state takes retained facts.
 pub const TypeCheckOutput = struct {
     checker: Check,
     checker_owned: bool = true,
-    checked_artifact: ?CheckedArtifact.CheckedModuleArtifact = null,
-    user_errors_allow_lowering: bool = false,
-    /// True when a clean check intentionally skipped publishing a checked
-    /// artifact because publication was deferred to finalization.
-    publication_deferred: bool = false,
+    publication: TypeCheckPublication,
+    publication_owned: bool = true,
 
     pub fn deinit(self: *TypeCheckOutput) void {
-        if (self.checked_artifact) |*artifact| artifact.deinit(artifact.canonical_names.allocator);
+        if (self.publication_owned) {
+            switch (self.publication) {
+                .published => |*artifact| artifact.deinit(artifact.canonical_names.allocator),
+                .deferred => {},
+            }
+        }
         if (self.checker_owned) self.checker.deinit();
     }
 
     pub fn takeCheckedArtifact(self: *TypeCheckOutput) CheckedArtifact.CheckedModuleArtifact {
-        const artifact = self.checked_artifact orelse
-            std.debug.panic("compile.typeCheckOutput missing checked artifact", .{});
-        self.checked_artifact = null;
-        return artifact;
+        std.debug.assert(self.publication_owned);
+        return switch (self.publication) {
+            .published => |artifact| blk: {
+                self.publication_owned = false;
+                break :blk artifact;
+            },
+            .deferred => std.debug.panic("compile.typeCheckOutput publication is deferred", .{}),
+        };
+    }
+
+    pub fn publicationDeferred(self: *const TypeCheckOutput) bool {
+        return self.publication == .deferred;
     }
 
     pub fn takeChecker(self: *TypeCheckOutput) Check {
@@ -383,205 +399,6 @@ pub const ArtifactPublicationInputs = struct {
     problem_store: ?*check.problem.Store = null,
     ctfe_options: eval.CompileTimeFinalization.Options = .{},
 };
-
-fn problemBlocksCheckedArtifact(problem: check.problem.Problem) bool {
-    return switch (problem) {
-        .static_dispatch => |static_dispatch| switch (static_dispatch) {
-            .unresolved_dispatcher => |unresolved| !unresolved.runtime_error_inserted,
-            .dispatcher_not_nominal,
-            .dispatcher_does_not_impl_method,
-            .type_does_not_support_equality,
-            .type_does_not_support_map,
-            .recursive_dispatch,
-            => true,
-        },
-        .effectful_function_name, .redundant_pattern, .unmatchable_pattern, .comptime_unused_branch, .comptime_condition, .literal_defaulted => false,
-        else => true,
-    };
-}
-
-fn problemAllowsLoweringWithUserErrors(problem: check.problem.Problem) bool {
-    return switch (problem) {
-        .static_dispatch => |static_dispatch| staticDispatchAllowsLoweringWithUserErrors(static_dispatch),
-        .effectful_function_name => true,
-        .type_mismatch,
-        .type_apply_mismatch_arities,
-        .cannot_access_opaque_nominal,
-        .nominal_type_resolution_failed,
-        .recursive_alias,
-        .unsupported_alias_where_clause,
-        .where_clause_receiver_not_introduced,
-        .invalid_nominal_decl_recursion,
-        .infinite_recursion,
-        .anonymous_recursion,
-        .polymorphic_value,
-        .polymorphic_var_annotation,
-        .effectful_top_level,
-        .effectful_expect,
-        .annotation_only_value,
-        .hosted_unboxed_function,
-        .host_boundary_open_row,
-        .platform_def_not_found,
-        .platform_hosted_section,
-        .platform_alias_not_found,
-        .comptime_crash,
-        .comptime_invalid_numeral,
-        .comptime_invalid_quote,
-        .comptime_expect_failed,
-        .comptime_eval_error,
-        .invalid_numeric_literal,
-        .tuple_access_needs_annotation,
-        .invalid_tuple_access,
-        .literal_defaulted,
-        .non_exhaustive_match,
-        .non_exhaustive_destructure,
-        .redundant_pattern,
-        .unmatchable_pattern,
-        .unreachable_code,
-        .comptime_unused_branch,
-        .comptime_condition,
-        => false,
-    };
-}
-
-fn staticDispatchAllowsLoweringWithUserErrors(static_dispatch: check.problem.StaticDispatch) bool {
-    return switch (static_dispatch) {
-        .unresolved_dispatcher => |unresolved| unresolved.runtime_error_inserted,
-        .dispatcher_not_nominal,
-        .dispatcher_does_not_impl_method,
-        .type_does_not_support_equality,
-        .type_does_not_support_map,
-        .recursive_dispatch,
-        => false,
-    };
-}
-
-fn problemLoweringWithUserErrorsRationale(kind: check.problem.Problem.Tag) []const u8 {
-    return switch (kind) {
-        .static_dispatch => "Static dispatch lowering can continue only when the inner dispatch problem owns an inserted runtime-error expression.",
-        .type_mismatch => "Type mismatch leaves checked values without reliable monotype inputs.",
-        .type_apply_mismatch_arities => "Type application arity mismatch leaves type structure invalid for lowering.",
-        .cannot_access_opaque_nominal => "Opaque nominal access failure means lowering cannot rely on the requested representation.",
-        .nominal_type_resolution_failed => "Nominal resolution failure leaves the referenced type unavailable to lowering.",
-        .recursive_alias => "Recursive aliases must not reach lowering as concrete type structure.",
-        .unsupported_alias_where_clause => "Unsupported alias where clauses have no lowered representation contract.",
-        .where_clause_receiver_not_introduced => "A where constraint on an enclosing rigid has no owned evidence parameter to lower.",
-        .invalid_nominal_decl_recursion => "Invalid recursive nominal declarations leave no finite backing to lower.",
-        .infinite_recursion => "Infinite type recursion prevents a finite lowered type.",
-        .anonymous_recursion => "Anonymous recursion prevents a finite lowered type.",
-        .polymorphic_value => "Polymorphic values in monomorphic positions have no single lowered type.",
-        .polymorphic_var_annotation => "Polymorphic var annotations cannot produce a concrete mutable storage type.",
-        .effectful_top_level => "Effectful top-level initialization cannot be represented as a checked constant.",
-        .effectful_expect => "Effectful expect evaluation cannot be treated as ordinary lowered user code.",
-        .effectful_function_name => "Effectful function-name reports are warnings and do not block lowering.",
-        .annotation_only_value => "Annotation-only values have no runtime expression to lower.",
-        .hosted_unboxed_function => "Hosted unboxed functions violate the host boundary representation contract.",
-        .host_boundary_open_row => "Open rows at host boundaries have no concrete ABI shape.",
-        .platform_def_not_found => "Missing platform definitions leave required runtime entry points unavailable.",
-        .platform_hosted_section => "Invalid hosted sections leave external symbols unresolved or ambiguous.",
-        .platform_alias_not_found => "Missing platform aliases leave required types unavailable.",
-        .comptime_crash => "Compile-time crashes are reported diagnostics, not recoverable runtime expressions.",
-        .comptime_invalid_numeral => "Rejected compile-time numerals are reported diagnostics, not lowered literal values.",
-        .comptime_invalid_quote => "Rejected compile-time quotes are reported diagnostics, not lowered literal values.",
-        .comptime_expect_failed => "Failed compile-time expects are reported diagnostics, not lowered runtime assertions.",
-        .comptime_eval_error => "Compile-time evaluation errors leave the requested constant unavailable.",
-        .invalid_numeric_literal => "Invalid numeric literals cannot produce a trusted lowered numeric value.",
-        .tuple_access_needs_annotation => "Tuple access without arity evidence cannot select a lowered element.",
-        .invalid_tuple_access => "A tuple access disproven by the resolved receiver type cannot be lowered.",
-        .literal_defaulted => "Literal defaulting is only a warning and does not block lowering.",
-        .non_exhaustive_match => "Non-exhaustive matches may jump to a generated miss path but still indicate user-error lowering is unsafe.",
-        .non_exhaustive_destructure => "Non-exhaustive destructures may jump to a generated miss path but still indicate user-error lowering is unsafe.",
-        .redundant_pattern => "Redundant patterns are warnings and do not block lowering.",
-        .unmatchable_pattern => "Unmatchable patterns are warnings and do not block lowering.",
-        .unreachable_code => "Unreachable code is a warning and does not block lowering.",
-        .comptime_unused_branch => "Compile-time unused branches are warnings and do not block lowering.",
-        .comptime_condition => "Compile-time condition reports are warnings and do not block lowering.",
-    };
-}
-
-fn staticDispatchLoweringWithUserErrorsRationale(kind: std.meta.Tag(check.problem.StaticDispatch)) []const u8 {
-    return switch (kind) {
-        .unresolved_dispatcher => "Lowering can continue only when checking inserted an explicit runtime-error expression at the unresolved dispatch site.",
-        .dispatcher_not_nominal => "A non-nominal dispatcher has no method table target for lowering.",
-        .dispatcher_does_not_impl_method => "A missing method leaves no resolved callable target for lowering.",
-        .type_does_not_support_equality => "Unsupported equality has no resolved equality implementation for lowering.",
-        .type_does_not_support_map => "Unsupported mapping has no checker-selected payload transformation plan for lowering.",
-        .recursive_dispatch => "Recursive dispatch has no finite resolved callable target for lowering.",
-    };
-}
-
-fn checkerHasArtifactBlockingProblems(checker: *const Check) bool {
-    for (checker.problems.problems.items) |problem| {
-        if (problemBlocksCheckedArtifact(problem)) return true;
-    }
-    return false;
-}
-
-fn checkerProblemsAllowLoweringWithUserErrors(checker: *const Check) bool {
-    for (checker.problems.problems.items) |problem| {
-        if (!problemAllowsLoweringWithUserErrors(problem)) return false;
-    }
-    return true;
-}
-
-test "problem lowerability rationale covers every problem kind" {
-    inline for (@typeInfo(check.problem.Problem.Tag).@"enum".fields) |field| {
-        const tag: check.problem.Problem.Tag = @enumFromInt(field.value);
-        try std.testing.expect(problemLoweringWithUserErrorsRationale(tag).len != 0);
-    }
-}
-
-test "static dispatch lowerability rationale covers every static dispatch kind" {
-    const StaticDispatchTag = std.meta.Tag(check.problem.StaticDispatch);
-    inline for (@typeInfo(StaticDispatchTag).@"enum".fields) |field| {
-        const tag: StaticDispatchTag = @enumFromInt(field.value);
-        try std.testing.expect(staticDispatchLoweringWithUserErrorsRationale(tag).len != 0);
-    }
-}
-
-fn moduleHasArtifactBlockingCanonicalizeDiagnostics(env: *const ModuleEnv) bool {
-    const diagnostics = env.store.sliceDiagnostics(env.diagnostics);
-    for (diagnostics) |diagnostic_idx| {
-        const diagnostic = env.store.getDiagnostic(diagnostic_idx);
-        switch (diagnostic) {
-            .shadowing_warning,
-            .unused_variable,
-            .used_underscore_variable,
-            .type_shadowed_warning,
-            .builtin_type_shadowed_warning,
-            .unused_type_var_name,
-            .type_var_marked_unused,
-            .underscore_in_type_declaration,
-            .module_header_deprecated,
-            .deprecated_number_suffix,
-            .unreachable_string_pattern_capture,
-            => {},
-            else => return true,
-        }
-    }
-    return false;
-}
-
-fn moduleHasDuplicateTopLevelValueDefs(gpa: Allocator, env: *const ModuleEnv) Allocator.Error!bool {
-    var seen = std.AutoHashMapUnmanaged(base.Ident.Idx, void){};
-    defer seen.deinit(gpa);
-
-    for (env.store.sliceDefs(env.global_value_defs)) |def_idx| {
-        const def = env.store.getDef(def_idx);
-        const pattern = env.store.getPattern(def.pattern);
-        const ident = switch (pattern) {
-            .assign => |assign| assign.ident,
-            .as => |as_pattern| as_pattern.ident,
-            else => continue,
-        };
-
-        const entry = try seen.getOrPut(gpa, ident);
-        if (entry.found_existing) return true;
-        entry.value_ptr.* = {};
-    }
-
-    return false;
-}
 
 fn importedArtifactsCoverImportedEnvs(
     imported_envs: []const *ModuleEnv,
@@ -1942,28 +1759,8 @@ pub const PackageEnv = struct {
 
         module_envs_map.deinit();
 
-        const has_artifact_blocking_canonicalize_diagnostics = moduleHasArtifactBlockingCanonicalizeDiagnostics(env);
-        const has_duplicate_top_level_value_defs = try moduleHasDuplicateTopLevelValueDefs(check_alloc, env);
-        const has_artifact_blocking_check_problems = checkerHasArtifactBlockingProblems(&checker);
-        const imported_artifacts_cover_imports = importedArtifactsCoverImportedEnvs(imported_envs, imported_artifacts);
-        const user_errors_allow_lowering =
-            !has_artifact_blocking_canonicalize_diagnostics and
-            !has_duplicate_top_level_value_defs and
-            !has_artifact_blocking_check_problems and
-            imported_artifacts_cover_imports and
-            checkerProblemsAllowLoweringWithUserErrors(&checker);
-
-        if (has_artifact_blocking_canonicalize_diagnostics or
-            has_duplicate_top_level_value_defs or
-            has_artifact_blocking_check_problems or
-            !imported_artifacts_cover_imports)
-        {
-            _ = try checker.problems.flushPendingStaticExhaustiveness(check_alloc);
-            return .{
-                .checker = checker,
-                .checked_artifact = null,
-                .user_errors_allow_lowering = false,
-            };
+        if (!importedArtifactsCoverImportedEnvs(imported_envs, imported_artifacts)) {
+            std.debug.panic("compile.typeCheckModule received an imported module environment without its checked artifact", .{});
         }
 
         // The platform root of an app build does not publish here: finalization
@@ -1976,13 +1773,11 @@ pub const PackageEnv = struct {
         if (defer_publication and !(try checker.requiresTypesContainError())) {
             return .{
                 .checker = checker,
-                .checked_artifact = null,
-                .user_errors_allow_lowering = user_errors_allow_lowering,
-                .publication_deferred = true,
+                .publication = .deferred,
             };
         }
 
-        var checked_artifact = publishCheckedArtifactFromCheckedModule(
+        var checked_artifact = try publishCheckedArtifactFromCheckedModule(
             artifact_alloc,
             env,
             imported_envs,
@@ -1997,23 +1792,12 @@ pub const PackageEnv = struct {
                 .problem_store = &checker.problems,
                 .ctfe_options = ctfe_options,
             },
-        ) catch |err| switch (err) {
-            error.CompileTimeProblem => {
-                _ = try checker.problems.flushPendingStaticExhaustiveness(check_alloc);
-                return .{
-                    .checker = checker,
-                    .checked_artifact = null,
-                    .user_errors_allow_lowering = false,
-                };
-            },
-            else => |other| return other,
-        };
+        );
         errdefer checked_artifact.deinit(artifact_alloc);
 
         return .{
             .checker = checker,
-            .checked_artifact = checked_artifact,
-            .user_errors_allow_lowering = user_errors_allow_lowering,
+            .publication = .{ .published = checked_artifact },
         };
     }
 
@@ -2116,13 +1900,13 @@ pub const PackageEnv = struct {
                         const resolved_module_idx: u32 = @intCast(imported_envs.items.len);
                         try imported_envs.append(self.gpa, ext_env_ptr);
                         env.imports.setResolvedModule(import_idx, resolved_module_idx);
-                        if (r.getArtifact(r.ctx, self.package_name, import_name)) |artifact| {
-                            try imported_artifacts.append(self.gpa, .{
-                                .module_idx = resolved_module_idx,
-                                .key = artifact.key,
-                                .view = CheckedArtifact.importedView(artifact),
-                            });
-                        }
+                        const artifact = r.getArtifact(r.ctx, self.package_name, import_name) orelse
+                            std.debug.panic("compile.doTypeCheck ready external import '{s}' has no checked artifact", .{import_name});
+                        try imported_artifacts.append(self.gpa, .{
+                            .module_idx = resolved_module_idx,
+                            .key = artifact.key,
+                            .view = CheckedArtifact.importedView(artifact),
+                        });
                     }
                     // External env not ready; skip (tryUnblock should have prevented this)
                 }
@@ -2134,13 +1918,13 @@ pub const PackageEnv = struct {
                 const resolved_module_idx: u32 = @intCast(imported_envs.items.len);
                 try imported_envs.append(self.gpa, child_env_ptr);
                 env.imports.setResolvedModule(import_idx, resolved_module_idx);
-                if (child.checkedArtifact()) |artifact| {
-                    try imported_artifacts.append(self.gpa, .{
-                        .module_idx = resolved_module_idx,
-                        .key = artifact.key,
-                        .view = CheckedArtifact.importedView(artifact),
-                    });
-                }
+                const artifact = child.checkedArtifact() orelse
+                    std.debug.panic("compile.doTypeCheck ready local import '{s}' has no checked artifact", .{child.name});
+                try imported_artifacts.append(self.gpa, .{
+                    .module_idx = resolved_module_idx,
+                    .key = artifact.key,
+                    .view = CheckedArtifact.importedView(artifact),
+                });
             }
         }
 
@@ -2163,9 +1947,7 @@ pub const PackageEnv = struct {
             false,
         );
         defer typecheck_output.deinit();
-        if (typecheck_output.checked_artifact != null) {
-            st.replaceCheckedArtifact(typecheck_output.takeCheckedArtifact());
-        }
+        st.replaceCheckedArtifact(typecheck_output.takeCheckedArtifact());
         self.total_type_checking_ns += readStageTimer(self.roc_ctx.std_io, &check_timer);
 
         // Build reports from problems

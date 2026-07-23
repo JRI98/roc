@@ -125,8 +125,7 @@ main = {
 					(e-call (constraint-fn-var 239)
 						(e-lookup-local
 							(p-assign (ident "a")))
-						(e-string
-							(e-literal (string "x"))))
+						(e-runtime-error (tag "erroneous_value_expr")))
 					(e-call (constraint-fn-var 247)
 						(e-lookup-local
 							(p-assign (ident "b")))

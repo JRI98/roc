@@ -262,8 +262,7 @@ NO CHANGE
 		(e-call (constraint-fn-var 459)
 			(e-lookup-local
 				(p-assign (ident "mkPair")))
-			(e-string
-				(e-literal (string "1")))
+			(e-runtime-error (tag "erroneous_value_expr"))
 			(e-num (value "2")))
 		(annotation
 			(ty-apply (name "Pair") (local)
@@ -274,8 +273,7 @@ NO CHANGE
 			(e-tag (name "Pair")
 				(args
 					(e-num (value "1"))
-					(e-string
-						(e-literal (string "str"))))))
+					(e-runtime-error (tag "erroneous_value_expr")))))
 		(annotation
 			(ty-apply (name "Pair") (local)
 				(ty-lookup (name "U64") (builtin)))))

@@ -85,7 +85,7 @@ a = (
 				(e-tag (name "X")
 					(args
 						(e-call (constraint-fn-var 215)
-							(e-num (value "0"))
+							(e-runtime-error (tag "erroneous_value_expr"))
 							(e-tag (name "X")
 								(args
 									(e-num (value "0")))))))))))

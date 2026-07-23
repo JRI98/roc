@@ -129,16 +129,7 @@ main! = |_| mapList([1, 2, 3, 4, 5])
 		(e-lambda
 			(args
 				(p-underscore))
-			(e-call (constraint-fn-var 292)
-				(e-lookup-local
-					(p-assign (ident "mapList")))
-				(e-list
-					(elems
-						(e-num (value "1"))
-						(e-num (value "2"))
-						(e-num (value "3"))
-						(e-num (value "4"))
-						(e-num (value "5"))))))))
+			(e-runtime-error (tag "erroneous_value_expr")))))
 ~~~
 # TYPES
 ~~~clojure

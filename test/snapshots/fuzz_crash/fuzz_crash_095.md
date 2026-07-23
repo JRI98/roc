@@ -51,7 +51,7 @@ t = 0->(0)()
 	(d-let
 		(p-assign (ident "t"))
 		(e-call (constraint-fn-var 211)
-			(e-num (value "0"))
+			(e-runtime-error (tag "erroneous_value_expr"))
 			(e-num (value "0")))))
 ~~~
 # TYPES

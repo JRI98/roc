@@ -321,10 +321,7 @@ With multiple lines
 						(args
 							(e-string))))
 				(field (name "e")
-					(e-dispatch-call (method "not") (constraint-fn-var 353)
-						(receiver
-							(e-string))
-						(args))))))
+					(e-runtime-error (tag "erroneous_value_expr"))))))
 	(d-let
 		(p-assign (ident "x"))
 		(e-block

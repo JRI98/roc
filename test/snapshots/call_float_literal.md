@@ -40,7 +40,7 @@ NO CHANGE
 # CANONICALIZE
 ~~~clojure
 (e-call (constraint-fn-var 201)
-	(e-dec-small (numerator "0") (denominator-power-of-ten "0") (value "0")))
+	(e-runtime-error (tag "erroneous_value_expr")))
 ~~~
 # TYPES
 ~~~clojure

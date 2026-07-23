@@ -411,7 +411,7 @@ main = {
 						(e-lookup-local
 							(p-assign (ident "val"))))
 					(args
-						(e-num (value "100")))))
+						(e-runtime-error (tag "erroneous_value_expr")))))
 			(e-lookup-local
 				(p-assign (ident "next_val")))))
 	(d-let
@@ -422,12 +422,7 @@ main = {
 		(e-block
 			(s-let
 				(p-assign (ident "next_val"))
-				(e-dispatch-call (method "update") (constraint-fn-var 559)
-					(receiver
-						(e-string
-							(e-literal (string "Hello"))))
-					(args
-						(e-num (value "100")))))
+				(e-runtime-error (tag "erroneous_value_expr")))
 			(e-runtime-error (tag "erroneous_value_use"))))
 	(d-let
 		(p-assign (ident "main"))

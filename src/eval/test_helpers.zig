@@ -842,6 +842,29 @@ pub fn compileInspectedProgram(
     return compileInspectedProgramImpl(allocator, io, source_kind, source, imports, null, null);
 }
 
+/// Parse, check, and publish an inspect-wrapped program without lowering it.
+pub fn parseAndCanonicalizeInspectedProgram(
+    allocator: Allocator,
+    source_kind: SourceKind,
+    source: []const u8,
+    imports: []const ModuleSource,
+) TestHelperError!ParsedResources {
+    return parseInspectedProgramImpl(allocator, source_kind, source, imports, null, null);
+}
+
+/// Same as `parseAndCanonicalizeInspectedProgram` but reuses a pre-published
+/// Builtin artifact owned by the caller.
+pub fn parseAndCanonicalizeInspectedProgramWithBuiltin(
+    allocator: Allocator,
+    source_kind: SourceKind,
+    source: []const u8,
+    imports: []const ModuleSource,
+    pre_published_builtin: PrePublishedBuiltin,
+    roc_ctx: ?CoreCtx,
+) TestHelperError!ParsedResources {
+    return parseInspectedProgramImpl(allocator, source_kind, source, imports, pre_published_builtin, roc_ctx);
+}
+
 /// Same as `compileInspectedProgram` but reuses a pre-published Builtin
 /// artifact owned by the caller. `roc_ctx` supplies filesystem access for file
 /// imports (the REPL passes its real `CoreCtx`); pass `null` otherwise.
@@ -866,7 +889,27 @@ fn compileInspectedProgramImpl(
     pre_published_builtin: ?PrePublishedBuiltin,
     roc_ctx: ?CoreCtx,
 ) TestHelperError!CompiledProgram {
-    var resources = try parseAndCanonicalizeProgramWithRootMode(
+    const resources = try parseInspectedProgramImpl(
+        allocator,
+        source_kind,
+        source,
+        imports,
+        pre_published_builtin,
+        roc_ctx,
+    );
+
+    return lowerInspectedProgram(allocator, io, resources);
+}
+
+fn parseInspectedProgramImpl(
+    allocator: Allocator,
+    source_kind: SourceKind,
+    source: []const u8,
+    imports: []const ModuleSource,
+    pre_published_builtin: ?PrePublishedBuiltin,
+    roc_ctx: ?CoreCtx,
+) TestHelperError!ParsedResources {
+    return parseAndCanonicalizeProgramWithRootMode(
         allocator,
         source_kind,
         source,
@@ -876,22 +919,33 @@ fn compileInspectedProgramImpl(
         pre_published_builtin,
         roc_ctx,
     );
-    errdefer cleanupParseAndCanonical(allocator, resources);
+}
 
-    const lowered = try lowerParsedProgramToLir(allocator, io, &resources, .native);
+/// Lower already-published inspect-wrapped resources for native and wasm
+/// evaluation. This function takes ownership of `resources`, including when
+/// lowering returns an error.
+pub fn lowerInspectedProgram(
+    allocator: Allocator,
+    io: std.Io,
+    resources: ParsedResources,
+) TestHelperError!CompiledProgram {
+    var owned_resources = resources;
+    errdefer cleanupParseAndCanonical(allocator, owned_resources);
+
+    const lowered = try lowerParsedProgramToLir(allocator, io, &owned_resources, .native);
     errdefer {
         var owned = lowered;
         owned.deinit(allocator);
     }
 
-    const wasm_lowered = try lowerParsedProgramToLir(allocator, io, &resources, .u32);
+    const wasm_lowered = try lowerParsedProgramToLir(allocator, io, &owned_resources, .u32);
     errdefer {
         var owned = wasm_lowered;
         owned.deinit(allocator);
     }
 
     return .{
-        .resources = resources,
+        .resources = owned_resources,
         .lowered = lowered,
         .wasm_lowered = wasm_lowered,
     };
@@ -1071,7 +1125,7 @@ fn publishProgramForComptimeProblemsImpl(
     imports: []const ModuleSource,
     pre_published_builtin: ?PrePublishedBuiltin,
 ) TestHelperError!ComptimePublishOutcome {
-    const resources = parseAndCanonicalizeProgramWithRootModeReporting(
+    const resources = try parseAndCanonicalizeProgramWithRootModeReporting(
         allocator,
         source_kind,
         source,
@@ -1081,24 +1135,24 @@ fn publishProgramForComptimeProblemsImpl(
         pre_published_builtin,
         .report_comptime_problems,
         null,
-    ) catch |err| switch (err) {
-        error.CompileTimeProblem => return .comptime_problems,
-        else => return err,
-    };
+    );
     defer cleanupParseAndCanonical(allocator, resources);
 
-    return if (resources.checker.problems.problems.items.len == 0)
-        .no_problems
-    else
-        .comptime_problems;
+    if (resources.checker.problems.problems.items.len != 0) {
+        return .comptime_problems;
+    }
+    for (resources.extra_modules) |module| {
+        if (module.checker.problems.problems.items.len != 0) {
+            return .comptime_problems;
+        }
+    }
+    return .no_problems;
 }
 
 /// Publish a program with compile-time evaluation problems routed into each
 /// module's checker problem store and return the full resources for tests that
-/// need to inspect which module received which diagnostic. Unlike
-/// `publishProgramForComptimeProblems`, this only returns resources when
-/// publishing completes without a blocking compile-time problem; crashing roots
-/// and failed expects still return `error.CompileTimeProblem`.
+/// need to inspect which module received which diagnostic. Crashing roots and
+/// failed expects publish explicit crash constants and return their resources.
 pub fn publishProgramKeepingReportedComptimeProblems(
     allocator: Allocator,
     source_kind: SourceKind,
@@ -1127,20 +1181,6 @@ const ComptimeProblemReporting = enum {
     ignore_comptime_problems,
     report_comptime_problems,
 };
-
-fn problemBlocksCheckedArtifact(problem: check.problem.Problem) bool {
-    return switch (problem) {
-        .effectful_function_name, .redundant_pattern, .unmatchable_pattern, .comptime_unused_branch, .comptime_condition, .literal_defaulted => false,
-        else => true,
-    };
-}
-
-fn checkedModuleHasArtifactBlockingProblems(module: *const CheckedModule) bool {
-    for (module.checker.problems.problems.items) |problem| {
-        if (problemBlocksCheckedArtifact(problem)) return true;
-    }
-    return module.module_env.types.containsErrContent();
-}
 
 fn parseAndCanonicalizeProgramWithRootMode(
     allocator: Allocator,
@@ -1234,10 +1274,6 @@ fn parseAndCanonicalizeProgramWithRootModeReporting(
             available_imports,
             roc_ctx,
         );
-        if (checkedModuleHasArtifactBlockingProblems(&checked)) {
-            cleanupCheckedModule(allocator, checked);
-            return error.TypeCheckError;
-        }
         try extra_modules.append(allocator, checked);
     }
 
@@ -1276,10 +1312,6 @@ fn parseAndCanonicalizeProgramWithRootModeReporting(
         roc_ctx,
     );
     errdefer cleanupCheckedModule(allocator, main_checked);
-    if (checkedModuleHasArtifactBlockingProblems(&main_checked)) {
-        return error.TypeCheckError;
-    }
-
     var all_module_envs = try allocator.alloc(*ModuleEnv, extra_modules.items.len + 2);
     defer allocator.free(all_module_envs);
     all_module_envs[0] = main_checked.module_env;

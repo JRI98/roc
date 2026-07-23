@@ -3206,26 +3206,13 @@ anno2 = Annotated.L2.alsoTyped # 889
 				(e-num (value "1")))))
 	(d-let
 		(p-assign (ident "associated_items_truly_comprehensive.D5_Pattern2.L2.L3.val3"))
-		(e-dispatch-call (method "plus") (constraint-fn-var 1659)
-			(receiver
-				(e-runtime-error (tag "ident_not_in_scope")))
-			(args
-				(e-num (value "1")))))
+		(e-runtime-error (tag "erroneous_value_expr")))
 	(d-let
 		(p-assign (ident "associated_items_truly_comprehensive.D5_Pattern2.L2.val2"))
-		(e-dispatch-call (method "plus") (constraint-fn-var 1668)
-			(receiver
-				(e-lookup-local
-					(p-assign (ident "associated_items_truly_comprehensive.D5_Pattern2.L2.L3.val3"))))
-			(args
-				(e-num (value "1")))))
+		(e-runtime-error (tag "erroneous_value_expr")))
 	(d-let
 		(p-assign (ident "associated_items_truly_comprehensive.D5_Pattern2.val1"))
-		(e-dispatch-call (method "plus") (constraint-fn-var 1677)
-			(receiver
-				(e-runtime-error (tag "ident_not_in_scope")))
-			(args
-				(e-num (value "1")))))
+		(e-runtime-error (tag "erroneous_value_expr")))
 	(d-let
 		(p-assign (ident "d5_2"))
 		(e-lookup-local
@@ -3236,16 +3223,13 @@ anno2 = Annotated.L2.alsoTyped # 889
 			(p-assign (ident "associated_items_truly_comprehensive.D5_Pattern2.L2.L3.L4.val4"))))
 	(d-let
 		(p-assign (ident "d5_4"))
-		(e-lookup-local
-			(p-assign (ident "associated_items_truly_comprehensive.D5_Pattern2.L2.L3.val3"))))
+		(e-runtime-error (tag "erroneous_value_use")))
 	(d-let
 		(p-assign (ident "d5_5"))
-		(e-lookup-local
-			(p-assign (ident "associated_items_truly_comprehensive.D5_Pattern2.L2.val2"))))
+		(e-runtime-error (tag "erroneous_value_use")))
 	(d-let
 		(p-assign (ident "d5_6"))
-		(e-lookup-local
-			(p-assign (ident "associated_items_truly_comprehensive.D5_Pattern2.val1"))))
+		(e-runtime-error (tag "erroneous_value_use")))
 	(d-let
 		(p-assign (ident "associated_items_truly_comprehensive.D5_Pattern3.val1"))
 		(e-dispatch-call (method "plus") (constraint-fn-var 1693)

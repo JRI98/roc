@@ -115,8 +115,7 @@ main! = |_| processNested([])
 			(args
 				(p-underscore))
 			(e-call (constraint-fn-var 276)
-				(e-lookup-local
-					(p-assign (ident "processNested")))
+				(e-runtime-error (tag "erroneous_value_expr"))
 				(e-empty_list)))))
 ~~~
 # TYPES

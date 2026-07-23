@@ -253,8 +253,7 @@ main! = |_| processComplex(Ok([Some(42), None]))
 			(e-match
 				(match
 					(cond
-						(e-lookup-local
-							(p-assign (ident "result"))))
+						(e-runtime-error (tag "erroneous_value_expr")))
 					(branches
 						(branch
 							(patterns
@@ -295,8 +294,7 @@ main! = |_| processComplex(Ok([Some(42), None]))
 			(args
 				(p-underscore))
 			(e-call (constraint-fn-var 371)
-				(e-lookup-local
-					(p-assign (ident "processComplex")))
+				(e-runtime-error (tag "erroneous_value_expr"))
 				(e-tag (name "Ok")
 					(args
 						(e-list

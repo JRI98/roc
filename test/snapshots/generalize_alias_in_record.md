@@ -103,8 +103,7 @@ NO CHANGE
 						(receiver
 							(e-lookup-local
 								(p-assign (ident "r")))))
-					(e-string
-						(e-literal (string "a"))))))))
+					(e-runtime-error (tag "erroneous_value_expr")))))))
 ~~~
 # TYPES
 ~~~clojure
