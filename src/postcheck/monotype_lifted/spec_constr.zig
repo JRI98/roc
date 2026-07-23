@@ -202,6 +202,17 @@
 //! the same function id, or a specialized clone whose stored source function
 //! template is the same. That keeps dispatch static while allowing this pass's
 //! own callable workers to match the patterns that created them.
+//!
+//! Store-borrow discipline: this pass clones expressions while walking spans of
+//! the same `Program` store, and cloning appends new nodes to those stores.
+//! Never hold a `Program`-store borrow (any `*Span` result) across a call that
+//! can append to the same store: copy the span first via `GuardedList.dupe`, or
+//! read one element at a time by stable index via the `*At` accessors
+//! (`branchAt`, `captureOperandAt`), which retain no borrow. The GuardedList
+//! generation guard turns a violation into a Debug panic. The generation is
+//! per-list, so a borrow of one store stays valid across an append to a
+//! different store — only same-store appends invalidate it, so copying a span
+//! whose store this walk never grows is unnecessary.
 
 const std = @import("std");
 const collections = @import("collections");
@@ -6393,9 +6404,11 @@ const Cloner = struct {
         decline_on_no_match: bool,
     ) Common.LowerError!?Value {
         if (scrutinee == .expr) return null;
-        const branches = self.pass.program.branchSpan(branches_span);
-        for (0..branches.len) |branch_index| {
-            const branch = GuardedList.at(branches, branch_index);
+        // Read each branch by stable index rather than holding a `branchSpan`
+        // borrow: `cloneExprValue(branch.body)` below can append to `branches`
+        // through a nested match, which would invalidate a live borrow.
+        for (0..branches_span.len) |branch_index| {
+            const branch = self.pass.program.branchAt(branches_span, branch_index);
             const match_change_start = self.changes.items.len;
             const verdict = try self.bindPatToValue(branch.pat, scrutinee);
             self.restore(match_change_start);
