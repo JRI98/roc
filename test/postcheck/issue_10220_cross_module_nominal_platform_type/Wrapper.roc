@@ -1,4 +1,4 @@
-App := [].{
+Wrapper := [].{
 	wrap = |value| Lib.make(value)
 }
 
