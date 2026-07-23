@@ -100,8 +100,7 @@ NO CHANGE
 				(e-call (constraint-fn-var 224)
 					(e-lookup-local
 						(p-assign (ident "picked")))
-					(e-string
-						(e-literal (string "a"))))))))
+					(e-runtime-error (tag "erroneous_value_expr")))))))
 ~~~
 # TYPES
 ~~~clojure
