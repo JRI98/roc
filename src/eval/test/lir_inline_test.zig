@@ -3495,6 +3495,16 @@ fn branchJoinedRecordStateWorkerIsGeneric(shape: ProcShape) bool {
         shape.jump_count >= 2;
 }
 
+fn isFusedRawListLoop(shape: ProcShape) bool {
+    return shape.list_get_unsafe_count >= 1 and
+        shape.join_count >= 1 and
+        shape.direct_call_count == 0;
+}
+
+fn rawListAccessOutsideLoop(shape: ProcShape) bool {
+    return shape.list_get_unsafe_count >= 1 and shape.join_count == 0;
+}
+
 fn expectRangeMapCollectUsesDirectListLoop(source: []const u8, expected_append_unsafe_count: usize) TestError!void {
     const allocator = std.testing.allocator;
 
@@ -5709,16 +5719,6 @@ test "issue 10301 for-loop over effect-produced list scalarizes" {
     try std.testing.expectEqual(root_shape.list_get_unsafe_count, reachable_total);
 }
 
-fn isFusedRawListLoop(shape: ProcShape) bool {
-    return shape.list_get_unsafe_count >= 1 and
-        shape.join_count >= 1 and
-        shape.direct_call_count == 0;
-}
-
-fn rawListAccessOutsideLoop(shape: ProcShape) bool {
-    return shape.list_get_unsafe_count >= 1 and shape.join_count == 0;
-}
-
 test "issue 10301 fold over effect-produced list scalarizes" {
     const allocator = std.testing.allocator;
     const source =
@@ -5771,12 +5771,13 @@ test "issue 10317 loop-carried reassignment keeps root arg count" {
     var optimized = try lowerModule(allocator, source, .wrappers);
     defer optimized.deinit(allocator);
 
-    const dev_root = dev.lowered.lir_result.store.getProcSpec(try rootProc(&dev.lowered));
-    const opt_root = optimized.lowered.lir_result.store.getProcSpec(try rootProc(&optimized.lowered));
-    try std.testing.expectEqual(
-        dev.lowered.lir_result.store.getLocalSpan(dev_root.args).len,
-        optimized.lowered.lir_result.store.getLocalSpan(opt_root.args).len,
-    );
+    // Comparing full argument layouts (not just counts) rules out a phantom
+    // argument replacing a legitimate one at the same arity.
+    const dev_layouts = try mainProcArgLayouts(allocator, &dev.lowered);
+    defer allocator.free(dev_layouts);
+    const opt_layouts = try mainProcArgLayouts(allocator, &optimized.lowered);
+    defer allocator.free(opt_layouts);
+    try std.testing.expectEqualSlices(LayoutIdx, dev_layouts, opt_layouts);
 }
 
 test "iterdiff: issue 10317 branch-reassigned carry agrees across inline modes" {

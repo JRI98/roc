@@ -117,10 +117,11 @@ constructor specialization bounds its substitution-candidate value walk
 (`valueCanSubstitute`), because a loop-carried value can reference itself and
 a cyclic value is correctly non-substitutable anyway.
 
-Cycles in a constructor-specialization `Value` tree are possible through
-exactly two pointer edges — a nominal value's backing and a static-data
-candidate's runtime value — so every walk that follows those edges carries an
-explicit bound. The size, substitution, unsafe-leaf, and reusability measures
+Cycles in a constructor-specialization `Value` tree form through two pointer
+edges — a nominal value's backing and a static-data candidate's runtime
+value — and a callable value's captures can carry either edge inside them, so
+every walk that follows the pointer edges or descends through callable
+captures carries an explicit bound. The size, substitution, unsafe-leaf, and reusability measures
 spend a shared per-node work budget and report the conservative answer when it
 runs out; the constructor-size measure saturates its sums so an exhausted child
 propagates the cap rather than overflowing, which makes "measured size equals

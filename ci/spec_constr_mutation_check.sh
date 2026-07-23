@@ -18,13 +18,12 @@
 #       regression tests catch.
 #
 # Why every target is lir_inline (and none is the lambda-mono differential
-# runner): that runner compares the LIR interpreter against the Lambda Mono tree
-# evaluator, but both derive from the *same* post-SpecConstr program, so a
-# SpecConstr semantic bug perturbs both identically and never diverges. Only a
-# comparison against a lowering that did not run SpecConstr can see these bugs;
-# lir_inline's .none-vs-.wrappers differential (SpecConstr runs only for
-# .wrappers) and its single-mode structural/validator assertions are that
-# comparison.
+# runner): that runner lowers every case with inline mode `.none`, which skips
+# SpecConstr entirely, so both of its oracles execute a program SpecConstr
+# never touched and a SpecConstr bug cannot diverge them. Only a comparison
+# against a lowering that ran SpecConstr can see these bugs; lir_inline's
+# .none-vs-.wrappers differential (SpecConstr runs only for .wrappers) and its
+# single-mode structural/validator assertions are that comparison.
 #
 # A chain-check mutation (delegating an effectful pending across another effect)
 # is deliberately not seeded here: its only observable symptom is reordered

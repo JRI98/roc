@@ -642,11 +642,13 @@ pub const cases = [_]Case{
         ,
     },
 
-    // SpecConstr iterator-fusion sweep: {for, fold} x {static, effect-produced}
-    // x {scalar, record, branch-reassigned carry} x {bare, adapter chain}. The
-    // producer's dbg and per-element dbg tracers put effect count and order
-    // into the compared transcript, so a fusion rewrite that duplicated,
-    // dropped, or reordered an effect diverges loudly.
+    // Iterator-consumer sweep: {for, fold} x {static, effect-produced} x
+    // {scalar, record, branch-reassigned carry} x {bare, adapter chain}. This
+    // harness lowers with inline mode `.none`, so SpecConstr never runs here
+    // and these cases guard the direct solved-to-LIR lowering of iterator
+    // loops, carries, and effect ordering — not the fusion rewrites. Fusion
+    // correctness for the same shapes is guarded by lir_inline's
+    // .none-vs-.wrappers differential and structural tests.
     .{
         .name = "spec_constr: for static list scalar carry",
         .source =

@@ -309,10 +309,11 @@ const CallableShape = struct {
 /// so a strip that ignored the bound would hang on a cycle. A finite value's
 /// pointer-edge chain is far shorter than this cap (known values are bounded to
 /// a few thousand nodes by their derivations), so reaching it means the value
-/// is cyclic: the static matchers decline conservatively and the materializing
-/// and projecting walks — which only ever run on values proven acyclic — treat
-/// it as a compiler bug. See design.md "Core Principles" on bounded post-check
-/// walks.
+/// is cyclic: the static matchers decline conservatively, and the
+/// materializing and reading walks — which only ever run on values proven
+/// acyclic — treat it as a compiler bug via `Common.invariant`, which is a
+/// checked panic only in safety-checked builds. See design.md "Core
+/// Principles" on bounded post-check walks.
 const value_wrapper_strip_cap: usize = 4096;
 
 const Value = union(enum) {
@@ -737,8 +738,11 @@ const Pass = struct {
         }
     }
 
-    /// Debug-only: every `.local` reference in a rewritten body must resolve to
-    /// an in-body binding, a function argument, or a recomputed capture. A
+    /// Debug-only: every `.local` reference in a rewritten body — mirroring
+    /// the reference forms the capture walk consumes, so an
+    /// `uninitialized_payload` condition is exempt exactly as it is there —
+    /// must resolve to an in-body binding, a function argument, or a
+    /// recomputed capture. A
     /// value-substituting rewrite that leaves a reference resolving to a
     /// vanished binding produces no diagnostic until code generation reads an
     /// undeclared register; this walk turns that whole class into a
@@ -3756,7 +3760,10 @@ const Cloner = struct {
     fn deinit(self: *Cloner) void {
         // Every decline path shrinks the bindings it created and every region
         // boundary flushes the rest; a binding surviving to teardown was
-        // emitted nowhere, which drops its evaluation from the program.
+        // emitted nowhere, which drops its evaluation from the program. When
+        // teardown runs on an error path (allocation failure mid-clone), the
+        // stack may legitimately hold bindings the aborted clone never
+        // flushed; compilation is aborting either way.
         if (std.debug.runtime_safety) std.debug.assert(self.pending.items.len == 0);
         self.pending.deinit(self.pass.allocator);
         self.expr_window_starts.deinit();
