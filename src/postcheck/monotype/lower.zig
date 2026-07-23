@@ -9222,6 +9222,17 @@ const BodyContext = struct {
         const region = self.sourceRegionForExpr(expr);
         self.builder.program.current_loc = try self.sourceLocFor(region);
         self.builder.program.current_region = region;
+        if (self.checkedExprDivergesInLoweredRuntime(expr_id)) {
+            // An uncontextual use still has to preserve an explicitly checked
+            // non-returning path. Keep its solved result type when one exists;
+            // a root error is bottom and can use unit until a caller supplies a
+            // more precise expected type through `lowerExprAtType`.
+            const divergent_ty = if (self.view.types.payload(expr.ty) == .err)
+                try self.unitType()
+            else
+                try self.lowerExprType(expr_id);
+            return try self.lowerDivergentExprAtType(expr_id, divergent_ty);
+        }
         switch (expr.data) {
             .runtime_error => return try self.lowerExprWithType(expr_id, try self.unitType()),
             .call => |call| {
@@ -18824,6 +18835,9 @@ const BodyContext = struct {
         const region = self.sourceRegionForExpr(expr);
         self.builder.program.current_loc = try self.sourceLocFor(region);
         self.builder.program.current_region = region;
+        if (self.checkedExprDivergesInLoweredRuntime(checked_expr)) {
+            return try self.lowerDivergentExprAtType(checked_expr, ty);
+        }
         if (try self.restoredHoistedExprAtType(checked_expr, ty)) |restored| return restored;
         switch (expr.data) {
             .runtime_error => return try self.lowerExprWithType(checked_expr, ty),
