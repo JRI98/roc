@@ -9173,6 +9173,10 @@ const BodyContext = struct {
     fn lowerExprType(self: *BodyContext, expr_id: checked.CheckedExprId) Allocator.Error!Type.TypeId {
         const expr = self.view.bodies.expr(expr_id);
         return switch (expr.data) {
+            // A checked runtime error is bottom: it never produces a value, so
+            // an unconstrained occurrence uses unit while contextual lowering
+            // supplies the exact expected type through lowerExprAtType.
+            .runtime_error => try self.unitType(),
             .call => |call| (try self.callResultMonoType(expr.ty, call, null)) orelse try self.lowerTypeView(expr.ty),
             .dispatch_call => |plan| (try self.dispatchResultMonoType(expr.ty, plan, null)) orelse try self.lowerTypeView(expr.ty),
             .interpolation => |interpolation| (try self.dispatchResultMonoType(expr.ty, interpolation.plan, null)) orelse try self.lowerTypeView(expr.ty),
@@ -9219,6 +9223,7 @@ const BodyContext = struct {
         self.builder.program.current_loc = try self.sourceLocFor(region);
         self.builder.program.current_region = region;
         switch (expr.data) {
+            .runtime_error => return try self.lowerExprWithType(expr_id, try self.unitType()),
             .call => |call| {
                 if (self.view.hoisted_constants.lookupByExpr(expr_id) != null) {
                     const expr_ty = try self.lowerExprType(expr_id);
@@ -17010,6 +17015,7 @@ const BodyContext = struct {
             .imported_proc,
             .hosted_proc,
             .platform_required_declaration,
+            .platform_required_checked_error,
             .platform_required_const,
             .platform_required_proc,
             .promoted_top_level_proc,
@@ -17038,6 +17044,7 @@ const BodyContext = struct {
             .imported_proc,
             .hosted_proc,
             .platform_required_declaration,
+            .platform_required_checked_error,
             .platform_required_proc,
             .promoted_top_level_proc,
             => try self.lowerTypeView(checked_ty),
@@ -17142,6 +17149,7 @@ const BodyContext = struct {
             .top_level_const,
             .imported_const,
             .platform_required_declaration,
+            .platform_required_checked_error,
             .platform_required_const,
             => Common.invariant("checked direct call target was not a procedure"),
         };
@@ -17250,6 +17258,7 @@ const BodyContext = struct {
             .imported_proc,
             .hosted_proc,
             .platform_required_declaration,
+            .platform_required_checked_error,
             .platform_required_const,
             .platform_required_proc,
             .promoted_top_level_proc,
@@ -17285,6 +17294,7 @@ const BodyContext = struct {
             .imported_proc,
             .hosted_proc,
             .platform_required_declaration,
+            .platform_required_checked_error,
             .platform_required_const,
             .platform_required_proc,
             .promoted_top_level_proc,
@@ -17317,6 +17327,10 @@ const BodyContext = struct {
         const ref_id = maybe_ref orelse Common.invariant("checked lookup reached Monotype without resolved value ref");
         const record = self.view.resolved_refs.records[@intFromEnum(ref_id)];
         switch (record.ref) {
+            .platform_required_checked_error => return try self.runtimeCrashExpr(ty, "platform requirement failed checking"),
+            else => {},
+        }
+        switch (record.ref) {
             .local_value,
             .pattern_binder,
             => {},
@@ -17332,6 +17346,7 @@ const BodyContext = struct {
             .imported_proc,
             .hosted_proc,
             .platform_required_declaration,
+            .platform_required_checked_error,
             .platform_required_const,
             .platform_required_proc,
             .promoted_top_level_proc,
@@ -17376,6 +17391,7 @@ const BodyContext = struct {
             .imported_proc,
             .hosted_proc,
             .platform_required_declaration,
+            .platform_required_checked_error,
             .platform_required_proc,
             .promoted_top_level_proc,
             => {},
@@ -17401,6 +17417,7 @@ const BodyContext = struct {
             .platform_required_const,
             => unreachable,
             .platform_required_declaration => Common.invariant("platform required declaration reached Monotype without a binding"),
+            .platform_required_checked_error => return try self.runtimeCrashExpr(ty, "platform requirement failed checking"),
         };
         return try self.addExpr(.{ .ty = ty, .data = data });
     }
@@ -18809,6 +18826,7 @@ const BodyContext = struct {
         self.builder.program.current_region = region;
         if (try self.restoredHoistedExprAtType(checked_expr, ty)) |restored| return restored;
         switch (expr.data) {
+            .runtime_error => return try self.lowerExprWithType(checked_expr, ty),
             .call => |call| {
                 if (try self.lowerParseIntrinsicCallExpr(checked_expr, expr.ty, call, ty)) |lowered| return lowered;
                 try self.constrainKnownType(expr.ty, ty);
@@ -25609,7 +25627,11 @@ const BodyContext = struct {
         checked_expr_id: checked.CheckedExprId,
         ty: Type.TypeId,
     ) Allocator.Error!BodyExprData {
-        const effect_ty = try self.lowerExprType(checked_expr_id);
+        // The checked divergence bit proves this expression never yields its
+        // source value. Lower only its observable path at unit; requiring a
+        // monotype for an erroneous source type would discard the explicit
+        // non-returning behavior carried by checked runtime_error data.
+        const effect_ty = try self.unitType();
         const effect = try self.lowerDivergentExprAtType(checked_expr_id, effect_ty);
         const stmt = try self.addStmt(.{ .expr = effect });
         return .{ .block = .{
@@ -25657,6 +25679,7 @@ const BodyContext = struct {
         const checked_expr = self.view.bodies.expr(checked_expr_id);
         return switch (checked_expr.data) {
             .crash => |msg| .{ .crash = try self.lowerStringLiteral(msg) },
+            .runtime_error => .{ .crash = try self.addStringLiteral("runtime error") },
             .ellipsis => .{ .crash = try self.addStringLiteral("not implemented") },
             .break_ => try self.breakCurrentLoopExprData(),
             .return_ => |ret| .{ .return_ = try self.lowerReturn(ret) },
@@ -25735,7 +25758,6 @@ const BodyContext = struct {
             .interpolation,
             .method_eq,
             .type_dispatch_call,
-            .runtime_error,
             .anno_only,
             .hosted_lambda,
             => Common.invariant("non-divergent checked expression reached divergent lowering"),
@@ -25815,6 +25837,7 @@ const BodyContext = struct {
             .ellipsis,
             .break_,
             .return_,
+            .runtime_error,
             => true,
             .str => |items| self.checkedAnyExprDivergesInLoweredRuntime(items),
             .list => |items| self.checkedAnyExprDivergesInLoweredRuntime(items),
@@ -25892,7 +25915,6 @@ const BodyContext = struct {
             .interpolation,
             .method_eq,
             .type_dispatch_call,
-            .runtime_error,
             .anno_only,
             .hosted_lambda,
             => false,
@@ -26916,6 +26938,13 @@ const BodyContext = struct {
         expr: checked.CheckedExprId,
         source_region: base.Region,
     ) Allocator.Error!DraftStmt {
+        // The initializer is explicit checked bottom. It never produces a value
+        // to bind, so emitting a pattern would incorrectly require a monotype
+        // for its deliberately erroneous source type.
+        if (self.view.bodies.expr(expr).data == .runtime_error) {
+            const unit_ty = try self.unitType();
+            return .{ .expr = try self.lowerExprAtType(expr, unit_ty) };
+        }
         const value = try self.lowerExpr(expr);
         const value_ty = try self.exprType(value);
         const comptime_site = if (self.shouldRecordComptimeSite(.destructure) and self.patternCanMiss(pattern))

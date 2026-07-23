@@ -232,14 +232,25 @@ pub const CanonicalizedResult = struct {
     canonicalize_diagnostics_ns: u64,
 };
 
-/// Result of successfully type-checking a module
+pub const TypeCheckedPublication = union(enum) {
+    published: CheckedArtifact.CheckedModuleArtifact,
+    deferred: *DeferredPublicationState,
+};
+
+/// Result of successfully type-checking a module.
+/// User diagnostics do not alter this outcome: publication is either complete
+/// or explicitly deferred until platform/app relation finalization.
 pub const OwnedSemanticModuleData = struct {
     module_env: *ModuleEnv,
-    checked_artifact: ?CheckedArtifact.CheckedModuleArtifact = null,
-    user_errors_allow_lowering: bool = false,
+    publication: TypeCheckedPublication,
+    publication_owned: bool = true,
 
     pub fn deinit(self: *OwnedSemanticModuleData) void {
-        if (self.checked_artifact) |*artifact| artifact.deinit(artifact.canonical_names.allocator);
+        if (!self.publication_owned) return;
+        switch (self.publication) {
+            .published => |*artifact| artifact.deinit(artifact.canonical_names.allocator),
+            .deferred => |state| state.deinit(),
+        }
     }
 };
 
@@ -261,13 +272,6 @@ pub const TypeCheckedResult = struct {
     type_check_ns: u64,
     /// Timing: nanoseconds spent on diagnostics
     check_diagnostics_ns: u64,
-    /// True when a clean check produced no artifact because publication was
-    /// deferred to finalization (the platform root of an app build); lets the
-    /// coordinator distinguish deferral from an artifact-blocking failure.
-    publication_deferred: bool = false,
-    /// Owned checking-finalization state retained until the relation-bearing
-    /// platform artifact is published. Null for every non-deferred module.
-    deferred_publication: ?*DeferredPublicationState = null,
 };
 
 /// Complete checker-owned continuation for a module whose checked artifact is
@@ -437,7 +441,6 @@ pub const WorkerResult = union(enum) {
                 r.reports.deinit(gpa);
             },
             .type_checked => |*r| {
-                if (r.deferred_publication) |state| state.deinit();
                 r.semantic.deinit();
                 gpa.destroy(r.semantic);
                 for (r.reports.items) |*rep| rep.deinit();

@@ -5302,10 +5302,8 @@ fn checkFileInternal(self: *Self, skip_numeric_defaults: bool) std.mem.Allocator
     // (top-level defs and local bindings) for infinite types
     try self.checkBindingRootsForInfiniteTypes();
 
-    if (!self.hasCanErrorDiagnostics()) {
-        try self.poisonErroneousValueUses();
-        try self.poisonErroneousValueExprs();
-    }
+    try self.poisonErroneousValueUses();
+    try self.poisonErroneousValueExprs();
 
     try self.reportPolymorphicTopLevelValues();
 
@@ -6599,6 +6597,48 @@ fn constraintIntroExpr(constraint: StaticDispatchConstraint) ?CIR.Expr.Idx {
     return @enumFromInt(raw);
 }
 
+/// The source expression whose checked value becomes invalid when this
+/// dispatch constraint fails. Ordinary dispatch records it in provenance;
+/// literal conversions own it through their checked literal plan.
+fn constraintSourceExpr(
+    self: *Self,
+    dispatcher_var: Var,
+    constraint: StaticDispatchConstraint,
+) ?CIR.Expr.Idx {
+    if (constraintIntroExpr(constraint)) |expr_idx| return expr_idx;
+    const literal_kind = constraint.origin.literalKind() orelse return null;
+    if (literal_kind == .interpolation) return null;
+
+    const dispatcher_root = self.types.resolveVar(dispatcher_var).var_;
+    for (self.cir.store.literalDispatchPlans()) |plan| {
+        const kind_matches = switch (literal_kind) {
+            .numeral => plan.dispatchKind() == .numeral,
+            .quote => plan.dispatchKind() == .quote,
+            .interpolation => unreachable,
+        };
+        if (!kind_matches) continue;
+        if (self.types.resolveVar(@enumFromInt(plan.target_var)).var_ != dispatcher_root) continue;
+        const node_idx: CIR.Node.Idx = @enumFromInt(plan.node_idx);
+        if (!isExprNodeTag(self.cir.store.nodes.get(node_idx).tag)) continue;
+        return @enumFromInt(plan.node_idx);
+    }
+    return null;
+}
+
+fn poisonConstraintSourceExpr(
+    self: *Self,
+    dispatcher_var: Var,
+    constraint: StaticDispatchConstraint,
+) Allocator.Error!void {
+    const expr_idx = self.constraintSourceExpr(dispatcher_var, constraint) orelse return;
+    if (self.cir.store.getExpr(expr_idx) == .e_runtime_error) return;
+    const diagnostic_idx = try self.cir.addDiagnostic(.{ .erroneous_value_expr = .{
+        .region = self.cir.store.getExprRegion(expr_idx),
+    } });
+    try self.replaceExprWithRuntimeError(expr_idx, diagnostic_idx);
+    try self.erroneous_value_exprs.put(self.gpa, expr_idx, {});
+}
+
 /// Record a dispatch-constrained receiver on the ambiguity worklist (see
 /// `ambiguity_candidates`). The var is stored as recorded and resolved through
 /// the union-find at judgment time, so receivers merged by later unification
@@ -7045,10 +7085,10 @@ fn applyInstantiationAmbiguityVerdict(self: *Self, verdict: AmbiguityVerdict) st
                 try self.replaceExprWithRuntimeError(inst_expr, diagnostic_idx);
             }
         } else {
-            // A dispatcher created outside `checkExpr` has no recorded source
-            // expression to mark. This report must remain artifact-blocking for
-            // run paths because there is no explicit runtime-error node for
-            // post-check lowering to consume.
+            // A constraint with no source expression cannot be executed
+            // directly. It still reports at its checked type region; any
+            // concrete value use that forces it is poisoned by the use-site
+            // paths above.
             primary = self.getRegionAt(verdict.var_);
         }
     } else {
@@ -13490,7 +13530,14 @@ fn checkExpr(self: *Self, expr_idx: CIR.Expr.Idx, env: *Env, expected: Expected)
     // Check if we have an annotation
     if (mb_anno_vars) |anno_vars| {
         // Unify the anno with the expr var
-        _ = try self.unifyInContext(anno_vars.anno_var, expr_var, env, anno_vars.context);
+        const annotation_result = try self.unifyInContext(anno_vars.anno_var, expr_var, env, anno_vars.context);
+        if (annotation_result.isProblem()) {
+            // The diagnostic belongs to checking, but later stages need an
+            // explicit executable value. End-of-check poisoning replaces this
+            // expression with a runtime error while the binding retains the
+            // annotation's checked type for all independent consumers.
+            try self.erroneous_value_exprs.put(self.gpa, expr_idx, {});
+        }
 
         // Check if the expression type contains any errors anywhere in its
         // structure. If it does and we have an annotation, use the annotation
@@ -15323,6 +15370,7 @@ fn checkMatchExpr(
         } });
         if (!try_result.isOk()) {
             has_invalid_try = true;
+            had_type_error = true;
         } else if (expected.returnResult()) |expected_return| {
             if (self.tryConditionIsDirectHostedCall(match.cond)) {
                 try self.widenTryConditionForExpectedReturn(cond_var, expected_return, env, expr_region);
@@ -15381,6 +15429,7 @@ fn checkMatchExpr(
             const guard_var = ModuleEnv.varFrom(guard_idx);
             const guard_bool_var = try self.freshBool(env, expr_region);
             const guard_result = try self.unifyInContext(guard_bool_var, guard_var, env, .if_condition);
+            if (!guard_result.isOk()) had_type_error = true;
             if (!match.skip_exhaustiveness and guard_result.isOk()) {
                 try self.warnIfComptimeConditionalExpr(guard_idx, .if_guard, expected);
             }
@@ -15439,6 +15488,7 @@ fn checkMatchExpr(
             const guard_var = ModuleEnv.varFrom(guard_idx);
             const branch_guard_bool_var = try self.freshBool(env, expr_region);
             const guard_result = try self.unifyInContext(branch_guard_bool_var, guard_var, env, .if_condition);
+            if (!guard_result.isOk()) had_type_error = true;
             if (!match.skip_exhaustiveness and guard_result.isOk()) {
                 try self.warnIfComptimeConditionalExpr(guard_idx, .if_guard, expected);
             }
@@ -15465,6 +15515,7 @@ fn checkMatchExpr(
             } });
 
             if (!branch_result.isOk()) {
+                had_type_error = true;
                 // If there was a body mismatch, do not check other branches to stop
                 // cascading errors. But still check each other branch's sub types
                 for (branch_idxs[branch_cur_index + 1 ..], branch_cur_index + 1..) |other_branch_idx, other_branch_cur_index| {
@@ -15603,6 +15654,14 @@ fn checkMatchExpr(
                 .problem_branch_index = idx,
             } });
         }
+    }
+
+    // A match whose pattern matrix, guard contract, or branch result failed to
+    // type-check has no valid decision tree to lower. Preserve the diagnostic
+    // and publish the match itself as the exact executable crash boundary;
+    // independent expressions and functions remain fully compilable.
+    if (had_type_error) {
+        try self.erroneous_value_exprs.put(self.gpa, expr_idx, {});
     }
 
     return does_fx;
@@ -19801,6 +19860,7 @@ fn satisfyBuiltinStrInterpolation(
     if (did_err) {
         try self.unifyWith(dispatcher_var, .err, env);
         try self.markConstraintFunctionAsError(constraint, env);
+        try self.poisonConstraintSourceExpr(dispatcher_var, constraint);
     }
     return true;
 }
@@ -19836,6 +19896,10 @@ fn ensureCustomInterpolationPartsChecked(
 
     if (did_err) {
         try self.markConstraintFunctionAsError(constraint, env);
+        // Interpolation constraints always retain their introducing expression
+        // in provenance, so the function var is only a placeholder for the
+        // dispatcher parameter that constraintSourceExpr does not consult.
+        try self.poisonConstraintSourceExpr(constraint.fn_var, constraint);
     }
 }
 
@@ -20961,6 +21025,7 @@ fn reportInvalidBuiltinFromNumeralLiteral(
     const num_literal = constraint.origin.numeralInfo() orelse return false;
     if (!try self.reportInvalidBuiltinFromNumeralInfo(dispatcher_var, num_kind, num_literal, env)) return false;
 
+    try self.poisonConstraintSourceExpr(dispatcher_var, constraint);
     try self.markConstraintFunctionAsError(constraint, env);
     return true;
 }
@@ -21004,6 +21069,7 @@ fn reportUnmaterializableNumeralLiteral(
         .region = num_literal.region,
     } });
 
+    try self.poisonConstraintSourceExpr(dispatcher_var, constraint);
     try self.unifyWith(dispatcher_var, .err, env);
     try self.markConstraintFunctionAsError(constraint, env);
     return true;
@@ -23496,28 +23562,6 @@ fn flatTypeContainsError(self: *Self, flat_type: FlatType, visited: *std.AutoHas
     };
 }
 
-fn hasCanErrorDiagnostics(self: *Self) bool {
-    const diagnostics = self.cir.store.sliceDiagnostics(self.cir.diagnostics);
-    for (diagnostics) |diagnostic_idx| {
-        const diagnostic = self.cir.store.getDiagnostic(diagnostic_idx);
-        switch (diagnostic) {
-            .shadowing_warning,
-            .unused_variable,
-            .used_underscore_variable,
-            .type_shadowed_warning,
-            .builtin_type_shadowed_warning,
-            .unused_type_var_name,
-            .type_var_marked_unused,
-            .underscore_in_type_declaration,
-            .module_header_deprecated,
-            .deprecated_number_suffix,
-            => {},
-            else => return true,
-        }
-    }
-    return false;
-}
-
 /// Check if any of the given vars contain errors
 fn varsContainError(self: *Self, vars: []const Var, visited: *std.AutoHashMap(Var, void)) std.mem.Allocator.Error!bool {
     for (vars) |v| {
@@ -23637,6 +23681,7 @@ fn reportConstraintError(
     };
     const dedup_entry = try self.reported_constraint_errors.getOrPut(dedup_key);
     if (dedup_entry.found_existing) {
+        try self.poisonConstraintSourceExpr(dispatcher_var, constraint);
         try self.markConstraintFunctionAsError(constraint, env);
         return;
     }
@@ -23673,6 +23718,7 @@ fn reportConstraintError(
     };
     _ = try self.problems.appendProblem(self.cir.gpa, constraint_problem);
 
+    try self.poisonConstraintSourceExpr(dispatcher_var, constraint);
     try self.markConstraintFunctionAsError(constraint, env);
 }
 
@@ -23693,6 +23739,7 @@ fn reportEqualityError(
     } };
     _ = try self.problems.appendProblem(self.cir.gpa, equality_problem);
 
+    try self.poisonConstraintSourceExpr(dispatcher_var, constraint);
     try self.markConstraintFunctionAsError(constraint, env);
 }
 
@@ -23711,6 +23758,7 @@ fn reportDerivedMapError(
         },
     } });
 
+    try self.poisonConstraintSourceExpr(dispatcher_var, constraint);
     try self.markConstraintFunctionAsError(constraint, env);
 }
 

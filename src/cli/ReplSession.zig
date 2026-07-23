@@ -601,6 +601,21 @@ const DefinitionValidation = struct {
     error_message: ?[]u8,
 };
 
+fn parsedResourcesHaveDiagnostics(parsed: *const eval.test_helpers.ParsedResources) Allocator.Error!bool {
+    if (parsed.checker.problems.problems.items.len > 0) return true;
+    const main_diagnostics = try parsed.module_env.getDiagnostics();
+    defer parsed.module_env.gpa.free(main_diagnostics);
+    if (main_diagnostics.len > 0) return true;
+
+    for (parsed.extra_modules) |*module| {
+        if (module.checker.problems.problems.items.len > 0) return true;
+        const diagnostics = try module.module_env.getDiagnostics();
+        defer module.module_env.gpa.free(diagnostics);
+        if (diagnostics.len > 0) return true;
+    }
+    return false;
+}
+
 fn validateDefinitions(self: *ReplSession, report_config: reporting.ReportingConfig) Allocator.Error!DefinitionValidation {
     const definitions = try self.definitionsSource();
     defer self.allocator.free(definitions);
@@ -621,8 +636,16 @@ fn validateDefinitions(self: *ReplSession, report_config: reporting.ReportingCon
         import_sources,
         self.prePublishedBuiltin(),
         self.roc_ctx,
-    )) |parsed| {
-        eval.test_helpers.cleanupParseAndCanonical(self.allocator, parsed);
+    )) |parsed_value| {
+        var parsed = parsed_value;
+        defer parsed.deinit(self.allocator);
+        if (try parsedResourcesHaveDiagnostics(&parsed)) {
+            const msg = self.renderModuleProblems(source, import_sources, report_config) catch |render_err| switch (render_err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                else => return .{ .valid = false, .error_message = null },
+            };
+            return .{ .valid = false, .error_message = msg };
+        }
         return .{ .valid = true, .error_message = null };
     } else |err| switch (err) {
         error.TypeCheckError => {

@@ -1066,7 +1066,7 @@ fn publishProgramForComptimeProblemsImpl(
     imports: []const ModuleSource,
     pre_published_builtin: ?PrePublishedBuiltin,
 ) TestHelperError!ComptimePublishOutcome {
-    const resources = parseAndCanonicalizeProgramWithRootModeReporting(
+    const resources = try parseAndCanonicalizeProgramWithRootModeReporting(
         allocator,
         source_kind,
         source,
@@ -1076,10 +1076,7 @@ fn publishProgramForComptimeProblemsImpl(
         pre_published_builtin,
         .report_comptime_problems,
         null,
-    ) catch |err| switch (err) {
-        error.CompileTimeProblem => return .comptime_problems,
-        else => return err,
-    };
+    );
     defer cleanupParseAndCanonical(allocator, resources);
 
     return if (resources.checker.problems.problems.items.len == 0)
@@ -1090,10 +1087,8 @@ fn publishProgramForComptimeProblemsImpl(
 
 /// Publish a program with compile-time evaluation problems routed into each
 /// module's checker problem store and return the full resources for tests that
-/// need to inspect which module received which diagnostic. Unlike
-/// `publishProgramForComptimeProblems`, this only returns resources when
-/// publishing completes without a blocking compile-time problem; crashing roots
-/// and failed expects still return `error.CompileTimeProblem`.
+/// need to inspect which module received which diagnostic. Crashing roots and
+/// failed expects publish explicit crash constants and return their resources.
 pub fn publishProgramKeepingReportedComptimeProblems(
     allocator: Allocator,
     source_kind: SourceKind,
@@ -1122,20 +1117,6 @@ const ComptimeProblemReporting = enum {
     ignore_comptime_problems,
     report_comptime_problems,
 };
-
-fn problemBlocksCheckedArtifact(problem: check.problem.Problem) bool {
-    return switch (problem) {
-        .effectful_function_name, .redundant_pattern, .unmatchable_pattern, .comptime_unused_branch, .comptime_condition, .literal_defaulted => false,
-        else => true,
-    };
-}
-
-fn checkedModuleHasArtifactBlockingProblems(module: *const CheckedModule) bool {
-    for (module.checker.problems.problems.items) |problem| {
-        if (problemBlocksCheckedArtifact(problem)) return true;
-    }
-    return module.module_env.types.containsErrContent();
-}
 
 fn parseAndCanonicalizeProgramWithRootMode(
     allocator: Allocator,
@@ -1229,10 +1210,6 @@ fn parseAndCanonicalizeProgramWithRootModeReporting(
             available_imports,
             roc_ctx,
         );
-        if (checkedModuleHasArtifactBlockingProblems(&checked)) {
-            cleanupCheckedModule(allocator, checked);
-            return error.TypeCheckError;
-        }
         try extra_modules.append(allocator, checked);
     }
 
@@ -1271,10 +1248,6 @@ fn parseAndCanonicalizeProgramWithRootModeReporting(
         roc_ctx,
     );
     errdefer cleanupCheckedModule(allocator, main_checked);
-    if (checkedModuleHasArtifactBlockingProblems(&main_checked)) {
-        return error.TypeCheckError;
-    }
-
     var all_module_envs = try allocator.alloc(*ModuleEnv, extra_modules.items.len + 2);
     defer allocator.free(all_module_envs);
     all_module_envs[0] = main_checked.module_env;

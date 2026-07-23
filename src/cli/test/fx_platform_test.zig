@@ -738,25 +738,11 @@ test "fx platform string interpolation type mismatch (interpreter)" {
     const run_result = try util.runRocCommand(std.testing.io, allocator, &.{
         "--opt=interpreter",
         "test/fx/num_method_call.roc",
-        "--allow-errors",
     });
     defer allocator.free(run_result.stdout);
     defer allocator.free(run_result.stderr);
 
-    // `--allow-errors` may exit successfully after reporting diagnostics, but
-    // it must not publish checked artifacts or run LIR for an erroneous graph.
-    switch (run_result.term) {
-        .exited => |code| {
-            try testing.expectEqual(@as(u8, 0), code);
-        },
-        else => {
-            std.debug.print("Run terminated abnormally: {}\n", .{run_result.term});
-            std.debug.print("STDOUT: {s}\n", .{run_result.stdout});
-            std.debug.print("STDERR: {s}\n", .{run_result.stderr});
-            return error.RunFailed;
-        },
-    }
-
+    try util.checkFailure(run_result);
     try testing.expectEqualStrings("", run_result.stdout);
 
     // Verify the error output contains proper diagnostic info
@@ -765,6 +751,7 @@ test "fx platform string interpolation type mismatch (interpreter)" {
     try testing.expect(std.mem.find(u8, run_result.stderr, "U8") != null);
     try testing.expect(std.mem.find(u8, run_result.stderr, "Str") != null);
     try testing.expect(std.mem.find(u8, run_result.stderr, "1 error") != null);
+    try testing.expect(std.mem.find(u8, run_result.stderr, "Roc crashed:") != null);
 }
 
 test "fx platform string interpolation type mismatch (dev backend)" {
@@ -775,25 +762,11 @@ test "fx platform string interpolation type mismatch (dev backend)" {
     const run_result = try util.runRocCommand(std.testing.io, allocator, &.{
         "--opt=dev",
         "test/fx/num_method_call.roc",
-        "--allow-errors",
     });
     defer allocator.free(run_result.stdout);
     defer allocator.free(run_result.stderr);
 
-    // `--allow-errors` may exit successfully after reporting diagnostics, but
-    // it must not publish checked artifacts or run LIR for an erroneous graph.
-    switch (run_result.term) {
-        .exited => |code| {
-            try testing.expectEqual(@as(u8, 0), code);
-        },
-        else => {
-            std.debug.print("Run terminated abnormally: {}\n", .{run_result.term});
-            std.debug.print("STDOUT: {s}\n", .{run_result.stdout});
-            std.debug.print("STDERR: {s}\n", .{run_result.stderr});
-            return error.RunFailed;
-        },
-    }
-
+    try util.checkFailure(run_result);
     try testing.expectEqualStrings("", run_result.stdout);
 
     // Verify the error output contains proper diagnostic info
@@ -802,6 +775,7 @@ test "fx platform string interpolation type mismatch (dev backend)" {
     try testing.expect(std.mem.find(u8, run_result.stderr, "U8") != null);
     try testing.expect(std.mem.find(u8, run_result.stderr, "Str") != null);
     try testing.expect(std.mem.find(u8, run_result.stderr, "1 error") != null);
+    try testing.expect(std.mem.find(u8, run_result.stderr, "Roc crashed:") != null);
 }
 
 test "fx platform run from different cwd" {
@@ -1065,23 +1039,21 @@ test "fx platform issue8433" {
     }
 }
 
-test "run aborts on type errors by default" {
-    // Tests that the default roc command aborts when there are type errors (without --allow-errors)
+test "run executes until it reaches a checked error by default" {
     const allocator = testing.allocator;
 
     const run_result = try util.runRoc(std.testing.io, allocator, &.{}, "test/fx/run_allow_errors.roc");
     defer allocator.free(run_result.stdout);
     defer allocator.free(run_result.stderr);
 
-    // Should fail with type errors
     try util.checkFailure(run_result);
-
-    // Should show the errors
     try testing.expect(std.mem.find(u8, run_result.stderr, "NAME NOT IN SCOPE") != null);
+    try testing.expect(std.mem.find(u8, run_result.stdout, "Hello, World!") != null);
+    try testing.expect(std.mem.find(u8, run_result.stderr, "Roc crashed:") != null);
 }
 
 test "run aborts on parse errors by default" {
-    // Tests that the default roc command aborts when there are parse errors (without --allow-errors)
+    // Parsing recovery has not produced executable checked input for this file.
     const allocator = testing.allocator;
 
     const run_result = try util.runRoc(std.testing.io, allocator, &.{}, "test/fx/parse_error.roc");
@@ -1095,8 +1067,7 @@ test "run aborts on parse errors by default" {
     try testing.expect(std.mem.find(u8, run_result.stderr, "UNEXPECTED STATEMENT") != null);
 }
 
-test "run with --allow-errors attempts execution despite type errors" {
-    // Tests that `roc --allow-errors` attempts to execute even with type errors.
+test "run executes until it reaches a checked error in an explicit backend" {
     // TODO: remove Windows workaround once the shared LIR image path
     // handles crash-on-type-error consistently on Windows.
     const opt_flag: []const u8 = if (@import("builtin").os.tag == .windows) "--opt=interpreter" else "--opt=dev";
@@ -1105,7 +1076,6 @@ test "run with --allow-errors attempts execution despite type errors" {
     const run_result = try util.runRocCommand(std.testing.io, allocator, &.{
         opt_flag,
         "test/fx/run_allow_errors.roc",
-        "--allow-errors",
     });
     defer allocator.free(run_result.stdout);
     defer allocator.free(run_result.stderr);
@@ -1113,13 +1083,13 @@ test "run with --allow-errors attempts execution despite type errors" {
     // Should still show the errors
     try testing.expect(std.mem.find(u8, run_result.stderr, "NAME NOT IN SCOPE") != null);
 
-    // The program will attempt to run and likely crash, which is expected behavior
-    // We just verify it didn't abort during type checking
+    try testing.expect(std.mem.find(u8, run_result.stdout, "Hello, World!") != null);
+    try testing.expect(std.mem.find(u8, run_result.stderr, "Roc crashed:") != null);
 }
 
-test "run with --allow-errors handles type mismatch in function args" {
+test "run handles a checked type mismatch in function args" {
     // Regression test for https://github.com/roc-lang/roc/issues/9263
-    // The dev backend crashed (SIGABRT) when --allow-errors was used on code
+    // The dev backend crashed (SIGABRT) on code
     // where a type mismatch in a function argument caused the return type to
     // become an error type variable nested inside a function type.
     const allocator = testing.allocator;
@@ -1127,7 +1097,6 @@ test "run with --allow-errors handles type mismatch in function args" {
     const run_result = try util.runRocCommand(std.testing.io, allocator, &.{
         "--opt=dev",
         "test/fx/allow_errors_type_mismatch.roc",
-        "--allow-errors",
     });
     defer allocator.free(run_result.stdout);
     defer allocator.free(run_result.stderr);
