@@ -5745,6 +5745,49 @@ test "issue 10317 loop-carried reassignment keeps root arg count" {
     );
 }
 
+test "iterdiff: issue 10317 branch-reassigned carry agrees across inline modes" {
+    try expectSameObservationsAcrossInlineModes(
+        \\main : I64
+        \\main = {
+        \\    var $x = 0
+        \\    var $y = 0
+        \\    for flag in [Bool.False, Bool.True, Bool.False] {
+        \\        $y = if flag {
+        \\            $x = $x + 1
+        \\            $x
+        \\        } else {
+        \\            $y
+        \\        }
+        \\    }
+        \\    dbg $x
+        \\    dbg $y
+        \\    $x * 10 + $y
+        \\}
+    );
+}
+
+test "iterdiff: match-reassigned carry agrees across inline modes" {
+    try expectSameObservationsAcrossInlineModes(
+        \\main : I64
+        \\main = {
+        \\    var $x = 0
+        \\    var $y = 0
+        \\    for v in [1.I64, 0, 2, 0] {
+        \\        $y = match v {
+        \\            0 => $y
+        \\            n => {
+        \\                $x = $x + n
+        \\                $x
+        \\            }
+        \\        }
+        \\    }
+        \\    dbg $x
+        \\    dbg $y
+        \\    $x * 10 + $y
+        \\}
+    );
+}
+
 test "sequential effect-produced for-loops both scalarize" {
     const allocator = std.testing.allocator;
     const source =
