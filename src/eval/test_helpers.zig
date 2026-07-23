@@ -1436,6 +1436,7 @@ pub fn parseCheckModule(
             .env = available.env,
             .statement_idx = available.statement_idx,
             .qualified_type_ident = qualified_ident,
+            .import_identity = .{ .module = import_ident },
         });
     }
 
