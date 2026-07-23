@@ -448,6 +448,7 @@ str_trim_end_import: ?u32 = null,
 str_split_import: ?u32 = null,
 str_join_with_import: ?u32 = null,
 str_split_first_import: ?u32 = null,
+str_split_last_import: ?u32 = null,
 str_drop_prefix_caseless_ascii_import: ?u32 = null,
 str_reserve_import: ?u32 = null,
 str_release_excess_capacity_import: ?u32 = null,
@@ -731,6 +732,7 @@ fn hostBuiltinImports(self: *const Self) HostBuiltinImports {
             .float_from_str => self.float_from_str_import,
             .str_equal => self.str_eq_import,
             .str_split_first => self.str_split_first_import,
+            .str_split_last => self.str_split_last_import,
             .str_concat => self.str_concat_import,
             .str_repeat => self.str_repeat_import,
             .str_trim => self.str_trim_import,
@@ -1920,6 +1922,10 @@ fn registerHostImports(self: *Self) Allocator.Error!void {
     const str_split_first_type = try self.module.addFuncType(&.{ .i32, .i32, .i32, .i32, .i32, .i32 }, &.{});
     self.str_split_first_import = try self.module.addImport("env", "roc_str_split_first", str_split_first_type);
 
+    // roc_str_split_last: (source, delimiter, result, after_off, before_off, found_off) -> void
+    const str_split_last_type = try self.module.addFuncType(&.{ .i32, .i32, .i32, .i32, .i32, .i32 }, &.{});
+    self.str_split_last_import = try self.module.addImport("env", "roc_str_split_last", str_split_last_type);
+
     // roc_str_drop_prefix_caseless_ascii: (source, prefix, result, after_off, found_off) -> void
     const str_drop_prefix_caseless_ascii_type = try self.module.addFuncType(&.{ .i32, .i32, .i32, .i32, .i32 }, &.{});
     self.str_drop_prefix_caseless_ascii_import = try self.module.addImport("env", "roc_str_drop_prefix_caseless_ascii", str_drop_prefix_caseless_ascii_type);
@@ -1933,6 +1939,7 @@ fn registerHostImports(self: *Self) Allocator.Error!void {
 pub const GenerateResult = struct {
     wasm_bytes: []u8,
     result_layout: layout.Idx,
+    heap_base: u32,
     has_imports: bool = false,
 };
 
@@ -2148,10 +2155,43 @@ pub fn generateEntrypointWrapper(
 
 /// Generate a complete wasm module for a zero-argument root proc.
 /// The exported `main` function initializes RocOps and tail-calls the root proc.
-pub fn generateModule(self: *Self, root_proc_id: LIR.LirProcSpecId, result_layout: layout.Idx) Allocator.Error!GenerateResult {
+/// Builtin call sites target definitions merged from `wasm32_builtins_object`.
+/// Dead-code elimination removes the superseded builtin callback imports, so
+/// the encoded module retains only the reachable platform runtime callbacks.
+pub fn generateModule(
+    self: *Self,
+    root_proc_id: LIR.LirProcSpecId,
+    result_layout: layout.Idx,
+    wasm32_builtins_object: []const u8,
+) Allocator.Error!GenerateResult {
+    // generateModule always runs data DCE, so every generated static-data
+    // address must carry the relocation edge that makes its segment live.
+    self.configureStaticDataAddressTracking();
+
     // Register host function imports (must be done before addFunction calls)
     self.registerHostImports() catch return error.OutOfMemory;
     self.registerHostedSymbolTargets(self.store.getProcSpecs()) catch return error.OutOfMemory;
+
+    if (wasm32_builtins_object.len == 0) {
+        wasmInvariantFmt("WASM/codegen invariant violated: eval builtin object is empty", .{});
+    }
+
+    var builtins_module = WasmModule.preload(self.allocator, wasm32_builtins_object, true) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => wasmInvariantFmt("WASM/codegen invariant violated: invalid eval builtin object: {s}", .{@errorName(err)}),
+    };
+    defer builtins_module.deinit();
+
+    var merge_result = self.module.mergeModule(&builtins_module) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => wasmInvariantFmt("WASM/codegen invariant violated: eval builtin merge failed: {s}", .{@errorName(err)}),
+    };
+    merge_result.deinit();
+
+    const builtin_symbols = BuiltinSignatures.populateForRelocs(&self.module) catch {
+        wasmInvariantFmt("WASM/codegen invariant violated: merged eval module is missing a builtin symbol", .{});
+    };
+    self.configureBuiltinRelocs(builtin_symbols);
 
     // Compile all procedures before the synthetic main wrapper.
     const proc_specs = self.store.getProcSpecs();
@@ -2275,15 +2315,30 @@ pub fn generateModule(self: *Self, root_proc_id: LIR.LirProcSpecId, result_layou
     self.currentCode().append(self.allocator, Op.end) catch return error.OutOfMemory;
     self.endFunction();
     try self.flushPendingBodies();
+    self.module.addExport("main", .func, func_idx) catch return error.OutOfMemory;
+    self.module.resolveRelocations() catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.InvalidRelocation => wasmInvariantFmt("WASM/codegen invariant violated: eval builtin relocation failed", .{}),
+    };
+
+    const called_fns = self.allocator.alloc(bool, self.module.liveFunctionCount()) catch return error.OutOfMemory;
+    defer self.allocator.free(called_fns);
+    @memset(called_fns, false);
+    self.module.eliminateDeadCode(called_fns) catch return error.OutOfMemory;
+    self.module.verifyNoBuiltinImports() catch {
+        wasmInvariantFmt("WASM/codegen invariant violated: eval module retains a builtin host import", .{});
+    };
     try self.module.materializeFuncBodies();
 
-    self.module.addExport("main", .func, func_idx) catch return error.OutOfMemory;
-
-    const wasm_bytes = self.module.encode(self.allocator) catch return error.OutOfMemory;
+    const wasm_bytes = self.module.encode(self.allocator) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.NonZeroZeroFillSegment => wasmInvariantFmt("WASM/codegen invariant violated: eval module contains nonzero omitted data", .{}),
+    };
 
     return .{
         .wasm_bytes = wasm_bytes,
         .result_layout = result_layout,
+        .heap_base = self.module.heapBase(),
         .has_imports = self.module.importCount() > 0,
     };
 }
@@ -10741,6 +10796,7 @@ fn generateLowLevel(self: *Self, ll: anytype) Allocator.Error!void {
     const args = self.store.getLocalSpan(ll.args);
 
     switch (ll.op) {
+        .num_plus_wrap, .num_minus_wrap, .num_times_wrap => unreachable,
         // Numeric operations (arithmetic, comparisons, shifts)
         .num_plus,
         .num_plus_checked,
@@ -12153,6 +12209,64 @@ fn generateLowLevel(self: *Self, ll: anytype) Allocator.Error!void {
                 try self.emitI32Const(@intCast(found_offset));
             }
             try self.emitBuiltinCall(BuiltinSignatures.kindOf(comptime LowLevelBuiltins.strOp(.str_split_first)), self.str_split_first_import);
+            try self.emitFpOffset(result_offset);
+        },
+
+        .str_split_last => {
+            try self.emitProcLocal(GuardedList.at(args, 0));
+            const source = self.storage.allocAnonymousLocal(.i32) catch return error.OutOfMemory;
+            try self.emitLocalSet(source);
+            try self.emitProcLocal(GuardedList.at(args, 1));
+            const delimiter = self.storage.allocAnonymousLocal(.i32) catch return error.OutOfMemory;
+            try self.emitLocalSet(delimiter);
+
+            const ls = self.getLayoutStore();
+            const ret_layout_val = ls.getLayout(ll.ret_layout);
+            if (ret_layout_val.tag != .struct_) unreachable;
+            const record_idx = ret_layout_val.getStruct().idx;
+            const record_data = ls.getStructData(record_idx);
+            const fields = ls.struct_fields.sliceRange(record_data.getFields());
+            if (fields.len != 3 or
+                ls.getStructFieldLayoutByOriginalIndex(record_idx, 0) != .str or
+                ls.getStructFieldLayoutByOriginalIndex(record_idx, 1) != .str or
+                ls.getStructFieldLayoutByOriginalIndex(record_idx, 2) != .bool)
+            {
+                unreachable;
+            }
+
+            const result_size = try self.layoutStorageByteSize(ll.ret_layout);
+            const result_align = try self.layoutStorageByteAlign(ll.ret_layout);
+            const result_offset = try self.allocStackMemory(result_size, result_align);
+            const after_offset: u32 = @intCast(ls.getStructFieldOffsetByOriginalIndex(record_idx, 0));
+            const before_offset: u32 = @intCast(ls.getStructFieldOffsetByOriginalIndex(record_idx, 1));
+            const found_offset: u32 = @intCast(ls.getStructFieldOffsetByOriginalIndex(record_idx, 2));
+            if (self.externalCallsUseRelocs()) {
+                const layout_offset = try self.allocStackMemory(12, 4);
+                try self.emitFpOffset(layout_offset);
+                try self.emitI32Const(@intCast(after_offset));
+                try self.emitStoreOp(.i32, 0);
+                try self.emitFpOffset(layout_offset);
+                try self.emitI32Const(@intCast(before_offset));
+                try self.emitStoreOp(.i32, 4);
+                try self.emitFpOffset(layout_offset);
+                try self.emitI32Const(@intCast(found_offset));
+                try self.emitStoreOp(.i32, 8);
+                const source_fields = try self.loadRocStrFields(source);
+                const delimiter_fields = try self.loadRocStrFields(delimiter);
+                try self.emitFpOffset(result_offset);
+                try self.emitRocStrFields(source_fields);
+                try self.emitRocStrFields(delimiter_fields);
+                try self.emitFpOffset(layout_offset);
+                try self.emitLocalGet(self.roc_ops_local);
+            } else {
+                try self.emitLocalGet(source);
+                try self.emitLocalGet(delimiter);
+                try self.emitFpOffset(result_offset);
+                try self.emitI32Const(@intCast(after_offset));
+                try self.emitI32Const(@intCast(before_offset));
+                try self.emitI32Const(@intCast(found_offset));
+            }
+            try self.emitBuiltinCall(BuiltinSignatures.kindOf(comptime LowLevelBuiltins.strOp(.str_split_last)), self.str_split_last_import);
             try self.emitFpOffset(result_offset);
         },
 
@@ -14405,7 +14519,7 @@ fn generateLowLevel(self: *Self, ll: anytype) Allocator.Error!void {
     }
 }
 
-/// Generate numeric low-level operations (num_add, num_sub, etc.)
+/// Generate numeric low-level operations (num_plus, num_minus, etc.)
 /// Handles both scalar and composite (i128/Dec) types.
 fn emitNumericLowLevel(self: *Self, op: anytype, args: anytype, ret_layout: layout.Idx) Allocator.Error!void {
     const operand_layout = self.procLocalLayoutIdx(GuardedList.at(args, 0));

@@ -103,6 +103,19 @@ fn bytesIndexOf(haystack: []const u8, needle: []const u8) ?usize {
     return null;
 }
 
+fn bytesLastIndexOf(haystack: []const u8, needle: []const u8) ?usize {
+    if (needle.len == 0) return haystack.len;
+    if (needle.len > haystack.len) return null;
+
+    var i: usize = haystack.len - needle.len + 1;
+    while (i > 0) {
+        i -= 1;
+        if (bytesEqual(haystack[i..][0..needle.len], needle)) return i;
+    }
+
+    return null;
+}
+
 const WasmStr = struct {
     data: [*]const u8,
     data_offset: usize,
@@ -137,9 +150,10 @@ pub const RunWasmStrResult = struct {
 pub fn runWasmStr(
     allocator: std.mem.Allocator,
     wasm_bytes: []const u8,
+    heap_base: u32,
     has_imports: bool,
 ) WasmEvalError![]u8 {
-    const result = try runWasmStrWithStats(allocator, wasm_bytes, has_imports);
+    const result = try runWasmStrWithStats(allocator, wasm_bytes, heap_base, has_imports);
     return result.output;
 }
 
@@ -147,9 +161,10 @@ pub fn runWasmStr(
 pub fn runWasmStrWithStats(
     allocator: std.mem.Allocator,
     wasm_bytes: []const u8,
+    heap_base: u32,
     has_imports: bool,
 ) WasmEvalError!RunWasmStrResult {
-    wasm_heap_ptr = 65536;
+    wasm_heap_ptr = heap_base;
     wasm_allocation_count = 0;
     wasm_crash_state = .none;
 
@@ -317,6 +332,7 @@ pub fn runWasmStrWithStats(
             env_imports.addHostFunction(entry[0], &[_]bytebox.ValType{ .I32, .I32, .I32 }, &[_]bytebox.ValType{}, entry[1], null) catch return error.WasmExecFailed;
         }
         env_imports.addHostFunction("roc_str_split_first", &[_]bytebox.ValType{ .I32, .I32, .I32, .I32, .I32, .I32 }, &[_]bytebox.ValType{}, hostStrSplitFirst, null) catch return error.WasmExecFailed;
+        env_imports.addHostFunction("roc_str_split_last", &[_]bytebox.ValType{ .I32, .I32, .I32, .I32, .I32, .I32 }, &[_]bytebox.ValType{}, hostStrSplitLast, null) catch return error.WasmExecFailed;
         env_imports.addHostFunction("roc_str_drop_prefix_caseless_ascii", &[_]bytebox.ValType{ .I32, .I32, .I32, .I32, .I32 }, &[_]bytebox.ValType{}, hostStrDropPrefixCaselessAscii, null) catch return error.WasmExecFailed;
 
         env_imports.addHostFunction("roc_str_caseless_ascii_equals", &[_]bytebox.ValType{ .I32, .I32 }, &[_]bytebox.ValType{.I32}, hostStrCaselessAsciiEquals, null) catch return error.WasmExecFailed;
@@ -1675,6 +1691,29 @@ fn hostStrSplitFirst(_: ?*anyopaque, module: *bytebox.ModuleInstance, params: [*
     const str_slice = str.data[0..str.len];
     const delimiter_slice = delimiter.data[0..delimiter.len];
     const maybe_index = bytesIndexOf(str_slice, delimiter_slice);
+    if (maybe_index) |index| {
+        writeWasmStrViewFromStr(buffer, result_ptr + before_offset, str, 0, index);
+        writeWasmStrViewFromStr(buffer, result_ptr + after_offset, str, index + delimiter.len, str.len - index - delimiter.len);
+        buffer[result_ptr + found_offset] = 1;
+    } else {
+        writeWasmEmptyStr(buffer, result_ptr + before_offset);
+        writeWasmEmptyStr(buffer, result_ptr + after_offset);
+        buffer[result_ptr + found_offset] = 0;
+    }
+}
+
+fn hostStrSplitLast(_: ?*anyopaque, module: *bytebox.ModuleInstance, params: [*]const bytebox.Val, _: [*]bytebox.Val) error{}!void {
+    const buffer = module.store.getMemory(0).buffer();
+    const str = readWasmStr(buffer, @intCast(params[0].I32));
+    const delimiter = readWasmStr(buffer, @intCast(params[1].I32));
+    const result_ptr: usize = @intCast(params[2].I32);
+    const after_offset: usize = @intCast(params[3].I32);
+    const before_offset: usize = @intCast(params[4].I32);
+    const found_offset: usize = @intCast(params[5].I32);
+
+    const str_slice = str.data[0..str.len];
+    const delimiter_slice = delimiter.data[0..delimiter.len];
+    const maybe_index = bytesLastIndexOf(str_slice, delimiter_slice);
     if (maybe_index) |index| {
         writeWasmStrViewFromStr(buffer, result_ptr + before_offset, str, 0, index);
         writeWasmStrViewFromStr(buffer, result_ptr + after_offset, str, index + delimiter.len, str.len - index - delimiter.len);

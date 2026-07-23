@@ -14,6 +14,7 @@
 //! This file keeps fx-specific tests that are not covered by that matrix.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const testing = std.testing;
 const util = @import("util.zig");
 const fx_test_specs = @import("fx_test_specs.zig");
@@ -764,7 +765,7 @@ test "fx platform string interpolation type mismatch (interpreter)" {
     try testing.expect(std.mem.find(u8, run_result.stderr, "TYPE MISMATCH") != null);
     try testing.expect(std.mem.find(u8, run_result.stderr, "U8") != null);
     try testing.expect(std.mem.find(u8, run_result.stderr, "Str") != null);
-    try testing.expect(std.mem.find(u8, run_result.stderr, "Found 1 error") != null);
+    try testing.expect(std.mem.find(u8, run_result.stderr, "1 error") != null);
 }
 
 test "fx platform string interpolation type mismatch (dev backend)" {
@@ -801,7 +802,7 @@ test "fx platform string interpolation type mismatch (dev backend)" {
     try testing.expect(std.mem.find(u8, run_result.stderr, "TYPE MISMATCH") != null);
     try testing.expect(std.mem.find(u8, run_result.stderr, "U8") != null);
     try testing.expect(std.mem.find(u8, run_result.stderr, "Str") != null);
-    try testing.expect(std.mem.find(u8, run_result.stderr, "Found 1 error") != null);
+    try testing.expect(std.mem.find(u8, run_result.stderr, "1 error") != null);
 }
 
 test "fx platform run from different cwd" {
@@ -1302,9 +1303,15 @@ test "fx platform hosted function passed as argument to higher-order function" {
 
 test "fx platform runtime stack overflow" {
     // Keep coverage for both paths:
-    // 1. The normal interpreter path on the real runtime sample.
+    // 1. The normal interpreter path on the real runtime sample. The
+    //    interpreter's call-depth guard exists only in Debug builds of the
+    //    compiler (release builds never constrain evaluation depth; see
+    //    design.md), so the guard's crash output can be asserted only when
+    //    this suite and the roc binary it spawns are built in Debug mode.
     // 2. The compiled dev-backend host path via the FX host self-test hook.
-    try expectInterpreterRuntimeStackOverflow();
+    if (comptime builtin.mode == .Debug) {
+        try expectInterpreterRuntimeStackOverflow();
+    }
     try expectDevRuntimeStackOverflow();
 }
 
@@ -1705,7 +1712,7 @@ test "fx platform issue8943 error message memory corruption" {
     }
 
     // We expect at least 2 occurrences from source regions plus one more at
-    // the end in "Found X error(s)..."
+    // the summary at the end.
     if (filename_count < 3) {
         std.debug.print("Error output appears corrupted - filename 'issue8943.roc' found only {d} times (expected at least 3):\n", .{filename_count});
         std.debug.print("STDERR: {s}\n", .{run_result.stderr});

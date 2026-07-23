@@ -17,7 +17,7 @@ const hash = @import("hash.zig");
 const crypto = @import("crypto.zig");
 const i128h = @import("compiler_rt_128.zig");
 const float_math_f32 = @import("float_math/f32.zig");
-const float_tan = @import("float_math/tan.zig");
+const float_math_f64 = @import("float_math/f64.zig");
 const numeric_conversions = @import("numeric_conversions.zig");
 
 const RocStr = str.RocStr;
@@ -29,6 +29,13 @@ const RocOps = utils.RocOps;
 
 /// Field offsets for the dev backend's `Str.split_first` result copy.
 pub const StrSplitFirstLayout = extern struct {
+    after_offset: u32,
+    before_offset: u32,
+    found_offset: u32,
+};
+
+/// Field offsets for the dev backend's `Str.split_last` result copy.
+pub const StrSplitLastLayout = extern struct {
     after_offset: u32,
     before_offset: u32,
     found_offset: u32,
@@ -261,6 +268,18 @@ pub fn roc_builtins_str_split_first(out: *anyopaque, a_bytes: ?[*]u8, a_len: usi
     const a = RocStr{ .bytes = a_bytes, .length = a_len, .capacity_or_alloc_ptr = a_cap };
     const b = RocStr{ .bytes = b_bytes, .length = b_len, .capacity_or_alloc_ptr = b_cap };
     const result = str.splitFirst(a, b, roc_ops);
+    const out_bytes: [*]u8 = @ptrCast(out);
+
+    @as(*RocStr, @ptrCast(@alignCast(out_bytes + layout.after_offset))).* = result.after;
+    @as(*RocStr, @ptrCast(@alignCast(out_bytes + layout.before_offset))).* = result.before;
+    @as(*u8, @ptrCast(@alignCast(out_bytes + layout.found_offset))).* = if (result.found) 1 else 0;
+}
+
+/// Wrapper: splitLast(RocStr, RocStr, *RocOps) -> { before, found, after }
+pub fn roc_builtins_str_split_last(out: *anyopaque, a_bytes: ?[*]u8, a_len: usize, a_cap: usize, b_bytes: ?[*]u8, b_len: usize, b_cap: usize, layout: *const StrSplitLastLayout, roc_ops: *RocOps) callconv(.c) void {
+    const a = RocStr{ .bytes = a_bytes, .length = a_len, .capacity_or_alloc_ptr = a_cap };
+    const b = RocStr{ .bytes = b_bytes, .length = b_len, .capacity_or_alloc_ptr = b_cap };
+    const result = str.splitLast(a, b, roc_ops);
     const out_bytes: [*]u8 = @ptrCast(out);
 
     @as(*RocStr, @ptrCast(@alignCast(out_bytes + layout.after_offset))).* = result.after;
@@ -1919,7 +1938,7 @@ pub fn roc_builtins_float_pow_f32(base: f32, exponent: f32) callconv(.c) f32 {
 
 /// Raise an F64 base to an F64 exponent.
 pub fn roc_builtins_float_pow(base: f64, exponent: f64) callconv(.c) f64 {
-    return std.math.pow(f64, base, exponent);
+    return float_math_f64.pow(base, exponent);
 }
 
 const FloatUnaryMathOp = enum {
@@ -1933,12 +1952,12 @@ const FloatUnaryMathOp = enum {
 
 fn floatUnaryMathF64(val: f64, comptime op: FloatUnaryMathOp) f64 {
     return switch (op) {
-        .sin => std.math.sin(val),
-        .cos => std.math.cos(val),
-        .tan => float_tan.tan64(val),
-        .asin => std.math.asin(val),
-        .acos => std.math.acos(val),
-        .atan => std.math.atan(val),
+        .sin => float_math_f64.sin(val),
+        .cos => float_math_f64.cos(val),
+        .tan => float_math_f64.tan(val),
+        .asin => float_math_f64.asin(val),
+        .acos => float_math_f64.acos(val),
+        .atan => float_math_f64.atan(val),
     };
 }
 

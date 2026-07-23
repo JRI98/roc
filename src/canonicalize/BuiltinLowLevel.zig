@@ -181,6 +181,9 @@ fn replaceProvidedByCompilerLowLevels(env: *ModuleEnv) (Allocator.Error || error
     if (env.common.findIdent("str_split_first_raw")) |str_split_first_ident| {
         try low_level_map.put(str_split_first_ident, .str_split_first);
     }
+    if (env.common.findIdent("str_split_last_raw")) |str_split_last_ident| {
+        try low_level_map.put(str_split_last_ident, .str_split_last);
+    }
     if (env.common.findIdent("Builtin.Str.count_utf8_bytes")) |str_count_utf8_bytes_ident| {
         try low_level_map.put(str_count_utf8_bytes_ident, .str_count_utf8_bytes);
     }
@@ -444,10 +447,13 @@ fn replaceProvidedByCompilerLowLevels(env: *ModuleEnv) (Allocator.Error || error
         try putLowLevelFmt(&low_level_map, env, &name_scratch, "Builtin.Num.{s}.rem_by", .{num_type}, .num_rem_by);
     }
 
-    // Numeric modulo operation (integer types only)
+    // Integer-only numeric operations
     const integer_types = [_][]const u8{ "U8", "I8", "U16", "I16", "U32", "I32", "U64", "I64", "U128", "I128" };
     for (integer_types) |num_type| {
         try putLowLevelFmt(&low_level_map, env, &name_scratch, "Builtin.Num.{s}.mod_by", .{num_type}, .num_mod_by);
+        try putLowLevelFmt(&low_level_map, env, &name_scratch, "Builtin.Num.{s}.plus_wrap", .{num_type}, .num_plus_wrap);
+        try putLowLevelFmt(&low_level_map, env, &name_scratch, "Builtin.Num.{s}.minus_wrap", .{num_type}, .num_minus_wrap);
+        try putLowLevelFmt(&low_level_map, env, &name_scratch, "Builtin.Num.{s}.times_wrap", .{num_type}, .num_times_wrap);
     }
 
     // Numeric negate operation (signed types only)

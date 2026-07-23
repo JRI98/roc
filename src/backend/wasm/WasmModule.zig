@@ -976,6 +976,15 @@ pub fn ensureMemoryMinBytes(self: *Self, byte_count: usize) void {
     }
 }
 
+/// First byte after all statically assigned data addresses.
+///
+/// This remains conservative after data DCE because segments keep their
+/// assigned offsets; runtime allocation must never reuse any address that was
+/// part of the module's static-data address space.
+pub fn heapBase(self: *const Self) u32 {
+    return self.data_offset;
+}
+
 /// Add a data segment to linear memory. Returns the offset where the data
 /// will be placed. The data is copied and aligned to `align_bytes`.
 pub fn addDataSegment(self: *Self, data: []const u8, align_bytes: u32) Allocator.Error!u32 {
@@ -2459,11 +2468,17 @@ pub fn eliminateDeadCode(self: *Self, called_fns: []const bool) Allocator.Error!
     defer live_import_fns.deinit(gpa);
     try live_import_fns.ensureTotalCapacity(gpa, import_count);
 
+    const dead_import = std.math.maxInt(u32);
+    const import_remap = try gpa.alloc(u32, import_count);
+    defer gpa.free(import_remap);
+    @memset(import_remap, dead_import);
+
     var fn_index: u32 = 0;
     var eliminated_import_count: u32 = 0;
     var write_idx: usize = 0;
     for (self.imports.items) |imp| {
         if (fn_index < import_count and live_flags[fn_index]) {
+            import_remap[fn_index] = @intCast(write_idx);
             live_import_fns.appendAssumeCapacity(fn_index);
             self.imports.items[write_idx] = imp;
             write_idx += 1;
@@ -2490,6 +2505,24 @@ pub fn eliminateDeadCode(self: *Self, called_fns: []const bool) Allocator.Error!
         if (self.linking.findAndReindexImportedFn(old_index, @intCast(new_idx))) |sym_index| {
             self.reloc_code.applyRelocsU32(self.code_bytes.items, sym_index, @intCast(new_idx));
         }
+    }
+
+    // Table elements store function indices directly rather than through
+    // relocations. Imports referenced by the table are necessarily live, but
+    // their indices still change when earlier dead imports are removed.
+    for (self.table_func_indices.items) |*table_func_idx| {
+        if (table_func_idx.* >= import_count) continue;
+        const remapped = import_remap[table_func_idx.*];
+        std.debug.assert(remapped != dead_import);
+        table_func_idx.* = remapped;
+    }
+
+    // Function exports also store direct function indices.
+    for (self.exports.items) |*exp| {
+        if (exp.kind != .func or exp.idx >= import_count) continue;
+        const remapped = import_remap[exp.idx];
+        std.debug.assert(remapped != dead_import);
+        exp.idx = remapped;
     }
 
     try self.eliminateDeadData(live_flags, fn_index_min, fn_count);
@@ -5150,6 +5183,17 @@ test "setup — table size matches element count after finalization" {
     try std.testing.expect(decoded.has_table);
 }
 
+test "heapBase follows the complete static-data address space" {
+    const allocator = std.testing.allocator;
+    var module = Self.init(allocator);
+    defer module.deinit();
+
+    try std.testing.expectEqual(@as(u32, 1024), module.heapBase());
+    try std.testing.expectEqual(@as(u32, 1024), try module.addDataSegment(&.{ 1, 2, 3 }, 1));
+    try std.testing.expectEqual(@as(u32, 1040), try module.addDataSegment(&.{4}, 16));
+    try std.testing.expectEqual(@as(u32, 1041), module.heapBase());
+}
+
 test "setup — memory exported as 'memory'" {
     const allocator = std.testing.allocator;
     var module = try buildPhase5TestModule(allocator);
@@ -6994,6 +7038,23 @@ test "eliminateDeadCode — indirect call targets (element section) preserved" {
     const dummy_count = module.dead_import_dummy_count;
     const dead_body = module.func_bodies.items[dummy_count + 2].body;
     try std.testing.expect(dead_body.len > DUMMY_FUNCTION.len);
+}
+
+test "eliminateDeadCode — table indices follow compacted function imports" {
+    const allocator = std.testing.allocator;
+    var module = try buildDCETestModule(allocator);
+    defer module.deinit();
+
+    // js_helper is import 2. Keeping it in the table makes it live, while the
+    // dead import before it is removed and shifts js_helper to function index 1.
+    try module.table_func_indices.append(allocator, 2);
+
+    var called_fns = [_]bool{false} ** 6;
+    try module.eliminateDeadCode(&called_fns);
+
+    try std.testing.expectEqual(@as(usize, 2), module.imports.items.len);
+    try std.testing.expectEqualStrings("js_helper", module.imports.items[1].field_name);
+    try std.testing.expectEqual(@as(u32, 1), module.table_func_indices.items[0]);
 }
 
 test "eliminateDeadCode — transitive callees preserved (A calls B calls C → all live)" {
