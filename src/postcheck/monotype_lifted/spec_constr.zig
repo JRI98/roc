@@ -10352,13 +10352,15 @@ test "static value matchers bound wrapper strips over a cyclic value" {
     // resolves through the substitution maps to an ancestor of its own
     // construction. Stripping the wrapper never reaches a constructor.
     var cyclic: Value = undefined;
-    cyclic = .{ .static_data_candidate = .{
-        .ty = union_ty,
-        // Never read: every walk this test exercises follows the runtime edge
-        // and declines before any materialization would consume the id.
-        .static_data = undefined,
-        .runtime = &cyclic,
-    } };
+    cyclic = .{
+        .static_data_candidate = .{
+            .ty = union_ty,
+            // Never read: every walk this test exercises follows the runtime edge
+            // and declines before any materialization would consume the id.
+            .static_data = undefined,
+            .runtime = &cyclic,
+        },
+    };
 
     // The substitution check answers "cannot substitute" on exhaustion — the
     // conservative direction, and correct, since a self-referential value
