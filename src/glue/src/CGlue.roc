@@ -104,25 +104,111 @@ resolve_tag_union_type_c = |type_table, duplicate_record_names, duplicate_tag_na
 			}
 		}
 
-c_record_field_decl : TypeTable, List(Str), List(Str), TypeNamePlan.PreferredNames, AbiFieldLayout, AbiWidth -> Str
-c_record_field_decl = |type_table, duplicate_record_names, duplicate_tag_names, preferred_names, field, width| {
+## Transitively flattened vector-member count of the type when its leaves are
+## exclusively 128-bit vectors (counting through record fields and transparent
+## single-variant tag wrappers); 0 for any other type. Counts saturate at 5:
+## callers only distinguish the 2..4 range, which is the memory-class shape
+## that needs the vector/byte union spelling.
+homogeneous_vector_member_count : TypeTable, U64 -> U64
+homogeneous_vector_member_count = |type_table, type_id|
+	match type_table.get(type_id) {
+		RocU8x16 => 1
+		RocI8x16 => 1
+		RocU16x8 => 1
+		RocI16x8 => 1
+		RocU32x4 => 1
+		RocI32x4 => 1
+		RocU64x2 => 1
+		RocI64x2 => 1
+		RocRecord(rec) => {
+			var $total = 0
+			var $homogeneous = !(List.is_empty(rec.fields))
+			for field in rec.fields {
+				member = if field.is_padding {
+					0
+				} else {
+					homogeneous_vector_member_count(type_table, field.type_id)
+				}
+				if member == 0 {
+					$homogeneous = Bool.False
+				} else if $total + member > 4 {
+					$total = 5
+				} else {
+					$total = $total + member
+				}
+			}
+			if $homogeneous {
+				$total
+			} else {
+				0
+			}
+		}
+		RocTagUnion(tu) =>
+			match TypeTable.single_variant_payload(tu) {
+				SinglePayload(payload_id) => homogeneous_vector_member_count(type_table, payload_id)
+				SingleNoPayload => 0
+				NotSingleVariant => 0
+			}
+		_ => 0
+	}
+
+## Whether a record with these committed fields is a memory-class vector
+## aggregate: every member is (an aggregate of) 128-bit vectors and there are
+## two to four of them in total. C classifies such an aggregate as homogeneous
+## and would pass it in registers, but the Roc host ABI passes it in memory —
+## the convention Zig and Rust hosts compile to — so C glue spells its members
+## as vector/byte unions to pin the memory-class classification.
+c_needs_vector_union_spelling : TypeTable, List(AbiFieldLayout) -> Bool
+c_needs_vector_union_spelling = |type_table, fields| {
+	var $total = 0
+	var $homogeneous = !(List.is_empty(fields))
+	for field in fields {
+		member = if field.is_padding {
+			0
+		} else {
+			homogeneous_vector_member_count(type_table, field.type_id)
+		}
+		if member == 0 {
+			$homogeneous = Bool.False
+		} else if $total + member > 4 {
+			$total = 5
+		} else {
+			$total = $total + member
+		}
+	}
+	$homogeneous and $total >= 2 and $total <= 4
+}
+
+c_vector_union_comment : Str
+c_vector_union_comment =
+	\\/* Every member of this aggregate is a 128-bit vector, so members are spelled
+	\\   as vector/byte unions (read the vector via `.value`). The union keeps C
+	\\   from classifying the aggregate as homogeneous: the Roc host ABI passes
+	\\   multi-vector aggregates in memory, matching Zig and Rust hosts. */
+
+c_record_field_decl : TypeTable, List(Str), List(Str), TypeNamePlan.PreferredNames, AbiFieldLayout, AbiWidth, Bool -> Str
+c_record_field_decl = |type_table, duplicate_record_names, duplicate_tag_names, preferred_names, field, width, wrap_vector_members| {
 	field_name = name_to_c_field_ident(field.name)
 	if field.is_padding {
 		# Padding fields are nonzero at both widths (asserted by the compiler).
 		"    uint8_t ${field_name}[${U64.to_str(AbiFieldLayout.size(field, width))}];\n"
 	} else {
 		c_type = type_id_to_c(type_table, duplicate_record_names, duplicate_tag_names, preferred_names, field.type_id)
-		"    ${c_type} ${field_name};\n"
+		if wrap_vector_members {
+			"    union { ${c_type} value; uint8_t bytes[${U64.to_str(AbiFieldLayout.size(field, width))}]; } ${field_name};\n"
+		} else {
+			"    ${c_type} ${field_name};\n"
+		}
 	}
 }
 
 ## Fields arrive in committed layout order (valid at both pointer widths);
 ## only per-width padding byte counts differ between the two renderings.
-c_record_fields_decl : TypeTable, List(Str), List(Str), TypeNamePlan.PreferredNames, List(AbiFieldLayout), AbiWidth -> Str
-c_record_fields_decl = |type_table, duplicate_record_names, duplicate_tag_names, preferred_names, fields, width| {
+c_record_fields_decl : TypeTable, List(Str), List(Str), TypeNamePlan.PreferredNames, List(AbiFieldLayout), AbiWidth, Bool -> Str
+c_record_fields_decl = |type_table, duplicate_record_names, duplicate_tag_names, preferred_names, fields, width, wrap_vector_members| {
 	var $field_strs = ""
 	for field in fields {
-		$field_strs = Str.concat($field_strs, c_record_field_decl(type_table, duplicate_record_names, duplicate_tag_names, preferred_names, field, width))
+		$field_strs = Str.concat($field_strs, c_record_field_decl(type_table, duplicate_record_names, duplicate_tag_names, preferred_names, field, width, wrap_vector_members))
 	}
 	$field_strs
 }
@@ -687,10 +773,16 @@ c_payload_layout_assertions = |type_name, tag_layout, width| {
 
 generate_payload_type_decl_c : TypeTable, List(Str), List(Str), TypeNamePlan.PreferredNames, Str, AbiTagLayout -> Str
 generate_payload_type_decl_c = |type_table, duplicate_records, duplicate_tags, preferred_names, type_name, tag_layout| {
-	fields64 = c_record_fields_decl(type_table, duplicate_records, duplicate_tags, preferred_names, tag_layout.payload_fields, Pointer64)
-	fields32 = c_record_fields_decl(type_table, duplicate_records, duplicate_tags, preferred_names, tag_layout.payload_fields, Pointer32)
+	wrap_vector_members = c_needs_vector_union_spelling(type_table, tag_layout.payload_fields)
+	fields64 = c_record_fields_decl(type_table, duplicate_records, duplicate_tags, preferred_names, tag_layout.payload_fields, Pointer64, wrap_vector_members)
+	fields32 = c_record_fields_decl(type_table, duplicate_records, duplicate_tags, preferred_names, tag_layout.payload_fields, Pointer32, wrap_vector_members)
 	assertions64 = c_payload_layout_assertions(type_name, tag_layout, Pointer64)
 	assertions32 = c_payload_layout_assertions(type_name, tag_layout, Pointer32)
+	comment = if wrap_vector_members {
+		"${c_vector_union_comment}\n"
+	} else {
+		""
+	}
 	decl =
 		\\#if UINTPTR_MAX == UINT64_MAX
 		\\typedef struct {
@@ -699,7 +791,7 @@ generate_payload_type_decl_c = |type_table, duplicate_records, duplicate_tags, p
 		\\typedef struct {
 		\\${fields32}} ${type_name};
 		\\${assertions32}#endif
-	"${decl}\n\n"
+	"${comment}${decl}\n\n"
 }
 
 c_tag_union_layout_assertions : Str, AbiLayout, AbiWidth -> Str
@@ -838,10 +930,16 @@ generate_record_type_decl = |type_table, duplicate_records, duplicate_tags, pref
 		return generate_opaque_type_decl(type_name, abi_layout.size64, abi_layout.alignment64, abi_layout.size32, abi_layout.alignment32)
 	}
 
-	fields64 = c_record_fields_decl(type_table, duplicate_records, duplicate_tags, preferred_names, fields, Pointer64)
-	fields32 = c_record_fields_decl(type_table, duplicate_records, duplicate_tags, preferred_names, fields, Pointer32)
+	wrap_vector_members = c_needs_vector_union_spelling(type_table, fields)
+	fields64 = c_record_fields_decl(type_table, duplicate_records, duplicate_tags, preferred_names, fields, Pointer64, wrap_vector_members)
+	fields32 = c_record_fields_decl(type_table, duplicate_records, duplicate_tags, preferred_names, fields, Pointer32, wrap_vector_members)
 	assertions64 = Str.concat(static_asserts(type_name, abi_layout.size64, abi_layout.alignment64), c_record_offset_assertions(type_name, fields, Pointer64))
 	assertions32 = Str.concat(static_asserts(type_name, abi_layout.size32, abi_layout.alignment32), c_record_offset_assertions(type_name, fields, Pointer32))
+	comment = if wrap_vector_members {
+		"${c_vector_union_comment}\n"
+	} else {
+		""
+	}
 	decl =
 		\\#if UINTPTR_MAX == UINT64_MAX
 		\\struct ${type_name} {
@@ -850,7 +948,7 @@ generate_record_type_decl = |type_table, duplicate_records, duplicate_tags, pref
 		\\struct ${type_name} {
 		\\${fields32}};
 		\\${assertions32}#endif
-	"${decl}\n\n"
+	"${comment}${decl}\n\n"
 }
 
 generate_opaque_type_decl : Str, U64, U64, U64, U64 -> Str
@@ -946,8 +1044,9 @@ generate_args_struct = |func, type_table, duplicate_records, duplicate_tags, pre
 	match arg_shape.hosted_args(func) {
 		NoMeaningfulArgs => ""
 		SingleRecordArg(record) => {
-			fields64 = c_record_fields_decl(type_table, duplicate_records, duplicate_tags, preferred_names, record.fields, Pointer64)
-			fields32 = c_record_fields_decl(type_table, duplicate_records, duplicate_tags, preferred_names, record.fields, Pointer32)
+			wrap_vector_members = c_needs_vector_union_spelling(type_table, record.fields)
+			fields64 = c_record_fields_decl(type_table, duplicate_records, duplicate_tags, preferred_names, record.fields, Pointer64, wrap_vector_members)
+			fields32 = c_record_fields_decl(type_table, duplicate_records, duplicate_tags, preferred_names, record.fields, Pointer32, wrap_vector_members)
 
 			doc = doc_comment([
 				"Arguments for ${func.name}",

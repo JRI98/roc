@@ -5987,13 +5987,18 @@ and applies the target's C ABI:
   vector result is returned in XMM0. An aggregate containing a vector follows
   the Win64 aggregate rules; it is not treated as the vector it contains.
 - Under AArch64 C ABIs, including fixed-prototype Windows-on-ARM64, a direct
-  128-bit short vector occupies one Q register. Aggregates follow the
-  platform's AAPCS64-derived rules, including homogeneous short-vector
-  aggregates of up to four members of the same fundamental `vector128` type in
-  consecutive vector registers. These rules do not distinguish lane width or
-  signedness within that fundamental type, so mixed Roc vector kinds still form
-  an HVA. HFA/HVA discovery recursively erases the same transparent
-  single-variant wrappers as generated glue.
+  128-bit short vector occupies one Q register, and an aggregate that
+  transparently wraps exactly one vector is the same Q-register value. Other
+  aggregates follow the platform's AAPCS64-derived size rules; in particular,
+  an aggregate with two or more vector members is memory-class in both call
+  directions. That is the host-boundary contract every supported host
+  language's natural declarations compile to: Zig `extern struct`s and Rust
+  `repr(C)` structs of vectors use the memory-class convention, and generated C
+  glue spells the vector members of such aggregates as vector/byte unions so C
+  compilers do not classify them as homogeneous vector aggregates (whose
+  AAPCS64 register rule only C toolchains implement). Homogeneity and
+  transparent-wrapper discovery recursively erase the same single-variant
+  wrappers as generated glue.
 - Under the WebAssembly Basic C ABI, a direct vector is `v128`. Transparent
   one-field aggregates retain the field's direct classification; other
   aggregates follow the WebAssembly aggregate rules. An erased callable is the
@@ -6024,19 +6029,19 @@ placement are separate explicit steps. Every register placement records both
 its byte pieces and their atomic carrier. Piecewise carriers become independent
 LLVM parameters, structure carriers preserve aggregate results even when they
 contain one field, scalar 128-bit integer arguments remain one naturally aligned
-`i128`, and AArch64 integer pairs/HFAs/HVAs remain one homogeneous array. On
-ELF AArch64, HFA/HVA parameters additionally carry `alignstack(8)` for F32/F64
-HFAs or `alignstack(16)` for HVAs; Mach-O and Windows use the same array carrier
-without that LLVM attribute. LLVM wrappers marshal exactly that carrier instead
-of flattening it and relying on a later stage to reconstruct argument identity.
-Mixed-kind HVA argument arrays use the first fundamental vector type, while
-structure returns retain each committed field's exact vector kind.
+`i128`, and AArch64 integer pairs, HFAs, and transparent vector aggregates
+remain one homogeneous array. On ELF AArch64, those array parameters
+additionally carry `alignstack(8)` for F32/F64 HFAs or `alignstack(16)` for
+vector aggregates; Mach-O and Windows use the same array carrier without that
+LLVM attribute. LLVM wrappers marshal exactly that carrier instead of
+flattening it and relying on a later stage to reconstruct argument identity.
+Structure returns retain each committed field's exact vector kind.
 
 Concrete argument assignment accounts for each register class's remaining capacity,
-preserves a SysV SSE/SSEUP vector as one value, assigns AArch64 HVA members to
-consecutive Q registers, applies the base AAPCS64 and Windows even-X-register
-rule for 16-byte-aligned multiword arguments, and spills an entire atomic value
-when the remaining registers cannot hold it. Apple arm64 removes that
+preserves a SysV SSE/SSEUP vector as one value, applies the base AAPCS64 and
+Windows even-X-register rule for 16-byte-aligned multiword arguments, and
+spills an entire atomic value (such as a complete HFA) when the remaining
+registers cannot hold it. Apple arm64 removes that
 even-register rule and packs stack arguments at their natural alignment; both
 differences are explicit target data. On SysV, scalar `I128`/`U128` uses two
 `i64` parameters while both INTEGER eightbytes fit and one `i128` parameter
@@ -6052,8 +6057,7 @@ placements remain byte offsets rather than being converted back into abstract
 eightbyte slots: this is required for Apple arm64's naturally aligned compact
 1/2/4-byte arguments. The inverse entrypoint wrappers copy from those same
 byte-exact offsets. AArch64 hosted result capture includes V0 through V3, the
-complete result-register set required by legal one-to-four-member HFAs and
-HVAs.
+complete result-register set required by legal one-to-four-member HFAs.
 
 On Windows x64, scalar `I128`/`U128` is indirect as an argument and returned in
 XMM0 with the compiler's `<2 x i64>` carrier. Generated `RocDec` remains an
@@ -6062,8 +6066,9 @@ the C spelling even though both Roc layouts contain the same 128 payload bits.
 
 The cross-language ABI fixture exercises these exhaustion rules in both call
 directions with generated C, Zig, and Rust declarations: nested transparent
-HFAs/HVAs after seven SIMD arguments, integer pairs after seven GP arguments,
-platform-specific `I128` register alignment, and exhausted SysV `I128`/`Dec`.
+HFAs and memory-class vector aggregates after seven SIMD arguments, integer
+pairs after seven GP arguments, platform-specific `I128` register alignment,
+and exhausted SysV `I128`/`Dec`.
 It also exhausts all eight AArch64 GP argument registers before passing
 `U8`/`U16`/`U32`, which pins Apple's compact stack offsets in hosted and
 provided directions.

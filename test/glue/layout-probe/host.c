@@ -191,11 +191,11 @@ static void check_provided_abi(void) {
     ProbeVectorRecord record_back = roc_provide_vector_record(record);
     if (memcmp(&record_back, &record, sizeof(record)) != 0) record_failure("provided vector record mismatch");
 
-    ProbeVectorQuad quad = { .a = bytes, .b = words, .c = udwords, .d = qwords };
+    ProbeVectorQuad quad = { .a = { .value = bytes }, .b = { .value = words }, .c = { .value = udwords }, .d = { .value = qwords } };
     ProbeVectorQuad quad_back = roc_provide_vector_quad(quad);
     if (memcmp(&quad_back, &quad, sizeof(quad)) != 0) record_failure("provided vector quad mismatch");
 
-    ProbeVectorHva hva = { .a = bytes, .b = bytes, .c = bytes, .d = bytes };
+    ProbeVectorHva hva = { .a = { .value = bytes }, .b = { .value = bytes }, .c = { .value = bytes }, .d = { .value = bytes } };
     ProbeVectorHva hva_back = roc_provide_vector_hva(hva);
     if (memcmp(&hva_back, &hva, sizeof(hva)) != 0) record_failure("provided vector HVA mismatch");
 
@@ -232,7 +232,7 @@ static void check_provided_abi(void) {
         bytes);
     if (memcmp(&exhausted, &bytes, sizeof(bytes)) != 0) record_failure("provided exhausted-register vector mismatch");
 
-    ProbeNestedVectorHva nested_hva = { .wrapped = bytes, .raw = bytes };
+    ProbeNestedVectorHva nested_hva = { .wrapped = { .value = bytes }, .raw = { .value = bytes } };
     ProbeNestedVectorHva nested_hva_back = roc_provide_spill_vector_hva(
         bytes, bytes, bytes, bytes, bytes, bytes, bytes, nested_hva);
     if (memcmp(&nested_hva_back, &nested_hva, sizeof(nested_hva)) != 0) record_failure("provided spilled HVA mismatch");

@@ -236,11 +236,11 @@ static void check_provided_abi(void) {
     ProbeVectorRecord record_back = roc_provide_vector_record(record);
     if (!memory_equal(&record_back, &record, sizeof(record))) record_failure("provided vector record mismatch");
 
-    ProbeVectorQuad quad = { .a = bytes, .b = words, .c = udwords, .d = qwords };
+    ProbeVectorQuad quad = { .a = { .value = bytes }, .b = { .value = words }, .c = { .value = udwords }, .d = { .value = qwords } };
     ProbeVectorQuad quad_back = roc_provide_vector_quad(quad);
     if (!memory_equal(&quad_back, &quad, sizeof(quad))) record_failure("provided vector quad mismatch");
 
-    ProbeVectorHva hva = { .a = bytes, .b = bytes, .c = bytes, .d = bytes };
+    ProbeVectorHva hva = { .a = { .value = bytes }, .b = { .value = bytes }, .c = { .value = bytes }, .d = { .value = bytes } };
     ProbeVectorHva hva_back = roc_provide_vector_hva(hva);
     if (!memory_equal(&hva_back, &hva, sizeof(hva))) record_failure("provided vector HVA mismatch");
 

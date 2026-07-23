@@ -32,25 +32,15 @@ pub const Class = union(enum) {
     double_integer,
     /// A homogeneous float aggregate passed in 1..4 SIMD registers.
     float_array: FloatArray,
-    /// A homogeneous short-vector aggregate passed in 1..4 SIMD registers.
-    vector_array: VectorArray,
+    /// An aggregate that transparently wraps exactly one short vector, passed
+    /// directly in one Q register like the vector itself.
+    vector: layout.Vector,
 };
 
 /// A homogeneous aggregate of `count` floats, each `elem_bits` wide (32 or 64).
 pub const FloatArray = struct {
     count: u8,
     elem_bits: u16,
-};
-
-/// A homogeneous aggregate of `count` AAPCS64 short-vector members.
-pub const VectorArray = struct {
-    count: u8,
-    /// The vector shape used for the ABI coercion. AAPCS64's fundamental
-    /// short-vector type distinguishes only 64-bit from 128-bit vectors, not
-    /// their lane element type, so mixed Roc lane kinds are still homogeneous.
-    /// Every Roc vector is 128 bits; retaining the first kind gives consumers
-    /// a concrete LLVM/Zig vector type with which to carry the register bits.
-    kind: layout.Vector,
 };
 
 /// AAPCS64 passes a homogeneous float aggregate of at most four members in SIMD registers.
@@ -83,13 +73,18 @@ pub fn classifyType(store: *const Store, idx: Idx) Class {
         // RocList is a three-word aggregate.
         .list, .list_of_zst => return classifyBySize(store, lay),
         .struct_ => {
+            // A single-vector aggregate is ABI-equivalent to the vector itself and
+            // travels in one Q register. Aggregates with two or more vector members
+            // are memory-class at the Roc<->host boundary: the boundary contract must
+            // be the one every supported host language's natural declarations
+            // compile to, and C, Zig, and Rust all agree on the memory-class
+            // convention for these aggregates (generated C glue spells their vector
+            // members as vector/byte unions to pin that classification), whereas
+            // only C toolchains implement AAPCS64's multi-member HVA register rule.
             var maybe_vector_kind: ?layout.Vector = null;
             const vector_count = countVectors(store, idx, &maybe_vector_kind);
-            if (vector_count >= 1 and vector_count <= max_hfa_floats) {
-                return .{ .vector_array = .{
-                    .count = vector_count,
-                    .kind = maybe_vector_kind.?,
-                } };
+            if (vector_count == 1) {
+                return .{ .vector = maybe_vector_kind.? };
             }
             var maybe_float_bits: ?u16 = null;
             const float_count = countFloats(store, idx, &maybe_float_bits);
@@ -119,6 +114,11 @@ pub fn classifyType(store: *const Store, idx: Idx) Class {
     }
 }
 
+/// Count the vector members of an aggregate whose leaves are exclusively short
+/// vectors, returning `invalid_float_count` (sentinel) the moment any other
+/// member (or unnamed padding) is seen. Exactly one vector member makes the
+/// aggregate a transparent Q-register value; two or more make it memory-class.
+/// Counting stops at two because higher counts classify identically.
 fn countVectors(store: *const Store, idx: Idx, maybe_kind: *?layout.Vector) u8 {
     const lay = store.getLayout(idx);
     switch (lay.tag) {
@@ -132,7 +132,7 @@ fn countVectors(store: *const Store, idx: Idx, maybe_kind: *?layout.Vector) u8 {
                 const field_count_vectors = countVectors(store, store.getStructFieldLayout(struct_idx, i), maybe_kind);
                 if (field_count_vectors == invalid_float_count) return invalid_float_count;
                 count += field_count_vectors;
-                if (count > max_hfa_floats) return invalid_float_count;
+                if (count > 1) return count;
             }
             return count;
         },
@@ -140,9 +140,6 @@ fn countVectors(store: *const Store, idx: Idx, maybe_kind: *?layout.Vector) u8 {
             const scalar = lay.getScalar();
             if (scalar.tag != .vector) return invalid_float_count;
             const kind = scalar.getVector();
-            // AAPCS64 defines vector64 and vector128 as the fundamental
-            // short-vector types. Lane width and signedness do not split the
-            // class. All Roc vectors are vector128, so any mixture is an HVA.
             if (maybe_kind.* == null) maybe_kind.* = kind;
             return 1;
         },
@@ -243,29 +240,34 @@ test "aarch64 classify: scalars pass by value" {
     try testing.expectEqual(Class.byval, classifyType(&store, .u8x16));
 }
 
-test "aarch64 classify: homogeneous short-vector aggregates" {
+test "aarch64 classify: vector aggregates" {
     var store = try Store.init(testing.allocator, .u64);
     defer store.deinit();
 
+    // A single-vector aggregate is a transparent Q-register value, including
+    // through a transparent single-variant tag wrapper.
     const one = try testStruct(&store, &.{.u16x8});
-    try testing.expectEqual(Class{ .vector_array = .{ .count = 1, .kind = .u16x8 } }, classifyType(&store, one));
-
-    const nested_pair = try testStruct(&store, &.{ one, one });
-    try testing.expectEqual(Class{ .vector_array = .{ .count = 2, .kind = .u16x8 } }, classifyType(&store, nested_pair));
-
-    const four = try testStruct(&store, &.{ .i32x4, .i32x4, .i32x4, .i32x4 });
-    try testing.expectEqual(Class{ .vector_array = .{ .count = 4, .kind = .i32x4 } }, classifyType(&store, four));
-
-    const mixed = try testStruct(&store, &.{ .u8x16, .i8x16 });
-    try testing.expectEqual(Class{ .vector_array = .{ .count = 2, .kind = .u8x16 } }, classifyType(&store, mixed));
+    try testing.expectEqual(Class{ .vector = .u16x8 }, classifyType(&store, one));
 
     const wrapped = try store.putTagUnion(&.{.i16x8});
     try testing.expectEqual(Class.byval, classifyType(&store, wrapped));
 
-    // Glue recursively erases a transparent single-variant wrapper, including
-    // when it appears as one field of an outer aggregate.
+    const wrapped_one = try testStruct(&store, &.{wrapped});
+    try testing.expectEqual(Class{ .vector = .i16x8 }, classifyType(&store, wrapped_one));
+
+    // Aggregates with two or more vector members are memory-class at the host
+    // boundary, regardless of nesting or lane kinds.
+    const nested_pair = try testStruct(&store, &.{ one, one });
+    try testing.expectEqual(Class.memory, classifyType(&store, nested_pair));
+
+    const four = try testStruct(&store, &.{ .i32x4, .i32x4, .i32x4, .i32x4 });
+    try testing.expectEqual(Class.memory, classifyType(&store, four));
+
+    const mixed = try testStruct(&store, &.{ .u8x16, .i8x16 });
+    try testing.expectEqual(Class.memory, classifyType(&store, mixed));
+
     const wrapped_pair = try testStruct(&store, &.{ wrapped, .u8x16 });
-    try testing.expectEqual(Class{ .vector_array = .{ .count = 2, .kind = .i16x8 } }, classifyType(&store, wrapped_pair));
+    try testing.expectEqual(Class.memory, classifyType(&store, wrapped_pair));
 }
 
 test "aarch64 classify: three-word aggregates go to memory" {

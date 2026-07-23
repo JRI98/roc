@@ -54,8 +54,8 @@ pub const RegisterCarrier = union(enum) {
     /// even-register rule.
     integer,
     /// All pieces are one homogeneous LLVM array. The optional byte alignment
-    /// is the ELF AArch64 `alignstack` parameter attribute required by
-    /// HFAs/HVAs.
+    /// is the ELF AArch64 `alignstack` parameter attribute required by HFAs
+    /// and transparent vector aggregates.
     array: ?u8,
 };
 
@@ -416,7 +416,7 @@ pub fn assignPhysicalArgs(
                         ) };
                         if (aarch64_target and counts.sse != 0) {
                             // AAPCS64 rule C.5 closes the SIMD register pool once
-                            // an HFA/HVA cannot be allocated in full.
+                            // an HFA cannot be allocated in full.
                             sse_used = simd_argument_registers;
                         }
                         if (aarch64_target and counts.gp != 0) {
@@ -502,49 +502,6 @@ fn integerPieces(
     return .{ .registers = .{ .pieces = pieces, .carrier = carrier } };
 }
 
-fn fillAarch64HvaPieces(
-    store: *const Store,
-    idx: Idx,
-    base_offset: u16,
-    pieces: []RegPiece,
-    cursor: *usize,
-) void {
-    const lay = store.getLayout(idx);
-    switch (lay.tag) {
-        .scalar => {
-            std.debug.assert(lay.getScalar().tag == .vector);
-            pieces[cursor.*] = .{
-                .class = .vector,
-                .offset = base_offset,
-                .size = 16,
-                .vector_kind = lay.getScalar().getVector(),
-            };
-            cursor.* += 1;
-        },
-        .struct_ => {
-            const struct_idx = lay.getStruct().idx;
-            const field_count = store.getStructData(struct_idx).fields.count;
-            var i: u32 = 0;
-            while (i < field_count) : (i += 1) {
-                std.debug.assert(!store.getStructFieldIsPadding(struct_idx, i));
-                fillAarch64HvaPieces(
-                    store,
-                    store.getStructFieldLayout(struct_idx, i),
-                    base_offset + @as(u16, @intCast(store.getStructFieldOffset(struct_idx, i))),
-                    pieces,
-                    cursor,
-                );
-            }
-        },
-        .tag_union => {
-            const info = store.getTagUnionInfo(lay);
-            std.debug.assert(info.variants.len == 1 and info.data.discriminant_size == 0);
-            fillAarch64HvaPieces(store, info.variants.get(0).payload_layout, base_offset, pieces, cursor);
-        },
-        else => unreachable,
-    }
-}
-
 fn placementAarch64(
     arena: std.mem.Allocator,
     store: *const Store,
@@ -573,11 +530,13 @@ fn placementAarch64(
                     .structure,
             } };
         },
-        .vector_array => |va| {
-            const pieces = try arena.alloc(RegPiece, va.count);
-            var cursor: usize = 0;
-            fillAarch64HvaPieces(store, idx, 0, pieces, &cursor);
-            std.debug.assert(cursor == va.count and pieces[0].vector_kind == va.kind);
+        .vector => |kind| {
+            // A transparent single-vector aggregate travels exactly like the
+            // vector itself, but keeps clang's aggregate carrier: a one-element
+            // array argument (with the ELF alignstack attribute) and a
+            // struct-valued return.
+            const pieces = try arena.alloc(RegPiece, 1);
+            pieces[0] = .{ .class = .vector, .offset = 0, .size = 16, .vector_kind = kind };
             return .{ .registers = .{
                 .pieces = pieces,
                 .carrier = if (ctx == .arg)
@@ -858,22 +817,28 @@ test "lower native vectors preserve a single vector register piece" {
     try expectRegisters(&.{.{ .class = .vector, .offset = 0, .size = 16, .vector_kind = .u32x4 }}, win.ret);
 }
 
-test "lower aarch64 homogeneous vector aggregate" {
+test "lower aarch64 vector aggregates" {
     var store = try Store.init(testing.allocator, .u64);
     defer store.deinit();
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    const hva = try testStruct(&store, &.{ .u8x16, .u8x16, .u8x16 });
-    const call = try lower(arena, &store, .aarch64, &.{hva}, hva, false);
+    // A transparent single-vector aggregate is one Q-register value.
+    const wrapper = try testStruct(&store, &.{.u8x16});
+    const single = try lower(arena, &store, .aarch64, &.{wrapper}, wrapper, false);
     const expected = [_]RegPiece{
         .{ .class = .vector, .offset = 0, .size = 16, .vector_kind = .u8x16 },
-        .{ .class = .vector, .offset = 16, .size = 16, .vector_kind = .u8x16 },
-        .{ .class = .vector, .offset = 32, .size = 16, .vector_kind = .u8x16 },
     };
-    try expectRegisters(&expected, call.args[0]);
-    try expectRegisters(&expected, call.ret);
+    try expectRegisters(&expected, single.args[0]);
+    try expectRegisters(&expected, single.ret);
+
+    // Aggregates with two or more vector members are memory-class in both
+    // directions at the host boundary.
+    const multi = try testStruct(&store, &.{ .u8x16, .u8x16, .u8x16 });
+    const call = try lower(arena, &store, .aarch64, &.{multi}, multi, false);
+    try testing.expectEqual(Placement.indirect, call.args[0]);
+    try testing.expectEqual(Placement.indirect, call.ret);
 }
 
 test "lower transparent tag payloads with their C ABI leaf class" {
@@ -998,7 +963,39 @@ test "physical win64 allocation uses shared argument positions" {
     try testing.expectEqual(@as(u16, 8), physical.stack_size);
 }
 
-test "physical aarch64 allocation spills complete HVA and integer aggregates" {
+test "physical aarch64 allocation spills complete HFA and integer aggregates" {
+    var store = try Store.init(testing.allocator, .u64);
+    defer store.deinit();
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const hfa2 = try testStruct(&store, &.{ .f64, .f64 });
+    const pair = try testStruct(&store, &.{ .i64, .u64 });
+    const args = [_]Idx{
+        .f64, .f64,   .f64, .f64, .f64, .f64, .f64,
+        hfa2, .i32x4, .i64, .i64, .i64, .i64, .i64,
+        .i64, .i64,   pair, .u64,
+    };
+    const lowered = try lower(arena, &store, .aarch64, &args, .i32, false);
+    const physical = try assignPhysicalArgs(arena, &store, .aarch64, lowered, &args);
+
+    try testing.expect(physical.args[7] == .stack_value);
+    try testing.expectEqual(@as(u16, 0), physical.args[7].stack_value.offset);
+    try testing.expectEqual(@as(u8, 8), physical.args[7].stack_value.alignment);
+    // Rule C.5 closes the SIMD pool, so the following direct vector also stacks.
+    try testing.expect(physical.args[8] == .stack_value);
+    try testing.expectEqual(@as(u16, 16), physical.args[8].stack_value.offset);
+    try testing.expectEqual(@as(u8, 16), physical.args[8].stack_value.alignment);
+
+    try testing.expect(physical.args[16] == .stack_value);
+    try testing.expectEqual(@as(u16, 32), physical.args[16].stack_value.offset);
+    // Rule C.13 closes the GP pool after the pair fails to fit in x7 alone.
+    try testing.expect(physical.args[17] == .stack_value);
+    try testing.expectEqual(@as(u16, 48), physical.args[17].stack_value.offset);
+}
+
+test "physical aarch64 multi-vector aggregate passes a pointer in a GP register" {
     var store = try Store.init(testing.allocator, .u64);
     defer store.deinit();
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
@@ -1006,27 +1003,14 @@ test "physical aarch64 allocation spills complete HVA and integer aggregates" {
     const arena = arena_state.allocator();
 
     const hva2 = try testStruct(&store, &.{ .u8x16, .i16x8 });
-    const pair = try testStruct(&store, &.{ .i64, .u64 });
-    const args = [_]Idx{
-        .u8x16, .u8x16, .u8x16, .u8x16, .u8x16, .u8x16, .u8x16,
-        hva2,   .i32x4, .i64,   .i64,   .i64,   .i64,   .i64,
-        .i64,   .i64,   pair,   .u64,
-    };
+    const args = [_]Idx{ hva2, .u8x16 };
     const lowered = try lower(arena, &store, .aarch64, &args, .i32, false);
+    try testing.expectEqual(Placement.indirect, lowered.args[0]);
+
     const physical = try assignPhysicalArgs(arena, &store, .aarch64, lowered, &args);
-
-    try testing.expect(physical.args[7] == .stack_value);
-    try testing.expectEqual(@as(u16, 0), physical.args[7].stack_value.offset);
-    try testing.expectEqual(@as(u8, 16), physical.args[7].stack_value.alignment);
-    // Rule C.5 closes the SIMD pool, so the following direct vector also stacks.
-    try testing.expect(physical.args[8] == .stack_value);
-    try testing.expectEqual(@as(u16, 32), physical.args[8].stack_value.offset);
-
-    try testing.expect(physical.args[16] == .stack_value);
-    try testing.expectEqual(@as(u16, 48), physical.args[16].stack_value.offset);
-    // Rule C.13 closes the GP pool after the pair fails to fit in x7 alone.
-    try testing.expect(physical.args[17] == .stack_value);
-    try testing.expectEqual(@as(u16, 64), physical.args[17].stack_value.offset);
+    try testing.expectEqual(PointerLocation{ .register = 0 }, physical.args[0].indirect);
+    // The pointer occupies a GP register, so the direct vector still takes q0.
+    try testing.expectEqual(@as(u8, 0), physical.args[1].registers[0].register_index);
 }
 
 test "LLVM carriers preserve native multi-register argument identity" {
@@ -1037,26 +1021,27 @@ test "LLVM carriers preserve native multi-register argument identity" {
     const arena = arena_state.allocator();
 
     const pair = try testStruct(&store, &.{ .i64, .i64 });
+    const wrapper = try testStruct(&store, &.{.u8x16});
     const hva = try testStruct(&store, &.{ .u8x16, .i16x8 });
     const f32_hfa = try testStruct(&store, &.{ .f32, .f32 });
 
-    const aarch = try lower(arena, &store, .aarch64, &.{ .i128, pair, hva, f32_hfa }, hva, false);
+    const aarch = try lower(arena, &store, .aarch64, &.{ .i128, pair, wrapper, f32_hfa, hva }, wrapper, false);
     try testing.expectEqual(RegisterCarrier.integer, aarch.args[0].registers.carrier);
     try testing.expectEqual(RegisterCarrier{ .array = null }, aarch.args[1].registers.carrier);
     try testing.expectEqual(RegisterCarrier{ .array = 16 }, aarch.args[2].registers.carrier);
     try testing.expectEqual(layout.Vector.u8x16, aarch.args[2].registers.pieces[0].vector_kind.?);
-    try testing.expectEqual(layout.Vector.i16x8, aarch.args[2].registers.pieces[1].vector_kind.?);
     try testing.expectEqual(RegisterCarrier{ .array = 8 }, aarch.args[3].registers.carrier);
-    // AAPCS64 returns an HVA as one struct-valued LLVM result.
+    // A multi-vector aggregate is memory-class in both directions.
+    try testing.expectEqual(Placement.indirect, aarch.args[4]);
+    // AAPCS64 returns a transparent vector aggregate as one struct-valued LLVM result.
     try testing.expectEqual(RegisterCarrier.structure, aarch.ret.registers.carrier);
     try testing.expectEqual(layout.Vector.u8x16, aarch.ret.registers.pieces[0].vector_kind.?);
-    try testing.expectEqual(layout.Vector.i16x8, aarch.ret.registers.pieces[1].vector_kind.?);
 
-    const macho = try lower(arena, &store, .aarch64_macho, &.{ f32_hfa, hva }, hva, false);
+    const macho = try lower(arena, &store, .aarch64_macho, &.{ f32_hfa, wrapper }, wrapper, false);
     try testing.expectEqual(RegisterCarrier{ .array = null }, macho.args[0].registers.carrier);
     try testing.expectEqual(RegisterCarrier{ .array = null }, macho.args[1].registers.carrier);
 
-    const windows = try lower(arena, &store, .aarch64_windows, &.{ f32_hfa, hva }, hva, false);
+    const windows = try lower(arena, &store, .aarch64_windows, &.{ f32_hfa, wrapper }, wrapper, false);
     try testing.expectEqual(RegisterCarrier{ .array = null }, windows.args[0].registers.carrier);
     try testing.expectEqual(RegisterCarrier{ .array = null }, windows.args[1].registers.carrier);
 
