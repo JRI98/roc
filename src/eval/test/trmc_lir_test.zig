@@ -607,9 +607,9 @@ test "trmc transforms the canonical repeat shape and builds correct structure" {
 test "trmc'd repeat escapes the interpreter call-depth cap" {
     const allocator = std.testing.allocator;
 
-    // Control: without the transform, depth 2000 exceeds the interpreter's
-    // 1024-frame cap and crashes.
-    {
+    // The interpreter's artificial call-depth cap is a Debug-only diagnostic.
+    // In Debug, verify the untransformed control case exceeds that cap.
+    if (comptime @import("builtin").mode == .Debug) {
         var store = LirStore.init(allocator);
         defer store.deinit();
         var layouts = try layout.Store.init(allocator, base.target.TargetUsize.native);

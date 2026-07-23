@@ -10436,8 +10436,6 @@ test "SpecConstr pattern clones bind fresh local identities" {
 }
 
 test "known match fold aborts on undecidable branches and trips the invariant when every branch is excluded" {
-    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
-
     const allocator = std.testing.allocator;
     var program = emptyLiftedProgramForTest(allocator);
     defer program.deinit();
@@ -10476,29 +10474,31 @@ test "known match fold aborts on undecidable branches and trips the invariant wh
     });
     try std.testing.expect((try cloner.simplifyKnownMatchValue(foo_value, folding_branches)) != null);
 
-    // Every branch a definite no-match violates checker exhaustiveness: the
-    // invariant must fire. The panic aborts, so probe it from a fork.
-    const excluded_branches = try program.addBranchSpan(&.{
-        .{ .pat = bar_pat, .body = body },
-    });
-    const pid = std.c.fork();
-    try std.testing.expect(pid >= 0);
-    if (pid == 0) {
-        const dev_null = std.c.open("/dev/null", .{ .ACCMODE = .WRONLY });
-        if (dev_null >= 0) {
-            _ = std.c.dup2(dev_null, 2);
-            _ = std.c.close(dev_null);
+    // Every branch a definite no-match violates checker exhaustiveness. In
+    // Debug, the invariant panics; probe that abort from a fork on POSIX.
+    if (comptime @import("builtin").mode == .Debug and @import("builtin").os.tag != .windows) {
+        const excluded_branches = try program.addBranchSpan(&.{
+            .{ .pat = bar_pat, .body = body },
+        });
+        const pid = std.c.fork();
+        try std.testing.expect(pid >= 0);
+        if (pid == 0) {
+            const dev_null = std.c.open("/dev/null", .{ .ACCMODE = .WRONLY });
+            if (dev_null >= 0) {
+                _ = std.c.dup2(dev_null, 2);
+                _ = std.c.close(dev_null);
+            }
+            _ = cloner.simplifyKnownMatchValue(foo_value, excluded_branches) catch std.c._exit(2);
+            // Reaching this line means the invariant did not fire.
+            std.c._exit(0);
         }
-        _ = cloner.simplifyKnownMatchValue(foo_value, excluded_branches) catch std.c._exit(2);
-        // Reaching this line means the invariant did not fire.
-        std.c._exit(0);
+        var status: c_int = 0;
+        _ = std.c.waitpid(pid, &status, 0);
+        const raw_status: u32 = @bitCast(status);
+        const failed = std.posix.W.IFSIGNALED(raw_status) or
+            (std.posix.W.IFEXITED(raw_status) and std.posix.W.EXITSTATUS(raw_status) != 0);
+        try std.testing.expect(failed);
     }
-    var status: c_int = 0;
-    _ = std.c.waitpid(pid, &status, 0);
-    const raw_status: u32 = @bitCast(status);
-    const failed = std.posix.W.IFSIGNALED(raw_status) or
-        (std.posix.W.IFEXITED(raw_status) and std.posix.W.EXITSTATUS(raw_status) != 0);
-    try std.testing.expect(failed);
 }
 
 test "call-pattern specialization declarations are referenced" {

@@ -12,6 +12,7 @@
 //!   --threads <N>        Max concurrent child processes (default: CPU count)
 //!   --timeout <ms>       Per-test timeout in ms (default: 120000, 240000 with glue)
 //!   --include-llvm       Include size and speed LLVM backend jobs
+//!   --cross-target <name> Build platform cases for this target without running them
 //!   --glue-roc <path>    Roc binary to use for glue generation (default: <roc_binary>)
 //!   --glue-opt <opt>     Glue execution mode: default, dev, size, or speed
 //!   --verbose            Print PASS results and timing details
@@ -116,6 +117,13 @@ const SuiteSelection = struct {
     fn isEmpty(self: SuiteSelection) bool {
         for (self.enabled) |enabled| {
             if (enabled) return false;
+        }
+        return true;
+    }
+
+    fn includesOnly(self: SuiteSelection, selected: Suite) bool {
+        for (self.enabled, 0..) |enabled, index| {
+            if (enabled != (index == @intFromEnum(selected))) return false;
         }
         return true;
     }
@@ -265,6 +273,8 @@ const PlatformCase = struct {
         native_run,
         /// Build natively, run with --test <spec>; check exit code 0
         io_spec: []const u8,
+        /// Build for the named cross-compilation target without running.
+        cross_compile: []const u8,
     };
 };
 
@@ -472,17 +482,24 @@ fn buildCases(
     include_llvm: bool,
     suites: SuiteSelection,
     glue_options: GlueRunnerOptions,
+    cross_target: ?[]const u8,
 ) CliRunnerError![]const CliCase {
     var cases: std.ArrayListUnmanaged(CliCase) = .empty;
 
     if (suites.includes(.platforms)) {
         for (&platform_config.platforms) |platform| {
-            for (&base_test_opts) |opt| {
-                try appendPlatformSpecs(allocator, &cases, platform, opt, filters);
-            }
-            if (include_llvm) {
-                for (&llvm_test_opts) |opt| {
+            if (cross_target) |target| {
+                const target_info = platform_config.findTarget(platform, target) orelse continue;
+                if (target_info.requires_linux and builtin.os.tag != .linux) continue;
+                try appendCrossCompilePlatformSpecs(allocator, &cases, platform, target, filters);
+            } else {
+                for (&base_test_opts) |opt| {
                     try appendPlatformSpecs(allocator, &cases, platform, opt, filters);
+                }
+                if (include_llvm) {
+                    for (&llvm_test_opts) |opt| {
+                        try appendPlatformSpecs(allocator, &cases, platform, opt, filters);
+                    }
                 }
             }
         }
@@ -638,6 +655,65 @@ fn appendPlatformSpecs(
                 }
             }
         },
+    }
+}
+
+fn appendCrossCompilePlatformSpecs(
+    allocator: Allocator,
+    cases: *std.ArrayListUnmanaged(CliCase),
+    platform: platform_config.PlatformConfig,
+    target: []const u8,
+    filters: []const []const u8,
+) CliRunnerError!void {
+    switch (platform.test_apps) {
+        .single => |app_name| {
+            const roc_file = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ platform.base_dir, app_name });
+            try appendCrossCompileCase(allocator, cases, platform.name, target, roc_file, &.{}, filters);
+        },
+        .spec_list => |specs| {
+            for (specs) |spec| {
+                try appendCrossCompileCase(
+                    allocator,
+                    cases,
+                    platform.name,
+                    target,
+                    spec.roc_file,
+                    spec.expected_build_stderr_contains,
+                    filters,
+                );
+            }
+        },
+        .simple_list => |specs| {
+            for (specs) |spec| {
+                try appendCrossCompileCase(allocator, cases, platform.name, target, spec.roc_file, &.{}, filters);
+            }
+        },
+    }
+}
+
+fn appendCrossCompileCase(
+    allocator: Allocator,
+    cases: *std.ArrayListUnmanaged(CliCase),
+    platform: []const u8,
+    target: []const u8,
+    roc_file: []const u8,
+    expected_build_stderr_contains: []const []const u8,
+    filters: []const []const u8,
+) CliRunnerError!void {
+    const name = try std.fmt.allocPrint(allocator, "{s} [cross {s}]", .{ roc_file, target });
+    const case = CliCase{
+        .id = cases.items.len,
+        .suite = .platforms,
+        .name = name,
+        .body = .{ .platform = .{
+            .roc_file = roc_file,
+            .platform = platform,
+            .expected_build_stderr_contains = expected_build_stderr_contains,
+            .test_kind = .{ .cross_compile = target },
+        } },
+    };
+    if (matchesFilters(case, filters)) {
+        try cases.append(allocator, case);
     }
 }
 
@@ -1558,8 +1634,6 @@ fn runSingleTest(io: std.Io, allocator: Allocator, spec: CliCase, timeout_ms: u6
 fn runPlatformCase(io: std.Io, allocator: Allocator, spec: CliCase, timeout_ms: u64) TestResult {
     var timer = harness.Timer.start() catch return .{ .status = .infra_error, .phase = .setup, .message = "no clock" };
     const platform = spec.body.platform;
-    const backend = spec.backend orelse
-        return .{ .status = .infra_error, .phase = .setup, .duration_ns = timer.read(), .message = "platform case missing backend" };
 
     const dirs = util.createIsolatedTestDirs(io, allocator) catch
         return .{ .status = .infra_error, .phase = .setup, .duration_ns = timer.read(), .message = "failed to create test directories" };
@@ -1597,9 +1671,16 @@ fn runPlatformCase(io: std.Io, allocator: Allocator, spec: CliCase, timeout_ms: 
     util.putIsolatedTempEnv(&env_map, dirs.temp_dir) catch
         return .{ .status = .infra_error, .phase = .setup, .duration_ns = timer.read(), .message = "failed to set isolated temp dir" };
 
-    const result = switch (backend) {
-        .interpreter => runInterpreterTest(io, allocator, backend, platform, roc_file, &env_map, dirs.work_dir, &timer, timeout_ms),
-        .dev, .size, .speed => runCompiledTest(io, allocator, backend, platform, roc_file, output_name, &env_map, dirs.work_dir, &timer, timeout_ms),
+    const result = switch (platform.test_kind) {
+        .cross_compile => |target| runCrossCompileTest(io, allocator, target, platform, roc_file, output_name, &env_map, dirs.work_dir, &timer, timeout_ms),
+        .native_run, .io_spec => blk: {
+            const backend = spec.backend orelse
+                break :blk TestResult{ .status = .infra_error, .phase = .setup, .duration_ns = timer.read(), .message = "platform case missing backend" };
+            break :blk switch (backend) {
+                .interpreter => runInterpreterTest(io, allocator, backend, platform, roc_file, &env_map, dirs.work_dir, &timer, timeout_ms),
+                .dev, .size, .speed => runCompiledTest(io, allocator, backend, platform, roc_file, output_name, &env_map, dirs.work_dir, &timer, timeout_ms),
+            };
+        },
     };
 
     if (result.status == .pass) {
@@ -1646,6 +1727,7 @@ fn runInterpreterTest(
             argv_buf[argc] = io_spec;
             argc += 1;
         },
+        .cross_compile => unreachable,
     }
 
     var run_timer = harness.Timer.start() catch return .{ .status = .infra_error, .phase = .run, .duration_ns = timer.read(), .message = "no clock" };
@@ -1733,6 +1815,7 @@ fn runCompiledTest(
             run_argv_buf[argc] = io_spec;
             argc += 1;
         },
+        .cross_compile => unreachable,
     }
 
     var run_timer = harness.Timer.start() catch return .{ .status = .infra_error, .phase = .run, .duration_ns = timer.read(), .build_ns = build_ns, .message = "no clock" };
@@ -1748,6 +1831,65 @@ fn runCompiledTest(
     };
     const run_ns = run_timer.read();
     return resultFromProcess(run_result, timer, .run, build_ns, run_ns, "run failed");
+}
+
+fn runCrossCompileTest(
+    io: std.Io,
+    allocator: Allocator,
+    target: []const u8,
+    platform: PlatformCase,
+    roc_file: []const u8,
+    output_name: []const u8,
+    env_map: *const std.process.Environ.Map,
+    work_dir: []const u8,
+    timer: *harness.Timer,
+    timeout_ms: u64,
+) TestResult {
+    const target_arg = std.fmt.allocPrint(allocator, "--target={s}", .{target}) catch
+        return .{ .status = .infra_error, .phase = .setup, .duration_ns = timer.read(), .message = "failed to allocate target arg" };
+    defer allocator.free(target_arg);
+    const output_arg = std.fmt.allocPrint(allocator, "--output={s}", .{output_name}) catch
+        return .{ .status = .infra_error, .phase = .setup, .duration_ns = timer.read(), .message = "failed to allocate output arg" };
+    defer allocator.free(output_arg);
+    const build_argv = &[_][]const u8{ roc_binary_path, "build", target_arg, output_arg, roc_file };
+
+    var build_timer = harness.Timer.start() catch
+        return .{ .status = .infra_error, .phase = .build, .duration_ns = timer.read(), .message = "no clock" };
+    const build_timeout_ms = childCommandTimeoutMs(timer, timeout_ms) orelse
+        return timeoutFailure(allocator, timer, .build, "case timeout exhausted before cross-build command started");
+    const build_result = util.runChildWithTimeout(io, allocator, build_argv, .{
+        .cwd = work_dir,
+        .env_map = env_map,
+        .max_output_bytes = 10 * 1024 * 1024,
+        .timeout_ms = build_timeout_ms,
+    }) catch |err| {
+        const msg = std.fmt.allocPrint(allocator, "cross-build spawn error: {}", .{err}) catch "cross-build spawn error";
+        return .{ .status = .infra_error, .phase = .build, .duration_ns = timer.read(), .build_ns = build_timer.read(), .message = msg };
+    };
+    const build_ns = build_timer.read();
+    const expected_stderr = platform.expected_build_stderr_contains;
+    if (processTimedOut(build_result.stderr) or hasMemoryErrors(build_result.stderr) != null or
+        !buildSucceededOrExpectedDiagnostics(build_result, expected_stderr))
+    {
+        return resultFromProcess(build_result, timer, .build, build_ns, 0, "cross-build failed");
+    }
+    if (missingExpectedStderr(build_result.stderr, expected_stderr)) |needle| {
+        const msg = std.fmt.allocPrint(allocator, "missing expected cross-build stderr: {s}", .{needle}) catch "missing expected cross-build stderr";
+        return .{
+            .status = .build_failed,
+            .phase = .build,
+            .duration_ns = timer.read(),
+            .build_ns = build_ns,
+            .exit_code = exitCode(build_result.term),
+            .stderr_capture = build_result.stderr,
+            .stdout_capture = build_result.stdout,
+            .message = msg,
+        };
+    }
+    if (!builtOutputExists(io, allocator, output_name)) {
+        return .{ .status = .build_failed, .phase = .build, .duration_ns = timer.read(), .build_ns = build_ns, .message = "cross-build succeeded but output file was not created" };
+    }
+    return .{ .status = .pass, .phase = .build, .duration_ns = timer.read(), .build_ns = build_ns };
 }
 
 fn builtOutputExists(io: std.Io, allocator: Allocator, output_name: []const u8) bool {
@@ -8690,6 +8832,7 @@ fn printUsage() void {
         \\  --threads <N>        Max concurrent workers (default: CPU count)
         \\  --timeout <ms>       Per-test timeout in ms (default: 120000, 240000 with glue)
         \\  --include-llvm       Include size and speed LLVM backend jobs
+        \\  --cross-target <name> Build platform cases for this target without running them
         \\  --glue-roc <path>    Roc binary to use for glue generation (default: <roc_binary>)
         \\  --glue-opt <opt>     Glue execution mode: default, dev, size, or speed
         \\  --verbose            Show PASS results with timing
@@ -8702,6 +8845,7 @@ const ParsedRunnerArgs = struct {
     suites: SuiteSelection,
     glue_options: GlueRunnerOptions,
     glue_roc: ?[]const u8 = null,
+    cross_target: ?[]const u8 = null,
 };
 
 fn parseSuiteName(value: []const u8) ?Suite {
@@ -8719,6 +8863,13 @@ fn parseGlueExecutionMode(value: []const u8) ?GlueExecutionMode {
     return null;
 }
 
+fn isKnownCrossTarget(value: []const u8) bool {
+    for (platform_config.platforms) |platform| {
+        if (platform_config.findTarget(platform, value) != null) return true;
+    }
+    return false;
+}
+
 fn parseRunnerArgs(allocator: Allocator, process_args: std.process.Args) CliRunnerError!ParsedRunnerArgs {
     const raw_z = try process_args.toSlice(allocator);
     const raw_args: []const []const u8 = @ptrCast(raw_z);
@@ -8729,6 +8880,7 @@ fn parseRunnerArgs(allocator: Allocator, process_args: std.process.Args) CliRunn
     var suites = SuiteSelection{};
     var glue_options = GlueRunnerOptions{};
     var glue_roc: ?[]const u8 = null;
+    var cross_target: ?[]const u8 = null;
     var saw_suite = false;
     var i: usize = 1;
     while (i < raw_args.len) : (i += 1) {
@@ -8760,6 +8912,29 @@ fn parseRunnerArgs(allocator: Allocator, process_args: std.process.Args) CliRunn
             glue_roc = raw_args[i];
             continue;
         }
+        if (std.mem.eql(u8, arg, "--cross-target")) {
+            i += 1;
+            if (i >= raw_args.len) {
+                std.debug.print("missing value for --cross-target\n", .{});
+                return error.InvalidArgs;
+            }
+            const value = raw_args[i];
+            if (!isKnownCrossTarget(value)) {
+                std.debug.print("unknown cross target: {s}\n", .{value});
+                return error.InvalidArgs;
+            }
+            cross_target = value;
+            continue;
+        }
+        if (std.mem.startsWith(u8, arg, "--cross-target=")) {
+            const value = arg["--cross-target=".len..];
+            if (!isKnownCrossTarget(value)) {
+                std.debug.print("unknown cross target: {s}\n", .{value});
+                return error.InvalidArgs;
+            }
+            cross_target = value;
+            continue;
+        }
         if (std.mem.startsWith(u8, arg, "--glue-roc=")) {
             glue_roc = arg["--glue-roc=".len..];
             continue;
@@ -8789,7 +8964,15 @@ fn parseRunnerArgs(allocator: Allocator, process_args: std.process.Args) CliRunn
     }
 
     if (!saw_suite or suites.isEmpty()) {
-        suites.addAll();
+        if (cross_target != null) {
+            suites.add(.platforms);
+        } else {
+            suites.addAll();
+        }
+    }
+    if (cross_target != null and !suites.includesOnly(.platforms)) {
+        std.debug.print("--cross-target can only be used with the platforms suite\n", .{});
+        return error.InvalidArgs;
     }
 
     return .{
@@ -8797,6 +8980,7 @@ fn parseRunnerArgs(allocator: Allocator, process_args: std.process.Args) CliRunn
         .suites = suites,
         .glue_options = glue_options,
         .glue_roc = glue_roc,
+        .cross_target = cross_target,
     };
 }
 
@@ -8819,6 +9003,37 @@ test "effectiveTimeoutMs extends default for glue suite only" {
     default_args.timeout_provided = true;
     default_args.timeout_ms = 15_000;
     try std.testing.expectEqual(@as(u64, 15_000), effectiveTimeoutMs(default_args, suites));
+}
+
+test "cross target builds one build-only case per matching platform spec" {
+    var arena = collections.SingleThreadArena.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var suites = SuiteSelection{};
+    suites.add(.platforms);
+    const cases = try buildCases(
+        arena.allocator(),
+        &.{"test/fx/"},
+        false,
+        suites,
+        .{},
+        "x64musl",
+    );
+
+    const fx = platform_config.findPlatform("fx").?;
+    const expected_count = switch (fx.test_apps) {
+        .spec_list => |specs| specs.len,
+        else => unreachable,
+    };
+    try std.testing.expectEqual(expected_count, cases.len);
+    for (cases) |case| {
+        try std.testing.expectEqual(@as(?OptMode, null), case.backend);
+        try std.testing.expect(std.mem.startsWith(u8, case.body.platform.roc_file, "test/fx/"));
+        switch (case.body.platform.test_kind) {
+            .cross_compile => |target| try std.testing.expectEqualStrings("x64musl", target),
+            else => return error.TestUnexpectedResult,
+        }
+    }
 }
 
 /// Entry point for the parallel CLI test runner.
@@ -8860,7 +9075,7 @@ pub fn main(init: std.process.Init) CliRunnerError!void {
         roc_binary_path;
     glue_execution_mode = parsed.glue_options.execution_mode;
 
-    const tests = try buildCases(spec_arena.allocator(), args.filters, args.include_llvm, parsed.suites, parsed.glue_options);
+    const tests = try buildCases(spec_arena.allocator(), args.filters, args.include_llvm, parsed.suites, parsed.glue_options, parsed.cross_target);
     if (tests.len == 0) return;
     const timeout_ms = effectiveTimeoutMs(args, parsed.suites);
 
@@ -8877,7 +9092,9 @@ pub fn main(init: std.process.Init) CliRunnerError!void {
 
     std.debug.print("=== CLI Test Runner ===\n", .{});
     std.debug.print("{d} tests, {d} workers, {d}s timeout", .{ tests.len, max_children, timeout_ms / 1000 });
-    if (args.include_llvm) {
+    if (parsed.cross_target) |target| {
+        std.debug.print(", cross target: {s}\n\n", .{target});
+    } else if (args.include_llvm) {
         std.debug.print(", backends: interpreter, dev, size, speed\n\n", .{});
     } else {
         std.debug.print(", backends: interpreter, dev\n\n", .{});
