@@ -642,6 +642,12 @@ const Pass = struct {
     fn run(self: *Pass) Common.LowerError!void {
         const original_fn_count = self.plans.len;
 
+        const capture_snapshot = try self.snapshotOriginalCaptures(original_fn_count);
+        defer {
+            for (capture_snapshot) |captures| self.allocator.free(captures);
+            self.allocator.free(capture_snapshot);
+        }
+
         // The append peel runs first, while an append chain's arms are still
         // separate `append` calls over their shared base. Specialization would
         // otherwise collapse a multi-append arm into one specialized adapter
@@ -658,8 +664,52 @@ const Pass = struct {
         try self.scalarizeKnownLoops(original_fn_count);
         try self.createSpecializations(original_fn_count);
         try Lift.recomputeCaptures(self.allocator, self.program);
+        self.verifyRewrittenCaptureGain(capture_snapshot);
 
         self.program.next_symbol = self.symbols.next;
+    }
+
+    /// Debug-only: the capture local ids each original fn declares before any
+    /// rewriting, indexed by fn. Empty outside safety-checked builds.
+    fn snapshotOriginalCaptures(self: *Pass, original_fn_count: usize) Allocator.Error![]const []const Ast.LocalId {
+        if (!std.debug.runtime_safety) return &.{};
+        const snapshot = try self.allocator.alloc([]const Ast.LocalId, original_fn_count);
+        for (0..original_fn_count) |index| {
+            const captures = self.program.typedLocalSpan(self.program.getFnAt(index).captures);
+            const locals = try self.allocator.alloc(Ast.LocalId, captures.len);
+            for (0..captures.len) |capture_index| {
+                locals[capture_index] = GuardedList.at(captures, capture_index).local;
+            }
+            snapshot[index] = locals;
+        }
+        return snapshot;
+    }
+
+    /// Debug-only: a value-substituting rewrite must never introduce a new
+    /// free local, so a fn whose body was rewritten in place may not gain a
+    /// capture its source did not declare. A gained capture is a reference
+    /// the rewrite left resolving to a vanished binding — capture
+    /// recomputation silently promotes it to a phantom argument, which
+    /// misreads whatever register the caller happens to leave there.
+    fn verifyRewrittenCaptureGain(self: *Pass, capture_snapshot: []const []const Ast.LocalId) void {
+        if (!std.debug.runtime_safety) return;
+        for (capture_snapshot, 0..) |original_captures, index| {
+            if (index >= self.whole_body_cloned.len or !self.whole_body_cloned[index]) continue;
+            const captures = self.program.typedLocalSpan(self.program.getFnAt(index).captures);
+            for (0..captures.len) |capture_index| {
+                const local = GuardedList.at(captures, capture_index).local;
+                var declared = false;
+                for (original_captures) |original| {
+                    if (original == local) {
+                        declared = true;
+                        break;
+                    }
+                }
+                if (!declared) {
+                    Common.invariant("rewritten fn gained a capture its source did not declare");
+                }
+            }
+        }
     }
 
     /// Rewrite each branch-chosen `append`-loop function into a base loop plus a
@@ -5590,8 +5640,14 @@ const Cloner = struct {
         // Every back edge reassigns the variable, so its pre-loop value is not
         // what the slot carries inside the loop. Reads sharing that binder (the
         // reassigned copies feeding `continue`) must resolve to the value the slot
-        // actually holds, so drop those pre-loop values before cloning the body.
-        for (initial_values) |initial| try self.dropCarriedBinderValue(initial);
+        // actually holds, so drop those pre-loop values before cloning the body
+        // and keep each slot's identity: the emitted params are installed under
+        // it below, which is the only resolution path a reassigned copy has.
+        const carried_identities = try self.pass.allocator.alloc(?BinderIdentity, initial_values.len);
+        defer self.pass.allocator.free(carried_identities);
+        for (initial_values, carried_identities) |initial, *identity| {
+            identity.* = try self.dropCarriedBinderValue(initial);
+        }
 
         // Splitting a slot into its shape leaves is only sound when every back
         // edge can hand those leaves back. Whether a back edge can is knowable
@@ -5619,10 +5675,11 @@ const Cloner = struct {
             defer forward_sources.deinit(self.pass.allocator);
             var forward_finals = std.ArrayList(Ast.LocalId).empty;
             defer forward_finals.deinit(self.pass.allocator);
-            for (params, shapes, values) |param, shape, value| {
+            for (params, shapes, values, carried_identities) |param, shape, value, carried_identity| {
                 const leaf_start = new_params.items.len;
                 const param_value = try self.valueFromShapeArgs(shape, &new_params);
                 try self.putSubst(param.local, param_value);
+                if (carried_identity) |identity| try self.putLoopCarriedSubst(identity, param_value);
                 try self.appendExprsFromValue(shape, value, &new_initials);
                 switch (shape) {
                     // An `.any` slot keeps its whole value in one param, so a
@@ -5675,11 +5732,16 @@ const Cloner = struct {
         defer self.pass.allocator.free(forward_sources);
         const forward_finals = try self.pass.allocator.alloc(Ast.LocalId, params.len);
         defer self.pass.allocator.free(forward_finals);
-        for (params, whole_params, forward_sources, forward_finals) |param, *whole, *source, *final| {
+        for (params, whole_params, forward_sources, forward_finals, carried_identities) |param, *whole, *source, *final, carried_identity| {
             whole.* = .{
                 .local = try self.cloneBinder(param.local, param.ty, .bind_runtime),
                 .ty = param.ty,
             };
+            if (carried_identity) |identity| {
+                const param_value = self.subst.get(param.local) orelse
+                    Common.invariant("carried whole-state param had no substitution after binding");
+                try self.putLoopCarriedSubst(identity, param_value);
+            }
             source.* = param.local;
             final.* = whole.local;
         }
@@ -5722,17 +5784,23 @@ const Cloner = struct {
     }
 
     /// Remove the pre-loop `binder_subst` value for the variable carried by a
-    /// loop slot whose initial value is that variable. The removal is recorded on
-    /// the change log so it is restored when the loop clone finishes.
-    fn dropCarriedBinderValue(self: *Cloner, initial: Ast.ExprId) Allocator.Error!void {
-        const local = localExpr(self.pass.program, initial) orelse return;
-        const identity = self.binderIdentityOf(local) orelse return;
-        const previous = self.binder_subst.get(identity) orelse return;
+    /// loop slot whose initial value is that variable, and return the slot's
+    /// binder identity so the loop clone can install its param value under it.
+    /// The removal is recorded on the change log so it is restored when the
+    /// loop clone finishes. Returns null when the initial is not a bare
+    /// binder-carrying local; the identity is returned whether or not a
+    /// pre-loop entry existed, because the slot's reassigned copies resolve
+    /// through it either way.
+    fn dropCarriedBinderValue(self: *Cloner, initial: Ast.ExprId) Allocator.Error!?BinderIdentity {
+        const local = localExpr(self.pass.program, initial) orelse return null;
+        const identity = self.binderIdentityOf(local) orelse return null;
+        const previous = self.binder_subst.get(identity) orelse return identity;
         try self.changes.append(self.pass.allocator, .{
             .key = .{ .binder = identity },
             .previous = previous,
         });
         _ = self.binder_subst.remove(identity);
+        return identity;
     }
 
     /// A block whose statements all dissolve — each binds a substitutable
@@ -8073,6 +8141,22 @@ const Cloner = struct {
     /// binder together with the digest of the local's monomorphic type. Two
     /// locals that share a binder but were monomorphized at different types are
     /// distinct bindings and must not read one another's substitution.
+    /// Install a binder-wide substitution for a loop-carried slot. Reassigned
+    /// copies of a carried variable share its source binder but not its local
+    /// id, so binder identity is the only path they resolve through. Unlike
+    /// `putSubst`, the entry is written for any value variant: an opaque
+    /// scalar param must reach those copies too, or they resolve to the
+    /// dropped pre-loop local and capture recomputation turns the vanished
+    /// binding into a phantom root argument.
+    fn putLoopCarriedSubst(self: *Cloner, identity: BinderIdentity, value: Value) Allocator.Error!void {
+        const previous = self.binder_subst.get(identity);
+        try self.changes.append(self.pass.allocator, .{
+            .key = .{ .binder = identity },
+            .previous = previous,
+        });
+        try self.binder_subst.put(identity, value);
+    }
+
     fn binderIdentityOf(self: *Cloner, local: Ast.LocalId) ?BinderIdentity {
         const local_data = self.pass.program.getLocal(local);
         const binder = local_data.binder orelse return null;

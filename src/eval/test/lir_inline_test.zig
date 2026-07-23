@@ -5710,6 +5710,41 @@ test "issue 10301 fold over effect-produced list scalarizes" {
     try std.testing.expectEqual(@as(usize, 0), try reachableProcShapeCount(allocator, &optimized.lowered, rawListAccessOutsideLoop));
 }
 
+// Repro for https://github.com/roc-lang/roc/issues/10317: a loop-carried
+// variable reassigned under a branch must keep resolving through its binder
+// identity after the carried slot is rebound to a fresh param; a dangling
+// reference would surface as a phantom root argument.
+test "issue 10317 loop-carried reassignment keeps root arg count" {
+    const allocator = std.testing.allocator;
+    const source =
+        \\main : I64
+        \\main = {
+        \\    var $x = 0
+        \\    var $y = 0
+        \\    for flag in [Bool.False] {
+        \\        $y = if flag {
+        \\            $x = 1
+        \\            0
+        \\        } else {
+        \\            0
+        \\        }
+        \\    }
+        \\    $x + $y
+        \\}
+    ;
+    var dev = try lowerModule(allocator, source, .none);
+    defer dev.deinit(allocator);
+    var optimized = try lowerModule(allocator, source, .wrappers);
+    defer optimized.deinit(allocator);
+
+    const dev_root = dev.lowered.lir_result.store.getProcSpec(try rootProc(&dev.lowered));
+    const opt_root = optimized.lowered.lir_result.store.getProcSpec(try rootProc(&optimized.lowered));
+    try std.testing.expectEqual(
+        dev.lowered.lir_result.store.getLocalSpan(dev_root.args).len,
+        optimized.lowered.lir_result.store.getLocalSpan(opt_root.args).len,
+    );
+}
+
 test "sequential effect-produced for-loops both scalarize" {
     const allocator = std.testing.allocator;
     const source =
