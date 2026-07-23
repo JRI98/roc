@@ -302,6 +302,19 @@ const CallableShape = struct {
     captures: []const Shape,
 };
 
+/// Maximum number of `nominal.backing` / `static_data_candidate.runtime` /
+/// callable-capture pointer edges any single value-tree strip may follow. A
+/// value can reference itself through those edges when a `.local` resolves
+/// through the substitution maps to an ancestor of a recursive construction,
+/// so a strip that ignored the bound would hang on a cycle. A finite value's
+/// pointer-edge chain is far shorter than this cap (known values are bounded to
+/// a few thousand nodes by their derivations), so reaching it means the value
+/// is cyclic: the static matchers decline conservatively and the materializing
+/// and projecting walks — which only ever run on values proven acyclic — treat
+/// it as a compiler bug. See design.md "Core Principles" on bounded post-check
+/// walks.
+const value_wrapper_strip_cap: usize = 4096;
+
 const Value = union(enum) {
     expr: Ast.ExprId,
     static_data_candidate: StaticDataCandidateValue,
@@ -3402,6 +3415,19 @@ const Cloner = struct {
     /// its region's start without crossing an effect.
     effect_marks: usize,
     region_entry_marks: usize,
+    /// Depth of the wrapper-strip recursion in the static value matchers
+    /// (`bindPatToValue`/`bindPatToMatchValue`/`bindPatToFlowValue`), counting
+    /// each `nominal.backing`/`static_data_candidate.runtime` pointer edge
+    /// followed. A loop-carried value can reference itself through those edges,
+    /// so an unbounded strip would hang; reaching `value_wrapper_strip_cap`
+    /// declines the static decision toward a residual runtime match.
+    wrapper_strip_depth: usize,
+    /// Depth of the wrapper-strip recursion in `materialize`, counting each
+    /// `nominal.backing`/`static_data_candidate.runtime`/callable-capture edge
+    /// followed. `materialize` runs on values proven acyclic by construction —
+    /// a cyclic value is rebound through a plain source clone before it can
+    /// reach here — so reaching `value_wrapper_strip_cap` is a compiler bug.
+    materialize_strip_depth: usize,
     inline_direct_calls: bool,
     inline_direct_requires_known_arg: bool,
     rewrite_call_patterns: bool,
@@ -3457,6 +3483,8 @@ const Cloner = struct {
             .expr_window_starts = std.AutoHashMap(Ast.ExprId, usize).init(pass.allocator),
             .effect_marks = 0,
             .region_entry_marks = 0,
+            .wrapper_strip_depth = 0,
+            .materialize_strip_depth = 0,
             .inline_direct_calls = true,
             .inline_direct_requires_known_arg = true,
             .rewrite_call_patterns = true,
@@ -3489,6 +3517,8 @@ const Cloner = struct {
             .expr_window_starts = std.AutoHashMap(Ast.ExprId, usize).init(pass.allocator),
             .effect_marks = 0,
             .region_entry_marks = 0,
+            .wrapper_strip_depth = 0,
+            .materialize_strip_depth = 0,
             .inline_direct_calls = true,
             .inline_direct_requires_known_arg = false,
             .rewrite_call_patterns = true,
@@ -6368,7 +6398,23 @@ const Cloner = struct {
     }
 
     fn cloneMatch(self: *Cloner, ty: Type.TypeId, match: @import("../monotype/ast.zig").MatchExpr) Common.LowerError!Ast.ExprId {
+        const pending_watermark = self.pending.items.len;
         const scrutinee = try self.cloneExprValueDemandingShape(match.scrutinee);
+        if (self.knownConstructorSize(scrutinee) == known_constructor_size_cap) {
+            // The scrutinee's measured size saturated the work budget: it is
+            // cyclic or too deep to materialize. Skip the known-match collapse
+            // and emit the residual match over a plain clone of the source
+            // scrutinee, finite by construction, rather than materializing a
+            // possibly self-referential value. Dropping the first clone's
+            // delegated pendings keeps the scrutinee's effect emitted only by
+            // the plain re-clone.
+            self.pending.shrinkRetainingCapacity(pending_watermark);
+            return try self.addExpr(.{ .ty = ty, .data = .{ .match_ = .{
+                .scrutinee = try self.cloneExprPlain(match.scrutinee),
+                .branches = try self.cloneBranchSpan(match.branches),
+                .comptime_site = match.comptime_site,
+            } } });
+        }
         if (try self.simplifyKnownMatch(scrutinee, match.branches)) |body| return body;
 
         const scrutinee_expr = try self.materialize(scrutinee);
@@ -6492,7 +6538,7 @@ const Cloner = struct {
                             .fields = prepared_fields,
                         } };
                     },
-                    .nominal => |nominal| return try self.bindPatToMatchValue(pat_id, nominal.backing.*, body, unsafe_count),
+                    .nominal => |nominal| return try self.bindPatToMatchValueStripped(pat_id, nominal.backing.*, body, unsafe_count),
                     .expr => |receiver| {
                         if (!canReadFieldsFromExpr(self.pass.program, receiver)) return null;
                         for (0..fields.len) |index| {
@@ -6531,7 +6577,7 @@ const Cloner = struct {
                             .items = items,
                         } };
                     },
-                    .nominal => |nominal| return try self.bindPatToMatchValue(pat_id, nominal.backing.*, body, unsafe_count),
+                    .nominal => |nominal| return try self.bindPatToMatchValueStripped(pat_id, nominal.backing.*, body, unsafe_count),
                     .expr => |receiver| {
                         if (!canReadFieldsFromExpr(self.pass.program, receiver)) return null;
                         for (0..pats.len) |index| {
@@ -6587,7 +6633,7 @@ const Cloner = struct {
                     else => return null,
                 };
                 const backing = try self.pass.arena.allocator().create(Value);
-                backing.* = (try self.bindPatToMatchValue(backing_pat, nominal.backing.*, body, unsafe_count)) orelse return null;
+                backing.* = (try self.bindPatToMatchValueStripped(backing_pat, nominal.backing.*, body, unsafe_count)) orelse return null;
                 return Value{ .nominal = .{
                     .ty = nominal.ty,
                     .backing = backing,
@@ -6614,12 +6660,31 @@ const Cloner = struct {
         unsafe_count: usize,
     ) Common.LowerError!?Value {
         const runtime = try self.pass.arena.allocator().create(Value);
-        runtime.* = (try self.bindPatToMatchValue(pat_id, candidate.runtime.*, body, unsafe_count)) orelse return null;
+        runtime.* = (try self.bindPatToMatchValueStripped(pat_id, candidate.runtime.*, body, unsafe_count)) orelse return null;
         return Value{ .static_data_candidate = .{
             .ty = candidate.ty,
             .static_data = candidate.static_data,
             .runtime = runtime,
         } };
+    }
+
+    /// Recurse into a nominal backing or static-data runtime while binding a
+    /// known match value, counting the pointer-edge strip so a value that
+    /// references itself through those edges cannot loop forever. The caller's
+    /// static probe (`bindPatToValue` in `selectKnownMatchValue`) already
+    /// declines the collapse for such a value, so reaching the cap here is not
+    /// expected; returning null declines the reuse binding conservatively.
+    fn bindPatToMatchValueStripped(
+        self: *Cloner,
+        pat_id: Ast.PatId,
+        value: Value,
+        body: Ast.ExprId,
+        unsafe_count: usize,
+    ) Common.LowerError!?Value {
+        if (self.wrapper_strip_depth >= value_wrapper_strip_cap) return null;
+        self.wrapper_strip_depth += 1;
+        defer self.wrapper_strip_depth -= 1;
+        return try self.bindPatToMatchValue(pat_id, value, body, unsafe_count);
     }
 
     /// Node-count threshold above which a known constructor value bound to an
@@ -6682,6 +6747,30 @@ const Cloner = struct {
         return try self.makeReusableForMatchWindowed(value);
     }
 
+    /// Clone a source expression to a known value for inlining, rebinding a
+    /// value whose measured constructor size saturated the work budget through
+    /// a plain clone of the source expression instead. A saturated size means
+    /// the value is cyclic or too deep to measure; boxing it would
+    /// deep-materialize a possibly self-referential value, whereas a plain
+    /// clone of the source expression is finite by construction. Dropping the
+    /// first clone's delegated pendings keeps its effect emitted only by the
+    /// plain re-clone: a leftover pending would flush the same effect a second
+    /// time. The discarded clone's dead nodes still counted toward
+    /// `effect_marks`, which only makes downstream delegation more conservative
+    /// and is deliberately left as-is.
+    fn cloneInlineValueBoundingCycles(self: *Cloner, expr_id: Ast.ExprId) Common.LowerError!Value {
+        const window_start = self.effect_marks;
+        const expr_watermark = self.pass.program.exprCount();
+        const pending_watermark = self.pending.items.len;
+        const value = try self.cloneExprValue(expr_id);
+        if (self.knownConstructorSize(value) == known_constructor_size_cap) {
+            self.pending.shrinkRetainingCapacity(pending_watermark);
+            return try self.makeReusableForMatch(.{ .expr = try self.cloneExprPlain(expr_id) });
+        }
+        try self.recordValueWindow(value, window_start, expr_watermark);
+        return value;
+    }
+
     /// Reported size for a known value that exhausts the size work budget: a
     /// value too large to measure counts as effectively unbounded. Reporting a
     /// value this large (rather than a truncated count) errs the inline
@@ -6713,28 +6802,31 @@ const Cloner = struct {
     fn knownConstructorSizeBudgeted(self: *Cloner, value: Value, budget: *u32) usize {
         if (budget.* == 0) return known_constructor_size_cap;
         budget.* -= 1;
+        // Saturating sums so a child that reported the cap propagates it to the
+        // parent instead of overflowing: `knownConstructorSize(value) ==
+        // known_constructor_size_cap` is then a reliable exhaustion signal.
         return switch (value) {
             .expr => 0,
             .static_data_candidate => |candidate| self.knownConstructorSizeBudgeted(candidate.runtime.*, budget),
             .tag => |tag| blk: {
                 var count: usize = 1;
-                for (tag.payloads) |payload| count += self.knownConstructorSizeBudgeted(payload, budget);
+                for (tag.payloads) |payload| count +|= self.knownConstructorSizeBudgeted(payload, budget);
                 break :blk count;
             },
             .record => |record| blk: {
                 var count: usize = 1;
-                for (record.fields) |field| count += self.knownConstructorSizeBudgeted(field.value, budget);
+                for (record.fields) |field| count +|= self.knownConstructorSizeBudgeted(field.value, budget);
                 break :blk count;
             },
             .tuple => |tuple| blk: {
                 var count: usize = 1;
-                for (tuple.items) |item| count += self.knownConstructorSizeBudgeted(item, budget);
+                for (tuple.items) |item| count +|= self.knownConstructorSizeBudgeted(item, budget);
                 break :blk count;
             },
-            .nominal => |nominal| 1 + self.knownConstructorSizeBudgeted(nominal.backing.*, budget),
+            .nominal => |nominal| 1 +| self.knownConstructorSizeBudgeted(nominal.backing.*, budget),
             .callable => |callable| blk: {
                 var count: usize = 1;
-                for (callable.captures) |capture| count += self.knownConstructorSizeBudgeted(capture.value, budget);
+                for (callable.captures) |capture| count +|= self.knownConstructorSizeBudgeted(capture.value, budget);
                 break :blk count;
             },
         };
@@ -6772,7 +6864,7 @@ const Cloner = struct {
         const args = self.pass.program.exprSpan(span);
         for (0..args.len) |index| {
             const arg = GuardedList.at(args, index);
-            if (self.peekKnownValue(arg)) |value| total += self.knownConstructorSize(value);
+            if (self.peekKnownValue(arg)) |value| total +|= self.knownConstructorSize(value);
         }
         return total;
     }
@@ -6782,7 +6874,7 @@ const Cloner = struct {
         const operands = self.pass.program.captureOperandSpan(span);
         for (0..operands.len) |index| {
             const operand = GuardedList.at(operands, index);
-            if (self.peekKnownValue(operand.value)) |value| total += self.knownConstructorSize(value);
+            if (self.peekKnownValue(operand.value)) |value| total +|= self.knownConstructorSize(value);
         }
         return total;
     }
@@ -7283,10 +7375,7 @@ const Cloner = struct {
         const arg_values = try self.pass.allocator.alloc(Value, args.len);
         defer self.pass.allocator.free(arg_values);
         for (args, 0..) |arg_expr, index| {
-            const window_start = self.effect_marks;
-            const expr_watermark = self.pass.program.exprCount();
-            arg_values[index] = try self.cloneExprValue(arg_expr);
-            try self.recordValueWindow(arg_values[index], window_start, expr_watermark);
+            arg_values[index] = try self.cloneInlineValueBoundingCycles(arg_expr);
         }
 
         var unsafe_count: usize = 0;
@@ -7359,22 +7448,16 @@ const Cloner = struct {
         const capture_values = try self.pass.allocator.alloc(CaptureValue, operands.len);
         defer self.pass.allocator.free(capture_values);
         for (operands, 0..) |operand, index| {
-            const window_start = self.effect_marks;
-            const expr_watermark = self.pass.program.exprCount();
             capture_values[index] = .{
                 .id = operand.id,
-                .value = try self.cloneExprValue(operand.value),
+                .value = try self.cloneInlineValueBoundingCycles(operand.value),
             };
-            try self.recordValueWindow(capture_values[index].value, window_start, expr_watermark);
         }
 
         const arg_values = try self.pass.allocator.alloc(Value, args.len);
         defer self.pass.allocator.free(arg_values);
         for (args, 0..) |arg_expr, index| {
-            const window_start = self.effect_marks;
-            const expr_watermark = self.pass.program.exprCount();
-            arg_values[index] = try self.cloneExprValue(arg_expr);
-            try self.recordValueWindow(arg_values[index], window_start, expr_watermark);
+            arg_values[index] = try self.cloneInlineValueBoundingCycles(arg_expr);
         }
 
         var unsafe_count: usize = 0;
@@ -7531,6 +7614,12 @@ const Cloner = struct {
                 return verdict;
             },
             .nominal => |backing_pat| {
+                // Stripping a nominal or static-data wrapper follows a value
+                // pointer edge that a recursive construction can loop through;
+                // a cyclic value declines to a residual runtime match.
+                if (self.wrapper_strip_depth >= value_wrapper_strip_cap) return .unknown;
+                self.wrapper_strip_depth += 1;
+                defer self.wrapper_strip_depth -= 1;
                 return switch (value) {
                     .static_data_candidate => |candidate| try self.bindPatToValue(pat_id, candidate.runtime.*),
                     .nominal => |nominal| try self.bindPatToValue(backing_pat, nominal.backing.*),
@@ -7637,10 +7726,18 @@ const Cloner = struct {
                 }
                 return true;
             },
-            .nominal => |backing_pat| return switch (value) {
-                .static_data_candidate => |candidate| try self.bindPatToFlowValue(pat_id, candidate.runtime.*),
-                .nominal => |nominal| try self.bindPatToFlowValue(backing_pat, nominal.backing.*),
-                else => false,
+            .nominal => |backing_pat| {
+                // Stripping a nominal or static-data wrapper follows a value
+                // pointer edge that a recursive construction can loop through;
+                // a cyclic value declines the flow binding.
+                if (self.wrapper_strip_depth >= value_wrapper_strip_cap) return false;
+                self.wrapper_strip_depth += 1;
+                defer self.wrapper_strip_depth -= 1;
+                return switch (value) {
+                    .static_data_candidate => |candidate| try self.bindPatToFlowValue(pat_id, candidate.runtime.*),
+                    .nominal => |nominal| try self.bindPatToFlowValue(backing_pat, nominal.backing.*),
+                    else => false,
+                };
             },
             .list,
             .int_lit,
@@ -7967,10 +8064,17 @@ const Cloner = struct {
     fn materialize(self: *Cloner, value: Value) Common.LowerError!Ast.ExprId {
         switch (value) {
             .expr => |expr| return expr,
-            .static_data_candidate => |candidate| return try self.addExpr(.{ .ty = candidate.ty, .data = .{ .static_data_candidate = .{
-                .static_data = candidate.static_data,
-                .runtime_expr = try self.materialize(candidate.runtime.*),
-            } } }),
+            .static_data_candidate => |candidate| {
+                if (self.materialize_strip_depth >= value_wrapper_strip_cap) {
+                    Common.invariant("materialize followed a static-data runtime chain past the strip cap; a cyclic value reached materialization");
+                }
+                self.materialize_strip_depth += 1;
+                defer self.materialize_strip_depth -= 1;
+                return try self.addExpr(.{ .ty = candidate.ty, .data = .{ .static_data_candidate = .{
+                    .static_data = candidate.static_data,
+                    .runtime_expr = try self.materialize(candidate.runtime.*),
+                } } });
+            },
             .tag => |tag| {
                 const payloads = try self.pass.allocator.alloc(Ast.ExprId, tag.payloads.len);
                 defer self.pass.allocator.free(payloads);
@@ -8005,9 +8109,16 @@ const Cloner = struct {
                     .tuple = try self.pass.program.addExprSpan(items),
                 } });
             },
-            .nominal => |nominal| return try self.addExpr(.{ .ty = nominal.ty, .data = .{
-                .nominal = try self.materialize(nominal.backing.*),
-            } }),
+            .nominal => |nominal| {
+                if (self.materialize_strip_depth >= value_wrapper_strip_cap) {
+                    Common.invariant("materialize followed a nominal backing chain past the strip cap; a cyclic value reached materialization");
+                }
+                self.materialize_strip_depth += 1;
+                defer self.materialize_strip_depth -= 1;
+                return try self.addExpr(.{ .ty = nominal.ty, .data = .{
+                    .nominal = try self.materialize(nominal.backing.*),
+                } });
+            },
             .callable => |callable| return try self.materializeCallable(callable),
         }
     }
@@ -8114,12 +8225,19 @@ const Cloner = struct {
             try self.putSubst(source_arg.local, .{ .expr = arg_expr });
         }
 
+        // The worker body is a fresh value tree, not a continuation of the
+        // capture chain that reached this worker, so its own materializations
+        // start their strip depth from zero.
+        const saved_strip_depth = self.materialize_strip_depth;
+        self.materialize_strip_depth = 0;
+        const worker_body = try self.cloneExpr(source_body);
+        self.materialize_strip_depth = saved_strip_depth;
         self.pass.program.setFn(worker_fn_id, .{
             .symbol = symbol,
             .source = source_fn.source,
             .args = args_span,
             .captures = captures_span,
-            .body = .{ .roc = try self.cloneExpr(source_body) },
+            .body = .{ .roc = worker_body },
             .ret = source_fn.ret,
         });
 
@@ -8150,7 +8268,14 @@ const Cloner = struct {
             const id = self.pass.program.captureIdOfLocal(capture.local);
             const value = callableCaptureValueForId(values, id) orelse
                 Common.invariant("specialized callable had no value for a capture slot");
-            const value_expr = try self.materialize(value);
+            const value_expr = blk: {
+                if (self.materialize_strip_depth >= value_wrapper_strip_cap) {
+                    Common.invariant("materialize followed a callable capture chain past the strip cap; a cyclic value reached materialization");
+                }
+                self.materialize_strip_depth += 1;
+                defer self.materialize_strip_depth -= 1;
+                break :blk try self.materialize(value);
+            };
             const value_local = localExpr(self.pass.program, value_expr);
             const operand_value = if (value_local != null and value_local.? == capture.local)
                 try self.addExpr(.{ .ty = capture.ty, .data = .{ .local = capture.local } })
@@ -9734,11 +9859,23 @@ fn callableTargetMatches(program: *const Ast.Program, expected: Ast.FnId, actual
     return Mono.fnTemplateIdentityEql(expected_source, actual_source);
 }
 
+// The field, item, tag, record, and tuple readers below run only on values
+// already proven to be a record, tuple, or tag under some wrapper chain, so
+// following that chain to the read field, item, or tag terminates by
+// construction. A value that references itself through the
+// `nominal.backing`/`static_data_candidate.runtime` pointer edges would loop,
+// so each reader counts the edges it follows and treats reaching
+// `value_wrapper_strip_cap` as a compiler bug.
 fn fieldFromValue(program: *const Ast.Program, value: Value, name: names.RecordFieldNameId) ?Value {
+    return fieldFromValueStripping(program, value, name, 0);
+}
+
+fn fieldFromValueStripping(program: *const Ast.Program, value: Value, name: names.RecordFieldNameId, strip_depth: usize) ?Value {
+    if (strip_depth >= value_wrapper_strip_cap) Common.invariant("fieldFromValue followed a value wrapper chain past the strip cap");
     return switch (value) {
-        .static_data_candidate => |candidate| fieldFromValue(program, candidate.runtime.*, name),
+        .static_data_candidate => |candidate| fieldFromValueStripping(program, candidate.runtime.*, name, strip_depth + 1),
         .record => |record| fieldFromRecord(program, record, name),
-        .nominal => |nominal| fieldFromValue(program, nominal.backing.*, name),
+        .nominal => |nominal| fieldFromValueStripping(program, nominal.backing.*, name, strip_depth + 1),
         else => null,
     };
 }
@@ -9759,37 +9896,57 @@ fn recordPatField(program: *const Ast.Program, fields: anytype, name: names.Reco
 }
 
 fn itemFromValue(value: Value, index: u32) ?Value {
+    return itemFromValueStripping(value, index, 0);
+}
+
+fn itemFromValueStripping(value: Value, index: u32, strip_depth: usize) ?Value {
+    if (strip_depth >= value_wrapper_strip_cap) Common.invariant("itemFromValue followed a value wrapper chain past the strip cap");
     return switch (value) {
-        .static_data_candidate => |candidate| itemFromValue(candidate.runtime.*, index),
+        .static_data_candidate => |candidate| itemFromValueStripping(candidate.runtime.*, index, strip_depth + 1),
         .tuple => |tuple| if (index < tuple.items.len) tuple.items[index] else null,
-        .nominal => |nominal| itemFromValue(nominal.backing.*, index),
+        .nominal => |nominal| itemFromValueStripping(nominal.backing.*, index, strip_depth + 1),
         else => null,
     };
 }
 
 fn tagFromValue(value: Value) ?TagValue {
+    return tagFromValueStripping(value, 0);
+}
+
+fn tagFromValueStripping(value: Value, strip_depth: usize) ?TagValue {
+    if (strip_depth >= value_wrapper_strip_cap) Common.invariant("tagFromValue followed a value wrapper chain past the strip cap");
     return switch (value) {
-        .static_data_candidate => |candidate| tagFromValue(candidate.runtime.*),
+        .static_data_candidate => |candidate| tagFromValueStripping(candidate.runtime.*, strip_depth + 1),
         .tag => |tag| tag,
-        .nominal => |nominal| tagFromValue(nominal.backing.*),
+        .nominal => |nominal| tagFromValueStripping(nominal.backing.*, strip_depth + 1),
         else => null,
     };
 }
 
 fn recordFromValue(value: Value) ?RecordValue {
+    return recordFromValueStripping(value, 0);
+}
+
+fn recordFromValueStripping(value: Value, strip_depth: usize) ?RecordValue {
+    if (strip_depth >= value_wrapper_strip_cap) Common.invariant("recordFromValue followed a value wrapper chain past the strip cap");
     return switch (value) {
-        .static_data_candidate => |candidate| recordFromValue(candidate.runtime.*),
+        .static_data_candidate => |candidate| recordFromValueStripping(candidate.runtime.*, strip_depth + 1),
         .record => |record| record,
-        .nominal => |nominal| recordFromValue(nominal.backing.*),
+        .nominal => |nominal| recordFromValueStripping(nominal.backing.*, strip_depth + 1),
         else => null,
     };
 }
 
 fn tupleFromValue(value: Value) ?TupleValue {
+    return tupleFromValueStripping(value, 0);
+}
+
+fn tupleFromValueStripping(value: Value, strip_depth: usize) ?TupleValue {
+    if (strip_depth >= value_wrapper_strip_cap) Common.invariant("tupleFromValue followed a value wrapper chain past the strip cap");
     return switch (value) {
-        .static_data_candidate => |candidate| tupleFromValue(candidate.runtime.*),
+        .static_data_candidate => |candidate| tupleFromValueStripping(candidate.runtime.*, strip_depth + 1),
         .tuple => |tuple| tuple,
-        .nominal => |nominal| tupleFromValue(nominal.backing.*),
+        .nominal => |nominal| tupleFromValueStripping(nominal.backing.*, strip_depth + 1),
         else => null,
     };
 }
@@ -10122,6 +10279,45 @@ test "static match verdicts separate definite no-match from statically undecidab
     const nominal_value = Value{ .nominal = .{ .ty = union_ty, .backing = &backing } };
     try std.testing.expectEqual(MatchVerdict.match, try cloner.bindPatToValue(nominal_pat, nominal_value));
     try std.testing.expectEqual(MatchVerdict.unknown, try cloner.bindPatToValue(nominal_pat, opaque_value));
+}
+
+test "static value matchers bound wrapper strips over a cyclic value" {
+    const allocator = std.testing.allocator;
+    var program = emptyLiftedProgramForTest(allocator);
+    defer program.deinit();
+
+    var pass = try Pass.init(allocator, &program);
+    defer pass.deinit();
+    var cloner = Cloner.initForRewrite(&pass);
+    defer cloner.deinit();
+
+    const u8_ty = try program.types.add(.{ .primitive = .u8 });
+    const union_ty = try program.types.add(.{ .tag_union = Type.Span.empty() });
+
+    // A static-data-candidate value whose runtime edge points back at itself:
+    // the fixpoint shape a recursively-constructed value takes when a `.local`
+    // resolves through the substitution maps to an ancestor of its own
+    // construction. Stripping the wrapper never reaches a constructor.
+    var cyclic: Value = undefined;
+    cyclic = .{ .static_data_candidate = .{
+        .ty = union_ty,
+        .static_data = @enumFromInt(0),
+        .runtime = &cyclic,
+    } };
+
+    // The substitution check answers "cannot substitute" on exhaustion — the
+    // conservative direction, and correct, since a self-referential value
+    // cannot be substituted.
+    try std.testing.expect(!cloner.valueCanSubstitute(cyclic));
+
+    // A nominal pattern strips the wrapper chain looking for its backing. The
+    // static-data case keeps the same pattern, so the strip would loop forever
+    // on the cycle; the strip cap declines it to a residual runtime match
+    // (`.unknown`) and to a declined flow binding (`false`) rather than hanging.
+    const wildcard_pat = try program.addPat(.{ .ty = u8_ty, .data = .wildcard });
+    const nominal_pat = try program.addPat(.{ .ty = union_ty, .data = .{ .nominal = wildcard_pat } });
+    try std.testing.expectEqual(MatchVerdict.unknown, try cloner.bindPatToValue(nominal_pat, cyclic));
+    try std.testing.expectEqual(false, try cloner.bindPatToFlowValue(nominal_pat, cyclic));
 }
 
 test "SpecConstr pattern clones bind fresh local identities" {

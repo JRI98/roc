@@ -117,6 +117,30 @@ constructor specialization bounds its substitution-candidate value walk
 (`valueCanSubstitute`), because a loop-carried value can reference itself and
 a cyclic value is correctly non-substitutable anyway.
 
+Cycles in a constructor-specialization `Value` tree are possible through
+exactly two pointer edges — a nominal value's backing and a static-data
+candidate's runtime value — so every walk that follows those edges carries an
+explicit bound. The size, substitution, unsafe-leaf, and reusability measures
+spend a shared per-node work budget and report the conservative answer when it
+runs out; the constructor-size measure saturates its sums so an exhausted child
+propagates the cap rather than overflowing, which makes "measured size equals
+the cap" a reliable exhaustion signal. A value flagged by that signal is never
+materialized: the inliners rebind it through a plain clone of its source
+expression, and a match over such a scrutinee emits a residual runtime match
+over a plain clone of the source scrutinee, both finite by construction. The
+value matchers (`bindPatToValue`, `bindPatToMatchValue`, `bindPatToFlowValue`),
+the field, item, and tag readers (`fieldFromValue`, `itemFromValue`,
+`tagFromValue`, `recordFromValue`, `tupleFromValue`), and `materialize` each
+count the pointer edges they follow against a shared strip cap; the matchers
+decline toward a residual runtime match on exhaustion, while those readers and
+`materialize` — which only ever run on values already proven acyclic by the
+rules above — treat reaching the cap as a compiler bug. The shape-driven walks (`valueFromShapeArgs`,
+`appendExprsFromValue`, `supplyLoopSlotLeaves`, `shapeMatchesValue`, `shapeEql`)
+carry no budget: `Shape` trees are finite and acyclic by construction — they are
+produced only by the budgeted derivations and a nominal shape's backing is a
+fresh allocation, never a back-reference — so those walks terminate on the
+structure alone.
+
 ## Checking Effects And Const Roots
 
 Checking owns Roc effect validation, compile-time evaluation eligibility, and

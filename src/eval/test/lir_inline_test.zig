@@ -4878,6 +4878,40 @@ fn expectSameObservationsAcrossInlineModes(source: []const u8) TestError!void {
     try expectRecordedRunsEqual(naive_run, optimized_run);
 }
 
+test "iterdiff: recursively-constructed iterator chain agrees across inline modes" {
+    // The e026f6e678 fixpoint shape: `wrap` maps its iterator argument and
+    // recurses on itself a runtime number of times, so the known iterator value
+    // for a use site references the recursive construction and its measured
+    // size saturates the work budget. Constructor specialization must not
+    // deep-materialize that value; it rebinds it through a plain clone of the
+    // source expression instead. This case proves that path lowers and produces
+    // the same result as the naive lowering (`wrap(depth, 0..<5)` at depth 3
+    // adds 3 to each element, summing to 25). `depth` is a runtime function
+    // argument, so the recursion is not statically unrolled.
+    try expectSameObservationsAcrossInlineModes(
+        \\wrap : U64, Iter(U64) -> Iter(U64)
+        \\wrap = |n, it|
+        \\    if n == 0 {
+        \\        it
+        \\    } else {
+        \\        wrap(n - 1, Iter.map(it, |x| x + 1))
+        \\    }
+        \\
+        \\build : U64 -> U64
+        \\build = |depth| {
+        \\    var $sum = 0.U64
+        \\    for x in wrap(depth, 0.U64..<5) {
+        \\        $sum = $sum + x
+        \\    }
+        \\    dbg $sum
+        \\    $sum
+        \\}
+        \\
+        \\main : U64
+        \\main = build(3)
+    );
+}
+
 test "iterdiff: bounded list map collect agrees across inline modes" {
     // Map over a statically-known list, collected into a List, then reduced to a
     // scalar. The `dbg` of the collected list is the structural (allocation-
