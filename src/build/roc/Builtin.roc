@@ -4178,10 +4178,10 @@ Builtin :: [].{
 		##
 		## Returns the list unchanged if the index is out of bounds.
 		## ```roc
-		## expect [1.I64, 2, 3, 4].drop_at_unordered(1) == [1, 4, 3]
+		## expect [1.I64, 2, 3, 4].drop_swap(1) == [1, 4, 3]
 		## ```
-		drop_at_unordered : List(a), U64 -> List(a)
-		drop_at_unordered = |list, index| {
+		drop_swap : List(a), U64 -> List(a)
+		drop_swap = |list, index| {
 			len = List.len(list)
 			if index < len {
 				List.drop_last(list_swap_unsafe(list, index, len - 1), 1)
