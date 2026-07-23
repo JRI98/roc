@@ -6610,7 +6610,7 @@ pub const Interpreter = struct {
             },
             .float => |bits| switch (bits) {
                 32 => val.write(f32, builtins.float_math_f32.pow(a.read(f32), b.read(f32))),
-                64 => val.write(f64, std.math.pow(f64, a.read(f64), b.read(f64))),
+                64 => val.write(f64, builtins.float_math_f64.pow(a.read(f64), b.read(f64))),
                 else => return self.invariantFailedError("LIR/interpreter invariant violated: unsupported float pow width {d}", .{bits}),
             },
             .signed_int, .unsigned_int => return self.invariantFailedError(
@@ -6688,12 +6688,12 @@ pub const Interpreter = struct {
             };
         }
         return switch (op) {
-            .sin => std.math.sin(value),
-            .cos => std.math.cos(value),
-            .tan => std.math.tan(value),
-            .asin => std.math.asin(value),
-            .acos => std.math.acos(value),
-            .atan => std.math.atan(value),
+            .sin => builtins.float_math_f64.sin(value),
+            .cos => builtins.float_math_f64.cos(value),
+            .tan => builtins.float_math_f64.tan(value),
+            .asin => builtins.float_math_f64.asin(value),
+            .acos => builtins.float_math_f64.acos(value),
+            .atan => builtins.float_math_f64.atan(value),
         };
     }
 

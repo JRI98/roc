@@ -150,9 +150,10 @@ pub const RunWasmStrResult = struct {
 pub fn runWasmStr(
     allocator: std.mem.Allocator,
     wasm_bytes: []const u8,
+    heap_base: u32,
     has_imports: bool,
 ) WasmEvalError![]u8 {
-    const result = try runWasmStrWithStats(allocator, wasm_bytes, has_imports);
+    const result = try runWasmStrWithStats(allocator, wasm_bytes, heap_base, has_imports);
     return result.output;
 }
 
@@ -160,9 +161,10 @@ pub fn runWasmStr(
 pub fn runWasmStrWithStats(
     allocator: std.mem.Allocator,
     wasm_bytes: []const u8,
+    heap_base: u32,
     has_imports: bool,
 ) WasmEvalError!RunWasmStrResult {
-    wasm_heap_ptr = 65536;
+    wasm_heap_ptr = heap_base;
     wasm_allocation_count = 0;
     wasm_crash_state = .none;
 

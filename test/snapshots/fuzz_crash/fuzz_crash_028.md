@@ -2610,8 +2610,7 @@ match_time = |
 expect # Cord
 	blah == 1 # nt
 
-main! : (String # Thnt!
-) -> Result({}, _)
+main! : (String) -> Result({}, _)
 
 ma = |_| { # Yee
 	world = "d"
