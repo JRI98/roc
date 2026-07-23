@@ -2158,6 +2158,50 @@ Builtin :: [].{
 			}
 		}
 
+		## Replaces every occurrence of `delimiter` in a string with `replacement`.
+		## Returns the string unchanged when `delimiter` is empty or not found.
+		## ```roc
+		## expect "a,b,c".replace_each(",", " and ") == "a and b and c"
+		## expect "abc".replace_each("x", "y") == "abc"
+		## ```
+		replace_each : Str, Str, Str -> Str
+		replace_each = |source, delimiter, replacement|
+			Str.join_with(Str.split_on(source, delimiter), replacement)
+
+		## Replaces the first occurrence of `delimiter` in a string with `replacement`.
+		## Returns the string unchanged when `delimiter` is empty or not found.
+		## ```roc
+		## expect "a,b,a".replace_first(",", " and ") == "a and b,a"
+		## expect "abc".replace_first("x", "y") == "abc"
+		## ```
+		replace_first : Str, Str, Str -> Str
+		replace_first = |source, delimiter, replacement|
+			if Str.is_empty(delimiter) {
+				source
+			} else {
+				match Str.split_first(source, delimiter) {
+					Ok({ before, after }) => before.concat(replacement).concat(after)
+					Err(NotFound) => source
+				}
+			}
+
+		## Replaces the last occurrence of `delimiter` in a string with `replacement`.
+		## Returns the string unchanged when `delimiter` is empty or not found.
+		## ```roc
+		## expect "a,b,a".replace_last(",", " and ") == "a,b and a"
+		## expect "abc".replace_last("x", "y") == "abc"
+		## ```
+		replace_last : Str, Str, Str -> Str
+		replace_last = |source, delimiter, replacement|
+			if Str.is_empty(delimiter) {
+				source
+			} else {
+				match Str.split_last(source, delimiter) {
+					Ok({ before, after }) => before.concat(replacement).concat(after)
+					Err(NotFound) => source
+				}
+			}
+
 		## Gives the number of bytes in a [Str] value.
 		## ```roc
 		## expect "Hello World".count_utf8_bytes() == 11
