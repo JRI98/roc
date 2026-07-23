@@ -2157,6 +2157,10 @@ pub fn generateModule(
     result_layout: layout.Idx,
     wasm32_builtins_object: []const u8,
 ) Allocator.Error!GenerateResult {
+    // generateModule always runs data DCE, so every generated static-data
+    // address must carry the relocation edge that makes its segment live.
+    self.configureStaticDataAddressTracking();
+
     // Register host function imports (must be done before addFunction calls)
     self.registerHostImports() catch return error.OutOfMemory;
     self.registerHostedSymbolTargets(self.store.getProcSpecs()) catch return error.OutOfMemory;
