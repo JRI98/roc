@@ -102,7 +102,7 @@ result = f(3)?
 				(e-if
 					(if-branches
 						(if-branch
-							(e-dispatch-call (method "is_lt") (constraint-fn-var 249)
+							(e-dispatch-call (method "is_lt") (constraint-fn-var 265)
 								(receiver
 									(e-runtime-error (tag "erroneous_value_use")))
 								(args

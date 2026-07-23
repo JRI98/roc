@@ -2539,6 +2539,14 @@ pub const CheckedBuiltinNominal = enum {
     f32,
     f64,
     dec,
+    u8x16,
+    i8x16,
+    u16x8,
+    i16x8,
+    u32x4,
+    i32x4,
+    u64x2,
+    i64x2,
     list,
     box,
     dict,
@@ -2569,6 +2577,14 @@ pub const CheckedPrimitive = enum(u8) {
     f32,
     f64,
     dec,
+    u8x16,
+    i8x16,
+    u16x8,
+    i16x8,
+    u32x4,
+    i32x4,
+    u64x2,
+    i64x2,
 };
 
 /// Public `CheckedBuiltinRuntimeEncoding` declaration.
@@ -2606,6 +2622,14 @@ pub fn builtinRuntimeEncoding(builtin_nominal: CheckedBuiltinNominal) CheckedBui
         .f32 => .{ .primitive = .f32 },
         .f64 => .{ .primitive = .f64 },
         .dec => .{ .primitive = .dec },
+        .u8x16 => .{ .primitive = .u8x16 },
+        .i8x16 => .{ .primitive = .i8x16 },
+        .u16x8 => .{ .primitive = .u16x8 },
+        .i16x8 => .{ .primitive = .i16x8 },
+        .u32x4 => .{ .primitive = .u32x4 },
+        .i32x4 => .{ .primitive = .i32x4 },
+        .u64x2 => .{ .primitive = .u64x2 },
+        .i64x2 => .{ .primitive = .i64x2 },
         .list => .list,
         .box => .box,
         .dict => .dict,
@@ -6782,6 +6806,14 @@ fn checkedBuiltinNominalForIdent(module_env: *const ModuleEnv, ident: base.Ident
     if (ident.eql(common.f32) or ident.eql(common.f32_type)) return .f32;
     if (ident.eql(common.f64) or ident.eql(common.f64_type)) return .f64;
     if (ident.eql(common.dec) or ident.eql(common.dec_type)) return .dec;
+    if (ident.eql(common.u8x16_type)) return .u8x16;
+    if (ident.eql(common.i8x16_type)) return .i8x16;
+    if (ident.eql(common.u16x8_type)) return .u16x8;
+    if (ident.eql(common.i16x8_type)) return .i16x8;
+    if (ident.eql(common.u32x4_type)) return .u32x4;
+    if (ident.eql(common.i32x4_type)) return .i32x4;
+    if (ident.eql(common.u64x2_type)) return .u64x2;
+    if (ident.eql(common.i64x2_type)) return .i64x2;
     if (ident.eql(common.list) or ident.eql(common.builtin_list)) return .list;
     if (ident.eql(common.box) or ident.eql(common.builtin_box)) return .box;
     if (ident.eql(common.dict) or ident.eql(common.builtin_dict)) return .dict;
@@ -18076,6 +18108,14 @@ fn checkedTypeHasNoReachableCallableSlotsInner(
                     .f32,
                     .f64,
                     .dec,
+                    .u8x16,
+                    .i8x16,
+                    .u16x8,
+                    .i16x8,
+                    .u32x4,
+                    .i32x4,
+                    .u64x2,
+                    .i64x2,
                     .bool,
                     .parse_tag_union_spec,
                     .fields,
@@ -23232,7 +23272,7 @@ pub const CheckedModuleArtifact = struct {
     /// Manual discriminant for `SERIALIZED_VERSION_HASH`: bump to force a cache /
     /// baked-blob invalidation for a layout change the structural fingerprint below
     /// cannot observe (e.g. a semantic change to how a field is interpreted).
-    const serialized_layout_version: u32 = 26;
+    const serialized_layout_version: u32 = 27;
 
     /// Comptime fingerprint of `Serialized`'s layout, mirroring
     /// `cache_module.MODULE_ENV_VERSION_HASH`. It is appended to the baked builtin
@@ -28053,8 +28093,8 @@ test "SERIALIZED_VERSION_HASH golden value" {
     // change, bump `serialized_layout_version` and replace the golden bytes below with
     // the ones this assertion prints.
     const golden: [32]u8 = .{
-        0x04, 0xCB, 0xFA, 0x7E, 0x5B, 0x04, 0x7D, 0x7E, 0x56, 0x42, 0xF6, 0xD3, 0xD3, 0x95, 0xD6, 0x93,
-        0x49, 0x4E, 0xC5, 0xB9, 0xAC, 0x59, 0x88, 0xB5, 0x85, 0xEA, 0x7C, 0x6C, 0xA6, 0x71, 0xAD, 0x2D,
+        0xB9, 0xA2, 0x99, 0x1C, 0xE1, 0xEE, 0x12, 0x1A, 0x42, 0x23, 0xC0, 0xE6, 0x19, 0xB6, 0x1A, 0x16,
+        0x8A, 0xC2, 0x7E, 0x88, 0xE2, 0x1D, 0xB8, 0x55, 0x3F, 0x9C, 0x36, 0x0C, 0x16, 0xEB, 0x42, 0xAA,
     };
     try std.testing.expectEqualSlices(u8, &golden, &CheckedModuleArtifact.SERIALIZED_VERSION_HASH);
 }

@@ -55,7 +55,8 @@ pub const Constants = struct {
     /// 30: Checked interpolation nodes retain their explicit dispatcher type variable.
     /// 31: Canonical expression storage includes compiler-derived method nodes.
     /// 32: Builtin indices include width-specific f32 conversion and math wrappers.
-    pub const CACHE_VERSION = 32;
+    /// 33: Builtin indices, identifiers, and checked layouts include integer SIMD vectors.
+    pub const CACHE_VERSION = 33;
 };
 
 /// Configuration for the Roc cache system.

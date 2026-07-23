@@ -509,26 +509,31 @@ fn appendGlueRuntimeCases(
     glue_options: GlueRunnerOptions,
 ) CliRunnerError!void {
     for (glue_runtime_platforms) |platform| {
-        inline for (.{ GlueLanguage.zig, GlueLanguage.rust, GlueLanguage.c }) |language| {
-            const target: GlueRuntimeTarget = .native;
-            const name = try std.fmt.allocPrint(
-                allocator,
-                "glue runtime: {s} {s} [{s}, glue-opt={s}]",
-                .{ language.displayName(), platform.name, target.displayName(), glue_options.execution_mode.cliName() },
-            );
-            const case = CliCase{
-                .id = cases.items.len,
-                .suite = .glue,
-                .name = name,
-                .body = .{ .glue_runtime = .{
-                    .language = language,
-                    .platform = platform,
-                    .target = target,
-                    .execution_mode = glue_options.execution_mode,
-                } },
-            };
-            if (matchesFilters(case, filters)) {
-                try cases.append(allocator, case);
+        // The broad glue contract corpus has checked-in musl inputs. The ABI
+        // probe additionally owns native macOS and Windows targets so those
+        // systems execute the exact cross-language vector boundary matrix.
+        if (builtin.os.tag == .linux or std.mem.eql(u8, platform.name, "layout-probe")) {
+            inline for (.{ GlueLanguage.zig, GlueLanguage.rust, GlueLanguage.c }) |language| {
+                const target: GlueRuntimeTarget = .native;
+                const name = try std.fmt.allocPrint(
+                    allocator,
+                    "glue runtime: {s} {s} [{s}, glue-opt={s}]",
+                    .{ language.displayName(), platform.name, target.displayName(), glue_options.execution_mode.cliName() },
+                );
+                const case = CliCase{
+                    .id = cases.items.len,
+                    .suite = .glue,
+                    .name = name,
+                    .body = .{ .glue_runtime = .{
+                        .language = language,
+                        .platform = platform,
+                        .target = target,
+                        .execution_mode = glue_options.execution_mode,
+                    } },
+                };
+                if (matchesFilters(case, filters)) {
+                    try cases.append(allocator, case);
+                }
             }
         }
 
@@ -1251,6 +1256,13 @@ const subcommand_cases = [_]CliCase{
     .{ .id = 0, .suite = .subcommands, .name = "roc U8 subtraction underflow crashes (issue 9361, dev)", .backend = .dev, .body = .{ .command = .{ .args = &.{ "--opt=dev", "--no-cache" }, .roc_file = "test/cli/issue9361_integer_sub_underflow_u8.roc", .exit = .failure, .contains = &.{.{ .stream = .stderr, .text = "Integer subtraction overflowed" }} } } },
     .{ .id = 0, .suite = .subcommands, .name = "roc U128 addition overflow crashes (issue 9360, dev)", .backend = .dev, .body = .{ .command = .{ .args = &.{ "--opt=dev", "--no-cache" }, .roc_file = "test/cli/issue9360_integer_add_overflow_u128.roc", .exit = .failure, .contains = &.{.{ .stream = .stderr, .text = "Integer addition overflowed" }} } } },
     .{ .id = 0, .suite = .subcommands, .name = "roc I128 subtraction underflow crashes (issue 9361, dev)", .backend = .dev, .body = .{ .command = .{ .args = &.{ "--opt=dev", "--no-cache" }, .roc_file = "test/cli/issue9361_integer_sub_underflow_i128.roc", .exit = .failure, .contains = &.{.{ .stream = .stderr, .text = "Integer subtraction overflowed" }} } } },
+    .{ .id = 0, .suite = .subcommands, .name = "roc runtime-count U128 shift links in a standalone dev executable", .backend = .dev, .body = .{ .command = .{ .args = &.{ "--opt=dev", "--no-cache" }, .roc_file = "test/cli/runtime_u128_shift_dev_link.roc", .exit = .success, .not_contains = &.{ .{ .stream = .stderr, .text = "undefined symbol" }, .{ .stream = .stderr, .text = "panic" } } } } },
+    .{ .id = 0, .suite = .subcommands, .name = "integer SIMD runtime smoke passes (interpreter)", .backend = .interpreter, .body = .{ .command = .{ .args = &.{ "--opt=interpreter", "--no-cache" }, .roc_file = "test/cli/runtime_simd_smoke.roc", .exit = .success, .not_contains = &.{ .{ .stream = .stderr, .text = "Mismatch" }, .{ .stream = .stderr, .text = "panic" } } } } },
+    .{ .id = 0, .suite = .subcommands, .name = "integer SIMD runtime smoke passes (dev)", .backend = .dev, .body = .{ .command = .{ .args = &.{ "--opt=dev", "--no-cache" }, .roc_file = "test/cli/runtime_simd_smoke.roc", .exit = .success, .not_contains = &.{ .{ .stream = .stderr, .text = "Mismatch" }, .{ .stream = .stderr, .text = "panic" } } } } },
+    .{ .id = 0, .suite = .subcommands, .name = "integer SIMD runtime smoke passes (LLVM speed)", .backend = .speed, .body = .{ .command = .{ .args = &.{ "--opt=speed", "--no-cache" }, .roc_file = "test/cli/runtime_simd_smoke.roc", .exit = .success, .not_contains = &.{ .{ .stream = .stderr, .text = "Mismatch" }, .{ .stream = .stderr, .text = "panic" } } } } },
+    .{ .id = 0, .suite = .subcommands, .name = "integer SIMD concat shift rejects counts above sixteen (interpreter)", .backend = .interpreter, .body = .{ .command = .{ .args = &.{ "--opt=interpreter", "--no-cache" }, .roc_file = "test/cli/runtime_simd_concat_shift_crash.roc", .exit = .failure, .contains = &.{.{ .stream = .stderr, .text = "U8x16.concat_shift_bytes: count out of range" }} } } },
+    .{ .id = 0, .suite = .subcommands, .name = "integer SIMD concat shift rejects counts above sixteen (dev)", .backend = .dev, .body = .{ .command = .{ .args = &.{ "--opt=dev", "--no-cache" }, .roc_file = "test/cli/runtime_simd_concat_shift_crash.roc", .exit = .failure, .contains = &.{.{ .stream = .stderr, .text = "U8x16.concat_shift_bytes: count out of range" }} } } },
+    .{ .id = 0, .suite = .subcommands, .name = "integer SIMD concat shift rejects counts above sixteen (LLVM speed)", .backend = .speed, .body = .{ .command = .{ .args = &.{ "--opt=speed", "--no-cache" }, .roc_file = "test/cli/runtime_simd_concat_shift_crash.roc", .exit = .failure, .contains = &.{.{ .stream = .stderr, .text = "U8x16.concat_shift_bytes: count out of range" }} } } },
     .{ .id = 0, .suite = .subcommands, .name = "roc U8 multiplication overflow crashes (interpreter)", .backend = .interpreter, .body = .{ .command = .{ .args = &.{ "--opt=interpreter", "--no-cache" }, .roc_file = "test/cli/checked_arithmetic_mul_overflow_u8.roc", .exit = .failure, .contains = &.{.{ .stream = .stderr, .text = "Integer multiplication overflowed" }} } } },
     .{ .id = 0, .suite = .subcommands, .name = "roc U8 multiplication overflow crashes (dev)", .backend = .dev, .body = .{ .command = .{ .args = &.{ "--opt=dev", "--no-cache" }, .roc_file = "test/cli/checked_arithmetic_mul_overflow_u8.roc", .exit = .failure, .contains = &.{.{ .stream = .stderr, .text = "Integer multiplication overflowed" }} } } },
     .{ .id = 0, .suite = .subcommands, .name = "roc U8 multiplication overflow crashes (llvm speed)", .backend = .speed, .body = .{ .command = .{ .args = &.{ "--opt=speed", "--no-cache" }, .roc_file = "test/cli/checked_arithmetic_mul_overflow_u8.roc", .exit = .failure, .contains = &.{.{ .stream = .stderr, .text = "Integer multiplication overflowed" }} } } },
@@ -2575,11 +2587,55 @@ const NativeMuslTarget = struct {
     c_host_needs_compiler_rt: bool,
 };
 
+const GlueNativeKind = enum {
+    musl,
+    macos,
+    windows,
+};
+
+const GlueNativeTarget = struct {
+    roc_target: []const u8,
+    zig_target: []const u8,
+    rust_target: []const u8,
+    host_library: []const u8,
+    output_name: []const u8,
+    kind: GlueNativeKind,
+    c_host_needs_compiler_rt: bool,
+};
+
 fn nativeMuslTarget() ?NativeMuslTarget {
     if (builtin.os.tag != .linux) return null;
     return switch (builtin.cpu.arch) {
         .x86_64 => .{ .roc_target = "x64musl", .zig_target = "x86_64-linux-musl", .rust_target = "x86_64-unknown-linux-musl", .c_host_needs_compiler_rt = false },
         .aarch64 => .{ .roc_target = "arm64musl", .zig_target = "aarch64-linux-musl", .rust_target = "aarch64-unknown-linux-musl", .c_host_needs_compiler_rt = true },
+        else => null,
+    };
+}
+
+fn nativeGlueTarget() ?GlueNativeTarget {
+    if (nativeMuslTarget()) |target| {
+        return .{
+            .roc_target = target.roc_target,
+            .zig_target = target.zig_target,
+            .rust_target = target.rust_target,
+            .host_library = "libhost.a",
+            .output_name = "glue-runtime-app",
+            .kind = .musl,
+            .c_host_needs_compiler_rt = target.c_host_needs_compiler_rt,
+        };
+    }
+
+    return switch (builtin.os.tag) {
+        .macos => switch (builtin.cpu.arch) {
+            .x86_64 => .{ .roc_target = "x64mac", .zig_target = "x86_64-macos", .rust_target = "x86_64-apple-darwin", .host_library = "libhost.a", .output_name = "glue-runtime-app", .kind = .macos, .c_host_needs_compiler_rt = false },
+            .aarch64 => .{ .roc_target = "arm64mac", .zig_target = "aarch64-macos", .rust_target = "aarch64-apple-darwin", .host_library = "libhost.a", .output_name = "glue-runtime-app", .kind = .macos, .c_host_needs_compiler_rt = false },
+            else => null,
+        },
+        .windows => switch (builtin.cpu.arch) {
+            .x86_64 => .{ .roc_target = "x64win", .zig_target = "x86_64-windows-msvc", .rust_target = "x86_64-pc-windows-msvc", .host_library = "host.lib", .output_name = "glue-runtime-app.exe", .kind = .windows, .c_host_needs_compiler_rt = false },
+            .aarch64 => .{ .roc_target = "arm64win", .zig_target = "aarch64-windows-msvc", .rust_target = "aarch64-pc-windows-msvc", .host_library = "host.lib", .output_name = "glue-runtime-app.exe", .kind = .windows, .c_host_needs_compiler_rt = false },
+            else => null,
+        },
         else => null,
     };
 }
@@ -6866,9 +6922,9 @@ fn runGlueRuntimeCase(
 ) TestResult {
     var timer = harness.Timer.start() catch return .{ .status = .infra_error, .phase = .setup, .message = "no clock" };
 
-    const native_target: ?NativeMuslTarget = switch (runtime.target) {
-        .native => nativeMuslTarget() orelse {
-            return .{ .status = .skip, .phase = .setup, .duration_ns = timer.read(), .message = "glue runtime native contracts run only on native Linux x64/arm64 hosts with checked-in musl target inputs" };
+    const native_target: ?GlueNativeTarget = switch (runtime.target) {
+        .native => nativeGlueTarget() orelse {
+            return .{ .status = .skip, .phase = .setup, .duration_ns = timer.read(), .message = "glue runtime native contracts do not support this host target" };
         },
         .wasm32 => null,
     };
@@ -6895,12 +6951,13 @@ fn runGlueRuntimeCase(
         return addPreservedWorkDirMessage(allocator, customInfraFailure(allocator, &timer, "failed to allocate glue runtime host path: {}", .{err}), env.dirs.work_dir);
     const host_o_path = std.fs.path.join(allocator, &.{ target_dir, "host.o" }) catch |err|
         return addPreservedWorkDirMessage(allocator, customInfraFailure(allocator, &timer, "failed to allocate glue runtime host object path: {}", .{err}), env.dirs.work_dir);
-    const host_lib_path = std.fs.path.join(allocator, &.{ target_dir, "libhost.a" }) catch |err|
+    const host_lib_name = if (native_target) |target| target.host_library else "libhost.a";
+    const host_lib_path = std.fs.path.join(allocator, &.{ target_dir, host_lib_name }) catch |err|
         return addPreservedWorkDirMessage(allocator, customInfraFailure(allocator, &timer, "failed to allocate glue runtime host archive path: {}", .{err}), env.dirs.work_dir);
     const host_wasm_path = std.fs.path.join(allocator, &.{ target_dir, "host.wasm" }) catch |err|
         return addPreservedWorkDirMessage(allocator, customInfraFailure(allocator, &timer, "failed to allocate glue runtime host wasm path: {}", .{err}), env.dirs.work_dir);
     const output_name = switch (runtime.target) {
-        .native => "glue-runtime-app",
+        .native => native_target.?.output_name,
         .wasm32 => "glue-runtime-app.wasm",
     };
     const output_path = std.fs.path.join(allocator, &.{ env.dirs.work_dir, output_name }) catch |err|
@@ -6925,10 +6982,18 @@ fn runGlueRuntimeCase(
     switch (runtime.target) {
         .native => {
             const target = native_target.?;
-            copyNativeMuslTargetFile(io, allocator, target, "crt1.o", target_dir) catch |err|
-                return addPreservedWorkDirMessage(allocator, customInfraFailure(allocator, &timer, "failed to copy glue runtime crt1.o: {}", .{err}), env.dirs.work_dir);
-            copyNativeMuslTargetFile(io, allocator, target, "libc.a", target_dir) catch |err|
-                return addPreservedWorkDirMessage(allocator, customInfraFailure(allocator, &timer, "failed to copy glue runtime libc.a: {}", .{err}), env.dirs.work_dir);
+            if (target.kind == .musl) {
+                const musl_target = NativeMuslTarget{
+                    .roc_target = target.roc_target,
+                    .zig_target = target.zig_target,
+                    .rust_target = target.rust_target,
+                    .c_host_needs_compiler_rt = target.c_host_needs_compiler_rt,
+                };
+                copyNativeMuslTargetFile(io, allocator, musl_target, "crt1.o", target_dir) catch |err|
+                    return addPreservedWorkDirMessage(allocator, customInfraFailure(allocator, &timer, "failed to copy glue runtime crt1.o: {}", .{err}), env.dirs.work_dir);
+                copyNativeMuslTargetFile(io, allocator, musl_target, "libc.a", target_dir) catch |err|
+                    return addPreservedWorkDirMessage(allocator, customInfraFailure(allocator, &timer, "failed to copy glue runtime libc.a: {}", .{err}), env.dirs.work_dir);
+            }
         },
         .wasm32 => {},
     }
@@ -7040,7 +7105,7 @@ fn compileGlueRuntimeCHost(
     env: *const CaseEnv,
     timer: *harness.Timer,
     timeout_ms: u64,
-    target: NativeMuslTarget,
+    target: GlueNativeTarget,
     include_dir: []const u8,
     host_path: []const u8,
     host_o_path: []const u8,
@@ -7162,6 +7227,7 @@ fn compileGlueRuntimeCWasmHost(
         "cc",
         "-target",
         "wasm32-freestanding",
+        "-msimd128",
         "-O2",
         "-std=c11",
         "-Wall",
@@ -7187,7 +7253,7 @@ fn compileGlueRuntimeZigHost(
     env: *const CaseEnv,
     timer: *harness.Timer,
     timeout_ms: u64,
-    target: NativeMuslTarget,
+    target: GlueNativeTarget,
     host_path: []const u8,
     host_o_path: []const u8,
     host_lib_path: []const u8,
@@ -7231,6 +7297,8 @@ fn compileGlueRuntimeZigWasmHost(
         "build-obj",
         "-target",
         "wasm32-freestanding-none",
+        "-mcpu",
+        "baseline+simd128",
         "-fPIC",
         "-ffunction-sections",
         "-fdata-sections",
@@ -7248,7 +7316,7 @@ fn compileGlueRuntimeRustHost(
     env: *const CaseEnv,
     timer: *harness.Timer,
     timeout_ms: u64,
-    target: NativeMuslTarget,
+    target: GlueNativeTarget,
     host_path: []const u8,
     host_lib_path: []const u8,
 ) ?TestResult {
@@ -7388,6 +7456,8 @@ fn compileGlueRuntimeRustWasmHost(
         "wasm32-unknown-unknown",
         "-C",
         "panic=abort",
+        "-C",
+        "target-feature=+simd128",
         "--crate-type",
         "staticlib",
         host_path,

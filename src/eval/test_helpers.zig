@@ -13,6 +13,7 @@ const collections = @import("collections");
 const compiled_builtins = @import("compiled_builtins");
 const wasm32_builtins = @import("wasm32_builtins");
 const lir = @import("lir");
+const roc_target = @import("roc_target");
 const reporting = @import("reporting");
 
 const builtin_static = can.BuiltinStatic;
@@ -308,7 +309,10 @@ pub const ParsedResources = struct {
 // reservations, not commitments. On Windows the reservation cost matters for
 // throughput because every parallel worker reserves its own region: keeping
 // it modest (1 GB) lets MapViewOfFile complete quickly and lets us scale to
-// many workers without tripping system address-space accounting.
+// many workers without tripping system address-space accounting. The full
+// SIMD differential module needs more than 256 MB of LIR image space, so 1 GB
+// is also the smallest power-of-two reservation that covers the exhaustive
+// compiler test corpus with useful headroom.
 //
 // If the OS rejects the preferred reservation (e.g. aarch64 Linux with
 // CONFIG_ARM64_VA_BITS=39 — default on 64-bit Raspberry Pi OS — caps user
@@ -322,15 +326,15 @@ else if (@sizeOf(usize) < 8)
 else if (builtin.os.tag == .macos)
     8 * 1024 * 1024 * 1024
 else if (builtin.os.tag == .windows)
-    256 * 1024 * 1024 // 256 MB on Windows — reservation cost matters for parallel workers
+    1024 * 1024 * 1024
 else
     2 * 1024 * 1024 * 1024 * 1024;
 
-// Floor for the retry loop. Eval tests need very little arena, so 256 MB is
-// plenty; any 64-bit Linux kernel can fit this even with reduced VA bits. The
-// allocator clamps this down to `EVAL_SHARED_MEMORY_SIZE` for targets whose
-// preferred size is smaller.
-const EVAL_SHARED_MEMORY_MIN_SIZE: usize = 256 * 1024 * 1024;
+// Floor for the retry loop. The exhaustive SIMD module needs more than 256 MB,
+// so every 64-bit target must retain the same tested 1 GB minimum as Windows.
+// The allocator clamps this down to `EVAL_SHARED_MEMORY_SIZE` for 32-bit and
+// freestanding targets whose preferred reservation is smaller.
+const EVAL_SHARED_MEMORY_MIN_SIZE: usize = 1024 * 1024 * 1024;
 
 fn configuredSharedMemorySize() usize {
     if (comptime build_options.shared_memory_size > std.math.maxInt(usize)) {
@@ -2297,22 +2301,46 @@ fn targetPtrWidthBits(target_usize: base.target.TargetUsize) u8 {
     return @intCast(target_usize.size() * 8);
 }
 
-fn llvmCompileOptions(target_usize: base.target.TargetUsize, opt: LlvmTestOpt) @import("llvm_compile").CompileOptions {
+const OwnedLlvmCompileOptions = struct {
+    options: @import("llvm_compile").CompileOptions,
+    cpu: [:0]u8,
+    features: [:0]u8,
+
+    fn deinit(self: *OwnedLlvmCompileOptions, allocator: Allocator) void {
+        allocator.free(self.cpu);
+        allocator.free(self.features);
+    }
+};
+
+fn llvmCompileOptions(allocator: Allocator, target_usize: base.target.TargetUsize, opt: LlvmTestOpt) TestHelperError!OwnedLlvmCompileOptions {
     const llvm_compile = @import("llvm_compile");
-    return switch (opt) {
+    const native_roc_target = roc_target.RocTarget.detectNative();
+    const resolved_target = std.zig.system.resolveTargetQuery(std.Options.debug_io, native_roc_target.llvmTargetQuery()) catch
+        return error.UnsupportedTarget;
+    const cpu = try allocator.dupeZ(u8, roc_target.llvmCpuName(resolved_target));
+    errdefer allocator.free(cpu);
+    const features = try roc_target.llvmFeatureString(allocator, resolved_target);
+    errdefer allocator.free(features);
+
+    const options: llvm_compile.CompileOptions = switch (opt) {
         .size => .{
             .function_sections = false,
             .use_module_target_triple = true,
             .optimization = llvm_compile.bindings.IrOptimizationLevel.Oz,
             .target_ptr_width_bits = targetPtrWidthBits(target_usize),
+            .cpu = cpu,
+            .features = features,
         },
         .speed => .{
             .function_sections = false,
             .use_module_target_triple = true,
             .optimization = llvm_compile.bindings.IrOptimizationLevel.O3,
             .target_ptr_width_bits = targetPtrWidthBits(target_usize),
+            .cpu = cpu,
+            .features = features,
         },
     };
+    return .{ .options = options, .cpu = cpu, .features = features };
 }
 
 fn callLlvmBoolRoot(
@@ -2609,11 +2637,13 @@ pub fn llvmEvalBoolRootModulesWithMaxWorkersAndCallbacks(
         bitcode_len += 1;
     }
 
+    var compile_options = try llvmCompileOptions(allocator, modules[0].layouts.targetUsize(), opt);
+    defer compile_options.deinit(allocator);
     const dylib_path = try llvm_compile.compileBitcodeModulesToSharedLibrary(
         allocator,
         std.Options.debug_io,
         bitcode_slices,
-        llvmCompileOptions(modules[0].layouts.targetUsize(), opt),
+        compile_options.options,
     );
     defer {
         std.Io.Dir.deleteFileAbsolute(std.Options.debug_io, std.mem.sliceTo(dylib_path, 0)) catch {};
@@ -2920,11 +2950,14 @@ pub fn llvmEvaluatorInspectedStr(allocator: Allocator, lowered: *const LoweredPr
         owned.deinit();
     }
 
-    const dylib_path = try llvm_compile.compileToSharedLibrary(allocator, std.Options.debug_io, bitcode.bitcode, .{
-        .function_sections = false,
-        .use_module_target_triple = true,
-        .target_ptr_width_bits = targetPtrWidthBits(lowered.view.layouts.targetUsize()),
-    });
+    var compile_options = try llvmCompileOptions(allocator, lowered.view.layouts.targetUsize(), .speed);
+    defer compile_options.deinit(allocator);
+    const dylib_path = try llvm_compile.compileToSharedLibrary(
+        allocator,
+        std.Options.debug_io,
+        bitcode.bitcode,
+        compile_options.options,
+    );
     defer {
         std.Io.Dir.deleteFileAbsolute(std.Options.debug_io, std.mem.sliceTo(dylib_path, 0)) catch {};
         allocator.free(dylib_path);
@@ -2994,7 +3027,10 @@ pub fn wasmEvaluatorStrWithStats(allocator: Allocator, lowered: *const LoweredPr
     defer codegen.deinit();
 
     const proc = lowered.view.store.getProcSpec(lowered.mainProc());
-    const wasm_result = codegen.generateModule(lowered.mainProc(), proc.ret_layout, wasm32_builtins.bytes) catch return error.OutOfMemory;
+    const wasm_result = codegen.generateModule(lowered.mainProc(), proc.ret_layout, wasm32_builtins.bytes) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.HostedFunctionTypeMismatch => return error.Internal,
+    };
     defer allocator.free(wasm_result.wasm_bytes);
 
     const result = try @import("wasm_runner.zig").runWasmStrWithStats(allocator, wasm_result.wasm_bytes, wasm_result.heap_base, wasm_result.has_imports);

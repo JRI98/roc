@@ -149,7 +149,7 @@ main = run(Wrap.W(42.U8))
 		(e-lambda
 			(args
 				(p-assign (ident "v")))
-			(e-dispatch-call (method "unwrap") (constraint-fn-var 270)
+			(e-dispatch-call (method "unwrap") (constraint-fn-var 286)
 				(receiver
 					(e-lookup-local
 						(p-assign (ident "v"))))
@@ -165,7 +165,7 @@ main = run(Wrap.W(42.U8))
 					(ty-lookup (name "Str") (builtin))))))
 	(d-let
 		(p-assign (ident "main"))
-		(e-call (constraint-fn-var 290)
+		(e-call (constraint-fn-var 306)
 			(e-lookup-local
 				(p-assign (ident "run")))
 			(e-nominal (nominal "Wrap")

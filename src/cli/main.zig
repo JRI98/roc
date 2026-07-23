@@ -267,6 +267,7 @@ const CliMainError =
     backend.wasm.WasmModule.RelocationError ||
     backend.wasm.WasmModule.EncodeError ||
     backend.wasm.WasmModule.SymbolLookupError ||
+    backend.wasm.WasmCodeGen.HostedSymbolError ||
     backend.RunImage.WriteError ||
     backend.RunImage.ImageError ||
     backend.CompilationError ||
@@ -1824,6 +1825,7 @@ const LayoutHashContext = struct {
                 switch (scalar.tag) {
                     .int => updateHashU32(hasher, @intCast(@intFromEnum(scalar.getInt()))),
                     .frac => updateHashU32(hasher, @intCast(@intFromEnum(scalar.getFrac()))),
+                    .vector => updateHashU32(hasher, @intCast(@intFromEnum(scalar.getVector()))),
                     .str, .opaque_ptr => {},
                 }
             },
@@ -2003,7 +2005,7 @@ fn entrypointAbiDigestFromLirData(
     target: RocTarget,
 ) (Allocator.Error || CliError)![32]u8 {
     const abi_target: layout.abi.Target = switch (target.toCpuArch()) {
-        .aarch64 => .aarch64,
+        .aarch64 => layout.abi.aarch64Target(target.toOsTag()),
         .x86_64 => if (target.toOsTag() == .windows) .x86_64_windows else .x86_64_sysv,
         .wasm32 => .wasm32,
         else => return ctx.fail(.{ .shim_generation_failed = .{ .err = error.UnsupportedTarget } }),
@@ -2017,13 +2019,19 @@ fn entrypointAbiDigestFromLirData(
             switch (placement) {
                 .none => updateHashU32(h, 0),
                 .indirect => updateHashU32(h, 1),
-                .registers => |pieces| {
+                .registers => |registers| {
                     updateHashU32(h, 2);
-                    updateHashU32(h, @intCast(pieces.len));
-                    for (pieces) |piece| {
+                    updateHashU32(h, @intFromEnum(std.meta.activeTag(registers.carrier)));
+                    switch (registers.carrier) {
+                        .array => |alignment| updateHashU32(h, alignment orelse 0),
+                        .piecewise, .structure, .integer => {},
+                    }
+                    updateHashU32(h, @intCast(registers.pieces.len));
+                    for (registers.pieces) |piece| {
                         updateHashU32(h, @intFromEnum(piece.class));
                         updateHashU32(h, piece.offset);
                         updateHashU32(h, piece.size);
+                        updateHashU32(h, if (piece.vector_kind) |kind| @intFromEnum(kind) + 1 else 0);
                     }
                 },
             }
@@ -8244,15 +8252,6 @@ fn llvmOptimizationLevel(opt: cli_args.OptLevel) builder.OptimizationLevel {
     };
 }
 
-fn stdTargetAbiForLlvmBuild(target: RocTarget) std.Target.Abi {
-    return switch (target) {
-        .x64musl, .arm64musl, .arm32musl => .musl,
-        .x64glibc, .x64linux, .arm64glibc, .arm64linux, .arm32linux => .gnu,
-        .x64win, .arm64win => .msvc,
-        else => .none,
-    };
-}
-
 fn noTargetLibcallsForLlvmBuild(target: RocTarget) bool {
     return switch (target.toOsTag()) {
         .macos, .windows => false,
@@ -8261,75 +8260,15 @@ fn noTargetLibcallsForLlvmBuild(target: RocTarget) bool {
 }
 
 fn stdTargetForLlvmBuild(ctx: *CliCtx, target: RocTarget) std.zig.system.DetectError!std.Target {
-    var query = std.Target.Query{
-        .cpu_arch = target.toCpuArch(),
-        .os_tag = target.toOsTag(),
-        .abi = stdTargetAbiForLlvmBuild(target),
-    };
-    if (target.toOsTag() == .macos) {
-        query.os_version_min = roc_target.macos_deployment.query_os_version;
-    }
-
-    // Raise the LLVM codegen floor above Zig's most-conservative per-arch
-    // baseline (2003-era x86-64 with only SSE2; ARMv8.0 for aarch64) so Roc
-    // programs may use the last two decades of instructions. The floor is an
-    // explicit, portable minimum applied to every Roc-program LLVM compile,
-    // native and cross alike, so it is independent of the CPU that the compiler
-    // binary itself targets.
-    switch (target.toCpuArch()) {
-        .x86_64 => {
-            // x86-64-v3 (Intel Haswell 2013+ / any AMD Zen) enables AVX2, BMI2,
-            // POPCNT, FMA, and more. The v-levels deliberately exclude the AES
-            // and PCLMULQDQ crypto instructions, so add those two explicitly.
-            query.cpu_model = .{ .explicit = &std.Target.x86.cpu.x86_64_v3 };
-            query.cpu_features_add.addFeature(@intFromEnum(std.Target.x86.Feature.aes));
-            query.cpu_features_add.addFeature(@intFromEnum(std.Target.x86.Feature.pclmul));
-        },
-        .aarch64, .aarch64_be => {
-            // Zig's baseline for aarch64-macos is already apple_m1, and a native
-            // macOS host detects its actual (>= M1) CPU, so macOS needs no
-            // explicit model. Linux/Windows baseline to generic ARMv8.0, so pin
-            // Cortex-A76 (ARMv8.2 + crypto extension), which covers
-            // Neoverse-N1/Graviton2+, Ampere, Snapdragon, and Raspberry Pi 5.
-            if (target.toOsTag() != .macos) {
-                query.cpu_model = .{ .explicit = &std.Target.aarch64.cpu.cortex_a76 };
-            }
-        },
-        // arm32 and wasm keep their existing baselines: wasm codegen is handled
-        // by Roc's own wasm backend, not this LLVM baseline.
-        else => {},
-    }
-
-    return std.zig.system.resolveTargetQuery(ctx.io.std_io, query);
+    return std.zig.system.resolveTargetQuery(ctx.io.std_io, target.llvmTargetQuery());
 }
 
 fn llvmCpuNameForTarget(std_target: std.Target) []const u8 {
-    return std_target.cpu.model.llvm_name orelse "";
+    return roc_target.llvmCpuName(std_target);
 }
 
 fn llvmFeatureStringForTarget(allocator: Allocator, std_target: std.Target) Allocator.Error![]const u8 {
-    const all_features = std_target.cpu.arch.allFeaturesList();
-    var model_features = std_target.cpu.model.features;
-    model_features.populateDependencies(all_features);
-
-    var features = std.ArrayList(u8).empty;
-    errdefer features.deinit(allocator);
-
-    for (all_features) |feature| {
-        const llvm_name = feature.llvm_name orelse continue;
-        const enabled = std_target.cpu.features.isEnabled(feature.index);
-        const model_enabled = model_features.isEnabled(feature.index);
-        if (enabled == model_enabled) continue;
-
-        if (features.items.len > 0) {
-            try features.append(allocator, ',');
-        }
-        try features.append(allocator, if (enabled) '+' else '-');
-        try features.appendSlice(allocator, llvm_name);
-    }
-
-    if (features.items.len == 0) return "";
-    return features.toOwnedSlice(allocator);
+    return roc_target.llvmFeatureString(allocator, std_target);
 }
 
 fn compileLlvmAppObject(

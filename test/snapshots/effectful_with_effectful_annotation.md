@@ -104,7 +104,7 @@ NO CHANGE
 				(ty-record))))
 	(d-let
 		(p-assign (ident "main!"))
-		(e-call (constraint-fn-var 215)
+		(e-call (constraint-fn-var 231)
 			(e-lookup-local
 				(p-assign (ident "print_msg!")))
 			(e-string
