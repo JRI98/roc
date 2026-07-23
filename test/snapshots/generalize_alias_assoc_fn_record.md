@@ -150,8 +150,7 @@ main = ((bag.run)([1, 2, 3]), (bag.run)(["a", "b"]))
 								(p-assign (ident "bag")))))
 					(e-list
 						(elems
-							(e-string
-								(e-literal (string "a")))
+							(e-runtime-error (tag "erroneous_value_expr"))
 							(e-string
 								(e-literal (string "b")))))))))
 	(s-nominal-decl

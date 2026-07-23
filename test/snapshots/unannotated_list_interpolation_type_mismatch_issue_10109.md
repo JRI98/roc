@@ -125,13 +125,7 @@ expect f(["a"]) == "x"
 						(p-assign (ident "#interp_1"))
 						(e-lookup-local
 							(p-assign (ident "inner"))))
-					(e-interpolation (constraint-fn-var 246) (dispatcher-var 23)
-						(first
-							(e-literal (string "<tr>")))
-						(parts
-							(e-lookup-local
-								(p-assign (ident "#interp_1")))
-							(e-literal (string "</tr>"))))))))
+					(e-runtime-error (tag "erroneous_value_expr"))))))
 	(s-expect
 		(e-method-eq (negated "false")
 			(lhs

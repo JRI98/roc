@@ -290,31 +290,8 @@ main = {
 							(e-num (value "2"))))))
 			(s-let
 				(p-assign (ident "p2"))
-				(e-call (constraint-fn-var 384)
-					(e-lookup-local
-						(p-assign (ident "map_pair")))
-					(e-num (value "3"))
-					(e-num (value "4"))
-					(e-lambda
-						(args
-							(p-assign (ident "x")))
-						(e-dispatch-call (method "plus") (constraint-fn-var 371)
-							(receiver
-								(e-lookup-local
-									(p-assign (ident "x"))))
-							(args
-								(e-num (value "1")))))
-					(e-lambda
-						(args
-							(p-assign (ident "y")))
-						(e-dispatch-call (method "times") (constraint-fn-var 380)
-							(receiver
-								(e-lookup-local
-									(p-assign (ident "y"))))
-							(args
-								(e-num (value "2")))))))
-			(e-lookup-local
-				(p-assign (ident "p2")))))
+				(e-runtime-error (tag "erroneous_value_expr")))
+			(e-runtime-error (tag "erroneous_value_use"))))
 	(s-alias-decl
 		(ty-header (name "Pair")
 			(ty-args

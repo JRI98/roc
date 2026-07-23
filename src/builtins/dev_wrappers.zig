@@ -17,7 +17,7 @@ const hash = @import("hash.zig");
 const crypto = @import("crypto.zig");
 const i128h = @import("compiler_rt_128.zig");
 const float_math_f32 = @import("float_math/f32.zig");
-const float_tan = @import("float_math/tan.zig");
+const float_math_f64 = @import("float_math/f64.zig");
 const numeric_conversions = @import("numeric_conversions.zig");
 
 const RocStr = str.RocStr;
@@ -1938,7 +1938,7 @@ pub fn roc_builtins_float_pow_f32(base: f32, exponent: f32) callconv(.c) f32 {
 
 /// Raise an F64 base to an F64 exponent.
 pub fn roc_builtins_float_pow(base: f64, exponent: f64) callconv(.c) f64 {
-    return std.math.pow(f64, base, exponent);
+    return float_math_f64.pow(base, exponent);
 }
 
 const FloatUnaryMathOp = enum {
@@ -1952,12 +1952,12 @@ const FloatUnaryMathOp = enum {
 
 fn floatUnaryMathF64(val: f64, comptime op: FloatUnaryMathOp) f64 {
     return switch (op) {
-        .sin => std.math.sin(val),
-        .cos => std.math.cos(val),
-        .tan => float_tan.tan64(val),
-        .asin => std.math.asin(val),
-        .acos => std.math.acos(val),
-        .atan => std.math.atan(val),
+        .sin => float_math_f64.sin(val),
+        .cos => float_math_f64.cos(val),
+        .tan => float_math_f64.tan(val),
+        .asin => float_math_f64.asin(val),
+        .acos => float_math_f64.acos(val),
+        .atan => float_math_f64.atan(val),
     };
 }
 
