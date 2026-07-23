@@ -11,6 +11,7 @@ const builtins = @import("builtins");
 const backend = @import("backend");
 const collections = @import("collections");
 const compiled_builtins = @import("compiled_builtins");
+const wasm32_builtins = @import("wasm32_builtins");
 const lir = @import("lir");
 const reporting = @import("reporting");
 
@@ -2961,10 +2962,10 @@ pub fn wasmEvaluatorStrWithStats(allocator: Allocator, lowered: *const LoweredPr
     defer codegen.deinit();
 
     const proc = lowered.view.store.getProcSpec(lowered.mainProc());
-    const wasm_result = codegen.generateModule(lowered.mainProc(), proc.ret_layout) catch return error.OutOfMemory;
+    const wasm_result = codegen.generateModule(lowered.mainProc(), proc.ret_layout, wasm32_builtins.bytes) catch return error.OutOfMemory;
     defer allocator.free(wasm_result.wasm_bytes);
 
-    const result = try @import("wasm_runner.zig").runWasmStrWithStats(allocator, wasm_result.wasm_bytes, wasm_result.has_imports);
+    const result = try @import("wasm_runner.zig").runWasmStrWithStats(allocator, wasm_result.wasm_bytes, wasm_result.heap_base, wasm_result.has_imports);
     return .{
         .output = result.output,
         .allocation_count = result.allocation_count,

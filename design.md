@@ -511,6 +511,14 @@ individual NaN representations. A new float operation or observation boundary
 must preserve these rules explicitly; a backend must never infer from its use
 whether normalization is required.
 
+Finite float bits remain observable through `to_bits`. A transcendental whose
+finite result is not fixed by a correctly-rounded IEEE operation must therefore
+use one explicit target-independent implementation for each float width across
+compile-time evaluation, the interpreter, and every backend. Backends must not
+substitute a target libm call or LLVM intrinsic for that implementation. The
+implementation must keep F32 operations binary32 and F64 operations binary64,
+and exact-bit backend tests pin representative finite results.
+
 Static initializer execution uses target-width symbolic memory rather than host
 pointers. Every allocation records its committed target layout, alignment,
 reference-count metadata, and relocations. Materialization freezes the graph
