@@ -6190,6 +6190,9 @@ invalid offset, and `U64.highest`; every public
 lane accessor pins its exact first-invalid index. The corpus is opt-in to
 ordinary test enumeration so the normal eval and Lambda Mono steps do not run
 it twice, but MiniCI runs the dedicated no-skip gate explicitly.
+The full Lambda Mono body-lowering differential sweep over the ordinary eval
+corpus runs once per day on Ubuntu through `nightly_gate.yml`; it is not part of
+PR MiniCI. This does not remove the dedicated SIMD gate's Lambda Mono lane.
 `zig build run-check-simd-codegen` separately requires optimized
 x86-64 output to contain representative byte-add, pairwise-dot, table-shuffle,
 and carryless-multiply instructions. `zig build run-check-glue-abi` compiles
