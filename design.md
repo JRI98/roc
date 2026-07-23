@@ -2265,6 +2265,23 @@ divergence from becoming a hoist candidate beside it. A rewrite that cloned a
 try continuation in its enclosing region would silently reopen effect
 reordering, and the window chain check cannot detect that itself.
 
+A loop-carried variable's reassigned copies share its source binder but not
+its local id, so once a loop clone rebinds the carried slot, binder identity
+is the only path those copies resolve through. Cloning a loop therefore drops
+the pre-loop binder value, installs the emitted param under the slot's binder
+identity for any value variant — an opaque scalar param must reach the copies
+too — and, while the loop clone is active, keeps a reassigned carried binder's
+entry pointing at its latest merged value across the restores of escaping
+`let` clones. Arm and join boundaries restore plainly, so a reassignment
+inside one branch never leaks to its sibling or past the join. Resolving a
+carried read to anything else is unsound in one of two ways: a read that
+reaches a vanished pre-loop local becomes a phantom argument when capture
+recomputation promotes the dangling reference, and a read that reaches the
+loop-entry value silently discards the reassignment. Two Debug validators
+guard the pair: no rewritten function may gain a capture its source did not
+declare, and every local reference in a rewritten body must resolve to an
+in-scope binding, argument, or recomputed capture.
+
 Every SpecConstr clone is hygienic. A retained pattern, loop parameter, join
 parameter, try-sequence local, or other runtime binder receives a fresh lifted
 local identity in each emitted copy, and every occurrence in that binder's
