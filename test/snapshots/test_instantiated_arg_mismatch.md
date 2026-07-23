@@ -91,8 +91,7 @@ EndOfFile,
 		(e-lookup-local
 			(p-assign (ident "pair")))
 		(e-num (value "42"))
-		(e-string
-			(e-literal (string "hello")))))
+		(e-runtime-error (tag "erroneous_value_expr"))))
 ~~~
 # TYPES
 ~~~clojure
