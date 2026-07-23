@@ -6611,8 +6611,8 @@ const Cloner = struct {
             // and emit the residual match over a plain clone of the source
             // scrutinee, finite by construction, rather than materializing a
             // possibly self-referential value. Dropping the first clone's
-            // delegated pendings keeps the scrutinee's effect emitted only by
-            // the plain re-clone.
+            // delegated pending bindings keeps the scrutinee's effect emitted
+            // only by the plain re-clone.
             self.pending.shrinkRetainingCapacity(pending_watermark);
             return try self.addExpr(.{ .ty = ty, .data = .{ .match_ = .{
                 .scrutinee = try self.cloneExprPlain(match.scrutinee),
@@ -6958,9 +6958,9 @@ const Cloner = struct {
     /// the value is cyclic or too deep to measure; boxing it would
     /// deep-materialize a possibly self-referential value, whereas a plain
     /// clone of the source expression is finite by construction. Dropping the
-    /// first clone's delegated pendings keeps its effect emitted only by the
-    /// plain re-clone: a leftover pending would flush the same effect a second
-    /// time. The discarded clone's dead nodes still counted toward
+    /// first clone's delegated pending bindings keeps its effect emitted only
+    /// by the plain re-clone: a leftover pending would flush the same effect a
+    /// second time. The discarded clone's dead nodes still counted toward
     /// `effect_marks`, which only makes downstream delegation more conservative
     /// and is deliberately left as-is.
     fn cloneInlineValueBoundingCycles(self: *Cloner, expr_id: Ast.ExprId) Common.LowerError!Value {
@@ -10354,7 +10354,9 @@ test "static value matchers bound wrapper strips over a cyclic value" {
     var cyclic: Value = undefined;
     cyclic = .{ .static_data_candidate = .{
         .ty = union_ty,
-        .static_data = @enumFromInt(0),
+        // Never read: every walk this test exercises follows the runtime edge
+        // and declines before any materialization would consume the id.
+        .static_data = undefined,
         .runtime = &cyclic,
     } };
 
