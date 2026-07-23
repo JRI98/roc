@@ -1563,6 +1563,29 @@ pub const PackageEnv = struct {
         var module_envs_map = std.AutoHashMap(base.Ident.Idx, Can.AutoImportedType).init(gpa);
         defer module_envs_map.deinit();
 
+        // Canonicalization receives resolved imports keyed by their complete
+        // source import name. Package qualification is part of that identity:
+        // `first.Random` and `second.Random` may name different modules even
+        // though both end in `Random`.
+        var resolved_import_envs = std.StringHashMap(*const ModuleEnv).init(gpa);
+        defer resolved_import_envs.deinit();
+        for (pre_resolved_imports) |pre| {
+            const result = try resolved_import_envs.getOrPut(pre.import_name);
+            if (result.found_existing) {
+                if (result.value_ptr.* != pre.module_env) {
+                    if (builtin.mode == .Debug) {
+                        std.debug.panic(
+                            "canonicalization received conflicting environments for exact import '{s}'",
+                            .{pre.import_name},
+                        );
+                    }
+                    unreachable;
+                }
+            } else {
+                result.value_ptr.* = pre.module_env;
+            }
+        }
+
         // Add sibling modules whose environments are already available.
         // Canonicalization consumes concrete exposed-node data from dependencies.
         const sibling_imports = try module_discovery.extractImportsFromDeclIndex(parse_ast, gpa);
@@ -1587,12 +1610,7 @@ pub const PackageEnv = struct {
             if (!exists) continue;
 
             // Check pre-resolved imports first (e.g., from coordinator's built dependency list)
-            const pre_resolved_env: ?*const ModuleEnv = blk: {
-                for (pre_resolved_imports) |pre| {
-                    if (std.mem.eql(u8, pre.import_name, sibling_name)) break :blk pre.module_env;
-                }
-                break :blk null;
-            };
+            const pre_resolved_env = resolved_import_envs.get(sibling_name);
 
             if (pre_resolved_env) |sibling_env| {
                 const statement_idx = computeSiblingStatementIdx(sibling_env, sibling_name);
@@ -1631,23 +1649,9 @@ pub const PackageEnv = struct {
             const base_ident = try env.insertIdent(base.Ident.for_text(base_module_name));
             const qualified_ident = try env.insertIdent(base.Ident.for_text(km.qualified_name));
 
-            // Try to get the actual module env. Prefer an already-built env the
-            // coordinator supplied via pre_resolved_imports (matching the sibling
-            // path above), then ask the resolver.
-            const actual_env: *const ModuleEnv = blk: {
-                for (pre_resolved_imports) |pre| {
-                    if (std.mem.eql(u8, pre.import_name, km.import_name) or
-                        std.mem.eql(u8, pre.import_name, base_module_name))
-                    {
-                        break :blk pre.module_env;
-                    }
-                    // Match on base module name too (e.g. pre "pf.Host" vs base "Host").
-                    const pre_base = if (std.mem.findScalarLast(u8, pre.import_name, '.')) |d|
-                        pre.import_name[d + 1 ..]
-                    else
-                        pre.import_name;
-                    if (std.mem.eql(u8, pre_base, base_module_name)) break :blk pre.module_env;
-                }
+            // Prefer the exact already-resolved import supplied by the
+            // coordinator, then ask the resolver using that same exact name.
+            const actual_env: *const ModuleEnv = resolved_import_envs.get(km.import_name) orelse blk: {
                 if (resolver) |res| {
                     if (res.getEnv(res.ctx, package_name, km.import_name)) |mod_env| {
                         break :blk mod_env;
