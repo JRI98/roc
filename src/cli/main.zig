@@ -2338,7 +2338,7 @@ fn rocRunInstalled(ctx: *CliCtx, args: cli_args.RunArgs) CliMainError!void {
         );
         return error.InvalidArguments;
     }
-    const term = try runCompiledExecutable(ctx, entry.artifact_path, args.app_args);
+    const term = try runCompiledExecutable(ctx, entry.artifact_path, entry.artifact_path, args.app_args);
     try finishCompiledRun(ctx, entry.artifact_path, term, 0);
 }
 
@@ -2933,11 +2933,11 @@ fn rocRunSharedMemoryShim(ctx: *CliCtx, args: cli_args.RunArgs, arg0: []const u8
     } else if (comptime is_windows) {
         // Windows: Use handle inheritance approach
         std.log.debug("Using Windows handle inheritance approach", .{});
-        try runWithWindowsHandleInheritance(ctx, exe_path, shm_handle, args.app_args);
+        try runWithWindowsHandleInheritance(ctx, exe_path, args.path, shm_handle, args.app_args);
     } else {
         // POSIX: Use existing file descriptor inheritance approach
         std.log.debug("Using POSIX file descriptor inheritance approach", .{});
-        try runWithPosixFdInheritance(ctx, exe_path, shm_handle, args.app_args);
+        try runWithPosixFdInheritance(ctx, exe_path, args.path, shm_handle, args.app_args);
     }
     std.log.debug("Interpreter execution completed", .{});
 
@@ -2983,7 +2983,7 @@ fn rocRunBuildAndExec(ctx: *CliCtx, args: cli_args.RunArgs, arg0: []const u8) Cl
         .root_source_url = args.root_source_url,
     }, arg0);
 
-    const term = try runCompiledExecutable(ctx, exe_path, args.app_args);
+    const term = try runCompiledExecutable(ctx, exe_path, args.path, args.app_args);
 
     compile.CacheCleanup.deleteTempDir(ctx.io.std_io, temp_dir);
     cleanup_temp_dir = false;
@@ -3002,27 +3002,10 @@ fn compiledRunOutputFilename(ctx: *CliCtx, roc_path: []const u8) Allocator.Error
 fn runCompiledExecutable(
     ctx: *CliCtx,
     exe_path: []const u8,
+    argv0: []const u8,
     app_args: []const []const u8,
 ) (CliError || error{OutOfMemory})!std.process.Child.Term {
-    const argv = ctx.arena.alloc([]const u8, 1 + app_args.len) catch {
-        return error.OutOfMemory;
-    };
-    argv[0] = exe_path;
-    for (app_args, 0..) |arg, i| {
-        argv[1 + i] = arg;
-    }
-
-    var child = std.process.spawn(ctx.io.std_io, .{
-        .argv = argv,
-        .cwd = .inherit,
-        .stdout = .inherit,
-        .stderr = .inherit,
-    }) catch |err| {
-        return ctx.fail(.{ .child_process_spawn_failed = .{
-            .command = exe_path,
-            .err = err,
-        } });
-    };
+    var child = try spawnExecutableWithArgv0(ctx, exe_path, argv0, app_args);
 
     return child.wait(ctx.io.std_io) catch |err| {
         return ctx.fail(.{ .child_process_wait_failed = .{
@@ -3030,6 +3013,114 @@ fn runCompiledExecutable(
             .err = err,
         } });
     };
+}
+
+fn spawnExecutableWithArgv0(
+    ctx: *CliCtx,
+    exe_path: []const u8,
+    argv0: []const u8,
+    app_args: []const []const u8,
+) (CliError || Allocator.Error)!std.process.Child {
+    if (comptime is_windows) {
+        const exe_path_w = std.unicode.utf8ToUtf16LeAllocZ(ctx.arena, exe_path) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.InvalidUtf8 => return ctx.fail(.{ .child_process_spawn_failed = .{
+                .command = exe_path,
+                .err = err,
+            } }),
+        };
+
+        var cmd_builder = try std.array_list.Managed(u8).initCapacity(ctx.gpa, 256);
+        defer cmd_builder.deinit();
+        try appendWindowsQuotedArg(&cmd_builder, argv0);
+        for (app_args) |arg| {
+            try cmd_builder.append(' ');
+            try appendWindowsQuotedArg(&cmd_builder, arg);
+        }
+
+        const cmd_line_w = std.unicode.utf8ToUtf16LeAllocZ(ctx.arena, cmd_builder.items) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.InvalidUtf8 => return ctx.fail(.{ .child_process_spawn_failed = .{
+                .command = exe_path,
+                .err = err,
+            } }),
+        };
+
+        var startup_info = std.mem.zeroes(windows.STARTUPINFOW);
+        startup_info.cb = @sizeOf(windows.STARTUPINFOW);
+        var process_info = std.mem.zeroes(windows.PROCESS_INFORMATION);
+
+        if (windows.CreateProcessW(
+            exe_path_w.ptr,
+            cmd_line_w.ptr,
+            null,
+            null,
+            1,
+            0,
+            null,
+            null,
+            &startup_info,
+            &process_info,
+        ) == 0) {
+            return ctx.fail(.{ .child_process_spawn_failed = .{
+                .command = exe_path,
+                .err = error.ProcessCreationFailed,
+            } });
+        }
+
+        return .{
+            .id = process_info.hProcess,
+            .thread_handle = process_info.hThread,
+            .stdin = null,
+            .stdout = null,
+            .stderr = null,
+            .request_resource_usage_statistics = false,
+        };
+    } else {
+        const Posix = struct {
+            extern "c" fn posix_spawn(
+                pid: *std.c.pid_t,
+                path: [*:0]const u8,
+                actions: ?*const anyopaque,
+                attr: ?*const anyopaque,
+                argv: [*:null]const ?[*:0]const u8,
+                env: [*:null]const ?[*:0]const u8,
+            ) c_int;
+        };
+
+        const exe_path_z = try ctx.arena.dupeZ(u8, exe_path);
+        const argv = try ctx.arena.allocSentinel(?[*:0]const u8, 1 + app_args.len, null);
+        argv[0] = (try ctx.arena.dupeZ(u8, argv0)).ptr;
+        for (app_args, 0..) |arg, i| {
+            argv[1 + i] = (try ctx.arena.dupeZ(u8, arg)).ptr;
+        }
+
+        var pid: std.c.pid_t = undefined;
+        const spawn_result = Posix.posix_spawn(
+            &pid,
+            exe_path_z.ptr,
+            null,
+            null,
+            argv.ptr,
+            @ptrCast(std.c.environ),
+        );
+        if (spawn_result != 0) {
+            std.log.err("posix_spawn failed with error code: {}", .{spawn_result});
+            return ctx.fail(.{ .child_process_spawn_failed = .{
+                .command = exe_path,
+                .err = error.ProcessCreationFailed,
+            } });
+        }
+
+        return .{
+            .id = pid,
+            .thread_handle = {},
+            .stdin = null,
+            .stdout = null,
+            .stderr = null,
+            .request_resource_usage_statistics = false,
+        };
+    }
 }
 
 const NativeRunTermination = union(enum) {
@@ -3465,9 +3556,9 @@ fn rocRunDefaultAppSharedMemoryShim(ctx: *CliCtx, args: cli_args.RunArgs, origin
     defer closeSharedMemoryHandle(shm_handle);
 
     if (comptime is_windows) {
-        try runWithWindowsHandleInheritance(ctx, exe_path, shm_handle, args.app_args);
+        try runWithWindowsHandleInheritance(ctx, exe_path, args.path, shm_handle, args.app_args);
     } else {
-        try runWithPosixFdInheritance(ctx, exe_path, shm_handle, args.app_args);
+        try runWithPosixFdInheritance(ctx, exe_path, args.path, shm_handle, args.app_args);
     }
     cleanup_temp_dir = false;
 
@@ -3511,7 +3602,13 @@ fn appendWindowsQuotedArg(cmd_builder: *std.array_list.Managed(u8), arg: []const
 }
 
 /// Run child process using Windows handle inheritance (idiomatic Windows approach)
-fn runWithWindowsHandleInheritance(ctx: *CliCtx, exe_path: []const u8, shm_handle: SharedMemoryHandle, app_args: []const []const u8) (CliError || error{OutOfMemory})!void {
+fn runWithWindowsHandleInheritance(
+    ctx: *CliCtx,
+    exe_path: []const u8,
+    source_path: []const u8,
+    shm_handle: SharedMemoryHandle,
+    app_args: []const []const u8,
+) (CliError || error{OutOfMemory})!void {
     // Make the shared memory handle inheritable
     if (windows.SetHandleInformation(@ptrCast(shm_handle.fd), windows.HANDLE_FLAG_INHERIT, windows.HANDLE_FLAG_INHERIT) == 0) {
         return ctx.fail(.{ .shared_memory_failed = .{
@@ -3565,7 +3662,7 @@ fn runWithWindowsHandleInheritance(ctx: *CliCtx, exe_path: []const u8, shm_handl
         return error.OutOfMemory;
     };
     defer cmd_builder.deinit();
-    try cmd_builder.print("\"{s}\"", .{exe_path});
+    try appendWindowsQuotedArg(&cmd_builder, source_path);
     for (app_args) |arg| {
         try cmd_builder.append(' ');
         try appendWindowsQuotedArg(&cmd_builder, arg);
@@ -3676,7 +3773,13 @@ fn runWithWindowsHandleInheritance(ctx: *CliCtx, exe_path: []const u8, shm_handl
 
 /// Run child process using POSIX file descriptor inheritance (existing approach for Unix)
 /// The exe_path should already be in a unique temp directory created by createUniqueTempDir.
-fn runWithPosixFdInheritance(ctx: *CliCtx, exe_path: []const u8, shm_handle: SharedMemoryHandle, app_args: []const []const u8) (CliError || error{OutOfMemory})!void {
+fn runWithPosixFdInheritance(
+    ctx: *CliCtx,
+    exe_path: []const u8,
+    source_path: []const u8,
+    shm_handle: SharedMemoryHandle,
+    app_args: []const []const u8,
+) (CliError || error{OutOfMemory})!void {
     // Write the coordination file (.txt) next to the executable
     // The executable is already in a unique temp directory
     std.log.debug("Writing fd coordination file for: {s}", .{exe_path});
@@ -3727,28 +3830,9 @@ fn runWithPosixFdInheritance(ctx: *CliCtx, exe_path: []const u8, shm_handle: Sha
         std.log.debug("fd={} FD_CLOEXEC cleared successfully", .{shm_handle.fd});
     }
 
-    // Build argv slice using arena allocator (memory lives until arena is freed)
-    const argv = ctx.arena.alloc([]const u8, 1 + app_args.len) catch {
-        return error.OutOfMemory;
-    };
-    argv[0] = exe_path;
-    for (app_args, 0..) |arg, i| {
-        argv[1 + i] = arg;
-    }
-
     std.log.debug("Spawning child process: {s} with {} app args", .{ exe_path, app_args.len });
     std.log.debug("Child process inherits current working directory", .{});
-    var child = std.process.spawn(ctx.io.std_io, .{
-        .argv = argv,
-        .cwd = .inherit,
-        .stdout = .inherit,
-        .stderr = .inherit,
-    }) catch |err| {
-        return ctx.fail(.{ .child_process_spawn_failed = .{
-            .command = exe_path,
-            .err = err,
-        } });
-    };
+    var child = try spawnExecutableWithArgv0(ctx, exe_path, source_path, app_args);
     std.log.debug("Child process spawned successfully (PID: {})", .{child.id});
 
     // Wait for child to complete
@@ -3851,6 +3935,7 @@ fn makeSharedMemoryHandleInheritable(ctx: *CliCtx, shm_handle: SharedMemoryHandl
 fn spawnHotShimChild(
     ctx: *CliCtx,
     exe_path: []const u8,
+    source_path: []const u8,
     shm_handle: SharedMemoryHandle,
     app_args: []const []const u8,
 ) (CliError || Allocator.Error || std.Thread.SpawnError || std.process.SpawnError)!*HotShimChild {
@@ -3868,23 +3953,7 @@ fn spawnHotShimChild(
     };
     try makeSharedMemoryHandleInheritable(ctx, shm_handle);
 
-    const argv = try ctx.arena.alloc([]const u8, 1 + app_args.len);
-    argv[0] = exe_path;
-    for (app_args, 0..) |arg, i| {
-        argv[1 + i] = arg;
-    }
-
-    const child = std.process.spawn(ctx.io.std_io, .{
-        .argv = argv,
-        .cwd = .inherit,
-        .stdout = .inherit,
-        .stderr = .inherit,
-    }) catch |err| {
-        return ctx.fail(.{ .child_process_spawn_failed = .{
-            .command = exe_path,
-            .err = err,
-        } });
-    };
+    const child = try spawnExecutableWithArgv0(ctx, exe_path, source_path, app_args);
 
     const watched = try ctx.gpa.create(HotShimChild);
     watched.* = .{
@@ -4528,7 +4597,7 @@ fn runHotReloadDevShim(
     var initial_input_set_needs_deinit = true;
     errdefer if (initial_input_set_needs_deinit) initial_input_set.deinit(ctx);
 
-    const host_child = try spawnHotShimChild(ctx, exe_path, hotReloadHostChildHandle(shm_handle), args.app_args);
+    const host_child = try spawnHotShimChild(ctx, exe_path, args.path, hotReloadHostChildHandle(shm_handle), args.app_args);
     var host_child_joined = false;
     errdefer {
         if (!host_child_joined) {
