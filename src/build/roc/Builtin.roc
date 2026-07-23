@@ -4175,6 +4175,15 @@ Builtin :: [].{
 			List.sublist(list, { len: n, start: 0 })
 		}
 
+		## Removes every element while preserving the current capacity.
+		## ```roc
+		## expect [1.I64, 2, 3].clear() == []
+		## ```
+		clear : List(a) -> List(a)
+		clear = |list| {
+			List.take_first(list, 0)
+		}
+
 		## Returns the given number of elements from the end of the list.
 		## ```roc
 		## expect [1, 2, 3, 4, 5, 6, 7, 8].take_last(4) == [5, 6, 7, 8]
