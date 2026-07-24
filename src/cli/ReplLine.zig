@@ -250,6 +250,7 @@ pub fn deinit(self: *ReplLine) void {
     }
 }
 
+/// Add submitted input to this line editor's in-memory history.
 pub fn recordHistory(self: *ReplLine, input: []const u8) Allocator.Error!void {
     try self.history.append(input);
 }
