@@ -4518,14 +4518,23 @@ deallocation with nested decrefs through the RC helper plan.
 RC helper selection is unchanged: each emitted statement carries the helper
 derived from the local's layout, and helper choice stays in this stage.
 
-Emission decisions ask liveness questions with on-demand forward scans over
-the ownership-neutral statement graph, the same shape the all-owned inserter
-used, with more questions per statement (early drops check each refcounted
-operand, and scans cover a binding's whole borrow group). If profiling ever
-shows ARC insertion hot in compile times, the intended remedy is one
-precomputed per-statement liveness table per proc consumed by the same
-decision points — a mechanical swap that changes no decision — not weaker
-scanning.
+Emission decisions consume one precomputed per-statement liveness table over
+the ownership-neutral statement graph. Its bit domain contains only locals
+whose committed layouts contain refcounted data, their explicit
+ownership-unit and borrow-group representatives from the solved ownership
+graph, and the explicit group and borrowed-call-result bits required by the
+equations above. Unrelated scalar locals are not ARC resources and never
+receive raw liveness bits. This distinction is load-bearing for wide static
+initializers: a list of a million scalar elements may require a million scalar
+LIR locals, but it contributes only the list allocation and its explicit
+ownership representatives to ARC's resource-bit width. Widening every row with
+non-resource locals would make ARC memory quadratic in an input that needs only
+linear ownership work.
+
+The table carries exactly the same read-before-rebind decisions as the earlier
+on-demand forward scans. Compile-time performance work may change its storage
+or construction, but must not weaken the liveness questions, omit resource
+bits, or approximate the least fixed point.
 
 The debug borrow certifier deliberately spends more: it re-certifies join
 bodies per distinct entry state and summarizes per statement for walk
