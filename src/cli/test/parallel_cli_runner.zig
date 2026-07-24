@@ -8136,6 +8136,8 @@ fn customGlueRust(io: std.Io, allocator: Allocator, env: *const CaseEnv, timer: 
         "--edition=2021",
         "-D",
         "warnings",
+        "--check-cfg",
+        "cfg()",
         "--crate-type",
         "lib",
         generated_path,
