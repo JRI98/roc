@@ -1618,6 +1618,7 @@ pub const PackageEnv = struct {
                     .env = sibling_env,
                     .statement_idx = statement_idx,
                     .qualified_type_ident = qualified_ident,
+                    .import_identity = .{ .module = sibling_ident },
                 });
                 continue;
             }
@@ -1630,6 +1631,7 @@ pub const PackageEnv = struct {
                         .env = sibling_env,
                         .statement_idx = statement_idx,
                         .qualified_type_ident = qualified_ident,
+                        .import_identity = .{ .module = sibling_ident },
                     });
                     continue;
                 }
@@ -1648,6 +1650,7 @@ pub const PackageEnv = struct {
             // Create identifiers for both the unqualified name and the qualified name
             const base_ident = try env.insertIdent(base.Ident.for_text(base_module_name));
             const qualified_ident = try env.insertIdent(base.Ident.for_text(km.qualified_name));
+            const import_ident = try env.insertIdent(base.Ident.for_text(km.import_name));
 
             // Prefer the exact already-resolved import supplied by the
             // coordinator, then ask the resolver using that same exact name.
@@ -1672,7 +1675,7 @@ pub const PackageEnv = struct {
                 .env = actual_env,
                 .statement_idx = statement_idx,
                 .qualified_type_ident = base_ident,
-                .is_package_qualified = true,
+                .import_identity = .{ .module = import_ident },
             };
 
             // Add entry for the UNQUALIFIED name (e.g., "Stdout", "Builder")
