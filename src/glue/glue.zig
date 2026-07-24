@@ -264,7 +264,7 @@ fn rocGlueInner(gpa: Allocator, stderr: *std.Io.Writer, stdout: *std.Io.Writer, 
         }
 
         for (artifact.provides_requires.provides) |provides_entry| {
-            const def_idx = provides_entry.def orelse continue;
+            const def_idx = provides_entry.def;
             const top_level = artifact.top_level_values.lookupByDef(def_idx) orelse
                 glueInvariant("provided entry has no top-level value", .{});
             const scheme = artifact.checked_types.schemeForKey(top_level.source_scheme) orelse

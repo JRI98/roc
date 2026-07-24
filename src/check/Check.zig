@@ -8032,8 +8032,7 @@ fn checkProvidesEntryHostBoundaryRows(
     self: *Self,
     provides_entry: ModuleEnv.ProvidesEntry,
 ) std.mem.Allocator.Error!void {
-    const def_node_idx = self.cir.getExposedValueNodeIndexById(provides_entry.ident) orelse return;
-    const def_idx: CIR.Def.Idx = @enumFromInt(@as(u32, @intCast(def_node_idx)));
+    const def_idx = provides_entry.local_def orelse return;
     const def = self.cir.store.getDef(def_idx);
     const def_var = ModuleEnv.varFrom(def_idx);
 
