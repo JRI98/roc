@@ -243,6 +243,7 @@ const FilePathMode = enum {
 const CommandCase = struct {
     args: []const []const u8,
     roc_file: ?[]const u8 = null,
+    app_args: []const []const u8 = &.{},
     file_path_mode: FilePathMode = .absolute,
     stdin: ?[]const u8 = null,
     exit: ExitExpectation = .success,
@@ -929,6 +930,11 @@ const subcommand_cases = [_]CliCase{
     .{ .id = 0, .suite = .subcommands, .name = "roc --watch hot reloads dev shim code", .skip = .{ .windows = "generated hot-reload test platform uses POSIX host code" }, .body = .{ .custom = .hot_reload_dev_shim } },
     .{ .id = 0, .suite = .subcommands, .name = "roc --watch hot reloads app-provided Model through Box", .skip = .{ .windows = "generated hot-reload model test platform uses POSIX host code" }, .body = .{ .custom = .hot_reload_model_boundary } },
     .{ .id = 0, .suite = .subcommands, .name = "roc --watch runs headerless default app", .body = .{ .custom = .hot_reload_default_app } },
+    .{ .id = 0, .suite = .subcommands, .name = "issue 10307: direct dev run passes source path as argv0", .backend = .dev, .body = .{ .command = .{ .args = &.{"--no-cache"}, .roc_file = "test/fx-open/argv0.roc", .app_args = &.{ "first", "second" }, .file_path_mode = .relative, .stdout_exact = "test/fx-open/argv0.roc|first|second\n" } } },
+    .{ .id = 0, .suite = .subcommands, .name = "issue 10307: explicit run passes source path as argv0", .backend = .dev, .body = .{ .command = .{ .args = &.{ "run", "--opt=dev", "--no-cache" }, .roc_file = "test/fx-open/argv0.roc", .app_args = &.{ "first", "second" }, .file_path_mode = .relative, .stdout_exact = "test/fx-open/argv0.roc|first|second\n" } } },
+    .{ .id = 0, .suite = .subcommands, .name = "issue 10307: interpreter run passes source path as argv0", .backend = .interpreter, .body = .{ .command = .{ .args = &.{ "--opt=interpreter", "--no-cache" }, .roc_file = "test/fx-open/argv0.roc", .app_args = &.{ "first", "second" }, .file_path_mode = .relative, .stdout_exact = "test/fx-open/argv0.roc|first|second\n" } } },
+    .{ .id = 0, .suite = .subcommands, .name = "issue 10307: size run passes source path as argv0", .backend = .size, .body = .{ .command = .{ .args = &.{ "--opt=size", "--no-cache" }, .roc_file = "test/fx-open/argv0.roc", .app_args = &.{ "first", "second" }, .file_path_mode = .relative, .stdout_exact = "test/fx-open/argv0.roc|first|second\n" } } },
+    .{ .id = 0, .suite = .subcommands, .name = "issue 10307: speed run passes source path as argv0", .backend = .speed, .body = .{ .command = .{ .args = &.{ "--opt=speed", "--no-cache" }, .roc_file = "test/fx-open/argv0.roc", .app_args = &.{ "first", "second" }, .file_path_mode = .relative, .stdout_exact = "test/fx-open/argv0.roc|first|second\n" } } },
     .{ .id = 0, .suite = .subcommands, .name = "roc build reports missing host symbols before linking", .body = .{ .command = .{ .args = &.{ "build", "--no-cache", "--target=x64musl" }, .roc_file = "test/missing-host-symbol/app.roc", .exit = .failure, .contains = &.{ .{ .stream = .stderr, .text = "MISSING HOST SYMBOLS" }, .{ .stream = .stderr, .text = "roc_host_vanish" } } } } },
     .{ .id = 0, .suite = .subcommands, .name = "roc check writes parse errors to stderr", .body = .{ .command = .{ .args = &.{ "check", "--no-cache" }, .roc_file = "test/cli/has_parse_error.roc", .exit = .failure, .stderr_min_len = 1, .contains_any = &.{.{ .needles = &parse_error_needles }} } } },
     .{ .id = 0, .suite = .subcommands, .name = "direct roc rejects compiler-owned glue platform as hostless", .body = .{ .command = .{ .args = &.{"--no-cache"}, .roc_file = "src/glue/src/DebugGlue.roc", .exit = .failure, .stderr_min_len = 1, .contains = &.{ .{ .stream = .stderr, .text = "EMPTY TARGETS SECTION" }, .{ .stream = .stderr, .text = "roc glue" } }, .not_contains = &.{ .{ .stream = .stderr, .text = "EXPECTED PLATFORM STRING" }, .{ .stream = .stderr, .text = "PANIC" }, .{ .stream = .stderr, .text = "unreachable" } } } } },
@@ -2093,7 +2099,7 @@ fn runCommandCase(
     var run_timer = harness.Timer.start() catch return .{ .status = .infra_error, .phase = .run, .duration_ns = timer.read(), .message = "no clock" };
     const child_timeout_ms = childCommandTimeoutMs(&timer, timeout_ms) orelse
         return addPreservedWorkDirMessage(allocator, timeoutFailure(allocator, &timer, .run, "case timeout exhausted before command started"), env.dirs.work_dir);
-    const result = runRocInEnv(io, allocator, &env, command.args, command.roc_file, command.file_path_mode, command.stdin, child_timeout_ms) catch |err| {
+    const result = runRocInEnv(io, allocator, &env, command.args, command.roc_file, command.file_path_mode, command.app_args, command.stdin, child_timeout_ms) catch |err| {
         const msg = std.fmt.allocPrint(allocator, "run spawn error: {}", .{err}) catch "run spawn error";
         return addPreservedWorkDirMessage(allocator, .{
             .status = .infra_error,
@@ -2129,10 +2135,11 @@ fn runRocInEnv(
     args: []const []const u8,
     roc_file: ?[]const u8,
     file_path_mode: FilePathMode,
+    app_args: []const []const u8,
     stdin: ?[]const u8,
     timeout_ms: u64,
 ) CliRunnerError!std.process.RunResult {
-    const argv = try buildRocArgv(allocator, args, roc_file, file_path_mode);
+    const argv = try buildRocArgv(allocator, args, roc_file, file_path_mode, app_args);
     return util.runChildWithTimeout(io, allocator, argv, .{
         .cwd = project_root_path,
         .env_map = &env.env_map,
@@ -2165,6 +2172,7 @@ fn buildRocArgv(
     args: []const []const u8,
     roc_file: ?[]const u8,
     file_path_mode: FilePathMode,
+    app_args: []const []const u8,
 ) CliRunnerError![]const []const u8 {
     var argv: std.ArrayListUnmanaged([]const u8) = .empty;
     const is_glue_command = args.len > 0 and std.mem.eql(u8, args[0], "glue");
@@ -2185,6 +2193,10 @@ fn buildRocArgv(
             .relative => path,
         };
         try argv.append(allocator, resolved);
+    }
+    if (app_args.len > 0) {
+        try argv.append(allocator, "--");
+        try argv.appendSlice(allocator, app_args);
     }
     return try argv.toOwnedSlice(allocator);
 }
@@ -2469,7 +2481,7 @@ fn runRocAndCheck(
 ) ?TestResult {
     const child_timeout_ms = childCommandTimeoutMs(timer, timeout_ms) orelse
         return timeoutFailure(allocator, timer, .run, "case timeout exhausted before command started");
-    const result = runRocInEnv(io, allocator, env, command.args, command.roc_file, command.file_path_mode, command.stdin, child_timeout_ms) catch |err|
+    const result = runRocInEnv(io, allocator, env, command.args, command.roc_file, command.file_path_mode, command.app_args, command.stdin, child_timeout_ms) catch |err|
         return customInfraFailure(allocator, timer, "run spawn error: {}", .{err});
 
     if (checkCommandExpectation(allocator, result, command)) |message| {
@@ -4217,7 +4229,7 @@ fn runRocInCaseEnv(
     try case_env_map.put("ZIG_LOCAL_CACHE_DIR", zig_cache_dir);
     try util.putIsolatedTempEnv(&case_env_map, temp_dir);
 
-    const argv = try buildRocArgv(allocator, args, roc_file, .absolute);
+    const argv = try buildRocArgv(allocator, args, roc_file, .absolute, &.{});
     return util.runChildWithTimeout(io, allocator, argv, .{
         .cwd = project_root_path,
         .env_map = &case_env_map,
@@ -4856,7 +4868,7 @@ fn customListBuiltinInlined(
 
     const child_timeout_ms = childCommandTimeoutMs(timer, timeout_ms) orelse
         return timeoutFailure(allocator, timer, .run, "case timeout exhausted before roc build started");
-    const result = runRocInEnv(io, allocator, env, &.{ "build", "--opt=speed", "--no-cache", output_arg }, app_path, .absolute, null, child_timeout_ms) catch |err|
+    const result = runRocInEnv(io, allocator, env, &.{ "build", "--opt=speed", "--no-cache", output_arg }, app_path, .absolute, &.{}, null, child_timeout_ms) catch |err|
         return customInfraFailure(allocator, timer, "roc build spawn error: {}", .{err});
     if (checkCommandExpectation(allocator, result, .{ .args = &.{"build"}, .exit = .success })) |message| {
         return failureFromRun(allocator, timer, result, message);
@@ -4883,7 +4895,7 @@ fn customGeneratedModuleGraph(
             return customInfraFailure(allocator, timer, "failed to allocate cache path: {}", .{err});
         const child_timeout_ms = childCommandTimeoutMs(timer, timeout_ms) orelse
             return timeoutFailure(allocator, timer, .run, "case timeout exhausted before roc check started");
-        const result = runRocInEnv(io, allocator, env, &.{"check"}, main_path, .absolute, null, child_timeout_ms) catch |err|
+        const result = runRocInEnv(io, allocator, env, &.{"check"}, main_path, .absolute, &.{}, null, child_timeout_ms) catch |err|
             return customInfraFailure(allocator, timer, "roc check spawn error: {}", .{err});
         if (checkCommandExpectation(allocator, result, .{ .args = &.{"check"}, .exit = .success })) |message| {
             return failureFromRun(allocator, timer, result, message);
@@ -5067,7 +5079,7 @@ fn customFmtStdin(
         return customInfraFailure(allocator, timer, "failed to read stdin source: {}", .{err});
     const child_timeout_ms = childCommandTimeoutMs(timer, timeout_ms) orelse
         return timeoutFailure(allocator, timer, .run, "case timeout exhausted before roc fmt --stdin started");
-    const result = runRocInEnv(io, allocator, env, &.{ "fmt", "--stdin" }, null, .absolute, input, child_timeout_ms) catch |err|
+    const result = runRocInEnv(io, allocator, env, &.{ "fmt", "--stdin" }, null, .absolute, &.{}, input, child_timeout_ms) catch |err|
         return customInfraFailure(allocator, timer, "roc fmt --stdin spawn error: {}", .{err});
     if (checkCommandExpectation(allocator, result, .{ .args = &.{ "fmt", "--stdin" } })) |message| {
         return failureFromRun(allocator, timer, result, message);
@@ -5570,7 +5582,7 @@ fn captureRocRun(
 ) CapturedRocRun {
     const child_timeout_ms = childCommandTimeoutMs(timer, timeout_ms) orelse
         return .{ .failure = timeoutFailure(allocator, timer, .run, "case timeout exhausted before command started") };
-    const result = runRocInEnv(io, allocator, env, command.args, command.roc_file, command.file_path_mode, command.stdin, child_timeout_ms) catch |err|
+    const result = runRocInEnv(io, allocator, env, command.args, command.roc_file, command.file_path_mode, command.app_args, command.stdin, child_timeout_ms) catch |err|
         return .{ .failure = customInfraFailure(allocator, timer, "run spawn error: {}", .{err}) };
 
     if (checkCommandExpectation(allocator, result, command)) |message| {
@@ -6478,7 +6490,7 @@ fn customBuildIssue9435(io: std.Io, allocator: Allocator, env: *const CaseEnv, t
         return customInfraFailure(allocator, timer, "failed to allocate output arg: {}", .{err});
     const child_timeout_ms = childCommandTimeoutMs(timer, timeout_ms) orelse
         return timeoutFailure(allocator, timer, .run, "case timeout exhausted before roc build started");
-    const result = runRocInEnv(io, allocator, env, &.{ "build", "--opt=dev", "--no-cache", out_arg }, "test/hosted_nominal_return/repro.roc", .absolute, null, child_timeout_ms) catch |err|
+    const result = runRocInEnv(io, allocator, env, &.{ "build", "--opt=dev", "--no-cache", out_arg }, "test/hosted_nominal_return/repro.roc", .absolute, &.{}, null, child_timeout_ms) catch |err|
         return customInfraFailure(allocator, timer, "roc build spawn error: {}", .{err});
     if (result.term == .signal or (result.term == .exited and result.term.exited == 134)) {
         return failureFromRun(allocator, timer, result, "roc build panicked or aborted");
