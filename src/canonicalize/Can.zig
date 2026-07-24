@@ -193,6 +193,12 @@ const TryNominalTarget = union(enum) {
     },
 };
 
+const PendingProvidesEntry = struct {
+    ident: Ident.Idx,
+    ffi_symbol: StringLiteral.Idx,
+    region: Region,
+};
+
 env: *ModuleEnv,
 parse_ir: *AST,
 /// Track whether we're in statement position (true) or expression position (false)
@@ -242,6 +248,9 @@ placeholder_idents: std.AutoHashMapUnmanaged(Ident.Idx, PlaceholderInfo) = .{},
 /// Definitions requested by the caller as explicit post-check roots.
 explicit_root_names: []const []const u8 = &.{},
 explicit_root_defs: std.ArrayListUnmanaged(ExplicitRootDef) = .empty,
+/// Platform provides declarations awaiting local-definition resolution after
+/// all top-level declarations have been canonicalized.
+pending_provides_entries: std.ArrayListUnmanaged(PendingProvidesEntry) = .empty,
 /// Stack of function regions for tracking var reassignment across function boundaries
 function_regions: std.array_list.Managed(Region),
 /// Maps var patterns to the function region they were declared in
@@ -583,6 +592,7 @@ pub fn deinit(
     self.exposed_type_texts.deinit(gpa);
     self.placeholder_idents.deinit(gpa);
     self.explicit_root_defs.deinit(gpa);
+    self.pending_provides_entries.deinit(gpa);
 
     for (0..self.scopes.items.len) |i| {
         var scope = &self.scopes.items[i];
@@ -4397,6 +4407,8 @@ pub fn canonicalizeFile(
         }
     }
 
+    try self.resolvePlatformProvides();
+
     // Check for exposed but not implemented items
     try self.checkExposedButNotImplemented();
     try self.checkExposedTypeSurfaces();
@@ -5373,10 +5385,39 @@ fn addPlatformProvidesItems(
             // Store the literal linker symbol as the provides entry
             const ffi_text = self.parse_ir.resolve(entry.symbol);
             const ffi_string_idx = try self.env.insertString(ffi_text);
-            _ = try self.env.provides_entries.append(gpa, .{
+            try self.pending_provides_entries.append(gpa, .{
                 .ident = ident_idx,
                 .ffi_symbol = ffi_string_idx,
+                .region = token_region,
             });
+        }
+    }
+}
+
+/// Resolve `provides` declarations once all platform top-level definitions are
+/// known. Only platform-local definitions are published to later stages.
+fn resolvePlatformProvides(self: *Self) std.mem.Allocator.Error!void {
+    for (self.pending_provides_entries.items) |entry| {
+        const local_def: ?CIR.Def.Idx = if (self.env.getExposedValueNodeIndexById(entry.ident)) |node_idx|
+            @enumFromInt(@as(u32, @intCast(node_idx)))
+        else
+            null;
+        _ = try self.env.provides_entries.append(self.env.gpa, .{
+            .ident = entry.ident,
+            .ffi_symbol = entry.ffi_symbol,
+            .local_def = local_def,
+        });
+        if (local_def != null) continue;
+
+        for (self.env.requires_types.items.items) |required| {
+            if (entry.ident.eql(required.ident)) {
+                _ = self.exposed_ident_texts.remove(self.env.getIdent(entry.ident));
+                try self.env.pushDiagnostic(.{ .provided_value_is_required = .{
+                    .ident = entry.ident,
+                    .region = entry.region,
+                } });
+                break;
+            }
         }
     }
 }

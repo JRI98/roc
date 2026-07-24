@@ -710,11 +710,8 @@ pub const ExportTableView = struct {
 pub const ProvidesEntry = struct {
     source_name: canonical.ExportNameId,
     ffi_symbol: canonical.ExternalSymbolNameId,
-    /// The top-level definition this provides entry binds, resolved by the
-    /// producer within its own module (the canonicalize->check boundary is
-    /// the one legitimate name-resolution point). Consumers (glue) use this
-    /// instead of re-matching definition names.
-    def: ?CIR.Def.Idx = null,
+    /// The platform-local top-level definition selected by canonicalization.
+    def: CIR.Def.Idx,
 };
 
 /// Public `RequiresEntry` declaration.
@@ -791,35 +788,13 @@ pub const ProvidedExportTable = struct {
         top_level_values: *const TopLevelValueTable,
         published_provides: []const ProvidesEntry,
     ) Allocator.Error!ProvidedExportTable {
-        const module_env = module.moduleEnvConst();
-        const source = module_env.provides_entries.items.items;
-        if (source.len != published_provides.len) {
-            checkedArtifactInvariant("published provides metadata disagrees with ModuleEnv provides count", .{});
-        }
-
         var exports = std.ArrayList(ProvidedExport).empty;
         errdefer exports.deinit(allocator);
 
-        for (source, published_provides) |provides_entry, published| {
-            const def_node_idx = module_env.getExposedValueNodeIndexById(provides_entry.ident) orelse {
-                if (builtin.mode == .Debug) {
-                    std.debug.panic(
-                        "checked artifact invariant violated: provided entry {s} has no top-level definition",
-                        .{module_env.getIdent(provides_entry.ident)},
-                    );
-                }
-                unreachable;
-            };
-            const def_idx: CIR.Def.Idx = @enumFromInt(@as(u32, @intCast(def_node_idx)));
-            const top_level = top_level_values.lookupByDef(def_idx) orelse {
-                if (builtin.mode == .Debug) {
-                    std.debug.panic(
-                        "checked artifact invariant violated: provided entry {s} has no top-level value",
-                        .{module_env.getIdent(provides_entry.ident)},
-                    );
-                }
-                unreachable;
-            };
+        for (published_provides) |published| {
+            const def_idx = published.def;
+            const top_level = top_level_values.lookupByDef(def_idx) orelse
+                checkedArtifactInvariant("provided entry has no top-level value", .{});
             const source_checked_type = try checkedTypeIdForRootSource(
                 allocator,
                 module,
@@ -17615,18 +17590,19 @@ fn publishProvidesMetadata(
 ) Allocator.Error![]ProvidesEntry {
     const module_env = module.moduleEnvConst();
     const source = module_env.provides_entries.items.items;
-    const provides = try allocator.alloc(ProvidesEntry, source.len);
-    errdefer allocator.free(provides);
+    var provides = std.ArrayList(ProvidesEntry).empty;
+    errdefer provides.deinit(allocator);
 
-    for (source, 0..) |entry, i| {
-        provides[i] = .{
+    for (source) |entry| {
+        const def = entry.local_def orelse continue;
+        try provides.append(allocator, .{
             .source_name = try names.internExportIdent(module_env.getIdentStoreConst(), entry.ident),
             .ffi_symbol = try names.internExternalSymbolName(module_env.getString(entry.ffi_symbol)),
-            .def = module.topLevelDefByIdent(entry.ident),
-        };
+            .def = def,
+        });
     }
 
-    return provides;
+    return provides.toOwnedSlice(allocator);
 }
 
 fn publishRequiresMetadata(
@@ -23272,7 +23248,7 @@ pub const CheckedModuleArtifact = struct {
     /// Manual discriminant for `SERIALIZED_VERSION_HASH`: bump to force a cache /
     /// baked-blob invalidation for a layout change the structural fingerprint below
     /// cannot observe (e.g. a semantic change to how a field is interpreted).
-    const serialized_layout_version: u32 = 27;
+    const serialized_layout_version: u32 = 28;
 
     /// Comptime fingerprint of `Serialized`'s layout, mirroring
     /// `cache_module.MODULE_ENV_VERSION_HASH`. It is appended to the baked builtin
@@ -24203,6 +24179,7 @@ pub const CheckedModuleArtifact = struct {
                 .procedure => |procedure| {
                     std.debug.assert(procedure.source_name == metadata.source_name);
                     std.debug.assert(procedure.ffi_symbol == metadata.ffi_symbol);
+                    std.debug.assert(procedure.def == metadata.def);
                     std.debug.assert(@intFromEnum(procedure.checked_type) < self.checked_types.roots.items.len);
                     const top_level = self.top_level_values.lookupByDef(procedure.def) orelse {
                         std.debug.panic("checked artifact invariant violated: provided procedure export references missing top-level value", .{});
@@ -24218,6 +24195,7 @@ pub const CheckedModuleArtifact = struct {
                 .data => |data| {
                     std.debug.assert(data.source_name == metadata.source_name);
                     std.debug.assert(data.ffi_symbol == metadata.ffi_symbol);
+                    std.debug.assert(data.def == metadata.def);
                     std.debug.assert(@intFromEnum(data.checked_type) < self.checked_types.roots.items.len);
                     const top_level = self.top_level_values.lookupByDef(data.def) orelse {
                         std.debug.panic("checked artifact invariant violated: provided data export references missing top-level value", .{});
@@ -28093,8 +28071,8 @@ test "SERIALIZED_VERSION_HASH golden value" {
     // change, bump `serialized_layout_version` and replace the golden bytes below with
     // the ones this assertion prints.
     const golden: [32]u8 = .{
-        0xB9, 0xA2, 0x99, 0x1C, 0xE1, 0xEE, 0x12, 0x1A, 0x42, 0x23, 0xC0, 0xE6, 0x19, 0xB6, 0x1A, 0x16,
-        0x8A, 0xC2, 0x7E, 0x88, 0xE2, 0x1D, 0xB8, 0x55, 0x3F, 0x9C, 0x36, 0x0C, 0x16, 0xEB, 0x42, 0xAA,
+        0xC3, 0x7D, 0x55, 0x73, 0xA3, 0x05, 0x93, 0x43, 0xE7, 0x2D, 0xCB, 0x5C, 0x75, 0xB4, 0x7B, 0x66,
+        0x12, 0xCB, 0x75, 0x3A, 0x61, 0x41, 0x37, 0xAA, 0x1A, 0x88, 0x78, 0xED, 0xB8, 0x25, 0x18, 0xE7,
     };
     try std.testing.expectEqualSlices(u8, &golden, &CheckedModuleArtifact.SERIALIZED_VERSION_HASH);
 }

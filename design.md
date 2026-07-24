@@ -1541,6 +1541,16 @@ sibling bindings, and a lookup at a checked-error index lowers to a runtime
 crash. There is no relation-less error fallback and no separate flow that
 "permits" user errors.
 
+A platform `provides` declaration must name a top-level value defined in the
+platform module. It cannot name a value from `requires` directly; a platform
+that wants to expose an app-provided value to its host defines an explicit
+platform-local entrypoint whose definition uses that requirement.
+Canonicalization writes `local_def` into every `ModuleEnv.ProvidesEntry`; it is
+non-null exactly when the header target is a top-level definition in the
+platform module. Header validation inspects all declarations, while checked
+provides output contains only entries with non-null `local_def`. Rejected
+declarations also produce source diagnostics.
+
 A platform requirement's for-clause alias is a binder over an app-supplied
 type: the requirement's `Model` IS the app's `Model` by the for-clause's own
 definition, so identity provenance follows meaning provenance. After the
