@@ -7287,6 +7287,7 @@ fn canonicalizeTypeDispatchApply(
     const args_slice = self.parse_ir.store.exprSlice(args_span);
     try stacks.pushFinishTypeDispatchApply(frame_allocator, .{
         .region = region,
+        .free_vars_start = self.scratch_free_vars.top(),
         .type_dispatch_stmt = type_dispatch_stmt,
         .method_name = method_name,
         .arg_count = args_slice.len,
@@ -12187,8 +12188,9 @@ fn runExprKernel(
                 .args = args_span,
             } }, state.region);
 
+            const free_vars_span = self.scratch_free_vars.spanFrom(state.free_vars_start);
             child_slots.shrinkRetainingCapacity(result_start);
-            try storeExprKernelOutput(&last_expr, &child_slots, frame_allocator, current_result_target, CanonicalizedExpr{ .idx = dispatch_expr_idx, .free_vars = DataSpan.empty() });
+            try storeExprKernelOutput(&last_expr, &child_slots, frame_allocator, current_result_target, CanonicalizedExpr{ .idx = dispatch_expr_idx, .free_vars = free_vars_span });
 
             continue :expr_kernel_loop .dispatch;
         },
@@ -15478,6 +15480,7 @@ const ExprFinishTagWork = struct {
 
 const ExprFinishTypeDispatchApplyWork = struct {
     region: Region,
+    free_vars_start: u32,
     type_dispatch_stmt: Statement.Idx,
     method_name: Ident.Idx,
     arg_count: usize,
