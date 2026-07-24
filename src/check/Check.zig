@@ -7192,14 +7192,6 @@ fn checkInstantiatedStaticDispatchConstraints(
             // never retain a slice across that operation.
             const dispatcher = self.instantiation_dispatchers.items[dispatcher_idx];
             if (dispatcher.constraints.len() == 0) continue;
-            var has_where_constraint = false;
-            for (self.types.sliceStaticDispatchConstraints(dispatcher.constraints)) |constraint| {
-                if (constraint.origin == .where_clause) {
-                    has_where_constraint = true;
-                    break;
-                }
-            }
-            if (!has_where_constraint) continue;
 
             // The ambiguity judgment has already decided which generalized
             // instantiations are unpinnable. Only those receivers will be

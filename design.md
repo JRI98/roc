@@ -2934,6 +2934,27 @@ the requester's graph, and an inferred local procedure's body pins signature
 variables the requester's remaining body relies on, so nested bodies lower at
 their request site.
 
+A deferred procedure-template request has two distinct sources of type
+evidence. Caller value flow owns the request's function arguments and return;
+the requested checked template owns explicit type-constructor arguments that
+may have no value-level occurrence, including phantom nominal arguments. Before
+the requester seals, Monotype traverses matching request and checked structure
+without relating ordinary value positions, and constrains only named type
+arguments and the explicit element arguments of builtin container types.
+Unifying the two complete function roots here is forbidden: two sibling
+requests can legitimately carry different concrete value arguments, and a
+callee checked root must not make those caller-owned cells aliases. The callee
+later creates its own fresh instantiation graph and constrains its complete
+checked root against the sealed request in that graph.
+
+Checking must also validate a mono-specialization default against the complete
+method callable type before placing direct evidence in the checked dispatch
+plan. A same-named method on the default owner is insufficient. An incompatible
+default target is a checked type error and the checked body site is poisoned
+there. Monotype instantiates the target declaration recorded in the checked
+plan at that plan's call arguments; it does not accept an incompatible
+relation.
+
 Instantiation graph nodes are cached by the owning checked module id and the
 exact checked type id. They are not cached by `TypeDigest`. A digest can
 identify closed structural type content for specialization and comparison, but
