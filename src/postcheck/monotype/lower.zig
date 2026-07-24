@@ -2984,13 +2984,10 @@ const Builder = struct {
     /// A deferred template request seals from the requester's graph node
     /// behind its request type, and value flow alone cannot reach
     /// type-level-only positions such as phantom nominal type arguments.
-    /// Instantiating the requested template's checked function root into the
-    /// requester's graph at request creation delivers those checked root nodes
-    /// before sealing, so a row that still takes its `row_default` at seal
-    /// time is genuinely unconstrained rather than starved. Each request pins
-    /// a fresh instantiation: the checked root is generalized, and two
-    /// requests of one template at different types must not share
-    /// instantiated nodes.
+    /// Instantiate the requested template's checked root freshly, then
+    /// constrain only explicit named/container type arguments from it.
+    /// Function arguments and returns belong to caller value flow and remain
+    /// independent across sibling targets.
     fn pinDeferredTemplateRequestToCheckedRoot(
         self: *Builder,
         requester: *InstGraph,
@@ -2999,7 +2996,7 @@ const Builder = struct {
     ) Allocator.Error!void {
         // A request type without a graph view is a sealed snapshot (generated
         // opaque evidence); sealing cannot default anything inside it.
-        if (requester.monoViewNode(fn_ty) == null) return;
+        const request_root = requester.monoViewNode(fn_ty) orelse return;
         const view = self.moduleForDigest(names.procTemplateModuleDigest(template_ref));
         const template = view.templates.get(template_ref.template);
         var draft = BodyDraftStore.init(self.allocator);
@@ -3009,7 +3006,9 @@ const Builder = struct {
             .template = undefined, // type-only context; type lowering does not read the owner template
         }, requester, &draft);
         defer ctx.deinit();
-        try ctx.constrainTypeToMono(template.checked_fn_root, fn_ty);
+        const checked_root = try ctx.instNode(template.checked_fn_root);
+        try requester.fillDeferredRequestTypeArgs(request_root, checked_root);
+        try requester.drainDirty();
     }
 
     fn lowerFnTemplateDef(self: *Builder, method_scope: ModuleView, fn_template: Ast.FnTemplate, evidence: []const SpecEvidence) Allocator.Error!Ast.FnId {
